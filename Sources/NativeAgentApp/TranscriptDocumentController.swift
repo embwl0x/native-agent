@@ -169,7 +169,7 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
         quiet = environment.quietOffscreenRead
         reduceMotion = environment.accessibilityReduceMotion
         pageVisible = environment.chatPageIsVisible
-        // A page under another claims no cursor: AppKit keeps cursor rects for views that are only transparent, never for hidden ones.
+        // A page under another is hidden, not only transparent, so nothing about it answers the pointer.
         textView.enclosingScrollView?.isHidden = !pageVisible
         if self.handle !== handle {
             if self.handle?.controller === self { self.handle?.controller = nil }

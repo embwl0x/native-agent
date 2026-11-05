@@ -75,6 +75,11 @@ let transcriptLog = ModuleLog(category: "TranscriptDocument")
         }
     }
 
+    /// The view is a block's hosted view or inside one.
+    func hosts(_ view: NSView) -> Bool {
+        entries.values.contains { view.isDescendant(of: $0.host.view) }
+    }
+
     /// Blocks gone from the document.
     func forget(_ blockIDs: Set<String>) {
         for blockID in blockIDs {

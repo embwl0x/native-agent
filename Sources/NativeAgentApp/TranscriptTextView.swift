@@ -48,13 +48,63 @@ final class TranscriptTextView: NSTextView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        super.mouseMoved(with: event)
-        controller?.hover(atViewPoint: convert(event.locationInWindow, from: nil))
+        let point = convert(event.locationInWindow, from: nil)
+        let onText = textIsOnTop(event)
+        // NSTextView sets its own I-beam on a move: only where the text is on top.
+        if onText { super.mouseMoved(with: event) }
+        setPointer(onText: onText, at: point)
+        controller?.hover(atViewPoint: point)
     }
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
+        setPointer(onText: false, at: .zero)
         controller?.hover(atViewPoint: nil)
+    }
+
+    // AppKit's cursor rects ignore whatever is drawn over a view, so a pane or card over the transcript showed the text cursor.
+    // The text's pointer is set from the window's hit test instead: the I-beam, or a link's hand, only where the text itself is on top.
+    override func resetCursorRects() {}
+
+    override func cursorUpdate(with event: NSEvent) {
+        setPointer(onText: textIsOnTop(event), at: convert(event.locationInWindow, from: nil))
+    }
+
+    /// Whether the pointer showing is the text's: the arrow goes back once, when the pointer leaves the text, and never over a pane's own.
+    private var showsTextPointer = false
+
+    private func setPointer(onText: Bool, at point: NSPoint) {
+        guard onText else {
+            if showsTextPointer { NSCursor.arrow.set() }
+            showsTextPointer = false
+            return
+        }
+        showsTextPointer = true
+        (linkIsUnder(point) ? NSCursor.pointingHand : NSCursor.iBeam).set()
+    }
+
+    /// The window's hit test lands on this view's own text: not a block's hosted view, a pane, a card or a bar drawn over it.
+    private func textIsOnTop(_ event: NSEvent) -> Bool {
+        guard let root = window?.contentView?.superview ?? window?.contentView else { return false }
+        let point = root.superview?.convert(event.locationInWindow, from: nil) ?? event.locationInWindow
+        guard let hit = root.hitTest(point), hit.isDescendant(of: self) else { return false }
+        return controller?.attachments.hosts(hit) != true
+    }
+
+    /// A link is drawn under the point: the character under it, read from its line through TextKit 2.
+    private func linkIsUnder(_ point: NSPoint) -> Bool {
+        let origin = textContainerOrigin
+        let inContainer = CGPoint(x: point.x - origin.x, y: point.y - origin.y)
+        guard let fragment = textLayoutManager?.textLayoutFragment(for: inContainer) else { return false }
+        let frame = fragment.layoutFragmentFrame
+        let inFragment = CGPoint(x: inContainer.x - frame.minX, y: inContainer.y - frame.minY)
+        guard let line = fragment.textLineFragments.first(where: { $0.typographicBounds.contains(inFragment) }) else { return false }
+        let inLine = CGPoint(x: inFragment.x - line.typographicBounds.minX, y: inFragment.y - line.typographicBounds.minY)
+        // The index is the caret nearest the point; the character under the point is the one before it when the caret sits right of the point.
+        var index = line.characterIndex(for: inLine)
+        if index > line.characterRange.location, line.locationForCharacter(at: index).x > inLine.x { index -= 1 }
+        guard index >= 0, index < line.attributedString.length else { return false }
+        return line.attributedString.attribute(.link, at: index, effectiveRange: nil) != nil
     }
 
     /// A click on a fold's headline opens or closes it; everything else selects as text does.
