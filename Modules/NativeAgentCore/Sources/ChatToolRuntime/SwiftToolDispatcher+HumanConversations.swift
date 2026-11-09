@@ -86,7 +86,10 @@ public enum HumanConversationReader {
         let parent = transcript.resolvingSymlinksInPath().deletingLastPathComponent()
         guard ["chat/messages", "chat/archive/messages"].contains(where: {
             parent.path == dataRoot.appendingPathComponent($0).resolvingSymlinksInPath().path
-        }) else { throw CocoaError(.fileReadNoPermission) }
+        }) else {
+            throw NSError(domain: "NativeAgent.ChatHistory", code: 403, userInfo: [
+                NSLocalizedDescriptionKey: "That conversation's file is outside the folders conversations live in. Its data was left unchanged."])
+        }
         let tail = try SwiftNativePersistenceCore.tailPhysicalLines(transcript, limit: recentRowLimit, maxBytes: recentByteLimit)
         // Keep gaps in place: a damaged later row cannot certify an earlier row as the latest message or reply destination.
         var decoded: [ChatMessage?] = []

@@ -480,7 +480,11 @@ public actor SessionHistoryReader {
         // Paths, not URLs: a folder a new install has not made yet has no trailing slash, and URLs would call that a different place.
         guard ["chat/messages", "chat/archive/messages"].contains(where: {
             parent.path == dataRoot.appendingPathComponent($0).resolvingSymlinksInPath().path
-        }) else { throw CocoaError(.fileReadNoPermission) }
+        }) else {
+            // This is the app's own refusal, so it never sends the person to macOS privacy settings.
+            throw NSError(domain: "NativeAgent.ChatHistory", code: 403, userInfo: [
+                NSLocalizedDescriptionKey: "That conversation's file is outside the folders conversations live in. Its data was left unchanged."])
+        }
         return path
     }
 

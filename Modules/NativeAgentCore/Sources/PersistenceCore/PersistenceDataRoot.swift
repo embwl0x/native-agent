@@ -15,6 +15,13 @@ private let repoMarkerFiles: [String] = [
 /// retries; launch reports a missing selected root.
 private let processDataRoot = resolveDefaultDataRoot()
 
+/// A new install starts the shape a lived-in one has, so nothing can behave differently for being first.
+public func makeConversationFolders(dataRoot: URL) throws {
+    for folder in ["chat/messages", "chat/archive/messages"] {
+        try FileManager.default.createDirectory(at: dataRoot.appendingPathComponent(folder, isDirectory: true), withIntermediateDirectories: true)
+    }
+}
+
 /// The process default is stable. Explicit resolver arguments below deliberately bypass it for callers resolving a different environment.
 public func defaultDataRoot() -> URL {
     processDataRoot

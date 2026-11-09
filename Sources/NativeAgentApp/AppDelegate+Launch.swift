@@ -72,6 +72,8 @@ extension AppDelegate {
             return
         }
         guard !Task.isCancelled else { return }
+        do { try PersistenceCore.makeConversationFolders(dataRoot: PersistenceCore.defaultDataRoot()) }
+        catch { ModuleLog.app("[launch] conversation folders could not be made: %@", error.localizedDescription) }
         NativeAgentShortcuts.updateAppShortcutParameters()
         approvalNotificationTask = Task { await NativeAgentApprovalNotifications.observe() }
         // Wire restart before migration suspends because SwiftUI can already accept turns.
