@@ -174,8 +174,8 @@ public actor PartFaces {
         let root = AbilityStore(dataRoot: dataRoot).root
         let url = URL(fileURLWithPath: path)
         let changedPart: String?
-        if url == root { changedPart = nil }
-        else if url.deletingLastPathComponent() == root { changedPart = url.lastPathComponent }
+        if url.path == root.path { changedPart = nil }
+        else if url.deletingLastPathComponent().path == root.path { changedPart = url.lastPathComponent }
         else { return }
         if holdsOwnPages { await ownPages() }
         for (id, source) in sources where changedPart == nil || source.part == changedPart {

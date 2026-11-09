@@ -293,7 +293,7 @@ public final class TrustFacade {
     private func capabilitySourceChanged(_ path: String) {
         let root = AbilityStore(dataRoot: dataRoot).root
         let changed = URL(fileURLWithPath: path)
-        guard changed == root || changed.deletingLastPathComponent() == root else { return }
+        guard changed.path == root.path || changed.deletingLastPathComponent().path == root.path else { return }
         capabilityChangeRequested = true
         guard capabilityChangeTask == nil else { return }
         capabilityChangeTask = Task { [weak self] in

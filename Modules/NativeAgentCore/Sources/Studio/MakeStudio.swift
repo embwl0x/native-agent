@@ -53,9 +53,9 @@ public struct MakeStudio: Sendable {
     private func checkedDestination(_ ref: String, file: String) throws -> URL {
         let dir = folder(ref).standardizedFileURL.resolvingSymlinksInPath()
         let destination = dir.appendingPathComponent(file).standardizedFileURL.resolvingSymlinksInPath()
-        guard Self.isRef(ref), dir.deletingLastPathComponent() == root.standardizedFileURL.resolvingSymlinksInPath(),
+        guard Self.isRef(ref), dir.deletingLastPathComponent().path == root.standardizedFileURL.resolvingSymlinksInPath().path,
               !file.isEmpty, !file.contains("/"), !file.contains("\\"), file != ".", file != "..",
-              destination.deletingLastPathComponent() == dir else {
+              destination.deletingLastPathComponent().path == dir.path else {
             throw Refusal(reason: "invalid_metadata", message: "Make paths must stay inside their ref folder. Metadata was preserved.")
         }
         return destination

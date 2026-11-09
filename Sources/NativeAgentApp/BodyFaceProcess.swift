@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -32,7 +33,15 @@ actor BodyFaceProcess {
     /// Opens the window, spawning its process after the previous one exits; her body calls it on open requests and after a lost window.
     func showWindow(destination: FaceDestination? = nil) async throws -> FaceReply {
         let endpoint = try await connection()
+        if let pid = child?.processIdentifier { await Self.handActivation(to: pid) }
         return try await endpoint.call(.showMainWindow(destination: destination))
+    }
+
+    /// macOS only lets the window's process come forward if it is handed the front. A person's launch gives it to this process; an app that kept it keeps it.
+    @MainActor private static func handActivation(to pid: pid_t) {
+        guard let window = NSRunningApplication(processIdentifier: pid) else { return }
+        NSApp.activate()
+        NSApp.yieldActivation(to: window)
     }
 
     /// Background presentation work cannot reopen a window the person closed.

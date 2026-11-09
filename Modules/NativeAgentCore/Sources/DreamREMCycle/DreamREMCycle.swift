@@ -324,7 +324,7 @@ public struct FileBackedDreamDiary: Sendable {
         return DiaryListing(
             entries: out, totalEntries: discovered.files.count,
             storage: discovered.storage,
-            activeFilenames: Set(discovered.files.filter { $0.url.deletingLastPathComponent() == diaryDir }.map(\.name)),
+            activeFilenames: Set(discovered.files.filter { $0.url.deletingLastPathComponent().path == diaryDir.path }.map(\.name)),
             storageUnreadable: unreadableDirectory, failures: failures)
     }
 

@@ -29,7 +29,7 @@ enum InboxActionFileBoundary {
             .appendingPathComponent(validatedID, isDirectory: false)
             .appendingPathExtension("json")
             .standardizedFileURL
-        guard candidate.deletingLastPathComponent() == base else { return nil }
+        guard candidate.deletingLastPathComponent().path == base.path else { return nil }
         return candidate
     }
 

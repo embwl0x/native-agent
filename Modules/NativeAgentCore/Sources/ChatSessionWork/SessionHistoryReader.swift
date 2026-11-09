@@ -477,8 +477,9 @@ public actor SessionHistoryReader {
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeId).jsonl")
         let parent = path.resolvingSymlinksInPath().deletingLastPathComponent()
+        // Paths, not URLs: a folder a new install has not made yet has no trailing slash, and URLs would call that a different place.
         guard ["chat/messages", "chat/archive/messages"].contains(where: {
-            parent == dataRoot.appendingPathComponent($0).resolvingSymlinksInPath()
+            parent.path == dataRoot.appendingPathComponent($0).resolvingSymlinksInPath().path
         }) else { throw CocoaError(.fileReadNoPermission) }
         return path
     }

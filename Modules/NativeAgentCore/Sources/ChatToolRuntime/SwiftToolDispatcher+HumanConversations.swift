@@ -85,7 +85,7 @@ public enum HumanConversationReader {
         let transcript = dataRoot.appendingPathComponent(row["messagesArchivePath"]?.stringValue ?? "chat/messages/\(sessionID).jsonl")
         let parent = transcript.resolvingSymlinksInPath().deletingLastPathComponent()
         guard ["chat/messages", "chat/archive/messages"].contains(where: {
-            parent == dataRoot.appendingPathComponent($0).resolvingSymlinksInPath()
+            parent.path == dataRoot.appendingPathComponent($0).resolvingSymlinksInPath().path
         }) else { throw CocoaError(.fileReadNoPermission) }
         let tail = try SwiftNativePersistenceCore.tailPhysicalLines(transcript, limit: recentRowLimit, maxBytes: recentByteLimit)
         // Keep gaps in place: a damaged later row cannot certify an earlier row as the latest message or reply destination.

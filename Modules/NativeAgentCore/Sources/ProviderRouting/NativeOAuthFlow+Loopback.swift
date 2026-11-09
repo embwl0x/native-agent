@@ -76,12 +76,11 @@ extension NativeOAuthFlow {
                 error: "Could not write token file: \(error.localizedDescription)")
         }
 
-        Task {
-            do {
-                _ = try await ChatGPTAccountModelRefresh.shared.refresh(dataRoot: dataRoot, force: true)
-            } catch {
-                nativeLog("ChatGPT account model refresh after sign-in failed: %@", error.localizedDescription)
-            }
+        // Awaited: Chat selects the account as soon as this returns, and selecting needs the account's model catalog.
+        do {
+            _ = try await ChatGPTAccountModelRefresh.shared.refresh(dataRoot: dataRoot, force: true)
+        } catch {
+            nativeLog("ChatGPT account model refresh after sign-in failed: %@", error.localizedDescription)
         }
         return OAuthFlowResult(ok: true, error: nil)
     }

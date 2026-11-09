@@ -22,7 +22,7 @@ extension ChatSessionRetention {
             }
             if case .string(let relative)? = row["messagesArchivePath"] {
                 let file = dataRoot.appendingPathComponent(relative).standardizedFileURL
-                guard file.resolvingSymlinksInPath().deletingLastPathComponent() == directory else {
+                guard file.resolvingSymlinksInPath().deletingLastPathComponent().path == directory.path else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
             }
