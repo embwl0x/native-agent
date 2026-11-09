@@ -436,6 +436,7 @@ extension MacFourVerbs {
             + (attributeGapNote.map { $0 + "\n" } ?? "")
             + Self.runningAppsLine(output)
             + pageText
+            + (Self.string(supplementalDiagnostics["image_withheld_reason"]).map { "\nPixels withheld: \($0)\n" } ?? "")
             + (cutLine.map { $0 + "\n" } ?? "") + (pointerLine.map { "\n" + $0 } ?? "")
         var pageDetail: [String: JSONValue] = [:]
         do {

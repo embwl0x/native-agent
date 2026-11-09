@@ -99,8 +99,7 @@ public enum ChatShellConversationRow {
         plainText(stripBridgePrefix(session.lastMessagePreview ?? ""))
     }
 
-    public static func listPreview(for session: NativeAgentShared.ChatSession, title: String) -> String {
-        let said = preview(for: session)
+    static func listPreview(_ said: String, title: String) -> String {
         // Compare a cut title by its words so far; compare a complete title exactly.
         let repeats = title.hasSuffix("…")
             ? title.count > 1 && said.hasPrefix(title.dropLast())
@@ -131,7 +130,6 @@ public enum ChatShellConversationRow {
         return trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    @MainActor
     public static func surface(for session: NativeAgentShared.ChatSession) -> String {
         if isWorking(session) { return "Connected agent" }
         switch session.source?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
@@ -139,11 +137,11 @@ public enum ChatShellConversationRow {
         case "ios": return "iPhone"
         case "slack": return "Slack"
         case "agent-bridge": return "Connected agent"
-        default: return "Mac"
+        case "app": return "Mac"
+        case nil, "": return "Origin unavailable"
+        default: return "External source"
         }
     }
-
-    public static let localSurface = "Mac"
 
     static func clamp(_ value: String, limit: Int = titleLimit) -> String {
         let flat = value.replacingOccurrences(of: "\n", with: " ")
@@ -220,26 +218,16 @@ public final class ChatShellOpeningLine {
         var revision = ""
         var line: String? = nil
         var lastTurn: String? = nil
+        var issue: String? = nil
     }
     @ObservationIgnored private var cache: [String: OpeningLine] = [:]
+    /// A page takes this in-memory value once, then interprets each row off the UI actor.
+    var reading: [String: OpeningLine] { _ = revision; return cache }
     @ObservationIgnored private let warmRead = LatestRead()
     public private(set) var revision: UInt64 = 0
 
     private let dataRoot: URL
     private init(dataRoot: URL) { self.dataRoot = dataRoot }
-
-    /// Prefer unprefixed user speech for titles; return nil when the bounded scan finds no usable speech.
-    public func line(for session: NativeAgentShared.ChatSession) -> String? {
-        projection(for: session).line
-    }
-
-    public func stamp(for session: NativeAgentShared.ChatSession) -> String? {
-        projection(for: session).lastTurn
-    }
-
-    public func prepare(_ sessions: [NativeAgentShared.ChatSession]) async throws {
-        _ = try await prepareProjections(sessions)
-    }
 
     func prepareProjections(_ sessions: [NativeAgentShared.ChatSession]) async throws -> [String: OpeningLine] {
         try await warmRead.read({
@@ -255,18 +243,6 @@ public final class ChatShellOpeningLine {
 
     nonisolated static func revision(for session: NativeAgentShared.ChatSession) -> String {
         "\(session.transcriptGeneration ?? -1)#\(session.messageCount ?? -1)"
-    }
-
-    public func isPrepared(for session: NativeAgentShared.ChatSession) -> Bool {
-        _ = revision
-        return cache[session.id]?.revision == Self.revision(for: session)
-    }
-
-    private func projection(for session: NativeAgentShared.ChatSession) -> OpeningLine {
-        _ = self.revision
-        let revision = Self.revision(for: session)
-        if let hit = cache[session.id], hit.revision == revision { return hit }
-        return OpeningLine()
     }
 
     nonisolated static func read(sessionID: String, dataRoot: URL) throws -> OpeningLine {
@@ -356,67 +332,21 @@ public final class ChatShellOpeningLine {
 }
 
 extension ChatShellConversationRow {
-    @MainActor
-    public static func isAgentOwn(_ session: NativeAgentShared.ChatSession, openingLines: ChatShellOpeningLine) -> Bool {
-        guard openingLines.isPrepared(for: session),
+    static func isAgentOwn(_ session: NativeAgentShared.ChatSession, reading: [String: ChatShellOpeningLine.OpeningLine]) -> Bool {
+        guard let opening = reading[session.id], opening.revision == ChatShellOpeningLine.revision(for: session),
+              opening.issue == nil,
               isMachineTitle(stripBridgePrefix(session.title), session: session),
               (session.messageCount ?? 0) > 0 else { return false }
-        return openingLines.line(for: session) == nil
-    }
-
-    @MainActor
-    public static func title(for session: NativeAgentShared.ChatSession) -> String {
-        session.displayTitle
+        return opening.line == nil
     }
 }
 
-/// Titles can contain untrusted payloads. Bound scalars, remove controls and collapse whitespace before menus; empty titles still need selectable
-/// identity.
-public struct MacChatRunningSessionRoute: Sendable, Equatable {
-    public let sessionId: String
-    /// Never expose raw stored titles in menus.
-    public let title: String
+extension ChatShellConversationRow {
+    private static let titleScalarLimit = 48
+    private static let titleInputScalarLimit = 512
 
-    /// Bound Unicode scalars: one grapheme may contain thousands of combining marks, so `String.count` is not a data bound.
-    public static let titleScalarLimit = 48
-
-    public static let titleInputScalarLimit = 512
-
-    /// Preserve the owner’s ordered, unique ids when deriving safe labels.
-    public static func routes(sessionIds: [String], sessions: [NativeAgentShared.ChatSession]) -> [MacChatRunningSessionRoute] {
-        let sessionsById = Dictionary(
-            sessions.map { ($0.id, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        let candidates = sessionIds.map { sessionId in
-            MacChatRunningSessionRoute(
-                sessionId: sessionId,
-                title: displayTitle(session: sessionsById[sessionId], sessionId: sessionId)
-            )
-        }
-
-        // Suffix every multi-route label with an untruncated unique ordinal; hostile titles can otherwise collide with generated suffixes.
-        guard candidates.count > 1 else { return candidates }
-        return candidates.enumerated().map { offset, route in
-            return MacChatRunningSessionRoute(
-                sessionId: route.sessionId,
-                title: disambiguatedTitle(
-                    route.title,
-                    sessionId: route.sessionId,
-                    ordinal: offset + 1
-                )
-            )
-        }
-    }
-
-    private static func displayTitle(session: NativeAgentShared.ChatSession?, sessionId: String) -> String {
-        guard let session else { return fallbackTitle(sessionId: sessionId) }
-        return sanitize(session.displayTitle) ?? ""
-    }
-
-    /// Remove controls instead of substituting characters a spoofing payload could exploit; collapse and bound the remaining text.
-    private static func sanitize(_ raw: String?) -> String? {
-        guard let raw else { return nil }
+    /// Titles cross into menus as bounded visible scalars, without control or format characters.
+    public static func faceTitle(_ raw: String) -> String {
         var scalars: [Unicode.Scalar] = []
         scalars.reserveCapacity(titleScalarLimit)
         var pendingSpace = false
@@ -458,7 +388,7 @@ public struct MacChatRunningSessionRoute: Sendable, Equatable {
             scalars.append(scalar)
         }
 
-        guard !scalars.isEmpty else { return nil }
+        guard !scalars.isEmpty else { return "Title contains no displayable text" }
         if truncated {
             let ellipsis: Unicode.Scalar = "…"
             if scalars.count == titleScalarLimit {
@@ -478,59 +408,9 @@ public struct MacChatRunningSessionRoute: Sendable, Equatable {
             return false
         }
     }
-
-    /// Distinct bounded identity suffixes keep multi-route menus navigable visually and through VoiceOver.
-    private static func disambiguatedTitle(
-        _ title: String,
-        sessionId: String,
-        ordinal: Int
-    ) -> String {
-        let token = safeSessionIDTail(sessionId) ?? String(ordinal)
-        let suffix = " [\(ordinal):\(token)]"
-        let suffixScalars = Array(suffix.unicodeScalars)
-        guard suffixScalars.count < titleScalarLimit else { return "Running session \(ordinal)" }
-        let baseLimit = titleScalarLimit - suffixScalars.count
-        var baseScalars = Array(title.unicodeScalars.prefix(baseLimit))
-        while baseScalars.last.map({ CharacterSet.whitespacesAndNewlines.contains($0) }) == true {
-            baseScalars.removeLast()
-        }
-        return String(String.UnicodeScalarView(baseScalars + suffixScalars))
-    }
-
-    /// Untitled or unknown sessions still need a nonempty, clickable label.
-    private static func fallbackTitle(sessionId: String) -> String {
-        guard let tail = safeSessionIDTail(sessionId) else { return "Untitled session" }
-        return "Session " + tail
-    }
-
-    private static func safeSessionIDTail(_ sessionId: String) -> String? {
-        var safeTail: [Unicode.Scalar] = []
-        safeTail.reserveCapacity(8)
-        var examinedScalars = 0
-        for scalar in sessionId.unicodeScalars {
-            guard examinedScalars < titleInputScalarLimit else { break }
-            examinedScalars += 1
-            guard isSafeSessionIDScalar(scalar) else { continue }
-            if safeTail.count == 8 { safeTail.removeFirst() }
-            safeTail.append(scalar)
-        }
-        guard !safeTail.isEmpty else { return nil }
-        return String(String.UnicodeScalarView(safeTail))
-    }
-
-    private static func isSafeSessionIDScalar(_ scalar: Unicode.Scalar) -> Bool {
-        switch scalar.value {
-        case 48...57, 65...90, 97...122:
-            return true
-        case 45, 58, 95:
-            return true
-        default:
-            return false
-        }
-    }
 }
 
-/// Derive live banners from runtime streaming, not the refreshing index, so active turns always retain route and Stop controls.
+/// Session commands read runtime streaming independently of the refreshing index.
 public enum OtherRunningChats {
     public static func otherRunning(
         streamingSessionIDs: Set<String>,
@@ -583,19 +463,5 @@ public enum ChatShellTroubleState {
 
     public static func showsStuckLink(_ messages: [ChatMessage]) -> Bool {
         consecutiveFailures(messages) >= 2
-    }
-}
-
-extension ChatShellConversationRow {
-    @MainActor
-    public static func subtitle(for session: NativeAgentShared.ChatSession, openingLines: ChatShellOpeningLine,
-                                relativeTimestamp: (String) -> String) -> String {
-        // Use transcript speech time for row age; index stamps also change on renames and migration.
-        let stamp = openingLines.stamp(for: session) ?? session.updatedAt ?? session.createdAt
-        let relative = relativeTimestamp(stamp)
-        let place = surface(for: session)
-        guard !relative.isEmpty else { return place }
-        guard place != localSurface else { return relative }
-        return "\(place) · \(relative)"
     }
 }

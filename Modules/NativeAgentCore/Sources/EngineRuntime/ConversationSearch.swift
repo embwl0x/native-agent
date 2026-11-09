@@ -69,12 +69,37 @@ import AppKit
 import Dispatcher
 import SystemOps
 import CoreGraphics
-// Blueprint: | `ConversationSearch.swift` | `CommandPaletteMessageIndex`, `TranscriptsFacade`, `LatestRead`, `TranscriptSearch` |
+// Blueprint: | `ConversationSearch.swift` | Canonical conversation ranking, saved-result readers and cause-preserving message index |
+
+public enum ConversationPaletteRanking {
+    public static func matches(_ sessions: [NativeAgentShared.ChatSession], query: String) -> [[String]] {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return [] }
+        let ordered = sessions.filter { $0.archived != true }.sorted {
+            let lhs = $0.updatedAt ?? $0.createdAt, rhs = $1.updatedAt ?? $1.createdAt
+            return lhs == rhs ? $0.id < $1.id : lhs > rhs
+        }
+        var ranks: [Int: [String]] = [:]
+        for session in ordered {
+            let title = ChatShellConversationRow.faceTitle(session.displayTitle).lowercased()
+            let preview = ChatShellConversationRow.preview(for: session).lowercased()
+            let rank: Int
+            if title == query { rank = 0 }
+            else if title.hasPrefix(query) { rank = 1 }
+            else if preview.hasPrefix(query) { rank = 2 }
+            else if title.contains(query) { rank = 3 }
+            else if preview.contains(query) { rank = 4 }
+            else { continue }
+            ranks[rank, default: []].append(session.id)
+        }
+        return (0..<5).map { ranks[$0] ?? [] }
+    }
+}
 
 extension TranscriptsFacade {
     public func observeSavedSearch(bots: BotRunnerScheduler, memory: MemoryFacade) async {
         let paths = ["memory/memory.sqlite", "memory/memory.sqlite-wal", "bots/definitions",
-                     "bots/shelf-index.json", "bots/runner-jobs.json", "bots/last-events.json", "trust/policy.json"]
+                     "bots/shelf-index.json", "clock/times.json", "bots/missed-runs.json", "bots/last-events.json", "trust/policy.json"]
         await EventDeadlinePhysiology.refreshOnChanges(paths: paths.map { dataRoot.appendingPathComponent($0) },
                                                        notifications: [BotRunQueue.didChange]) {
             await self.refreshSavedSearch(bots: bots, memory: memory)
@@ -134,32 +159,34 @@ public actor CommandPaletteMessageIndex {
         let latest = LatestRead()
         nonisolated init() {}
 
-        func refresh(_ sessions: [(id: String, stamp: String)], transcripts: TranscriptsFacade) async -> Int {
+        func refresh(_ sessions: [(id: String, stamp: String)], transcripts: TranscriptsFacade) async -> [String: String] {
             let read = await latest.read({
                 let stale = sessions.filter { snapshot.texts[$0.id]?.stamp != $0.stamp }
-                return await withTaskGroup(of: (String, String, [String]?).self) { group in
+                return await withTaskGroup(of: (String, String, [String]?, String?).self) { group in
                     for session in stale {
                         group.addTask {
-                            guard let safeID = NativeAgentChatSessionID.normalizedPathComponent(session.id) else { return (session.id, session.stamp, []) }
-                            guard let transcript = try? await transcripts.readTranscript(safeSessionId: safeID) else {
-                                return (session.id, session.stamp, nil)
+                            guard let safeID = NativeAgentChatSessionID.normalizedPathComponent(session.id) else {
+                                return (session.id, session.stamp, nil, "The saved conversation id is not a safe path component.")
                             }
-                            return (session.id, session.stamp, TranscriptSearch.documents(from: transcript.messages).map(\.content))
+                            do {
+                                let transcript = try await transcripts.readTranscript(safeSessionId: safeID)
+                                return (session.id, session.stamp, TranscriptSearch.documents(from: transcript.messages).map(\.content), nil)
+                            } catch { return (session.id, session.stamp, nil, error.localizedDescription) }
                         }
                     }
-                    var read: [(String, String, [String]?)] = []
+                    var read: [(String, String, [String]?, String?)] = []
                     for await row in group { read.append(row) }
                     return read
                 }
             }, publish: { read in
                 snapshot.order = sessions.map(\.id)
-                for (id, stamp, lines) in read {
+                for (id, stamp, lines, _) in read {
                     if let lines { snapshot.texts[id] = (stamp, lines) }
                 }
                 let kept = Set(snapshot.order)
                 snapshot.texts = snapshot.texts.filter { kept.contains($0.key) }
             })
-            return read.filter { $0.2 == nil }.count
+            return read.reduce(into: [:]) { if let issue = $1.3 { $0[$1.0] = issue } }
         }
     }
     private let projection = SearchSnapshotPublication()
@@ -169,7 +196,7 @@ public actor CommandPaletteMessageIndex {
     }
 
     /// Failed reads retain proven text without caching failure; the next revision refresh can read it again.
-    public func refresh(_ sessions: [(id: String, stamp: String)], transcripts: TranscriptsFacade) async -> Int {
+    public func refreshWithFailures(_ sessions: [(id: String, stamp: String)], transcripts: TranscriptsFacade) async -> [String: String] {
         await projection.refresh(sessions, transcripts: transcripts)
     }
 

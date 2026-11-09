@@ -1,7 +1,8 @@
+import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `JobDoorClaude.swift` | `ClaudeCodeJobDoor`: a job through `claude -p` stream-json, its permission prompts answered by the agent's broker over stdio |
+// Blueprint: | `JobDoorClaude.swift` | `ClaudeCodeJobDoor`: stream-json jobs and brokered stdio permission replies |
 
 /// Claude Code takes a job headless: `claude -p` reading and writing stream-json, its permission prompts sent to this host over stdio
 /// (`--permission-prompts host --permission-prompt-tool stdio`) and answered by the agent's broker against the envelope. `--restricted` confines its file
@@ -58,7 +59,7 @@ struct ClaudeCodeJobDoor: JobRunner {
                        run: JobDoorRun) async {
         let name = job.contact.name
         var asks: [String: Task<Void, Never>] = [:]
-        var session: String?, model: String?, said: String?
+        var session: String?, model: String?
         var outcome: JobOutcome?, report: String?
         do {
             try await process.send(.object(["type": .string("control_request"), "request_id": .string("init-" + UUID().uuidString.lowercased()),
@@ -80,7 +81,6 @@ struct ClaudeCodeJobDoor: JobRunner {
                 case "assistant"?:
                     for block in fields["message"]?.objectValue?["content"]?.arrayValue ?? [] {
                         let part = block.objectValue ?? [:]
-                        if part["type"]?.stringValue == "text", let text = part["text"]?.stringValue { said = text }
                         if part["type"]?.stringValue == "tool_use", let tool = part["name"]?.stringValue {
                             out.send(.working(note: Self.note(tool, part["input"]?.objectValue ?? [:])))
                         }
@@ -103,8 +103,12 @@ struct ClaudeCodeJobDoor: JobRunner {
                         let errors = (fields["errors"]?.arrayValue ?? []).compactMap(\.stringValue).joined(separator: "; ")
                         outcome = .failed(text ?? (errors.isEmpty ? "it ended \(fields["subtype"]?.stringValue ?? "with an error")" : errors))
                     } else {
-                        report = text ?? said
-                        outcome = .finished
+                        if let text {
+                            report = text
+                            outcome = .finished
+                        } else {
+                            outcome = .failed("\(name)'s success result contains no final report")
+                        }
                     }
                 default: break
                 }
@@ -120,18 +124,33 @@ struct ClaudeCodeJobDoor: JobRunner {
             do {
                 try await process.send(.object(["type": .string("control_request"), "request_id": .string("stop-" + UUID().uuidString.lowercased()),
                                                 "request": .object(["subtype": .string("interrupt")])]))
-            } catch { nativeLog("Claude Code job door: the interrupt was not delivered: %@", error.localizedDescription) }
-            _ = await Task.detached { await process.stop(grace: .seconds(2)) }.value
+            } catch {
+                RepairOwed.owe(dataRoot, id: job.job + ":interrupt", kind: .message, operation: "agent.job:" + job.job + ":interrupt",
+                    owner: name, words: "Job \(job.job)'s interrupt was not delivered: \(error.localizedDescription)",
+                    lever: "Inspect its remote session before resuming work.")
+            }
+            let unconfirmed = await Task.detached { await process.stop() }.value
+            if let unconfirmed {
+                RepairOwed.owe(dataRoot, id: job.job + ":stop", kind: .message, operation: "agent.job:" + job.job + ":stop",
+                    owner: name, words: "Job \(job.job)'s process termination is unconfirmed: \(unconfirmed)",
+                    lever: "Inspect the retained process before starting more work through this contact.")
+            }
             if let session { await JobDoorLive.shared.release(Self.door + ":" + session, run) }
             return out.stopped("its job was stopped")
         }
-        let unconfirmed = await process.stop(grace: .seconds(2))
+        let unconfirmed = await process.stop()
         if let session { await JobDoorLive.shared.release(Self.door + ":" + session, run) }
-        if let unconfirmed { out.send(.working(note: "Its program did not confirm it stopped: " + unconfirmed)) }
-        let ending = outcome ?? .failed("\(name) exited before it reported a result")
+        if let unconfirmed { return out.fail(JobDoorFailure("Its program termination is unconfirmed: " + unconfirmed)) }
+        var ending = outcome ?? .failed("\(name) exited before it reported a result")
         if ending == .finished {
-            let made = await JobDoorArtifacts.deliverable(job, since: record.startedAt, report: report, model: model, out: out)
-            out.send(.deliverable(made))
+            do {
+                let made = try await JobDoorArtifacts.deliverable(job, since: record.startedAt, report: report, model: model)
+                out.send(.deliverable(made))
+                if let failure = made.inventoryFailure { ending = .failed(failure) }
+            } catch {
+                out.send(.deliverable(JobDeliverable(artifacts: [], report: report, model: model)))
+                ending = .failed("Its deliverable could not be inventoried: \(error.localizedDescription)")
+            }
         }
         out.send(.ended(ending))
     }
@@ -182,6 +201,6 @@ struct ClaudeCodeJobDoor: JobRunner {
         }
         guard !Task.isCancelled else { return }
         do { try await process.send(.object(["type": .string("control_response"), "response": response])) }
-        catch { out.send(.working(note: "Its permission request could not be answered: \(error.localizedDescription).")) }
+        catch { out.fail(JobDoorFailure("Its permission request \(id) could not be answered: \(error.localizedDescription).")) }
     }
 }

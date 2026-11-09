@@ -83,7 +83,6 @@ extension ChatGPTTransport {
         staleToken: String? = nil,
         requestAccount: OAuthRequestAccount = OAuthRequestAccount()
     ) async throws -> String {
-        try OAuthProductionSession.validate(session)
         let path = resolveAuthPath()
         let isCLI = Self.isUserCodexPath(path)
         guard let blob0 = try Self.loadAuthBlob(at: path) else {
@@ -162,6 +161,9 @@ extension ChatGPTTransport {
     private func refreshTokens(
         at path: URL, baseline: Data, blob: [String: Any], requestAccount: OAuthRequestAccount
     ) async throws -> String {
+        guard let refreshEndpoint else {
+            throw LLMError.providerError(message: "ChatGPT refresh endpoint is invalid; correct its provider configuration.")
+        }
         // Never rotate the Codex CLI's credentials.
         guard !Self.isUserCodexPath(path) else {
             throw LLMError.failure(.codexCLISessionExpired)
@@ -184,11 +186,12 @@ extension ChatGPTTransport {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await OAuthGrantOperations.post(refreshEndpoint, body, timeout: 30, session: session)
+            (data, response) = try await OAuthGrantOperations.post(refreshEndpoint, body, session: session)
         } catch {
             throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: refreshEndpoint, operation: "refresh"))
         }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        let status = http.statusCode
         if !(200..<300).contains(status) {
             // 429/5xx are transient; preserve Retry-After for 429.
             if status == 429 {

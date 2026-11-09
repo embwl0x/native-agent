@@ -88,7 +88,7 @@ public struct GrokInboundReply: Sendable {
                 if case .held = answered {
                     throw AgentConversationStore.Failure(message: "its delivery is already recorded as in progress or uncertain; no second turn was started.")
                 }
-            } catch is AgentConversationContinuation.NotStarted { terminal = "taken by wait or room" }
+            } catch is AgentConversationContinuation.NotStarted { terminal = "taken by wait, read or room" }
             catch is CancellationError {
                 terminal = "stopped: the answer is saved; any admitted turn keeps what it produced, and no second turn will be started"
             } catch {
@@ -137,7 +137,7 @@ public struct GrokInboundReply: Sendable {
             if saved.seen == true {
                 // A seen answer can remain pending if consumption was interrupted before its door was recorded.
                 _ = try store.update(saved.messageID, peer: saved.peerID) {
-                    if $0.seen == true, $0.handOver == "pending" { $0.handOver = "taken by wait" }
+                    if $0.seen == true, $0.handOver == "pending" { $0.handOver = "taken by wait, read or room" }
                 }
                 continue
             }
@@ -200,7 +200,7 @@ public struct GrokInboundReply: Sendable {
                 [This is \(answerer)'s answer to \
                 \(asked ?? "your message identified by " + pending.messageID + "; its original text is absent from the saved conversation") in this \
                 conversation. The exchange is complete: do not send the question again. Your reply here goes to \(asker), not to \(answerer): tell \
-                \(asker) the answer once. Anything for \(answerer) goes in a message to \(answerer).]\n
+                \(asker) what is worth telling, or end the turn without words if nothing is. Anything for \(answerer) goes in a message to \(answerer).]\n
                 """ + text
         return TurnRequest(message: message, sessionID: pending.conversationID, surface: peer.surface, envelope: envelope,
                            replyRoute: route.chatToolReplyRoute, origin: origin, pinnedRunID: runID, codexCompletion: binding)

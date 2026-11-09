@@ -1,17 +1,11 @@
 import Foundation
-// Blueprint: | `TranscriptRowFace.swift` | What the Mac read of one transcript row (where it sits, its tag, its fold line, the agent's words for it), read once on the Mac and carried to the phone with the row |
+// Blueprint: | `TranscriptRowFace.swift` | Mac-owned transcript presentation carried to the phone |
 
-/// What a row shows, read once by the Mac, which owns the knowledge (bridges, envelopes, provenance, tool outcomes, persona receipts). The Mac's
-/// build reads it in process; the phone receives it on the row (`ChatMessageRecord.face`). A row nobody read yet (the phone's own send in
-/// flight, its streaming reply) reads `plain`. A face a newer Mac wrote that this build cannot read is left out, and the row reads plainly.
-public struct TranscriptRowFace: Codable, Hashable, Sendable, LeftOutWhenUnreadable {
+/// Mac-owned transcript presentation, carried to the phone with its row. Local rows use `plain` until the Mac reads them.
+public struct TranscriptRowFace: Codable, Hashable, Sendable {
     /// The person's own words sit right; a delegated reply's envelope folds; everything else sits left.
     public enum Seat: String, Codable, Sendable {
         case right, left, envelope
-
-        public init(from decoder: Decoder) throws {
-            self = Seat(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .left
-        }
     }
 
     public struct Tag: Codable, Hashable, Sendable {

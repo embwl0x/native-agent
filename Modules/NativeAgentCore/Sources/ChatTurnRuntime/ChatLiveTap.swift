@@ -6,6 +6,7 @@ import os
 public enum ChatLiveTap {
     public enum Kind: Sendable {
         case delta(String)
+        case writing(String)
         case answered(String)
         /// The status comes from the runtime, so retained output preserves the turn's actual outcome.
         case incomplete(String, status: String)

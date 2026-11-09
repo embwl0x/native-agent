@@ -2,83 +2,62 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `TelegramApprovalHandling.swift` | `TelegramApprovalHandling`: addressed approval resolution |
+// Blueprint: | `TelegramApprovalHandling.swift` | `TelegramApprovalHandling`: a card's button or a slash decision names one action of its matter's Inbox row |
 
-public enum TelegramApprovalDecision: String, Sendable, Equatable {
-    case approved
-    case denied
-}
-
+/// The person's answer to a card on Telegram: one action of its matter's Inbox row. A button names only the action; its matter is the one its
+/// message was sent for. A slash command (`/approve <id>`, `/deny <id>`) names the matter and the row's approve or reject.
 public struct TelegramApprovalCommand: Sendable, Equatable {
-    public let id: String
-    public let decision: TelegramApprovalDecision
+    /// The matter a slash command names; nil for a button.
+    public let matter: String?
+    public let action: String
     public let addressedBot: String?
-    public let choice: Int?
 
-    public init(
-        id: String,
-        decision: TelegramApprovalDecision,
-        addressedBot: String? = nil,
-        choice: Int? = nil
-    ) {
-        self.id = id
-        self.decision = decision
+    public init(matter: String?, action: String, addressedBot: String? = nil) {
+        self.matter = matter
+        self.action = action
         self.addressedBot = addressedBot
-        self.choice = choice
     }
 
     public static func parse(command: TelegramParsedSlashCommand, addressedBot: String?) -> TelegramApprovalCommand? {
-        let decision: TelegramApprovalDecision
+        let action: String
         switch command.definition.handler {
-        case .approve: decision = .approved
-        case .deny: decision = .denied
+        case .approve: action = "approve"
+        case .deny: action = "reject"
         default: return nil
         }
         guard let id = command.args.first else { return nil }
-        return TelegramApprovalCommand(id: id, decision: decision, addressedBot: addressedBot)
+        return TelegramApprovalCommand(matter: id, action: action, addressedBot: addressedBot)
     }
 
+    /// A card's button carries `na_card:` and its action's id: Telegram holds at most 64 bytes, so the matter is read from the message.
+    public static let callbackPrefix = "na_card:"
+    public static let callbackLimit = 64
+
     public static func parse(callbackData raw: String) -> TelegramApprovalCommand? {
-        let parts = raw.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
-        guard parts.count == 3, parts[0] == "na_approval" else { return nil }
-        let decision: TelegramApprovalDecision
-        var choice: Int?
-        switch parts[1] {
-        case "approve", "approved":
-            decision = .approved
-        case "deny", "denied", "reject", "rejected":
-            decision = .denied
-        case let verb where verb.hasPrefix("c") && Int(verb.dropFirst()).map({ $0 >= 0 }) == true:
-            decision = .approved
-            choice = Int(verb.dropFirst())
-        default:
-            return nil
-        }
-        let id = parts[2].trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !id.isEmpty else { return nil }
-        return TelegramApprovalCommand(id: id, decision: decision, choice: choice)
+        guard raw.hasPrefix(callbackPrefix) else { return nil }
+        let action = String(raw.dropFirst(callbackPrefix.count))
+        guard !action.isEmpty else { return nil }
+        return TelegramApprovalCommand(matter: nil, action: action)
     }
 }
 
 public protocol TelegramApprovalHandling: Sendable {
     func startApprovalDelivery() async
     func stopApprovalDelivery() async
-    /// Slash decisions carry nil; mirrored cards carry their picked option.
-    func resolveTelegramApproval(
-        id: String,
-        decision: TelegramApprovalDecision,
-        choice: Int?,
-        chatId: Int,
-        fromUserId: Int?
-    ) async throws -> TelegramApprovalResolution
+    /// The person's answer to a card, from an allowlisted sender: a button on the card's message (`messageId`), or a slash command naming
+    /// its matter. It runs that matter's Inbox row action through the person's Telegram door, or says why it did not.
+    func act(_ command: TelegramApprovalCommand, chatId: Int, messageId: Int?, fromUserId: Int?) async -> TelegramApprovalResolution
 }
 
-/// Telegram acknowledges the decision; the shared approval owner reports its result.
+/// Telegram acknowledges the answer in the act's own words; the card's owner reports its result.
 public struct TelegramApprovalResolution: Sendable, Equatable {
     public let acknowledgement: String
+    /// True when the card's row offers nothing more on Telegram, so its buttons are done; nil when the row could not be read.
+    public let settled: Bool?
 
-    public init(acknowledgement: String) {
+    public init(acknowledgement: String, settled: Bool?) {
         self.acknowledgement = acknowledgement
+        self.settled = settled
     }
 }
 

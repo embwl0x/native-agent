@@ -22,7 +22,7 @@ public extension MacChatTurnRuntime {
     nonisolated func storeMacChatMemoryFact(_ text: String) async throws {
         _ = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
             .store(content: text, source: "mac.slash-remember", metadata: nil,
-                   context: MemoryWriteContext(turn: nil, senseReads: nil))
+                   context: MemoryWriteContext(turn: nil, senseReads: nil, telling: MemoryDataProvenance.toldByPerson(dataRoot: dataRoot)))
     }
 
     nonisolated func storeMacChatNote(_ text: String) async throws {
@@ -38,7 +38,7 @@ public extension MacChatTurnRuntime {
                 "confidence": .double(0.8), "importance": .double(0.5),
                 "surface": .string("chat"), "command": .string("/note"),
             ]),
-            context: MemoryWriteContext(turn: nil, senseReads: nil)
+            context: MemoryWriteContext(turn: nil, senseReads: nil, telling: MemoryDataProvenance.toldByPerson(dataRoot: dataRoot))
         )
     }
 

@@ -1,4 +1,5 @@
 import AgentWorkspace
+import AgentConversations
 import Dispatcher
 import Foundation
 import NativeAgentShared
@@ -14,7 +15,7 @@ extension SwiftToolDispatcher {
     func standingBotApprovalReason(tool: String, input: [String: JSONValue]) -> String? {
         guard tool == "bot_delete" else { return nil }
         let definitions = BotDefinitionStore(dataRoot: dataRoot)
-        guard let id = try? botReference(input, definitions: definitions),
+        guard let id = try? botReference(input, definitions: definitions, dataRoot: dataRoot),
               let bot = try? definitions.get(id) else { return "Delete this bot? Its saved notes stay." }
         return "Delete the bot \(bot.name)? Its saved notes stay."
     }
@@ -47,7 +48,6 @@ extension SwiftToolDispatcher {
                 fields["failure_code"] = .string("invalid_arguments")
                 fields["detail"] = .string(ChatToolOutcome.errorMessage(error))
                 fields["effects"] = .string("none")
-                fields.removeValue(forKey: "remedy")
                 result = ChatToolOutcome.normalizedFailure(.object(fields), tool: tool)
             }
             return result
@@ -123,7 +123,7 @@ extension SwiftToolDispatcher {
         let edits = fields.filter { $0.value != .null && (["schedule", "notify_condition"].contains($0.key) || $0.value != .string("")) }
         guard !edits.isEmpty else { throw botArgumentError("fields must contain at least one setting", field: "fields",
             accepted: "An object containing at least one setting to change.") }
-        var bot = try definitions.get(botReference(args, definitions: definitions))
+        var bot = try definitions.get(botReference(args, definitions: definitions, dataRoot: dataRoot))
         let notes: [String]
         do {
             if let value = edits["name"] { bot.name = try botString(value, field: "name") }
@@ -244,25 +244,7 @@ extension SwiftToolDispatcher {
             switch tool {
             case "bot_ask":
                 let question = try botString(args["question"], field: "question")
-                let botID: UUID
-                do { botID = try botReference(args, definitions: definitions) }
-                catch {
-                    let references = botSuppliedReferences(args)
-                    if references.count == 1, case .string(let name) = references[0].value {
-                        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let contacts = try AgentPeerStore(dataRoot: dataRoot).list().filter {
-                            $0.name.caseInsensitiveCompare(name) == .orderedSame
-                        }
-                        if contacts.count == 1, let contact = contacts.first {
-                            return .object(["status": .string("failed"), "reason": .string("agent_contact"),
-                                "effects": .string("none"),
-                                "detail": .string("\(contact.name) is an agent contact, not a standing helper. Use agent.message to ask it. Nothing was sent."),
-                                "next_call": .object(["action": .string("agent.message"), "args": .object([
-                                    "agent": .string("peer:" + contact.id), "text": .string(question)])])])
-                        }
-                    }
-                    throw error
-                }
+                let botID = try botReference(args, definitions: definitions, dataRoot: dataRoot, question: question)
                 guard allowsCanonicalBodyTools else { throw BotRunnerError.notPermitted }
                 guard let standingBotSession else { throw StandingBotsError.invalidValue("Bot chat is unavailable.") }
                 _ = try definitions.get(botID)
@@ -349,7 +331,7 @@ extension SwiftToolDispatcher {
                     currentModel: currentModel,
                     notes: candidate.notes)
             case "bot_delete":
-                let id = try botReference(args, definitions: definitions)
+                let id = try botReference(args, definitions: definitions, dataRoot: dataRoot)
                 _ = try definitions.get(id)
                 writeStarted = true
                 try definitions.delete(id)
@@ -357,7 +339,7 @@ extension SwiftToolDispatcher {
             case "bot_pause":
                 let paused = try botDecode(Bool.self, args["paused"], field: "paused")
                 let details = try botDetails(args)
-                let bot = try definitions.get(botReference(args, definitions: definitions))
+                let bot = try definitions.get(botReference(args, definitions: definitions, dataRoot: dataRoot))
                 guard bot.cadence != .manual || bot.eventTrigger != nil else {
                     throw botArgumentError("This helper has no schedule to pause or resume. Manual messages and Run once remain available.",
                         field: "id", accepted: "The id of a scheduled helper from bot.list.")
@@ -372,7 +354,7 @@ extension SwiftToolDispatcher {
             case "bot_list":
                 let details = try botDetails(args)
                 let includeModels = try args["include_models"].map { try botDecode(Bool.self, $0, field: "include_models") } ?? false
-                let selected = try args["id"].map { _ in try definitions.get(botReference(args, definitions: definitions)) }
+                let selected = try args["id"].map { _ in try definitions.get(botReference(args, definitions: definitions, dataRoot: dataRoot)) }
                 let currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model
                 // Each helper's last run and last reply are distinct.
                 let byBot = try shelf.entriesByBot()
@@ -391,7 +373,7 @@ extension SwiftToolDispatcher {
                 if includeModels { result["model_choices"] = try await SwiftNativeProviderRouting(dataRoot: dataRoot).botModelChoices() }
                 return .object(result)
             case "bot_run_once":
-                let bot = try definitions.get(botReference(args, definitions: definitions))
+                let bot = try definitions.get(botReference(args, definitions: definitions, dataRoot: dataRoot))
                 let question = try args["question"].map { try botString($0, field: "question") }
                 guard let standingBotRunEnqueue else {
                     return .object(["status": .string("failed"), "reason": .string("run_queue_unavailable"),
@@ -444,7 +426,7 @@ extension SwiftToolDispatcher {
                             "This shelf entry belongs to a different bot. Use the exact message_id returned by the selected bot.")
                     }
                 } else {
-                    let selected = try definitions.get(botReference(["id": selection["bot_id"] ?? .null], definitions: definitions))
+                    let selected = try definitions.get(botReference(["id": selection["bot_id"] ?? .null], definitions: definitions, dataRoot: dataRoot))
                     guard let latest = try shelf.entriesByBot()[selected.id]?.last(where: {
                         !$0.uncertainties.contains("Run receipt pending finalization.")
                     }) else {
@@ -492,7 +474,7 @@ extension SwiftToolDispatcher {
                 return result
             case "shelf_read":
                 let bot = botSuppliedReferences(args).isEmpty
-                    ? nil : try botReference(args, definitions: definitions)
+                    ? nil : try botReference(args, definitions: definitions, dataRoot: dataRoot)
                 let since = try args["since"].map { value in
                     let text = try botString(value, field: "since")
                     let day = DateFormatter()
@@ -690,17 +672,50 @@ private func botSuppliedReferences(_ args: [String: JSONValue]) -> [(key: String
 }
 
 /// The one helper resolver: bot.* and the Helpers page item. A helper is shown as its UUID (any case), its contact bot:<UUID>,
-/// its session bot-<uuid> or its name; each names it here.
-func botReference(_ args: [String: JSONValue], definitions: BotDefinitionStore) throws -> UUID {
+/// its session bot-<uuid> or its name; each names it here. Only bot_ask passes its validated question so a contact remedy preserves it;
+/// other callers inspect the contact, including bot_run_once with a question.
+func botReference(_ args: [String: JSONValue], definitions: BotDefinitionStore, dataRoot: URL, question: String? = nil) throws -> UUID {
     let text = try botString(args["id"], field: "id").trimmingCharacters(in: .whitespacesAndNewlines)
-    if let id = UUID(uuidString: text.hasPrefix("bot:") ? String(text.dropFirst(4)) : text) ?? BotDefinition.id(forSession: text) { return id }
-    let matches = try definitions.list().filter { $0.name.lowercased() == text.lowercased() }
-    guard matches.count == 1 else {
-        throw botArgumentError(matches.isEmpty ? "No helper matches \(text). Use an id from bot.list."
-            : "More than one helper has that name; use its UUID from bot.list.",
-            field: "id", accepted: "A helper UUID or exact name from bot.list.")
+    let id = UUID(uuidString: text.hasPrefix("bot:") ? String(text.dropFirst(4)) : text) ?? BotDefinition.id(forSession: text)
+    if let id {
+        do { _ = try definitions.get(id); return id }
+        catch StandingBotsError.notFound { }
     }
-    return matches[0].id
+    let matches: [BotDefinition] = if id == nil {
+        try definitions.list().filter { $0.name.caseInsensitiveCompare(text) == .orderedSame }
+    } else { [] }
+    if matches.count == 1, let helper = matches.first { return helper.id }
+    if matches.isEmpty {
+        let contacts = try AgentPeerStore(dataRoot: dataRoot).references(named: text)
+        if contacts.count == 1, let contact = contacts.first {
+            let action: String
+            let guidance: String
+            let recovery: ToolFailureError.Recovery
+            var contactArgs: [String: JSONValue] = ["agent": .string(contact)]
+            if let question {
+                action = "agent.message"
+                contactArgs["text"] = .string(question)
+                guidance = "Use agent.message to ask it."
+                recovery = .correctArguments
+            } else {
+                action = "agent.read"
+                guidance = "Read its conversation with agent.read."
+                recovery = .inspect
+            }
+            throw ToolFailureError("\(text) is an agent contact, not a helper. \(guidance) Nothing ran.",
+                argumentPath: "$.id", accepted: "A helper UUID or exact name from bot.list.", effects: .none,
+                nextCall: ToolFailureError.call("app", ["action": .string(action), "args": .object(contactArgs)]),
+                recovery: recovery)
+        }
+        if contacts.count > 1 {
+            throw ToolFailureError("More than one agent contact matches \(text). Choose its exact address from agent.contacts. Nothing ran.",
+                argumentPath: "$.id", effects: .none,
+                nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]), recovery: .inspect)
+        }
+    }
+    throw botArgumentError(matches.isEmpty ? "No helper matches \(text). Use an id from bot.list."
+        : "More than one helper has that name; use its UUID from bot.list.",
+        field: "id", accepted: "A helper UUID or exact name from bot.list.")
 }
 
 /// The Bots editor's "On an event", checked the way the editor checks it.

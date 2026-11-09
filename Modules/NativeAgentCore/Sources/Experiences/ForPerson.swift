@@ -1,13 +1,13 @@
 import Foundation
 import NativeAgentCore
 import os
-// Blueprint: | `ForPerson.swift` | `Matter`, `Door`, `ForPerson`: what is for the person is the experiences addressed to `person`, held in memory (loaded once, fed at write); the person's reading, door deliveries and the inbox wire are readings of them |
+// Blueprint: | `ForPerson.swift` | `Matter`, `Door`, `ForPerson`: the person's matters, deliveries, reading and inbox wire |
 
 /// Something for the person (step 4 §2.4): one experience addressed to `person`. Its row is its face on every door; an ask owes the person's `decide`; each
 /// of the person's doors owes `deliver:<door>`.
 public struct Matter: Sendable, Equatable {
-    /// Two facts replace importance: does it need the person's answer, and did something go wrong (the one
-    /// thing that breaks the person's quiet hours).
+    /// Two facts replace importance: does it need the person's answer, and did something go wrong
+    /// (which breaks quiet hours). The router separately verifies the person's current request for a pinned door.
     public enum Form: Sendable, Equatable {
         case words, ask, done, wentWrong
 
@@ -75,7 +75,7 @@ public enum Door: Hashable, Sendable {
     case slack(channel: String, thread: String?)
     case conversation(String)
 
-    /// The person's doors (User's ruling): the phone always, the thread it came from, and the Mac, which is let go at send time
+    /// The person's doors: the phone always, the thread it came from, and the Mac, which is let go at send time
     /// when the person is not at it.
     public static func person(thread: Door?) -> [Door] { [.phone] + [thread].compactMap { $0 } + [.mac] }
 
@@ -102,12 +102,13 @@ public enum Door: Hashable, Sendable {
     /// The one reading of an obligation's `to`.
     public init?(address: String) {
         let parts = address.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
-        switch (parts.first, parts.count) {
-        case ("phone", 1): self = .phone
-        case ("mac", 1): self = .mac
-        case ("telegram", 2...): self = .telegram(chat: parts[1], thread: parts.count == 3 ? parts[2] : nil)
-        case ("slack", 2...): self = .slack(channel: parts[1], thread: parts.count == 3 ? parts[2] : nil)
-        case ("conversation", 2...): self = .conversation(String(address.dropFirst("conversation:".count)))
+        var values = parts.makeIterator()
+        switch (values.next(), values.next(), values.next()) {
+        case ("phone", nil, nil): self = .phone
+        case ("mac", nil, nil): self = .mac
+        case ("telegram", .some(let place), let thread): self = .telegram(chat: place, thread: thread)
+        case ("slack", .some(let place), let thread): self = .slack(channel: place, thread: thread)
+        case ("conversation", .some, _): self = .conversation(String(address.dropFirst("conversation:".count)))
         default: return nil
         }
     }
@@ -251,6 +252,23 @@ public actor ForPerson {
 
     // MARK: - The person's reading
 
+    /// An owner's later outcome revises the existing face, including history, without reopening consent or owing a second delivery.
+    @discardableResult
+    public func updateFace(_ matter: Matter) async throws -> Filed {
+        try await load()
+        let filed = OSAllocatedUnfairLock(initialState: Filed.unchanged)
+        try await write(matter.id) { store in
+            guard let current = try await store.experience(matter.id) else {
+                throw ToolFailureError("The matter to update does not exist.", effects: .none, owner: matter.id)
+            }
+            let face = matter.face(at: current.face?.row?.at ?? current.at)
+            guard face != current.face else { return }
+            try await store.append([.face(face)], to: matter.id)
+            filed.withLock { $0 = .refreshed }
+        }
+        return filed.withLock { $0 }
+    }
+
     public func read(_ id: String) async throws {
         try await write(id) { store in
             guard let current = try await store.experience(id), Self.reading(current) == .unread else { return }
@@ -352,6 +370,8 @@ public actor ForPerson {
     /// An answer anywhere closes it everywhere: once the person's `decide` settles, the doors still owed let it go.
     private func feed(_ matter: Experience) {
         if let held = reading[matter.id], (held.updatedAt ?? held.at) > (matter.updatedAt ?? matter.at) { return }
+        // The write stream and the writer's readback meet here. An unchanged matter is no change, including a no-op tell/answer.
+        guard reading[matter.id] != matter else { return }
         reading[matter.id] = matter
         byPhoneEvent[Self.phoneEvent(matter.id)] = matter.id
         if matter.owes["decide"]?.phase.isSettled == true, !Self.unsettledDeliveries(matter).isEmpty {

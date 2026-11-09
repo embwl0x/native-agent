@@ -135,16 +135,19 @@ public struct MacAXAppInfo: Sendable, Equatable {
     public let name: String
     public let bundleIdentifier: String?
     public let processIdentifier: Int32
-    public init(name: String, bundleIdentifier: String?, processIdentifier: Int32) {
+    public let isDockApp: Bool
+    public init(name: String, bundleIdentifier: String?, processIdentifier: Int32, isDockApp: Bool) {
         self.name = name
         self.bundleIdentifier = bundleIdentifier
         self.processIdentifier = processIdentifier
+        self.isDockApp = isDockApp
     }
     public func toJSON() -> JSONValue {
         .object([
             "name": .string(name),
             "bundle_id": bundleIdentifier.map { .string($0) } ?? .null,
             "pid": .int(Int64(processIdentifier)),
+            "dock_app": .bool(isDockApp),
         ])
     }
 }

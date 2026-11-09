@@ -16,7 +16,7 @@ import PersistenceCore
 import Privacy
 import MacControl
 import TrustCenter
-// Blueprint: | `ClaudeBridgeRuntime.swift` | Response deadlines retain accepted work until exit. |
+// Blueprint: | `ClaudeBridgeRuntime.swift` | Retain accepted work until exit; connections own passive reads. |
 
 /// Factories bind at launch; ingress and retained delivery remain with the runtime owner.
 public protocol ClaudeBridgeRuntimePort: ClaudeBridgeMessagePort {
@@ -45,20 +45,13 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     public static let port = InstallPaths.current.loopbackPorts().bridge
     private static let maxRequestBodyBytes = 4 * 1024 * 1024
 
-    private static let connectionDeadlineSeconds: Int = 30
-    public static let toolWorkDeadlineSeconds: Int = 300
-    /// Keep read/debug waits short: stalled cognition must not retain unbounded tasks or connections, and these endpoints do no model work.
-    public static let readWorkDeadlineSeconds: Int = 60
-
-    /// Work and deadline share one latch so exactly one can write the HTTP response.
+    /// Admission, progress and settlement share one response claim.
     public final class WorkLatch: @unchecked Sendable {
         public init() {}
 
         private let lock = NSLock()
         private var claimed = false
-        private var deadlineWork: DispatchWorkItem?
 
-        /// The winning response cancels its timer so completed requests cannot retain connections until expiry.
         public func claim() -> Bool {
             lock.lock()
             if claimed {
@@ -66,23 +59,8 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 return false
             }
             claimed = true
-            let pending = deadlineWork
-            deadlineWork = nil
             lock.unlock()
-            // Cancelling from inside the deadline's own execution is a no-op.
-            pending?.cancel()
             return true
-        }
-
-        /// Do not arm a deadline after work has already claimed the response.
-        public func arm(afterSeconds seconds: Int, _ body: @escaping @Sendable () -> Void) {
-            let work = DispatchWorkItem(block: body)
-            lock.lock()
-            let alreadyClaimed = claimed
-            if !alreadyClaimed { deadlineWork = work }
-            lock.unlock()
-            guard !alreadyClaimed else { return }
-            DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(seconds), execute: work)
         }
     }
 
@@ -114,14 +92,11 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         var operationAdmitted = false
         var operationClosed = false
     }
-    // A response timeout does not release a slot while its operation lives. Use the same 64-request ceiling as connection admission.
+    // Admission counts the operation until its owner exits.
     private var requestWorkers: [UUID: RequestWorker] = [:]
     public private(set) var startedAt: Date = Date()
-    // Connection UUIDs gate exact request-read deadlines so reused connection identities cannot inherit a late timeout.
     private struct ConnectionEntry {
         let conn: NWConnection
-        var deadline: BridgeReadDeadlineState
-        let deadlineWork: DispatchWorkItem
     }
     private var connections: [ObjectIdentifier: ConnectionEntry] = [:]
 
@@ -135,7 +110,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         }
     }
 
-    /// Retain each request through actual exit, including a tool operation whose HTTP deadline has already answered. Accepted tool work survives
+    /// Retain each request through actual exit. Accepted tool work survives
     /// disconnect/stop; reads are canceled with their connection.
     func startRequest(conn: NWConnection, latch: WorkLatch, priority: TaskPriority,
                       accepted: Bool = false,
@@ -353,7 +328,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         startSync()
     }
 
-    /// Retire listeners, connections, timers and discovery files together; repeated stop is safe.
+    /// Retire listeners, connections and discovery files together; repeated stop is safe.
     public func stop() {
         teardown(token: nil)
     }
@@ -374,7 +349,6 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         stateLock.unlock()
         retireRequests(token: retiringToken)
         for entry in entries {
-            entry.deadlineWork.cancel()
             entry.conn.cancel()
         }
     }
@@ -465,35 +439,21 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         stateLock.unlock()
         guard bridgeIsReady else { conn.cancel(); return }
         let key = ObjectIdentifier(conn)
-        // Bound request-body reads so a peer cannot hold a slot forever; UUID fencing prevents late timers cancelling reused connections.
-        let deadlineToken = UUID()
-        let deadlineWork = DispatchWorkItem { [weak self] in
-            self?.cancelUnroutedConnection(key: key, deadlineToken: deadlineToken)
-        }
         stateLock.lock()
         guard connections.count < 64, !_token.isEmpty, _activePort != 0 else {
             stateLock.unlock()
             conn.cancel()
             return
         }
-        connections[key] = ConnectionEntry(
-            conn: conn,
-            deadline: BridgeReadDeadlineState(token: deadlineToken),
-            deadlineWork: deadlineWork
-        )
+        connections[key] = ConnectionEntry(conn: conn)
         stateLock.unlock()
-        DispatchQueue.global().asyncAfter(
-            deadline: .now() + .seconds(Self.connectionDeadlineSeconds),
-            execute: deadlineWork
-        )
         conn.stateUpdateHandler = { [weak self] state in
             switch state {
             case .cancelled, .failed:
                 self?.stateLock.lock()
-                let removed = self?.connections.removeValue(forKey: key)
+                self?.connections.removeValue(forKey: key)
                 self?.eventSubscribers.removeValue(forKey: key)
                 self?.stateLock.unlock()
-                removed?.deadlineWork.cancel()
                 self?.retireRequests(connection: key)
             default: break
             }
@@ -502,34 +462,12 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         BridgeCore.readRequest(conn, buffered: Data(), maxBodyBytes: Self.maxRequestBodyBytes, server: self)
     }
 
-    /// Cancel only the exact still-unrouted request whose read deadline expired.
-    private func cancelUnroutedConnection(key: ObjectIdentifier, deadlineToken: UUID) {
-        stateLock.lock()
-        guard let entry = connections[key],
-              entry.deadline.shouldCancel(firingToken: deadlineToken) else {
-            stateLock.unlock()
-            return
-        }
-        connections.removeValue(forKey: key)
-        stateLock.unlock()
-        entry.conn.cancel()
-    }
-
     // MARK: - Routing
 
     public func route(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data) {
-        // The connection deadline covers request reads, never response work.
-        let connKey = ObjectIdentifier(conn)
         stateLock.lock()
-        var readDeadlineWork: DispatchWorkItem?
-        if var entry = connections[connKey] {
-            entry.deadline.routed = true
-            connections[connKey] = entry
-            readDeadlineWork = entry.deadlineWork
-        }
         let liveToken = _token
         stateLock.unlock()
-        readDeadlineWork?.cancel()
         if routeAgentContact(conn: conn, method: method, path: path, headers: headers, body: body) { return }
         // Constant-time authorization rejects an empty live token.
         switch BridgeCore.authorize(authorizationHeader: headers["authorization"], liveToken: liveToken) {
@@ -555,7 +493,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleState(conn: conn, path: path)
+            handleState(conn: conn)
         case "/message":
             guard method == "POST" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
@@ -620,7 +558,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleOrganismDebug(conn: conn, body: body, path: path)
+            handleOrganismDebug(conn: conn, body: body)
         case "/events":
             guard method == "GET" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
@@ -725,8 +663,7 @@ extension ClaudeBridgeRuntime {
 }
 
 extension ClaudeBridgeRuntime {
-    func handleState(conn: NWConnection, path: String) {
-        // Work and deadline must share one response latch.
+    func handleState(conn: NWConnection) {
         let workLatch = WorkLatch()
         let workTask = startRequest(conn: conn, latch: workLatch, priority: .userInitiated) { [weak self] _ in
             guard let self else { return }
@@ -738,17 +675,7 @@ extension ClaudeBridgeRuntime {
             guard workLatch.claim() else { return }
             self.writeJSON(conn, status: 200, obj: payload)
         }
-        guard let workTask else { writeJSON(conn, status: 503, obj: ["error": "server_stopping_or_busy"]); return }
-        workLatch.arm(afterSeconds: Self.readWorkDeadlineSeconds) { [weak self] in
-            guard let self, workLatch.claim() else { return }
-            workTask.cancel()
-            self.writeJSON(conn, status: 504, obj: [
-                "error": "work_timeout",
-                "path": path,
-                "seconds": Self.readWorkDeadlineSeconds,
-                "outcome": "unknown",
-            ])
-        }
+        guard workTask != nil else { writeJSON(conn, status: 503, obj: ["error": "server_stopping_or_busy"]); return }
     }
 
 

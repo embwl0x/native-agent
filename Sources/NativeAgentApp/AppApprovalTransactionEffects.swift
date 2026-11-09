@@ -23,10 +23,6 @@ extension ApprovalExecution {
 struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
     private var dataRoot: URL { NativeAgentEngine.live.dataRoot }
 
-    func disableSkill(name: String, turn: Turn) async throws {
-        try await NativeSkillRegistryActions.disableSkill(name: name, dataRoot: dataRoot, turn: turn)
-    }
-
     func enableSkill(name: String, reviewedDigest: String?, turn: Turn) async throws {
         try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(
             envelope: TurnEnvelope.current(turn: turn, surface: "ability.enable"), turn: turn) { door in

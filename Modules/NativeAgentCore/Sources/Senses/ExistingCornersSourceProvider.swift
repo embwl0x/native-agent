@@ -216,6 +216,10 @@ public enum SenseNativePages {
     public static func chromeContinuation(_ page: [String: JSONValue], cursor: JSONValue, scope: String, alias: String? = nil) -> String? {
         guard case .object(let fields) = cursor, case .string(let url)? = page["url"],
               let host = URL(string: url)?.host, case .int(let tab)? = page["tabId"], tab >= 0,
+              case .string(let document)? = page["documentId"], !document.isEmpty,
+              case .string(let frameDocument)? = fields["frameDocumentId"], !frameDocument.isEmpty,
+              fields["tabId"] == .int(tab), fields["documentId"] == .string(document),
+              case .string(let layer)? = fields["readLayer"], ["content", "overlay"].contains(layer),
               case .int(let frame)? = fields["frameId"], frame >= 0,
               let encoded = try? cursor.serialize(pretty: false) else { return nil }
         let fragment: String
@@ -228,7 +232,12 @@ public enum SenseNativePages {
                 }
             }
             guard coordinates.count == 6 else { return nil }
-            fragment = "view-\(frame)-" + coordinates.joined(separator: "_")
+            let column = place["complementary"] == .bool(true) ? "complementary-" : ""
+            let anchor: String
+            if case .object(let value)? = fields["anchor"], case .string(let identity)? = value["identity"],
+               case .string(let key)? = value["key"] { anchor = "-\(identity)-\(key)" }
+            else { anchor = "" }
+            fragment = column + "view-\(frame)-" + coordinates.joined(separator: "_") + anchor
         } else {
             guard fields["textOffset"] == nil, fields["optionOffset"] == nil else { return nil }
             fragment = "view-\(frame)"
@@ -237,7 +246,8 @@ public enum SenseNativePages {
         for key in ["textOffset", "optionOffset"] {
             if case .int(let offset)? = fields[key], offset > 0 { position.append("\(key)=\(offset)") }
         }
-        let canonical = chromeAddress(host: host, url: url, fragment: fragment)
+        let canonical = chromeAddress(host: host, url: url,
+            fragment: "tab-\(tab)-document-\(document)-frame-document-\(frameDocument)-\(layer)-" + fragment)
             + "?read=more" + (position.isEmpty ? "" : "&" + position.joined(separator: "&"))
         // Bind redirects by captured tab and page position because grown views may retain the requested URL spelling.
         if let alias {

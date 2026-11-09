@@ -60,7 +60,7 @@ public enum ProviderOAuthCredentialMaintenance {
         switch provider {
         case "xai_oauth_direct":
             _ = try await XAIOAuthTransport(tokenPathOverride: path, telemetryDataRootOverride: root)
-                .ensureFreshAccessToken(forceRefresh: false)
+                .ensureFreshAccessToken()
         case "anthropic_oauth_direct":
             _ = try await AnthropicOAuthTransport(authPathOverride: path, telemetryDataRootOverride: root)
                 .ensureFreshAccessToken()

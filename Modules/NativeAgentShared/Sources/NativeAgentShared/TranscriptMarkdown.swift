@@ -88,8 +88,7 @@ extension TranscriptDocument {
         return out
     }
 
-    /// Inline runs with today's parse and link policy (`ChatRichContentParser.inline`: inline-only, whitespace kept, only http, https and
-    /// mailto stay links). A failed parse shows its visible failure text. Text with no character inline markdown reads parses to itself.
+    /// Inline Markdown preserves whitespace and only http, https and mailto links; parse failures remain visible.
     public static func inline(_ text: String) -> [TranscriptRun] {
         guard !text.isEmpty else { return [] }
         if isPlain(text) { return [TranscriptRun(text: text)] }
@@ -153,9 +152,7 @@ extension TranscriptDocument {
 
 @available(macOS 15, iOS 18, *)
 extension TranscriptDocument {
-    /// A reply's paragraphs from its readable text (protocol markers already removed by the caller): provider citations hidden, fences
-    /// split by `ChatRichContentParser.blocks` (an unterminated fence stays code), tables by `ChatMarkdownTableParser`, then paragraphs,
-    /// list rows, headings and quotes. With `edge`, the last paragraph is the live edge and an open marker there renders closed, as the paced reply does.
+    /// Parse readable reply blocks; only the live edge closes unfinished Markdown.
     public static func replyPieces(_ text: String, ink: TranscriptBlock.Ink, edge: Bool) -> [TranscriptPiece] {
         let content = ChatRichContentParser.blocks(text)
         var out: [TranscriptPiece] = []
@@ -180,8 +177,7 @@ extension TranscriptDocument {
         return out
     }
 
-    /// Paragraphs split at blank lines as the paced reply splits them. A paragraph with list rows becomes one item per row (bullets as •,
-    /// numbers kept, depth = leading spaces with tabs as four, as `listRows` reads them); its other rows and plain paragraphs go by line.
+    /// Blank lines separate paragraphs; list markers preserve item order and indentation.
     public static func prosePieces(_ text: String, ink: TranscriptBlock.Ink, edge: Bool) -> [TranscriptPiece] {
         let paragraphs = StreamingParagraphText.paragraphs(Substring(text))
         var out: [TranscriptPiece] = []
@@ -208,7 +204,7 @@ extension TranscriptDocument {
 }
 
 /// One paragraph of a message before it has its id and lead.
-public struct TranscriptPiece: Sendable {
+public struct TranscriptPiece: Equatable, Sendable {
     public var kind: TranscriptBlock.Kind
     public var source: String
 

@@ -42,17 +42,19 @@ extension InlineInteractionResolver {
         of id: String, sessionID: String, dataRoot: URL
     ) async throws -> TurnEnvelope? {
         let read = try await checkedRows(sessionID, dataRoot)
-        for row in read.rows.reversed() {
-            guard case .object(let object) = row,
-                  case .object(let metadata)? = object["metadata"],
-                  metadata["kind"] == .string(InlineInteractionWire.transcriptKind),
-                  case .object(let raw)? = metadata[InlineInteractionWire.metadataKey],
-                  raw["id"] == .string(id)
-            else { continue }
-            _ = try SwiftNativeChatOrchestrationClient.checkedInlineInteraction(in: row, lifeID: read.lifeID)
-            return TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
-        }
-        return nil
+        return try await Task.detached(priority: .userInitiated) { () throws -> TurnEnvelope? in
+            for row in read.rows.reversed() {
+                guard case .object(let object) = row,
+                      case .object(let metadata)? = object["metadata"],
+                      metadata["kind"] == .string(InlineInteractionWire.transcriptKind),
+                      case .object(let raw)? = metadata[InlineInteractionWire.metadataKey],
+                      raw["id"] == .string(id)
+                else { continue }
+                _ = try SwiftNativeChatOrchestrationClient.checkedInlineInteraction(in: row, lifeID: read.lifeID)
+                return TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
+            }
+            return nil
+        }.value
     }
     static func require(
         id: String, sessionID: String, dataRoot: URL

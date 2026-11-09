@@ -55,7 +55,7 @@ public enum MacTransientMenus {
     }
 
     public static func read(source: any MacAXElementSource, pid: Int32, context: MacOperationContext) -> [Menu] {
-        guard pid != getpid(), source.isTrusted(), source.frontmostApp()?.processIdentifier == pid else { return [] }
+        guard !PersonOnlyWindows.isOwnProcess(pid), source.isTrusted(), source.frontmostApp()?.processIdentifier == pid else { return [] }
         var remaining = maxItems
         return source.transientMenuRoots(pid: pid, context: context).prefix(maxMenus).compactMap { root in
             guard remaining > 0, let attributes = source.attributes(of: root, context: context),

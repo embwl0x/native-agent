@@ -36,7 +36,6 @@ public actor AgentContactTasks {
     var order: [String] = []
     var pushConfigs: [String: [String: AgentContactPushConfig]] = [:]
     var pushDeliveries: [String: (generation: UUID, worker: Task<Void, Never>)] = [:]
-    var pushRestorations: [String: (generation: UUID, worker: Task<Void, Never>)] = [:]
     let capacity: Int
     private let inbox: SwiftNativeApprovalInbox
     private var approvalObservation: Task<Void, Never>?
@@ -65,7 +64,6 @@ public actor AgentContactTasks {
         approvalRefresh?.cancel()
         receiptObservation?.cancel()
         for delivery in pushDeliveries.values { delivery.worker.cancel() }
-        for restoration in pushRestorations.values { restoration.worker.cancel() }
     }
     /// Listener transitions are ordered even when their actor hops arrive out of order. Stop retires passive resources; accepted turns keep their record-owned
     /// worker and settle normally. Explicit cancel is separate.
@@ -82,8 +80,6 @@ public actor AgentContactTasks {
         approvalRefresh?.cancel()
         receiptObservation?.cancel(); receiptObservation = nil
         for delivery in pushDeliveries.values { delivery.worker.cancel() }
-        for restoration in pushRestorations.values { restoration.worker.cancel() }
-        pushRestorations.removeAll()
         pushConfigs.removeAll()
         if active {
             scheduleApprovalRefresh()
@@ -629,7 +625,7 @@ public actor AgentContactTasks {
                     do {
                         let made = try AgentContactJob.fileParts(taskID: task.id, dataRoot: dataRoot)
                         parts += made.parts
-                        if made.unsent > 0 { failures.append("\(made.unsent) job file(s) could not be read or were too large") }
+                        failures += made.failures
                     } catch { failures.append("job files: \(error.localizedDescription)") }
                 }
                 let recovery = failures.isEmpty ? nil : AgentContactReplyRecovery(source: url.path,

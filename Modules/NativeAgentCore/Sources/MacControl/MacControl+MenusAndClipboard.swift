@@ -63,7 +63,7 @@ extension SwiftNativeMacControl {
     }
 
     /// Read published menu items without opening menus so discovery emits no input.
-    func handleMenu(_ body: [String: JSONValue], context: MacOperationContext) -> MacControlResult {
+    func handleMenu(_ body: [String: JSONValue], context: MacOperationContext) async -> MacControlResult {
         let started = now()
         guard accessibilitySource(context: context).isTrusted() else { return axUntrustedResult(action: "menu") }
         let app: MacAXAppInfo
@@ -71,6 +71,7 @@ extension SwiftNativeMacControl {
         case .refused(let refusal): return refusal
         case .app(let hit): app = hit
         }
+        if let refusal = await macAdmissionRefusal(pid: app.processIdentifier, action: "menu", context: context) { return refusal }
         // Keep every bounded find match so duplicate menu names stay ambiguous. Only explicit paths select levels; bare names containing slashes stay literal.
         let selected = body["find"]?.stringValue.map(MacMenuBar.selection)
         let wantedLevels = selected.map {
@@ -246,6 +247,7 @@ extension SwiftNativeMacControl {
         if let continuation, continuation.app?.processIdentifier != app.processIdentifier {
             return refuse("continuation_target_mismatch", continuation.modelContext(context: context))
         }
+        if let refusal = await macAdmissionRefusal(pid: app.processIdentifier, action: "menu_press", context: context) { return refusal }
         // Limit descent to the requested top-level menu to preserve the bounded walk.
         let reading = MacMenuBar.read(
             source: accessibilitySource(context: context), pid: app.processIdentifier,
@@ -357,8 +359,16 @@ extension SwiftNativeMacControl {
             guard MacMenuBar.cleanTitle(bar.title ?? bar.value) == item.titlePath.first else {
                 return driftRefusal()
             }
+            let validation = MacWaitSignals(effects: effectObserverSource,
+                activation: defaultMacAppActivationObserverSource(), pid: app.processIdentifier)
+            defer { validation.stop() }
             _ = accessibilityActSource(context: context).perform(bar, action: "AXPress", turn: turn, context: context)
-            usleep(150_000)
+            _ = await macSettle("menu_validation", signals: validation, patience: 0.15) {
+                guard case .resolved(let fresh) = self.accessibilityActSource(context: context).resolve(
+                    menuPath: item.path, inAppPid: app.processIdentifier, titlePath: item.titlePath, context: context) else { return false }
+                return fresh.enabled
+            }
+            if Task.isCancelled || context.expired { return refuse("app_stopped", "Stopped while validating the menu; no command was pressed.") }
             guard case .resolved(let fresh) = accessibilityActSource(context: context).resolve(menuPath: item.path, inAppPid: app.processIdentifier,
                 titlePath: item.titlePath, context: context) else { return driftRefusal() }
             target = fresh
@@ -431,34 +441,34 @@ extension SwiftNativeMacControl {
                     + (outcome.cause ?? outcome.rawValue), evidence
             )
         }
-        let clock = now
-        // A menu/focus reaction is not the command's surface effect. Keep observing within the same deadline until that transition arrives, then enumerate the
-        // owning process's windows for the readback.
         let surfaceCommand = if case .surface = declaration { true } else { false }
-        let wait = await MacActClosedLoop.waitForEffect(collector: collector,
-            waitMs: MacActClosedLoop.defaultWaitMs, startedAt: performedAt, clock: { clock() },
-            until: surfaceCommand ? MacActClosedLoop.navigationNotificationKinds : [])
-        observation?.stop()
-        let windowsAfter: [MacAXWindowRef]
-        do { windowsAfter = try accessibilityActSource(context: context).windows(pid: pid, context: context) }
-        catch {
-            return MacControlResult(ok: true, action: "menu_press", output: .object([
-                "pressed": .bool(true), "status": .string("acted_unobserved"),
-                "message": .string(
-                    "The menu press was delivered, but its window readback failed: " + error.localizedDescription
-                        + " Inspect this app before another press."
-                )
-            ]), error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
+        func pass() -> MacActClosedLoop.ActClassification {
+            let windowsAfter: [MacAXWindowRef]
+            do { windowsAfter = try accessibilityActSource(context: context).windows(pid: pid, context: context) }
+            catch {
+                return MacActClosedLoop.ActClassification(status: "acted_unobserved", reason: "window_readback_unavailable",
+                    note: "The menu press was delivered, but window readback failed: " + error.localizedDescription)
+            }
+            let input = surfaceCommand ? nil : focusedBefore.flatMap { accessibilityActSource(context: context).textInput($0, context: context) }
+            return MacActClosedLoop.verify(declaration,
+                value: input?.value, selection: input?.selection,
+                surfaceChanged: windowsAfter.contains { window in
+                    !windowsBefore.contains { $0.handle == window.handle && $0.identity.title == window.identity.title }
+                } ? true : nil,
+                dismissed: windowsBefore.contains { accessibilityActSource(context: context).windowPresence($0, context: context) == false } ? true : nil,
+                processGone: accessibilitySource(context: context).appInfo(pid: pid) == nil,
+                notifications: collector.kinds())
         }
-        let input = surfaceCommand ? nil : focusedBefore.flatMap { accessibilityActSource(context: context).textInput($0, context: context) }
-        let verdict = MacActClosedLoop.verify(declaration,
-            value: input?.value, selection: input?.selection,
-            surfaceChanged: windowsAfter.contains { window in
-                !windowsBefore.contains { $0.handle == window.handle && $0.identity.title == window.identity.title }
-            } ? true : nil,
-            dismissed: windowsBefore.contains { accessibilityActSource(context: context).windowPresence($0, context: context) == false } ? true : nil,
-            processGone: accessibilitySource(context: context).appInfo(pid: pid) == nil,
-            notifications: wait.notifications)
+        var verdict = MacActClosedLoop.ActClassification(status: "acted_unobserved", reason: "effect_unreadable")
+        let signals = MacWaitSignals(collector: collector, startedAt: performedAt)
+        defer { signals.stop() }
+        _ = await macSettle("menu_press", signals: signals, patience: Double(MacActClosedLoop.defaultWaitMs) / 1000,
+            until: surfaceCommand ? MacActClosedLoop.navigationNotificationKinds : []) {
+            verdict = pass()
+            return verdict.status == "acted"
+        }
+        observation?.stop()
+        let wait = MacActClosedLoop.effectWait(collector: collector, startedAt: performedAt)
         return MacControlResult(
             ok: true,
             action: "menu_press",

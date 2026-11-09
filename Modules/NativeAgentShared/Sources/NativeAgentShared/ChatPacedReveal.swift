@@ -29,7 +29,7 @@ public struct StreamingParagraphText: View {
         self.inline = inline
     }
 
-    public static let paragraphGap: CGFloat = 10
+    nonisolated public static let paragraphGap: CGFloat = 10
 
     public var body: some View {
         let paragraphs = projectedParagraphs ?? Self.paragraphs(text)
@@ -131,10 +131,8 @@ public struct StreamingParagraphText: View {
         return composed
     }
 
-    /// The live edge with a marker the agent has opened but not yet closed, so `**bold` streams bold; with nothing after it yet, the marker is
-    /// hidden. Only live markers count: a backslash-escaped `*` and anything inside a closed code span are literal, and inside a code span still open
-    /// at the edge `**` is literal too.
-    public static func closingEdge(_ text: Substring) -> String {
+    /// Close live Markdown markers while preserving escapes and literal code.
+    nonisolated public static func closingEdge(_ text: Substring) -> String {
         var edge = String(text)
         var bold: [Range<String.Index>] = []
         var index = edge.startIndex
@@ -176,7 +174,7 @@ public struct StreamingParagraphText: View {
     }
 
     /// Splits at each blank line, dropping the break. A break still at the stream's edge adds nothing until the next paragraph's first word.
-    public static func paragraphs(_ text: Substring) -> [Substring] {
+    nonisolated public static func paragraphs(_ text: Substring) -> [Substring] {
         var out: [Substring] = []
         var start = text.startIndex
         while let range = text[start...].range(of: "\n\n") {

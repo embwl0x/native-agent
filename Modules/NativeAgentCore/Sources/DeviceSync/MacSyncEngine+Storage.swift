@@ -240,7 +240,16 @@ extension MacSyncEngine {
         let digests = snapshotFileDigests
         await sync.storage.perform {
             do {
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(digests), to: url)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = .sortedKeys
+                let data = try encoder.encode(digests)
+                do {
+                    if try Data(contentsOf: url) == data { return }
+                } catch {
+                    // Only checked absence permits creating the digest file. An unreadable file is not an empty digest set.
+                    if !Self.isNoSuchFileError(error) { throw error }
+                }
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
             } catch { nativeLog("[MacSyncEngine] could not save snapshot digests: %@", error.localizedDescription) }
         }
     }
@@ -501,42 +510,38 @@ extension MacSyncEngine {
         return writeError
     }
 
-    // Reclaim missing/expired response keys within KVS's 1024-key/1 MB quota; pressure alone cannot discard recent readable replies.
+    /// Checked response metadata owns cleanup; unreadable responses retain their wake keys.
     func sweepInboxResponseKVSKeys() async {
+        guard let responsesDir else { return }
         let keyPrefix = inboxResponseKeyPrefix
-        let maybeKeys = await withCKTimeout("MacSyncEngine.sweepInboxResponseKVSKeys.readKeys") {
+        let keys = await Task.detached(priority: .utility) {
             Array(NSUbiquitousKeyValueStore.default.dictionaryRepresentation.keys.filter { $0.hasPrefix(keyPrefix) })
-        }
-        guard let keys = maybeKeys else {
-            syncError = "Could not read iCloud inbox response keys for cleanup; retrying before the next inbox scan."
-            print("[MacSyncEngine] inbox_response_* KVS sweep could not read keys; cleanup will retry.")
-            return
-        }
+        }.value
         guard !keys.isEmpty else { return }
         let now = Date()
-        // iCloud file stats may block: collect metadata off main before MainActor applies KVS mutations.
         let keyPrefixCount = inboxResponseKeyPrefix.count
-        let entries: [MacSyncInboxResponseSweep.Entry] = await Task.detached(priority: .utility) { [responsesDir, keys] in
-            let fm = FileManager.default
+        let (entries, failures) = await Task.detached(priority: .utility) { [responsesDir, keys] in
             var entries: [MacSyncInboxResponseSweep.Entry] = []
+            var failures: [String] = []
             for key in keys {
                 let msgId = String(key.dropFirst(keyPrefixCount))
-                var modified: Date?
-                var exists = false
-                if let responsesDir {
-                    let url = responsesDir.appendingPathComponent("\(msgId).json")
-                    if fm.fileExists(atPath: url.path) {
-                        exists = true
-                        modified = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-                        if modified == nil {
-                            modified = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
-                        }
+                let url = responsesDir.appendingPathComponent("\(msgId).json")
+                do {
+                    guard let modified = try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else {
+                        throw CocoaError(.fileReadUnknown)
+                    }
+                    entries.append(.init(key: key, modified: modified, exists: true))
+                } catch {
+                    if Self.isNoSuchFileError(error) {
+                        entries.append(.init(key: key, modified: nil, exists: false))
+                    } else {
+                        failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
                     }
                 }
-                entries.append(MacSyncInboxResponseSweep.Entry(key: key, modified: modified, exists: exists))
             }
-            return entries
+            return (entries, failures)
         }.value
+        if !failures.isEmpty { syncError = "Response-key cleanup could not read: " + failures.joined(separator: "; ") }
         let sweepPlan = MacSyncInboxResponseSweep.plan(
             entries: entries,
             now: now,
@@ -553,16 +558,15 @@ extension MacSyncEngine {
         if !sweepPlan.keysToRemove.isEmpty {
             // Capture an immutable snapshot because the Sendable closure cannot share the outer var.
             let snapshot = sweepPlan
-            let didSynchronize = await withCKTimeout("MacSyncEngine.sweepInboxResponseKVSKeys.removeKeys") {
+            let didSynchronize = await Task.detached(priority: .utility) {
                 let kvs = NSUbiquitousKeyValueStore.default
                 MacSyncInboxResponseSweep.apply(snapshot) { key in
                     kvs.removeObject(forKey: key)
                 }
                 return kvs.synchronize()
-            }
-            if didSynchronize != true {
-                syncError = "Could not sweep stale iCloud inbox response keys; retrying before the next inbox scan."
-                print("[MacSyncEngine] inbox_response_* KVS sweep was not synchronized; stale key cleanup will retry.")
+            }.value
+            if !didSynchronize {
+                syncError = "iCloud KVS did not accept response-key cleanup; remote cleanup is unconfirmed."
             }
         }
     }
@@ -572,13 +576,12 @@ extension MacSyncEngine {
             .appendingPathComponent("icloud/chat_transactions", isDirectory: true)].compactMap { $0 }
     }
 
-    /// Serialize scan/delete on the storage executor; exact metadata crossings and file events own future wakes. Failed deletion keeps its retry floor.
-    /// Archives retain seven days/50 MB; replay markers retain 30 days to outlive pending files.
+    /// Exact retention dates schedule deletion; failed work waits for a storage event.
+    /// Processed/rejected archives retain seven days/50 MB; incomplete-bookkeeping markers await actual settlement.
     func reconcileArchiveRetention(pruneFirst: Bool) {
         let rejectedDir = inboxDir?.appendingPathComponent("_rejected")
-        let dirs = [inboxDir, responsesDir, rejectedDir].compactMap { $0 }
+        let dirs = [inboxDir, rejectedDir].compactMap { $0 }
         let transactionDirectories = retainedTransactionDirectories
-        let markerDir = ICloudSyncStatePaths.completedUnarchivedDirectory(dataRoot: PersistenceCore.defaultDataRoot())
         guard isActive, !dirs.isEmpty else { return }
         let previous = pruneDeadlineTask
         let generation = snapshotLifecycleGeneration
@@ -591,26 +594,31 @@ extension MacSyncEngine {
             // Keep the directory watch armed while discovering exact files, then register them before reading metadata or contents.
             let observing = await self.startArchiveRetentionWatcher(transactionDirectories: transactionDirectories)
             if !observing { return }
-            var prune = pruneFirst && (self.archiveRetentionRetryAfter ?? .distantPast) <= Date()
+            var prune = pruneFirst
             while !Task.isCancelled, self.isActive, generation == self.snapshotLifecycleGeneration {
                 if prune {
-                    let failed = await self.sync.storage.perform {
-                        let markerFailed = Self.pruneCompletedUnarchivedMarkers(in: markerDir)
-                        return Self.pruneArchiveDirs(dirs, transactionDirectories: transactionDirectories) || markerFailed
+                    let failures = await self.sync.storage.perform {
+                        Self.pruneArchiveDirs(dirs, transactionDirectories: transactionDirectories)
                     }
                     guard !Task.isCancelled, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
-                    self.archiveRetentionRetryAfter = failed ? Date().addingTimeInterval(60) : nil
+                    if !failures.isEmpty {
+                        self.syncError = "Archive cleanup needs storage repair: " + failures.joined(separator: "; ")
+                    }
                 }
                 let now = Date()
-                let deadline = await self.sync.storage.perform {
-                    Self.nextArchiveRetentionDeadline(in: dirs, after: now, transactionDirectories: transactionDirectories,
-                                                     completionMarkerDirectory: markerDir)
+                let (deadline, failures) = await self.sync.storage.perform {
+                    Self.nextArchiveRetentionDeadline(in: dirs, after: now, transactionDirectories: transactionDirectories)
                 }
                 guard !Task.isCancelled, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
-                // Without expiry or failed deletion, only exact file events owe a wake; empty archives need no sampling.
-                guard let next = self.archiveRetentionRetryAfter ?? deadline else { return }
+                if !failures.isEmpty {
+                    self.syncError = "Archive retention could not read: " + failures.joined(separator: "; ")
+                }
+                guard let next = deadline else { return }
                 let delay = next.timeIntervalSince(Date())
-                if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+                if delay > 0 {
+                    do { try await Task.sleep(for: .seconds(delay)) }
+                    catch { return }
+                }
                 prune = true
             }
         }
@@ -620,165 +628,157 @@ extension MacSyncEngine {
     nonisolated static func nextArchiveRetentionDeadline(
         in dirs: [URL],
         after now: Date,
-        transactionDirectories: [URL] = [],
-        completionMarkerDirectory: URL? = nil
-    ) -> Date? {
+        transactionDirectories: [URL] = []
+    ) -> (Date?, [String]) {
         let fm = FileManager.default
-        let maxBytes = 50 * 1024 * 1024
         var deadlines: [Date] = []
+        var failures: [String] = []
         for dir in dirs {
-            guard !Task.isCancelled, let items = try? fm.contentsOfDirectory(
-                at: dir,
-                includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey],
-                options: []
-            ) else { continue }
-            var totalBytes = 0
-            for item in items where !Task.isCancelled {
-                let values = try? item.resourceValues(forKeys: [
-                    .creationDateKey, .fileSizeKey, .isDirectoryKey,
-                ])
-                guard values?.isDirectory != true else { continue }
-                totalBytes += values?.fileSize ?? 0
-                if let created = values?.creationDate {
-                    let due = created.addingTimeInterval(7 * 24 * 60 * 60)
-                    deadlines.append(max(due, now))
+            do {
+                let (files, metadataFailures) = try archivedFiles(in: dir)
+                failures += metadataFailures
+                for item in files where !Task.isCancelled {
+                    let due = item.created.addingTimeInterval(7 * 24 * 60 * 60)
+                    if due > now { deadlines.append(due) }
                 }
+            } catch {
+                failures.append("\(dir.lastPathComponent): \(error.localizedDescription)")
             }
-            if totalBytes > maxBytes { deadlines.append(now) }
         }
         for transactionDirectory in transactionDirectories {
-            guard !Task.isCancelled, let items = try? fm.contentsOfDirectory(
-                at: transactionDirectory,
-                includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            let items: [URL]
+            do {
+                items = try fm.contentsOfDirectory(at: transactionDirectory, includingPropertiesForKeys: [.contentModificationDateKey])
+            } catch {
+                failures.append("\(transactionDirectory.lastPathComponent): \(error.localizedDescription)")
+                continue
+            }
             for item in items where !Task.isCancelled {
-                if let due = transactionRetentionCrossing(at: item), due > now {
-                    deadlines.append(due)
+                do {
+                    if let due = try transactionRetentionCrossing(at: item), due > now { deadlines.append(due) }
+                } catch {
+                    failures.append("\(item.lastPathComponent): \(error.localizedDescription)")
                 }
             }
         }
-        if let completionMarkerDirectory,
-           let items = try? fm.contentsOfDirectory(at: completionMarkerDirectory,
-                includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) {
-            for item in items where item.pathExtension == ICloudSyncStatePaths.completedUnarchivedExtension {
-                if let written = try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
-                    deadlines.append(max(written.addingTimeInterval(30 * 24 * 3600), now))
-                }
-            }
-        }
-        return deadlines.min()
+        return (deadlines.min(), failures)
     }
 
     // Last write is the row's updatedAt, so it owns the retention clock.
-    nonisolated static func transactionRetentionCrossing(at url: URL) -> Date? {
-        guard url.pathExtension == "json",
-              let written = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-        else { return nil }
+    nonisolated static func transactionRetentionCrossing(at url: URL) throws -> Date? {
+        guard url.pathExtension == "json" else { return nil }
+        guard let written = try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else {
+            throw CocoaError(.fileReadUnknown)
+        }
         return written.addingTimeInterval(30 * 24 * 60 * 60)
     }
 
     /// Keep active, uncertain and unreadable actions; recovered chats are terminal and retain 30 days. Read only local/current iCloud contents to avoid
     /// blocking; request downloads otherwise and let exact-file events resume pruning.
-    nonisolated static func isTerminalTransaction(at url: URL) -> Bool {
-        guard let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]),
-              let ubiquitous = values.isUbiquitousItem else { return false }
-        if ubiquitous, values.ubiquitousItemDownloadingStatus != .current {
-            try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+    nonisolated static func isTerminalTransaction(at url: URL) throws -> Bool {
+        let values = try url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+        if values.isUbiquitousItem == true, values.ubiquitousItemDownloadingStatus != .current {
+            try FileManager.default.startDownloadingUbiquitousItem(at: url)
             return false
         }
-        guard let data = try? Data(contentsOf: url) else { return false }
+        let data = try Data(contentsOf: url)
         if url.deletingLastPathComponent().lastPathComponent == "chat_transactions" {
-            return iCloudBridge.isTerminalChatTransaction(data)
+            return try iCloudBridge.isTerminalChatTransaction(data)
         }
-        guard let record = try? JSONDecoder().decode(ICloudTransactionRecord.self, from: data),
-              hasCurrentInboxBinding(record, transactionID: url.deletingPathExtension().lastPathComponent) else { return false }
+        let record = try JSONDecoder().decode(ICloudTransactionRecord.self, from: data)
+        guard hasCurrentInboxBinding(record, transactionID: url.deletingPathExtension().lastPathComponent) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
         return record.state == "completed" || record.state == "failed"
-            || (record.action == "chat" && record.state == "unknown")
     }
 
-    /// Thirty-day completion markers outlive the seven-day pending files that could replay a command.
-    @discardableResult
-    nonisolated static func pruneCompletedUnarchivedMarkers(
-        in dir: URL,
-        olderThan retention: TimeInterval = 30 * 24 * 3600,
-        now: Date = Date()
-    ) -> Bool {
-        let fm = FileManager.default
-        guard let items = try? fm.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else { return fm.fileExists(atPath: dir.path) }
-        var failed = false
-        let cutoff = now.addingTimeInterval(-retention)
-        for url in items
-        where url.pathExtension == ICloudSyncStatePaths.completedUnarchivedExtension {
-            guard let modified = try? url.resourceValues(
-                forKeys: [.contentModificationDateKey]
-            ).contentModificationDate else { continue }
-            if modified <= cutoff {
-                do { try fm.removeItem(at: url) }
-                catch { failed = true }
+    /// Only an explicit processed archive or a rejected envelope has finished its inbox lifetime.
+    nonisolated private static func archivedFiles(in directory: URL) throws -> ([ArchivedFile], [String]) {
+        let items = try FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey])
+        var files: [ArchivedFile] = []
+        var failures: [String] = []
+        for url in items {
+            if directory.lastPathComponent == Folder.inbox,
+               !(url.lastPathComponent.hasPrefix("processed_") && url.pathExtension == "done") { continue }
+            do {
+                let values = try url.resourceValues(forKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey])
+                if values.isDirectory == true { continue }
+                guard let created = values.creationDate, let size = values.fileSize, size >= 0, values.isDirectory == false else {
+                    throw CocoaError(.fileReadUnknown, userInfo: [NSFilePathErrorKey: url.path])
+                }
+                files.append(.init(url: url, created: created, size: size))
+            } catch {
+                failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
-        return failed
+        return (files, failures)
     }
 
     /// Nonisolated so blocking scan/delete work stays off the main actor.
     @discardableResult
-    nonisolated static func pruneArchiveDirs(_ dirs: [URL], transactionDirectories: [URL] = []) -> Bool {
+    nonisolated static func pruneArchiveDirs(_ dirs: [URL], transactionDirectories: [URL] = []) -> [String] {
         let fm = FileManager.default
         let now = Date()
         let cutoff = now.addingTimeInterval(-7 * 24 * 3600)
         let maxBytes: Int = 50 * 1024 * 1024
-        var failed = false
+        var failures: [String] = []
         func remove(_ url: URL) -> Bool {
             do {
                 try fm.removeItem(at: url)
                 return true
             } catch {
                 if isNoSuchFileError(error) { return true }
-                failed = true
+                failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
                 nativeLog("[MacSyncEngine] Archive cleanup failed for %@: %@", url.lastPathComponent, error.localizedDescription)
                 return false
             }
         }
         for dirURL in dirs {
-            guard let items = try? fm.contentsOfDirectory(
-                at: dirURL,
-                includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey],
-                options: []) else { continue }
-            // Prune files only; recursive directory deletion could erase younger rejected entries.
-            func isDir(_ u: URL) -> Bool { ((try? u.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false) }
-            for url in items where !isDir(url) {
-                if let created = try? url.resourceValues(forKeys: [.creationDateKey]).creationDate, created < cutoff {
-                    _ = remove(url)
+            do {
+                let (files, metadataFailures) = try archivedFiles(in: dirURL)
+                failures += metadataFailures
+                let remaining = files.filter { $0.created >= cutoff || !remove($0.url) }.sorted { $0.created < $1.created }
+                var totalSize = 0
+                for file in remaining {
+                    let (sum, overflow) = totalSize.addingReportingOverflow(file.size)
+                    guard !overflow else { throw CocoaError(.fileReadCorruptFile) }
+                    totalSize = sum
                 }
-            }
-            let remaining = ((try? fm.contentsOfDirectory(
-                at: dirURL,
-                includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey],
-                options: [])) ?? [])
-                .compactMap { url -> (url: URL, created: Date, size: Int)? in
-                    let values = try? url.resourceValues(forKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey])
-                    guard values?.isDirectory != true else { return nil }
-                    return (url, values?.creationDate ?? .distantFuture, values?.fileSize ?? 0)
-                }.sorted { $0.created < $1.created }
-            var totalSize = remaining.reduce(0) { $0 + $1.size }
-            for file in remaining {
-                guard totalSize > maxBytes else { break }
-                if remove(file.url) { totalSize -= file.size }
+                for file in remaining {
+                    guard totalSize > maxBytes else { break }
+                    if file.created < cutoff { continue }
+                    if remove(file.url) { totalSize -= file.size }
+                }
+            } catch {
+                failures.append("\(dirURL.lastPathComponent): \(error.localizedDescription)")
             }
         }
         for transactionDirectory in transactionDirectories {
-            guard let items = try? fm.contentsOfDirectory(
-                at: transactionDirectory,
-                includingPropertiesForKeys: [.contentModificationDateKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]) else { continue }
+            let items: [URL]
+            do {
+                items = try fm.contentsOfDirectory(at: transactionDirectory,
+                    includingPropertiesForKeys: [.contentModificationDateKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+            } catch {
+                failures.append("\(transactionDirectory.lastPathComponent): \(error.localizedDescription)")
+                continue
+            }
             for item in items {
-                if let due = transactionRetentionCrossing(at: item), due <= now, isTerminalTransaction(at: item) {
-                    _ = remove(item)
+                do {
+                    if let due = try transactionRetentionCrossing(at: item), due <= now, try isTerminalTransaction(at: item) {
+                        _ = remove(item)
+                    }
+                } catch {
+                    failures.append("\(item.lastPathComponent): \(error.localizedDescription)")
                 }
             }
         }
-        return failed
+        return failures
     }
+}
+
+private struct ArchivedFile: Sendable {
+    let url: URL
+    let created: Date
+    let size: Int
 }

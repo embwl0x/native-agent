@@ -83,17 +83,17 @@ package enum AgentWorkspaceEnvironment {
     /// Only a target reference survives a write, never its submitted contents. Reading it is a new gated owner operation, not proof the write succeeded.
     static func readback(tool: String, input: [String: JSONValue]) -> AgentWorkspaceLocation? {
         if tool.hasPrefix("browser.chrome_"), case .int(let tab)? = input["tab_id"] {
-            return .record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)],
+            return .record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tab)],
                 title: "Selected browser page")
         }
         if ["desk_note", "desk_update_item", "desk_set_status", "desk_add_ref"].contains(tool), let handle = input["handle"] {
             return .record(tool: "desk_read", input: ["handle": handle], title: "Updated work")
         }
-        if tool == "messages_send", let thread = input["thread_id"] {
-            return .record(tool: "messages_recent_threads", input: ["thread_id": thread], title: "Messages conversation")
+        if tool == "messages.send", let thread = input["thread_id"] {
+            return .record(tool: "messages.recent", input: ["thread_id": thread], title: "Messages conversation")
         }
-        if tool == "mail_reply", let id = input["message_id"], let expected = input["expected_message_id"] {
-            return .record(tool: "mail_list_recent", input: ["message_id": id, "expected_message_id": expected].merging(
+        if tool == "mail.reply", let id = input["message_id"], let expected = input["expected_message_id"] {
+            return .record(tool: "mail.recent", input: ["message_id": id, "expected_message_id": expected].merging(
                 input.filter { ["expected_account", "expected_account_id", "position"].contains($0.key) }) { a, _ in a }, title: "Email conversation")
         }
         if ["bot_create", "bot_update", "bot_pause"].contains(tool) {
@@ -251,8 +251,8 @@ package enum AgentWorkspaceEnvironment {
             }
             if tool.hasPrefix("browser.chrome_"), case .object(let receipt) = value,
                receipt["tabClosed"] != .bool(true), case .int(let tab)? = receipt["tabId"] {
-                projection.actions.insert(.init(label: "Read this browser page", action: .open(.record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(
-                    tab), "max_nodes": .int(80), "max_text_chars": .int(10_000)], title: "Browser page"))), at: 0)
+                projection.actions.insert(.init(label: "Read this browser page", action: .open(.record(tool: "browser.chrome_snapshot",
+                    input: ["tab_id": .int(tab)], title: "Browser page"))), at: 0)
             }
             return projection
         default: return nil

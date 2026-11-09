@@ -13,9 +13,7 @@ public func makeResidentProviderLLMClient(
     providersRoot: URL? = nil,
     router suppliedRouter: SwiftNativeProviderRouting? = nil,
     lifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
-    streamGuard: ProviderStreamGuardConfig = .fromEnvironment(),
-    processEnvironmentOverride: [String: String]? = nil,
-    stallOnlyTransport: Bool? = nil
+    processEnvironmentOverride: [String: String]? = nil
 ) -> any LLMClient {
     let credentialRoot = providersRoot?.standardizedFileURL
     let router = suppliedRouter ?? SwiftNativeProviderRouting(dataRoot: credentialRoot ?? dataRoot)
@@ -24,30 +22,28 @@ public func makeResidentProviderLLMClient(
     let llm: any LLMClient
     if usesCanonicalBody {
         let telemetryRoot: URL? = credentialRoot == nil ? nil : dataRoot
-        let stallSession = (stallOnlyTransport ?? (streamGuard.wallTimeout == 0))
-            ? ProviderStreamGuard.stallOnlySession : nil
         // Both account-backed adapters resolve the same root as readiness. CodexProcess owns binding its child home to that selected credential.
         llm = SwiftNativeLLMClient(
             router: router,
             codex: CodexProcess(processEnvironmentOverride: processEnvironmentOverride,
                 dataRootOverride: credentialRoot ?? dataRoot),
             anthropic: AnthropicTransport(
-                session: stallSession ?? .shared,
+                session: ProviderHTTP.session,
                 dataRootOverride: credentialRoot,
                 telemetryDataRootOverride: telemetryRoot
             ),
             openAI: OpenAITransport(
-                session: stallSession ?? .shared,
+                session: ProviderHTTP.session,
                 dataRootOverride: credentialRoot,
                 telemetryDataRootOverride: telemetryRoot
             ),
             openAIOAuthDirect: ChatGPTTransport(
-                session: stallSession ?? ChatGPTTransport.productionSession,
+                session: ChatGPTTransport.productionSession,
                 dataRootOverride: credentialRoot ?? dataRoot,
                 telemetryDataRootOverride: telemetryRoot
             ),
             anthropicOAuthDirect: AnthropicOAuthTransport(
-                session: stallSession ?? AnthropicOAuthTransport.productionSession,
+                session: AnthropicOAuthTransport.productionSession,
                 authPathOverride: credentialRoot.map {
                     $0.appendingPathComponent("providers", isDirectory: true)
                         .appendingPathComponent("anthropic_oauth_direct.json")
@@ -55,25 +51,33 @@ public func makeResidentProviderLLMClient(
                 telemetryDataRootOverride: telemetryRoot
             ),
             xaiOAuthDirect: XAIOAuthTransport(
-                session: stallSession ?? .shared,
+                session: ProviderHTTP.session,
                 tokenPathOverride: credentialRoot.map {
                     XAIOAuthTransport.tokenPath(dataRoot: $0)
                 },
                 telemetryDataRootOverride: telemetryRoot
             ),
             moonshot: MoonshotTransport(
-                session: stallSession ?? .shared,
+                session: ProviderHTTP.session,
                 dataRootOverride: credentialRoot,
                 telemetryDataRootOverride: telemetryRoot
             ),
             kimiCode: AnthropicTransport.kimiCode(
-                session: stallSession ?? .shared,
+                session: ProviderHTTP.session,
                 dataRootOverride: credentialRoot,
                 telemetryDataRootOverride: telemetryRoot
             ),
-            openRouter: OpenRouterTransport(session: stallSession ?? .shared, dataRootOverride: credentialRoot),
+            meta: AnthropicTransport(
+                session: ProviderHTTP.session,
+                endpoint: URL(string: "https://api.meta.ai/v1/messages"),
+                dataRootOverride: credentialRoot,
+                telemetryDataRootOverride: telemetryRoot,
+                providerId: "meta",
+                credentialConfigFile: "meta.json",
+                firstPartyAnthropicToolContract: false
+            ),
+            openRouter: OpenRouterTransport(session: ProviderHTTP.session, dataRootOverride: credentialRoot),
             diagnosticDataRoot: dataRoot,
-            streamGuardConfig: streamGuard,
             lifecycleObserver: lifecycleObserver,
             moonshotCatalogDataRoot: credentialRoot ?? PersistenceCore.defaultDataRoot()
         )
@@ -175,7 +179,7 @@ public enum LLMError: Error, Equatable, LocalizedError {
     case invalidResponse(status: Int)
     /// Mid-stream provider errors stay distinct from pre-stream HTTP failures.
     case providerError(message: String)
-    /// Missing terminal evidence or empty output is truncation; neither can masquerade as a clean reply.
+    /// Missing terminal evidence is truncation, even for a request that permits a silent answer.
     case streamTruncated(message: String)
     /// Output-budget cuts preserve partial prose and withhold tools.
     case outputLengthLimit(partial: String)
@@ -222,10 +226,10 @@ public final class SwiftNativeLLMClient: LLMClient {
     private let moonshot: (any LLMTransport)?
     /// Kimi Code's exact subscription route reuses the Anthropic Messages wire.
     private let kimiCode: (any LLMTransport)?
+    private let meta: (any LLMTransport)?
     /// A missing OpenRouter adapter is notConfigured for that route; it cannot borrow a first-party adapter.
     private let openRouter: (any LLMTransport)?
     private let diagnosticDataRoot: URL?
-    private let streamGuardConfig: ProviderStreamGuardConfig
     private let lifecycleObserver: (any LLMCallLifecycleObserving)?
     /// Catalogs must use this body's exact root so a secondary runtime cannot consult the live user's cache.
     private let moonshotCatalogDataRoot: URL
@@ -240,9 +244,9 @@ public final class SwiftNativeLLMClient: LLMClient {
         xaiOAuthDirect: (any LLMTransport)? = nil,
         moonshot: (any LLMTransport)? = nil,
         kimiCode: (any LLMTransport)? = nil,
+        meta: (any LLMTransport)? = nil,
         openRouter: (any LLMTransport)? = nil,
         diagnosticDataRoot: URL? = nil,
-        streamGuardConfig: ProviderStreamGuardConfig = .fromEnvironment(),
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
         moonshotCatalogDataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
@@ -255,9 +259,9 @@ public final class SwiftNativeLLMClient: LLMClient {
         self.xaiOAuthDirect = xaiOAuthDirect
         self.moonshot = moonshot
         self.kimiCode = kimiCode
+        self.meta = meta
         self.openRouter = openRouter
         self.diagnosticDataRoot = diagnosticDataRoot
-        self.streamGuardConfig = streamGuardConfig
         self.lifecycleObserver = lifecycleObserver
         self.moonshotCatalogDataRoot = moonshotCatalogDataRoot
     }
@@ -349,6 +353,7 @@ public final class SwiftNativeLLMClient: LLMClient {
         if case .outputLengthLimit = error as? LLMError { return error }
         // This owns valid pipe prefixes and exact invalid bytes. A prose-only Diagnostic would discard the evidence needed to repair the encoding.
         if error is CodexOutputEncodingFailure { return error }
+        if error is ProviderRecovery.Stopped { return error }
         if ProviderFailure.classify(error) == .contextTooLong { return ProviderFailure.normalize(error) }
         let detail = ProviderFailure.diagnosticDescription(error)
         let repair = ProviderFailure.repair(error, provider: started.providerId, model: started.model, surface: started.surface,
@@ -356,7 +361,7 @@ public final class SwiftNativeLLMClient: LLMClient {
         let normalized = ProviderFailure.normalize(error) as? ProviderFailure.Diagnostic
         return ProviderFailure.Diagnostic(cause: ProviderFailure.classify(error) ?? .malformedResponse, detail: detail,
             deadlineExpired: normalized?.deadlineExpired ?? false, admitted: normalized?.admitted ?? false, repair: repair,
-            tries: normalized?.tries ?? 1)
+            tries: normalized?.tries ?? 1, retryAfter: normalized?.retryAfter)
     }
 
     private struct AdapterResolution: Sendable {
@@ -400,7 +405,7 @@ public final class SwiftNativeLLMClient: LLMClient {
         try validateCatalogAvailability(resolution)
         var routedCall = call
         routedCall.admission = try admission.modelAdmission
-        return try adapter(for: resolution, tools: nil, call: routedCall).adapter
+        return try adapter(for: resolution, tools: nil, call: routedCall)
             .requestOutputTokens(model: resolution.model, call: routedCall)
     }
 
@@ -409,34 +414,37 @@ public final class SwiftNativeLLMClient: LLMClient {
         for resolution: AdapterResolution,
         tools: [LLMToolSchema]?,
         call: LLMCall
-    ) throws -> (adapter: any LLMTransport, label: String) {
-        let chosen: (adapter: any LLMTransport, label: String)
+    ) throws -> any LLMTransport {
+        let chosen: any LLMTransport
         switch resolution.providerId {
         case "openrouter":
             guard let openRouter else { throw LLMError.notConfigured(provider: "openrouter") }
-            chosen = (openRouter, "openrouter")
-        case "anthropic": chosen = (anthropic, "anthropic")
+            chosen = openRouter
+        case "anthropic": chosen = anthropic
         case "anthropic_oauth_direct":
             guard let anthropicOAuthDirect else { throw LLMError.notConfigured(provider: "anthropic_oauth_direct") }
-            chosen = (anthropicOAuthDirect, "anthropic_oauth_direct")
+            chosen = anthropicOAuthDirect
         case "kimi-code":
             guard let kimiCode else { throw LLMError.notConfigured(provider: "kimi-code") }
-            chosen = (kimiCode, "kimi-code")
-        case "openai": chosen = (openAI, "openai")
+            chosen = kimiCode
+        case "openai": chosen = openAI
+        case "meta":
+            guard let meta else { throw LLMError.notConfigured(provider: "meta") }
+            chosen = meta
         case "openai_oauth_direct":
             guard let openAIOAuthDirect else { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
-            chosen = (openAIOAuthDirect, "openai_oauth_direct")
+            chosen = openAIOAuthDirect
         case "xai_oauth_direct":
             guard let xaiOAuthDirect else { throw LLMError.notConfigured(provider: "xai_oauth_direct") }
-            chosen = (xaiOAuthDirect, "xai")
+            chosen = xaiOAuthDirect
         case "moonshot":
             guard let moonshot else { throw LLMError.notConfigured(provider: "moonshot") }
-            chosen = (moonshot, "moonshot")
-        case "codex": chosen = (codex, "codex")
+            chosen = moonshot
+        case "codex": chosen = codex
         default: throw LLMError.notConfigured(provider: resolution.providerId)
         }
         // A marker transport (the Claude subscription) is never handed a tools array; reaching here with one is this body's own disagreement, said as such.
-        if tools != nil, type(of: chosen.adapter).toolWire == .textMarkers {
+        if tools != nil, type(of: chosen).toolWire == .textMarkers {
             let setting = "providers." + (ProviderSurfaceGroups.group(for: call.surface)
                 ?? ProviderSurfaceGroups.chat).id + "_model"
             throw ToolFailureError(
@@ -503,17 +511,14 @@ public final class SwiftNativeLLMClient: LLMClient {
                             $0.requestPlan = call.requestPlan
                         }
                     }
-                    try self.streamGuardConfig.validate()
                     let routingSnapshot = try await self.checkedRoutingSnapshot(call: call)
                     let admission = try routingSnapshot.routeAdmission(for: call.surface,
                         suppliedModel: model ?? "", call: call)
                     if call.replyWork?.isStopped == true { throw CancellationError() }
                     var routedCall = call
                     routedCall.admission = try admission.modelAdmission
-                    routedCall.wallOwned = true
                     if routedCall.traceDataRoot == nil { routedCall.traceDataRoot = self.diagnosticDataRoot }
                     let held = routedCall
-                    var config = self.streamGuardConfig
                     if let budget = held.turn?.tokenBudget, !budget.beginRequest() {
                         throw LLMError.outputLengthLimit(partial: budget.partialReply)
                     }
@@ -524,17 +529,13 @@ public final class SwiftNativeLLMClient: LLMClient {
                     lifecycle = started
                     try self.validateCatalogAvailability(resolution)
                     try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) {
-                        let (adapter, providerLabel) = try self.adapter(for: resolution, tools: tools, call: held)
+                        let adapter = try self.adapter(for: resolution, tools: tools, call: held)
                         let kind = LLMMessagesStreamKind.incremental
                         streamKind = kind
-                        if let deadline = await self.lifecycleObserver?.firstOutputDeadline(
-                            provider: resolution.providerId, model: resolution.model, streamKind: kind.rawValue, requestBytes: requestBytes) {
-                            config.firstOutput = deadline
-                        }
                         try await LLMMessagesStreamKind.$current.withValue(kind) {
                         let stream = ProviderStreamGuard.wrap(makeUpstream: { wire in adapter.streamMessages(
                             messages: messages, system: system, model: resolution.model, tools: tools, call: wire) },
-                            config: config, providerLabel: providerLabel, isOutput: { _ in true }, call: held)
+                            call: held)
                         try Task.checkCancellation()
                         held.lifetime.dispatched?()
                             for try await event in stream {
@@ -635,17 +636,10 @@ extension LLMMessageStreamEvent {
         var ownedCall = call
         ownedCall.replyWork = work
         let held = ownedCall
-        // The collector holds its turn, route and stop owner through cancellation-independent settlement.
-        let collector = Task {
-            do {
-                if work.isStopped { throw CancellationError() }
-                return Result<String, Error>.success(try await collect(events(held), using: recorder, work: work, call: held))
-            } catch { return Result<String, Error>.failure(error) }
+        return try await work.reply {
+            if work.isStopped { throw CancellationError() }
+            return try await collect(events(held), using: recorder, work: work, call: held)
         }
-        let result = await withTaskCancellationHandler {
-            await settle { await collector.value }
-        } onCancel: { work.stop() }
-        return try result.get()
     }
 
     private static func collect(
@@ -677,7 +671,7 @@ extension LLMMessageStreamEvent {
             if work.isStopped { throw CancellationError() }
             return output(trimmed: true)
         } catch {
-            // A deadline or decoding failure also stops and joins live work. Never publish a terminal partial while its producer still runs.
+            // A decoding failure also joins live work. Never publish a terminal partial while its producer still runs.
             let stoppedByCaller = work.isStopped
             work.stop()
             await work.join()

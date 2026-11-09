@@ -1,38 +1,8 @@
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `DeskStatus.swift` | Desk and task status marks, status words and kind words |
+// Blueprint: | `DeskStatus.swift` | Desk and task status words |
 
-// MARK: - Desk words and marks (shared with Desk tasks)
-
-/// Status words carry meaning; keep marks uncoloured so colour does not become a second status vocabulary.
-struct DeskStatusMark: View {
-    let status: String
-    var movementAt: String? = nil
-    @Environment(\.scenePhase) private var scenePhase
-
-    var body: some View {
-        let movement = movementAt.flatMap(UserDisplayFormatters.parseISOTimestamp)
-        let expiry = movement?.addingTimeInterval(DeskActivityState.movementWindow)
-        return TimelineView(.explicit(expiry.map { [$0] } ?? [])) { context in
-            switch status.lowercased() {
-            case "now", "running", "active":
-                let active = scenePhase == .active && movement.map { $0 <= context.date } == true
-                    && expiry.map { context.date < $0 } == true
-                PulsingDot(color: AlivePalette.text, size: 7, isActive: active)
-            case "done", "completed", "succeeded":
-                Image(systemName: "checkmark")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(AlivePalette.secondary)
-            case "next":
-                Circle().fill(AlivePalette.secondary).frame(width: 7, height: 7)
-            default:
-                Circle().strokeBorder(AlivePalette.secondary, lineWidth: 1.5).frame(width: 8, height: 8)
-            }
-        }
-        .frame(width: 12, height: 12)
-        .accessibilityHidden(true)
-    }
-}
+// MARK: - Desk words
 
 enum DeskStatusWords {
     static func word(for status: String) -> String {
@@ -52,17 +22,6 @@ enum DeskStatusWords {
         default:
             if status.lowercased().contains("approval") { return "Needs your yes" }
             return AliveWords.humanized(status.lowercased())
-        }
-    }
-}
-
-enum DeskKindWords {
-    static func word(for kind: String) -> String {
-        switch kind.lowercased() {
-        case "gh": return "GitHub"
-        case "standing": return "Standing"
-        case "watch": return "Watch"
-        default: return AliveWords.humanized(kind.lowercased())
         }
     }
 }

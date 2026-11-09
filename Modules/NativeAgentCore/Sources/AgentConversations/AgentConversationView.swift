@@ -4,13 +4,10 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentConversationView.swift` | `AgentConversationView`, `read`, `view`, `conversationPresentation`, `compact`, `queueProjection`, `withQueue`, `withLive`, `expiringReply`, `dotReply`, `claudeWorklogTail`, `claudeWorklog` |
+// Blueprint: | `AgentConversationView.swift` | Retained send evidence, live progress, queues and conversation presentation. |
 
 /// Presentation consumes authorized reads; session state transitions remain with the session owner.
 public enum AgentConversationView {
-    public static let claudeWorklogURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude/state/claude-worklog.jsonl")
-
     public static func claudeWorklogTail(_ url: URL) throws -> [[String: Any]] {
         guard let read = try SwiftNativePersistenceCore.tailPhysicalLines(url, limit: .max, maxBytes: 65_536)
         else { throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: url.path]) }
@@ -38,7 +35,7 @@ public enum AgentConversationView {
         return rows
     }
 
-    public static func claudeWorklog(input: [String: JSONValue] = [:]) -> JSONValue {
+    @concurrent public static func claudeWorklog(input: [String: JSONValue] = [:]) async -> JSONValue {
         var since: Date?
         if case .string(let text)? = input["since"], !text.isEmpty {
             since = text == "today" ? Calendar.current.startOfDay(for: Date()) : NativeTimestampFormat.parseISO8601(text)
@@ -53,26 +50,20 @@ public enum AgentConversationView {
             }
             limit = Int(count)
         }
+        let claudeWorklogURL = InstallPaths.current.claudeWorklog
         let rows: [[String: Any]]
         do { rows = try claudeWorklogTail(claudeWorklogURL) }
         catch CocoaError.fileReadNoSuchFile {
-            return .object(["status": .string("absent"), "detail": .string("Claude has no worklog.")])
+            return .object(["status": .string("unavailable"), "effects": .string("none"),
+                "detail": .string("The advertised worklog is missing at \(claudeWorklogURL.path); restore its writer or remove the advertised read."),
+                "remedy": Repair.remedy(owner: claudeWorklogURL.path, nextCall: nil, tap: nil)])
         } catch let failure as ToolFailureError {
             var fields = failure.failureEvidence(defaultCode: "agent_worklog_incomplete")
             fields["status"] = .string("unavailable")
             fields["detail"] = .string(failure.message)
             return .object(fields)
         } catch {
-            let attributes = try? FileManager.default.attributesOfItem(atPath: claudeWorklogURL.path)
-            let canRepairMode = (error as? CocoaError)?.code == .fileReadNoPermission
-                && attributes?[.type] as? FileAttributeType == .typeRegular
-                && (attributes?[.ownerAccountID] as? NSNumber)?.uint32Value == getuid()
-                && (attributes?[.posixPermissions] as? NSNumber).map { $0.intValue & 0o400 == 0 } == true
-            let command = "chmod u+r -- '" + claudeWorklogURL.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
-            let remedy: JSONValue = canRepairMode
-                ? Repair.remedy(owner: claudeWorklogURL.path + ": owner read permission", nextCall: .object([
-                    "tool": .string("app"), "input": .object(["action": .string("shell.run"), "args": .object(["cmd": .string(command)])])]), tap: nil)
-                : .object(["kind": .string("inspect"),
+            let remedy: JSONValue = .object(["kind": .string("inspect"),
                     "instruction": .string("""
                         Inspect the path with next_call to identify the failed read's cause. If macOS denies access, the person must grant it in \
                         System Settings > Privacy & Security > Full Disk Access > NativeAgent switch. Inspection alone changes nothing.
@@ -100,48 +91,27 @@ public enum AgentConversationView {
             "detail": .string(entries.isEmpty ? "No recent worklog entries match this read." : "Claude's recorded work; not independently verified.")])
     }
 
-    /// Inbound-only transport cannot owe an outbound reply; show retained conversation without pending state.
+    /// An available outbound transport can owe a reply until its owner settles or the caller cancels.
     public static func dotReply(_ receipt: JSONValue, sentAt: Date?) -> JSONValue {
-        guard let sentAt, ChatGPTDotIPCTransport.available, case .object(var fields) = receipt else { return receipt }
+        guard sentAt != nil, ChatGPTDotIPCTransport.available, case .object(var fields) = receipt else { return receipt }
         fields["status"] = .string("waiting")
-        fields["reply_deadline"] = .string(ISO8601DateFormatter().string(from: sentAt.addingTimeInterval(1800)))
-        return expiringReply(.object(fields))
-    }
-
-    package static func expiringReply(_ receipt: JSONValue) -> JSONValue {
-        guard case .object(var fields) = receipt, fields["reply"] == nil, fields["answer"] == nil,
-              fields["terminal"] != .bool(true), fields["completed"] != .bool(true),
-              case .string(let status)? = fields["status"],
-              ["sending", "waiting", "enqueued", "queued", "running", "working", "submitted", "accepted", "delivering", "pending",
-                  "delivery_unknown", "outcome_unknown", "no_reply"].contains(status),
-              case .string(let stamp)? = fields["reply_deadline"],
-              let deadline = ISO8601DateFormatter().date(from: stamp), deadline <= Date() else { return receipt }
-        if fields["reply_observation"] == .string("running") {
-            fields["status"] = .string("no_reply_expired"); fields["reply_state"] = .string("no_reply_expired")
-            fields["detail"] = .string(
-                "The reply deadline has elapsed; local observation is settling. No finished answer has been confirmed; nothing was resent.")
-            return .object(fields)
-        }
-        fields["status"] = .string("no_reply_expired")
-        fields["reply_state"] = .string("no_reply_expired")
-        fields["terminal"] = .bool(true)
-        fields["automatic_resend"] = .bool(false)
-        fields["ended_at"] = .string(stamp)
-        fields["detail"] = .string("No reply arrived before the reply deadline. Sending again is your choice; any late answer still arrives.")
         return .object(fields)
     }
 
     static func queueProjection(_ row: AgentConversationRecord?) -> JSONValue? {
         guard let row, let queued = row.queued, !queued.isEmpty else { return nil }
         return .array(queued.map { item in
-            // Only a saved hold reads as held; launch resumes a queue that has no sender.
             let going = item.id == row.queueReservation
-            return .object(["id": .string(item.id), "text": .string(AgentScreen.clip(item.text, 400)),
+            let refused = item.notSentReason != nil
+            var fields: [String: JSONValue] = ["id": .string(item.id), "text": .string(AgentScreen.clip(item.text, 400)),
                 "queued_at": .string(ISO8601DateFormatter().string(from: item.queuedAt)),
                 "by_person": .bool(item.byPerson == true),
-                "state": .string(item.held == DataRootLife.stoppedReason ? "stopped" : item.held != nil ? "held" : going ? "sending" : "queued"),
+                "state": .string(item.held == DataRootLife.stoppedReason ? "stopped" : refused ? "not_sent"
+                    : item.waitingForMac == true ? "held" : going ? "sending" : "queued"),
                 "detail": .string(item.held ?? (going ? "Going now: the reply ahead of it has settled."
-                    : "Goes by itself when the reply ahead of it settles."))])
+                    : "Goes by itself when the reply ahead of it settles."))]
+            if refused { fields["terminal"] = .bool(true); fields["sent"] = .bool(false) }
+            return .object(fields)
         })
     }
 
@@ -160,13 +130,14 @@ public enum AgentConversationView {
         if fields["reply"] != nil, case .array? = fields["conversation"] { fields.removeValue(forKey: "conversation") }
         var thread: [String: JSONValue] = ["conversation": .string(row.label), "exchanges": .int(Int64(row.exchanges?.count ?? 0)),
             "state": .string(row.phase), "history": .string("agent_read shows the conversation, both directions.")]
-        if let id = AgentConversationSession.threadID(row.agent) { thread["thread_id"] = .string(id) }
+        if let id = AgentConversationSession.threadID(row) { thread["thread_id"] = .string(id) }
         fields["thread"] = .object(thread)
         return .object(fields)
     }
 
-    static func view(_ row: AgentConversationRecord, details: Bool, read: Bool = false, dataRoot: URL,
-                     historyBefore: String? = nil, historyExchange: String? = nil, includeHistory: Bool = true) -> JSONValue {
+    package static func view(_ row: AgentConversationRecord, details: Bool, read: Bool = false, dataRoot: URL,
+                     historyBefore: String? = nil, historyExchange: String? = nil, includeHistory: Bool = true,
+                     historyLimit: Int = 8) -> JSONValue {
         let receipt = row.sendReceipt ?? .object(["status": .string("unknown")])
         guard case .object = receipt else { return receipt }
         let peers: [AgentPeerContact]
@@ -185,7 +156,7 @@ public enum AgentConversationView {
         var result = details ? receipt : conversationPresentation(row, transport: peer?.transport, prefix: read ? "last_send_" : "")
         if history {
             result = AgentConversationHistoryView.adding(to: result, agent: row.agent, name: row.name,
-                before: historyBefore, exchange: historyExchange, dataRoot: dataRoot, peers: peers, lines: lines)
+                before: historyBefore, exchange: historyExchange, limit: historyLimit, dataRoot: dataRoot, peers: peers, lines: lines)
         }
         result = withLive(result, row: row, dataRoot: dataRoot)
         guard case .object(var shown) = result else { return result }
@@ -193,7 +164,7 @@ public enum AgentConversationView {
             shown["can_reply_detail"] = .string(presence.detail)
             result = .object(shown)
         }
-        if let id = AgentConversationSession.threadID(row.agent) {
+        if let id = AgentConversationSession.threadID(row) {
             shown["thread_id"] = .string(id)
             result = .object(shown)
         }
@@ -305,9 +276,9 @@ public enum AgentConversationView {
             "receipt_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages"] {
             if let field = value[key] ?? root[key] { result[key] = field }
         }
-        for key in ["reply_state", "reply_deadline", "automatic_resend", "read", "execution", "completed", "terminal", "needs_input",
+        for key in ["reply_state", "automatic_resend", "read", "execution", "completed", "terminal", "needs_input",
             "needs_authentication", "sent", "delivery", "effects", "argument_path", "accepted", "reason", "error", "execution_error", "healed",
-                "repair", "remedy", "harness_item", "delivered", "delivered_at"] {
+                "repair", "remedy", "body_item", "delivered", "delivered_at"] {
             if let field = value[key] ?? root[key] { lastSend[key] = field }
         }
         if row.phase != "sending", row.sendFailed { lastSend["delivery"] = .string("failed") }
@@ -316,8 +287,7 @@ public enum AgentConversationView {
             let automatic = row.automaticRead || row.readInput != nil
             lastSend["detail"] = .string(transport == .desktop
                 ? """
-                    \(row.name) is answering in its own chat; the answer is read from there and lands on this exchange by itself (within three \
-                    minutes). Do not resend this message.
+                    \(row.name) is answering in its own chat; the answer is read from there and lands on this exchange by itself.
                     """
                 : AgentConversationSession.backgroundSend(row)
                 ? root["delivery"] == .string("unconfirmed")
@@ -327,7 +297,7 @@ public enum AgentConversationView {
                         """
                     : """
                         \(row.name) is working on it. Its reply comes to you as a turn by itself when it lands (wait on this conversation returns \
-                        it instead); do not resend this message.
+                        it instead).
                         """
                 : automatic
                 ? "Waiting for \(row.name). NativeAgent will bring the answer back; no repeated checks or resend needed."

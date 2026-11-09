@@ -10,8 +10,8 @@ extension AgentScreen {
 
     static let families: [Family] = [
         .init(name: "contacts", about: "people in Contacts", tools: ["contacts_"]),
-        .init(name: "notes", about: "Apple Notes", tools: ["notes_"]),
-        .init(name: "music", about: "Music: playing, library, playlists", tools: ["music_"]),
+        .init(name: "notes", about: "Apple Notes", tools: ["notes."]),
+        .init(name: "music", about: "Music: playing, library, playlists", tools: ["music."]),
         .init(name: "clipboard", about: "the Mac clipboard", tools: ["clipboard_"]),
         .init(name: "images", about: "make a picture", tools: ["image_generate"]),
     ]

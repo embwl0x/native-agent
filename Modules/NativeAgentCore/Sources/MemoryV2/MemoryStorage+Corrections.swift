@@ -1,7 +1,13 @@
 import Foundation
 import GRDB
 import PersistenceCore
-// Blueprint: | `MemoryStorage+Corrections.swift` | `MemoryStorage`: idempotent canonical correction occurrences |
+// Blueprint: | `MemoryStorage+Corrections.swift` | `MemoryStorage`, `correctionMoments`: idempotent canonical correction occurrences; session-and-time read |
+
+/// When and in which session the person corrected the agent; the ledger's own record, without the memory's words.
+public struct CorrectionMoment: Sendable, Equatable {
+    public let session: String?
+    public let at: Date
+}
 
 extension MemoryStorage {
     struct CorrectionOccurrence: Sendable {
@@ -92,20 +98,45 @@ extension MemoryStorage {
         await pokeProjectionHooks(saved)
     }
 
+    /// A window starting before the ledger's complete coverage throws: an uncovered window is never read as fewer corrections.
+    private static func requireCorrectionCoverage(from start: Date, in db: Database) throws {
+        guard let since = try Double.fetchOne(db, sql: "SELECT complete_since FROM correction_ledger_state WHERE id = 1"),
+              since.isFinite else {
+            throw MemoryStorageError.databaseUnavailable("correction ledger coverage is unavailable")
+        }
+        guard start.timeIntervalSince1970 >= since else {
+            throw MemoryStorageError.databaseUnavailable(
+                """
+                    Complete correction history is available only since \(Date(timeIntervalSince1970: since).ISO8601Format()); earlier duplicate previews \
+                    discarded occurrences.
+                    """)
+        }
+    }
+
+    /// Session and time of each correction in (start, end], under the same coverage law as `correctionOccurrences`; no memory text is read.
+    func correctionMoments(from start: Date, to end: Date) async throws -> [CorrectionMoment] {
+        try await dbPool.read { db in
+            try Self.requireCorrectionCoverage(from: start, in: db)
+            return try Row.fetchAll(db, sql: """
+                SELECT c.session_id AS correction_session, c.occurred_at AS correction_date
+                FROM correction_occurrences c JOIN memories ON memories.id = c.memory_id
+                WHERE c.occurred_at > ? AND c.occurred_at <= ? AND memories.status != 'deleted'
+                ORDER BY c.occurred_at, c.memory_id, c.origin_id
+                """, arguments: [start.timeIntervalSince1970, end.timeIntervalSince1970]).map { row in
+                    let instant: Double = try row.decode(forColumn: "correction_date")
+                    guard instant.isFinite else {
+                        throw MemoryStorageError.invalidTemporalEvidence("correction occurrence time is not finite")
+                    }
+                    let session: String? = try row.decode(forColumn: "correction_session")
+                    return CorrectionMoment(session: session, at: Date(timeIntervalSince1970: instant))
+                }
+        }
+    }
+
     /// Full owner record for the window. Failure or incomplete retained history throws; neither is presented as zero or a partial total.
     func correctionOccurrences(from start: Date, to end: Date) async throws -> [CorrectionOccurrence] {
         try await dbPool.read { db in
-            guard let since = try Double.fetchOne(db, sql: "SELECT complete_since FROM correction_ledger_state WHERE id = 1"),
-                  since.isFinite else {
-                throw MemoryStorageError.databaseUnavailable("correction ledger coverage is unavailable")
-            }
-            guard start.timeIntervalSince1970 >= since else {
-                throw MemoryStorageError.databaseUnavailable(
-                    """
-                        Complete correction history is available only since \(Date(timeIntervalSince1970: since).ISO8601Format()); earlier duplicate previews \
-                        discarded occurrences.
-                        """)
-            }
+            try Self.requireCorrectionCoverage(from: start, in: db)
             return try Row.fetchAll(db, sql: """
                 SELECT memories.*, c.origin_id AS correction_origin, c.at AS correction_at,
                        c.occurred_at AS correction_date, c.session_id AS correction_session,
@@ -129,6 +160,11 @@ extension MemoryStorage {
 }
 
 extension SwiftNativeMemoryV2 {
+    /// Corrections in (since, through] as session and time from the canonical ledger; a window the ledger does not cover throws.
+    public static func correctionMoments(dataRoot: URL, since: Date, through: Date) async throws -> [CorrectionMoment] {
+        try await resolvedStorage(dataRoot: dataRoot).correctionMoments(from: since, to: through)
+    }
+
     func repeatCorrection(id: String, source: String, turnMetadata: [String: JSONValue], context: MemoryWriteContext) async throws {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }

@@ -42,11 +42,15 @@ extension Keyring {
     }
 
     /// Every destination must match the secret's grant, including the current executable identity.
-    public static func granted(_ name: String, hosts: [String], programs: [String]) -> Bool {
-        guard let entry = try? entry(name) else { return false }
-        return Set(hosts).isSubset(of: entry.hosts) && programs.allSatisfy { path in
-            AgentHostCommandLines.identity(ofExecutable: path).map { entry.programs.contains(Program(path: path, identity: $0)) } == true
+    public static func granted(_ entry: Entry, hosts: [String], programs: [String]) throws -> Bool {
+        guard Set(hosts).isSubset(of: entry.hosts) else { return false }
+        for path in programs {
+            guard let identity = AgentHostCommandLines.identity(ofExecutable: path) else {
+                throw Refusal(code: "program_identity_unavailable", message: "The identity of program \(path) could not be read; its grant is unverified.")
+            }
+            guard entry.programs.contains(Program(path: path, identity: identity)) else { return false }
         }
+        return true
     }
 
     /// Bind grants to the destinations shown on the card. Refuse stale generations and closed cards so an earlier sign-in cannot overwrite a newer
@@ -250,17 +254,12 @@ extension NativeOAuthFlow {
         }
         let code: String
         do {
-            switch validateCallback(try await server.wait(timeoutSeconds: 300, expectedState: state), expectedState: state,
+            switch validateCallback(try await server.wait(expectedState: state), expectedState: state,
                                     providerErrorMessage: { _ in "The service rejected browser sign-in." }) {
             case .code(let returned): code = returned
             case .failure(let reason):
                 return "oauth_callback_invalid: \(reason) Start a new sign-in with Try again on the \(name) card."
             }
-        } catch OAuthLoopbackCallbackError.timedOut {
-            return """
-                oauth_callback_timeout: No browser callback arrived within 300 seconds. Choose Try again on the \(name) card and finish browser sign-in \
-                within five minutes.
-                """
         } catch OAuthLoopbackCallbackError.canceled {
             return "oauth_sign_in_cancelled: Sign-in was cancelled. Leave it stopped; no further action is needed."
         } catch is CancellationError {

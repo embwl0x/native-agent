@@ -1,6 +1,5 @@
 import StandingBots
 import Foundation
-import Observation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -9,59 +8,31 @@ import Cognition
 import DeviceSync
 import ChatToolRuntime
 import AuthoredCapabilities
+import ApprovalTransactions
 // Blueprint: | `EngineProviders.swift` | One checked root-specific settings/catalog owner across surfaces |
 
 /// Share checked root-specific provider settings, catalog and routing across pickers, setup, Telegram and phone.
 @MainActor
-@Observable
 public final class ProvidersFacade {
     public nonisolated let dataRoot: URL
 
     public var connections: [ProviderInfo] { settings?.providers ?? [] }
-    public enum Readiness: Equatable, Sendable {
-        case loading, ready, needsConnection
-        case unavailable(String)
-    }
-    public var readiness: Readiness {
-        if let settingsError { return .unavailable(settingsError) }
-        guard settings != nil else { return .loading }
-        return hasReadyConnection ? .ready : .needsConnection
-    }
     public var catalog: ModelCatalogResponse? { settings?.catalog }
-    public private(set) var settings: SettingsSnapshot?
+    public private(set) var settings: ProviderSettingsSnapshot?
     public private(set) var settingsError: String?
-    @ObservationIgnored lazy var settingsReads = LatestRead()
-    @ObservationIgnored weak var facePages: PartFaces?
-    var providerProbeStarts: [String: Date] = [:]
-    var catalogRefreshStarted: Date?
-    public var codexAuth: CodexAuthStatus?
-    @ObservationIgnored private let codexAuthRead = LatestRead()
+    lazy var settingsReads = LatestRead()
+    weak var facePages: PartFaces?
+    var providerProbeStarts: [String: Date] = [:] { didSet { publishProviderState() } }
+    var catalogRefreshStarted: Date? { didSet { publishProviderState() } }
+    var catalogRefreshTask: Task<SettingsRefreshOutcome, Never>?
+    public var codexAuth: CodexAuthStatus? { didSet { publishProviderState() } }
+    private let codexAuthRead = LatestRead()
 
     public func refreshCodexAuth() async throws -> CodexAuthStatus {
         try await codexAuthRead.read({ try await codexAuthStatus() }, publish: { codexAuth = $0 })
     }
-    /// Share effective route and context evidence per conversation across surfaces.
-    @MainActor public struct SessionPresentation {
-        public let contract: BotChatContract?
-        public var choice: ProviderTurnChoice?
-        public let context: SessionContextStatus?
-        public let error: String?
-        fileprivate var settings: SettingsSnapshot?
-        public var providerGroups: [ChatComposerModelGroup] {
-            ChatComposerModelGroup.groups(connections: settings?.providers ?? [], catalog: settings?.catalog,
-                                          providerID: choice?.provider ?? "")
-        }
-        public var selectedModel: ModelCatalogItem? {
-            providerGroups.first { $0.id == choice?.provider }?.models.first { $0.id == choice?.model }
-        }
-        public var efforts: [ReasoningEffortOption] {
-            ProvidersFacade.reasoningOptions(from: settings?.catalog, selectedModel: selectedModel)
-        }
-        public var supportsFast: Bool { selectedModel?.supportsFast == true }
-        public var fastIsOn: Bool { choice?.fast == true && (contract != nil || supportsFast) }
-    }
-    public private(set) var sessions: [String: SessionPresentation] = [:]
-    @ObservationIgnored private var sessionReads: [String: LatestRead] = [:]
+    private var sessionReads: [String: LatestRead] = [:]
+    private var faceDeliveries: [UUID: FaceDeliveryReceipt] = [:]
     /// Mounts own observation independently so another window cannot cancel this session’s reads.
     public func observeSession(_ sessionID: String) async {
         var paths = ["providers/surfaces.json", "providers/active.json", "providers",
@@ -78,13 +49,23 @@ public final class ProvidersFacade {
     }
 
     @discardableResult
-    public func refreshSession(_ sessionID: String) async -> SessionPresentation {
+    public func refreshSession(_ sessionID: String) async -> ProviderSessionPresentation {
         let read = sessionReads[sessionID] ?? LatestRead()
         sessionReads[sessionID] = read
-        return await read.read({ await self.readSession(sessionID) }, publish: { sessions[sessionID] = $0 })
+        return await read.read({ await self.readSession(sessionID) }, publish: { faceChanges.yield(.session(sessionID, $0)) })
     }
 
-    private func readSession(_ sessionID: String) async -> SessionPresentation {
+    public func deliverFaces() async throws {
+        let id = UUID()
+        let receipt = FaceDeliveryReceipt()
+        faceDeliveries[id] = receipt
+        defer { faceDeliveries.removeValue(forKey: id) }
+        if case .terminated = faceChanges.yield(.delivery(receipt)) { await receipt.close() }
+        try await receipt.wait()
+    }
+
+    @concurrent private nonisolated func readSession(_ sessionID: String) async -> ProviderSessionPresentation {
+        let settings = await self.settings
         let contract = await BotChatContract.checked(sessionID, dataRoot: dataRoot)
         var choice = contract?.choice
         do {
@@ -101,24 +82,25 @@ public final class ProvidersFacade {
                 context = try await RuntimeReadouts.getSessionContext(sessionId: sessionID,
                     model: choice.model, providerID: choice.provider, dataRoot: dataRoot)
             } else { context = nil }
-            let read = SessionPresentation(contract: contract, choice: choice, context: context, error: contract?.modelChoiceProblem, settings: settings)
-            return read
+            return ProviderSessionPresentation(controls: .init(contract: contract.map { .init(name: $0.name, model: $0.model) },
+                choice: choice, providerGroups: [], models: [:]), context: context,
+                error: contract?.modelChoiceProblem).prepared(settings: settings)
         } catch {
-            let read = SessionPresentation(contract: contract, choice: choice, context: nil, error: error.localizedDescription, settings: settings)
-            return read
+            return ProviderSessionPresentation(controls: .init(contract: contract.map { .init(name: $0.name, model: $0.model) },
+                choice: choice, providerGroups: [], models: [:]), context: nil,
+                error: error.localizedDescription).prepared(settings: settings)
         }
     }
     func retireSessionReads() {
-        for (id, read) in sessionReads {
-            read.write { _ = sessions.removeValue(forKey: id) }
-        }
+        for read in sessionReads.values { read.write {} }
+        faceChanges.yield(.retireSessions)
     }
 
     func refreshSessionsAfterRoutingWrite() async {
         for id in Array(sessionReads.keys) { _ = await refreshSession(id) }
     }
     private var accountModelRefreshTask: Task<Void, Never>?
-    @ObservationIgnored private var accountModelUpdatesTask: Task<Void, Never>?
+    private var accountModelUpdatesTask: Task<Void, Never>?
 
     public enum ChatBrainSaveResult: Equatable, Sendable {
         case unchanged(ProviderTurnChoice)
@@ -126,20 +108,27 @@ public final class ProvidersFacade {
         case failed(message: String, cause: String? = nil)
     }
 
-    public internal(set) var isSavingChatBrain = false
+    public internal(set) var isSavingChatBrain = false { didSet { publishProviderState() } }
     public var chatBrainCanonicalSelection: ProviderTurnChoice? {
         settings.flatMap { $0.preferences["chat"] }.map {
             ProviderTurnChoice(provider: settings?.activeProviders["chat"] ?? "",
                 model: $0.model, reasoningEffort: $0.reasoningEffort, fast: $0.serviceTier == "priority")
         }
     }
-    @ObservationIgnored var chatBrainPendingSave: (generation: UInt64, selection: ProviderTurnChoice)?
-    @ObservationIgnored var chatBrainSaveGeneration: UInt64 = 0
-    @ObservationIgnored var chatBrainLastSaveResult: (generation: UInt64, result: ChatBrainSaveResult)?
-    @ObservationIgnored var chatBrainSaveTask: Task<Void, Never>?
+    var chatBrainPendingSave: (generation: UInt64, selection: ProviderTurnChoice)?
+    var chatBrainSaveGeneration: UInt64 = 0
+    var chatBrainLastSaveResult: (generation: UInt64, result: ChatBrainSaveResult)?
+    var chatBrainSaveTask: Task<Void, Never>?
 
-    public nonisolated init(dataRoot: URL) {
+    private nonisolated let faceChanges: AsyncStream<ProviderFaceChange>.Continuation
+    private nonisolated let faceProjectionTask: Task<Void, Never>
+
+    public nonisolated init(dataRoot: URL, settingsFeed: SettingsFeedProjection) {
         self.dataRoot = dataRoot
+        let (changes, input) = AsyncStream.makeStream(of: ProviderFaceChange.self)
+        faceChanges = input
+        let projection = ProviderFaceProjection(feed: settingsFeed, dataRoot: dataRoot)
+        faceProjectionTask = Task { await projection.consume(changes) }
         Task { @MainActor [weak self] in
             guard let self else { return }
             let events = EventDeadlinePhysiology.storeAndFileEvents(
@@ -156,17 +145,30 @@ public final class ProvidersFacade {
         }
     }
 
-    func publishSettings(_ snapshot: SettingsSnapshot) {
+    func publishSettings(_ snapshot: ProviderSettingsSnapshot) {
         settings = snapshot
-        sessions = sessions.mapValues { var value = $0; value.settings = snapshot; return value }
         settingsError = nil
+        faceChanges.yield(.snapshot(snapshot))
         refreshFace()
     }
 
-    func publishSettingsFailure(_ detail: String) { settingsError = detail; refreshFace() }
+    func publishSettingsFailure(_ detail: String) {
+        settingsError = detail
+        faceChanges.yield(.failure(detail))
+        refreshFace()
+    }
+
+    private func publishProviderState() {
+        faceChanges.yield(.status(probes: providerProbeStarts, catalogStarted: catalogRefreshStarted,
+                                  codexAuth: codexAuth, saving: isSavingChatBrain))
+    }
 
     deinit {
+        for receipt in faceDeliveries.values { Task { await receipt.close() } }
+        faceChanges.finish()
+        faceProjectionTask.cancel()
         accountModelUpdatesTask?.cancel()
+        catalogRefreshTask?.cancel()
     }
 
     public nonisolated var routing: SwiftNativeProviderRouting {
@@ -196,11 +198,14 @@ extension ProvidersFacade {
         try await clearProvider(id)
         Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
         // OAuth credentials have their own store; deleting a registry row alone cannot prove disconnect.
-        let clearedOAuth = NativeOAuthFlow.clearTokens(providerId: id, dataRoot: dataRoot)
+        let clearedOAuth = await NativeOAuthFlow.clearTokens(providerId: id, dataRoot: dataRoot)
         let oauthID = NativeOAuthFlow.normalizedOAuthProviderId(id)
         if ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct"].contains(oauthID),
            !clearedOAuth {
             return (false, "Clear failed: the OAuth credential could not be removed.")
+        }
+        guard try routing.confirmsDisconnection(id) else {
+            return (false, "Sign-out is not confirmed: saved credentials or permission to use them remain.")
         }
         // Inspect the shared CLI file directly because app sign-out disables CLI adoption in chat’s credential path.
         do {
@@ -273,7 +278,7 @@ extension ProvidersFacade {
                     provider_id: provider.id, display_name: provider.displayName ?? provider.id,
                     auth_modes: modes, auth_status: authStatus, models: models,
                     auth_mode: string("auth_mode"), default_model: string("default_model"),
-                    models_note: string("models_note")
+                    models_note: string("models_note"), connectionRevision: string("entry_revision")
                 )
             } catch {
                 let detail = "\(provider.id)'s catalog is unavailable: \(error.localizedDescription)"
@@ -308,13 +313,6 @@ extension ProvidersFacade {
 
 public extension NativeAgentEngine {
     @MainActor
-    func clearSurfaceOverride(surface: String) async throws {
-        guard let group = ProviderSurfaceGroups.group(for: surface) else { throw ProviderRoutingError.invalidRequest }
-        _ = try await saveProviderGroupSelection(group: group, providerID: nil, model: nil,
-            reasoningEffort: nil, serviceTier: nil, clearOverride: true)
-    }
-
-    @MainActor
     func saveProviderGroupSelection(
         group: ProviderSurfaceGroup, providerID: String? = nil, model: String? = nil,
         reasoningEffort: String? = nil, serviceTier: String? = nil, clearOverride: Bool = false
@@ -323,7 +321,7 @@ public extension NativeAgentEngine {
             group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
             serviceTier: serviceTier, clearOverride: clearOverride
         )
-        try providers.publishCommittedRouting(result.snapshot)
+        await providers.publishCommittedRouting(result.snapshot)
         _ = await providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
         await providers.refreshSessionsAfterRoutingWrite()
         if group.surfaces.contains("cognition_reflection") {
@@ -356,7 +354,7 @@ public extension NativeAgentEngine {
 // MARK: - Catalog
 
 extension ProvidersFacade {
-    public nonisolated func modelCatalog(
+    @concurrent public nonisolated func modelCatalog(
         refresh: Bool,
         codexCacheURL: URL? = nil
     ) async throws -> ModelCatalogResponse {
@@ -426,7 +424,7 @@ extension ProvidersFacade {
     }
 
     /// Use readiness’s selected credential and adapter verdict; source flags must not come from a second scan.
-    public nonisolated func codexAuthStatus(
+    @concurrent public nonisolated func codexAuthStatus(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         allowEnvironmentOverride: Bool = true
     ) async throws -> CodexAuthStatus {
@@ -462,7 +460,7 @@ extension ProvidersFacade {
 extension ProvidersFacade {
     /// Accept only advertised sign-in modes; omission selects the provider’s first advertised mode.
     public nonisolated func configureProvider(
-        id: String, apiKey: String?, authMode: String, defaultModel: String? = nil
+        id: String, apiKey: String?, authMode: String, defaultModel: String? = nil, expectedRevision: String? = nil
     ) async throws {
         let provider = try await provider(id: id)
         let supportedModes = provider.auth_modes.map {
@@ -485,7 +483,7 @@ extension ProvidersFacade {
         if let model = defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
             config["default_model"] = .string(model)
         }
-        _ = try await routing.configureProvider(id: id, config: .object(config))
+        _ = try await routing.configureProvider(id: id, config: .object(config), expectedRevision: expectedRevision)
     }
 
     /// Admit selections under the routing transaction against the served picker catalog; nil `providerID` preserves the active-provider pin.
@@ -500,7 +498,7 @@ extension ProvidersFacade {
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier
         )
-        try publishCommittedRouting(result.snapshot)
+        await publishCommittedRouting(result.snapshot)
         await refreshSessionsAfterRoutingWrite()
         return result.snapshot
     }

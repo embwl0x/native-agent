@@ -43,13 +43,12 @@ public enum TelegramTurnPresentationReducer {
 
         case .notice(let kind, let text):
             let lowerKind = kind.lowercased()
-            let delegate = delegateName(forNotice: kind, text: text)
             if lowerKind.contains("timeout") || lowerKind.contains("stall") {
                 return TurnPresentationReducer.recordActivity(
                     state,
                     phase: .stalled,
                     detail: text,
-                    delegateName: delegate,
+                    delegateName: nil,
                     at: instant
                 )
             }
@@ -74,15 +73,6 @@ public enum TelegramTurnPresentationReducer {
                     at: instant
                 )
             }
-            if lowerKind.hasPrefix("invoke_") || delegate != nil {
-                return TurnPresentationReducer.recordActivity(
-                    state,
-                    phase: .delegation,
-                    detail: text,
-                    delegateName: delegate,
-                    at: instant
-                )
-            }
             return TurnPresentationReducer.reduce(
                 state,
                 lifecycle: .working(action: text),
@@ -98,13 +88,5 @@ public enum TelegramTurnPresentationReducer {
         case .writing(let writing):
             return TurnPresentationReducer.recordMovement(state, writing: writing, at: instant)
         }
-    }
-
-    private static func delegateName(forNotice kind: String, text: String) -> String? {
-        let combined = "\(kind) \(text)".lowercased()
-        if combined.contains("claude") || combined.contains("claude") { return "Background work" }
-        if combined.contains("codex") { return "Background work" }
-        if combined.contains(" omp") || combined.hasPrefix("omp") { return "Background work" }
-        return nil
     }
 }

@@ -5,13 +5,13 @@ import PersistenceCore
 // Blueprint: | `PersonRhythm.swift` | `PersonRhythm`: zone-bound daily evidence, standing claims and break identities |
 
 /// Only cognition mutates lived day evidence; daily contributions prevent a busy conversation from counting as independent days.
-public struct PersonRhythm: Codable, Sendable {
-    public struct Activity: Codable, Sendable {
+public struct PersonRhythm: Codable, Sendable, Equatable {
+    public struct Activity: Codable, Sendable, Equatable {
         public var at: Date
         public var door: String
         public init(at: Date, door: String) { self.at = at; self.door = String(door.prefix(64)) }
     }
-    public struct Bin: Codable, Sendable {
+    public struct Bin: Codable, Sendable, Equatable {
         public var active = 0.0
         public var observed = 0.0
         var squared = 0.0
@@ -19,26 +19,39 @@ public struct PersonRhythm: Codable, Sendable {
             active *= factor; observed *= factor; squared *= factor * factor
         }
         var tries: Int {
-            squared > 0 ? Int(min(observed, observed * observed / squared).rounded(.down)) : 0
+            get throws {
+                guard active.isFinite, observed.isFinite, squared.isFinite,
+                      active >= 0, observed >= active, squared >= 0, squared <= observed else {
+                    throw CocoaError(.coderReadCorrupt)
+                }
+                // Check the mass too, before squaring it. Finite JSON numbers need not fit an integer.
+                _ = try PersonRhythm.count(observed)
+                return try squared > 0 ? PersonRhythm.count(min(observed, observed * observed / squared)) : 0
+            }
         }
     }
-    struct Day: Codable, Sendable {
+    struct Day: Codable, Sendable, Equatable {
         var at: Date
         var observed = Array(repeating: 0.0, count: 24)
         /// First activity in each hour, not a transcript or an event log.
         var activity: [Activity] = []
         var completeStart = true
     }
-    public struct Claim: Codable, Sendable {
+    public struct Claim: Codable, Sendable, Equatable {
         public enum Kind: String, Codable, Sendable { case quiet, startsBy, activeIn }
         public var kind: Kind
         public var from: Int
         public var to: Int
         public var confidence: Double
+        var isValid: Bool {
+            (0..<24).contains(from) && (0..<(kind == .startsBy ? 1440 : 24)).contains(to)
+                && confidence.isFinite && (0...1).contains(confidence)
+        }
         public func contains(hour: Int) -> Bool {
             from < to ? (from..<to).contains(hour) : hour >= from || hour < to
         }
         public func words(person: String, day: Date) -> String {
+            guard isValid else { return "The person's rhythm claim is invalid; its time is unavailable." }
             switch kind {
             case .quiet: return "\(person) is usually quiet from \(PersonRhythm.time(from * 60, on: day)) to \(PersonRhythm.time(to * 60, on: day))."
             case .startsBy: return "\(person) is usually up by \(PersonRhythm.time(to, on: day))."
@@ -46,11 +59,12 @@ public struct PersonRhythm: Codable, Sendable {
             }
         }
     }
-    public struct Break: Codable, Sendable {
+    public struct Break: Codable, Sendable, Equatable {
         public var at: Date
         public var claim: Claim
         public init(at: Date, claim: Claim) { self.at = at; self.claim = claim }
         public func words(person: String) -> String {
+            guard claim.isValid else { return "The person's pending rhythm claim is invalid; its time is unavailable." }
             let calendar = Calendar.current
             let minute = calendar.component(.hour, from: at) * 60 + calendar.component(.minute, from: at)
             if claim.kind == .quiet {
@@ -81,20 +95,31 @@ public struct PersonRhythm: Codable, Sendable {
     public static func path(_ root: URL) -> URL { root.appendingPathComponent("mind/rhythm.json") }
     public static func load(_ root: URL) throws -> Self? {
         let path = path(root)
-        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-        let value = try JSONDecoder().decode(Self.self, from: Data(contentsOf: path))
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch CocoaError.fileReadNoSuchFile { return nil }
+        let value = try JSONDecoder().decode(Self.self, from: data)
         guard value.bins.count == 24, value.carried.count == 24,
               TimeZone(identifier: value.timeZone) != nil, value.days.count <= 64,
-              value.claims.count <= 3,
-              value.claims.allSatisfy({ $0.from >= 0 && $0.from < 24 && $0.to >= 0
-                  && $0.to < ($0.kind == .startsBy ? 1440 : 24) && $0.confidence.isFinite }),
+              value.carriedAt.timeIntervalSinceReferenceDate.isFinite, value.starts.count <= 64,
+              value.starts.allSatisfy({ $0.timeIntervalSinceReferenceDate.isFinite }),
+              value.breaks.values.allSatisfy({ $0.timeIntervalSinceReferenceDate.isFinite }),
+              value.pending.values.allSatisfy({ $0.at.timeIntervalSinceReferenceDate.isFinite && $0.claim.isValid }),
+              value.claims.count <= 3, value.claims.allSatisfy(\.isValid),
               value.days.allSatisfy({ $0.observed.count == 24 && $0.activity.count <= 24
-                  && $0.observed.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 } }),
-              (value.bins + value.carried).allSatisfy({
-                  $0.active.isFinite && $0.observed.isFinite && $0.squared.isFinite
-                      && $0.active >= 0 && $0.observed >= $0.active && $0.squared >= 0
+                  && $0.at.timeIntervalSinceReferenceDate.isFinite
+                  && $0.activity.allSatisfy { $0.at.timeIntervalSinceReferenceDate.isFinite }
+                  && $0.observed.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 }
               }) else { throw CocoaError(.coderReadCorrupt) }
+        for bin in value.bins + value.carried { _ = try bin.tries }
         return value
+    }
+    /// A damaged tally is unavailable evidence, never a clamped count or a trapping conversion.
+    private static func count(_ value: Double) throws -> Int {
+        guard value.isFinite, value >= 0, let count = Int(exactly: value.rounded(.down)) else {
+            throw CocoaError(.coderReadCorrupt)
+        }
+        return count
     }
     public func save(_ root: URL) throws {
         let path = Self.path(root)
@@ -133,7 +158,7 @@ public struct PersonRhythm: Codable, Sendable {
         }
     }
     /// Only complete indexed days support message-silence evidence; silence cannot establish Mac uptime.
-    public mutating func coldStart(_ rows: [Activity], at: Date) {
+    public mutating func coldStart(_ rows: [Activity], at: Date) throws {
         for row in rows { activity(row) }
         let today = Calendar.current.startOfDay(for: at)
         let first = days.map(\.at).min()
@@ -141,7 +166,7 @@ public struct PersonRhythm: Codable, Sendable {
             if days[i].at == first { days[i].completeStart = false }
             if days[i].at < today, days[i].at != first { days[i].observed = Array(repeating: 1, count: 24) }
         }
-        recompute(at: at)
+        try recompute(at: at)
     }
     /// Hour fractions need their recorded zone; timestamp-free aggregates cannot travel.
     private mutating func rebucket(to calendar: Calendar) {
@@ -163,10 +188,12 @@ public struct PersonRhythm: Codable, Sendable {
             timeZone = calendar.timeZone.identifier
         }
     }
-    public mutating func recompute(at: Date) {
+    public mutating func recompute(at: Date) throws {
         let calendar = Calendar.current
         rebucket(to: calendar)
-        let cutoff = calendar.date(byAdding: .day, value: -30, to: calendar.startOfDay(for: at))!
+        guard let cutoff = calendar.date(byAdding: .day, value: -30, to: calendar.startOfDay(for: at)) else {
+            throw CocoaError(.coderReadCorrupt)
+        }
         let fade = pow(0.5, max(0, at.timeIntervalSince(carriedAt)) / (7 * 86_400))
         for i in carried.indices { carried[i].fade(fade) }
         carriedAt = at
@@ -184,6 +211,8 @@ public struct PersonRhythm: Codable, Sendable {
         days.removeAll { $0.at < cutoff }
         bins = carried
         for day in days { contribution(day, into: &bins) }
+        // Validate derived bins before ratios or integer counts can admit a claim.
+        for bin in bins { _ = try bin.tries }
         breaks = breaks.filter { $0.value >= cutoff }
         pending = pending.filter { $0.value.at >= cutoff }
         // One coarse quiet run; never treat its hours as independent nights.
@@ -211,41 +240,38 @@ public struct PersonRhythm: Codable, Sendable {
         claims = []
         if let run {
             let hours = (0..<run.length).map { (run.from + $0) % 24 }
-            let tries = hours.map { bins[$0].tries }.min() ?? 0
+            let tries = try hours.map { try bins[$0].tries }.min() ?? 0
             let rate = hours.map { 1 - bins[$0].active / bins[$0].observed }.min() ?? 0
-            if let lower = standing(Int((Double(tries) * rate).rounded(.down)), tries) {
+            if let lower = standing(try Self.count(Double(tries) * rate), tries) {
                 claims.append(Claim(kind: .quiet, from: run.from, to: quietEnd, confidence: lower))
             }
         }
         let weights = starts.map { pow(0.5, max(0, at.timeIntervalSince($0)) / (7 * 86_400)) }
         let sum = weights.reduce(0, +), squared = weights.reduce(0) { $0 + $1 * $1 }
-        let n = squared > 0 ? Int(min(sum, sum * sum / squared).rounded(.down)) : 0
+        let n = try squared > 0 ? Self.count(min(sum, sum * sum / squared)) : 0
         let timed = zip(starts, weights).map {
             (minute: calendar.component(.hour, from: $0.0) * 60 + calendar.component(.minute, from: $0.0), weight: $0.1)
         }.sorted { $0.minute < $1.minute }
         var mass = 0.0
         let upper = timed.first { value in mass += value.weight; return mass >= sum * 0.95 }?.minute
         let hitWeight = upper.map { upper in timed.filter { $0.minute <= upper }.reduce(0) { $0 + $1.weight } } ?? 0
-        let hits = sum > 0 ? min(n, Int((Double(n) * hitWeight / sum + 1e-9).rounded(.down))) : 0
+        let hits = try sum > 0 ? min(n, Self.count(Double(n) * (hitWeight / sum) + 1e-9)) : 0
         if let upper, let lower = standing(hits, n) {
             claims.append(Claim(kind: .startsBy, from: 0, to: upper, confidence: lower))
         }
         if let h = activeCandidate, bins[h].observed > 0 {
-            let n = bins[h].tries
-            let hits = Int((Double(n) * bins[h].active / bins[h].observed).rounded(.down))
+            let n = try bins[h].tries
+            let hits = try Self.count(Double(n) * (bins[h].active / bins[h].observed))
             if let lower = standing(hits, n) { claims.append(Claim(kind: .activeIn, from: h, to: (h + 1) % 24, confidence: lower)) }
         }
     }
     public func started(on day: Date) -> Bool {
         starts.contains { Calendar.current.isDate($0, inSameDayAs: day) }
     }
-    public static func time(_ minute: Int, on day: Date) -> String {
-        let calendar = Calendar.current
-        let at = calendar.date(bySettingHour: (minute / 60) % 24, minute: minute % 60, second: 0, of: day)!
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "h:mm a"
-        return formatter.string(from: at)
+    public static func time(_ minute: Int, on _: Date) -> String {
+        guard (0..<1440).contains(minute) else { return "time unavailable" }
+        // These are local wall-clock minutes, including a learned hour skipped on today's DST transition.
+        let hour = minute / 60
+        return String(format: "%d:%02d %@", (hour + 11) % 12 + 1, minute % 60, hour < 12 ? "AM" : "PM")
     }
 }

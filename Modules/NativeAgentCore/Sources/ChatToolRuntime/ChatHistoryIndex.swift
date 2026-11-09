@@ -100,39 +100,6 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         }
     }
 
-    /// Cares read stored conversation words and attribution from the canonical index.
-    public struct LivedLine: Sendable {
-        public let conversation: String
-        public let role: String
-        public let messageId: String?
-        /// Share run identity between each reply and the message it answers.
-        public let runId: String?
-        public let at: Date
-        public let words: String
-        public let author: String?
-        public let peer: String?
-        /// Exclude writer-stamped machinery from lived conversation.
-        public let mechanical: Bool
-    }
-
-    /// Deduplicate retained transcript/archive copies while preserving each transcript's file order.
-    public func livedLines(since: Date) throws -> [LivedLine] {
-        let listed = try ChatSessionRetention.transcriptFiles(
-            dataRoot: dataRoot, archived: ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot))
-        var seen: Set<String> = []
-        var out: [LivedLine] = []
-        for (conversation, file) in listed {
-            for row in try rows(at: file, receipts: false) {
-                guard row.valid, row.shape == 2, let role = row.role, role == "user" || role == "assistant",
-                      let at = row.instant, at >= since, let words = row.rawContent,
-                      seen.insert("\(conversation)|\(row.messageId ?? row.identity)").inserted else { continue }
-                out.append(LivedLine(conversation: conversation, role: role, messageId: row.messageId, runId: row.runId, at: at,
-                                     words: words, author: row.author, peer: row.peer, mechanical: row.mechanical))
-            }
-        }
-        return out
-    }
-
     /// Preserve transcript file order; unavailable UTF-8 must throw instead of fabricating history.
     func rows(at file: URL, receipts: Bool) throws -> [ChatHistorySearchRow] {
         absorption.lock()

@@ -2,7 +2,6 @@ import Foundation
 import NativeAgentShared
 import BackgroundLoops
 import PersistenceCore
-import os
 // Blueprint: | `SlackSocketModeLoop.swift` | `SlackSocketModeLoop`, `tick`, `tickOutcome`: socket lifetime independent of accepted handlers |
 
 enum SlackSocketSessionClosure: Error, Sendable, Equatable {
@@ -14,9 +13,6 @@ public struct SlackSocketModeLoop: LoopRunner {
     public let wake: OrganWake
     public var tickTimeoutOverride: TimeInterval? { 3_900 }
 
-    // Recycle healthy socket sessions before the tick watchdog's hang deadline.
-    let sessionRecycleInterval: TimeInterval = 3_600
-
     let config: SlackSocketModeConfig
     let dataRoot: URL
     let progressChatHandler: SlackProgressChat?
@@ -26,10 +22,6 @@ public struct SlackSocketModeLoop: LoopRunner {
     let feedRetention = JSONLPathOwnedCapPolicy(
         maxLines: JSONLLineCaps.slackReceipts, maxBytes: 1_048_576, trimToBytes: 786_432
     )
-
-    static let shortLivedSessionFloor: TimeInterval = 30
-    /// Stay inside the 25 s ping interval so a dead socket is detected on the same tick.
-    static let pingResponseDeadline: TimeInterval = 10
 
     static let defaultReconnectInterval: TimeInterval = 15
 
@@ -64,7 +56,6 @@ public struct SlackSocketModeLoop: LoopRunner {
     }
 
     private func socketTickOutcome() async -> LoopTickOutcome {
-        let sessionStartedAt = Date()
         do {
             await writeState([
                 "connected": .bool(false),
@@ -79,16 +70,9 @@ public struct SlackSocketModeLoop: LoopRunner {
             ])
             try Task.checkCancellation()
             let socket = session.webSocketTask(with: socketURL)
+            SlackSocketConnections.retain(socket, dataRoot: dataRoot)
+            defer { SlackSocketConnections.release(socket, dataRoot: dataRoot) }
             socket.resume()
-            // Mark planned closes so receive errors remain successful recycling.
-            let recycleFlag = OSAllocatedUnfairLock(initialState: false)
-            let recycleTask = Task { [sessionRecycleInterval] in
-                try? await Task.sleep(nanoseconds: UInt64(max(1, sessionRecycleInterval) * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-                recycleFlag.withLock { $0 = true }
-                socket.cancel(with: .goingAway, reason: nil)
-            }
-            defer { recycleTask.cancel() }
             var endingError: Error?
             do {
                 try await receiveLoop(socket: socket)
@@ -96,38 +80,36 @@ public struct SlackSocketModeLoop: LoopRunner {
             socket.cancel(with: .goingAway, reason: nil)
             if endingError is CancellationError { throw CancellationError() }
             try Task.checkCancellation()
-            let outcome = Self.classifySessionClosure(
-                endingError,
-                sessionDuration: max(0, Date().timeIntervalSince(sessionStartedAt)),
-                recyclePlanned: recycleFlag.withLock { $0 },
-                recycleInterval: sessionRecycleInterval
-            )
+            let outcome = Self.classifySessionClosure(endingError)
             switch outcome {
             case .completed:
-                let reason = (endingError as? SlackSocketSessionClosure).map(Self.closeReason)
-                    ?? (endingError == nil ? "receive_loop_returned" : "session_recycled")
+                let reason = (endingError as? SlackSocketSessionClosure).map(Self.closeReason) ?? "receive_loop_returned"
                 await writeState([
                     "connected": .bool(false),
                     "receiveLoopEndedAt": .string(Self.nowString()),
                     "lastCloseReason": .string(reason),
+                    "waitingOn": .null,
                 ])
                 return outcome
             case .failed(let error):
                 if let endingError, !(endingError is SlackSocketSessionClosure) { throw endingError }
                 throw SlackSocketModeError.api(error)
             case .skipped:
+                await writeState(["connected": .bool(false), "waitingOn": .null])
                 return outcome
             }
         } catch let error where error is CancellationError || Task.isCancelled {
             await writeState([
                 "connected": .bool(false),
                 "cancelledAt": .string(Self.nowString()),
+                "waitingOn": .null,
             ])
             return .skipped(reason: "Slack socket mode canceled")
         } catch {
             await writeState([
                 "connected": .bool(false),
                 "receiveLoopErroredAt": .string(Self.nowString()),
+                "waitingOn": .null,
             ])
             await recordError(context: "socket_mode", error: error)
             return .failed(error: Self.redact(String(describing: error)))
@@ -142,8 +124,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         let parsed = try await SlackWebAPI.response(for: req, session: session)
         if let status = parsed["httpStatus"] as? Int { throw SlackSocketModeError.api("apps.connections.open HTTP \(status)") }
-        guard parsed["error"] as? String != "non_json_response",
-              case .object(let obj) = JSONValue(fromFoundation: parsed) else {
+        guard case .object(let obj) = JSONValue(fromFoundation: parsed) else {
             throw SlackSocketModeError.api("apps.connections.open returned non-object JSON")
         }
         guard obj["ok"]?.boolValue == true else {
@@ -158,29 +139,13 @@ public struct SlackSocketModeLoop: LoopRunner {
 
     private func receiveLoop(socket: URLSessionWebSocketTask) async throws {
         try Task.checkCancellation()
-        let pingTask = Task {
-            await pingUntilCancelled(socket: socket)
+        await writeState(["waitingOn": .string("Slack socket frame or close; cancel by switching Socket Mode off")])
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await receiveLoopBody(socket: socket)
+        } onCancel: {
+            socket.cancel(with: .goingAway, reason: nil)
         }
-        // Every exit path drains the session's own ping; accepted turns are not the session's and keep running.
-        do {
-            try await withTaskCancellationHandler {
-                try Task.checkCancellation()
-                try await receiveLoopBody(socket: socket)
-            } onCancel: {
-                // Cancelling the Swift task must also wake a parked receive.
-                pingTask.cancel()
-                socket.cancel(with: .goingAway, reason: nil)
-            }
-        } catch {
-            await drainSessionWork(pingTask: pingTask)
-            throw error
-        }
-        await drainSessionWork(pingTask: pingTask)
-    }
-
-    private func drainSessionWork(pingTask: Task<Void, Never>) async {
-        pingTask.cancel()
-        await pingTask.value
     }
 
     private func receiveLoopBody(socket: URLSessionWebSocketTask) async throws {
@@ -261,59 +226,6 @@ public struct SlackSocketModeLoop: LoopRunner {
         let claim = try await deliveryJournal.claim(inbound)
         try await acknowledge()
         return claim
-    }
-
-    private func pingUntilCancelled(socket: URLSessionWebSocketTask) async {
-        while !Task.isCancelled {
-            do {
-                try await Task.sleep(nanoseconds: 25_000_000_000)
-                try await sendPing(socket: socket)
-                try Task.checkCancellation()
-                try Task.checkCancellation()
-                await writeState([
-                    "connected": .bool(true),
-                    "lastPingAt": .string(Self.nowString()),
-                ])
-            } catch is CancellationError {
-                return
-            } catch {
-                await writeState([
-                    "connected": .bool(false),
-                    "lastPingErrorAt": .string(Self.nowString()),
-                    "lastPingError": .string(Self.redact(String(describing: error))),
-                ])
-                socket.cancel(with: .goingAway, reason: nil)
-                return
-            }
-        }
-    }
-
-    /// Pong, cancellation and deadline race to settle the first outcome.
-    private func sendPing(socket: URLSessionWebSocketTask) async throws {
-        let gate = ContinuationOnce<Result<Void, Error>>()
-        let deadline = Task {
-            try? await Task.sleep(for: .seconds(Self.pingResponseDeadline))
-            guard !Task.isCancelled else { return }
-            gate.resume(.failure(SlackSocketModeError.api(
-                "Slack did not answer a socket-mode ping within \(Int(Self.pingResponseDeadline))s"
-            )))
-        }
-        defer { deadline.cancel() }
-        let result = await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Result<Void, Error>, Never>) in
-                gate.install(continuation)
-                socket.sendPing { error in
-                    if let error {
-                        gate.resume(.failure(error))
-                    } else {
-                        gate.resume(.success(()))
-                    }
-                }
-            }
-        } onCancel: {
-            gate.resume(.failure(CancellationError()))
-        }
-        try result.get()
     }
 
     static func apiURL(_ method: String) -> URL {

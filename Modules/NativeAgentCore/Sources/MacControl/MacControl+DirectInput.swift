@@ -57,7 +57,7 @@ extension SwiftNativeMacControl {
         context: MacOperationContext
     ) throws -> MacAXActTarget? {
         guard let identity = snapshot.windowIdentity,
-              identity.pid != getpid(),
+              !PersonOnlyWindows.isOwnProcess(identity.pid),
               accessibilitySource(context: context).frontmostApp()?.processIdentifier == identity.pid,
               let label = mark.label, !label.isEmpty,
               ["title", "value", "descendant_text"].contains(mark.labelSource)
@@ -476,7 +476,7 @@ extension SwiftNativeMacControl {
             return refusal
         }
         // Refuse frontmost self-process AX acts with the same self-inspection cause as reads, before path lookup can obscure it.
-        if accessibilitySource(context: context).frontmostApp()?.processIdentifier == getpid() {
+        if PersonOnlyWindows.isOwnProcess(accessibilitySource(context: context).frontmostApp()?.processIdentifier) {
             return injectionRefusal(
                 action: "ax_act",
                 error: Self.selfInspectionError,

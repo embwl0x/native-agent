@@ -79,45 +79,6 @@ private func prop(_ type: String, description: String) -> JSONValue {
 public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
     return [
         ConnectorActionDescriptor(
-            id: "mac.spotlight_search", connectorId: "mac", connector: "mac",
-            name: "Mac Spotlight Search",
-            description: "Search Mac via Spotlight (mdfind). Read-only.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "spotlight",
-            inputSchema: schema([
-                ("query", prop("string")),
-                ("limit", prop("integer")),
-            ], required: ["query"])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.notify", connectorId: "mac", connector: "mac",
-            name: "Mac Notification",
-            description: "Post a macOS notification.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "notifications",
-            inputSchema: schema([
-                ("title", prop("string")),
-                ("message", prop("string")),
-                ("sound", prop("string")),
-            ], required: ["title", "message"])
-        ),
-        ConnectorActionDescriptor(
-            id: "mobile.notify", connectorId: "mobile", connector: "mobile",
-            name: "iPhone Push Notification",
-            description: """
-                Send the user a real APNS push notification on the paired iPhone when attention is useful. Check readiness on app {page:\"pairing\"}; \
-                do not inspect raw APNS config files.
-                """,
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "notifications",
-            statusEndpoint: "/v1/mobile/push/status",
-            inputSchema: schema([
-                ("title", prop("string")),
-                ("message", prop("string")),
-                ("source", prop("string")),
-            ], required: ["title", "message"])
-        ),
-        ConnectorActionDescriptor(
             id: "codex.work_journal", connectorId: "codex_work", connector: "codex_work",
             name: "Codex Work Journal",
             description: """
@@ -159,9 +120,9 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ),
         ConnectorActionDescriptor(
             id: "scheduler.schedule_job", connectorId: "scheduler", connector: "scheduler",
-            name: "Schedule Body Rhythm",
+            name: "Schedule a Read",
             description: """
-                Create one-shot or recurring body rhythms on once/every/hourly/daily/weekly/monthly/cron schedules. Intentions, check-ins and \
+                Put a watch or proactive scan on the clock, once or on an every/hourly/daily/weekly/monthly/cron rhythm. Intentions, check-ins and \
                 reminders use queue.add {text, when, until?, say?}.
                 """,
             risk: "medium", dryRunAvailable: true, requiresApproval: false,
@@ -170,12 +131,8 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("name", prop("string")),
                 ("kind", .object([
                     "type": .string("string"),
-                    "enum": .array([
-                        .string("connector_action"), .string("part"),
-                        .string("dream"), .string("rem"),
-                        .string("harness_benchmark"), .string("proactive_scan"),
-                    ]),
-                    "description": .string("Body rhythms only. Intentions, check-ins and reminders use queue.add."),
+                    "enum": .array([.string("connector_action"), .string("proactive_scan")]),
+                    "description": .string("A watch (connector_action) or a proactive scan. Intentions, check-ins and reminders use queue.add."),
                 ])),
                 ("schedule", .object([
                     "type": .string("object"),
@@ -188,18 +145,18 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("payload", .object([
                     "type": .string("object"),
                     "description": .string("""
-                        Rhythm payload. connector_action: actionId/input. dream/rem: objective. part: part/signal (schedule:<cron>). proactive_scan: \
-                        reason/limit/surfaceLimit. For fixed reminder words use queue.add with say.
+                        connector_action: actionId (a read) and input. proactive_scan: reason/limit/surfaceLimit/staleDays. For fixed reminder words \
+                        use queue.add with say.
                         """),
                 ])),
             ], required: ["name", "kind", "schedule"])
         ),
         ConnectorActionDescriptor(
             id: "scheduler.create_job", connectorId: "scheduler", connector: "scheduler",
-            name: "Create Body Rhythm",
+            name: "Create a Scheduled Read",
             description: """
-                Create a recurring or one-shot body rhythm for connector reads, parts, dreams, REM, benchmarks or proactive scans. Intentions, \
-                check-ins and reminders use queue.add {text, when, until?, say?}.
+                Put a watch or proactive scan on the clock: a repeating interval, or one read after in_minutes. Intentions, check-ins and \
+                reminders use queue.add {text, when, until?, say?}.
                 """,
             risk: "medium", dryRunAvailable: true, requiresApproval: false,
             category: "scheduler",
@@ -207,37 +164,32 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("name", prop("string")),
                 ("kind", .object([
                     "type": .string("string"),
-                    "enum": .array([
-                        .string("connector_action"), .string("part"),
-                        .string("dream"), .string("rem"),
-                        .string("harness_benchmark"), .string("proactive_scan"),
-                    ]),
-                    "description": .string("Body rhythms only. Intentions, check-ins and reminders use queue.add."),
+                    "enum": .array([.string("connector_action"), .string("proactive_scan")]),
+                    "description": .string("A watch (connector_action) or a proactive scan. Intentions, check-ins and reminders use queue.add."),
                 ])),
-                ("interval_seconds", prop("integer", description: "Repeat interval in seconds. Minimum 60.")),
-                ("run_at", prop("string", description: "Optional ISO-8601 first run time.")),
-                ("one_shot", prop("boolean")),
+                ("interval_seconds", prop("integer", description: "Repeat interval in seconds. Minimum 60. Supply this or in_minutes.")),
+                ("in_minutes", prop("number", description: "One read after this many minutes. Supply this or interval_seconds.")),
                 ("payload", .object([
                     "type": .string("object"),
                     "description": .string("""
-                        For connector_action: actionId/input. For dream/rem: objective. For part: part/signal (schedule:<cron>). For proactive_scan: \
-                        reason/limit/surfaceLimit. Intentions use queue.add.
+                        For connector_action: actionId (a read) and input. For proactive_scan: reason/limit/surfaceLimit/staleDays. Intentions use \
+                        queue.add.
                         """),
                 ])),
             ], required: ["name", "kind"])
         ),
         ConnectorActionDescriptor(
             id: "scheduler.list_jobs", connectorId: "scheduler", connector: "scheduler",
-            name: "List Scheduled Jobs",
-            description: "List NativeAgent's app-owned scheduled jobs and their next run times.",
+            name: "List Scheduled Reads",
+            description: "List the watches and proactive scans on NativeAgent's clock and their next times.",
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "scheduler",
             inputSchema: emptySchema()
         ),
         ConnectorActionDescriptor(
             id: "scheduler.cancel_job", connectorId: "scheduler", connector: "scheduler",
-            name: "Cancel Scheduled Job",
-            description: "Disable a NativeAgent scheduled job by id.",
+            name: "Cancel a Scheduled Read",
+            description: "Withdraw a watch or proactive scan from NativeAgent's clock by id.",
             risk: "medium", dryRunAvailable: true, requiresApproval: false,
             category: "scheduler",
             inputSchema: schema([
@@ -254,94 +206,6 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "assistant_setup",
             inputSchema: emptySchema()
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.mail_list_recent", connectorId: "mac", connector: "mac",
-            name: "Mac Mail Recent Messages",
-            description: "Read recent Mail.app messages through the unified dispatcher. Read-only and scheduleable.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "mac_pim",
-            inputSchema: schema([
-                ("limit", prop("integer")),
-                ("hours_back", prop("integer")),
-                ("unread_only", prop("boolean")),
-                ("mailbox", prop("string")),
-            ])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.calendar_list_upcoming", connectorId: "mac", connector: "mac",
-            name: "Mac Calendar Upcoming Events",
-            description: "Read upcoming Calendar.app events through the unified dispatcher. Read-only and scheduleable.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "mac_pim",
-            inputSchema: schema([
-                ("hours_ahead", prop("integer")),
-                ("calendar_name", prop("string")),
-            ])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.reminders_list_due_today", connectorId: "mac", connector: "mac",
-            name: "Mac Reminders Due Today",
-            description: """
-                Read Reminders.app items in today and overdue parts, each with its full count and independently capped reminders/has_more, plus total \
-                and summary. Read-only and scheduleable.
-                """,
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "mac_pim",
-            inputSchema: schema([
-                ("limit", prop("integer")),
-                ("include_completed", prop("boolean")),
-                ("list_name", prop("string")),
-            ])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.messages_list_recent", connectorId: "mac", connector: "mac",
-            name: "Mac Messages Recent",
-            description: "Read recent Messages conversations through NativeAgent's app-owned Apple integration. Read-only and scheduleable.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "mac_pim",
-            inputSchema: schema([
-                ("limit", prop("integer")),
-                ("since_hours", prop("integer")),
-                ("contact", prop("string")),
-            ])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.notes_list_recent", connectorId: "mac", connector: "mac",
-            name: "Mac Notes Recent",
-            description: "Read recently modified Apple Notes through the unified dispatcher. Read-only and scheduleable.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "mac_pim",
-            inputSchema: schema([
-                ("limit", prop("integer")),
-                ("hours_back", prop("integer")),
-                ("folder", prop("string")),
-            ])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.notes_search", connectorId: "mac", connector: "mac",
-            name: "Mac Notes Search",
-            description: "Search Apple Notes by substring in title or body through the unified dispatcher. Read-only.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "mac_pim",
-            inputSchema: schema([
-                ("query", prop("string")),
-                ("limit", prop("integer")),
-            ], required: ["query"])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.contacts_search", connectorId: "mac", connector: "mac",
-            name: "Mac Contacts Search",
-            description: """
-                Search Contacts.app with query: @ selects email, phone-shaped text selects phone, otherwise name. The selected lookup runs once. \
-                Read-only.
-                """,
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "mac_pim",
-            inputSchema: schema([
-                ("query", prop("string")),
-                ("limit", prop("integer")),
-            ], required: ["query"])
         ),
     ]
 }

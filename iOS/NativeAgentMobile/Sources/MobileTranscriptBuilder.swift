@@ -1,10 +1,11 @@
 import Foundation
 import NativeAgentShared
+import QuartzCore
+import UIKit
 
-// Blueprint: | `MobileTranscriptBuilder.swift` | The phone's door onto the shared transcript builder: the Mac's rows with their faces, the phone's own rows, and the phone's physics (earlier history, send buttons, decisions still owed, the live reply) |
+// Blueprint: | `MobileTranscriptBuilder.swift` | Off-main phone rows and door inputs; Shared press and display feed |
 
-/// One row of the conversation as the phone holds it: a row the Mac sent, with the face the Mac read for it, or a row only the phone has
-/// yet (a send in flight, the streaming reply), read plainly. Its id is the key the phone's messages are kept by.
+/// Synced rows carry Mac presentation; local rows carry only the phone's known role and words.
 struct MobileTranscriptRow: TranscriptRow, Hashable {
     let id: String
     let role: String
@@ -14,6 +15,7 @@ struct MobileTranscriptRow: TranscriptRow, Hashable {
     let source: String?
     let metadata: ChatMessageMetadata?
     let face: TranscriptRowFace?
+    let isLocal: Bool
 
     /// A row the Mac sent. Its words are the phone's message's when it holds one (a whole message loaded, a card's empty text).
     init(_ record: ChatMessageRecord, message: ChatMessage?) {
@@ -25,6 +27,7 @@ struct MobileTranscriptRow: TranscriptRow, Hashable {
         source = record.source
         metadata = record.metadata
         face = record.face
+        isLocal = false
     }
 
     /// A row only the phone has: its attachments carry their kinds so the builder places them.
@@ -45,6 +48,7 @@ struct MobileTranscriptRow: TranscriptRow, Hashable {
             self.metadata = metadata
         }
         face = nil
+        isLocal = true
     }
 
     /// The key the phone keeps a Mac row's message by.
@@ -52,9 +56,7 @@ struct MobileTranscriptRow: TranscriptRow, Hashable {
         (UUID(uuidString: recordID) ?? ChatMessage.derivedMessageID(recordID)).uuidString
     }
 
-    /// The conversation in the Mac's order. Each message the store shows sits where the store holds it; the rows the phone's messages
-    /// leave out (tool runs, asks) sit before the message they precede in the Mac's rows; rows after the last message the Mac sent sit
-    /// before the phone's own rows that follow it.
+    /// Merge local messages into the Mac's conversation order without losing non-message rows.
     static func rows(records: [ChatMessageRecord], messages: [ChatMessage]) -> [MobileTranscriptRow] {
         var recordAt: [String: Int] = [:]
         for (index, record) in records.enumerated() where recordAt[key(record.id)] == nil { recordAt[key(record.id)] = index }
@@ -86,23 +88,20 @@ struct MobileTranscriptRow: TranscriptRow, Hashable {
 }
 
 /// What the conversation shows, as the thread reads it from the store and the sync engine.
-struct MobileTranscriptInput {
+struct MobileTranscriptInput: Sendable, Equatable {
     /// The conversation the document belongs to; a new one opens at its end.
     var sessionKey: String
     /// The store's messages: what a row's menu, attachments and live words read.
     var messages: [ChatMessage]
-    /// The conversation's rows in order (`MobileTranscriptRow.rows`).
-    var rows: [MobileTranscriptRow]
+    /// Raw synced records; merging and grouping belong to the press's input drain.
+    var records: [ChatMessageRecord]
     /// The reply the running turn streams into; nil when nothing streams here.
     var liveMessageID: UUID?
     /// What the live reply says before its first word.
     var waitingLine: String
-    /// Approvals by the row that asks for them, and by their own id for the decisions still owed that no row here asks for.
-    var approvals: [String: ApprovalRequest]
-    /// Decisions still owed with no row here asking: after everything.
-    var tailApprovals: [ApprovalRequest]
-    /// This conversation's mirrored cards, by inbox item id.
-    var inboxCards: [String: InboxItemRecord]
+    var approvals: [ApprovalRequest]
+    /// The owner supplies the finished Inbox face; the press seats its rows beside their conversation matters.
+    var inboxFace: PartFaceSnapshot?
     var exchanges: [OtherRoomExchange]
     /// Cards draw only while the transcript reads cleanly.
     var cardsAvailable: Bool
@@ -115,18 +114,40 @@ struct MobileTranscriptInput {
     /// Sending and switching hold every send button.
     var sendsEnabled: Bool
 
-    var isEmpty: Bool { rows.isEmpty && tailApprovals.isEmpty }
+    var isEmpty: Bool {
+        records.isEmpty && messages.isEmpty && !approvals.contains { ConversationApprovals.waitsOnYou($0) }
+    }
 }
 
-extension TranscriptDocument {
+enum MobileTranscriptPreparation {
+    private static let log = ModuleLog(category: "MobileTranscriptPress")
+    struct Prepared: Sendable {
+        var input: TranscriptPressInput<MobileTranscriptRow>
+        var attachments: TranscriptAttachmentData
+        var messages: [String: ChatMessage]
+        var lastAssistantID: String?
+    }
+
     /// The whole conversation through the shared builder, with the phone's physics: earlier history first, each row's send buttons after
     /// it, the decisions still owed after everything, and the live reply's waiting line.
-    @MainActor
-    static func build(_ input: MobileTranscriptInput, cache: TranscriptBuildCache<MobileTranscriptRow>) -> TranscriptDocument {
+    @concurrent nonisolated
+    static func prepare(_ input: MobileTranscriptInput, width: Double, scale: Double, category: String,
+                        viewport: Set<String>, openingParagraphs: Int) async -> Prepared {
+        let rows = MobileTranscriptRow.rows(records: input.records, messages: input.messages)
+        log("press.prepare rows=%ld", rows.count)
+        var asked: [String: String] = [:]
+        for record in input.records where record.face?.asks == true {
+            if let matter = record.askedMatter { asked[MobileTranscriptRow.key(record.id)] = matter }
+        }
+        let owedMatters = input.approvals.filter { ConversationApprovals.waitsOnYou($0) }.map(\.id)
+            .filter { !asked.values.contains($0) }
+        for matter in owedMatters { asked[matter] = matter }
+        var inbox: [String: PartFace.Row] = [:]
+        if let face = input.inboxFace?.drawnFace {
+            for row in face.sections.flatMap(\.rows) { inbox[row.id] = row }
+        }
         var messages: [String: ChatMessage] = [:]
         for message in input.messages { messages[message.id.uuidString] = message }
-        var rows: [String: MobileTranscriptRow] = [:]
-        for row in input.rows { rows[row.id] = row }
         var after: [String: [TranscriptBlock]] = [:]
         for message in input.messages {
             let id = message.id.uuidString
@@ -147,34 +168,88 @@ extension TranscriptDocument {
         let older = input.canLoadOlder ? [actionBlock(id: "older", messageID: "older",
                                                       label: input.isLoadingHistory ? "Loading earlier messages…" : "Load earlier messages",
                                                       link: input.isLoadingHistory ? nil : .olderHistory)] : []
-        let owed = input.tailApprovals.map { approval in
-            TranscriptBlock(id: "approval-" + approval.id, messageID: "approval-" + approval.id, role: "system",
-                            kind: .attachment(.approval(rowID: approval.id)), source: "", lead: .message, foldGroup: nil)
+        let owed = owedMatters.map { matter in
+            TranscriptBlock(id: "approval-" + matter, messageID: "approval-" + matter, role: "system",
+                            kind: .attachment(.approval(rowID: matter)), source: "", lead: .message, foldGroup: nil)
         }
-        let thread = TranscriptThread(
-            groups: TranscriptGrouping.groups(input.rows), exchanges: input.exchanges,
-            face: { $0.face ?? .plain($0) },
-            cards: { rowID in
-                guard input.cardsAvailable else { return [] }
-                if let message = messages[rowID], let card = message.interaction, message.interactionDescriptor != nil,
-                   message.interactionSessionID != nil {
-                    return [card.id]
-                }
-                if let mirror = rows[rowID]?.metadata?.interactionMirror, input.inboxCards["interaction:" + mirror.interactionID] != nil {
-                    return ["interaction:" + mirror.interactionID]
-                }
-                return []
+        let data = TranscriptAttachmentData(messages: messages,
+            rowContent: Dictionary(rows.map { ($0.id, $0.content) }, uniquingKeysWith: { _, latest in latest }),
+            asked: asked, inbox: inbox)
+        let cards = input.cardsAvailable ? messages.compactMapValues { $0.matter.map { [$0] } } : [:]
+        let pressed = TranscriptPressInput(
+            session: input.sessionKey, presentation: "phone", groups: TranscriptGrouping.groups(rows), exchanges: input.exchanges,
+            cards: cards, faceEpoch: "", face: { row in
+                if row.isLocal { return .plain(row) }
+                if let face = row.face { return face }
+                return TranscriptRowFace(seat: .left,
+                    words: "Presentation unavailable for Mac row \(row.id). Reopen the conversation to inspect its sync status.\n\n" + row.content,
+                    quiet: true, failed: true)
+            },
+            wanted: { _ in }, render: { block, width, _ in
+                try TranscriptRenderer(width: CGFloat(width), category: category).prepared(block)
             },
             door: TranscriptDoor(leading: older, after: after, trailing: owed,
-                                 live: input.liveMessageID.map { .init(rowID: $0.uuidString, waiting: input.waitingLine) })
+                                 live: input.liveMessageID.map { .init(rowID: $0.uuidString, waiting: input.waitingLine) }),
+            liveID: input.liveMessageID?.uuidString,
+            liveText: input.liveMessageID.flatMap { messages[$0.uuidString]?.text },
+            width: width, scale: scale, viewport: viewport, openingParagraphs: openingParagraphs,
+            useCarriedWords: true
         )
-        return TranscriptBuilder.build(thread, cache: cache)
+        return Prepared(input: pressed, attachments: data, messages: messages,
+                        lastAssistantID: input.messages.last { $0.role == .assistant }?.id.uuidString)
     }
 
     /// A row's button as one quiet paragraph of action words; without a link it reads as the button disabled.
     static func actionBlock(id: String, messageID: String, label: String, link: TranscriptLink?) -> TranscriptBlock {
-        TranscriptBlock(id: id, messageID: messageID, role: "system",
-                        kind: .reply(runs: [TranscriptRun(text: label, bold: link != nil, link: link?.url)], ink: .quiet),
-                        source: label, lead: .paragraph, foldGroup: nil)
+        do {
+            return TranscriptBlock(id: id, messageID: messageID, role: "system",
+                                   kind: .reply(runs: [TranscriptRun(text: label, bold: link != nil, link: try link?.url)], ink: .quiet),
+                                   source: label, lead: .paragraph, foldGroup: nil)
+        } catch {
+            let failure = "\(label) unavailable: \(error.localizedDescription)"
+            return TranscriptBlock(id: id, messageID: messageID, role: "system",
+                                   kind: .reply(runs: [TranscriptRun(text: failure)], ink: .quiet),
+                                   source: failure, lead: .paragraph, foldGroup: nil)
+        }
+    }
+}
+
+/// Every phone document uses the Shared press; its feed is applied on the phone's display rhythm.
+@MainActor
+final class MobileTranscriptPress {
+    static let shared = MobileTranscriptPress()
+    let press: TranscriptPress<MobileTranscriptRow>
+    let face: FaceFeed
+
+    private init() {
+        let source = FaceFeedSource()
+        let frames = MobileTranscriptFrames()
+        press = TranscriptPress(feed: source)
+        face = FaceFeed(source: source) { await frames.next() }
+    }
+}
+
+@MainActor
+private final class MobileTranscriptFrames: NSObject {
+    private var link: CADisplayLink?
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func next() async {
+        await withCheckedContinuation { waiter in
+            waiters.append(waiter)
+            if link == nil {
+                let link = CADisplayLink(target: self, selector: #selector(frame(_:)))
+                link.add(to: .main, forMode: .common)
+                self.link = link
+            }
+            link?.isPaused = false
+        }
+    }
+
+    @objc private func frame(_ sender: CADisplayLink) {
+        sender.isPaused = true
+        let ready = waiters
+        waiters = []
+        for waiter in ready { waiter.resume() }
     }
 }

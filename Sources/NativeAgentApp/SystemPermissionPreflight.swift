@@ -16,7 +16,7 @@ import Photos
 import PersistenceCore
 import UserNotifications
 
-// Blueprint: | `SystemPermissionPreflight.swift` | Shared consent; scoped failures, bounded activation and Bluetooth waits, checked cleanup |
+// Blueprint: | `SystemPermissionPreflight.swift` | Shared consent; scoped failures, activation and Bluetooth event waits, checked cleanup |
 
 extension SystemPermissionPreflight {
     /// Request native grants only with the person present. Each unresolved item reports why; the first one in walk order has its Settings pane open.
@@ -86,7 +86,7 @@ extension SystemPermissionPreflight {
                 let cause = "\(gate.displayName) (\(id)) permission request could not complete: \(error.localizedDescription)"
                 // Cancellation must not open another pane; other failures keep both cause and remedy.
                 let handoff = Task.isCancelled
-                    || !openedPanes.isEmpty || !openedPanes.insert(gate).inserted ? nil : openSettings(gate, registered: true)
+                    || !openedPanes.isEmpty || !openedPanes.insert(gate).inserted ? nil : await openSettings(gate, registered: true)
                 let remedy = " Open System Settings > Privacy & Security > \(gate.displayName), allow NativeAgent, then return here and refresh."
                 problems.append(cause + remedy + (handoff.map { " " + $0 } ?? ""))
                 requestFailed = true
@@ -100,7 +100,7 @@ extension SystemPermissionPreflight {
             if let reason = await cardBlockReason([id], mode: mode) {
                 problems.append(reason)
                 // Open only the first unresolved pane because each later pane hides the previous one.
-                if openedPanes.isEmpty, openedPanes.insert(gate).inserted, let failure = openSettings(gate, registered: true) {
+                if openedPanes.isEmpty, openedPanes.insert(gate).inserted, let failure = await openSettings(gate, registered: true) {
                     problems.append(failure)
                 }
             }
@@ -126,14 +126,8 @@ extension SystemPermissionPreflight {
             forName: NSApplication.didBecomeActiveNotification, object: NSApp, queue: .main
         ) { _ in activated.resume() }
         defer { NotificationCenter.default.removeObserver(observer) }
-        let deadline = Task {
-            do { try await Task.sleep(for: .seconds(3)) }
-            catch { return }
-            activated.resume()
-        }
-        defer { deadline.cancel() }
         NSApp.activate()
-        await activated.park()
+        if !NSApp.isActive { await activated.park() }
         guard !Task.isCancelled else { return "The macOS permission request was interrupted." }
         guard NSApp.isActive else {
             return "NativeAgent could not become active to request macOS permission. Bring NativeAgent to the front and try again."
@@ -150,7 +144,7 @@ extension SystemPermissionPreflight {
     /// Keep a failed handoff visible in Settings instead of implying the request ran. Accessibility registers before its pane opens unless the caller
     /// just asked for it.
     @MainActor
-    static func openSettings(_ capability: SystemPermissionCapability, registered: Bool = false) -> String? {
+    static func openSettings(_ capability: SystemPermissionCapability, registered: Bool = false) async -> String? {
         if capability == .accessibility, !registered { registerForAccessibility() }
         guard let url = settingsURL(for: capability) else {
             return "NativeAgent could not find a System Settings privacy pane for \(capability.displayName)."
@@ -161,7 +155,10 @@ extension SystemPermissionPreflight {
                 manually, enable NativeAgent, then return here and refresh.
                 """
         }
-        SettingsDock.shared.show(for: capability)
+        do {
+            guard let model = ApplicationLifetime.shared.appModel else { throw FaceWireError.disconnected }
+            try await SettingsDock.shared.show(for: capability, face: BodyFacePresentation.current(model: model))
+        } catch { return "System Settings opened, but its NativeAgent guidance could not open: " + error.localizedDescription }
         return nil
     }
 
@@ -177,13 +174,7 @@ private final class BluetoothPrompt: NSObject, @preconcurrency CBCentralManagerD
         let prompt = BluetoothPrompt()
         prompt.manager = CBCentralManager(delegate: prompt, queue: .main)
         let done = prompt.answered
-        let deadline = Task {
-            do { try await Task.sleep(for: .seconds(30)) }
-            catch { return }
-            done.resume()
-        }
         defer {
-            deadline.cancel()
             prompt.manager?.delegate = nil
             prompt.manager = nil
         }

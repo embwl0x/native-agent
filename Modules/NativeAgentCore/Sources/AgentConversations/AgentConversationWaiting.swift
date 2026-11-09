@@ -13,8 +13,7 @@ import TurnTrace
 // Blueprint: | `AgentConversationWaiting.swift` | Waits preserve checked approval and restart evidence. |
 extension AgentConversationSession {
     private static let approvalWaitFailureCode = "agent_conversation_approval_unavailable"
-    /// Admission precedes waiting; a refused read cannot be waited past. Store writes wake the reply wait, whose deadline returns the saved snapshot without
-    /// extending the turn.
+    /// Admission precedes the caller's documented retrieval wait; expiry returns evidence without settling execution.
     package static func waitForReply(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, input: [String: JSONValue], scope: String,
         dataRoot: URL, admit: Bool = false,
                              read: @escaping Dispatch) async throws -> JSONValue {
@@ -39,9 +38,15 @@ extension AgentConversationSession {
             if case .object(var fields) = result { fields["wait_outcome"] = .string("not_tracked"); result = .object(fields) }
             return result
         }
-        let asked: Double = switch input["seconds"] { case .int(let n)?: Double(n); case .double(let n)?: n; default: 60 }
+        let asked: Double
+        switch input["seconds"] {
+        case nil, .null?: asked = 60
+        case .int(let n)? where n > 0 && n <= 300: asked = Double(n)
+        case .double(let n)? where n.isFinite && n > 0 && n <= 300: asked = n
+        default: throw ToolFailureError("seconds must be positive and at most 300 (default 60).", argumentPath: "seconds", effects: .none)
+        }
         let started = Date()
-        let deadline = started.addingTimeInterval(min(max(asked, 1), 300))
+        let deadline = started.addingTimeInterval(asked)
         if let peer = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { "peer:" + $0.id == agent }),
            peer.ability == nil, ChatGPTDotIPCTransport.owns(peer) {
             // The listener marks changes when its reply lands.
@@ -73,7 +78,7 @@ extension AgentConversationSession {
             return .object(fields)
         }
         if admit {
-            let first = try await read("agent_read", readInput, turn, conversation.withoutHistory, mac)
+            let first = try await read("agent_read", readInput, turn, conversation.withoutHistory.withoutConsuming, mac)
             if readRefused(first) { return first }
         }
         let transport = try AgentPeerStore(dataRoot: dataRoot).list().first { "peer:" + $0.id == agent }?.transport
@@ -90,7 +95,8 @@ extension AgentConversationSession {
                   retained == nil || row.operationID == retained?.operationID else { outcome = "not_opened"; break }
             latest = row
             if watching == nil { watching = row.id; AgentConversationRunning.shared.watch(row.id) }
-            guard try replyInFlight(row, transport, dataRoot: dataRoot) else {
+            guard try replyInFlight(row, transport, dataRoot: dataRoot)
+                    || !stoppedOrReleased(row) && heldReplyPending(row) else {
                 if outcome != "nothing_in_flight" { outcome = "settled" }
                 break
             }
@@ -104,7 +110,7 @@ extension AgentConversationSession {
         if ["still_waiting", "cancelled"].contains(outcome), let latest {
             snapshot = AgentConversationView.view(latest, details: input["details"] == .bool(true), dataRoot: dataRoot, includeHistory: false)
         } else {
-            snapshot = try await read("agent_read", readInput, turn, conversation.withoutHistory, mac)
+            snapshot = try await read("agent_read", readInput, turn, conversation.withoutHistory.withoutConsuming, mac)
         }
         guard case .object(var fields)? = snapshot else { return .object(["wait_outcome": .string(outcome)]) }
         // Claim only the exact routine answer returned by this wait; stopped or timed-out waits cannot consume it.
@@ -138,9 +144,9 @@ extension AgentConversationSession {
         try replyInFlight(row, transport, dataRoot: dataRoot) || AgentConversationRunning.shared.watched(row.id) || row.queueReservation != nil
             || row.queued?.contains(where: { $0.held == nil || $0.waitingForMac == true }) == true
     }
-    /// Sending counts as occupied only while this process owns the send.
+    /// Admission owns a send before its task registers; only process-exit evidence can abandon that interval.
     static func replyInFlight(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?, dataRoot: URL) throws -> Bool {
-        if row.phase == "sending" { return AgentConversationRunning.shared.live(row: row.id, operation: row.operationID) }
+        if row.phase == "sending" { return !ownerless(row) }
         if try unsettledAttentionChecked(row, dataRoot: dataRoot) { return true }
         guard row.phase == "waiting" else { return false }
         // Process-owned desktop and background watches cannot survive restart.
@@ -166,13 +172,16 @@ extension AgentConversationSession {
             if row.phase == "waiting" { return desktop.contains(row.agent) && !running.routeWatching(row: row.id, operation: row.operationID) }
             return try row.phase == "sending" || unsettledAttentionChecked(row, dataRoot: dataRoot) && !awaitingApproval(row)
         }
-        // A receipt correction, not news: an old row keeps its time (a phase change still moves it).
+        // An old row keeps its time (a phase change still moves it); the agent is told, in the chat that sent it, what the restart did to its send.
         for row in try store.records() {
             do {
                 guard try orphaned(row) else { continue }
                 _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
                     guard try orphaned($0) else { return }
                     interrupted(&$0)
+                    if $0.agent.hasPrefix("peer:"), $0.personInitiated != true {
+                        $0.deliveryState = "delivering"; $0.automaticRead = true; $0.nextReadAt = Date()
+                    }
                 }
             } catch let failure as ToolFailureError where failure.code == approvalWaitFailureCode {
                 // The missing/unreadable approval belongs to this send. Its owner has recorded a named repair; unrelated queues resume.
@@ -203,7 +212,8 @@ extension AgentConversationSession {
     }
     /// Process exit ends the local turn without proving a reply or authorizing a resend.
     package static func restartDetail(_ name: String) -> String {
-        "Interrupted by an app restart before \(name)'s reply came back, so it was not answered here. Nothing was resent; send it again if it is still wanted."
+        "The app restarted while this was in flight to \(name). It may have reached \(name); if \(name) answers, the answer arrives in this "
+            + "conversation. Nothing was resent; send it again only if no answer comes and you still want it."
     }
     /// A sending row still holds its previous receipt and needs a fresh interruption receipt. Preserve other sends’ locators: remote work may finish after
     /// the local wait ends.
@@ -230,15 +240,16 @@ extension AgentConversationSession {
         settle(&root)
         absorb(.object(root), into: &row)
     }
-    /// Unknown dispatched outcomes and executable approvals fence the thread until terminal evidence or explicit cancellation. This projection cannot replace
-    /// the checked approval owner used by executable waits.
+    /// Unknown dispatched outcomes fence the thread while their call is live; executable approvals fence it until terminal evidence or explicit
+    /// cancellation. This projection cannot replace the checked approval owner used by executable waits.
     package static func unsettledAttention(_ row: AgentConversationRecord) -> Bool {
         guard row.phase == "attention", !stoppedOrReleased(row), case .object(let root)? = row.receipt else { return false }
         let value = row.sendEvidence
         if root["sent"] == .bool(false) || value["sent"] == .bool(false) { return false }
         let status = string(value["run_status"]) ?? string(value["status"]) ?? ""
-        // Unknown outcomes hold the thread only while their owning call can still produce a reply.
+        // Unknown outcomes hold the thread only while their owning call can still produce a reply: a call that ended produces none.
         return ["outcome_unknown", "delivery_unknown"].contains(status) && value["terminal"] != .bool(true)
+                && AgentConversationRunning.shared.live(row: row.id, operation: row.operationID)
             || AgentConversationRecord.approvalWaits(status)
     }
     /// Retain an approved exchange’s place ahead of its queue until replay claims it; terminal approval evidence releases it.

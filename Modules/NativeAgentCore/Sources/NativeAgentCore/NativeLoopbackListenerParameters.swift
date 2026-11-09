@@ -34,7 +34,7 @@ enum NativeLoopbackListenerParameters {
     }
 }
 
-/// Socket-lifecycle tissue shared by the three resident loopback adapters. It owns listener identity, cancellation and its bounded port diagnostic. Tokens,
+/// Socket-lifecycle tissue shared by the three resident loopback adapters. It owns listener identity, cancellation and its port diagnostic. Tokens,
 /// descriptors, request policy, effects, and verification remain with each bridge/browser owner. Each install listens on its own fixed port (InstallPaths
 /// .loopbackPorts); a port another process holds is a failure naming that process, never a hop to another port.
 public final class NativeLoopbackListener: @unchecked Sendable {
@@ -199,12 +199,12 @@ public final class NativeLoopbackListener: @unchecked Sendable {
         }
         lock.lock()
         guard generation == attempt, callbacks != nil else { lock.unlock(); return }
-        failure = "port \(port) is held by another process"
+        failure = "bind failed on port \(port): address in use; waiting on lsof for the listener's identity"
         let next: ListeningProcessDiagnostic?
         if diagnostic == nil {
             let id = UUID()
-            next = ListeningProcessDiagnostic(id: id, port: port) { [weak self] holder in
-                self?.diagnosticFinished(id: id, generation: attempt, holder: holder)
+            next = ListeningProcessDiagnostic(id: id, port: port) { [weak self] outcome in
+                self?.diagnosticFinished(id: id, generation: attempt, outcome: outcome)
             }
             diagnostic = next
         } else {
@@ -216,15 +216,19 @@ public final class NativeLoopbackListener: @unchecked Sendable {
         next?.start()
     }
 
-    private func diagnosticFinished(id: UUID, generation attempt: UInt64, holder: String?) {
+    private func diagnosticFinished(id: UUID, generation attempt: UInt64, outcome: ListeningProcessDiagnostic.Outcome) {
         lock.lock()
         guard diagnostic?.id == id else { lock.unlock(); return }
         diagnostic = nil
         guard generation == attempt else { lock.unlock(); return }
-        let holder = holder ?? "a process lsof could not name"
-        failure = "port \(port) is held by \(holder)"
+        let detail: String
+        switch outcome {
+        case .holder(let holder): detail = "bind failed on port \(port): address in use by \(holder)"
+        case .unavailable(let why): detail = "bind failed on port \(port): address in use; process diagnosis unavailable: \(why)"
+        }
+        failure = detail
         lock.unlock()
-        nativeLog("[\(label)] port \(port) is held by \(holder); not listening")
+        nativeLog("[\(label)] \(detail); not listening")
     }
 
     private func recordFailure(_ detail: String, generation attempt: UInt64) {
@@ -282,21 +286,28 @@ public final class NativeLoopbackListener: @unchecked Sendable {
 
 }
 
-/// One read-only `lsof`, stopped after two seconds or owner cancellation. The listener retains admission until termination; no timeout joins a worker.
+/// One read-only `lsof`, settled by process exit and pipe EOF or owner cancellation.
 private final class ListeningProcessDiagnostic: @unchecked Sendable {
+    enum Outcome: Sendable {
+        case holder(String)
+        case unavailable(String)
+    }
+
     let id: UUID
     private let lock = NSLock()
-    private let process = Process()
+    private let process = ManagedProcess()
     private let pipe = Pipe()
-    private let completion: @Sendable (String?) -> Void
+    private let completion: @Sendable (Outcome) -> Void
     private var drain: ProcessPipeDrain?
-    private var deadline: DispatchSourceTimer?
     private var bytes = Data()
+    private var truncated = false
+    private var failure: String?
     private var cancelled = false
     private var finished = false
+    private var settling = false
     private var launched = false
 
-    init(id: UUID, port: UInt16, completion: @escaping @Sendable (String?) -> Void) {
+    init(id: UUID, port: UInt16, completion: @escaping @Sendable (Outcome) -> Void) {
         self.id = id
         self.completion = completion
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
@@ -313,57 +324,71 @@ private final class ListeningProcessDiagnostic: @unchecked Sendable {
             drain = try ProcessPipeDrain(handle: pipe.fileHandleForReading) { [weak self] chunk in
                 self?.lock.withLock {
                     guard let self else { return }
-                    self.bytes.append(chunk.prefix(max(0, 65_536 - self.bytes.count)))
+                    let count = min(chunk.count, max(0, 65_536 - self.bytes.count))
+                    self.bytes.append(chunk.prefix(count))
+                    if count < chunk.count { self.truncated = true }
                 }
             }
             process.terminationHandler = { [self] _ in finish() }
             // Serialize launch with cancel so stop cannot miss an unlaunched PID.
             try process.run()
             launched = true
-            try? pipe.fileHandleForWriting.close()
-            let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-            timer.setEventHandler { [weak self] in self?.cancel() }
-            timer.schedule(deadline: .now() + 2)
-            deadline = timer
-            timer.resume()
             lock.unlock()
         } catch {
+            failure = error.localizedDescription
             lock.unlock()
             finish()
         }
     }
 
     func cancel() {
-        lock.withLock {
-            guard !finished else { return }
+        let stopping = lock.withLock { () -> (ProcessTreeSnapshot?, ProcessPipeDrain?) in
+            guard !finished else { return (nil, nil) }
             cancelled = true
-            deadline?.cancel()
-            if launched, process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+            return (launched ? process.groupSnapshot : nil, settling ? drain : nil)
         }
+        if let snapshot = stopping.0 { ProcessTreeReaper.quiesceAndKill(snapshot) }
+        stopping.1?.stop()
     }
 
     private func finish() {
         lock.lock()
-        guard !finished else { lock.unlock(); return }
-        finished = true
-        let valid = launched && !cancelled && process.terminationStatus == 0
+        guard !finished, !settling else { lock.unlock(); return }
+        settling = true
+        let launched = self.launched
         let drain = self.drain
-        self.drain = nil
-        deadline?.cancel()
-        deadline = nil
         process.terminationHandler = nil
-        try? pipe.fileHandleForWriting.close()
         lock.unlock()
-        // EOF is not awaited: the existing drain performs only bounded, nonblocking reads, then closes even if a writer retained the pipe.
-        drain?.stopAndWait()
-        if drain == nil { try? pipe.fileHandleForReading.close() }
-        let output = lock.withLock { String(decoding: bytes, as: UTF8.self) }
+        if launched, process.terminationError == nil { drain?.waitForEOF() }
+        else { drain?.stopAndWait() }
+        let captured = lock.withLock {
+            finished = true
+            self.drain = nil
+            return (bytes, truncated, failure, cancelled)
+        }
+        if let failure = captured.2 { completion(.unavailable(failure)); return }
+        if let failure = process.terminationError { completion(.unavailable(failure)); return }
+        guard !captured.3 else { completion(.unavailable("the listener owner cancelled diagnosis")); return }
+        guard launched, process.terminationStatus == 0 else {
+            completion(.unavailable("lsof exited with status \(process.terminationStatus)"))
+            return
+        }
+        if let failure = drain?.captureFailure { completion(.unavailable(failure)); return }
+        guard !captured.1 else { completion(.unavailable("lsof output exceeded its 65,536-byte diagnostic limit")); return }
+        guard let output = String(data: captured.0, encoding: .utf8) else {
+            completion(.unavailable("lsof output is not valid UTF-8"))
+            return
+        }
         var pid: String?
         var command: String?
         for line in output.split(separator: "\n") {
             if line.hasPrefix("p"), pid == nil { pid = String(line.dropFirst()) }
             if line.hasPrefix("c"), command == nil { command = String(line.dropFirst()) }
         }
-        completion(valid ? pid.map { "\(command ?? "unknown") (pid \($0))" } : nil)
+        guard let pid, let command, !pid.isEmpty, !command.isEmpty else {
+            completion(.unavailable("lsof returned no complete listener identity"))
+            return
+        }
+        completion(.holder("\(command) (pid \(pid))"))
     }
 }

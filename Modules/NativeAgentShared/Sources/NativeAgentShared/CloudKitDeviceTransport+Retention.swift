@@ -37,39 +37,32 @@ extension CloudKitDeviceTransport {
 
     /// Mac-only and self-throttled so every drain may request bounded retention work.
     @discardableResult
-    public func sweepExpiredRecords() async -> Int {
+    public func sweepExpiredRecords() async throws -> Int {
         guard holdsPairing else { return 0 }
         let now = Date()
         guard claimRetentionSweep(now: now) else { return 0 }
         let cutoff = now.addingTimeInterval(-Self.retentionWindow)
         var deleted = 0
         var backlog = false
-        var timedOut = false
+        var failures: [String] = []
         for recordType in [
             NADeviceSyncRecordType.chatMessage,
             NADeviceSyncRecordType.notification,
         ] {
-            let outcome = await sweepExpiredRecords(recordType: recordType, cutoff: cutoff)
-            deleted += outcome.deleted
-            // A full fetched page signals backlog regardless of its deletion count.
-            if outcome.backlog { backlog = true }
-            if outcome.deleteTimedOut { timedOut = true }
+            do {
+                let outcome = try await sweepExpiredRecords(recordType: recordType, cutoff: cutoff)
+                deleted += outcome.deleted
+                if outcome.backlog { backlog = true }
+            } catch {
+                failures.append(recordType + ": " + error.localizedDescription)
+            }
         }
         setRetentionBacklog(backlog)
-        // Cancellation cannot prove the server rejected a timed-out batch.
-        if timedOut {
-            nativeLog(
-                "[ck-device] retention sweep: %d confirmed deletion(s) before %@, plus a batch whose delete timed out — that batch's count is unknown",
-                deleted,
-                "\(cutoff)"
-            )
-        } else {
-            nativeLog(
-                "[ck-device] retention sweep deleted %d record(s) modified before %@",
-                deleted,
-                "\(cutoff)"
-            )
+        guard failures.isEmpty else {
+            throw DeviceSyncError.underlying(message:
+                "CloudKit retention confirmed \(deleted) deletion(s); unreadable families: " + failures.joined(separator: "; "))
         }
+        nativeLog("[ck-device] retention confirmed %d deletion(s) before %@", deleted, "\(cutoff)")
         return deleted
     }
 
@@ -90,54 +83,18 @@ extension CloudKitDeviceTransport {
         lock.lock(); retentionBacklog = backlog; lock.unlock()
     }
 
-    private func sweepExpiredRecords(recordType: String, cutoff: Date) async -> DeviceCKSweepOutcome {
-        var outcome = DeviceCKSweepOutcome()
-        let page: DeviceCKSweepPage
-        do {
-            page = try await withDeviceCKTimeoutThrowing(
-                "CloudKitDeviceTransport.sweep",
-                seconds: 10,
-                onFailure: accountFailureReporter
-            ) {
-                return try await self.expiredRecordPage(
-                    recordType: recordType,
-                    cutoff: cutoff
-                )
-            }
-        } catch {
-            nativeLog("[ck-device] retention sweep query failed for %@: %@", recordType, String(describing: error))
-            return outcome
+    private func sweepExpiredRecords(recordType: String, cutoff: Date) async throws -> DeviceCKSweepOutcome {
+        let page = try await withDeviceCKOperation("CloudKitDeviceTransport.sweep", onFailure: accountFailureReporter) {
+            try await self.expiredRecordPage(recordType: recordType, cutoff: cutoff)
         }
-        // The oldest page advances only by confirmed deletion.
-        outcome.backlog = page.fetched >= Self.retentionSweepBatch
-            && page.names.count == page.fetched
+        var outcome = DeviceCKSweepOutcome()
+        outcome.backlog = page.fetched >= Self.retentionSweepBatch && page.names.count == page.fetched
         let names = page.names
         guard !names.isEmpty else { return outcome }
-        do {
-            try await withDeviceCKTimeoutThrowing(
-                "CloudKitDeviceTransport.sweepDelete",
-                seconds: 15,
-                onFailure: accountFailureReporter
-            ) {
-                let op = CKModifyRecordsOperation(
-                    recordsToSave: nil,
-                    recordIDsToDelete: names.map { CKRecord.ID(recordName: $0) }
-                )
-                op.qualityOfService = .utility
-                try await self.performModifyRecords(op)
-            }
-        } catch is DeviceCKLandmineTimeout {
-            // Keep the batch count unknown until server acceptance is proven.
-            nativeLog(
-                "[ck-device] retention sweep delete batch of %d timed out for %@; the server may still have applied it — count unknown",
-                names.count,
-                recordType
-            )
-            outcome.deleteTimedOut = true
-            return outcome
-        } catch {
-            nativeLog("[ck-device] retention sweep delete failed for %@: %@", recordType, String(describing: error))
-            return outcome
+        try await withDeviceCKOperation("CloudKitDeviceTransport.sweepDelete", onFailure: accountFailureReporter) {
+            let op = CKModifyRecordsOperation(recordsToSave: nil, recordIDsToDelete: names.map { CKRecord.ID(recordName: $0) })
+            op.qualityOfService = .utility
+            try await self.performModifyRecords(op)
         }
         outcome.deleted = names.count
         return outcome
@@ -163,26 +120,34 @@ extension CloudKitDeviceTransport {
 
         let holder = DeviceCKRecordNameHolder()
         op.recordMatchedBlock = { id, result in
-            guard case .success(let ck) = result else { return }
-            holder.noteFetched()
-            guard let modDate = ck.modificationDate, modDate < cutoff else { return }
-            holder.add(id.recordName)
-        }
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<DeviceCKSweepPage, Error>) in
-            op.queryResultBlock = { result in
-                let page = holder.snapshot()
-                switch result {
-                case .success:
-                    cont.resume(returning: DeviceCKSweepPage(
-                        names: page.names,
-                        fetched: page.fetched
-                    ))
-                case .failure(let err):
-                    cont.resume(throwing: Self.mapError(err))
+            switch result {
+            case .success(let ck):
+                holder.noteFetched()
+                guard let modDate = ck.modificationDate else {
+                    holder.fail(DeviceSyncError.underlying(message: "CloudKit retention record \(id.recordName) has no server date."))
+                    return
                 }
+                if modDate < cutoff { holder.add(id.recordName) }
+            case .failure(let error): holder.fail(error)
             }
-            self.database.add(op)
         }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<DeviceCKSweepPage, Error>) in
+                op.queryResultBlock = { result in
+                    switch result {
+                    case .success:
+                        do {
+                            let page = try holder.snapshot()
+                            cont.resume(returning: DeviceCKSweepPage(names: page.names, fetched: page.fetched))
+                        } catch { cont.resume(throwing: Self.mapError(error)) }
+                    case .failure(let err):
+                        cont.resume(throwing: Self.mapError(err))
+                    }
+                }
+                self.database.add(op)
+                if Task.isCancelled { op.cancel() }
+            }
+        } onCancel: { op.cancel() }
     }
 
 }

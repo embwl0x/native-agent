@@ -12,7 +12,7 @@ extension SwiftNativeTrustCenter {
         // Access-mode display/preset projection; PermissionLaw decides each call.
         policy["autonomyDefault"] = .string("supervised")
         // Autonomy additions apply only to proven fresh installs; putting them in the merge base would grant existing policies.
-        policy["updatedAt"] = .string(Self.isoTimestamp(clock()))
+        // updatedAt belongs to a saved policy. An absent source date stays absent on every read.
         policy["appDataRoot"] = .string(dataRoot.path)
         policy["filePolicy"] = .object([
             "workspaceRoots": .array(TrustCenterDefaultWorkspaceRoots.defaultRootPaths(dataRoot: dataRoot).map { .string($0) }),

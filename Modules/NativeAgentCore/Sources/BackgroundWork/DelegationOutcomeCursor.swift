@@ -13,24 +13,17 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         public var deliveryReceiptVersions: [String: String] = [:]
         /// Recorded outcome enables escalation; without it the cursor cannot prove the card’s severity.
         public var cardedOutcomes: [String: String]
-        /// Remove recovered stalls so a later stall can speak again; terminal identities stay settled.
-        public var announcedStallIDs: [String]
 
         public init(cardedIDs: Set<String> = [],
-                    cardedOutcomes: [String: String] = [:],
-                    announcedStallIDs: [String] = []) {
+                    cardedOutcomes: [String: String] = [:]) {
             self.cardedIDs = cardedIDs
             self.cardedOutcomes = cardedOutcomes
-            self.announcedStallIDs = announcedStallIDs
         }
     }
     public var stores: [String: StoreCursor]
     public init(stores: [String: StoreCursor] = [:]) {
         self.stores = stores
     }
-    /// Bounds reversible liveness warnings, not terminal receipt identities.
-    public static let cardedIDLimit = 500
-
     public func store(_ source: String) -> StoreCursor {
         stores[source] ?? StoreCursor()
     }
@@ -43,22 +36,6 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
     }
     public func cardedOutcome(source: String, id: String) -> DelegationOutcome? {
         store(source).cardedOutcomes[id].flatMap(DelegationOutcome.init(rawValue:))
-    }
-    public mutating func markStallAnnounced(source: String, id: String) {
-        var cursor = store(source)
-        if !cursor.announcedStallIDs.contains(id) {
-            cursor.announcedStallIDs.append(id)
-            if cursor.announcedStallIDs.count > Self.cardedIDLimit {
-                cursor.announcedStallIDs.removeFirst(
-                    cursor.announcedStallIDs.count - Self.cardedIDLimit)
-            }
-        }
-        stores[source] = cursor
-    }
-    public mutating func clearStallAnnouncement(source: String, id: String) {
-        var cursor = store(source)
-        cursor.announcedStallIDs.removeAll { $0 == id }
-        stores[source] = cursor
     }
     // Keep persisted wire keys explicit so property renames cannot silently change storage.
 
@@ -95,7 +72,6 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
             guard cursor.cardedOutcomes.values.allSatisfy({ DelegationOutcome(rawValue: $0) != nil })
             else { throw CocoaError(.fileReadCorruptFile) }
             cursor.deliveryReceiptVersions = try dictionary(obj["delivery_receipt_versions"])
-            cursor.announcedStallIDs = try strings(obj["announced_stall_ids"])
             result.stores[source] = cursor
         }
         return result
@@ -113,10 +89,6 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
             }
             if !cursor.deliveryReceiptVersions.isEmpty {
                 obj["delivery_receipt_versions"] = .object(cursor.deliveryReceiptVersions.mapValues { .string($0) })
-            }
-            if !cursor.announcedStallIDs.isEmpty {
-                obj["announced_stall_ids"] = .array(
-                    cursor.announcedStallIDs.map { .string($0) })
             }
             stores[source] = .object(obj)
         }

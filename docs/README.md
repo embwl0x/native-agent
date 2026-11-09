@@ -29,17 +29,23 @@ and [CHANGELOG.md](../CHANGELOG.md).
 
 ## How it works
 
+Quiet never ends what they holds. A conversation is held whole until the request
+reaches the input budget; then the oldest whole turns go in half-budget jumps.
+The input budget is min(model window minus response allowance, 200,000 tokens).
+History fitting uses the input budget; refusal and result pointers use model
+window minus response allowance, the physical limit.
+
 | Document | For |
 |---|---|
 | [Internal Workings](INTERNAL_WORKINGS.md) | The connected lifecycle: context, memory, action, growth, delegation |
-| [Anatomy of a Turn](ANATOMY_OF_A_TURN.md) | One message from acceptance to settlement |
+| [Anatomy of a Turn](ANATOMY_OF_A_TURN.md) | One message from acceptance to settlement; optional CPU hearing cuts generation, arrivals withdraw unstarted proposals, running calls retain receipts |
 | [Session conversations](session-conversations.md) | The row's declared kind, helper ownership and the shared person/peer/own-work questions |
-| [Conversation context history](conversation-context-history.md) | One user-leading delivery on every provider; exact sent-row metadata, paragraph deltas/keyframes, replay and byte budgets |
+| [Conversation context history](conversation-context-history.md) | Context sent once; conversation held to the input budget; older words reached |
 | [Capabilities](CAPABILITIES.md) | What is implemented, with honest limits |
 | [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md) | Source-owner map (checked by `script/generate_architecture_blueprint.swift --check`) |
 | [Project Direction](PROJECT_DIRECTION.md) | Product principles and links to owning contracts |
 | [App tool contract](TOOL_LOADING.md) | One always-on `app`: home, pages, items, actions, scripts and discovery |
-| [Turn resilience](TURN_RESILIENCE.md) | Why a turn dies, what keeps it alive; detected/Custom windows, shared request-builder measurement, Compact at percentage and proportional aging/verified fold targets |
+| [Turn resilience](TURN_RESILIENCE.md) | Turn failures, shared request measurement, input-budget fitting and retained result pointers |
 | [Stop](STOP.md) | The Stop law: Stop cancels the work, never its settlement |
 | [Senses](SENSES.md) | Native-world sense contract, helper wire protocol and source boundaries |
 | [Experience](EXPERIENCE.md) | One experience record, domain-owned outcomes, delivery and repair obligations |
@@ -47,7 +53,7 @@ and [CHANGELOG.md](../CHANGELOG.md).
 | [Memory system map](MEMORY_SYSTEM_MAP.md), [What a good memory is](memory-quality.md) | Every memory piece and its standard |
 | [Canonical data paths](canonical_data_paths.md), [Runtime storage limits](runtime-storage-limits.md) | Where state lives and how it is bounded |
 | [Automated systems](AUTOMATED_SYSTEMS.md) | Background loops, live health/status probes, event lifecycles and pulse owners |
-| [Subconscious](SUBCONSCIOUS.md), [Cognition wiring](COGNITION_WIRING.md), [Organism](ORGANISM.md) | The inner-life layers, as built |
+| [Subconscious](SUBCONSCIOUS.md), [Cognition wiring](COGNITION_WIRING.md), [Organism](ORGANISM.md) | Inner life, attention and checked thought words |
 | [Continuous cognitive substrate](CONTINUOUS_COGNITIVE_SUBSTRATE.md) | The substrate engineering boundaries |
 | [Jev (retired)](JEV.md) | Retirement and legacy-data guidance |
 | [Chrome surface](../Extensions/NativeAgentChrome/README.md), [Chrome protocol](../Extensions/NativeAgentChrome/protocol/PROTOCOL.md) | Group-owned tabs, trusted text/key input, document-selected DOM/picture reads and effect/cleanup evidence |

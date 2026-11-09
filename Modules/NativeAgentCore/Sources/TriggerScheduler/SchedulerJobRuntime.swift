@@ -1,28 +1,8 @@
 import Foundation
-import PersistenceCore
 
-// Blueprint: | `SchedulerJobRuntime.swift` | `SchedulerJobRuntime`: Civil timing prevents duplicate occurrences across zones |
+// Blueprint: | `SchedulerJobRuntime.swift` | `SchedulerJobRuntime`: a civil minute's identity, which no zone change can repeat |
 
-/// Share schedule arithmetic with the job normalizer so the app loop cannot duplicate its calendar parser.
 public enum SchedulerJobRuntime {
-    /// Today's matching civil minute, or nil on a day that skips it.
-    static func dailyOccurrence(_ schedule: [String: JSONValue], on date: Date) -> Date? {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = .autoupdatingCurrent
-        let start = calendar.startOfDay(for: date)
-        guard let epoch = try? SchedulerJobNormalizer.nextFromSchedule(
-            schedule, afterEpoch: start.timeIntervalSince1970 - 60, now: { date }
-        ) else { return nil }
-        let occurrence = Date(timeIntervalSince1970: epoch)
-        return calendar.isDate(occurrence, inSameDayAs: date) ? occurrence : nil
-    }
-
-    public static func wallClockSchedule(_ job: [String: JSONValue]) -> [String: JSONValue]? {
-        guard !bool(job["oneShot"], default: false), case .object(let schedule)? = job["schedule"],
-              ["hourly", "daily", "weekly", "monthly", "cron"].contains(SchedulerJobNormalizer.scheduleType(schedule)) else { return nil }
-        return schedule
-    }
-
     /// Civil identity deliberately has no offset: changing zones cannot create another occurrence.
     public static func occurrence(at date: Date, zone: TimeZone) -> String {
         let format = DateFormatter()
@@ -31,86 +11,5 @@ public enum SchedulerJobRuntime {
         format.timeZone = zone
         format.dateFormat = "yyyy-MM-dd HH:mm"
         return format.string(from: date)
-    }
-
-    public static func wallClockOccurrence(for job: [String: JSONValue], epoch: Double) -> String? {
-        guard wallClockSchedule(job) != nil else { return nil }
-        return occurrence(at: Date(timeIntervalSince1970: epoch), zone: .autoupdatingCurrent)
-    }
-
-    static func civilEpoch(_ key: String) -> Double? {
-        guard key.count == 16, key.contains(" ") else { return nil }
-        return SchedulerJobNormalizer.parseISO(key.replacingOccurrences(of: " ", with: "T") + ":00Z")
-    }
-
-    public static func nextWallClockOccurrence(for job: [String: JSONValue]) -> String? {
-        string(job["nextWallClockOccurrence"])
-    }
-
-    /// Claims keep their saved instant. Other wall-clock work resolves its civil identity in the current zone.
-    public static func scheduledEpoch(for job: [String: JSONValue]) -> Double? {
-        let saved = epoch(from: job["nextRunAt"]) ?? epoch(from: job["nextRunAtEpoch"])
-        guard job["activeOccurrence"] == nil,
-              wallClockSchedule(job) != nil else { return saved }
-        guard let key = nextWallClockOccurrence(for: job), let next = civilEpoch(key) else { return nil }
-        if let saved, wallClockOccurrence(for: job, epoch: saved) == key { return saved }
-        guard let utc = TimeZone(secondsFromGMT: 0) else { return nil }
-        return wallClock(Date(timeIntervalSince1970: next), from: utc, to: .autoupdatingCurrent)?.timeIntervalSince1970
-    }
-
-    /// The civil minute `date` reads in `from`, formed again in `to`.
-    public static func wallClock(_ date: Date, from: TimeZone, to: TimeZone) -> Date? {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = from
-        let components = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
-        calendar.timeZone = to
-        return calendar.date(from: components)
-    }
-
-    public static func epoch(from raw: JSONValue?) -> Double? {
-        SchedulerJobNormalizer.floatEpochForDecoration(raw)
-    }
-
-    public static func string(_ raw: JSONValue?) -> String? {
-        SchedulerJobNormalizer.string(raw)
-    }
-
-    public static func bool(_ raw: JSONValue?, default defaultValue: Bool) -> Bool {
-        SchedulerJobNormalizer.boolValue(raw, default: defaultValue)
-    }
-
-    public static func int(_ raw: JSONValue?, default defaultValue: Int) -> Int {
-        (try? SchedulerJobNormalizer.integer(raw)) ?? defaultValue
-    }
-
-    public static func nextRunEpoch(
-        for job: JSONValue,
-        afterEpoch: Double,
-        now: @escaping @Sendable () -> Date = { Date() }
-    ) throws -> Double? {
-        guard case .object(let obj) = job else { return nil }
-        if bool(obj["oneShot"], default: false) { return nil }
-        guard case .object(let schedule)? = obj["schedule"] else {
-            throw TriggerSchedulerError.schedulerInvalid("Saved job has no structured schedule; repair its definition before advancing it.")
-        }
-        return try SchedulerJobNormalizer.nextFromSchedule(schedule, afterEpoch: afterEpoch, now: now)
-    }
-
-    /// Past `now` and past the minute `dueEpoch` claimed: in a fall-back hour a run finishing at the second 01:01 must not be handed the second 01:59.
-    public static func nextRunEpochAfterNow(
-        for job: JSONValue,
-        beyond dueEpoch: Double? = nil,
-        now: @escaping @Sendable () -> Date = { Date() }
-    ) throws -> Double? {
-        try [now().timeIntervalSince1970, dueEpoch].compactMap { $0 }
-            .compactMap { try nextRunEpoch(for: job, afterEpoch: $0, now: now) }.max()
-    }
-
-    public static func decorationISO(epoch: Double) -> String {
-        SchedulerJobNormalizer.epochToDecorationISO(epoch)
-    }
-
-    public static func floatString(_ value: Double) -> String {
-        SchedulerJobNormalizer.floatString(value)
     }
 }

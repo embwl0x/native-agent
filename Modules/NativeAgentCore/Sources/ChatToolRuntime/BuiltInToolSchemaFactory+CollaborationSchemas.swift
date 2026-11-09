@@ -50,7 +50,7 @@ extension BuiltInToolSchemaFactory {
                 description: """
                     Your jobs (work you gave other agents and your own lines with agent.job, newest first) and retained reply deliveries \
                     (answers owed to, delivered to or let go for the chats and contacts that asked). agent.read {job} opens one job; agent.read \
-                    opens a conversation. Discarded text is not recoverable; stall_basis='none' means unmeasurable.
+                    opens a conversation. Discarded text is not recoverable.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [

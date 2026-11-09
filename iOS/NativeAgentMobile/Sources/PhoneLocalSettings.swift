@@ -12,18 +12,16 @@ enum PhoneSettingWrite: Sendable {
 
     struct Admission: Sendable {
         let pairing: String
-        let expiresAt: Date
         let approved: Bool
         let stillAuthorized: @MainActor @Sendable () -> Bool
     }
     /// Recheck after queued user changes: consent applies only to this request and pairing.
     func check(raising: Bool = false) throws {
         guard case .request(let admission) = self else { return }
-        guard admission.expiresAt > Date(),
-              admission.stillAuthorized(),
+        guard admission.stillAuthorized(),
               admission.pairing == AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) else {
             throw PhoneLocalSetting.failure(
-                "The phone request ended, expired or pairing changed before this effect. Read the current setting before another change.")
+                "The phone request ended or pairing changed before this effect. Read the current setting before another change.")
         }
         guard !raising || admission.approved else {
             throw PhoneLocalSetting.failure("This now raises phone sharing authority. Ask again so the phone can show its approval sheet.")
@@ -93,8 +91,7 @@ enum PhoneLocalSettings {
 
     static func perform(_ request: PhoneRequest, approved: Bool, pairing: String,
                         stillAuthorized: @escaping @MainActor @Sendable () -> Bool) async throws -> [String: String] {
-        let authority = PhoneSettingWrite.request(.init(pairing: pairing, expiresAt: request.expiresAt,
-            approved: approved, stillAuthorized: stillAuthorized))
+        let authority = PhoneSettingWrite.request(.init(pairing: pairing, approved: approved, stillAuthorized: stillAuthorized))
         let controls = await controls()
         try authority.check()
         guard let id = request.params["id"] else {

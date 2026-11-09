@@ -113,13 +113,9 @@ extension SwiftToolDispatcher {
         "desk_close", "desk_archive", "desk_blocked_on", "desk_defer", "desk_work_log",
     ]
 
-    func deskHeld(_ handle: String, session: String) async throws -> JSONValue? {
-        guard let by = try await deskStore().hold(handle, session: session) else { return nil }
-        return .object([
-            "status": .string("refused"), "reason": .string("held_by"), "held_by": .string(by), "effects": .string("none"),
-            "detail": .string("\(handle) is held by \(by), which is working it; nothing changed. "
-                + "Leave it to that one, or pick it up there."),
-        ])
+    func deskHeld(_ handle: String) async throws -> JSONValue? {
+        guard let conflict = try await deskStore().runHold(handle) else { return nil }
+        return conflict.refusal(handle)
     }
 
     /// Resolve against the mutation snapshot to avoid targeting a different item.
@@ -462,12 +458,12 @@ extension SwiftToolDispatcher {
                 let personName = id.contains(where: { $0.isLetter }) && id.allSatisfy {
                     $0.isLetter || $0.isWhitespace || "-'.".contains($0)
                 } && !id.lowercased().hasPrefix("desk.")
-                // A conversation the agent is in is waited on like its person: its next message.
-                let conversation = NativeAgentChatSessionID.normalizedPathComponent(id).map {
-                    FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("chat/messages/\($0).jsonl").path)
-                } ?? false
                 // A contact is named by the id agent.read hands out (peer:…) as well as by name.
-                let contact = id.hasPrefix("peer:") && ((try? AgentPeerStore(dataRoot: dataRoot).list())?.contains { "peer:" + $0.id == id } ?? false)
+                let contact = id.hasPrefix("peer:")
+                    ? try AgentPeerStore(dataRoot: dataRoot).list().contains { "peer:" + $0.id == id } : false
+                // A conversation the agent can reach is waited on like its person, through the same identity resolver as agent.read.
+                let conversation = !personName && !contact && ids.count == 1
+                    ? try AgentConversationStore(dataRoot: dataRoot).containsConversation(id) : false
                 if ids.count == 1, personName || conversation || contact, case .string? = input["on"] {
                     var statusInput = input
                     statusInput.removeValue(forKey: "wait")
@@ -600,15 +596,8 @@ extension SwiftToolDispatcher {
                 return refusedChanged
             }
             let descendants = SwiftNativeDeskStore.descendants(of: handle, in: state).reversed().filter { !$0.status.isTerminal }
-            let session = ChatToolSessionInjection.explicitSessionId(in: input)
-            if !session.isEmpty, let by = try await store.hold([handle] + descendants.map(\.handle), session: session) {
-                return .object([
-                    "status": .string("refused"), "reason": .string("held_by"), "held_by": .string(by), "effects": .string("none"),
-                    "detail": .string("""
-                        An item in this subtree is held by \(by), which is working it; nothing was closed. Leave it to that one, or pick it up \
-                        there.
-                        """),
-                ])
+            if let conflict = try await store.runHold([handle] + descendants.map(\.handle)) {
+                return conflict.refusal("An item in \(handle)'s subtree")
             }
             for kid in descendants {
                 do {

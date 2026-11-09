@@ -40,6 +40,22 @@ attentional continuity. Its `ContinuityField` and the organism's
   and typed-reading invalidation; predictive application returns only its ledger
   and chemistry. `OrganismBodySchemaSampler` owns sampled readings.
 - The runtime samples body evidence and canonical affect before projection.
+  `canonicalAffectProjection` returns one `OrganismLifeReading`: decayed affect,
+  net charge from live cares (including appraised movements caused by the
+  agent's own reply), novelty from the person's unfamiliar topic and a grown
+  care's first movement, and located
+  hand pain from the field's latest known tool outcomes. Care charge uses the
+  care owner's depth and half-life; new concerns' novelty fades on the `now`
+  depth's two-hour half-life. Repeated reads add no feeling. The kernel maps
+  relational warmth to warmth, appraised pressure to urgency, and the greater
+  of appraised uncertainty and negative care charge into vigilance by taking
+  the maximum with the body's decayed, event-earned vigilance. A refresh never
+  erases workflow or response-outcome effects, and rereading cannot stack them.
+  Curiosity and novelty follow these novelty signals; coherence is the neutral baseline plus
+  0.15 times signed care charge minus 0.25 times appraised uncertainty.
+  Warmth, urgency, novelty, curiosity and coherence use the canonical reading;
+  vigilance also retains lived outcomes under its existing elapsed-time decay.
+  No historical tags or stored files are rescored.
   `NativeCognitionRuntime.organismBodySample` caches its base body read for
   two seconds; provider health is derived only from checked lifecycle evidence. Unreadable trace history owes repair and never selects a cumulative capability belief as a substitute. Status-less outcomes remain unknown; summaries cannot attest success. The unproduced memory-hygiene signal vocabulary is removed.
 - The shared after-turn interpretation supplies caring judgments.
@@ -96,15 +112,32 @@ the body and canonical substrate affect at one fixed time, obtains an organism
 frozen read, and prepares the capsule from that projection. The result contains
 both capsule and behavior posture. `commitTurnProjection` advances the
 presentation clock after a successful live turn, even with an empty capsule;
-previews and failed turns do not consume cadence. Candidates that are not shown
+previews and unconfirmed deliveries do not consume cadence. Candidates that are not shown
 remain owed rather than counting as presented.
 
 **Felt state.** `CognitiveSubstrate+CapsuleFeltSignals.swift` maps projected
 chemistry into the felt fingerprint. `OrganismChemistry.bodyLine` can supply a
-bounded `- Body:` candidate. Ordinary turns select one non-rut felt cue or none,
+bounded `- Body:` candidate. Positive feeling, bracing and tiredness coexist
+in that line; operational advice does not replace feeling. Located hand pain
+travels separately in the existing private posture context, naming the act
+and its recorded cause as receipt data. Generic dispatches are grouped by
+exact tool name; motor outcomes by action identity, with their domain as the
+act. A later known success replaces that act's pain reading without claiming
+an earlier failed effect completed. Starts, cancellation and unknown outcomes
+prove no recovery. Missing cause text is stated as unrecorded. Only the two
+newest supported pain readings travel, bounded and redacted before clipping;
+the field retains receipt ownership, and the body saves no pain copy.
+Ordinary turns select one non-rut felt cue or none,
 with an optional separate Sound rut line; private reflection is cadence-exempt.
 Unchanged body lines are suppressed between presentation windows. Losing the
 cue slot or fitting budget does not count a body line as presented.
+**Felt state.** `CognitiveSubstrate+CapsuleFeltSignals.swift` reads projected
+chemistry directly into the first feeling paragraph, alongside mood, charged
+cares and recorded dream tone. Warmth and bracing can both be present; quiet
+states stay described. The capsule does not inject the instruction-bearing
+`OrganismChemistry.bodyLine` or phone telemetry. Intentions and Sound follow
+the frame in their own lanes; [Subconscious](SUBCONSCIOUS.md#what-reaches-the-model)
+owns fitting, completed-reply continuity and the sleep-to-dream evidence contract.
 
 **Attention.** The kernel publishes predicted tool groups from pending tool
 expectations. `NativeCognitionRuntime.attentionSignals` reads the resident
@@ -126,12 +159,12 @@ is separate from body posture, alongside substrate load and call ceilings.
 toward `axisHighRail = 0.94`; `lower` scales a positive decrease by the current
 value. Repeated success therefore has diminishing influence.
 
-### 2. Homeostatic settle, budgeted per wall-hour
+### 2. Homeostatic settle, on elapsed time
 
-Per-signal settling has an elapsed-time ceiling
-(`maximumSettlePerHour = 0.20`). The kernel uses local ingestion time to
-measure the gap, so a delayed source timestamp cannot buy extra settling.
-Elapsed-time continuity decay also runs during restore.
+`OrganismPersistentState.decayed` relaxes chemistry toward `ChemicalState.neutral`
+on the kernel's existing live touches, frozen reads and restore. The signal-count
+settling path is removed: traffic cannot buy extra relaxation. Canonical affect
+and care charge use their owners' analytic decay at the same reading instant.
 `mind.settle_body` applies six hours' chemical relaxation to the current value
 and anchors it at the current instant. It does not advance field age or
 prediction expiry into the future; the next real elapsed interval still runs.
@@ -167,9 +200,79 @@ encounter stamp and recent doses persist; the body's lived watermark proves once
 Tenderness fades on a three-day half-life. Sustained canonical warmth can
 contribute a smaller bounded undertone.
 
-Its interpersonal effect is confined to softening the correction-related
-vigilance increase. It does not relax tool, provider, permission or verification
-policy. Dream completion does not dose tenderness.
+Tenderness colors felt presentation. A correction receives its actual
+conversational appraisal, without an unconditional chemistry penalty or a
+second tenderness-based correction adjustment. Tenderness does not relax
+tool, provider, permission or verification policy. Dream completion does not
+dose tenderness.
+
+### 5. Life and located consequences
+
+Tool and provider traffic leaves canonical affect unchanged, supplies neutral
+emotional tags, and spends no dream residue. Affect admission has one exhaustive
+event transition; operational cases return before re-feel or residue spending.
+Semantic appraisal does not borrow
+nearby tool failures, repairs or effort to color a later person's message;
+stakes must arrive through that exchange's appraisal and touched cares.
+An assistant completion receives no reward
+or pressure relief merely for speaking, and its tag does not inherit nearby
+tool bookkeeping. Its lived meaning comes through care appraisal; the next
+person's response receives the shared interpretation's affect judgment.
+Tool/provider/delivery prediction outcomes retain capability evidence and
+operational caution without changing chemistry. Body sampling likewise
+retains health evidence without turning path changes into mood. A failed tool
+act establishes no global loss of the hands. Verified effects can still move
+agency and confidence through `ownOutcomeDose`; actual work can cost fatigue.
+
+The continuity node holds an unresolved failed receipt, including its cause,
+through starts and cancellations of that act. A subsequent failure supplies
+its actual cause; only a success of the same act resolves the pain. Neither
+elapsed quiet time nor ordinary capacity eviction proves recovery. Unresolved
+lived failures remain in the field alongside its other retained obligations;
+the private body projection names at most two at once. Clear still forgets them.
+An `organDeviated` signal remains organism-field evidence. It supplies neither
+a failed tool receipt nor located hand pain; any felt stakes require appraisal.
+
+Topic novelty reads the latest human arrival against earlier retained
+conversation/care nodes and the live cares' words. Each brought letter/number
+term contributes its unfamiliar share, with familiarity and the resulting
+curiosity fading on the care owner's two-hour present-depth half-life. This
+language-independent lexical signal requires no new model call, keyword list,
+or absolute threshold; it does not claim semantic understanding of synonyms.
+The shared affect interpreter has no chosen-register judgment.
+Holding a private chosen register requires that shared interpretation and its
+journal fold to carry the choice and its stretch; it is not inferred from
+phrasing or another speaker's guess.
+or absolute threshold; semantic tags and bodily curiosity share it. It does
+not claim semantic understanding of synonyms.
+The existing shared interpretation carries `affect.chosenRegister` only when
+their reply states a self-chosen mood/register or its release. Its exact reply
+evidence is checked by the interpretation owner; incoming requests, guessed
+tone and undisclosed private rolls cannot choose for them. Null preserves the
+choice. A choice replaces the held choice; `released` explicitly ends it.
+The stretch is `conversation` (that session only), `until` (their stated end,
+checked on reads without a timer), or `until_replaced` (an open-ended choice).
+Canonical affect holds the last choice, stretch, source moment and exchange time under
+the existing journal watermark, including after expiry. Care wakes use the
+same fold. Affect decay preserves the choice; Clear forgets it. Present
+malformed state refuses restore; older affect records simply have no choice.
+The affect checkpoint also records each choice as a `register_choice` artifact
+in the same cognition transaction, with the ordinary artifact retention law.
+The original reply remains its conversational evidence. `mind.inner_state`
+returns the last choice and exact source words for recall even after its
+stretch ends; full detail reads bounded recorded choices in its requested
+window directly from the artifact store, with an explicit issue on read failure.
+During the stretch it colors every capsule as `Your chosen register`, ahead of
+cues and outside their cadence gate; it does not fabricate
+chemical deltas or replace what they actually feels. No extra model call,
+persona edit, schema rewrite or second state owner is involved.
+Accepted self-caused care movements use `by: their`, as required by the shared
+interpretation prompt, JSON shape and `CognitiveCare.Mover`. Both ordinary
+exchanges and care wakes use this one accepted shape. The existing shared
+interpretation reads their reply and the person's next response in the prior
+exchange context: their own care movements and how their words landed reach the
+same affect/care fold. Speaking alone is no evidence of a successful landing;
+a refused interpretation supplies no movement.
 
 ## The diurnal clock
 
@@ -278,7 +381,15 @@ two-hour background slot, unused-claim release and spent-window retention.
 
 `NativeCognitionRuntime+BodyContinuity.swift` owns
 `<dataRoot>/cognition/organism_state.json`; `OrganismPersistence.swift` defines
-the stored state and restoration/decay behavior. Only its current schema is accepted: encounter, epoch, lived watermark, field identities, outcome weights and current body fields are checked, with no rekeying or invented old defaults. The persisted body bits remain the continuity representation and transient typed readings rebuild from their sensors. Capability outcome weights
+the stored state and restoration/decay behavior. Its sole writer compares the
+decoded stored value with the value at persisted date precision before writing;
+JSON key or set order causes no write. Unreadable stored continuity remains a
+failure and is preserved. `savedAt` remains the chemistry's settlement anchor,
+so genuine elapsed decay is saved with the values it anchors.
+Only its current schema is accepted: encounter, epoch, lived watermark, field
+identities, outcome weights and current body fields are checked, with no rekeying
+or invented old defaults. The persisted body bits remain the continuity
+representation and transient typed readings rebuild from their sensors. Capability outcome weights
 spend the full elapsed interval on their seven-day half-life, independently of
 the 72-hour tissue-decay cap. Dream completion evidence reads only the checked
 `ConversationHistory.dreamConsolidationMark` owner (`lastDreamedAt`);
@@ -286,7 +397,12 @@ diary modification times and parent writability cannot establish completion or
 store health. Missing marks contribute no completion evidence; damaged marks
 make the reading unavailable. The completion effect follows the
 [dream settlement law](COGNITION_WIRING.md#the-subconscious-loops--schedule-artifacts-re-entry): its original section
-UUID, time and felt summary are saved before publication. An enabled kernel stores
+UUID, time and felt summary are saved before publication. Attention receives
+that completion before optional body effects. The feeling frame reads the
+recorded night admission and the diary journal's retained published completion,
+including after relaunch, for a neutral dream or disabled body. Missing evidence
+stays unknown. A matching readable completion answers despite damaged sibling
+journals; with no match, journal failures name their paths and causes. An enabled kernel stores
 that UUID with dream repair and wakefulness reset; retry saves that owner state
 without reapplying the signal. A disabled body records an explicit journal skip.
 Stop or a recovered diary publication cannot discard this step.

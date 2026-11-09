@@ -28,10 +28,17 @@ import Studio
 
 /// Action verbs retain their meaning on every page; admission classifies the action and folded calls re-enter their own gates.
 public struct AppAction: Sendable {
+    /// An exact reference carries its namespace; contextual qualifiers cannot narrow its identity.
+    public struct ArgumentReference: Sendable {
+        public let parameter: String
+        public let prefix: String
+        public let qualifiers: [String]
+    }
     public enum Owner: Sendable {
         case agent
-        /// Owner-only actions name the user's control and an agent-safe alternative when one exists.
-        case person(String, instead: String? = nil)
+        /// A lever: the person's authority over the agent. It names why it is theirs and an agent-safe alternative when one exists; `asks`
+        /// says whether a card can carry the agent's ask for it (false: it needs the person themself, so the agent's call is refused).
+        case person(String, instead: String? = nil, asks: Bool = true)
     }
 
     public let id: String
@@ -63,6 +70,10 @@ public struct AppAction: Sendable {
     public let input: [String: JSONValue]
     /// Door arg name → the host call's own input key, where the two differ.
     public let rename: [String: String]
+    /// Declared meanings for unique argument binding and refused-call advice; the receipt names every interpretation.
+    public let argumentNames: [String: [String]]
+    public let argumentValues: [String: [String: JSONValue]]
+    public let argumentReferences: [String: ArgumentReference]
     /// Reads its subject and raises no note, so the door reads no inbox around it.
     public let read: Bool
     public let readWhen: [String: JSONValue]
@@ -81,6 +92,8 @@ public struct AppAction: Sendable {
          irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .agent, capabilities: Set<String>? = nil,
          screen: Bool = false, warn: String = "", tool: String = "",
          input: [String: JSONValue] = [:], rename: [String: String] = [:], read: Bool = false,
+         argumentNames: [String: [String]] = [:], argumentValues: [String: [String: JSONValue]] = [:],
+         argumentReferences: [String: ArgumentReference] = [:],
          versionExempt: Bool = false, revision: Int = 1, readWhen: [String: JSONValue] = [:], scope: String = "",
          advisory: Bool = false, resultSchema: JSONValue = AppActions.resultEnvelope,
          lifecycle: CapabilityLifecycle.Action? = nil, schema: LLMToolSchema? = nil, partAction: Bool = false,
@@ -93,6 +106,8 @@ public struct AppAction: Sendable {
         self.id = id; self.page = AppDoorNames.resolve(page); self.label = label; self.args = args; self.subject = subject; self.owner = owner
         self.irreversible = irreversible; self.toolClass = toolClass; self.screen = screen; self.warn = warn; self.tool = tool
         self.input = input; self.rename = hostNames.merging(rename) { _, declared in declared }; self.read = read
+        self.argumentNames = argumentNames; self.argumentValues = argumentValues
+        self.argumentReferences = argumentReferences
         self.versionExempt = versionExempt
         self.revision = revision
         self.readWhen = readWhen
@@ -114,6 +129,8 @@ public struct AppAction: Sendable {
     /// A folded tool runs under its own gates and Trust key. Omitted label and args come from its schema.
     static func fold(_ tool: String, _ page: String, id: String? = nil, _ label: String? = nil, _ args: [String]? = nil,
                      input: [String: JSONValue] = [:], read: Bool = false,
+                     argumentNames: [String: [String]] = [:], argumentValues: [String: [String: JSONValue]] = [:],
+                     argumentReferences: [String: ArgumentReference] = [:],
                      irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .agent, capabilities: Set<String> = ["safe_read", "tool_call"],
                          screen: Bool = false,
                      warn: String = "", schema: LLMToolSchema? = nil, versionExempt: Bool = false,
@@ -134,11 +151,16 @@ public struct AppAction: Sendable {
                          declaredArgs,
                          irreversible: irreversible, toolClass: toolClass, reach: reach, capabilities: capabilities,
                          screen: screen, warn: warn, tool: tool, input: input,
-                         read: read, versionExempt: versionExempt, readWhen: readWhen,
+                         read: read, argumentNames: argumentNames, argumentValues: argumentValues,
+                         argumentReferences: argumentReferences,
+                         versionExempt: versionExempt, readWhen: readWhen,
                          advisory: advisory, resultSchema: resultSchema, lifecycle: lifecycle, schema: schema, folded: true)
     }
 
-    public var isPersonOwned: Bool { if case .person = owner { true } else { false } }
+    public var isPersonOwned: Bool { lever != nil }
+    public var lever: AppActionBinding.Lever? {
+        if case .person(let why, _, let asks) = owner { AppActionBinding.Lever(why: why, asks: asks) } else { nil }
+    }
     var reaches: ToolClass { read ? .read : folded ? schema?.toolClass ?? toolClass : toolClass }
     /// Parts retain their own identity when a row declares a tool call.
     public var isFold: Bool { folded || authored }
@@ -154,7 +176,14 @@ public struct AppAction: Sendable {
     }
 
     public var binding: AppActionBinding {
-        AppActionBinding(isPersonOwned: isPersonOwned, irreversible: irreversible, read: read, secretArgs: secretArgs,
+        AppActionBinding(lever: lever, irreversible: irreversible, read: read, secretArgs: secretArgs,
+                         boundArguments: { [self] given in
+                             guard let schema = try AppActions.discovery(self).objectValue?["args_schema"] else {
+                                 throw ToolFailureError("\(id)'s input schema is unavailable. Nothing ran.", effects: .none,
+                                     code: "tool_schema_unavailable")
+                             }
+                             return AppActions.boundArguments(self, given, schema: schema).args
+                         },
                          readWhen: readWhen, lifecycle: lifecycle, subject: subject,
                          tool: tool, fixedInput: input, rename: rename, folded: isFold,
                          descriptor: schema.map { ToolDescriptor(schema: $0, bucket:
@@ -167,10 +196,14 @@ public struct AppAction: Sendable {
     }
 
     /// Admission uses declared reach; a run's receipt uses its actual calls. The broker's per-call read class wins over broad ability permissions.
+    /// A verb a part answers: it reports like the native verb it is, by its declared class, not as an ability's run.
+    var answersVerb: Bool { partAction && input["verb"] != nil }
+
     func effectFields(args: [String: JSONValue] = [:], result: [String: JSONValue] = [:]) -> [String: JSONValue] {
         var read = readOnly(args: args)
         var irreversible = irreversible
-        if part != nil || authored {
+        let ability = (part != nil || authored) && !answersVerb
+        if ability {
             var run = result
             // The door wraps a run in result; later receipt stamps must read that same ledger instead of restoring the admission prior.
             while run["calls"] == nil, let nested = run["result"]?.objectValue { run = nested }
@@ -180,8 +213,7 @@ public struct AppAction: Sendable {
             }
         }
         return ["read_only": .bool(read), "irreversible": .bool(irreversible),
-                "effect": .string(id == "ability.validate" ? "none" : read ? "read" : part != nil || authored ? "part" : irreversible ? "irreversible"
-                    : "write")]
+                "effect": .string(id == "ability.validate" ? "none" : read ? "read" : ability ? "part" : irreversible ? "irreversible" : "write")]
     }
 
     /// Compact rows show the id and argument names with the user's required context.
@@ -194,10 +226,9 @@ public struct AppAction: Sendable {
         if !warn.isEmpty { text += " · \(warn)" }
         // Only while Simple view is on screen does showing a page change the view itself.
         if id == "page.show", SimpleViewMode.isShowing { text += " · " + SimpleViewMode.noPagesNote }
-        if case .person(let why, let instead) = owner {
-            // Full Mac admits owner actions unless the action requires the person directly.
-            text += (tool.isEmpty ? " · the owner's: " : " · the owner's below Full Mac: ") + why
-                + (instead.map { ". Instead: \($0)" } ?? "")
+        if case .person(let why, let instead, let asks) = owner {
+            // A lever is the person's at every posture: the agent's call raises their card, or is refused when no card can carry it.
+            text += (asks ? " · the person's (your call asks them): " : " · the person's: ") + why + (instead.map { ". Instead: \($0)" } ?? "")
         }
         return text
     }

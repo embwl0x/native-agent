@@ -7,7 +7,7 @@ import ToolExecution
 
 extension EngineBackgroundWorkPort {
     func assistanceCard(dataRoot: URL, input: JSONValue) async throws -> AssistanceCardContent {
-        try await maintenancePart(dataRoot: dataRoot, id: "maintenance-assistance", input: input,
+        try await maintenancePart(dataRoot: dataRoot, id: "native-diagnostics", input: input,
             origin: "maintenance:assistance-card", as: AssistanceCardContent.self)
     }
 

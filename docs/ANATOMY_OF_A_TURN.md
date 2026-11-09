@@ -52,38 +52,94 @@ Every door admits through `TurnAdmission.run` with its arrival as a typed value
 (`TurnArrival`: words, attachments, surface, and a row that is shown, hidden or
 already saved); envelope, origin, run and taint come from the door's own turn.
 An arrival that waits for a busy conversation is also offered to their open turn
-there (`ChatTurnSteering`). Read at a step, admission returns `.steered`: that
+there (`ChatTurnSteering`). While a round generates, eligible arrivals reach the
+selected turn program's optional `hear(h, felt)` on CPU. `{cut: true}` closes
+that round's stream, retains only its prose, checkpoints it, reads arrivals,
+then asks again. Every proposed call is discarded, including complete calls;
+no partial tool or thinking block enters the conversation. This is not Stop.
+Without `hear`, or when it returns nothing, the round reaches its boundary.
+A failed `hear` owes repair and cuts nothing; it never swaps the turn program.
+The cut observation attributes the interruption to hearing an arrival, without
+claiming it came from the person. It records whether the boundary read new
+messages; if the arrival left before that read, the next request and the turn
+part receive that fact instead of an instruction to answer absent words.
+Before proposed calls are
+handed to the turn part, readable, untainted words from the person withdraw the
+unstarted proposal: the stem keeps its prose, reads arrivals and asks their to
+decide again. Peers and their own arrivals do not withdraw proposals. Stop still
+cancels at once.
+Read at a step boundary, admission returns `.steered`: that
 turn's reply answers it, so the door that sent it posts nothing and only settles
 its own record. If its own place in line comes first, it runs as its door's
-normal turn. The person's and their own untainted words join any turn of theirs;
+normal turn. A delayed contact reply records that handoff as `steered` and
+settles its arrival as delivered, without settling the reading turn's checkpoint.
+The reading turn's log retains each joined arrival's identity, exact words and
+attachments. A checked checkpoint readback precedes retiring its old checkpoint
+or requesting a model that can acknowledge it. Reservations extend across cuts
+before first text. Relaunch rebuilds these readings outside history, whose end
+is pinned before the resumed turn's first shown input; a restored joining door
+takes the same delivered answer through admission instead of running again.
+The person's and their own untainted words may join a turn of theirs;
 peer-steered arrivals join only a turn that same sender started under the same steering, so
-nothing rides past the floor its own turn would meet. Their own arrival's narrower
-file-access ceiling must also be held by the reading turn; otherwise it waits
-for its own place. A door accepts an arrival
+nothing rides past the floor its own turn would meet. Every arrival's
+file-access ceiling must also be held by the reading turn: an arrival with
+`none` needs that path-read restriction, and one with `read_only` needs that
+write restriction (`none` is not a write fence). A turn can hold both.
+Missing or invalid ceilings join no turn; an incompatible arrival waits for
+its own place under its own restrictions. A door accepts an arrival
 only once it is durable in its own intake record (Mac: its saved row and turn
 checkpoint; Telegram: its inbox claim; Slack: its journal record; phone: its
-CloudKit record), and launch re-admits what is still unanswered. There is no
+CloudKit record), and launch recovers it through that door's owner. Telegram's
+`pending` claims and Slack's `claimed` records admit work; `processing` and
+`generating` record the boundary before invoking the turn. Recovery of those
+admitted generations delivers a saved answer. Telegram retains an owed, unknown
+outcome without one. Slack settles an orphaned generation without saved output as
+interrupted; the person's `/retry` pins its retained input to a new command's run.
+Missing checkpoints or replies never authorize automatic generation. There is no
 queued-turn store and no successor turn. Work that
-never joins another turn (a regenerate, a restored run, their unaddressed wake, a helper's
+never joins another turn (a regenerate, a restored run, a helper's
 loop) uses `runAlone`. The chat client binds run and trace identities to the
 accepted turn.
-Resident wake admission considers only open turns in the same canonical data
-root before classifying their resident or helper ownership.
-News with a recorded conversation enters that conversation as a hidden arrival
+`Turn.fileAccessCeiling` is the one held restriction value, using Shared's
+canonical mode IDs. Assigning another mode intersects it; neither `auto` nor
+an absent binding erases an inherited restriction. `fileAccess` is its existing
+scalar control label, not a complete representation of a combined ceiling.
+Checkpoints, Desk continuations and approval continuations retain the complete
+value; a recorded scalar still supplies its declared restriction when no
+additional ceiling was recorded. Nothing rewrites existing saved records.
+Every arrival outside the agent's mind stream wakes attention from sleep
+(`Attention.arrived()`, [Subconscious](SUBCONSCIOUS.md#attention)).
+Work coming back to a recorded conversation (a `returned` happening with a
+route, `MindStream.returnTo`) enters that conversation as a hidden arrival
 through the same admission. If read by their open turn, it sends nothing else;
-otherwise its reply returns through that conversation's recorded door. In an agent
+otherwise its reply returns through that conversation's recorded door.
+When it runs alone, admission declares its hidden input in the existing turn
+checkpoint. That input retains origin, files, persona, completion identity,
+query, conversation ownership and speech initiative alongside the checkpoint's
+envelope, route and steering. Recovery restores it through the ordinary resume
+owner without requiring or creating a visible user row; the streaming loop
+projects its saved tool receipts alone, with input still owned by the checkpoint.
+Only an explicit hidden
+declaration permits this; an absent visible row remains a transcript fault. In an agent
 conversation with no open turn, its answer row becomes the contact's send row
 and the conversation store holds its exchange for the contact's next door call.
 The `agent-held` reply route keeps this settlement out of person-result notices;
 completion records `completed` / `held_for_contact` after that handoff, while
 the held exchange alone owns actual delivery. Chosen silence holds nothing.
-The resident ledger still owns the claim and thread hop/rest limits.
-Missing conversations or routes owe repair,
+A contact's replies return at most three times per contact conversation an hour
+(`AgentConversationStore.returnsPerHour`, `AgentConversationReplies.swift`); past that a reply stays kept in its
+conversation. Missing conversations or routes owe repair,
 never a reply through another line. Helper sessions are not targets: their minds
-remain their own. News without a conversation keeps their resident-wake line.
+remain their own. Everything else owed to the agent opens a thought in its
+mind stream (session `mind`, title "Thoughts", never replayed as history): a turn
+admitted like any other, whose opening message carries what it attends as
+`attended` ([manifest](skill_manifest_spec.md#weigh)); one thought at a time,
+and a thought that comes while one is open joins it by the steering offer.
 A line of them (`agent.job` with `agent: "self"`) is admitted the same way:
 `OwnLineDoor` opens its own-work conversation, named by the job, and runs the
-brief as its arriving message through `TurnAdmission.run` on their own surface,
+brief as its arriving message through `TurnAdmission.runAlone` on `chat`, with
+the recorded `builder` conversation kind identifying their own work
+([conversation identity](session-conversations.md)),
 carrying the commissioning turn's limits: its peer steering and its file access,
 which the line's request can only narrow further. It runs on their conversational
 gate with the chat approval filer, so an act that needs the person raises the
@@ -156,7 +212,7 @@ without a held turn captures trace correlation at construction; reconstruction
 supplies the recorded route fields, including their absence. A held turn with
 no route never borrows another task's destination or thread.
 The native Mac Send owner declares its
-local origin in the envelope; native part, helper and Research Lab owners name
+local origin in the envelope; native part and helper owners name
 their native origin; approval replay builds the verified card's exact origin.
 `TurnEnvelope.current(turn:surface:)` reads only the turn's envelope; with none it
 returns unauthenticated, remote-marked provenance, and a tool's surface
@@ -200,7 +256,7 @@ that a run is absent or publishing a message count.
 
 Quiet hours use a checked `user_prefs.json` window. A missing file or absent
 window is unset; present unreadable or malformed preferences stop context
-preparation and hold dependent resident wakes and delivery with repair owed.
+preparation and hold dependent delivery with repair owed.
 Deadline readers book no quiet-hour boundary while the window is unavailable;
 preference/clock invalidation rearms them after repair. The body withholds its
 diurnal projection until that preference can be read. Update notes
@@ -227,8 +283,33 @@ under the arrival's own run and shown row id, a saved row consumed, a hidden
 one writing nothing. If that write fails the arrival keeps waiting and runs as
 its own turn. A round that reads it but stops before output leaves it waiting
 with its row saved; its own turn then reuses that row, since a run's user row
-is written once. Only an arrival their open turn can read cuts the round; a
-peer's words ride only into a turn from that same door.
+is written once. After a words-only round completes, the stem saves and reads
+eligible arrivals before handing the part an observation (`turn_arrival`) to
+continue. The completed prose precedes them in context. Retained prose is one
+ordered record through checkpoints and settlement: the completed round's words,
+then the arrival's prose (including words before tool calls), then later prose,
+in the order streamed. Words a cut stopped count as commentary, so the reply answering the person stands alone. Only the leading commentary prefix is marked for folding
+or answer-only reads; later tool prose never moves ahead of a completed answer.
+Tool rounds also check for the person's readable, untainted arrival before
+each sequential slot and each concurrent slot's admission, including refills.
+Unstarted slots return `status: skipped`, `execution: not_run`, `effects: none`
+and `reason: person_arrival`, preserving each call/result pair; completed
+siblings keep their receipts. No running call is cancelled or rewound.
+The admission check precedes start publication in both paths: a skipped slot
+has no tool-use progress or cognitive start, no Work start and no started
+transcript activity; only its paired proposal and never-run receipt remain.
+Nested tool-capable part thoughts are inside an already-running call and have
+no arrival-reading session, so their dispatch has no arrival gate. Tool session
+identity stays available to their tools; the outer turn reads the waiting words
+at its next boundary, before its next model request.
+App batches hand back between steps with remaining entries in `unrun` and the
+first unstarted step in `next_step`. An earlier failed receipt, including a
+nested receipt, keeps the batch failed with its remedy and failure detail;
+the arrival only adds which steps did not start, and the provider error bit
+stays set. A running ability keeps its existing
+next-step hand-back. The next model call reads arrivals. Only the turn program's
+`hear` can cut a generating round; a peer's words join only a turn that same sender started
+under the same steering.
 
 Source: `ChatOrchestrationClient+StructuredChat.swift` and
 `ChatOrchestrationClient+MessagePersistence.swift`; history preparation and
@@ -245,6 +326,22 @@ request combines:
 - bounded conversation history and session continuity; and
 - an optional cognitive capsule and organism posture.
 
+Recent life rides the changing packet through `TurnEpisodicContext`, outside
+the feeling frame. The [experience contract](EXPERIENCE.md#reading-their-own-record)
+owns its source, last-reply boundary, disclosure and bounded coverage. A failed
+life or private-choice read carries its cause and owes source repair; neither
+becomes an empty successful reading or prevents unrelated recall from serving.
+
+The conversation's private working-memory slot is read from its existing scratch
+owner. `chat.working_memory {text:…}` replaces it; empty text clears it. It holds
+at most 1200 characters until explicitly replaced or cleared, across relaunches.
+`ConversationPrefixSeeding` prepends it only to the live provider message, after
+capturing the public sent-context evidence. The text is absent from
+`SentTurnContext`, replay, tool previews, traces and phone payloads; request
+measurement includes its characters. Public scratch reads exclude the reserved
+slot. Conversation-bound ephemeral requests use their verified conversation;
+sessionless work does not acquire another conversation's private choice.
+
 Preparation reads the held turn's model admission through
 `ContextBudgetPolicy.resolve(turn:dataRoot:)`; it cannot choose a route when one
 is missing. Fresh ephemeral work admits its route at ingress and carries that
@@ -253,6 +350,41 @@ History replay and earlier snippets take a required resolved budget rather than
 an optional token window. Missing admission or verified window fails before
 preparation. The [history contract](conversation-context-history.md) owns this boundary.
 
+### Recall unavailability
+
+A turn never fails because remembering is unavailable. Semantic-query failure,
+a missing query ticket, an unreadable or missing user-memory projection,
+Context-off direct recall failure, and an unreadable REM pin index withhold
+that recall for this turn. The same
+context owner still prepares the rest of the working set; no alternate recall,
+retry or longer wait runs. The dynamic packet carries one plain line beginning
+`Recall was unavailable this turn`, naming each cause and saying that it is not
+evidence that a memory exists or does not exist. An unread user core withholds
+generated USER facts and leaves `expression.established` unknown, so the seed
+does not infer a first conversation from a failed read.
+
+`context.summary` records `contextFlow.semanticQueryReady=false` when the
+semantic reading was unavailable, `memory.userCoreUnavailable` for the USER
+read, and the causes in `labels` (`context.semantic_query.unavailable`,
+`memory.user_core.unavailable`, `memory.turn_recall.unavailable`, or
+`rem_pins.read.unavailable`). Unread pins contribute no pin text; their index
+remains untouched and owes repair to `rem_pins.json`. An available
+semantic reading stays ready even if the independent user-core read failed.
+Cold loading, pending embeddings, lifecycle retirement, admission capacity and
+query-size bounds do not establish a fault. Actual faults use `RepairOwed` and
+the existing `doctor.run` path, folding repeated failures into one open debt per
+operation/owner. The embedding owner reports faults that arrive after the wait
+ends too; a deadline ends only the wait, not its runtime-owned batch. A checked
+success of that same operation settles its debt. Cancellation still cancels.
+Required persona, generation, configuration and other context failures remain
+failures; this rule does not supply a substitute context.
+
+The optional intentions projection uses that same named-unavailability line.
+An unread Desk withholds its intentions (`desk.intentions.unavailable`); an
+unread name needed to word a waiting intention withholds the projection
+(`desk.intentions.person_name.unavailable`). Each owes repair to its source;
+neither admits work from unread intentions or prevents unrelated conversation.
+
 Read-only current facts start beside history and context assembly. Contact
 availability is read live there, alongside workspace facts; its runtime input
 still joins at the same position after the history-sensitive elsewhere line.
@@ -260,6 +392,11 @@ Both the early elsewhere read and its late composition enter through
 `ChatWorkspaceBinding`, which binds the workspace owner's ports. The late
 entry also covers a missing early reading and selected-exchange consumption.
 Neither contacts nor the cognitive capsule use a time-based cache.
+The runtime guidance asks their to look up what they should know with `chat.search`,
+`memory.recall`, `desk.read` or `context.expand` before saying what they could not
+find. This native runtime fact reaches every admitted model and surface. Saved
+pull-only contact summaries say their messages wait for the next check-in, so
+sending does not interrupt them; command and desktop routes make no such claim.
 The person's Agent-view reader supplies its read-only authored-program host to
 both preview projections, including helper faces; preview work has no turn and
 cannot acquire a tool-dispatch path from the conversation on screen.
@@ -327,19 +464,41 @@ encode the request for the selected route. Tool continuation, their own acts and
 reply-ending decisions return through `step`, rather than being prompt policy
 in the Swift helpers.
 
-The changing packet can include `# USER (pinned)`, `# What I mean to do`,
+The changing packet can include `# USER (pinned)`,
+`# What I mean to do (mine; I do what's safe now, and raise one only when it's done, it needs someone, or I'm asked)`,
 `# Live sense news`, `# Relevant context (derived from canonical local sources)`
 and deeper-context pointers; the optional `[CognitiveSubstrate]` capsule joins
-the turn's context separately. The intention section gives one bounded line
-per open step: its words, moment and until. Clock moments come soonest first,
+the turn's context separately. USER carries the person's disclosure-filtered
+picture up to 6,000 UTF-8 bytes including its heading and preamble allowance:
+pinned facts first in pinned order, then the remaining person facts newest
+first. A pin changes order, never the selection to pins alone. Only facts
+that fit are precovered against recall; excess facts stay recallable. The
+stable segment carries only USER's preamble, so changing memory facts leave
+its bytes and the cached history prefix alone. The intention section gives one
+bounded line per open step: its words, moment and until. Clock moments come soonest first,
 then other steps by newest update, with at most six lines and no empty section.
-User's turns and their own carry their/person-origin steps (including older
+the turn's context separately. `MyQueueReady.forTurn` decides
+which next-turn or message-triggered steps are due on this turn; these come
+first, marked `due now`, with the whole uncapped `MyQueueReady.line` head and
+rest, including fixed delivery words and completion/wait instructions. Other
+steps keep bounded lines with their words, moment and until: clock moments
+soonest first, then other steps by newest update. At most six steps appear,
+with no empty section.
+A person's turn lists only the steps due on it, with a count of the rest and
+`queue.list`; their own turns list them all. User's turns and their own carry their/person-origin steps (including older
 `owedToPerson` steps); peer turns carry only that peer's recorded intentions,
 regardless of Trust elevation. Unidentified peer provenance discloses none.
 `ChatOrchestration+Intentions.swift` reads the live Desk owner;
 `TurnContextPreparation.swift` adds the facts to `TurnReach.packet`, the same
-material whose delivered keyframe or delta is retained in the turn owner's
-`diagnostics/fed/<session>.json`. See
+material whose delivered block is retained in the turn owner's
+`diagnostics/fed/<session>.json`. A message is only what its sender said:
+queue steps and queue-unavailability notices enter this changing packet,
+never a person's or peer's words or their saved `sentTurnContext.userText`.
+The packet is never replayed. An unread intentions source leaves a named
+unavailability notice here, with its cause and repair owed; it is not an empty
+queue. A dedicated step's thought keeps its own opening and completion
+instructions through `MyQueueReady.line`, its `carry.<handle>` work identity,
+recorded steering and resume path. See
 [Intentions — As built, 10-30](INTENTIONS.md#as-built-10-30).
 
 Automatic direct recall carries MemoryV2's write owner (`MemoryV2Defaults.personaID`),
@@ -372,19 +531,22 @@ result if its seen/window bookkeeping fails and owes repair for that write.
 in this one (the last hour if they have not replied here yet): the person's words
 on every other conversation and their answers there (the newest four exchanges, 280
 characters per side, older ones counted), the other conversations they are mid-turn
-in right now, their own wake, up to five completed bridge exchanges (600 characters
+in right now, the agent's newest thought (`Your own thought <age> ago (<outcome>)`,
+with up to 200 closing characters of its own prose through `ThoughtWords`), up to five completed bridge exchanges (600 characters
 per side), and up to three helpers' newest replies, newest helper first. Every
 later step of the turn, after their reply too, carries `AgentScreen.breath`: this same
 reading and rendering with the window starting at their last step, so a message they
-gets or answers on another door, a post, a wake or a bridge exchange reaches this
+gets or answers on another door, a post, a thought or a bridge exchange reaches this
 line while it is still working. The same window also reads `act` experiences
 whose outcomes report `effects: occurred`, resolving their cause to the heard
 experience's exact transcript row. It excludes this conversation and helper
 sessions, and carries the newest eight as `<door> you <action> <status>`, oldest
 first, with `+N more` for the rest. A peer-steered line carries these action names
 only from person doors that the word reading admits; bridge and wake actions stay
-out. Missing or unreadable record evidence names its failure and leaves the
-step's cursor unchanged. Each nonempty step reading records `context.breath` with
+out. A native part call's closing dispatch can attest the mind stream without a
+heard row. Missing or unreadable act evidence names that item's gap; a failed
+word reading leaves the step's cursor unchanged. Each nonempty step reading
+records `context.breath` with
 its lines and `read` flag in the record's detail grain. A peer-steered line gets
 only door, count and time for speech. Each helper
 line names its bot-store owner as `name (my helper) since your last reply here`
@@ -400,8 +562,71 @@ sentence>"` (door, count and time only on a turn a peer steers), so they knows w
 they already told them (10-30: an open Desk step made their believe a summary they had
 posted at 9:02 never went out). "Remember across conversations" off closes the
 whole summary. Peer-steered turns carry no helper or bridge words and no words
-from the person's other doors; a wake's words also stay out. The per-turn memo
-keeps person-started and peer-steered summaries separate.
+from the person's other doors; a thought's closing words also stay out.
+
+At turn start, other conversations remain present for 24 hours: up to five compact
+lines, newest first, show the last message's time before the recent-word boundary,
+its opening 120 characters, and `app {page:"chat",item:"<session>"}` to open the
+conversation. This read runs ahead of every first word, so each recently modified
+other transcript is read back in 64 KiB chunks from captured EOF only until a chunk
+holds an eligible message or lies wholly before the day. Imported reply times need
+not follow append order, so a whole chunk decides, never one row. An incomplete
+append waits for its newline. A contact send counts with its attested reply or the
+delivery owner's positive acceptance for that exact send; earlier delivered/read
+exchanges retain that evidence when a newer send starts. Delivered one-way notes
+count without an answer; person-authored sends do not. The mind stream is read
+through its thought owner. Helpers and their own work use this same day reading; their own
+work's words require its self-authored, unsteered source stamp. The day reading is
+moment context, never a retained summary or part of the cached prefix. Recent
+exchanges retain their existing words, and the day excludes those exchanges.
+Effected acts read from their last reply here; the life packet's exact
+experience IDs suppress duplicate action lines. Later breaths read only their
+step window. Peers retain only the existing recent person-door action names,
+door/count/time speech, and day door/time lines, with no private words.
+
+`SwiftNativeTurnEngine.personContinuityAllowed` is the shared turn gate for the life
+packet, elsewhere words and each later breath: a person's chat/iPhone arrival,
+or their own unsteered turn in a direct app/iPhone conversation. Peer origins,
+bridge doors and carried peers (including elevated ones) admit no cross-room
+private words; remote strangers receive no person's acts. A mixed session's
+`continuityParticipant` remains a strict binding for implicit previous-session
+recall, never the current turn's identity. No saved row is rewritten.
+The life packet reads at most 96 recent experiences and 192 dispatch details and
+carries four acts since this conversation's last accepted reply. A closing
+dispatch directly attests a native act on their own unsteered mind stream even when
+no heard experience exists. Other unavailable causes remain named gaps. A complete empty
+selection has no heading or disclaimer; bounds and real read gaps still speak.
+
+`ThoughtWords` reads only a thought settled `hit` or `empty`, joining its saved run
+to the completed assistant row in `chat/messages/mind.jsonl`. One backward pass
+from a captured end of that file uses at most 64 KiB per read and retains only
+the current row's fragments. Complete rows use `ContactThread.decodeRow`; an
+incomplete trailing append is ignored, never decoded. The pass stops at the run's
+last assistant row, or its opening user row when no assistant words exist; it
+never loads and splits the whole transcript. Open, seek, short-read and decoding
+failures remain unavailable. Before sharing prose it checks every recorded
+happening, including earlier-drive references:
+any peer or elevated source withholds the words. The closing row's own steering
+stamp also withholds them. Missing or unreadable provenance, transcript or
+completion evidence is unavailable with its cause; a missing row does not prove
+silence. Zero recorded happening IDs leave earlier-drive provenance unknown and
+make the words unavailable, even when the closing row has a clean stamp.
+Failed and withheld thoughts supply no prose. The read retains at most
+600 closing characters, redacted by the transcript's secret redactor.
+
+A thought (`scope == mind`) receives the last `hit` or `empty` thought on its own
+recorded class through this same read, as a dynamic fact after history establishes
+the receiving turn's provenance. Peer-steered thoughts receive no carried prose.
+No eligible previous thought means no same-class line. Zero-ID thoughts may be
+passed over on this class only: the last readable words are labeled as such,
+beside one cause for the later gap. If none can be shared, that cause appears
+once without prose. Taint or any other unreadable evidence stops this search.
+Other rooms still name the newest thought's own unavailable evidence, never
+older words in its place.
+`prior = []` remains: this is neither history replay nor tool output, and writes
+neither persona nor memory. The class is `attended.class`, the same key used by
+the thought's no-op record. [Subconscious](SUBCONSCIOUS.md#attention) owns the
+thought record and its outcomes.
 
 ### How prompt caching reduces token cost
 
@@ -411,10 +636,20 @@ context do not. History entry pins one clock before parallel reads for facts,
 quiet hours and workspace timing. The tool loop requires that prepared context;
 the single static `app` schema keeps discovery from changing the tool array.
 
-Replayed history follows the stable system material. The
-[conversation context contract](conversation-context-history.md) owns its
-verbatim tail and stateless whole-turn checkpoints in half-budget jumps when the
-composed request reaches the model's default window. There is no generated summary or
+Replayed history follows the stable system material, each exchange with its
+time and each message one text block. Quiet never ends what they holds. A
+conversation is held whole until the request reaches the input budget; then
+the oldest whole turns go in half-budget jumps. The input budget is min(model
+window minus response allowance, 200,000 tokens). History fitting uses the input
+budget; refusal and result pointers use model window minus response allowance,
+the physical limit. Between jumps history only
+appends, permitting prefix cache reuse.
+Older rows are reached through up to four leads and `context.expand`, not
+held. The public now-block leads the current user message whole and is sent once:
+saved on its row as evidence, never replayed. The
+[conversation context contract](conversation-context-history.md) owns the
+held conversation, the time line, the leads and stateless whole-turn checkpoints
+anchored to the transcript's start. There is no generated summary or
 per-turn trimming. The decode memo still keys only exact UTF-8 row bytes, with
 at most 2,048 rows and 8 MiB of input keys; it never owns selected history or
 supplies missing transcript evidence. Speech stays whole, and leading assistant
@@ -432,8 +667,16 @@ This arrangement permits provider-side prefix reuse. It does not guarantee a
 cache hit or a particular latency or price reduction; those require actual
 provider usage evidence.
 
-Source: `ChatSessionWork/SessionHistoryTail.swift`, `SessionHistoryReader.swift`,
-`ChatTurnRuntime/ChatOrchestration+SessionHistory.swift` and `ConversationPrefixSeeding.swift`.
+A hearing cut keeps this request prefix and appends the retained prose and
+new reading before asking again. It spends another request. Neither closing
+the stream nor missing terminal usage proves saved tokens, a refunded call,
+or retained provider cache. Cut-stream billing and cache reuse require live
+usage evidence; they remain unmeasured. Codex's producer can continue to exit
+and EOF after forwarding closes.
+
+Source: `ChatSessionWork/SessionHistoryMessageProjection.swift`, `SessionHistoryTail.swift`,
+`SessionHistoryReader.swift`, `ChatTurnRuntime/ChatOrchestration+SessionHistory.swift` and
+`ConversationPrefixSeeding.swift`.
 
 ### Measuring the work before the model
 
@@ -531,7 +774,22 @@ still precedes truncation on a miss; this memo changes no provider input.
 `provider.requestStarted` marks route/adapter dispatch, before adapter request
 assembly. `provider.httpRequestStarted` marks each HTTP send attempt after body
 assembly and the network-availability wait, immediately before URLSession; it
-records only `requestBodyBytes`. It is neither an exact packet timestamp nor
+records `requestBodyBytes` and a request id shared with `provider.httpRequestEnded`,
+`provider.httpHeadersOpened` and `provider.httpFirstBodyBytes`. The latter two
+record the URLSession delegate's response callback before releasing headers to
+the caller, and its first nonempty body chunk before yielding it to the parser.
+Both carry `request`, `conversationRequest` and, when admitted, `provider`,
+`model` and the optional `reasoningEffort`. Headers carry `statusCode` for an
+HTTP response; first bytes carry `bodyChunkBytes`, the size of that callback's
+chunk, not a cumulative count. Neither records header values or body content.
+The event envelope's `ts` names each observation. Empty bodies produce no
+first-byte row, and failure before headers produces neither row; missing rows
+leave the corresponding stretch unknown. They do not change completion,
+cancellation or error delivery. `provider.firstDelta` is the turn's first
+nonempty parsed text, not first body bytes; it has no request id. Join the HTTP
+rows by `request`; a first-text join by turn and ordering must remain unknown
+when concurrent or repeated requests make attribution ambiguous.
+It is neither an exact packet timestamp nor
 proof of provider receipt, and retries can produce several rows. CLI routes
 do not emit this HTTP event. Compare both boundaries against acceptance; an
 absent stage or send event is incomplete evidence, never zero latency or a
@@ -557,8 +815,13 @@ and argument match, delivered or unshown; no call before turn closure is a
 miss. Retries keep the read; resumed turns do not repeat it. Each settled
 claim emits the existing `expansion.check` row with situation, outcome and standing.
 
-Each call's result passes through the outermost `ExpansionDispatcher` on its
-way back. Follow-up situations use verb, argument names and status word,
+The loop holds an `ExpansionToolDispatchClient`: opening reads are part of
+its required contract, carried through the outer file-access wrapper with
+the request's ceiling. No dispatcher type cast selects whether they run.
+Each call's result passes through `ExpansionDispatcher` inside that wrapper
+on its way back. Part thoughts wrap their restricted dispatcher in the same
+expansion owner, which excludes part callers from practice.
+Follow-up situations use verb, argument names and status word,
 plus the wake on the first call; result field lists no longer fragment
 practice. Practice persists across model changes, separately for each mind
 and authority. Record v3 folds v2 practices on load, unions situations with
@@ -574,6 +837,10 @@ Protocol markers and incomplete citations remain held only until they can be rea
 safely as prose. A pure tool round has no words to display. Each valid parsed
 round records `provider.roundOutput` with `round`, `proseCharacters` and
 `toolCallCount`; these counts describe provider output, not transport delivery.
+An unstarted round withdrawn for the person records `turn.proposalSkipped`
+with its call ids and names, `reason: person_arrival` and `effects: none`.
+Its completed prose stays before the arrival in context and once in the reply;
+no tool-use blocks from that proposal enter the provider conversation.
 
 A turn is alive exactly while its stream moves, and the person sees that
 movement as it happens. Every provider byte is movement, words or not: a
@@ -591,13 +858,30 @@ on the Mac working card and the Work pane, and the Telegram progress face's acti
 with an `app` call named by its action once the input names it. The line ends
 with the next lifecycle step (the call's dispatch, reply words, a retry). A
 phone-originated turn relays the line as its existing `notice` progress; the
-Mac card of another door's turn reads the same `stream.tick`. A turn begun on
-the Mac does not reach the phone's live line: that relay carries words and
-terminals only, and an unknown live kind would settle the phone's bubble.
-Nothing here stops a stream: the provider guard keeps owning dead sockets and
-Stop keeps owning the person's choice. Only when no byte arrives does the card
-age: after 20 seconds its meta line says how long nothing has moved, after 90
-its title says no movement, an observation and not a verdict.
+Mac card of another door's turn reads the same `stream.tick`. A resident turn
+begun on the Mac carries that line through `ChatLiveTap` and its existing live
+relay as `kind: writing`, under the turn's run id. The phone draws the working
+line on that run's bubble. Writing and unknown movement kinds never settle it;
+only an explicit terminal kind ends it. The relay coalesces unsent movement and
+an ending replaces it.
+The same presentation evidence also reaches a quiet line above another
+conversation's composer on Mac, full Shotgun and phone. The first call-writing
+or tool-start event makes it eligible; a thought with no calls stays silent
+outside its room. It opens the working session, retains Stop and disappears on
+the owner's terminal event. Only call-name movement crosses rooms, never call
+arguments, conversation words, notices, approval text or previews. The phone
+reads the Mac's published turn face through its activity snapshot; the
+[face contract](designs/separate-face.md#stage-one-turn-status) describes
+delivery and absence. This adds no turn owner, store or outcome clock.
+Nothing here stops a stream: the provider's
+[liveness boundary](TURN_RESILIENCE.md#4-provider-liveness) owns task completion
+and network loss, and Stop owns the person's choice. After 20 seconds without
+movement the card's meta line describes that duration. A clock never changes
+its phase or decides a turn's outcome. Mac turn status is projected off main
+into the shared `TurnFace` at `FaceKey.turn(session:)`; the card, Work pane,
+presence and other Mac turn readers draw that slot. Elapsed time advances on
+the face from the start date, without engine ticks. The
+[face-feed contract](designs/separate-face.md#stage-one-turn-status) owns this boundary.
 
 The session owns live delivery through `SessionTurnDelivery`, attached at the
 shared structured turn boundary before preparation or work. A mounted Mac or
@@ -614,6 +898,9 @@ the index supplies local presentation without reading history. Remote provenance
 uses one backward read of at most 2,048 physical rows and 1 MiB, regardless of
 total transcript size. A missing row, malformed newer row, or exhausted window
 never supplies a destination.
+Before that destination read, `SessionConversation.checkedKind` identifies a declared `builder`, `agent` or `ephemeral` conversation as
+having no human destination. Without a mount or explicit reply route it creates no delivery debt. Unknown ownership or an unreadable index
+does not prove that exemption; unavailable human delivery retains its repair obligation.
 Explicit human replies retain the stricter latest-user-row rule in `read`.
 This selection leaves the caller's completion route and authorization unchanged.
 Telegram and Slack continuations reserve/reuse their existing
@@ -633,7 +920,8 @@ observer; it cannot substitute for or disable the session's recipient. The old
 Telegram/Slack handler-to-chat sink parameters and Mac restart sink forwarding
 are removed. If a recipient or recorded route is unavailable, the turn keeps its
 normal transcript settlement; absence is neither delivery nor a delivery failure.
-`turn.deliveryAttached` records the selected recipient or its unavailability.
+`turn.deliveryAttached` records the selected recipient or its unavailability, or `recipient: not-needed` with `required: false` for a conversation
+without a human destination.
 Unavailable delivery retains an exact-session/run `RepairOwed` claim with
 operation `session.delivery:<session>:<run>`; saving the transcript or finding
 a recipient on a later run does not settle that debt. Recovery must deliver
@@ -690,8 +978,27 @@ A call runs beside another only when its declared class is read and its
 catalog bucket is core or file-ops; browser, Mac integration, Mac control,
 system, shell, the app door and unplaced tools run one at a time, and
 `git diff` of the working tree runs alone because it rewrites `.git/index`.
-Provider-facing results are bounded. Oversized results can be retained behind
-a session-and-turn-scoped handle and read through `result.page`.
+Provider-facing results are bounded only after their complete redacted body
+is retained. `ProviderToolResultPage` and `ProviderToolResultRecoveryStore`
+own this boundary for every tool, dispatch preview and context-overflow
+pointer (whose `saved_result_path` remains with chat after its handle is
+released). Program returns cross the helper transport whole; script and part
+ledgers keep every journaled step's answer,
+including reads and answers the program does not return. No helper prefix or
+byte-count-only step result bypasses retention.
+
+A bounded view names `result_handle`, `full_result_retained:true` and
+`next_call`. `result.page` reads that session-and-turn-scoped handle: `page`
+is the zero-based page offset, `raw:true` reads exact UTF-8 bytes, and
+`next_page` or `continue:true` advances without running the action again.
+Dispatch traces keep this pointer in `receipt.result_recovery` even when
+their result preview is bounded. Handles distinguish exact content and scope;
+later views and elapsed time never overwrite or evict a live turn's output.
+Turn settlement releases its handles; expired crash leftovers have no read
+authority. A missing scope, failed retention, unavailable spill or incomplete
+page reports its own failure, never an unretained prefix or a verdict about
+the original action's effects. A retention failure keeps the complete result
+in its caller's dispatch record; model delivery marks the projection error.
 
 The loop handles cancellation, bounded dispatch response waits and malformed-call feedback. The original tool owns its actual receipt and checkpoint settlement after a wait expires. Native routes execute only structured calls, text-marker routes only their offered markers, and text-only routes execute none. Malformed text is refused without salvage, and helpers share the offered-descriptor admission before the gate chain. No schema-loading round is needed between iterations. [Turn resilience](TURN_RESILIENCE.md#3-tool-dispatch-deadline) owns this contract.
 Fenced and inline code examples remain answer text; markers inside them never
@@ -776,7 +1083,7 @@ system is healthy.
 `args`/`result` previews and a structured `receipt`, plus `durationMs` on
 completion and `parentId` for nested calls. Failed rows retain the result's
 own `status` as `result_status`, and its supplied `failure_code`, `code`,
-`reason`, `argument_path`, `error`, `detail` and `message` as separate fields
+`reason`, `checker`, `remedy`, `argument_path`, `error`, `detail` and `message` as separate fields
 beside the preview and in the receipt. Absent fields stay absent; null fields
 stay null. Text is secret-redacted before each field is capped at 300 characters
 (including the truncation marker); object/array error details become bounded
@@ -793,7 +1100,12 @@ Their reply ends the turn. The turn settles at their part's `reply.end` and its
 takes the throwing-turn repair, and nothing of theirs runs after the reply. Any step
 may end the turn: after a model reply, after a result, or before drawing power at
 all. Their end may carry a model reply's words, their own `reply.stream`, selected
-attachments, or nothing. With no words or selected attachments, their `reply.end`
+attachments, or nothing. A thought's model request declares silence complete
+through `LLMCall.allowsSilentCompletion`; a person's chat request keeps the
+default requirement for output. The [provider terminal contract](TURN_RESILIENCE.md)
+admits only a clean silent completion under that declaration, then delivers the
+ordinary `model` event with empty text and no calls to their turn program.
+With no words or selected attachments, their `reply.end`
 settles completed and posts nothing: no assistant row, empty bubble, message or
 notification. The heard experience's `answer` obligation settles `accepted`
 with `Ref(source: "silence", id: <turn id>)`. Its answer experience records that
@@ -853,13 +1165,19 @@ calls' usage, `LLMCallTraceRecorder.spent`), minutes and the longest stretch of
 one round's calls repeated.
 When it used tools, that is one line beside the exchange the after-turn memory
 call reads (`AfterTurnOrigin.took`); and each of their parts called in it
-records how many rounds called it (`AbilityStore.recordRounds`, read as
-`learned.use.rounds_per_use`).
+records how many rounds called it, under the version that ran
+(`AbilityStore.recordRounds`, read as `learned.use.rounds_per_use`).
+Terminal execution accounting supplies each part's exact full version key to the turn's round owner, including answered verbs and nested
+scripts/batches. Each tool round counts once per version, settled on reply or interruption; another turn's last run cannot change that identity.
 
 Source: `ChatTurnRuntime/ChatTurnSettlement.swift`,
 `ChatOrchestration+StreamingToolLoop.swift`, `AfterReply.swift`, `PersistedToolReceipt.swift`,
 `MacChatTurnStreamSettlement.swift`, `MacChatTurnLifecycleState.swift`,
 `MacChatTurnLifecycleStore.swift` and `MacChatTurnTranscriptProofReader.swift`.
+Launch repair asks the lifecycle persistence actor for each exact checkpoint's
+presence; file reads, decoding and life checks run there. Presentation retains
+its live-turn and terminal-identity checks on MainActor. An
+unreadable checkpoint keeps its own repair pending while other records proceed.
 
 ## Related reading
 

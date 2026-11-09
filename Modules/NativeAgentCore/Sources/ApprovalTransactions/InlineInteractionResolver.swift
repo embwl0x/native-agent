@@ -1,3 +1,4 @@
+import ApprovalInbox
 import AuthoredCapabilities
 import Experiences
 import Foundation
@@ -23,11 +24,20 @@ import Privacy
 public enum InlineInteractionResolver {
     public static var platform: (any InlineInteractionPlatformPort)!
 
-    /// The transcript supplies provenance; the record fixes its doors at birth, including the person's conversation mirror.
+    /// The transcript supplies provenance; the record fixes its doors at birth, including the person's conversation mirror. The row is the
+    /// card's face on every door: each answer is its door call (a choice or the card's own control is `card.answer`, a failed card's retry
+    /// `card.try_again`, Not now `card.not_now`, Open on Mac `inbox.open_on_mac`). A value the card collects (a key, a token) is no answer
+    /// here: it goes from the Mac's key entry straight to its owner, never into a call.
     @discardableResult
     static func fileMatter(_ card: InlineInteraction, sessionID: String, dataRoot: URL) async throws -> ForPerson.Filed {
-        guard !card.state.isUnknown,
-              InlineCards.model(card, descriptor: descriptor(for: card, dataRoot: dataRoot)).needsAttention else { return .unchanged }
+        let control = await descriptor(for: card, dataRoot: dataRoot)
+        let model = InlineCards.model(card, descriptor: control)
+        let owner = ForPerson.at(dataRoot)
+        let existing = try await owner.matter("interaction:" + card.id)
+        // An unfamiliar saved state may explain an existing row, but cannot create an ask or settle its decision.
+        guard !card.state.isUnknown || existing != nil else { return .unchanged }
+        guard model.needsAttention || existing != nil else { return .unchanged }
+        let continuationFailed = card.continuationFailure != nil
         let origin = try await originEnvelope(of: card.id, sessionID: sessionID, dataRoot: dataRoot)
         let thread: Door?
         if let route = origin?.replyRoute, route.surface == "telegram" || route.surface == "slack" {
@@ -37,19 +47,58 @@ public enum InlineInteractionResolver {
             thread = route.surface == "telegram" ? .telegram(chat: destination, thread: route.threadId)
                 : .slack(channel: destination, thread: route.threadId)
         } else { thread = nil }
-        var doors = Door.person(thread: thread)
-        if let anchor = try ApprovalChatCards.usersConversation(unless: sessionID, dataRoot: dataRoot) {
-            doors.append(.conversation(anchor))
+        let doors = try await Task.detached(priority: .userInitiated) {
+            try Door.asking(thread: thread, unless: sessionID, dataRoot: dataRoot)
+        }.value
+        let id: [String: PartFace.Value] = ["id": .string(card.id)]
+        // Picks are the card's options and settle from any of the person's doors, except a model card's row that opens Providers; a card with
+        // no options answers with its own control, and that control, a retry and opening the request run on the Mac.
+        let picks = !continuationFailed && (card.kind == .choose || card.kind == .modelChoice) ? card.options : []
+        let mac = ["mac"]
+        let providerEntry = model.needsAttention && !continuationFailed && control.control == .providerAPIKey
+        var answers: [PartFace.Action] = picks.enumerated().map { index, option in
+            .init(id: "interaction_choice_\(index)", label: NativeAppSecretRedactor.redactText(option.label),
+                  doors: option.id == "__save_for_group__" ? mac : nil, call: .init("card.answer", id.merging(["choice": .string(option.id)]) { $1 }))
         }
-        let choices: [PartFace.Action] = card.kind == .choose ? card.options.enumerated().map { index, option in
-            .init(id: "interaction_choice_\(index)", label: NativeAppSecretRedactor.redactText(option.label))
-        } : []
-        let matter = Matter(id: "interaction:" + card.id, form: .ask, from: InlineInteractionDelivery.source,
-            title: NativeAppSecretRedactor.redactText(card.title), summary: NativeAppSecretRedactor.redactText(card.why),
+        if providerEntry {
+            answers.append(.init(id: "act", label: "Enter on Mac", role: .primary, doors: mac,
+                call: .init("provider.sign_in", ["provider": .string(control.target)])))
+        } else if picks.isEmpty, model.fields.isEmpty, control.isActionable, card.state.isOpen {
+            answers.append(.init(id: "answer", label: model.primaryLabel, role: .primary, doors: mac, call: .init("card.answer", id)))
+        }
+        if continuationFailed || (!providerEntry && model.canRetry && model.fields.isEmpty && model.state == .failed) {
+            answers.append(.init(id: "try_again", label: "Try again", role: .primary, doors: mac, call: .init("card.try_again", id)))
+        }
+        let summary: String
+        if !card.state.isOpen {
+            let retryScope = model.needsAttention && !continuationFailed
+                ? model.scopeLines + [model.persistenceNote, "Not now: " + card.declineConsequence].compactMap { $0 } : []
+            summary = ([model.outcome, model.outcomeMeta].compactMap { $0 } + retryScope)
+                .filter { !$0.isEmpty }.joined(separator: "\n\n")
+        } else {
+            summary = ([card.state.failureReason ?? card.why]
+                + model.scopeLines + [model.persistenceNote, "Not now: " + card.declineConsequence].compactMap { $0 })
+                .filter { !$0.isEmpty }.joined(separator: "\n\n")
+        }
+        let form: Matter.Form = card.state.isUnknown ? .words
+            : continuationFailed ? .wentWrong : model.needsAttention ? .ask : .done
+        let matter = Matter(id: "interaction:" + card.id, form: form,
+            from: InlineInteractionDelivery.source,
+            title: NativeAppSecretRedactor.redactText(card.title),
+            summary: NativeAppSecretRedactor.redactText(summary)
+                + (providerEntry ? " Enter the key or sign in in the protected entry on the Mac."
+                    + " This request waits until the saved connection is verified." : ""),
             symbol: "hand.raised.fill", badge: "REQUEST", open: "card:" + card.id,
-            choices: choices + [.init(id: "act", label: "Open request"), .init(id: "reject", label: "Not now", role: .destructive)],
+            choices: !model.needsAttention ? [] : continuationFailed ? answers : answers + (providerEntry ? [] : [
+                .init(id: "act", label: "Open request", doors: mac, call: .init("inbox.open_on_mac", ["id": .string("interaction:" + card.id)])),
+            ]) + [
+                .init(id: "reject", label: "Not now", role: .destructive, call: .init("card.not_now", id)),
+            ],
             evidence: [.init(source: Matter.messages(sessionID), id: card.id)])
-        return try await ForPerson.at(dataRoot).tell(matter, doors: doors)
+        if let existing, [.archived, .dismissed].contains(ForPerson.reading(existing)) {
+            return try await owner.updateFace(matter)
+        }
+        return try await owner.tell(matter, doors: doors)
     }
     /// Inject the scene-owned turn starter so every surface shares continuation policy. Only the first real question shows a user bubble; internal continuation
     /// markers stay hidden. Report actual admission so a refused turn cannot strand a durable claim as resumed.
@@ -87,10 +136,15 @@ public enum InlineInteractionResolver {
     private static var loggedReadFailures: Set<String> = []
     static func checkedRows(_ sessionID: String, _ dataRoot: URL) async throws -> (rows: [JSONValue], lifeID: String) {
         do {
-            let lifeID = try DataRootLife.current(in: dataRoot)
-            let rows = try await SwiftNativePersistenceCore.readJSONL(path(sessionID, dataRoot))
+            let file = path(sessionID, dataRoot)
+            // Mirror-card reads may start on the main actor; the whole-file read and JSON decode never run there.
+            let read = try await Task.detached(priority: .userInitiated) {
+                let lifeID = try DataRootLife.current(in: dataRoot)
+                let rows = try await SwiftNativePersistenceCore.readJSONL(file)
+                return (rows: rows, lifeID: lifeID)
+            }.value
             loggedReadFailures.remove(sessionID)
-            return (rows, lifeID)
+            return read
         } catch {
             if loggedReadFailures.insert(sessionID).inserted {
                 nativeLog("[interaction] transcript read failed for \(sessionID): \(error)")
@@ -104,15 +158,17 @@ public enum InlineInteractionResolver {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> InlineInteraction? {
         let read = try await checkedRows(sessionID, dataRoot)
-        for row in read.rows {
-            guard case .object(let object) = row,
-                  case .object(let metadata)? = object["metadata"],
-                  metadata["kind"] == .string(InlineInteractionWire.transcriptKind),
-                  case .object(let raw)? = metadata[InlineInteractionWire.metadataKey],
-                  raw["id"] == .string(id) else { continue }
-            return try SwiftNativeChatOrchestrationClient.checkedInlineInteraction(in: row, lifeID: read.lifeID)
-        }
-        return nil
+        return try await Task.detached(priority: .userInitiated) { () throws -> InlineInteraction? in
+            for row in read.rows {
+                guard case .object(let object) = row,
+                      case .object(let metadata)? = object["metadata"],
+                      metadata["kind"] == .string(InlineInteractionWire.transcriptKind),
+                      case .object(let raw)? = metadata[InlineInteractionWire.metadataKey],
+                      raw["id"] == .string(id) else { continue }
+                return try SwiftNativeChatOrchestrationClient.checkedInlineInteraction(in: row, lifeID: read.lifeID)
+            }
+            return nil
+        }.value
     }
     /// Read each card with its owning row in one checked snapshot so rendering preserves placement and surfaces failures.
     public static func checkedInteractionsByRow(
@@ -121,7 +177,8 @@ public enum InlineInteractionResolver {
     ) async -> Result<[(rowID: String, interaction: InlineInteraction)], any Error> {
         do {
             let read = try await checkedRows(sessionID, dataRoot)
-            return .success(interactionsByRow(in: read.rows, lifeID: read.lifeID))
+            let pairs = await Task.detached { interactionsByRow(in: read.rows, lifeID: read.lifeID) }.value
+            return .success(pairs)
         } catch {
             return .failure(error)
         }
@@ -150,17 +207,14 @@ public enum InlineInteractionResolver {
             primaryActionLabel: "", declineConsequence: "",
             state: .unknown("unavailable"), createdAt: .distantPast)
     }
-    public static func descriptor(
+    public nonisolated static func descriptor(
         for interaction: InlineInteraction,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> InlineInteractionDescriptor {
-        InlineInteractionRegistry.descriptor(
-            kind: interaction.kind,
-            target: interaction.target,
-            // The descriptor must show the entire chain its tap grants.
-            additionalTargets: interaction.additionalTargets,
-            dataRoot: dataRoot
-        )
+    ) async -> InlineInteractionDescriptor {
+        await Task.detached(priority: .userInitiated) {
+            InlineInteractionRegistry.descriptor(kind: interaction.kind, target: interaction.target,
+                additionalTargets: interaction.additionalTargets, dataRoot: dataRoot)
+        }.value
     }
     public static func waitForAnswer(_ interaction: InlineInteraction, tool: String, input: [String: JSONValue],
                                      sessionID: String, dataRoot: URL, turn: Turn,
@@ -271,17 +325,34 @@ public enum InlineInteractionResolver {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> InlineInteraction? {
         let stamped: InlineInteraction
+        var changed: Bool
         do {
-            stamped = try await SwiftNativeChatOrchestrationClient.fileInlineInteraction(
+            let filed = try await SwiftNativeChatOrchestrationClient.fileInlineInteraction(
                 interaction, sessionID: sessionID, resumeText: resumeText, resumable: resumable,
                 toolName: toolName, toolArgumentsJSON: toolArgumentsJSON, toolCallId: toolCallId,
                 requestingTool: requestingTool, origin: origin, dataRoot: dataRoot, turn: turn)
+            stamped = filed.card
+            changed = filed.changed
         } catch {
-            nativeLog("[interaction] raise failed for \(interaction.id): \(error)")
+            await RepairOwed.owe(dataRoot, id: interaction.id, kind: .decision, operation: "interaction.raise:" + interaction.id, owner: "interaction",
+                words: "The request could not be filed: " + TurnSecretRedactor.redactText(error.localizedDescription),
+                lever: "Repair the request's transcript filing and raise this same request again.").value
             return nil
         }
-        do { try await fileMatter(stamped, sessionID: sessionID, dataRoot: dataRoot) }
-        catch { nativeLog("[interaction] matter filing failed for \(stamped.id): \(error)") }
+        let operation = "interaction.raise:" + stamped.id
+        do {
+            let matter = try await fileMatter(stamped, sessionID: sessionID, dataRoot: dataRoot)
+            changed = changed || matter == .born || matter == .refreshed
+        }
+        catch {
+            await RepairOwed.owe(dataRoot, id: stamped.id, kind: .decision, operation: operation, owner: "interaction",
+                words: "The transcript retained the request, but its matter could not be filed: "
+                    + TurnSecretRedactor.redactText(error.localizedDescription),
+                lever: "Repair matter filing and raise the retained request again; its transcript and continuation remain intact.").value
+            return nil
+        }
+        await RepairOwed.settle(dataRoot, operation: operation, evidence: .init(source: Matter.messages(sessionID), id: stamped.id)).value
+        guard changed else { return stamped }
         await ApprovalChatCards.publishInteractionChange(id: stamped.id, sessionID: sessionID, dataRoot: dataRoot)
         NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: sessionID)
         NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
@@ -308,7 +379,7 @@ public enum InlineInteractionResolver {
                 elevatedPeerSources: previous?.elevatedPeerSources)
             current.continuation?.originTurnId = previous?.originTurnId
             current.continuation?.originRunId = previous?.originRunId
-            current.continuation?.lifeID = try DataRootLife.current(in: dataRoot)
+            current.continuation?.lifeID = try await Task.detached { try DataRootLife.current(in: dataRoot) }.value
         }
         // Failed cards remain answerable; running controls refuse another tap to prevent duplicate mutations.
         switch current.state {
@@ -317,7 +388,7 @@ public enum InlineInteractionResolver {
         default:
             throw ResolveError.alreadySettled(current.state.name)
         }
-        let descriptor = descriptor(for: current, dataRoot: dataRoot)
+        let descriptor = await descriptor(for: current, dataRoot: dataRoot)
         guard descriptor.isActionable else {
             throw ResolveError.noControl(
                 descriptor.unavailableReason ?? "No control for \(current.target)."
@@ -347,6 +418,8 @@ public enum InlineInteractionResolver {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> InlineInteraction {
         try await refuseAgentOnUsersCard(id, byAgent: byAgent, dataRoot: dataRoot)
+        // A call the person parked on this card stays theirs only when the person answers it.
+        if byAgent { PersonParkedCalls.agentAnswered(id) }
         let current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
         try checkRevision(current, expectedRevision)
         guard current.state.isOpen else {

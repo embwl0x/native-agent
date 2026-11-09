@@ -40,6 +40,11 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
     }
     /// One time it moved the agent: a pointer to what really happened (`source`: `exchange:<session>/<turn>` or a memory id), never a second copy of it.
     public struct Moment: Sendable, Equatable, Codable {
+        public struct Pressure: Sendable, Equatable, Codable {
+            public var before: Double
+            public var after: Double
+            public var open: Bool
+        }
         public var at: Date
         /// -1...1: away from or toward what the agent cares about.
         public var moved: Double
@@ -51,12 +56,18 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
         public var depthChange: DepthChange?
         /// A proposed change, held as evidence until the agent's night confirms it.
         public var stancePressure: Stance?
+        /// The position accepted at this moment, retained as evidence for her self reading.
+        public var stanceChange: Stance?
         /// Only an observed gap closure counts as evidence.
         public var closedGap: Bool?
+        /// The interpretation observed her reply saying or doing something about this care.
+        public var answered: Bool?
+        /// Actual state on either side of this mutation; absent on older evidence, never reconstructed from later state.
+        public var pressure: Pressure?
 
         public init(at: Date, moved: Double, by: Mover, who: String? = nil, felt: String, note: String,
                     source: String, depthChange: DepthChange? = nil, stancePressure: Stance? = nil,
-                    closedGap: Bool? = nil) {
+                    closedGap: Bool? = nil, stanceChange: Stance? = nil, answered: Bool? = nil) {
             self.at = at
             self.moved = moved.isFinite ? min(1, max(-1, moved)) : 0
             self.by = by
@@ -66,7 +77,9 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
             self.source = source
             self.depthChange = depthChange
             self.stancePressure = stancePressure
+            self.stanceChange = stanceChange
             self.closedGap = closedGap
+            self.answered = answered
         }
     }
     /// Movements older than the newest `storyMovements`, folded into one line.
@@ -172,7 +185,7 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
         self.origin = origin
         self.createdAt = createdAt
         self.updatedAt = updatedAt
-        for moment in story { record(moment) }
+        for moment in story { recordHistory(moment) }
     }
     /// Recent movement, signed, each decayed on this care's clock at read time.
     public func charge(at now: Date) -> Double {
@@ -181,8 +194,30 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
             sum + moment.moved * pow(0.5, max(0, now.timeIntervalSince(moment.at)) / halfLife)
         }
     }
+    public func pressure(at now: Date) -> Double {
+        guard depth != .life || open != nil else { return 0 }
+        return abs(charge(at: now)) * (open != nil ? 1.5 : 1)
+    }
     /// Backdated movements retain time order; only movements beyond `storyMovements` fold. Notes have their own bound; depth changes never fold.
-    public mutating func record(_ moment: Moment) {
+    public mutating func record(_ moment: Moment, changing: (inout CognitiveCare) -> Void = { _ in }) {
+        let before = pressure(at: moment.at)
+        changing(&self)
+        recordHistory(moment)
+        if let index = story.lastIndex(of: moment) {
+            let transition = Moment.Pressure(before: before, after: pressure(at: moment.at), open: open != nil)
+            story[index].pressure = transition
+        }
+    }
+
+    /// Merging keeps the union outside ordinary story folding; finish its transition after that union is complete.
+    mutating func finishPressureTransition(from previous: Self, at: Date, source: String) {
+        guard let index = story.lastIndex(where: { $0.at == at && $0.source == source }) else { return }
+        let transition = Moment.Pressure(before: previous.pressure(at: at), after: pressure(at: at), open: open != nil)
+        story[index].pressure = transition
+    }
+
+    /// Joining or restoring evidence preserves its original transition, including an explicitly unknown older transition.
+    private mutating func recordHistory(_ moment: Moment) {
         story.insert(moment, at: story.lastIndex(where: { $0.at <= moment.at }).map { $0 + 1 } ?? 0)
         updatedAt = max(updatedAt, moment.at)
         while story.filter({ $0.depthChange == nil && $0.moved != 0 }).count > Self.storyMovements,
@@ -198,8 +233,11 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
                             since: min(folded?.since ?? gone.at, gone.at),
                             movedDays: Array(days))
         }
-        while story.filter({ $0.depthChange == nil && $0.moved == 0 && $0.stancePressure == nil && $0.felt != "changed my mind" }).count > Self.storyNotes,
-              let oldest = story.firstIndex(where: { $0.depthChange == nil && $0.moved == 0 && $0.stancePressure == nil && $0.felt != "changed my mind" }) {
+        while story.filter({ $0.depthChange == nil && $0.moved == 0 && $0.answered != true && $0.closedGap != true && $0.stancePressure == nil
+            && $0.stanceChange == nil && $0.felt != "changed my mind" }).count > Self.storyNotes,
+              let oldest = story.firstIndex(where: { $0.depthChange == nil && $0.moved == 0 && $0.answered != true
+                  && $0.closedGap != true && $0.stancePressure == nil
+                  && $0.stanceChange == nil && $0.felt != "changed my mind" }) {
             story.remove(at: oldest)
         }
         // Only exact same-day proposals are redundant. The dream, never this compactor, decides whether different proposals point the same way.

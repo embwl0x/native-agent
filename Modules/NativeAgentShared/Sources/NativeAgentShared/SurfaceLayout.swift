@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `SurfaceLayout.swift` | `SurfaceLayout` owns the document shape, vocabulary and seed; `SurfaceLayoutAvailability` carries its checked value or `SurfaceLayoutFailure` path/detail/repair across Mac and phone, and exposes shipped content names through their shipped profiles without supplying a substitute layout. `addMissing`, `shown`, `arranged` project validated layouts; `QuietToolPage` owns shared page definitions including inbox/unindexed reads; `AppDoorNames` shares page/item aliases and door resolution (`step`, `place`, home rooms), deriving accepted part face pages from those definitions |
+// Blueprint: | `SurfaceLayout.swift` | `SurfaceLayout` owns the document shape, vocabulary and seed; `SurfaceLayoutAvailability` carries its checked value or `SurfaceLayoutFailure` path/detail/repair across Mac and phone, and exposes shipped content names through their shipped profiles without supplying a substitute layout. `addMissing`, `shown`, `arranged` project validated layouts; `QuietToolPage` owns shared page definitions including inbox/unindexed reads; `AppDoorNames` shares page/item aliases and door resolution (`step`, `place`, home rooms), deriving accepted part face pages from those definitions and the ids a page of the agent's own may have (`ownPageRefusal`); `ownPage` reads a `page:<id>` block on the surfaces that take one (rail, more) |
 
 public enum SurfaceLayoutAvailability: Codable, Sendable, Equatable {
     case available(SurfaceLayout)
@@ -72,8 +72,15 @@ public struct QuietToolPage: Sendable, Equatable {
                   summary: "Saved facts, pending proposals, and the knowledge graph."),
         QuietToolPage(id: "desk", title: "Desk",
                   summary: "Projects, dependencies, schedules, pursuits, progress and outcomes."),
+        QuietToolPage(id: "make", title: "Make",
+                  summary: "Every made thing, newest first; follow next_call for more. item:<ref> reads its versions. The person sees Make beside chat."),
+        // A group of the door's actions with no screen of its own reads as its summary, its actions and its settings; the summary names
+        // the page where the person sees it.
         QuietToolPage(id: "notifications", title: "Notifications",
-                  summary: "The proactive inbox, its triggers, watched folders, and history."),
+                  summary: """
+                      Notifying the person on the Mac or the paired phone. The person sees what needs them on the Inbox (Notifications in the \
+                      rail) and sets notifications on Settings.
+                      """),
         QuietToolPage(id: "bots", title: "Helpers",
                   summary: "Standing briefs on a schedule or an event, and their dated replies."),
         QuietToolPage(id: "personality", title: "Personality",
@@ -81,24 +88,25 @@ public struct QuietToolPage: Sendable, Equatable {
         QuietToolPage(id: "providers", title: "Providers",
                   summary: "Connected AI accounts and the model each activity group runs on."),
         QuietToolPage(id: "trust", title: "Trust",
-                  summary: "Presets, feature permissions, approvals, and Mac integration access."),
+                  summary: "Presets, feature permissions, approvals, read and write access per Mac app, macOS grants, and activity capture."),
         QuietToolPage(id: "connectors", title: "Connectors",
-                  summary: "Service connections, with Agents, Telegram and iPhone tabs."),
+                  summary: "Service connections, Telegram, the paired iPhone and its senses, and agent contacts."),
         QuietToolPage(id: "telegram", title: "Telegram",
-                  summary: "Telegram on or off, who may reach the agent, mention-only, its model, test reply and logs."),
-        QuietToolPage(id: "mac_integration", title: "Mac Integration",
-                  summary: "Read and write access per Mac app: Calendar, Mail, Messages, Notes and the rest."),
+                  summary: """
+                      Telegram's actions: a test reply, clearing its logs, repairing its admission index, removing the token. The person sees and \
+                      sets Telegram on Connectors.
+                      """),
         QuietToolPage(id: "pairing", title: "iPhone pairing",
                   summary: """
-                      Paired phones and the iCloud pairing status. item:phone-senses reads each phone sense's setup, missing steps and the Phone \
-                      senses guide.
+                      The paired iPhone's actions: remove a phone, ask for its location. item:phone-senses reads each phone sense's setup, \
+                      missing steps and the Phone senses guide. The person sees pairing, the phone's notifications and its senses on Connectors.
                       """),
         QuietToolPage(id: "agents", title: "Agents",
                   summary: """
                       Agent contacts and coding helpers: message, read, connect, stop, recipes, bridge jobs, and Claude's worklog of what Claude has \
-                      been doing and working on, newest first.
+                      been doing and working on, newest first. The person sees agent contacts on Connectors.
                       """),
-        // Each app’s page owns its access controls so the person can change access where its actions live.
+        // An app's actions live on its page; the person sets its read and write access on Trust.
         QuietToolPage(id: "mail", title: "Mail",
                   summary: "Apple Mail (every account added to Mail, Gmail included): read, search, triage, send and reply."),
         QuietToolPage(id: "calendar", title: "Calendar",
@@ -119,7 +127,7 @@ public struct QuietToolPage: Sendable, Equatable {
                   summary: "Read a public page privately, and search the web."),
         QuietToolPage(id: "browser", title: "Browser",
                   summary: "The NativeAgent browser and your own Chrome tab: open, read, links, screenshots, clicks and forms."),
-        // Trust owns Full Mac accessibility; Mac integration owns Music access.
+        // Trust owns Full Mac accessibility and Music access.
         QuietToolPage(id: "mac", title: "Mac",
                   summary: """
                       The live screen: look, act by name, go to an app, file or URL, wait, read a document, menus, the clipboard, system info and app \
@@ -128,15 +136,24 @@ public struct QuietToolPage: Sendable, Equatable {
         QuietToolPage(id: "music", title: "Music",
                   summary: "Apple Music: what's playing, play, pause or skip, search the library, tracks and playlists."),
         QuietToolPage(id: "capabilities", title: "Capabilities",
-                  summary: "What the agent can actually do, action by action."),
+                  summary: """
+                      What the agent can actually do, action by action: the senses, the chat tools and their access, the abilities the agent grew, \
+                      and the built-in guidance.
+                      """),
         QuietToolPage(id: "diagnostics", title: "Diagnostics",
                   summary: "Doctor, Status, Runs log, Cognition and Inspector."),
+        QuietToolPage(id: "dreams", title: "Dreams", summary: "Dream diary entries, held reading and the person's cycle controls."),
+        QuietToolPage(id: "knowledge", title: "Knowledge Graph", summary: "Entities, relationships and reviewed graph upkeep."),
+        QuietToolPage(id: "cognition", title: "Cognition", summary: "The resident mind's reading, evidence and the person's controls."),
+        QuietToolPage(id: "memory-upkeep", title: "Memory upkeep", summary: "Memory diagnostics and the person's upkeep controls."),
         QuietToolPage(id: "skills", title: "Skills",
-                  summary: "Built-in guidance from the persona, to read."),
+                  summary: "Built-in guidance from the persona, to read. The person sees it on Capabilities."),
         QuietToolPage(id: "tools", title: "Tools",
-                  summary: "Available tools and their access, and the abilities the agent grew: read, save, keep and manage them."),
+                  summary: "The abilities the agent grew: read, save, keep and manage them. The person sees them on Capabilities."),
         QuietToolPage(id: "settings", title: "Settings",
-                  summary: "Appearance, shortcuts, updates, and the switches for an inner life, dreams and memory."),
+                  summary: """
+                      Appearance, shortcuts, updates, the switches for an inner life, dreams and memory, notifications, and the search server.
+                      """),
     ]
 
 
@@ -169,7 +186,7 @@ public enum AppDoorNames {
         "pair": "pairing", "pairing devices": "pairing", "iphone pairing": "pairing", "chrome": "browser",
         "phone senses": "pairing/phone-senses",
         "ongoing": "desk", "computer": "mac", "skill": "skills", "agent": "agents", "abilities": "tools", "ability": "tools",
-        "bot": "bots", "helpers": "bots", "connector": "connectors", "mac integration": "mac_integration",
+        "bot": "bots", "helpers": "bots", "connector": "connectors",
         "skills & tools": "skills",
         "health": "status", "doctor": "diagnostics/doctor",
     ]
@@ -183,6 +200,22 @@ public enum AppDoorNames {
     public static func resolve(_ raw: String) -> String {
         let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return aliases[key] ?? key
+    }
+
+    /// Names the door and the window already take for a place that is not a page: home and its rooms (`step` turns them into home's item),
+    /// the door's own words (the senses door's page among them), and every page's tabs (page.show opens a tab by its name).
+    static let placeNames: Set<String> = homeItems.union(["home", "app", "current", "visible", "senses"])
+        .union(SurfaceLayout.vocabulary.filter { $0.surface.hasPrefix("tabs.") }.flatMap { $0.blocks.map { $0.name.lowercased() } })
+
+    /// Why `page` cannot be a page of the agent's own, or nil when it can: a short lowercase id that names no page, alias, room or tab the app has.
+    public static func ownPageRefusal(_ page: String) -> String? {
+        guard page.range(of: "^[a-z][a-z0-9-]{1,31}$", options: .regularExpression) != nil else {
+            return "A page of the agent's own is 2 to 32 lowercase letters, digits or hyphens, starting with a letter."
+        }
+        guard !partPages.contains(page), aliases[page] == nil, !placeNames.contains(page) else {
+            return "\(page) is already one of the app's pages, rooms or tabs; name a page of the agent's own."
+        }
+        return nil
     }
 
     /// One step of where the door takes a call's page before anything reads or acts (`AppToolExecutor.runAppDoor`): an alias resolves and a `page/item`
@@ -228,6 +261,7 @@ public enum AppDoorNames {
             source/time
             """],
         "diagnostics": ["doctor": "Doctor's last report; run doctor.run for fresh checks"],
+        "capabilities": ["<row id>": "the document a row opens (page:capabilities/<row id>), as its owner answers it on the Mac's page too"],
         "telegram": ["status": "the poller's health, config and log freshness; never tokens or ids"],
         "skills": ["<skill name>": "the built-in guidance, as ability.read reads it",
                    "census": "conversion progress and blockers, including preserved historical originals"],
@@ -298,24 +332,37 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
         ("chat", "The chat's conversations column, top to bottom (Simple's profile hides it); expanded is whether a fold starts open", [
             ("rows", "the conversations"), ("briefs", "Briefs (folds)"), ("working", "Working: bridge and agent sessions (folds)"),
         ]),
-        ("today", "The Today page, top to bottom", [
-            ("waiting", "what waits on the person"), ("earlier", "notes from earlier days"), ("did", "What I did today"),
-            ("ahead", "what's ahead"), ("queues", "the queue links"),
-        ]),
         ("tabs.memories", "Memories' tabs, left to right", [("memories", ""), ("knowledge", "Knowledge graph")]),
-        ("tabs.personality", "Personality's tabs, left to right", [("personality", ""), ("minds", "My minds"), ("dreams", "")]),
-        ("tabs.trust", "Trust's tabs, left to right", [("trust", "Access"), ("features", ""), ("mac", ""), ("advanced", "")]),
-        ("tabs.connectors", "Connectors' tabs, left to right", [("connectors", ""), ("agents", ""), ("telegram", ""), ("iphone", "")]),
-        ("tabs.capabilities", "Capabilities' tabs, left to right", [("capabilities", "What I can do"), ("senses", "")]),
+        ("tabs.personality", "Personality's tabs, left to right", [("personality", ""), ("dreams", "")]),
         ("tabs.diagnostics", "Diagnostics' tabs, left to right", [
-            ("diagnostics", "Health checks, status and runs"), ("Cognition", ""),
-            ("Inspector", "Chat turn details"), ("skills", ""), ("tools", ""),
+            ("diagnostics", "Health checks, status and runs"), ("Cognition", ""), ("Inspector", "Chat turn details"),
         ]),
         ("more", "The iPhone's More page, top to bottom", [("rooms", "Rooms"), ("setup", "Setup"), ("power", "Power user")]),
     ]
 
     /// Blocks that fold, and so carry `expanded`; each starts closed.
     public static let folds: Set<String> = ["chat.briefs", "chat.working"]
+
+    /// The surfaces that also take a page of the agent's own, as a block named `page:<id>`. No seed has one.
+    public static let pageSurfaces: Set<String> = ["rail", "more"]
+    public static let pagePrefix = "page:"
+    public static let pageBlockAbout = """
+        page:<id> places a page of the agent's own here: an active part whose face is {projection:true, page:"<id>"}, drawn from its \
+        host.state notebook. Only a page of the agent's own now can be placed; a placed page that is not published draws nothing.
+        """
+
+    /// The page of the agent's own a `page:<id>` block places on `surface`, when the surface takes one and the id is one such a page may
+    /// have. Whether that page exists now is the engine's to say.
+    public static func ownPage(_ surface: String, _ block: String) -> String? {
+        guard pageSurfaces.contains(surface), block.hasPrefix(pagePrefix) else { return nil }
+        let page = String(block.dropFirst(pagePrefix.count))
+        return AppDoorNames.ownPageRefusal(page) == nil ? page : nil
+    }
+
+    /// Whether a "surface.block" name is a page of the agent's own on a surface that takes one.
+    public static func placesOwnPage(_ key: String) -> Bool {
+        pageSurfaces.contains { key.hasPrefix($0 + ".") && ownPage($0, String(key.dropFirst($0.count + 1))) != nil }
+    }
 
     public static let profilesAbout = """
         simple, advanced and agent are the window's views (settings.view_mode shows one); each hides surface.block names in that view only. phone is \
@@ -342,14 +389,14 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
 
     /// A surface, profile or block a newer build added, at its seed position: after the nearest block that comes before it in the seed.
     /// A saved layout reads in the current vocabulary: a surface or block the vocabulary no longer has leaves, and what the person chose
-    /// about every other block stands.
+    /// about every other block stands. A `page:<id>` block stays where its surface takes one and its id is one a page of the agent's own may have.
     public mutating func dropRemoved() {
         let known = Dictionary(uniqueKeysWithValues: Self.vocabulary.map { ($0.surface, Set($0.blocks.map(\.name))) })
         surfaces = Dictionary(uniqueKeysWithValues: surfaces.compactMap { surface, blocks in
-            known[surface].map { names in (surface, blocks.filter { names.contains($0.name) }) }
+            known[surface].map { names in (surface, blocks.filter { names.contains($0.name) || Self.ownPage(surface, $0.name) != nil }) }
         })
         let named = Set(known.flatMap { surface, names in names.map { surface + "." + $0 } })
-        for name in profiles.keys { profiles[name]?.hidden.removeAll { !named.contains($0) } }
+        for name in profiles.keys { profiles[name]?.hidden.removeAll { !named.contains($0) && !Self.placesOwnPage($0) } }
     }
 
     public mutating func addMissing() {

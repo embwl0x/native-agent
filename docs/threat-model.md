@@ -127,7 +127,7 @@ started keeps its one card, as above.
 
 Switches over their own mind live in Settings and are theirs in both directions:
 cross-conversation recall, the knowledge graph, adaptive promotion, semantic
-memory, inner life and reflection, their hour, weekly self-improvement, dreams
+memory, inner life and reflection, their hour, overnight revision, dreams
 and REM, image understanding, PDF/DOCX reading preferences and context flow.
 `setting.set` needs neither a quoted request nor a Trust posture for these
 rows. Their saved fields stay in their existing owners; unreadable saved
@@ -161,6 +161,12 @@ JWTs, Slack xox/xapp tokens and Bearer values of 20 or more characters.
 Calendar and Reminder note previews inspect the complete notes with
 `NativeAppSecretRedactor` before taking 300 characters; Mac and phone
 notification receipts likewise redact the complete message before taking 200.
+Phone transcript words and their display metadata, faces, card strings,
+attachment recognition and reading copies use the same shared text policy
+before bounding; tool-input objects additionally withhold secret-named values.
+Phone replies and cumulative live text are scrubbed before signing, and KVS
+notices before clipping. Typed card controls and provenance retain their schema;
+this projection does not repair saved transcripts or retained signed envelopes.
 Security audit strings use the canonical credential recognizer before clipping,
 as well as the audit boundary's additional token and JWT checks. A match
 withholds the whole string, including credentials under ordinary field names.

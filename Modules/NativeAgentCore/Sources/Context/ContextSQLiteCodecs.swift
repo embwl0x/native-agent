@@ -21,7 +21,7 @@ extension ContextSQLiteStore {
         let injectionPolicy: ContextInjectionPolicy
         let contentRole: ContextContentRole
         let entities: [ContextEntity]
-        let memoryProvenance: ContextMemoryProvenance?
+        let memoryRoots: [MemoryRoot]?
         let triggers: [String]
         let activation: Double
         let recentUsefulness: Double
@@ -42,7 +42,7 @@ extension ContextSQLiteStore {
             injectionPolicy = atom.injectionPolicy
             contentRole = atom.contentRole
             entities = atom.entities
-            memoryProvenance = atom.memoryProvenance
+            memoryRoots = atom.memoryRoots
             triggers = atom.triggers
             activation = atom.activation
             recentUsefulness = atom.recentUsefulness
@@ -108,7 +108,7 @@ extension ContextSQLiteStore {
             injectionPolicy: payload.injectionPolicy,
             contentRole: payload.contentRole,
             entities: payload.entities,
-            memoryProvenance: payload.memoryProvenance,
+            memoryRoots: payload.memoryRoots,
             triggers: payload.triggers,
             activation: payload.activation,
             recentUsefulness: payload.recentUsefulness,

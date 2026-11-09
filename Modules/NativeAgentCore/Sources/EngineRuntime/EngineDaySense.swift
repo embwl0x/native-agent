@@ -1,15 +1,15 @@
 import Cognition
 import Connectors
+import Experiences
 import Foundation
 @preconcurrency import EventKit
 import MacIntegration
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-import Senses
 import TrustCenter
 
-// Blueprint: | `EngineDaySense.swift` | Clock-driven day perception with authorized calendar titles and care rest |
+// Blueprint: | `EngineDaySense.swift` | Clock-driven day perception with authorized calendar titles, posted once per local day as a world happening |
 
 extension CognitionHost {
     public func perceiveDay(dataRoot: URL) async {
@@ -40,48 +40,32 @@ enum EngineDaySense {
 
     static func dayKey(_ date: Date) -> String { formatter("yyyy-MM-dd").string(from: date) }
 
+    /// The day line is one happening per local day: its key is the date, so a second post the same day writes nothing.
     static func post(dataRoot: URL) async {
-        guard !posting, !Task.isCancelled, let crossing = SensesHub.shared.crossing else { return }
+        guard !posting, !Task.isCancelled else { return }
         posting = true
         defer { posting = false }
+        let start = calendar.startOfDay(for: Date())
+        let ordinals = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+            "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth",
+            "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth", "twenty-first",
+            "twenty-second", "twenty-third", "twenty-fourth", "twenty-fifth", "twenty-sixth",
+            "twenty-seventh", "twenty-eighth", "twenty-ninth", "thirtieth", "thirty-first"]
+        let day = calendar.component(.day, from: start)
+        var line = "It's \(formatter("EEEE").string(from: start)) the \(ordinals[day - 1]) of \(formatter("MMMM").string(from: start))."
         do {
-            let start = calendar.startOfDay(for: Date())
-            let stamp = ISO8601DateFormatter().string(from: start)
-            let path = dataRoot.appendingPathComponent("mind/day-posted")
-            let previous: String?
-            do { previous = try String(contentsOf: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) }
-            catch CocoaError.fileReadNoSuchFile { previous = nil }
-            if let previous {
-                guard ISO8601DateFormatter().date(from: previous) != nil else { throw CocoaError(.fileReadCorruptFile) }
-                if previous == stamp { return }
-            }
-            let ordinals = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
-                "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth",
-                "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth", "twenty-first",
-                "twenty-second", "twenty-third", "twenty-fourth", "twenty-fifth", "twenty-sixth",
-                "twenty-seventh", "twenty-eighth", "twenty-ninth", "thirtieth", "thirty-first"]
-            let day = calendar.component(.day, from: start)
-            var line = "It's \(formatter("EEEE").string(from: start)) the \(ordinals[day - 1]) of \(formatter("MMMM").string(from: start))."
-            do {
-                let agenda = try await calendarWords(dataRoot: dataRoot, start: start)
-                // A day or zone change during the calendar read belongs to the next buffered invalidation.
-                guard !Task.isCancelled, start == calendar.startOfDay(for: Date()) else { return }
-                if let agenda, try await calendarAllowed(dataRoot: dataRoot) { line += agenda }
-            } catch is CancellationError {
-                return
-            } catch {
-                nativeLog("Day calendar unavailable: %@", error.localizedDescription)
-                line += " The calendar is unavailable: \(error.localizedDescription)"
-            }
+            let agenda = try await calendarWords(dataRoot: dataRoot, start: start)
+            // A day or zone change during the calendar read belongs to the next buffered invalidation.
             guard !Task.isCancelled, start == calendar.startOfDay(for: Date()) else { return }
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(Data((stamp + "\n").utf8), to: path)
-            _ = await crossing.cross(line, watch: "clock:day", reason: "the day came round",
-                                     id: "clock:day:" + dayKey(start), says: line, agent: nil)
+            if let agenda, try await calendarAllowed(dataRoot: dataRoot) { line += agenda }
         } catch is CancellationError {
             return
         } catch {
-            nativeLog("Day perception unavailable: %@", error.localizedDescription)
+            nativeLog("Day calendar unavailable: %@", error.localizedDescription)
+            line += " The calendar is unavailable: \(error.localizedDescription)"
         }
+        guard !Task.isCancelled, start == calendar.startOfDay(for: Date()) else { return }
+        Attention.post(Happening(.world, subject: "clock:day", door: "clock:day", words: line, once: "clock:day:" + dayKey(start)), dataRoot: dataRoot)
     }
 
     private static func calendarAllowed(dataRoot: URL) async throws -> Bool {

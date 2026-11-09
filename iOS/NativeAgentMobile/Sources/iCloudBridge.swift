@@ -5,12 +5,12 @@ import CryptoKit
 import SwiftUI
 import NativeAgentShared
 import UIKit
-// Blueprint: | `iCloudBridge.swift` | Authenticated delivery; bounded unknown-send observation, pre-dispatch receipt listeners and checked retention |
+import CloudKit
+// Blueprint: | `iCloudBridge.swift` | Authenticated admission, consumer dispatch and durable receive settlement; unresolved delivery stays open |
 
 typealias KVSKey = NativeAgentICloudBridgeConstants.KVSKey
-typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
 
-struct ICloudUnverifiedRecord: Codable, Identifiable {
+struct ICloudUnverifiedRecord: Codable, Identifiable, Equatable, Sendable {
     let id: String
     let kind: String
     let sender: String
@@ -56,8 +56,9 @@ final class iCloudBridge: ObservableObject {
 
     /// Bind observed Mac pairing material to the phone key used to read it; installing a different key invalidates that evidence.
     struct MacPairingKeyReading: Equatable {
-        let recordKey: Data
+        let recordKey: Data?
         let phoneKey: Data
+        let failure: String?
     }
     @Published var macPairingKey: MacPairingKeyReading?
 
@@ -71,13 +72,7 @@ final class iCloudBridge: ObservableObject {
             PhoneSenses.shared.publish()
         }
     }
-    @Published var syncStatus: String = "iCloud not checked" {
-        didSet {
-            if accountFailure != nil, syncStatus != DeviceSyncAccountFailure.phoneMessage {
-                syncStatus = DeviceSyncAccountFailure.phoneMessage
-            }
-        }
-    }
+    @Published var syncStatus: String = "iCloud not checked"
     @Published var accountFailure: DeviceSyncAccountFailure?
     private(set) var accountFailureGeneration: UInt64 = 0
 
@@ -89,8 +84,6 @@ final class iCloudBridge: ObservableObject {
 
     let kvs = NSUbiquitousKeyValueStore.default
     private var activeSendCount = 0
-    var driveURL: URL?
-    var metadataQuery: NSMetadataQuery?
     // CloudKit requires checked selection and entitlement; nil means unavailable.
     var deviceTransport: CloudKitDeviceTransport?
     var usesCloudKitDeviceTransport: Bool { deviceTransport != nil }
@@ -99,93 +92,41 @@ final class iCloudBridge: ObservableObject {
     var deviceDrainQueued = false
     var foregroundReceiveTask: Task<Void, Never>?
     var foregroundPresenceTask: Task<Void, Never>?
-    // Delivery keeps record IDs only; existing chat/action owners decide whether requests remain live.
-    private var deliveryNudges: [String: String] = [:]
-    private var deliveryNudgeKey: String?
-    private var deliveryNudgeTask: Task<Void, Never>?
-    /// Notify only at verified receipt admission; disappearing nudges/exchanges do not prove receipt.
-    private var deliveryReceiptObservers: [UUID: (String, () -> Void)] = [:]
+    var foregroundCatchUpTask: Task<Void, Never>?
+    private var unacceptedDeliveries: [String: String] = [:]
+    private var deliveryPairingKey: String?
+    private static let missingPairingRefusal = "this phone has no pairing key"
+    private static let signatureRefusal = "its signature does not match this phone's pairing"
+    private static let consumerRefusal = "nothing on this phone is listening for it yet"
+    private static let chatConsumerRefusal = "the chat is not listening yet"
 
     func deliveryPairingMatches(_ secret: Data) -> Bool {
-        deliveryNudgeKey == "mobile.icloud.unaccepted.\(keyDigest(secret))"
+        deliveryPairingKey == "mobile.icloud.unaccepted.\(keyDigest(secret))"
     }
 
     func deliveryPairingDidChange() {
-        // Unknown authority cannot retire delivery, even when setup/foreground callers missed the material change.
         guard let material = pairingStore?.material, material != .unavailable else { return }
-        let secret = material.secret
-        let key = secret.map { "mobile.icloud.unaccepted.\(keyDigest($0))" }
-        if deliveryNudgeKey != key {
-            // A new key may now verify or accept what the old one could not.
-            if deliveryNudgeKey != nil, key != nil { Task { await self.retryHeldMacRecords(force: true) } }
-            if let deliveryNudgeKey { userDefaults.removeObject(forKey: deliveryNudgeKey) }
-            deliveryNudgeTask?.cancel()
-            deliveryNudgeTask = nil
-            deliveryNudgeKey = key
-            deliveryNudges = key.flatMap { userDefaults.dictionary(forKey: $0) as? [String: String] } ?? [:]
-        }
-        resumeDeliveryNudges()
-    }
-
-    func resumeDeliveryNudges() {
-        guard let secret = pairingStore?.iCloudPairingSecret else { return }
-        if !deliveryPairingMatches(secret) {
-            deliveryPairingDidChange()
-            return
-        }
-        guard deviceTransport != nil, let key = deliveryNudgeKey else { return }
-        guard deliveryNudgeTask == nil, !deliveryNudges.isEmpty else { return }
-        let generation = setupGeneration
-        deliveryNudgeTask = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(8)) } catch { return }
-            guard let self, self.setupGeneration == generation, self.deliveryNudgeKey == key else { return }
-            // The handle owns its wake deadline, never the delivery being awakened.
-            self.deliveryNudgeTask = nil
-            // Retain nudges while authority is unreadable; checked same-key publication resumes them without stale task handles.
-            guard self.pairingStore?.iCloudPairingSecret == secret,
-                  let transport = self.deviceTransport else { return }
-            let chat = ChatStore.shared
-            await chat.restorationTask?.value
-            await PhonePlaces.shared.restorationTask?.value
-            await PhoneSenses.shared.restorationTask?.value
-            guard self.setupGeneration == generation, self.deliveryNudgeKey == key,
-                  self.pairingStore?.iCloudPairingSecret == secret else { return }
-            self.deliveryNudges = self.deliveryNudges.filter { _, correlation in
-                if let exchange = chat.pendingExchanges[correlation], !exchange.isExpired { return true }
-                return PhonePlaces.shared.ownsDelivery(correlation)
-                    || PhoneSenses.shared.ownsDelivery(correlation)
-                    || !iCloudSyncEngine.shared.sendingTransactions.isEmpty || ActionResponseWaiters.shared.isWaiting(correlation)
+        let key = material.secret.map { "mobile.icloud.unaccepted.\(keyDigest($0))" }
+        guard deliveryPairingKey != key else { return }
+        let stored: [String: String]
+        if let key, let raw = userDefaults.object(forKey: key) {
+            guard let records = raw as? [String: String] else {
+                syncStatus = "Pending Mac deliveries could not be read. Repair this iPhone's saved connection state before sending again."
+                return
             }
-            self.persistDeliveryNudges()
-            guard !self.deliveryNudges.isEmpty else { return }
-            await self.dispatchLatestKVSChatProgress(key: KVSKey.chatProgressLatest)
-            _ = await self.drainDeviceTransport()
-            for (record, correlation) in self.deliveryNudges {
-                guard self.setupGeneration == generation, self.deliveryNudgeKey == key,
-                      self.pairingStore?.iCloudPairingSecret == secret else { return }
-                guard self.deliveryNudges[record] == correlation else { continue }
-                do {
-                    try await transport.resignalMessage(named: record)
-                    guard self.setupGeneration == generation, self.deliveryNudges[record] == correlation,
-                          self.pairingStore?.iCloudPairingSecret == secret else { continue }
-                    self.kvs.set(UUID().uuidString, forKey: KVSKey.newMessageInDrive)
-                    await PairingStore.synchronizeKVSWithTimeout()
-                } catch {
-                    guard self.setupGeneration == generation, self.deliveryNudgeKey == key,
-                          self.pairingStore?.iCloudPairingSecret == secret else { return }
-                    self.syncStatus = "Waiting for Mac acceptance — delivery nudge failed: \(error.localizedDescription)"
-                }
-            }
-            self.resumeDeliveryNudges()
+            stored = records
+        } else { stored = [:] }
+        deliveryPairingKey = key
+        unacceptedDeliveries = stored
+        if key != nil {
+            Task { await self.reconsiderRefusedMacRecords(repairedReasons: [Self.missingPairingRefusal, Self.signatureRefusal]) }
         }
     }
 
-    private func persistDeliveryNudges() {
-        guard let deliveryNudgeKey else { return }
-        userDefaults.set(deliveryNudges, forKey: deliveryNudgeKey)
-        if deliveryNudges.isEmpty {
-            deliveryNudgeTask?.cancel()
-            deliveryNudgeTask = nil
+    private func persistUnacceptedDeliveries() {
+        guard let deliveryPairingKey else { return }
+        if userDefaults.dictionary(forKey: deliveryPairingKey) as? [String: String] != unacceptedDeliveries {
+            userDefaults.set(unacceptedDeliveries, forKey: deliveryPairingKey)
         }
     }
 
@@ -198,56 +139,21 @@ final class iCloudBridge: ObservableObject {
               pairingStore?.iCloudPairingSecret == secret else { return false }
         guard await PhoneSenses.shared.acceptDelivery(correlation), setupGeneration == generation,
               pairingStore?.iCloudPairingSecret == secret else { return false }
-        for (expected, receive) in Array(deliveryReceiptObservers.values) where expected == correlation {
-            receive()
-        }
-        stopDeliveryNudges(for: correlation)
+        retireDelivery(for: correlation)
         return true
     }
 
-    /// Unknown outcomes permit observation only; failed/empty reads wait to the bounded deadline without resubmission.
-    func confirmMessageDelivery(
-        _ message: BridgeMessage,
-        until deadline: Date,
-        hasMacEvidence: () -> Bool = { false }
-    ) async -> Bool {
-        guard let transport = deviceTransport else { return hasMacEvidence() }
-        let generation = setupGeneration
-        let secret = pairingStore?.iCloudPairingSecret
-        let correlation = message.metadata?["actionId"] ?? message.id
-        var received = false
-        let observer = UUID()
-        deliveryReceiptObservers[observer] = (correlation, { received = true })
-        defer { deliveryReceiptObservers.removeValue(forKey: observer) }
-        var delay: TimeInterval = 1
-        while !Task.isCancelled, generation == setupGeneration,
-              secret == pairingStore?.iCloudPairingSecret {
-            if received || hasMacEvidence() { return true }
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0 else { break }
-            let matches = await transport.messageRecordMatches(message, timeoutSeconds: min(5, remaining))
-            guard !Task.isCancelled, generation == setupGeneration,
-                  secret == pairingStore?.iCloudPairingSecret else { return false }
-            if matches || received || hasMacEvidence() { return true }
-            let pause = min(delay, max(0, deadline.timeIntervalSinceNow))
-            do { try await Task.sleep(for: .seconds(pause)) } catch { return false }
-            delay = min(8, delay * 2)
-        }
-        guard !Task.isCancelled, generation == setupGeneration,
-              secret == pairingStore?.iCloudPairingSecret else { return false }
-        return received || hasMacEvidence()
-    }
-
-    func stopDeliveryNudges(for correlation: String) {
-        guard deliveryNudges.values.contains(correlation) else { return }
-        deliveryNudges = deliveryNudges.filter { $0.value != correlation }
-        persistDeliveryNudges()
+    func retireDelivery(for correlation: String) {
+        guard unacceptedDeliveries.values.contains(correlation) else { return }
+        unacceptedDeliveries = unacceptedDeliveries.filter { $0.value != correlation }
+        persistUnacceptedDeliveries()
     }
 
     func isAwaitingMacAcceptance(_ correlation: String) -> Bool {
-        deliveryNudges.values.contains(correlation)
+        unacceptedDeliveries.values.contains(correlation)
     }
     private let userDefaults: UserDefaults
+    private let unverifiedStorage: MobileLocalStorage
     @Published private(set) var unverifiedRecords: [ICloudUnverifiedRecord] = []
     @Published private(set) var unverifiedRecordsError: String?
     private let unverifiedRecordsKey = "mobile.icloud.unverifiedRecords.v1"
@@ -256,30 +162,24 @@ final class iCloudBridge: ObservableObject {
         SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Keep deferred IDs instance-local so relaunch/pairing changes reverify unclaimed records; persisted IDs are diagnostic only.
-    private var deferredThisRun: [String: Set<String>] = [:]
-
-    func isVerificationDeferred(_ id: String, secret: Data, version: Int64) -> Bool {
-        deferredThisRun["\(version)|\(keyDigest(secret))"]?.contains(id) == true
-    }
-
-    func retainUnverified(_ msg: BridgeMessage, secret: Data, version: Int64, reason: String) {
-        deferredThisRun["\(version)|\(keyDigest(secret))", default: []].insert(msg.id)
+    func retainUnverified(_ msg: BridgeMessage, secret: Data, version: Int64, reason: String) async {
+        let prior = unverifiedRecords
         unverifiedRecords.removeAll { $0.id == msg.id }
         unverifiedRecords.append(.init(id: msg.id, kind: msg.metadata?["kind"] ?? "chat",
             sender: msg.sender, timestamp: msg.timestamp, reason: reason,
             pairingVersion: version, keyDigest: keyDigest(secret)))
-        persistUnverifiedRecords()
+        if unverifiedRecords != prior { await persistUnverifiedRecords() }
         NSLog("[iCloudBridge] verification_deferred id=%@ kind=%@ sender=%@ timestamp=%@ pairing_version=%lld reason=%@",
               msg.id, msg.metadata?["kind"] ?? "chat", msg.sender,
               ISO8601DateFormatter().string(from: msg.timestamp), version, reason)
     }
 
-    private func persistUnverifiedRecords() {
+    private func persistUnverifiedRecords() async {
         guard unverifiedRecordsError == nil else { return }
+        let records = unverifiedRecords
         do {
-            let data = try JSONEncoder().encode(unverifiedRecords)
-            userDefaults.set(data, forKey: unverifiedRecordsKey)
+            unverifiedStorage.save(key: unverifiedRecordsKey, value: { records }, onError: { _ in /* flush reports the completed outcome below. */ })
+            try await unverifiedStorage.flush()
         } catch {
             unverifiedRecordsError = """
                 Verification history could not be saved: \(error.localizedDescription). Repair iPhone local storage; existing saved \
@@ -287,36 +187,28 @@ final class iCloudBridge: ObservableObject {
                 """
         }
     }
-    /// Resolve Drive mount off-main so container lookup cannot block the UI.
-    private let ubiquityContainerURL: @Sendable (String?) -> URL?
     private var messageHandlers: [UUID: (BridgeMessage) -> Void] = [:]
     private var rejectionHandlers: [UUID: (ICloudBridgeRejectedMessage) -> Void] = [:]
     // Unsigned signature_invalid_resync hints authorize pairing refresh only.
     private var resyncHintHandlers: [UUID: (BridgeMessage) -> Void] = [:]
-    /// Every Mac record this phone has handled, by when it first arrived. CloudKit keeps a record for `retentionWindow`, and a drain can
-    /// re-read anything that old, so the phone remembers each one exactly that long: a record handled once is never handled again.
+    /// Durable handled records are retained for the transport's retention window.
     private var seenMacRecords: [String: Date] = [:]
-    var seenMessageIDs: Set<String> { Set(seenMacRecords.keys) }
     /// A drain saves what it handled once, when it ends; nothing is written per record.
     private var seenMacRecordsDirty = false
-    /// Records the phone has refused, by id: how often and since when, and whether it now holds them (cursor moved past).
+    /// Unresolved admission failures retain their exact message and cause.
     private(set) var failingMacRecords: [String: FailingMacRecord] = [:]
     /// Why the record being admitted was refused this time.
     private var refusal: String?
-    private var retriedHeldThisLaunch = false
-    private static let failingMacRecordsURL = URL.applicationSupportDirectory.appending(path: "failing-mac-records.json")
-    static let stuckAfterAttempts = 3
-    static let stuckAfter: TimeInterval = 120
-    private static let deliveryLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "NativeAgentMobile", category: "delivery")
+    private nonisolated static let failingMacRecordsURL = URL.applicationSupportDirectory.appending(path: "failing-mac-records.json")
+    private var receiveLedgersLoaded = false
+    private var receiveLedgerRestoration: Task<Bool, Never>?
+    private let receiveLedgerRead = LatestRead()
     private var seenKVSProgressMessageIDs: Set<String> = []
     private var seenKVSProgressMessageIDsOrdered: [String] = []
-    var isCheckingMacOutbox = false
-    var macOutboxScanQueued = false
-    var setupTask: Task<Void, Never>?
     /// Drains wait for incoming registration before reading the inbox.
     var deviceIncomingSetupTask: Task<Void, Never>?
     private(set) var setupGeneration = 0
-    private static let seenMacRecordsURL = URL.applicationSupportDirectory.appending(path: "seen-mac-records.json")
+    private nonisolated static let seenMacRecordsURL = URL.applicationSupportDirectory.appending(path: "seen-mac-records.json")
     private let maxSeenKVSProgressMessageIDs = 200
 
     weak var pairingStore: PairingStore?
@@ -324,33 +216,68 @@ final class iCloudBridge: ObservableObject {
     init(
         deviceTransport: CloudKitDeviceTransport? = nil,
         pairingStore: PairingStore? = nil,
-        userDefaults: UserDefaults = .standard,
-        ubiquityContainerURL: @escaping @Sendable (String?) -> URL? = {
-            FileManager.default.url(forUbiquityContainerIdentifier: $0)
-        }
+        userDefaults: UserDefaults = .standard
     ) {
         self.deviceTransport = deviceTransport
         self.pairingStore = pairingStore
         self.userDefaults = userDefaults
-        self.ubiquityContainerURL = ubiquityContainerURL
-        do { unverifiedRecords = try MobileLocalStorage.restore([ICloudUnverifiedRecord].self, key: unverifiedRecordsKey, defaults: userDefaults) ?? [] }
-        catch { unverifiedRecordsError = """
-            Verification history could not be read: \(error.localizedDescription). Repair iPhone local storage; existing saved bytes are retained and will \
-            not be replaced.
-            """ }
-        if let data = try? Data(contentsOf: Self.seenMacRecordsURL),
-           let saved = try? JSONDecoder().decode([String: Date].self, from: data) {
-            seenMacRecords = saved
-        }
-        if let data = try? Data(contentsOf: Self.failingMacRecordsURL),
-           let saved = try? JSONDecoder().decode([String: FailingMacRecord].self, from: data) {
-            failingMacRecords = saved
-        }
+        self.unverifiedStorage = MobileLocalStorage(defaults: userDefaults)
+        Task { await restoreReceiveLedgers() }
     }
 
-    private func recordSeenMacReplyID(_ id: String) {
-        guard seenMacRecords[id] == nil else { return }
-        seenMacRecords[id] = Date()
+    /// No record can be admitted until both replay memories have been read. Only a missing file is first use.
+    func restoreReceiveLedgers() async -> Bool {
+        if receiveLedgersLoaded { return true }
+        if let receiveLedgerRestoration { return await receiveLedgerRestoration.value }
+        let task = Task {
+            do {
+                unverifiedRecords = try await unverifiedStorage.read([ICloudUnverifiedRecord].self, key: unverifiedRecordsKey) ?? []
+            } catch { unverifiedRecordsError = "Verification history could not be read: \(error.localizedDescription). Its saved bytes will not be replaced." }
+            let result = await receiveLedgerRead.read({
+                await VolumeIO.result {
+                    (try Self.readReceiveLedger([String: Date].self, at: Self.seenMacRecordsURL),
+                     try Self.readReceiveLedger([String: FailingMacRecord].self, at: Self.failingMacRecordsURL))
+                }
+            }, publish: { result in
+                switch result {
+                case .success(let (seen, failing)):
+                    seenMacRecords = seen
+                    failingMacRecords = failing
+                    receiveLedgersLoaded = true
+                case .failure(let error):
+                    syncStatus = "Mac receive history could not be read: \(error.localizedDescription). "
+                        + "Repair iPhone local storage; saved records remain untouched."
+                }
+            })
+            if case .success = result { return true }
+            return false
+        }
+        receiveLedgerRestoration = task
+        let restored = await task.value
+        receiveLedgerRestoration = nil
+        return restored
+    }
+
+    private nonisolated static func readReceiveLedger<Value: Decodable & Sendable>(_ type: [String: Value].Type, at url: URL) throws -> [String: Value] {
+        let data: Data
+        do { data = try VolumeIO.contents(of: url) }
+        catch CocoaError.fileReadNoSuchFile { return [:] }
+        return try JSONDecoder().decode(type, from: data)
+    }
+
+    private func recordSeenMacRecord(_ id: String) async -> Bool {
+        guard seenMacRecords[id] == nil else { return await persistSeenMacRecords() }
+        let receivedAt = Date()
+        seenMacRecords[id] = receivedAt
+        guard await persistSeenMacRecords() else {
+            // A failed receipt must not suppress the next delivery of this record.
+            if seenMacRecords[id] == receivedAt {
+                seenMacRecords.removeValue(forKey: id)
+                seenMacRecordsDirty = true
+            }
+            return false
+        }
+        return true
     }
 
     var isSetUp = false
@@ -360,10 +287,12 @@ final class iCloudBridge: ObservableObject {
         isSetUp = true
         setupGeneration += 1
         syncStatus = "iCloud connecting…"
-        setupTask?.cancel()
+        NotificationCenter.default.removeObserver(self, name: .CKAccountChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(cloudKitAccountDidChange(_:)), name: .CKAccountChanged, object: nil)
 
         do { try configureDeviceTransportIfAvailable() }
         catch {
+            isSetUp = false
             available = false
             syncStatus = "CloudKit unavailable: \(error.localizedDescription)"
             return
@@ -377,7 +306,10 @@ final class iCloudBridge: ObservableObject {
                 name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
                 object: kvs
             )
-            Task { await PairingStore.synchronizeKVSWithTimeout() }
+            Task {
+                do { try await PairingStore.synchronizeKVS() }
+                catch { syncStatus = error.localizedDescription }
+            }
             available = true
             syncStatus = "CloudKit ready"
             return
@@ -445,38 +377,23 @@ final class iCloudBridge: ObservableObject {
 
         // Keep signed envelopes intact inline or in encrypted CKAsset when audio/size exceeds the inline budget.
         if let ck = deviceTransport {
-            resumeDeliveryNudges()
+            deliveryPairingDidChange()
+            guard deliveryPairingMatches(secret) else {
+                throw SyncError.persistence("Pending Mac deliveries could not be restored for this pairing.")
+            }
             let recordName = msg.metadata?[NAChatMessageCodec.recordIDMetadataKey] ?? msg.id
-            deliveryNudges[recordName] = msg.metadata?["actionId"] ?? msg.id
-            persistDeliveryNudges()
-            // Subscribe before dispatch because a Mac receipt can beat save completion/timeout; this observer owns no delivery state.
-            var received = false
-            let observer = UUID()
-            deliveryReceiptObservers[observer] = (msg.metadata?["actionId"] ?? msg.id, { received = true })
-            defer { deliveryReceiptObservers.removeValue(forKey: observer) }
+            unacceptedDeliveries[recordName] = msg.metadata?["actionId"] ?? msg.id
+            persistUnacceptedDeliveries()
             do {
-                do { try await ck.send(msg) }
-                catch is DeviceSyncSendOutcomeUnknown {
-                    syncStatus = "Still sending…"
-                    let confirmed = await confirmMessageDelivery(msg, until: Date().addingTimeInterval(60),
-                                                                 hasMacEvidence: { received })
-                    guard confirmed else {
-                        syncStatus = ChatWaitStatusPresentation.deliveryUnconfirmed
-                        throw DeviceSyncSendOutcomeUnknown(message: ChatWaitStatusPresentation.deliveryUnconfirmed)
-                    }
-                }
+                try await ck.send(msg)
             } catch {
                 if !(error is DeviceSyncSendOutcomeUnknown) {
-                    deliveryNudges.removeValue(forKey: recordName)
-                    persistDeliveryNudges()
+                    unacceptedDeliveries.removeValue(forKey: recordName)
+                    persistUnacceptedDeliveries()
                 }
-                resumeDeliveryNudges()
-                if case .account(let failure) = error as? DeviceSyncError {
-                    recordAccountFailure(failure)
-                }
+                if case .account(let failure) = error as? DeviceSyncError { recordAccountFailure(failure) }
                 throw error
             }
-            resumeDeliveryNudges()
             lastSyncAt = Date()
             syncStatus = "Sending via CloudKit"
             onTransportSucceeded?()
@@ -512,7 +429,10 @@ final class iCloudBridge: ObservableObject {
         }
         // Consumer registration must drain messages retained while that consumer was absent.
         if let ck = deviceTransport {
-            Task { await ck.drainIncoming() }
+            Task {
+                await reconsiderRefusedMacRecords(repairedReasons: [Self.consumerRefusal, Self.chatConsumerRefusal])
+                await ck.drainIncoming()
+            }
         }
         return id
     }
@@ -552,7 +472,7 @@ final class iCloudBridge: ObservableObject {
 
     @discardableResult
     func pollIncomingNow(recovery: DeviceSyncRecovery = .init()) async -> Bool {
-        guard recovery.hasTime else { return false }
+        guard recovery.isActive else { return false }
         if deviceTransport != nil {
             return await drainDeviceTransport(recovery: recovery)
         }
@@ -560,50 +480,36 @@ final class iCloudBridge: ObservableObject {
         return false
     }
 
-    /// One Mac record, as the drain hands it over. A record its owner takes is handled. A record refused now pins the drain's cursor so it is
-    /// read again; one that keeps being refused (`stuckAfterAttempts` times over `stuckAfter`) is held instead: the cursor moves past it,
-    /// the log and Diagnostics name it with its reason, and it is tried again only at launch or when the pairing key changes.
+    /// Only verified consumer acceptance and its durable receipt advance the transport cursor.
     @MainActor
-    func handleIncomingFromTransport(_ msg: BridgeMessage, archiveDriveFile: (() async -> Void)? = nil) async -> Bool {
+    func handleIncomingFromTransport(_ msg: BridgeMessage) async -> Bool {
         let generation = setupGeneration
+        guard await restoreReceiveLedgers(), generation == setupGeneration else { return false }
         refusal = nil
-        if await admitIncoming(msg, archiveDriveFile: archiveDriveFile) {
-            if failingMacRecords.removeValue(forKey: msg.id) != nil { saveFailingMacRecords() }
+        if await admitIncoming(msg) {
+            if failingMacRecords.removeValue(forKey: msg.id) != nil { return await saveReceiveLedgers() }
             return true
         }
-        guard archiveDriveFile == nil, generation == setupGeneration else { return false }
-        return holdIfStuck(msg, reason: refusal ?? "this phone did not take it")
+        guard generation == setupGeneration else { return false }
+        await retainRefusedMacRecord(msg, reason: refusal ?? "this phone did not take it")
+        return false
     }
 
-    /// Keep consumption and Drive archival as separate receipts; unclaimed files must remain in the outbox.
+    /// Verification and consumer acceptance precede the durable handled-record receipt.
     @MainActor
-    private func admitIncoming(_ msg: BridgeMessage, archiveDriveFile: (() async -> Void)? = nil) async -> Bool {
+    private func admitIncoming(_ msg: BridgeMessage) async -> Bool {
         let generation = setupGeneration
         guard pairingStore?.isRepairingConnection != true else { return refuse("a pairing repair is in progress") }
         let mobileSourceKey: String
         do { mobileSourceKey = try NativeAgentICloudBridgeConstants.mobileSourceKey }
         catch { syncStatus = error.localizedDescription; return refuse("this phone's source key is unavailable") }
         let kind = msg.metadata?["kind"]
-        if seenMacRecords[msg.id] != nil { return true }
-        // Live is now: streamed words are cumulative, so an old piece of a reply is history the transcript already holds. Handling it
-        // would only cost the work and the redraws of a reply that has ended; its ending still passes, for the send it answered.
-        if msg.metadata?["live"] == "true", kind == "text_delta",
-           Date().timeIntervalSince(msg.timestamp) > ChatStore.liveIsNow {
-            recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
-            return true
-        }
-        if let secret = pairingStore?.iCloudPairingSecret,
-           isVerificationDeferred(msg.id, secret: secret, version: pairingStore?.knownSecretVersion ?? 0),
-           abs(Date().timeIntervalSince(msg.timestamp)) <= 24 * 60 * 60 {
-            return refuse("its signature waits for the current pairing key")
-        }
-
-        // Foreign records cannot stall CloudKit cursors; shared Drive files remain for their intended recipient.
+        if seenMacRecords[msg.id] != nil { return await persistSeenMacRecords() }
+        // Foreign records cannot stall CloudKit cursors.
         if let tsk = msg.metadata?["targetSourceKey"], !tsk.isEmpty,
            tsk != ChatRuntimeControls.deviceSourceKey,
            tsk.trimmingCharacters(in: .whitespacesAndNewlines) != mobileSourceKey {
-            guard archiveDriveFile == nil else { return false }
-            recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
+            guard await recordSeenMacRecord(msg.id) else { return refuse("its handled-record memory could not be saved") }
             return true
         }
 
@@ -613,18 +519,15 @@ final class iCloudBridge: ObservableObject {
                 // Consume resync lookalikes without deferral/banner because they are not replies and must not hold the cursor.
                 NSLog("[iCloudBridge] malformed resync hint consumed id=%@ field=%@", msg.id, field)
                 syncStatus = "Ignored a malformed iCloud pairing refresh hint"
-                recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
-                await archiveDriveFile?()
+                guard await recordSeenMacRecord(msg.id) else { return refuse("its handled-record memory could not be saved") }
                 guard generation == setupGeneration else { return false }
                 return true
             }
-            recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
-            await archiveDriveFile?()
+            guard await recordSeenMacRecord(msg.id) else { return refuse("its handled-record memory could not be saved") }
             guard generation == setupGeneration else { return false }
             syncStatus = "iCloud pairing refresh from Mac"
             if await pairingStore?.refreshFromCloudKit() == true {
                 NSLog("[iCloudBridge] signature_invalid_resync applied — new HMAC installed")
-                if archiveDriveFile != nil { macOutboxScanQueued = true }
                 for handler in resyncHintHandlers.values { handler(msg) }
             }
             return true
@@ -633,26 +536,17 @@ final class iCloudBridge: ObservableObject {
         // Handle foreign targets/resync before waiting for signed consumers so nonlocal records cannot wedge delivery.
         guard kind == "notification" || kind == "icloud_action_response" || kind == PhoneRequest.messageKind
                 || !messageHandlers.isEmpty
-                || !rejectionHandlers.isEmpty else { return refuse("nothing on this phone is listening for it yet") }
-        guard let secret = pairingStore?.iCloudPairingSecret else { return refuse("this phone has no pairing key") }
+                || !rejectionHandlers.isEmpty else { return refuse(Self.consumerRefusal) }
+        guard let secret = pairingStore?.iCloudPairingSecret else { return refuse(Self.missingPairingRefusal) }
 
         // A new key may verify the same reply; failure is not request rejection and cannot acknowledge the record away.
         let verified = await Self.verifyReply(msg, secret: secret)
-        guard generation == setupGeneration, pairingStore?.isRepairingConnection != true else { return false }
+        guard generation == setupGeneration, pairingStore?.iCloudPairingSecret == secret,
+              pairingStore?.isRepairingConnection != true else { return false }
         if !verified {
-            // Consume stale unverifiable records without dispatch/rejection so they cannot settle work or raise recurring banners after key changes.
-            if abs(Date().timeIntervalSince(msg.timestamp)) > 24 * 60 * 60 {
-                NSLog("[iCloudBridge] archiving >24h-old unverifiable Mac message %@ without dispatch", msg.id)
-                unverifiedRecords.removeAll { $0.id == msg.id }
-                persistUnverifiedRecords()
-                recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
-                await archiveDriveFile?()
-                guard generation == setupGeneration else { return false }
-                return true
-            }
             // Defer only after notifying a rejection consumer; without one, retain eligibility for the next drain.
             if !rejectionHandlers.isEmpty {
-                retainUnverified(msg, secret: pairingStore?.iCloudPairingSecret ?? secret,
+                await retainUnverified(msg, secret: secret,
                     version: pairingStore?.knownSecretVersion ?? 0,
                     reason: msg.sender != "mac" ? "sender_invalid" : msg.signature == nil ? "signature_missing" : "signature_mismatch")
             }
@@ -662,18 +556,26 @@ final class iCloudBridge: ObservableObject {
                 messageID: msg.id, correlationID: nil, reason: "signature_invalid")
             syncStatus = rejection.userMessage
             for handler in rejectionHandlers.values { handler(rejection) }
-            return refuse("its signature does not match this phone's pairing")
+            return refuse(Self.signatureRefusal)
         }
         if unverifiedRecords.contains(where: { $0.id == msg.id }) {
             unverifiedRecords.removeAll { $0.id == msg.id }
-            persistUnverifiedRecords()
+            await persistUnverifiedRecords()
         }
+        guard generation == setupGeneration, pairingStore?.isRepairingConnection != true else { return false }
 
         // A signed acknowledgement settles what this phone still owes, however late it lands.
         guard await acceptDelivery(msg) else { return refuse("its delivery receipt was not accepted") }
         guard generation == setupGeneration else { return false }
 
         recordMacConfirmation(at: msg.timestamp)
+        guard await dispatchIncoming(msg, generation: generation) else { return false }
+        guard await recordSeenMacRecord(msg.id) else { return refuse("its handled-record memory could not be saved") }
+        return generation == setupGeneration
+    }
+
+    private func dispatchIncoming(_ msg: BridgeMessage, generation: Int) async -> Bool {
+        let kind = msg.metadata?["kind"]
         let status: String?
         if kind == PhoneRequest.messageKind {
             // Verification may refresh pairing while suspended; bind durable acceptance to the key that now authenticates this message.
@@ -694,22 +596,19 @@ final class iCloudBridge: ObservableObject {
             guard await NativeAgentBridgeNotificationScheduler.schedule(msg) else { return refuse("its notification could not be scheduled") }
             status = "Received notification from Mac"
         } else {
-            guard !messageHandlers.isEmpty else { return refuse("the chat is not listening yet") }
+            guard !messageHandlers.isEmpty else { return refuse(Self.chatConsumerRefusal) }
             status = "Received from Mac"
         }
         guard generation == setupGeneration else { return false }
-        recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
-        await archiveDriveFile?()
-        guard generation == setupGeneration else { return false }
-        if let status { lastSyncAt = Date(); syncStatus = status }
         if kind != PhoneRequest.messageKind, kind != "icloud_action_response", kind != "notification" {
             if kind == "text_delta" || [nil, "reply", "final", "error", "cancelled"].contains(kind) {
                 NSLog("[phone-pipe] received kind=%@ correlation=%@ seq=%@ writtenAt=%@ receivedAt=%@",
                     kind ?? "reply", msg.correlationID ?? "-", msg.metadata?["seq"] ?? "-",
                     NativeTimestampFormat.fractionalZulu(msg.timestamp), NativeTimestampFormat.fractionalZulu(Date()))
             }
-            for handler in messageHandlers.values { handler(msg) }
+            for handler in Array(messageHandlers.values) { handler(msg) }
         }
+        if let status { lastSyncAt = Date(); syncStatus = status }
         return true
     }
 
@@ -727,15 +626,15 @@ final class iCloudBridge: ObservableObject {
             let progressChanged = changedKeys == nil || changedKeys?.contains(KVSKey.chatProgressLatest) == true
             // Notices have a separate latest-value key so progress cannot overwrite them.
             let noticeChanged = changedKeys == nil || changedKeys?.contains(KVSKey.chatNoticeLatest) == true
-            let driveChanged = changedKeys == nil || changedKeys?.contains(KVSKey.newMessageInDrive) == true
+            let deliveryChanged = changedKeys == nil || changedKeys?.contains(KVSKey.newMessageInDrive) == true
             if progressChanged {
                 await self.dispatchLatestKVSChatProgress(key: KVSKey.chatProgressLatest)
             }
             if noticeChanged {
                 await self.dispatchLatestKVSChatProgress(key: KVSKey.chatNoticeLatest)
             }
-            // Drain only on the once-per-message durable-send nudge, never on token progress.
-            if driveChanged { await self.drainDeviceTransport() }
+            // CloudKit durable-send nudge.
+            if deliveryChanged { await self.drainDeviceTransport() }
         }
     }
 
@@ -744,10 +643,14 @@ final class iCloudBridge: ObservableObject {
         let generation = setupGeneration
         guard let data = kvs.data(forKey: key) else { return }
 
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
         let msg: BridgeMessage
-        do { msg = try decoder.decode(BridgeMessage.self, from: data) }
+        do {
+            msg = try await Task.detached(priority: .userInitiated) {
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                return try decoder.decode(BridgeMessage.self, from: data)
+            }.value
+        }
         catch {
             syncStatus = "Mac progress could not be read (\(key)): \(error.localizedDescription). Check Connection in Settings."
             return
@@ -757,7 +660,6 @@ final class iCloudBridge: ObservableObject {
             syncStatus = "Mac progress rejected — pairing out of sync"
             return
         }
-        guard abs(Date().timeIntervalSince(msg.timestamp)) <= 24 * 60 * 60 else { return }
         guard let kind = msg.metadata?["kind"],
               kind == "progress" || kind == "tool_use" || kind == "tool_result"
                 || kind == "notice" else {
@@ -798,35 +700,25 @@ final class iCloudBridge: ObservableObject {
     func tearDown(preservingConsumers: Bool = false) {
         setupGeneration += 1
         stopForegroundReceiving()
-        setupTask?.cancel()
-        setupTask = nil
         deviceIncomingSetupTask?.cancel()
         deviceIncomingSetupTask = nil
-        metadataQuery?.stop()
-        metadataQuery = nil
         NotificationCenter.default.removeObserver(self)
         if !preservingConsumers {
             messageHandlers = [:]
             rejectionHandlers = [:]
             resyncHintHandlers = [:]
         }
-        deferredThisRun = [:]
         deviceTransport = nil
-        deliveryNudgeTask?.cancel()
-        deliveryNudgeTask = nil
-        deliveryNudgeKey = nil
-        deliveryNudges = [:]
+        deliveryPairingKey = nil
+        unacceptedDeliveries = [:]
         deviceDrainInFlight = false
         deviceDrainQueued = false
-        saveSeenMacRecords()
-        driveURL = nil
+        Task { _ = await saveSeenMacRecords() }
         available = false
         lastSyncAt = nil
         accountFailureGeneration &+= 1
         accountFailure = nil
         syncStatus = "iCloud disconnected"
-        isCheckingMacOutbox = false
-        macOutboxScanQueued = false
         isSetUp = false
         iCloudSyncEngine.shared.tearDown()
     }
@@ -836,82 +728,80 @@ final class iCloudBridge: ObservableObject {
         return false
     }
 
-    /// A refused record pins the cursor while its refusal may pass; once it has kept being refused it is held and the cursor moves on.
-    private func holdIfStuck(_ msg: BridgeMessage, reason: String) -> Bool {
-        let now = Date()
-        var entry = failingMacRecords[msg.id] ?? FailingMacRecord(message: msg, reason: reason, firstRefusedAt: now, attempts: 0, held: false)
-        entry.reason = reason
-        entry.attempts += 1
-        if !entry.held, entry.attempts >= Self.stuckAfterAttempts, now.timeIntervalSince(entry.firstRefusedAt) >= Self.stuckAfter {
-            entry.held = true
-            Self.deliveryLog.notice("""
-                held Mac record \(msg.id, privacy: .public) kind \(msg.metadata?["kind"] ?? "chat", privacy: .public) from \(msg.timestamp, privacy: .public) \
-                after \(entry.attempts, privacy: .public) refusals: \(reason, privacy: .public)
-                """)
-        }
-        failingMacRecords[msg.id] = entry
-        saveFailingMacRecords()
-        return entry.held
+    private func retainRefusedMacRecord(_ message: BridgeMessage, reason: String) async {
+        let firstRefusedAt = failingMacRecords[message.id]?.firstRefusedAt ?? Date()
+        failingMacRecords[message.id] = FailingMacRecord(message: message, reason: reason, firstRefusedAt: firstRefusedAt)
+        _ = await saveReceiveLedgers()
     }
 
-    /// Held records are tried once per launch and when the pairing key changes; one still refused a day after its first refusal is let go.
-    func retryHeldMacRecords(force: Bool = false) async {
-        guard force || !retriedHeldThisLaunch else { return }
-        retriedHeldThisLaunch = true
+    /// A repaired owner re-evaluates only the records that waited for it.
+    private func reconsiderRefusedMacRecords(repairedReasons: Set<String>) async {
+        guard await restoreReceiveLedgers() else { return }
         let generation = setupGeneration
-        for (id, entry) in failingMacRecords where entry.held {
+        let repaired = failingMacRecords.filter { repairedReasons.contains($0.value.reason) }.map(\.key)
+        for id in repaired {
             guard generation == setupGeneration else { return }
-            refusal = nil
-            if await admitIncoming(entry.message) {
-                failingMacRecords[id] = nil
-            } else if Date().timeIntervalSince(entry.firstRefusedAt) > 24 * 60 * 60 {
-                Self.deliveryLog.notice("let go of Mac record \(id, privacy: .public): \(entry.reason, privacy: .public)")
-                recordSeenMacReplyID(id); persistSeenMacReplyIDs()
-                failingMacRecords[id] = nil
-            } else if let refusal {
-                failingMacRecords[id]?.reason = refusal
-            }
-        }
-        saveFailingMacRecords()
-    }
-
-    private func saveFailingMacRecords() {
-        do {
-            try FileManager.default.createDirectory(at: URL.applicationSupportDirectory, withIntermediateDirectories: true)
-            try JSONEncoder().encode(failingMacRecords).write(to: Self.failingMacRecordsURL, options: .atomic)
-        } catch {
-            NSLog("[iCloudBridge] refused-record ledger could not be saved: %@", error.localizedDescription)
+            await reconsiderRefusedMacRecord(id)
         }
     }
 
-    /// During a drain this only marks the memory changed; the drain saves it once when it ends.
-    private func persistSeenMacReplyIDs() {
+    func reconsiderRefusedMacRecord(_ id: String) async {
+        guard await restoreReceiveLedgers(), let entry = failingMacRecords[id] else { return }
+        let generation = setupGeneration
+        refusal = nil
+        let admitted = await admitIncoming(entry.message)
+        guard generation == setupGeneration else { return }
+        if admitted { failingMacRecords.removeValue(forKey: id) }
+        else if let refusal { failingMacRecords[id]?.reason = refusal }
+        _ = await saveReceiveLedgers()
+    }
+
+    /// Transport acceptance waits for the durable receipt, including during a drain. Failure leaves its claim and cursor retryable.
+    private func persistSeenMacRecords() async -> Bool {
         seenMacRecordsDirty = true
-        if !deviceDrainInFlight { saveSeenMacRecords() }
+        return await saveSeenMacRecords()
     }
 
     /// Writes the memory, forgetting records CloudKit no longer keeps.
-    func saveSeenMacRecords() {
-        guard seenMacRecordsDirty else { return }
-        seenMacRecordsDirty = false
+    func saveSeenMacRecords() async -> Bool {
+        guard seenMacRecordsDirty else { return true }
+        return await saveReceiveLedgers()
+    }
+
+    private func saveReceiveLedgers() async -> Bool {
+        guard receiveLedgersLoaded else { return false }
         let cutoff = Date().addingTimeInterval(-CloudKitDeviceTransport.retentionWindow)
         seenMacRecords = seenMacRecords.filter { $0.value > cutoff }
+        let seen = seenMacRecords
+        let failing = failingMacRecords
         do {
-            try FileManager.default.createDirectory(at: URL.applicationSupportDirectory, withIntermediateDirectories: true)
-            try JSONEncoder().encode(seenMacRecords).write(to: Self.seenMacRecordsURL, options: .atomic)
+            try await VolumeIO.run {
+                try Self.writeReceiveLedger(seen, to: Self.seenMacRecordsURL)
+                try Self.writeReceiveLedger(failing, to: Self.failingMacRecordsURL)
+            }
+            if seenMacRecords == seen { seenMacRecordsDirty = false }
+            return true
         } catch {
             seenMacRecordsDirty = true
-            NSLog("[iCloudBridge] handled-record memory could not be saved: %@", error.localizedDescription)
+            syncStatus = "Mac receive history could not be saved: \(error.localizedDescription). Its settlement remains owed."
+            return false
         }
     }
 
+    private nonisolated static func writeReceiveLedger<Value: Encodable>(_ value: Value, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(value)
+        do { if try VolumeIO.contents(of: url) == data { return } }
+        catch CocoaError.fileReadNoSuchFile { /* First committed receive history. */ }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
 }
 
-/// A Mac record this phone refused: the record itself, why, since when and how often, and whether it is held past the drain's cursor.
-struct FailingMacRecord: Codable {
+/// An unresolved Mac record and its admission failure.
+struct FailingMacRecord: Codable, Sendable {
     var message: BridgeMessage
     var reason: String
     var firstRefusedAt: Date
-    var attempts: Int
-    var held: Bool
 }

@@ -11,7 +11,6 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
     /// Abilities bypass script action/read caps but retain OwnedProgram's 4 MiB I/O bounds.
     public static let actionLimit = 50
     public static let readLimit = 100
-    public static let returnLimit = 16 * 1024
     public static let logLimit = 2 * 1024
     public static let inputLimit = 16 * 1024
     public static let stepLimit = 50
@@ -346,13 +345,15 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             }
             return receipt
         }
+        let startedAt = Date()
         var receipt = await execute(program, input: input, preview: preview, replay: replay, host: host, execution: execution, held: held)
         // Ad hoc scripts must not leave ability evidence because they are not parts.
-        if !preview, program.kind != .script, program.entry != .face, !(host is OwnedProgramFixtures) {
+        if !preview, !program.isPart, program.kind != .script, program.entry != .face, !(host is OwnedProgramFixtures) {
             let observed = execution.dependencySnapshot
             receipt = await AbilityStore(dataRoot: dataRoot).settleRun(id: program.id, version: program.version,
                 receipt: receipt, input: replay == nil ? input : nil,
-                dependencySnapshot: observed?.id == program.id && observed?.version == program.version ? observed?.shapes : nil, turn: execution.turn)
+                dependencySnapshot: observed?.id == program.id && observed?.version == program.version ? observed?.shapes : nil,
+                turn: execution.turn, at: startedAt)
         }
         return receipt
     }
@@ -661,7 +662,10 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
     public struct ScriptError: Error {
         public let reason: String
         public let detail: String
-        public init(reason: String, detail: String) { self.reason = reason; self.detail = detail }
+        public let tryInstead: JSONValue?
+        public init(reason: String, detail: String, tryInstead: JSONValue? = nil) {
+            self.reason = reason; self.detail = detail; self.tryInstead = tryInstead
+        }
     }
     /// Resume replays calls from the journal without executing them, answers the stop point, and refuses any divergent call before dispatch.
     public struct Replay: Sendable {

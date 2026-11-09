@@ -21,14 +21,25 @@ extension AbilityStore {
             ["completed", "cut", "network", "error", "refused", "last_run"].map { ($0, count) }))
         var evidence = Dictionary(uniqueKeysWithValues: (["count", "reads"] + runOutcomes).map { ($0, count) })
         evidence["operations"] = map(operation)
+        evidence["rounds"] = map(count); evidence["surprise"] = map(count)
+        evidence["hours"] = map(map(count)); evidence["first_seen"] = .object(["type": .string("string")])
+        evidence["surprise_through"] = .object(["type": .string("string")])
         var row = Dictionary(uniqueKeysWithValues: statistics.map { ($0, JSONValue.object([
             "description": .string("Retained accounting metadata; preserve its recovered JSON unchanged.")])) })
         for name in ["uses", "useCount", "corrections"] { row[name] = count }
         row["runs"] = object(["versions": map(object(evidence, required: ["count"]))])
+        let text: JSONValue = .object(["type": .string("string")])
+        let opened = ["version", "kept", "why", "opened"]
+        row["trial"] = object(Dictionary(uniqueKeysWithValues: opened.map { ($0, text) }), required: opened)
+        var closed = Dictionary(uniqueKeysWithValues: (opened + ["closed", "set_aside_why"]).map { ($0, text) })
+        closed["verdict"] = .object(["enum": .array(trialVerdicts.sorted().map(JSONValue.string))])
+        closed["by"] = .object(["enum": .array(trialDeciders.sorted().map(JSONValue.string))])
+        row["trials"] = .object(["type": .string("array"), "maxItems": .int(Int64(CapabilityLifecycle.inputLimit)),
+            "items": object(closed, required: opened + ["closed", "verdict", "by"])])
         var result = map(object(row, open: false)).objectValue!
         result["description"] = .string("""
             Ability id → recovered accounting row. Only accounting keys are admitted; preserve readable rows exactly. Nonnegative counters must agree: \
-            outcomes sum to count, reads ≤ ok, operation totals ≤ count. Authority stays in each ability file.
+            outcomes sum to count, reads ≤ ok, operation and hour totals ≤ count. Authority stays in each ability file.
             """)
         return .object(result)
     }()
@@ -112,7 +123,7 @@ extension AbilityStore {
         Self.decoded.removeValue(forKey: other.path)
         if slot == .current { NotificationCenter.default.post(name: Self.didChange, object: root.appendingPathComponent(file.id).path) }
     }
-    static func encode(_ file: File) throws -> Data {
+    package static func encode(_ file: File) throws -> Data {
         var header = file.metadata
         header.merge(try partHeader(header)) { _, value in value }
         if var row = header["record"]?.objectValue {
@@ -234,7 +245,7 @@ extension AbilityStore {
         guard !overflow else { throw failure("Accounting counter overflow at \(field); stored bytes preserved.") }
         return next
     }
-    private static func accountingObject(_ value: JSONValue?, field: String) throws -> [String: JSONValue] {
+    static func accountingObject(_ value: JSONValue?, field: String) throws -> [String: JSONValue] {
         guard let value else { return [:] }
         guard let fields = value.objectValue else { throw failure("Invalid accounting object at \(field).") }
         return fields
@@ -259,12 +270,16 @@ extension AbilityStore {
             for (version, value) in try accountingObject(runs["versions"], field: field + ".runs.versions") {
                 guard let evidence = value.objectValue else { throw failure("Invalid accounting row at \(field).runs.versions.\(version).") }
                 let path = field + ".runs.versions." + version
-                guard evidence["count"] != nil else { throw failure("Missing accounting counter at \(path).count.") }
                 let count = try counter(evidence["count"], field: path + ".count")
-                let total = try outcomeCount(evidence, at: path)
-                if total != count { throw failure("Accounting outcomes disagree with \(path).count.") }
                 let reads = try counter(evidence["reads"], field: path + ".reads")
                 guard reads <= (try counter(evidence["ok"], field: path + ".ok")) else { throw failure("Invalid accounting relationship at \(path).reads.") }
+                _ = try tallyCounters(evidence, at: path)
+                if let seen = evidence["first_seen"], seen.stringValue.flatMap(NativeTimestampFormat.parseISO8601) == nil {
+                    throw failure("Invalid accounting time at \(path).first_seen.")
+                }
+                if let end = evidence["surprise_through"], end.stringValue.flatMap(NativeTimestampFormat.parseISO8601) == nil {
+                    throw failure("Invalid accounting time at \(path).surprise_through.")
+                }
                 for (key, value) in try accountingObject(evidence["operations"], field: path + ".operations") {
                     guard let operation = value.objectValue else { throw failure("Invalid accounting scope at \(path).operations.\(key).") }
                     let total = try outcomeCount(operation, at: path + ".operations.\(key)", names: ["completed", "cut", "network", "error", "refused"])
@@ -276,5 +291,52 @@ extension AbilityStore {
                 }
             }
         }
+    }
+
+    /// The trial reader and store admission share the exact counter, hour and histogram laws. No multiplication in integer space.
+    static func tallyCounters(_ evidence: [String: JSONValue], at path: String) throws -> (uses: Int, misses: Int, surprises: Int, rounds: [Int: Int]) {
+        func add(_ a: Int64, _ b: Int64, _ field: String) throws -> Int64 {
+            let (sum, overflow) = a.addingReportingOverflow(b)
+            guard !overflow else { throw failure("Accounting counter overflow at \(field).") }
+            return sum
+        }
+        guard evidence["count"] != nil else { throw failure("Missing accounting counter at \(path).count.") }
+        let uses = try counter(evidence["count"], field: path + ".count")
+        guard try outcomeCount(evidence, at: path) == uses else { throw failure("Accounting outcomes disagree with \(path).count.") }
+        var hours: Int64 = 0, hourOutcomes: [String: Int64] = [:]
+        for (hour, value) in try accountingObject(evidence["hours"], field: path + ".hours") {
+            let hourPath = path + ".hours." + hour
+            let bucket = try accountingObject(value, field: hourPath)
+            guard NativeTimestampFormat.parseISO8601(hour + ":00:00Z") != nil,
+                  Set(bucket.keys).isSubset(of: Set(runOutcomes)) else { throw failure("Invalid accounting hour at \(hourPath).") }
+            hours = try add(hours, outcomeCount(bucket, at: hourPath), path + ".hours")
+            guard hours <= uses else { throw failure("Accounting hour totals exceed \(path).count.") }
+            for outcome in runOutcomes {
+                let total = try add(hourOutcomes[outcome] ?? 0, counter(bucket[outcome], field: hourPath + "." + outcome), hourPath + "." + outcome)
+                guard total <= (try counter(evidence[outcome], field: path + "." + outcome)) else {
+                    throw failure("Accounting hour outcomes exceed \(path).\(outcome).")
+                }
+                hourOutcomes[outcome] = total
+            }
+        }
+        let misses = try outcomeCount(evidence, at: path, names: ["error", "cut"])
+        guard misses <= uses else { throw failure("Accounting misses exceed \(path).count.") }
+        var surprises = misses
+        for (kind, value) in try accountingObject(evidence["surprise"], field: path + ".surprise") {
+            guard surpriseKinds.contains(kind) else { throw failure("Unknown accounting surprise at \(path).surprise.\(kind).") }
+            surprises = try add(surprises, counter(value, field: path + ".surprise." + kind), path + ".surprise")
+        }
+        var rounds: [Int: Int] = [:], tries: Int64 = 0
+        for (key, value) in try accountingObject(evidence["rounds"], field: path + ".rounds") {
+            guard let n = Int(key), n >= 0, String(n) == key else { throw failure("Invalid accounting round bucket at \(path).rounds.\(key).") }
+            let count = try counter(value, field: path + ".rounds." + key)
+            tries = try add(tries, count, path + ".rounds")
+            guard tries <= uses, let count = Int(exactly: count) else { throw failure("Accounting round uses exceed \(path).count.") }
+            rounds[n] = count
+        }
+        guard let uses = Int(exactly: uses), let misses = Int(exactly: misses), let surprises = Int(exactly: surprises) else {
+            throw failure("Accounting tally exceeds the integer range at \(path).")
+        }
+        return (uses, misses, surprises, rounds)
     }
 }

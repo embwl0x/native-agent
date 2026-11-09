@@ -58,7 +58,8 @@ public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
         return bounded
     }
 
-    static func fingerprint(_ values: [String]) -> String {
+    /// Shared by prediction scopes and the memory manager's recorded judgment route.
+    public static func fingerprint(_ values: [String]) -> String {
         let text = values.map { "\($0.utf8.count):" + $0 }.joined()
         return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }

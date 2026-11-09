@@ -2,8 +2,7 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-import TurnTrace
-// Blueprint: | `CapabilityCatalog.swift` | Read-only checked sources/roots; writes validate identity under lock. |
+// Blueprint: | `CapabilityCatalog.swift` | Read-only checked sources/roots. |
 
 // MARK: - Capability catalog persistence
 // Saved sources and roots are checked authority: reads neither rewrite them nor create signing identity. Storage exclusions do not remove hidden retained files
@@ -175,96 +174,4 @@ public enum CapabilityCatalogStoreReader {
             _ = try CapabilityTrustRoot(row: .object($0))
         }
     }
-}
-
-/// Refuse unusable names before deriving durable source identity or writing.
-private func swiftCatalogSlugify(_ value: String) throws -> String {
-    let lowered = value.lowercased()
-    var out = ""
-    var pendingDash = false
-    for scalar in lowered.unicodeScalars {
-        let v = scalar.value
-        let isLowerAlnum = (v >= 0x61 && v <= 0x7A) || (v >= 0x30 && v <= 0x39)
-        if isLowerAlnum {
-            if pendingDash && !out.isEmpty { out += "-" }
-            pendingDash = false
-            out.unicodeScalars.append(scalar)
-        } else {
-            pendingDash = true
-        }
-    }
-    let trimmed = String(out.prefix(80))
-    guard !trimmed.isEmpty else {
-        throw ToolFailureError("The catalog source name cannot form a stable identity.",
-            argumentPath: "name", accepted: "A source name containing at least one ASCII letter or digit.",
-            effects: .none, code: "catalog_source_name_invalid", status: .refused,
-            instruction: "Include an ASCII letter or digit in the source name, then save it again.", recovery: .correctArguments)
-    }
-    return trimmed
-}
-
-
-/// Source writes validate under the `catalog/sources/sources.json` flock, then commit once; reads are lock-free.
-public actor SwiftNativeCatalogWrites {
-    private let dataRoot: URL
-    private let clock: @Sendable () -> Date
-
-    public init(
-        dataRoot: URL,
-        clock: @escaping @Sendable () -> Date = { Date() }
-    ) {
-        self.dataRoot = dataRoot
-        self.clock = clock
-    }
-
-    private var sourcesPath: URL {
-        dataRoot
-            .appendingPathComponent("catalog", isDirectory: true)
-            .appendingPathComponent("sources", isDirectory: true)
-            .appendingPathComponent("sources.json")
-    }
-
-    public func upsertCatalogSource(name: String, url: String, kind: String) async throws -> [String: JSONValue] {
-        let name = String(name.prefix(120))
-        let sourceID = try swiftCatalogSlugify(name)
-        let now = SwiftNativeManifestSigner.isoTimestamp(clock())
-        let status = url.isEmpty ? "needs_setup" : "ready"
-
-        let replacement: [String: JSONValue] = [
-            "id": .string(sourceID),
-            "name": .string(name),
-            "kind": .string(kind),
-            "url": .string(url),
-            "status": .string(status),
-            "lastCheckedAt": .null,
-            "updatedAt": .string(now),
-        ]
-
-        let sourcesPathLocal = sourcesPath
-        let dataRootLocal = dataRoot
-        let record = try await SwiftNativePersistenceCore.withFileLock(sourcesPathLocal) {
-            var sources = try CapabilityCatalogStoreReader.catalogSources(dataRoot: dataRootLocal)
-            let index = sources.firstIndex { $0["id"] == .string(sourceID) }
-            var record: [String: JSONValue]
-            if let index {
-                record = sources[index]
-                sources.remove(at: index)
-            } else {
-                record = ["createdAt": .string(now)]
-            }
-            record.merge(replacement) { _, new in new }
-            sources.append(record)
-            try await SwiftNativePersistenceCore.writeJSON(.array(sources.map { .object($0) }), to: sourcesPathLocal)
-            return record
-        }
-        // Receipt failures propagate even after the source write succeeded.
-        try await TurnTracePersistLane(dataRootOverride: dataRoot).appendChecked(
-            TurnTraceEvent(kind: "catalog.source.save", title: name, status: status,
-            payload: .object([
-                "sourceId": .string(sourceID),
-                "status": .string(status),
-            ]), createdAt: SwiftNativeManifestSigner.isoTimestamp(clock()), turn: nil))
-        return record
-    }
-
 }

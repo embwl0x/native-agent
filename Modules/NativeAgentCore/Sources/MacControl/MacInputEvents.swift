@@ -27,8 +27,8 @@ public protocol MacEventSink: Sendable {
     /// Secure Keyboard Entry silently drops synthesized keys despite successful posting; gate keys while leaving mouse and scroll usable.
     var secureKeyboardEntryActive: Bool { get }
     func post(key: MacKeyEvent, turn: Turn, context: MacOperationContext)
-    func post(mouse: MacMouseEvent, turn: Turn, context: MacOperationContext)
-    func post(scroll: MacScrollEvent, turn: Turn, context: MacOperationContext)
+    func post(mouse: MacMouseEvent, turn: Turn, context: MacOperationContext, routingToken: Int64?) -> Bool
+    func post(scroll: MacScrollEvent, turn: Turn, context: MacOperationContext, routingToken: Int64?) -> Bool
     /// Per-process delivery must not depend on which window owns the keyboard.
     func post(key: MacKeyEvent, toPid pid: Int32, turn: Turn, context: MacOperationContext) -> Bool
 }
@@ -38,6 +38,52 @@ public extension MacEventSink {
     var secureKeyboardEntryActive: Bool { false }
     /// Missing per-process delivery must not redirect input into the global key window.
     func post(key: MacKeyEvent, toPid pid: Int32, turn: Turn, context: MacOperationContext) -> Bool { false }
+
+    func send(key: MacKeyEvent, toPid pid: Int32? = nil, turn: Turn, context: MacOperationContext) async throws -> Bool {
+        if let pid { return post(key: key, toPid: pid, turn: turn, context: context) }
+        if key.down { try await waitForPersonKeyboard(context: context) }
+        guard !key.down || context.driver?.allowsEmission(context: context) == true else { return false }
+        post(key: key, turn: turn, context: context)
+        return true
+    }
+
+    func send(mouse: MacMouseEvent, turn: Turn, context: MacOperationContext) async throws {
+        try await PersonOnlyWindows.withAgentPointer(at: CGPoint(x: mouse.x, y: mouse.y), driver: turn.windowDriver) { connections in
+            try await MacInputRouting.post(connections: connections) { token in
+                self.post(mouse: mouse, turn: turn, context: context, routingToken: token)
+            }
+        }
+    }
+
+    func send(scroll: MacScrollEvent, turn: Turn, context: MacOperationContext) async throws {
+        guard let point = AgentPointerHold.lastAgentPoint ?? SystemMacPointerPositionSource().currentPosition().map({ CGPoint(x: $0.x, y: $0.y) }) else {
+            throw PersonOnlyWindows.MotorFailure(detail: "The pointer position is unavailable; no scroll was posted.")
+        }
+        try await PersonOnlyWindows.withAgentPointer(at: point, driver: turn.windowDriver) { connections in
+            try await MacInputRouting.post(connections: connections) { token in
+                self.post(scroll: scroll, turn: turn, context: context, routingToken: token)
+            }
+        }
+    }
+}
+
+private func waitForPersonKeyboard(context: MacOperationContext) async throws {
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        group.addTask {
+            try await PersonOnlyWindows.waitForKeyboard()
+        }
+        group.addTask {
+            for await _ in await MacAttentionSessionStore.shared.driverChanges() {
+                guard context.driver?.allowsEmission(context: context) == true else {
+                    throw PersonOnlyWindows.MotorFailure(detail: "Mac driver authority ended while waiting for the person's keyboard.")
+                }
+            }
+            throw PersonOnlyWindows.MotorFailure(detail: "The Mac driver owner shut down while waiting for the person's keyboard.")
+        }
+        defer { group.cancelAll() }
+        _ = try await group.next()
+    }
+    try Task.checkCancellation()
 }
 
 /// Every post checks the operation’s explicit driver; release authority covers only inputs this act pressed.
@@ -47,7 +93,7 @@ struct DriverCheckedMacEventSink: MacEventSink {
     var secureKeyboardEntryActive: Bool { base.secureKeyboardEntryActive }
 
     func post(key event: MacKeyEvent, turn: Turn, context: MacOperationContext) {
-        guard !event.down || Self.waitWhilePersonTypes(context: context), let binding = context.driver, binding.allowsEmission(context: context) else { return }
+        guard let binding = context.driver, binding.allowsEmission(context: context) else { return }
         if event.down, !MacAppActGate.admit(MacAppActGate.frontRefusal(context: context), context: context) { return }
         base.post(key: event, turn: turn, context: context)
         guard binding.appActRefusal == nil else { return }
@@ -58,16 +104,6 @@ struct DriverCheckedMacEventSink: MacEventSink {
                 base.post(key: MacKeyEvent(keyCode: event.keyCode, down: false), turn: turn, context: context)
             })
         } else { binding.held(key, context: context, release: nil) }
-    }
-
-    /// Global key-down waits while the person owns Shotgun's keyboard; key-up and per-process input never wait, and the main thread never blocks.
-    static func waitWhilePersonTypes(context: MacOperationContext) -> Bool {
-        while PersonOnlyWindows.keyboardHeldByPerson {
-            guard !Thread.isMainThread, !Task.isCancelled,
-                  context.driver?.allowsEmission(context: context) == true else { return false }
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        return true
     }
 
     func post(key event: MacKeyEvent, toPid pid: Int32, turn: Turn, context: MacOperationContext) -> Bool {
@@ -84,25 +120,28 @@ struct DriverCheckedMacEventSink: MacEventSink {
         return true
     }
 
-    func post(mouse event: MacMouseEvent, turn: Turn, context: MacOperationContext) {
-        guard let binding = context.driver, binding.allowsEmission(context: context) else { return }
-        base.post(mouse: event, turn: turn, context: context)
-        guard binding.appActRefusal == nil else { return }
+    func post(mouse event: MacMouseEvent, turn: Turn, context: MacOperationContext, routingToken: Int64?) -> Bool {
+        guard let binding = context.driver, binding.allowsEmission(context: context),
+              base.post(mouse: event, turn: turn, context: context, routingToken: routingToken) else { return false }
         binding.notePostedEvent(turn: turn)
         let key = "mouse:\(event.button)"
         if event.phase == .down {
             binding.held(key, context: context, release: { [base] in
                 guard let point = SystemMacPointerPositionSource().currentPosition() else { return }
-                base.post(mouse: MacMouseEvent(phase: .up, button: event.button, x: point.x, y: point.y), turn: turn, context: context)
+                _ = base.post(mouse: MacMouseEvent(phase: .up, button: event.button, x: point.x, y: point.y),
+                    turn: turn, context: context, routingToken: nil)
             })
         } else if event.phase == .up { binding.held(key, context: context, release: nil) }
+        return true
     }
 
-    func post(scroll event: MacScrollEvent, turn: Turn, context: MacOperationContext) {
-        guard let binding = context.driver, binding.allowsEmission(context: context) else { return }
-        base.post(scroll: event, turn: turn, context: context)
+    func post(scroll event: MacScrollEvent, turn: Turn, context: MacOperationContext, routingToken: Int64?) -> Bool {
+        guard let binding = context.driver, binding.allowsEmission(context: context),
+              base.post(scroll: event, turn: turn, context: context, routingToken: routingToken) else { return false }
         binding.notePostedEvent(turn: turn)
+        return true
     }
+
 }
 
 #if canImport(CoreGraphics) && os(macOS)
@@ -130,7 +169,7 @@ public struct CGEventSink: MacEventSink {
     }
 
     public func post(key event: MacKeyEvent, toPid pid: Int32, turn: Turn, context: MacOperationContext) -> Bool {
-        guard pid > 0, pid != getpid(), let cg = keyEvent(event) else { return false }
+        guard pid > 0, !PersonOnlyWindows.isOwnProcess(pid), let cg = keyEvent(event) else { return false }
         guard !event.down || MacAppActGate.admit(MacAppActGate.refusal(pid: pid, looking: context.looking, context: context),
             context: context) else { return false }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
@@ -141,7 +180,7 @@ public struct CGEventSink: MacEventSink {
 
     public func post(key event: MacKeyEvent, turn: Turn, context: MacOperationContext) {
         guard let cg = keyEvent(event) else { return }
-        postNative(cg, context: context)
+        emitNative(cg, context: context)
     }
 
     private func keyEvent(_ event: MacKeyEvent) -> CGEvent? {
@@ -179,7 +218,60 @@ public struct CGEventSink: MacEventSink {
         return [down, up]
     }
 
-    package func postNative(_ event: CGEvent, context: MacOperationContext) {
+    package func postNative(_ event: CGEvent, context: MacOperationContext) async throws {
+        switch event.type {
+        case .keyDown:
+            try await waitForPersonKeyboard(context: context)
+            guard emitTrackedNative(event, context: context) else {
+                throw PersonOnlyWindows.MotorFailure(detail: "Key emission was refused after the keyboard hold ended; no key was posted.")
+            }
+        case .mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+             .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .leftMouseUp, .rightMouseUp, .otherMouseUp, .scrollWheel:
+            try await PersonOnlyWindows.withAgentPointer(at: event.location) { connections in
+                try await MacInputRouting.post(connections: connections) { token in
+                    event.setIntegerValueField(.eventSourceUserData, value: token)
+                    return emitTrackedNative(event, context: context)
+                }
+            }
+        default: emitTrackedNative(event, context: context)
+        }
+    }
+
+    @discardableResult private func emitTrackedNative(_ event: CGEvent, context: MacOperationContext) -> Bool {
+        guard emitNative(event, context: context) else { return false }
+        guard let binding = context.driver else { return true }
+        let button: MacMouseButton
+        switch event.type {
+        case .keyDown, .keyUp:
+            let code = UInt16(clamping: event.getIntegerValueField(.keyboardEventKeycode))
+            let key = "key:\(code)"
+            if event.type == .keyDown {
+                binding.held(key, context: context, release: {
+                    guard let release = self.keyEvent(.init(keyCode: code, down: false)) else { return }
+                    self.emitNative(release, context: context)
+                })
+            } else { binding.held(key, context: context, release: nil) }
+            return true
+        case .leftMouseDown, .leftMouseUp: button = .left
+        case .rightMouseDown, .rightMouseUp: button = .right
+        default: return true
+        }
+        let key = "mouse:\(button)"
+        if event.type == .leftMouseDown || event.type == .rightMouseDown {
+            let point = event.location
+            binding.held(key, context: context, release: {
+                guard let release = self.mouseEvent(.init(phase: .up, button: button, x: point.x, y: point.y)) else { return }
+                self.emitNative(release, context: context)
+            })
+        } else { binding.held(key, context: context, release: nil) }
+        return true
+    }
+
+    @discardableResult private func emitNative(_ event: CGEvent, context: MacOperationContext) -> Bool {
+        switch event.type {
+        case .keyUp, .leftMouseUp, .rightMouseUp, .otherMouseUp: break
+        default: guard context.driver?.allowsEmission(context: context) == true else { return false }
+        }
         // Releases must settle held input even after a switch change; only agent-synthesized input enters here.
         let refusal: MacAppActRefusal?
         switch event.type {
@@ -189,22 +281,20 @@ public struct CGEventSink: MacEventSink {
             refusal = MacAppActGate.pointRefusal(x: event.location.x, y: event.location.y, context: context)
         default: refusal = nil
         }
-        guard MacAppActGate.admit(refusal, context: context) else { return }
+        guard MacAppActGate.admit(refusal, context: context) else { return false }
         NativeAgentMotorEpoch.notePostedHIDEvent()
         event.post(tap: .cghidEventTap)
+        return true
     }
 
-    public func post(mouse event: MacMouseEvent, turn: Turn, context: MacOperationContext) {
+    public func post(mouse event: MacMouseEvent, turn: Turn, context: MacOperationContext, routingToken: Int64?) -> Bool {
         let point = CGPoint(x: event.x, y: event.y)
-        if event.phase != .up {
-            guard MacAppActGate.admit(MacAppActGate.pointRefusal(x: event.x, y: event.y, context: context), context: context) else { return }
-        }
-        // Preserve the person’s cursor while the agent owns pointer input.
+        guard let cg = mouseEvent(event) else { return false }
+        if let routingToken { cg.setIntegerValueField(.eventSourceUserData, value: routingToken) }
         AgentPointerHold.begin(warpTo: nil)
-        defer { AgentPointerHold.posted(phase: event.phase, at: point) }
-        guard let cg = mouseEvent(event) else { return }
-        PersonOnlyWindows.beforeAgentPointer(at: point)
-        postNative(cg, context: context)
+        let posted = emitNative(cg, context: context)
+        AgentPointerHold.posted(phase: event.phase, button: event.button, at: point, emitted: posted)
+        return posted
     }
 
     private func mouseEvent(_ event: MacMouseEvent) -> CGEvent? {
@@ -239,11 +329,12 @@ public struct CGEventSink: MacEventSink {
         return cg
     }
 
-    public func post(scroll event: MacScrollEvent, turn: Turn, context: MacOperationContext) {
+    public func post(scroll event: MacScrollEvent, turn: Turn, context: MacOperationContext, routingToken: Int64?) -> Bool {
         let units: CGScrollEventUnit = event.unit == .pixel ? .pixel : .line
         // Scroll follows the cursor, so restore the agent’s point after returning the person’s cursor.
         let scrollPoint = AgentPointerHold.begin(warpTo: AgentPointerHold.lastAgentPoint)
-        defer { scrollPoint.map { AgentPointerHold.posted(phase: nil, at: $0) } }
+        var posted = false
+        defer { scrollPoint.map { AgentPointerHold.posted(phase: nil, at: $0, emitted: posted) } }
         guard let cg = CGEvent(
             scrollWheelEvent2Source: source(),
             units: units,
@@ -251,14 +342,15 @@ public struct CGEventSink: MacEventSink {
             wheel1: event.deltaY,
             wheel2: event.deltaX,
             wheel3: 0
-        ) else { return }
+        ) else { return false }
         cg.setIntegerValueField(
             .eventSourceUserData,
             value: NativeAgentMacEventIdentity.sourceUserData
         )
         cg.flags.formUnion(flags(event.modifiers))
-        PersonOnlyWindows.beforeAgentPointer(at: cg.location)
-        postNative(cg, context: context)
+        if let routingToken { cg.setIntegerValueField(.eventSourceUserData, value: routingToken) }
+        posted = emitNative(cg, context: context)
+        return posted
     }
 }
 
@@ -269,8 +361,8 @@ public struct UnavailableMacEventSink: MacEventSink {
     public init() {}
     public var isAvailable: Bool { false }
     public func post(key: MacKeyEvent, turn: Turn, context: MacOperationContext) {}
-    public func post(mouse: MacMouseEvent, turn: Turn, context: MacOperationContext) {}
-    public func post(scroll: MacScrollEvent, turn: Turn, context: MacOperationContext) {}
+    public func post(mouse: MacMouseEvent, turn: Turn, context: MacOperationContext, routingToken: Int64?) -> Bool { false }
+    public func post(scroll: MacScrollEvent, turn: Turn, context: MacOperationContext, routingToken: Int64?) -> Bool { false }
 }
 
 public func defaultMacEventSink() -> any MacEventSink {

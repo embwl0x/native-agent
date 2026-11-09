@@ -249,24 +249,16 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
                     return AppToolExecutor.failure("door_unavailable", "An authored action needs its originating turn.")
                 }
                 let callExecution = hostExecution.serving(program)
-                if let perform {
-                    guard let reentry = callExecution.perform else {
-                        return .object(["status": .string("refused"), "effects": .string("none"),
-                            "reason": .string("door_unavailable"), "detail": .string("A primitive needs the originating turn's gate chain.")])
-                    }
-                    // The deferred body belongs to this admission, not the earlier host composition.
-                    var primitiveExecution = callExecution
-                    primitiveExecution.authoredCall = (tool: id, perform: perform)
-                    let requester = callTurn.partID.map { "\(PersonaCompiler.agentDisplayName(dataRoot: self.securityCenter.dataRoot))'s \($0)" }
-                    do { return try await reentry(id, arguments, callTurn.with(\.requester, requester), primitiveExecution) }
-                    catch { return ChatToolOutcome.failure(error: error, tool: id) }
+                guard let perform, let reentry = callExecution.perform else {
+                    return .object(["status": .string("refused"), "effects": .string("none"), "checker": .string("app_door"),
+                        "reason": .string("door_unavailable"), "detail": .string("Authored work needs its body and originating turn's gate chain.")])
                 }
-                let envelope = await self.securityCenter.evaluateTool(tool: id, input: arguments,
-                    origin: Self.securityOrigin(turn: callTurn, surface: surface), enforceAutonomy: self.enforceAutonomySecurity, turn: callTurn)
-                guard envelope.decision != .block, !self.enforceAutonomySecurity || !envelope.requiresApproval else {
-                    return Self.securityGateResponse(envelope)
-                }
-                return nil
+                // The deferred body belongs to this admission, not the earlier host composition.
+                var admittedExecution = callExecution
+                admittedExecution.authoredCall = (tool: id, perform: perform)
+                let requester = callTurn.partID.map { "\(PersonaCompiler.agentDisplayName(dataRoot: self.securityCenter.dataRoot))'s \($0)" }
+                do { return try await reentry(id, arguments, callTurn.with(\.requester, requester), admittedExecution) }
+                catch { return ChatToolOutcome.failure(error: error, tool: id) }
             }
         scoped.host = host
         let bound = scoped
@@ -312,7 +304,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         // An already-satisfied request returns the owner's answer; a card would leave the turn waiting on nobody.
         if includeAppOwnedTools, tool == InlineInteractionWire.toolName,
            let need = InlineInteractionNeed.interaction(in: result),
-           let done = await InlineInteractionResolver.liveProjection(need, dataRoot: PersistenceCore.defaultDataRoot()).state.outcome?.summary {
+           let done = await InlineInteractionResolver.verifiedSetupSummary(need, dataRoot: PersistenceCore.defaultDataRoot()) {
             var settled: [String: JSONValue] = [
                 "status": .string("ok"),
                 "already_done": .bool(true),
@@ -428,6 +420,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             "requires_approval": .bool(envelope.requiresApproval),
             "origin_trusted": .bool(envelope.originTrusted),
             "reason": .string(envelope.primaryReason),
+            "checker": .string("trust"),
             "reasons": .array(envelope.reasons.map { .string($0.persistedValue) }),
             "capabilities": .array(envelope.capabilities.map { .string($0) }),
             "message": .string(envelope.requiresApproval ? "Security Center requires approval before running this tool."

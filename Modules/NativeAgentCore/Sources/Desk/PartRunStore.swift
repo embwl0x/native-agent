@@ -37,14 +37,12 @@ public enum PartRunStore {
         return waiting || claimed
     }
 
+    /// Discard waiting bytes; a claim alone owns consumption or release of its claimed bytes.
     public static func discard(_ id: String, root: URL) throws {
-        var removed = false
-        for url in [file(id, root: root), claimedFile(id, root: root)] {
-            do { try FileManager.default.removeItem(at: url); removed = true }
-            catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError { continue }
-            catch { throw failure("run_cleanup_failed", "Checkpoint cleanup at \(url.path) failed: \(error.localizedDescription).", at: url,
-                effects: removed ? .partial : .none) }
-        }
+        let url = file(id, root: root)
+        do { try FileManager.default.removeItem(at: url) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError { return }
+        catch { throw failure("run_cleanup_failed", "Checkpoint cleanup at \(url.path) failed: \(error.localizedDescription).", at: url) }
     }
 
     public static func waitingIDs(root: URL) throws -> [String] {

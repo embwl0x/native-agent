@@ -71,11 +71,13 @@ struct ACPJobDoor: JobRunner {
             switch reply.stopReason {
             case "cancelled": outcome = .stopped("\(name) cancelled its turn")
             case "refusal": outcome = .failed("\(name) refused the job")
-            default:
-                // end_turn, its own turn or token limit, or a declined permission: the organ is done, and the check judges what it left.
-                outcome = .finished
-                deliverable = await JobDoorArtifacts.deliverable(job, since: record.startedAt, report: reply.text.isEmpty ? nil : reply.text,
-                                                                 model: reply.model, out: out)
+            case "end_turn":
+                deliverable = JobDeliverable(artifacts: [], report: reply.text.isEmpty ? nil : reply.text, model: reply.model)
+                let made = try await JobDoorArtifacts.deliverable(job, since: record.startedAt, report: reply.text.isEmpty ? nil : reply.text,
+                                                                  model: reply.model)
+                deliverable = made
+                outcome = made.inventoryFailure.map(JobOutcome.failed) ?? .finished
+            default: outcome = .failed("\(name)'s turn ended without completion: \(reply.stopReason)")
             }
         } catch {
             outcome = .failed("\(name)'s session: " + ((error as? AgentACPClient.Failure)?.localizedDescription ?? error.localizedDescription))

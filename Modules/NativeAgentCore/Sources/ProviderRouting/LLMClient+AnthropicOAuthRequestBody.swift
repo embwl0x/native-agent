@@ -98,14 +98,13 @@ extension AnthropicOAuthTransport {
         #if DEBUG
         guard let dir = ProcessInfo.processInfo.environment["NATIVE_AGENT_LLM_BODY_DUMP_DIR"],
               !dir.isEmpty else { return }
-        let ts = UInt64(Date().timeIntervalSince1970 * 1000)
-        // UUID suffix: concurrent same-millisecond dumps must not overwrite each other.
         let url = URL(fileURLWithPath: dir)
-            .appendingPathComponent("\(ts)-\(call)-\(UUID().uuidString.prefix(8)).json")
-        if let data = try? JSONSerialization.data(
-            withJSONObject: body, options: [.prettyPrinted, .sortedKeys]
-        ) {
-            try? data.write(to: url, options: [.atomic])
+            .appendingPathComponent("\(call)-\(UUID().uuidString).json")
+        do {
+            let data = try JSONSerialization.data(withJSONObject: body, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: url, options: [.atomic])
+        } catch {
+            nativeLog("Anthropic body diagnostic write failed: %@", error.localizedDescription)
         }
         #endif
     }
@@ -195,8 +194,7 @@ extension AnthropicOAuthTransport {
         return true
     }
 
-    /// Text-tool chat requests stop at the outer call boundary, never at bare parallel-call markers. RunawayOutputDetector ends repeated bare blocks at the
-    /// last complete call.
+    /// The server stops text-tool replies at the declared protocol boundary.
     static func applyTextLaneStops(to body: inout [String: Any], system: String?, call: LLMCall) {
         if system?.contains(textToolProtocolHeader) == true {
             body["stop_sequences"] = ["</function_calls>", "<function_results>", "\n<tool_result", "\nNativeAgent tool result #"]

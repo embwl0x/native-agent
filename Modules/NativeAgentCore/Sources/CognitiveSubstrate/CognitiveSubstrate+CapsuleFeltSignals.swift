@@ -9,9 +9,8 @@ extension CognitiveSubstrate {
         var text: String
         var family: String
         var carriedObject: Bool
-        var carriedAmbivalence: Bool
-        /// The spoken line omits the object; `text` retains it for Reminded-of queries.
-        var bareText: String = ""
+        var leadWord: String
+        var counterWord: String?
     }
 
     /// Tint uses felt nodes among the first six capsule-eligible workspace items; prefix precedes filtering.
@@ -201,8 +200,95 @@ extension CognitiveSubstrate {
             text: CognitiveSubstrate.feltLineText(parts: rendered, object: object, second: second),
             family: parts.family,
             carriedObject: object != nil,
-            carriedAmbivalence: second != nil,
-            bareText: CognitiveSubstrate.feltLineText(parts: rendered, object: nil, second: second))
+            leadWord: rendered.lead,
+            counterWord: second)
+    }
+
+    /// The frame and the association selectors share the frozen care disclosure and rejection boundary.
+    static func capsuleReachableCares(for request: CognitiveCapsuleRequest, from read: CognitiveFrozenRead) -> [CognitiveCare] {
+        let speaker = request.speaker.map { CognitiveCareProvenance.personKey($0, aliases: read.carePersonAliases) }
+            .flatMap { read.carePeopleAvailable || CognitiveCareProvenance.independentPersonKey($0) ? $0 : nil }
+        let terms = associationTerms(in: request.userMessage)
+        return read.cares.filter { care in
+            care.fadedAt == nil && !read.associationSuppressions.contains {
+                $0.source == "care:" + care.id.uuidString && suppressionCovers($0.terms, messageTerms: terms)
+            } && (care.with.isEmpty || speaker == CognitiveCare.ownerKey || speaker.map(care.with.contains) == true)
+        }
+    }
+
+    /// Descriptions cover quiet states too; missing chemistry never becomes a feeling. Warmth and bracing are independent dimensions.
+    private static func frameFeelingWords(
+        request: CognitiveCapsuleRequest, read: CognitiveFrozenRead, leadWord: String?
+    ) -> [(axis: String, word: String)] {
+        var words: [(axis: String, word: String)] = []
+        var tension: Double?
+        if frameCognitionAvailable(read) {
+            let mood = read.mood.valence
+            let arousal = read.affect.arousal
+            words += [
+                ("mood", mood >= 0.22 ? "good in myself" : mood <= -0.20 ? "a little heavy" : "even in myself"),
+                ("energy", arousal >= 0.52 ? "keyed up" : arousal <= 0.28 ? "quiet" : "engaged"),
+            ]
+            if let leadWord { words.append(("feeling", leadWord)) }
+            tension = read.affect.uncertainty
+        }
+        if let chemistry = request.organismProjection?.chemicalState {
+            if let uncertainty = tension { tension = max(uncertainty, chemistry.vigilance) }
+            else { tension = chemistry.vigilance }
+            words += [
+                ("warmth", chemistry.warmth >= 0.60 ? "warm and open" : chemistry.warmth >= 0.22 ? "quietly warm" : "reserved"),
+                ("curiosity", chemistry.curiosity >= 0.60 ? "keenly curious" : chemistry.curiosity >= 0.22 ? "curious" : "not drawn toward novelty"),
+                ("fatigue", chemistry.fatigue >= 0.55 ? "worn" : chemistry.fatigue >= 0.24 ? "a little tired" : "not tired"),
+            ]
+        }
+        if let tension { words.append(("tension", tension >= 0.60 ? "braced" : tension >= 0.22 ? "a little braced" : "unbraced")) }
+        return words
+    }
+
+    static func frameCognitionAvailable(_ read: CognitiveFrozenRead) -> Bool {
+        guard read.configuration.persistenceEnabled else { return true }
+        let health = read.snapshot.persistenceHealth
+        return !health.writesBlocked && (health.status == .healthy || health.status == .degraded)
+    }
+
+    /// Presentation remembers only the described dimensional family, so a shift means a difference from a whole delivered frame.
+    func feelingFrame(
+        request: CognitiveCapsuleRequest,
+        read: CognitiveFrozenRead,
+        dreamFeeling: String,
+        leadWord: String?,
+        counterWord: String?,
+        presentationState: inout CognitiveCapsulePresentationState
+    ) -> CognitiveFeelingFrame {
+        let words = Self.frameFeelingWords(request: request, read: read, leadWord: leadWord)
+        var sentences = words.isEmpty ? [] : ["I feel " + words.map(\.word).joined(separator: ", ") + "."]
+        if !Self.frameCognitionAvailable(read) { sentences.append("My mood, energy and cares are unread just now.") }
+        if Self.frameCognitionAvailable(read), let counterWord { sentences.append("There is also something \(counterWord) underneath.") }
+        if request.organismProjection == nil { sentences.append("My body's warmth, curiosity and tiredness are unread just now.") }
+        if let shift = feelingShift(for: words, presentationState: &presentationState) { sentences.append(shift) }
+
+        let reachable = Self.frameCognitionAvailable(read) ? Self.capsuleReachableCares(for: request, from: read) : []
+        var charged: [(CognitiveCare, Double)] = []
+        for care in reachable {
+            let charge = abs(care.charge(at: read.fixedAt))
+            if charge > 0 { charged.append((care, charge)) }
+        }
+        charged.sort { left, right in left.1 != right.1 ? left.1 > right.1 : left.0.id.uuidString < right.0.id.uuidString }
+        let cares = charged.prefix(2).map { care, _ in
+            let movement = care.story.last { $0.moved != 0 && $0.at <= read.fixedAt }
+            let subject: String
+            if care.origin == .seed, let movement, !movement.note.isEmpty { subject = movement.note }
+            else { subject = care.about }
+            let felt = movement.flatMap { $0.felt.isEmpty ? nil : $0.felt }
+            return capsuleLineText(subject, maxCharacters: 90) + (felt.map { " (\($0))" } ?? "")
+        }
+        if !cares.isEmpty { sentences.append("On my mind: \(cares.joined(separator: "; ")).") }
+        if !read.carePeopleAvailable { sentences.append("The people my cares belong with are unread just now.") }
+        sentences.append(dreamFeeling)
+        let paragraph = sentences.joined(separator: " ").components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }.joined(separator: " ")
+        let counter = Self.frameCognitionAvailable(read) ? counterWord.map { [$0] } ?? [] : []
+        return CognitiveFeelingFrame(paragraph: paragraph, words: words.map(\.word) + counter)
     }
 
     /// Only the dominant node agreeing with the felt family's sign may name its object. Capsule and introspection share this attribution boundary.

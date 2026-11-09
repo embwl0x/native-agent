@@ -24,7 +24,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
         "capabilities",
         "persona",
         ".onboarded",
-        "scheduler/jobs.json",
+        "clock/times.json",
         "connectors/registry.json",
         "connectors/workspaces.json",
     ]
@@ -86,7 +86,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
                 navigation references and draft inputs; off-disk backup excludes lock and temporary sidecars; no local backup, production export, or \
                 phone sync
                 """),
-            Spec(id: "her_screen", title: "Her Screen", relativePath: "her_screen", detail: """
+            Spec(id: "her_screen", title: "My Screen", relativePath: "her_screen", detail: """
                 stable screen names, touched items, last-seen marks, acknowledgement stamps, app maps and retained quarantine bytes; off-disk backup \
                 only; no local backup, production export, or phone sync
                 """),
@@ -94,8 +94,8 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
                 detail: "notice part's per-app/version offer and dismissal state; off-disk backup only; no local backup, production export, or phone copy"),
             Spec(id: "memory", title: "Memory", relativePath: "memory", detail: "semantic memories, recall indexes, and knowledge graph state"),
             Spec(id: "chat", title: "Chat", relativePath: "chat", detail: """
-                chat sessions, messages, archives, retained tool results, pins, prefix replay and session scratch state; local backups also carry \
-                turn lifecycle and attachments; separate per-session Markdown export
+                chat sessions, messages, archives, retained tool results, pins, prefix replay and session scratch with private working memory; \
+                local backups also carry turn lifecycle and attachments; separate per-session Markdown export
                 """),
             Spec(id: "context", title: "Context", relativePath: "context", detail: """
                 derived ContextFlow SQLite generations, session directives and update-delivery notes
@@ -197,7 +197,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
                 export, or phone sync
                 """),
             Spec(id: "workflows", title: "Workflows", relativePath: "workflows", detail: "workflow templates, approvals, and retained retired run history"),
-            Spec(id: "scheduler", title: "Scheduler", relativePath: "scheduler", detail: "Swift scheduled jobs and trigger records"),
+            Spec(id: "clock", title: "Clock", relativePath: "clock", detail: "declared times and their delivery or withdrawal evidence"),
             Spec(id: "triggers", title: "Triggers", relativePath: "triggers",
                 detail: "config and last-fire state; off-disk backup only; no local backup, production export, or trigger-file phone snapshot"),
             Spec(id: "telegram", title: "Telegram", relativePath: "telegram", detail: """
@@ -210,7 +210,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
             Spec(id: "mobile_snapshot_cache", title: "Phone Sync Cache", relativePath: "mobile_snapshot_cache",
                 detail: "phone snapshots/responses and local transaction ledger; no backup or export"),
             Spec(id: "improvements", title: "Self Improvement", relativePath: "improvements", detail: "evaluation gauntlet records"),
-            Spec(id: "benchmark", title: "Retained Benchmarks", relativePath: "harness/benchmark",
+            Spec(id: "benchmark", title: "Retained Benchmarks", relativePath: "body/benchmark",
                 detail: """
                     orphaned benchmark receipts; no live reader or writer; excluded from backups, export and phone sync; \
                     retained for the owner to decide
@@ -264,8 +264,8 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
                 detail: "release reports; support copies this tree; excluded from local backup and direct phone copy"),
             Spec(id: "cutover", title: "Cutover Records", relativePath: "cutover",
                 detail: "retained cutover records; support copies this tree; excluded from local backup and direct phone copy"),
-            Spec(id: "harness", title: "Learning Receipts", relativePath: "harness",
-                detail: "retained harness records; support selects learning_receipts.jsonl; excluded from all backups and direct phone copy"),
+            Spec(id: "body", title: "Learning Receipts", relativePath: "body",
+                detail: "retained body records; support selects learning_receipts.jsonl; excluded from all backups and direct phone copy"),
             Spec(id: "install", title: "Install Identity", relativePath: "install",
                 detail: "InstallPaths public data-root marker; excluded from local backup, archive inputs and phone sync"),
             Spec(id: "workspace", title: "Workspace", relativePath: "workspace", detail: """

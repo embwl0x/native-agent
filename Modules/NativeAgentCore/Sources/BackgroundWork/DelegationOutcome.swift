@@ -4,8 +4,8 @@ import AgentWorkspace
 import BackgroundLoops
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `DelegationOutcome.swift` | Owner-proven terminal outcomes remain distinct from stalls |
-// Terminal outcomes and stalls stay distinct; durable cursor progress requires card settlement.
+// Blueprint: | `DelegationOutcome.swift` | Owner-proven terminal outcomes; durable cursor progress requires card settlement |
+// Durable cursor progress requires card settlement.
 
 
 public struct DelegationJobsRead: Sendable, Equatable {
@@ -58,7 +58,7 @@ extension DelegationReadout {
         if completedAt != nil { return true }
         // POST settlement, rather than execution completion alone, makes delivery terminal.
         if isDelivering { return false }
-        if stallBasis == .terminal { return true }
+        if deliverySettled { return true }
         if let statusWord, Self.terminalStatusWords.contains(statusWord) { return true }
         return false
     }
@@ -98,10 +98,6 @@ extension DelegationReadout {
             phase = .blocked
             verification = .unknown
             next = "Inspect the retained result and resolve the original completion route before explicitly delivering it. Do not rerun the worker."
-        } else if stalled && !isTerminal {
-            phase = .blocked
-            verification = .pending
-            next = "Fresh bridge liveness or a terminal runner outcome."
         } else {
             switch terminalOutcome {
             case .succeeded:

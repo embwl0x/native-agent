@@ -6,7 +6,7 @@ import MemoryV2
 import TrustCenter
 import NativeAgentShared
 import DeviceSync
-// Blueprint: | `EngineMemory.swift` | `refreshStatuses`, `proposals(status:)`, `graphSnapshot`, `ProposalRecord`; Canonical memory projections |
+// Blueprint: | `EngineMemory.swift` | Canonical memory projections; lifecycle-bound SQLite/WAL graph observation through the shared LatestRead snapshot |
 
 /// Share MemoryV2 and Knowledge Graph owners per root across observable pages and phone reads.
 @MainActor
@@ -16,16 +16,28 @@ public final class MemoryFacade {
     private var embeddingSource: (owner: SwiftNativeMemoryV2, runtime: ManagedEmbeddingProvider)?
     @ObservationIgnored private let embeddingsRead = LatestRead()
     public private(set) var embeddingsError: String?
-    public var embeddingSnapshot: EmbeddingRuntimeSnapshot? {
-        embeddingSource?.runtime.snapshot()
+    /// The runtime snapshot checks saved configuration and installed models. Observe its source and runtime where each is owned, off main for disk work.
+    public func readEmbeddingSnapshot(onChange: (@Sendable () -> Void)? = nil) async -> EmbeddingRuntimeSnapshot? {
+        if embeddingSource == nil { await loadEmbeddings() }
+        let runtime: ManagedEmbeddingProvider?
+        if let onChange {
+            runtime = withObservationTracking { embeddingSource?.runtime } onChange: { onChange() }
+        } else { runtime = embeddingSource?.runtime }
+        guard let runtime else { return nil }
+        return await Task.detached(priority: .userInitiated) {
+            if let onChange {
+                return withObservationTracking { runtime.snapshot() } onChange: { onChange() }
+            }
+            return runtime.snapshot()
+        }.value
     }
 
-    public func loadEmbeddings() async {
+    private func loadEmbeddings() async {
         _ = await embeddingsRead.read { () async -> Result<(owner: SwiftNativeMemoryV2, runtime: ManagedEmbeddingProvider), Error> in
-            do { return .success(try await Task.detached {
-                let owner = self.owner
-                return (owner, try await owner.managedEmbeddingRuntime())
-            }.value) }
+            do {
+                let owner = await resolveOwner()
+                return .success((owner, try await owner.managedEmbeddingRuntime()))
+            }
             catch { return Result<(owner: SwiftNativeMemoryV2, runtime: ManagedEmbeddingProvider), Error>.failure(error) }
         } publish: { result in
             switch result {
@@ -35,6 +47,7 @@ public final class MemoryFacade {
         }
     }
     public func toggleEmbeddings(_ enabled: Bool) async throws {
+        if embeddingSource == nil { await loadEmbeddings() }
         guard let embeddingSource else { throw MemoryV2Error.storageUnavailable }
         try await embeddingSource.owner.configureEmbeddingBackendAndReindex(enabled: enabled)
     }
@@ -77,6 +90,8 @@ public final class MemoryFacade {
     public var totalCount: Int? { status?.counts?.active }
     public private(set) var diagnostics: MemoryV2NativeStackSnapshot = .empty
     public private(set) var diagnosticsCheckedAt: Date?
+    public private(set) var diagnosticsObservationIssue: String?
+    public func setDiagnosticsObservationIssue(_ issue: String?) { diagnosticsObservationIssue = issue }
     public private(set) var proposals: [ProposalRecord] = [] {
         didSet { proposalsDidChange?() }
     }
@@ -110,19 +125,26 @@ public final class MemoryFacade {
     public var graphTotalEdges: Int? { graphSnapshot?.canvasEdges.count }
     public private(set) var graphLoading = false
     public private(set) var graphLoadError: String?
+    public private(set) var graphObservationError: String?
     @ObservationIgnored private var graphRead: Task<Void, Never>?
-    @ObservationIgnored private var graphReadsRequested = 0
+    @ObservationIgnored private var graphReadRequested = false
 
     public nonisolated init(dataRoot: URL) {
         self.dataRoot = dataRoot
     }
 
-    /// Default roots share the canonical writer; override roots isolate it so reads and buttons still address one store.
-    nonisolated private var owner: SwiftNativeMemoryV2 {
+    /// Canonical-root resolution reads symlinks and may open storage; every facade caller suspends main first.
+    /// Default roots share the canonical writer; override roots keep their existing isolation.
+    @concurrent private nonisolated func resolveOwner() async -> SwiftNativeMemoryV2 {
         SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
     }
 
     // MARK: - Reads
+
+    /// Keep kind reads on the memory owner's list policy, including its full result set and errors.
+    public nonisolated func listMemory(kind: String?) async throws -> [MemoryV2.MemoryRecord] {
+        try await resolveOwner().listMemory(kind: kind)
+    }
 
     public func refreshDiagnostics() async {
         _ = await diagnosticsRead.read {
@@ -135,19 +157,22 @@ public final class MemoryFacade {
 
     public func refreshEmbeddingDiagnostics() async {
         await refreshDiagnostics()
-        for _ in 0..<10 where diagnostics.shouldPollEmbeddingStartup {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            if Task.isCancelled { return }
+        let changes = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        defer { changes.continuation.finish() }
+        var iterator = changes.stream.makeAsyncIterator()
+        while !Task.isCancelled {
+            guard let runtime = await readEmbeddingSnapshot(onChange: { changes.continuation.yield(()) }) else { return }
             _ = await diagnosticsRead.read {
                 var snapshot = diagnostics
-                snapshot.applyEmbeddingRuntime(await owner.embeddingRuntimeSnapshot())
+                snapshot.applyEmbeddingRuntime(runtime)
                 return snapshot
             } publish: { diagnostics = $0 }
+            guard await iterator.next() != nil else { return }
         }
     }
 
     /// Resolve search hits by id even outside the bounded newest-memory list.
-    public nonisolated func activeMemories(ids: [String]? = nil, limit: Int? = 200) async throws -> [MemoryV2.MemoryRecord] {
+    @concurrent public nonisolated func activeMemories(ids: [String]? = nil, limit: Int? = 200) async throws -> [MemoryV2.MemoryRecord] {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let stored: [StoredMemory]
         if let ids {
@@ -183,7 +208,7 @@ public final class MemoryFacade {
         return try result.get()
     }
 
-    private nonisolated func readProposals(status: String) async throws -> [ProposalRecord] {
+    @concurrent private nonisolated func readProposals(status: String) async throws -> [ProposalRecord] {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         return try await storage.listProposals(status: status)
             .filter { status != "pending" || SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }
@@ -232,28 +257,28 @@ public final class MemoryFacade {
     /// Resolve and open the memory store off the caller’s actor because it may migrate.
     /// These page mutations have no chat turn or sense-read ledger.
     public nonisolated func store(content: String, source: String, metadata: JSONValue?) async throws {
-        _ = try await owner.store(content: content, source: source, metadata: metadata,
-            context: MemoryWriteContext(turn: nil, senseReads: nil))
+        _ = try await resolveOwner().store(content: content, source: source, metadata: metadata,
+            context: MemoryWriteContext(turn: nil, senseReads: nil, telling: MemoryDataProvenance.toldByPerson(dataRoot: dataRoot)))
     }
 
     /// Merge only `pinned` within the canonical transaction.
     public nonisolated func setPinned(_ pinned: Bool, id: String) async throws {
         do {
-            _ = try await owner.updateMemory(id: id, update: .object(["pinned": .bool(pinned)]),
-                context: MemoryWriteContext(turn: nil, senseReads: nil))
+            _ = try await resolveOwner().updateMemory(id: id, update: .object(["pinned": .bool(pinned)]),
+                context: MemoryWriteContext(turn: nil, senseReads: nil, telling: nil))
         } catch MemoryV2Error.recordNotFound {
             throw Self.notFound(id)
         }
     }
 
     public nonisolated func delete(id: String) async throws {
-        guard try await owner.deleteMemoryIfPresent(id: id) else { throw Self.notFound(id) }
+        guard try await resolveOwner().deleteMemoryIfPresent(id: id) else { throw Self.notFound(id) }
     }
 
     public func accept(proposalID: String,
         publish: @MainActor @Sendable (_ change: () -> Void) -> Void = { $0() }
     ) async throws -> MemoryV2.MemoryRecord {
-        let accepted = try await owner.acceptProposal(id: proposalID, context: MemoryWriteContext(turn: nil, senseReads: nil))
+        let accepted = try await resolveOwner().acceptProposal(id: proposalID, context: MemoryWriteContext(turn: nil, senseReads: nil, telling: nil))
         proposalsRead.write { publish { proposals.removeAll { $0.id == proposalID } } }
         return accepted
     }
@@ -261,7 +286,7 @@ public final class MemoryFacade {
     public func reject(proposalID: String, reason: String,
         publish: @MainActor @Sendable (_ change: () -> Void) -> Void = { $0() }
     ) async throws {
-        _ = try await owner.rejectProposal(id: proposalID, reason: reason.isEmpty ? nil : reason)
+        _ = try await resolveOwner().rejectProposal(id: proposalID, reason: reason.isEmpty ? nil : reason)
         proposalsRead.write { publish { proposals.removeAll { $0.id == proposalID } } }
     }
 
@@ -274,9 +299,9 @@ public final class MemoryFacade {
     // MARK: - Search
 
     /// Clear recall for queries under three characters; resolve kept records through canonical ids. A face refresh re-ranks without recording another use.
-    public func search(query: String, recordingUsage: Bool = true) async {
+    @discardableResult
+    public func search(query: String, recordingUsage: Bool = true) async -> MemorySearchReading {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prior = lastSuccessfulSearch
         searchRead.write {
             searchQuery = trimmed
             searchResultQuery = nil
@@ -284,24 +309,25 @@ public final class MemoryFacade {
             searchResults = nil
             searchError = nil
         }
-        if trimmed.count < 3 {
-            searchIsLoading = false
-            return
+        guard let reading = await readSearch(recordingUsage: recordingUsage) else {
+            return MemorySearchReading(query: trimmed, records: nil, issue: nil)
         }
+        return reading
+    }
+
+    /// Re-rank the owner's current query without setting it again or crediting another use. Query selection and read admission share main.
+    public func refreshSearch() async {
+        _ = await readSearch(recordingUsage: false)
+    }
+
+    private func readSearch(recordingUsage: Bool) async -> MemorySearchReading? {
+        guard let trimmed = searchQuery, trimmed.count >= 3 else { return nil }
+        let prior = lastSuccessfulSearch
         // Failed reads retain proven rows with their actual query, never a substitute search.
-        _ = await searchRead.read { () -> (String?, [MemoryV2.MemoryRecord]?, String?, [String]) in
-            do {
-                try await Task.sleep(nanoseconds: 150_000_000)
-            } catch {
-                return (nil, nil, nil, [])
-            }
-            let owner = owner
+        let reading = await searchRead.read { () -> (String?, [MemoryV2.MemoryRecord]?, String?, [String]) in
             do {
                 // Credit usage only after accepted publication, never retrieval.
-                let response = try await owner.recall(
-                    MemoryV2RecallRequest(text: trimmed, topK: 50, persona: nil),
-                    recordingUsage: false
-                )
+                let response = try await recallForSearch(trimmed)
                 var seen = Set<String>()
                 let hitIDs = response.hits.compactMap { hit -> String? in
                     guard case .object(let obj)? = hit.extras,
@@ -324,13 +350,49 @@ public final class MemoryFacade {
             if error == nil, let query, let records { lastSuccessfulSearch = (query, records) }
             // Credit exactly the delivered recall rows; the next serve repairs a dropped asynchronous usage bump.
             if !Task.isCancelled, !deliveredIDs.isEmpty {
-                let owner = owner
-                Task { try? await owner.recordRecallHits(ids: deliveredIDs) }
+                Task { await recordSearchHits(ids: deliveredIDs) }
             }
         }
+        return MemorySearchReading(query: trimmed, records: reading.2 == nil ? reading.1 : nil, issue: reading.2)
+    }
+
+    private nonisolated func recallForSearch(_ query: String) async throws -> MemoryV2RecallResponse {
+        try await resolveOwner().recall(MemoryV2RecallRequest(text: query, topK: 50, persona: nil), recordingUsage: false)
+    }
+
+    private nonisolated func recordSearchHits(ids: [String]) async {
+        do { try await resolveOwner().recordRecallHits(ids: ids) }
+        catch { nativeLog("Memory search: delivered-hit usage could not be recorded (%@)", error.localizedDescription) }
     }
 
     // MARK: - Knowledge Graph
+
+    /// A mounted graph owns its subscription, not another copy of the graph. Watch SQLite and its live WAL before reading.
+    @concurrent public nonisolated func watchGraphChanges() async {
+        let changes = FileChangeEvents(paths: [graphPath, URL(fileURLWithPath: graphPath.path + "-wal")], emitInitial: false)
+        await withTaskCancellationHandler {
+            let armed = await changes.waitUntilArmed()
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                graphObservationError = armed ? nil : "Knowledge graph live updates could not be observed. Reopen the graph to check again."
+            }
+            await loadGraph()
+            guard !Task.isCancelled else { return }
+            if await graphLoadError == nil { await refreshDiagnostics() }
+            for await _ in changes.stream {
+                guard !Task.isCancelled else { break }
+                await loadGraph()
+            }
+            if !Task.isCancelled, armed {
+                await MainActor.run {
+                    graphObservationError = "Knowledge graph live observation stopped. Reopen the graph to check again; the displayed snapshot is retained."
+                }
+            }
+        } onCancel: {
+            Task.detached(priority: .utility) { changes.cancel() }
+        }
+        changes.cancel()
+    }
 
     nonisolated private var graphPath: URL {
         dataRoot
@@ -345,13 +407,12 @@ public final class MemoryFacade {
     /// Keep the prior snapshot with its error on failure. Share one graph read across mounts; joining refreshes get a fresh trailing read so captured bytes
     /// cannot predate the change.
     public func loadGraph() async {
-        graphReadsRequested += 1
+        graphReadRequested = true
         if graphRead == nil {
             graphRead = Task {
                 graphLoading = true
-                var served = 0
-                while served < graphReadsRequested {
-                    served = graphReadsRequested
+                while graphReadRequested {
+                    graphReadRequested = false
                     await readGraph()
                 }
                 graphLoading = false

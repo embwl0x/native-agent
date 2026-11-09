@@ -19,13 +19,9 @@ extension CloudKitDeviceTransport {
     /// CloudKit builds the alert from the record even without app execution. Requested results are chat records, so they cannot match this
     /// subscription.
     func subscribeToVisibleNotifications() async throws {
-        do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.subscribeToVisibleNotifications", onFailure: accountFailureReporter) {
-                let sub = Self.makeVisibleNotificationSubscription()
-                try await self.ensureSubscription(sub, id: sub.subscriptionID)
-            }
-        } catch is DeviceCKLandmineTimeout {
-            throw DeviceSyncError.transient(message: "CloudKit visible notification subscription timed out")
+        try await withDeviceCKOperation("CloudKitDeviceTransport.subscribeToVisibleNotifications", onFailure: accountFailureReporter) {
+            let sub = Self.makeVisibleNotificationSubscription()
+            try await self.ensureSubscription(sub, id: sub.subscriptionID)
         }
     }
 
@@ -81,22 +77,18 @@ extension CloudKitDeviceTransport {
         subscriptionID: String,
         label: String
     ) async throws {
-        do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.\(label)", onFailure: accountFailureReporter) {
-                let predicate = NSPredicate(value: true)
-                let sub = CKQuerySubscription(
-                    recordType: recordType,
-                    predicate: predicate,
-                    subscriptionID: subscriptionID,
-                    options: [.firesOnRecordCreation, .firesOnRecordUpdate]
-                )
-                let info = CKSubscription.NotificationInfo()
-                info.shouldSendContentAvailable = true
-                sub.notificationInfo = info
-                try await self.ensureSubscription(sub, id: subscriptionID)
-            }
-        } catch is DeviceCKLandmineTimeout {
-            throw DeviceSyncError.transient(message: "CloudKit \(label) timed out")
+        try await withDeviceCKOperation("CloudKitDeviceTransport.\(label)", onFailure: accountFailureReporter) {
+            let predicate = NSPredicate(value: true)
+            let sub = CKQuerySubscription(
+                recordType: recordType,
+                predicate: predicate,
+                subscriptionID: subscriptionID,
+                options: [.firesOnRecordCreation, .firesOnRecordUpdate]
+            )
+            let info = CKSubscription.NotificationInfo()
+            info.shouldSendContentAvailable = true
+            sub.notificationInfo = info
+            try await self.ensureSubscription(sub, id: subscriptionID)
         }
     }
 

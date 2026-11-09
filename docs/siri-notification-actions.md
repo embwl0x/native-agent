@@ -41,15 +41,17 @@ Native App Shortcuts expose six actions:
 Ask, Remember, Approve and Status require authentication and the current paired
 agent over CloudKit. Talk also requires the current paired agent and authentication,
 opens the app, and obtains microphone and Speech permission before listening.
+Cold approval actions read both the pending approvals and the synced Inbox face
+before sending its exact row call; they do not depend on a mounted phone scene.
 Its on-device recognition, voice and audio lifetime are described in
 [Talk mode](mobile_companion.md#talk-mode). New work needs the Mac awake with NativeAgent open.
-Ask/Remember wait up to 300 seconds on iOS 27, 25 on iOS 26, after sending.
-A timeout does not cancel the sent message: open the app for its reply;
-invoking the shortcut again sends a new message.
+Ask/Remember wait on the original correlation's reply or terminal event, intent
+cancellation or owner shutdown. Silence leaves that request pending; invoking
+the shortcut again creates a separate message.
 Chat and the intent share terminal classification. Explicit `reply`/`final`
 completes the intent; `error`, `cancelled` and signed rejection report failure.
 `incomplete` or a missing kind ends the wait with the received words and
-unconfirmed status, never success or a later “has not replied” timeout.
+unconfirmed status, never success inferred from silence.
 
 Notification Reply retains the text in its conversation's durable chat queue
 before delivery. A failed send stays queued for recovery in Chat.
@@ -60,6 +62,9 @@ Approve, Deny and Reply require foreground activation and authentication.
 Approve/Deny reread the canonical inbox, require a pending request with
 reviewable details, and use `ApprovalDecisionAction`, as the in-app buttons do.
 A normal notification click navigates without deciding the request.
+Approval and Desk destinations enter Advanced view from Simple or Agent view,
+independently of any chat shortcut overlay. A chat destination preserves the
+person's current view mode.
 
 The approval observer establishes a startup baseline for Mac banners. New
 pending requests retain their Mac and phone intents on the canonical card.

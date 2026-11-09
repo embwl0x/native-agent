@@ -26,7 +26,7 @@ public protocol MacAXEffectObservation: AnyObject, Sendable {
     func stop()
 }
 
-/// Live AX notifications require the main run loop.
+/// Live AX notifications use the dedicated AX run loop.
 public protocol MacAXEffectObserverSource: Sendable {
     /// An unavailable observer returns nil so callers report unobserved with a reason, never infer no effect.
     func install(
@@ -36,14 +36,13 @@ public protocol MacAXEffectObserverSource: Sendable {
     ) -> (any MacAXEffectObservation)?
 }
 
-/// Notifications arrive on the main run loop while the act waits off it, so the sink must be thread-safe.
+/// Notifications arrive on the AX thread while the act waits off it, so the sink must be thread-safe.
 public final class MacAXEffectCollector: @unchecked Sendable {
-    /// Cap retained events because apps can emit hundreds in milliseconds; still report the dropped count.
-    public static let hardCap = 64
-
     private let lock = NSLock()
-    private var received: [MacAXEffectNotification] = []
-    private var dropped = 0
+    private var firstNotification: MacAXEffectNotification?
+    private var batch: [String: MacAXEffectNotification] = [:]
+    private var total = 0
+    private var seenKinds: Set<String> = []
     private var pending = false
     private var waiter: AsyncStream<Void>.Continuation?
 
@@ -52,11 +51,10 @@ public final class MacAXEffectCollector: @unchecked Sendable {
     public func record(_ notification: MacAXEffectNotification) {
         lock.lock()
         defer { lock.unlock() }
-        if received.count < Self.hardCap {
-            received.append(notification)
-        } else {
-            dropped += 1
-        }
+        if total < Int.max { total += 1 }
+        seenKinds.insert(notification.kind)
+        batch[notification.kind] = notification
+        if firstNotification == nil { firstNotification = notification }
         pending = true
         waiter?.yield(())
     }
@@ -90,7 +88,8 @@ public final class MacAXEffectCollector: @unchecked Sendable {
                 for await _ in events { break }
             }
             group.addTask {
-                try? await Task.sleep(for: .seconds(max(0, seconds)))
+                do { try await Task.sleep(for: .seconds(max(0, seconds))) }
+                catch { return } // A signal or Stop cancels the patience task.
             }
             await group.next()
             group.cancelAll()
@@ -106,22 +105,23 @@ public final class MacAXEffectCollector: @unchecked Sendable {
         live?.finish()
     }
 
-    public func snapshot() -> [MacAXEffectNotification] {
-        lock.lock()
-        defer { lock.unlock() }
-        return received
+    /// Drain wake evidence without losing the first notification or lifetime counts and kinds.
+    func drain() -> [MacAXEffectNotification] {
+        lock.withLock {
+            let result = Array(batch.values).sorted { $0.at < $1.at }
+            batch.removeAll(keepingCapacity: true)
+            pending = false
+            return result
+        }
     }
+
+    func count() -> Int { lock.withLock { total } }
+    func kinds() -> [String] { lock.withLock { seenKinds.sorted() } }
 
     public func first() -> MacAXEffectNotification? {
         lock.lock()
         defer { lock.unlock() }
-        return received.first
-    }
-
-    public func droppedCount() -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return dropped
+        return firstNotification
     }
 }
 
@@ -166,7 +166,7 @@ private final class SystemMacAXEffectObservation: MacAXEffectObservation, @unche
                 AXObserverRemoveNotification(observer, element, kind as CFString)
             }
             CFRunLoopRemoveSource(
-                CFRunLoopGetMain(),
+                CFRunLoopGetCurrent(),
                 AXObserverGetRunLoopSource(observer),
                 .defaultMode
             )
@@ -177,7 +177,7 @@ private final class SystemMacAXEffectObservation: MacAXEffectObservation, @unche
     deinit { stop() }
 }
 
-/// AX delivers on the main run loop; creation and removal stay on MacAXExecutionLane.
+/// AX creation, delivery and removal share MacAXExecutionLane's run loop.
 public struct SystemMacAXEffectObserverSource: MacAXEffectObserverSource {
     public init() {}
 
@@ -211,7 +211,7 @@ public struct SystemMacAXEffectObserverSource: MacAXEffectObserverSource {
                 return nil
             }
             CFRunLoopAddSource(
-                CFRunLoopGetMain(),
+                CFRunLoopGetCurrent(),
                 AXObserverGetRunLoopSource(observer),
                 .defaultMode
             )

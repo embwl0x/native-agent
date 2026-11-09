@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -20,7 +21,7 @@ import ApplicationServices
 import UserNotifications
 #endif
 
-// Blueprint: | `MacScreenReadiness.swift` | `MacSessionState`, `MacWakeGuard`, `MacScreenLock.wakeIfCovered`, `SwiftNativeMacControl.handleWake`: Readiness |
+// Blueprint: | `MacScreenReadiness.swift` | Session readiness; event-judged automatic screen wake and caller-requested explicit settling |
 
 // MARK: - Login-session state
 
@@ -162,10 +163,24 @@ public enum MacScreenLock {
     }
 
     /// Focused-password evidence survives covered wakes; LatestRead orders publication.
-    public static var wakeFailed: Bool { wakeLock.withLock { passwordFocusedAfterWake == true } }
-    private static let wakeLock = NSLock()
-    @MainActor private static let wakeReads = LatestRead()
-    nonisolated(unsafe) private static var passwordFocusedAfterWake: Bool?
+    public static var wakeFailed: Bool { passwordFocusedAfterWake.withLock { $0 == true } }
+    private static let passwordFocusedAfterWake = Mutex<Bool?>(nil)
+    private typealias WakeResult = (before: MacSessionState, after: MacSessionState, mouseEvents: Int, keyEvents: Int)
+    private actor WakeReads {
+        private let latest = LatestRead()
+        func read(_ load: @Sendable () async -> Result<WakeResult, Error>) async -> Result<WakeResult, Error> {
+            await latest.read(load) { result in
+                passwordFocusedAfterWake.withLock { focused in
+                    if case .failure(let error) = result {
+                        focused = (error as? Covered)?.code == "mac_locked" ? true : nil
+                    } else if case .success(let wake) = result, !wake.after.obstructed {
+                        focused = false
+                    }
+                }
+            }
+        }
+    }
+    private static let wakeReads = WakeReads()
 
     public static func isLocked() -> Bool {
         defaultMacSessionStateSource().currentState().screenIsLocked
@@ -182,7 +197,7 @@ public enum MacScreenLock {
 
     /// Automatic readiness allows two nudges; explicit settling requests one even when uncovered, with observed evidence.
     @discardableResult
-    @MainActor public static func wakeIfCovered(
+    @concurrent public static func wakeIfCovered(
         source: any MacSessionStateSource = defaultMacSessionStateSource(),
         before: MacSessionState? = nil, keyTap: Bool = true, settleMs: Int? = nil,
         turn: Turn, context: MacOperationContext, beforeInput: @Sendable () async throws -> Void = {}) async throws -> (before: MacSessionState,
@@ -192,14 +207,6 @@ public enum MacScreenLock {
                 return .success(try await performWakeIfCovered(source: source, before: before, keyTap: keyTap, settleMs: settleMs, turn: turn,
                     context: context, beforeInput: beforeInput))
             } catch { return .failure(error) }
-        } publish: { result in
-            wakeLock.withLock {
-                if case .failure(let error) = result {
-                    passwordFocusedAfterWake = (error as? Covered)?.code == "mac_locked" ? true : nil
-                } else if case .success(let wake) = result, !wake.after.obstructed {
-                    passwordFocusedAfterWake = false
-                }
-            }
         }
         return try result.get()
     }
@@ -259,6 +266,28 @@ public enum MacScreenLock {
             for event in [move, back, shiftDown, shiftUp] {
                 event.setIntegerValueField(.eventSourceUserData, value: NativeAgentMacEventIdentity.sourceUserData)
             }
+            let collector = MacAXEffectCollector()
+            let signals = MacWaitSignals(collector: collector)
+            var observers: [(NotificationCenter, NSObjectProtocol)] = []
+            if settleMs == nil {
+                let distributed = DistributedNotificationCenter.default()
+                let notifications: [(NotificationCenter, Notification.Name)] = [
+                    (NSWorkspace.shared.notificationCenter, NSWorkspace.screensDidWakeNotification),
+                    (distributed, Notification.Name("com.apple.screensaver.didstop")),
+                    (distributed, Notification.Name("com.apple.screenIsUnlocked")),
+                ]
+                // Arm before posting input so a fast dismissal remains in the collector.
+                observers = notifications.map { center, name in
+                    let token = center.addObserver(forName: name, object: nil, queue: nil) { _ in
+                        collector.record(MacAXEffectNotification(kind: name.rawValue, at: Date()))
+                    }
+                    return (center, token)
+                }
+            }
+            defer {
+                for (center, token) in observers { center.removeObserver(token) }
+                signals.stop()
+            }
             for move in [move, back] {
                 try await beforeInput()
                 try Task.checkCancellation()
@@ -286,12 +315,20 @@ public enum MacScreenLock {
                 after = source.currentState()
                 return (before, after, mouseEvents, keyEvents)
             }
-            for _ in 0..<15 {
-                try await Task.sleep(for: .milliseconds(200))
+            var readFailure: Error?
+            let end = await macSettle("screen_wake", signals: signals, patience: 3) {
                 after = source.currentState()
-                if let reason = MacWakeGuard.nudgeRefusalReason(for: after) { throw Covered(detail: reason) }
-                if try !covered() { return (before, after, mouseEvents, keyEvents) }
+                do {
+                    if let reason = MacWakeGuard.nudgeRefusalReason(for: after) { throw Covered(detail: reason) }
+                    return try !covered()
+                } catch {
+                    readFailure = error
+                    throw error
+                }
             }
+            try Task.checkCancellation()
+            if let readFailure { throw readFailure }
+            if end == .held { return (before, after, mouseEvents, keyEvents) }
         }
         let loginWindow = try loginWindowUp()
         // Focused secure fields prove authentication UI; loginwindow alone may be a passwordless saver.

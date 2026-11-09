@@ -218,15 +218,15 @@ public actor SwiftNativeTelegramBot {
         let text = message?.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             // Numeric targets share the chat's send lane; usernames send directly.
-            return try await _tgRetryAfterFloodControl(chatId: Int(target)) {
+            return try await _tgSendInChatLane(chatId: Int(target)) {
                 let result = try await TelegramPollLoop._tgPostJSON(token: cfg.botToken, method: "sendMessage",
                     resultType: TelegramTestResult.self) {
                     try JSONSerialization.data(withJSONObject: [
                         "chat_id": target,
-                        "text": text?.isEmpty == false ? text! : "NativeAgent Telegram test reply: online."
+                        "text": text.flatMap { $0.isEmpty ? nil : $0 } ?? "NativeAgent Telegram test reply: online."
                     ])
                 }
-                return result.value
+                return try result.value
             }
         } catch let failure as TelegramAPIFailure {
             throw failure
@@ -258,18 +258,15 @@ public actor SwiftNativeTelegramBot {
     }
 }
 
-/// getUpdates owns its connection pool and replaces it after two consecutive timeouts.
+/// getUpdates retains one connection pool; a transport failure returns without replacing it.
 public actor TelegramLongPollSession {
     /// Every successful response wakes health readers; disk checkpoints retain their cadence.
     public static let successfulPoll = Notification.Name("TelegramLongPollSession.successfulPoll")
-    private(set) var current = URLSession(configuration: .ephemeral)
-    private var consecutiveTimeouts = 0
+    let current = URLSession(configuration: .ephemeral)
     public private(set) var lastSuccessfulPollAt: Date?
     private var lastHealthCheckpointAt: Date?
 
     public init() {}
-
-    func recordResponse() { consecutiveTimeouts = 0 }
 
     func recordSuccessfulPoll() -> Bool {
         let now = Date()
@@ -281,13 +278,6 @@ public actor TelegramLongPollSession {
         return true
     }
 
-    func recordTimeout() {
-        consecutiveTimeouts += 1
-        guard consecutiveTimeouts >= 2 else { return }
-        current.invalidateAndCancel()
-        current = URLSession(configuration: .ephemeral)
-        consecutiveTimeouts = 0
-    }
 }
 
 extension SwiftNativeTelegramBot {
@@ -309,20 +299,18 @@ extension SwiftNativeTelegramBot {
         }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
-        req.timeoutInterval = max(TimeInterval(timeoutSeconds + 10), 35)
+        req.timeoutInterval = max(TimeInterval(timeoutSeconds) + 10, 35)
 
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await session.current.data(for: req)
-            await session.recordResponse()
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as URLError where error.code == .cancelled {
             // Preserve URLSession cancellation so shutdown is not reported as an outage.
             throw CancellationError()
         } catch {
-            if (error as? URLError)?.code == .timedOut { await session.recordTimeout() }
             // Preserve the transport error cause for diagnosis and offline classification.
             throw TelegramBotError.underlying(String(describing: error))
         }

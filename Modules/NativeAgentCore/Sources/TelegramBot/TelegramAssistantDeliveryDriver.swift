@@ -66,7 +66,6 @@ actor TelegramAssistantDeliveryDriver {
     private let sendRichFinal: SendRichFinal
     private let editRichMessage: EditRichMessage
     private let deleteMessage: DeleteMessage
-    private let richDraftInterval: TimeInterval = 1.0 // Telegram allows ~1 edit/s per chat.
     private let recordFailure: FailureRecorder
     private let persistDelivery: PersistDelivery
     private let sendGeneratedImage: @Sendable (String, Data) async throws -> Void
@@ -74,12 +73,12 @@ actor TelegramAssistantDeliveryDriver {
 
     private var terminal = false
     private var draftsUnavailable = false
-    private var lastRichDraftAt = Date.distantPast
     private var pendingRichText: String?
     private var accumulatedText = ""
     private var richDraftFlush: Task<Void, Never>?
-    private var draftSpacing: Task<Void, Error>?
     private var groupDelivery: TelegramAssistantDeliveryState?
+    /// Only accepted renderings suppress edits. A new driver has no wire evidence yet.
+    private var renderedGroupPackets: [Int: TelegramInputRichMessage] = [:]
 
     init(
         token: String,
@@ -128,26 +127,12 @@ actor TelegramAssistantDeliveryDriver {
 
     private func flushRichDrafts() async {
         while pendingRichText != nil, !terminal, !draftsUnavailable {
-            let wait = richDraftInterval - Date().timeIntervalSince(lastRichDraftAt)
-            if wait > 0 {
-                do {
-                    let delay = Task { try await Task.sleep(for: .seconds(wait)) }
-                    draftSpacing = delay
-                    try await delay.value
-                    draftSpacing = nil
-                } catch {
-                    break
-                }
-                continue
-            }
             guard let text = pendingRichText else { break }
             pendingRichText = nil
             let safeText = TelegramRichMessageRenderer.sanitize(TelegramRichMessageRenderer.stripBoldMarkers(text))
             // An opening fence has no visible block; let the next delta complete it before disabling the preview.
             let packets = TelegramRichMessageRenderer.render(safeText)
             guard let rich = packets.last else { continue }
-            // One task owns the wire and claims this window before the send.
-            lastRichDraftAt = Date()
             do {
                 if try await holdDelivery() { draftsUnavailable = true; break }
                 guard !terminal else { break }
@@ -169,7 +154,6 @@ actor TelegramAssistantDeliveryDriver {
 
     private func finishRichDrafts() async {
         pendingRichText = nil
-        draftSpacing?.cancel()
         // Private drafts have no durable identity and cannot overwrite a final.
         if destination.chatId > 0 { richDraftFlush?.cancel() }
         // A group create must retain its result before final delivery chooses between editing it and posting. Never abandon/cancel that wire call.
@@ -186,7 +170,9 @@ actor TelegramAssistantDeliveryDriver {
             if try await holdDelivery() { break }
             guard !terminal else { break }
             if let id = delivery.previewMessageIds?.dropFirst(index).first {
+                if renderedGroupPackets[id] == packet { continue }
                 try await editRichMessage(token, destination, id, packet)
+                renderedGroupPackets[id] = packet
                 tracePreviewAccepted(characters: text.count)
             } else {
                 delivery.outcomeUnknown = true
@@ -211,6 +197,7 @@ actor TelegramAssistantDeliveryDriver {
                 }
                 tracePreviewAccepted(characters: text.count)
                 delivery.previewMessageIds = (delivery.previewMessageIds ?? []) + [id]
+                renderedGroupPackets[id] = packet
                 delivery.outcomeUnknown = false
                 // Keep the known ID even if persistence throws: this process can still edit it; the saved unknown boundary protects a restart.
                 groupDelivery = delivery
@@ -356,7 +343,6 @@ actor TelegramAssistantDeliveryDriver {
         var rejected = delivery
         rejected.outcomeUnknown = false
         if let failure = error as? TelegramAPIFailure,
-           failure.httpStatus != 429, failure.errorCode != 429,
            (failure.httpStatus ?? 0) < 500, (failure.errorCode ?? 0) < 500 {
             let reason = TurnPresentationReducer.sanitized(String(describing: failure)) ?? "delivery failed"
             rejected.lastRejection = .init(

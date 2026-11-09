@@ -32,18 +32,6 @@ extension NativeAgentEngine {
 }
 extension NativeAgentEngine {
     @MainActor
-    public func observeSessionMessages(_ sessionID: String, finished: (Error?) -> Void) async {
-        let events = FileChangeEvents(paths: [dataRoot.appendingPathComponent("chat/messages/\(sessionID).jsonl")], emitInitial: true)
-        await withTaskCancellationHandler {
-            for await _ in events.stream {
-                guard !Task.isCancelled else { break }
-                var failure: Error?
-                await readMountedTranscript(sessionId: sessionID, failure: { failure = $0 })
-                finished(failure)
-            }
-        } onCancel: { events.cancel() }
-    }
-    @MainActor
     public func loadDetachedSessionMessages(
         _ sessionId: String, finished: ([String]) -> Void
     ) async {

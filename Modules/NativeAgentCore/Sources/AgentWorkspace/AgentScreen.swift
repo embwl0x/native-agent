@@ -287,7 +287,7 @@ package enum AgentScreen {
             + "page:desk/<handle> with app {page:\"desk\", item:<handle>}.",
         "Job rows: agent.read {job:<row id without job:>}. Queue: queue.done / queue.drop {id:<row id>}.",
         "Blocked steps: desk.wait {handle:<page:desk handle>, on:<card, message or debt id>}. Peer elevation: Trust > Connected agents.",
-        "Arrival rows: home.accept {id:<row id without arrival:>}. Repair: repair.let_go {id:<row id>, reason}.",
+        "Repair: repair.let_go {id:<row id>, reason}.",
         "Find: app {page:\"home\", find:\"…\"}.",
     ]
 

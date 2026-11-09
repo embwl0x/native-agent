@@ -1,6 +1,5 @@
 import Foundation
 import CryptoKit
-import Observation
 import PersistenceCore
 import Synchronization
 #if os(Linux)
@@ -12,17 +11,39 @@ import NativeAgentShared
 // Blueprint: | `EmbeddingModelDownload.swift` | `EmbeddingModelDownload`: checked resumable installation and convergence |
 
 /// One owner task survives navigation; status surfaces observe Core's push stream.
-@MainActor @Observable
+@MainActor
 public final class EmbeddingModelDownloadController {
+    public struct Update: Sendable {
+        public let status: EmbeddingDownloadStatus
+        public let activating: Bool
+    }
+
     public static let shared = EmbeddingModelDownloadController()
-    public var status = EmbeddingModelDownload.Status()
-    public var activating = false
+    public var status = EmbeddingDownloadStatus() { didSet { publishUpdate() } }
+    public var activating = false { didSet { publishUpdate() } }
+    private var observers: [UUID: AsyncStream<Update>.Continuation] = [:]
     private var lastDoctorInstallCompleted = false
     private var installCommitted = false
     private let downloader = EmbeddingModelDownload(dataRoot: PersistenceCore.defaultDataRoot())
     private var task: Task<Void, Never>?
     private var pauseTask: Task<Void, Never>?
     private var observation: Task<Void, Never>?
+
+    public func updates() -> AsyncStream<Update> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            observers[id] = continuation
+            continuation.yield(.init(status: status, activating: activating))
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.observers.removeValue(forKey: id) }
+            }
+        }
+    }
+
+    private func publishUpdate() {
+        let value = Update(status: status, activating: activating)
+        for observer in observers.values { observer.yield(value) }
+    }
 
     public func start(createOnly: Bool = true) {
         guard task == nil, pauseTask == nil else { return }
@@ -77,7 +98,7 @@ public final class EmbeddingModelDownloadController {
         }
     }
 
-    public func doctorSnapshot() async -> EmbeddingModelDownload.Status {
+    public func doctorSnapshot() async -> EmbeddingDownloadStatus {
         await downloader.currentStatus()
     }
 
@@ -93,18 +114,6 @@ public final class EmbeddingModelDownloadController {
 
 /// Keep standalone downloads separate from the serving model. PrivacyMap excludes extras/coreml and extras/.coreml-download from backup, export and phone sync.
 public actor EmbeddingModelDownload {
-    public struct Status: Sendable {
-        public var phase: String = "Not started"
-        public var completed: Int64 = 0
-        public var total: Int64 = 0
-        public var running = false
-        public var available = false
-        /// Set only by this operation's target commit, never by inspection of an already-current target. Cleanup has its own outcome.
-        public var installedRelease: String?
-        public var cleanupFailure: String?
-        public init() {}
-    }
-
     public struct ByteRange: Sendable, Equatable {
         public let start: Int64
         public let end: Int64
@@ -310,15 +319,15 @@ public actor EmbeddingModelDownload {
 
     private let root: URL
     private let descriptorURL: URL?
-    private var status = Status()
-    private var observers: [UUID: AsyncStream<Status>.Continuation] = [:]
+    private var status = EmbeddingDownloadStatus()
+    private var observers: [UUID: AsyncStream<EmbeddingDownloadStatus>.Continuation] = [:]
     public init(dataRoot: URL, bundle: Bundle = .main) {
         root = dataRoot
         descriptorURL = bundle.url(forResource: "embedding-download", withExtension: "json")
         status.available = descriptorURL != nil
     }
 
-    public func updates() -> AsyncStream<Status> {
+    public func updates() -> AsyncStream<EmbeddingDownloadStatus> {
         let id = UUID()
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             observers[id] = continuation
@@ -329,7 +338,7 @@ public actor EmbeddingModelDownload {
         }
     }
 
-    public func currentStatus() -> Status { status }
+    public func currentStatus() -> EmbeddingDownloadStatus { status }
 
     private func pauseMarker() throws -> URL? {
         guard let descriptor = try Self.configuredDescriptor(at: descriptorURL),
@@ -375,14 +384,15 @@ public actor EmbeddingModelDownload {
             nativeLog("[embedding-download] No bundled descriptor; download not required")
             return false
         }
-        status = Status()
+        status = EmbeddingDownloadStatus()
         status.available = true
         status.running = true
         publish("Checking memory model…")
         defer { status.running = false; publish() }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpMaximumConnectionsPerHost = 48
-        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForRequest = .infinity
+        configuration.timeoutIntervalForResource = .infinity
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
         do {

@@ -2,11 +2,10 @@ import Foundation
 
 // Blueprint: | `ChatMarkdownTable.swift` | `ChatMarkdownTableParser`: pure prose segmentation and alignment/cell parsing of transcript tables |
 
-// Parse prose as a pure cached projection so settled replies parse once without state or side effects.
 // Require both header and separator before a table so partial input cannot flicker into columns.
 
-public struct ChatMarkdownTable: Equatable, Sendable {
-    public enum Align: Equatable, Sendable { case leading, center, trailing }
+public struct ChatMarkdownTable: Equatable, Sendable, Codable {
+    public enum Align: Equatable, Sendable, Codable { case leading, center, trailing }
 
     public var header: [String]
     public var aligns: [Align]
@@ -21,11 +20,11 @@ public struct ChatMarkdownTable: Equatable, Sendable {
     public var columnCount: Int { max(header.count, rows.map(\.count).max() ?? 0) }
 
     public func align(_ column: Int) -> Align {
-        column < aligns.count ? aligns[column] : .leading
+        aligns.indices.contains(column) ? aligns[column] : .leading
     }
 
     public func cell(_ row: [String], _ column: Int) -> String {
-        column < row.count ? row[column] : ""
+        row.indices.contains(column) ? row[column] : ""
     }
 }
 
@@ -38,7 +37,6 @@ public enum ChatMarkdownTableParser {
     private static let cache = ChatContentCache<[ChatProseSegment]>()
 
     public static func segments(_ text: String) -> [ChatProseSegment] {
-        // Avoid parser allocation on ordinary prose: without a pipe there can be no table.
         guard text.contains("|") else { return [.text(text)] }
         if let hit = cache.lookup(text) { return hit }
 
@@ -60,7 +58,6 @@ public enum ChatMarkdownTableParser {
             if line.contains("|"), index + 1 < lines.count,
                let aligns = separatorAligns(lines[index + 1]) {
                 let header = cells(line)
-                // A separator must match the header before it proves a table.
                 if !header.isEmpty, aligns.count == header.count {
                     var body: [[String]] = []
                     var cursor = index + 2

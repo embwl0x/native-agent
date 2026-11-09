@@ -70,8 +70,11 @@ extension InlineInteractionResolver {
         carried.sources.forEach { taint.mark(peer: $0) }
         carried.elevated.forEach { taint.elevate(peer: $0) }
         do {
-            guard try DataRootLife.isCurrent(interaction.continuation?.lifeID, in: dataRoot) else { return nil }
+            let currentLife = try await Task.detached { try DataRootLife.isCurrent(interaction.continuation?.lifeID, in: dataRoot) }.value
+            guard currentLife else { return nil }
         } catch { nativeLog("[interaction] life identity is unavailable: \(error)"); return nil }
+        // The life read suspended; another tap may now hold this continuation.
+        guard resumesInFlight[interaction.id] == nil else { return nil }
         // A card tap/restart has no running parent. Its continuation is a new act; a waiting host keeps its own turn.
         guard let continuation = interaction.continuation else { return nil }
         let heldTurn = (host ?? Turn(run: continuation.resumeRunId, session: sessionID)).with(\.peerSteering, taint)
@@ -91,6 +94,7 @@ extension InlineInteractionResolver {
     ) async -> JSONValue? {
         var record = interaction
         record.continuation?.state = .claimed
+        record.continuation?.reason = nil
         do {
             try await persist(record, sessionID: sessionID, dataRoot: dataRoot, expecting: {
                 $0.revision == interaction.revision && $0.continuation?.state == .waiting
@@ -116,7 +120,8 @@ extension InlineInteractionResolver {
                 record.state = .settled(outcome)
             }
         } catch {
-            record = record.failed(reason: error.localizedDescription)
+            record.continuation?.reason = TurnSecretRedactor.redactText(error.localizedDescription)
+            record.revision += 1
             // A recoverable failure waits for an explicit retry; only Stop or deliberate invalidation permanently retires the continuation.
             record.continuation?.state = .waiting
         }
@@ -138,6 +143,11 @@ extension InlineInteractionResolver {
             }
         }
     }
+    /// Retry only the saved continuation, never the already completed setup or a checkpointed effect.
+    public static func retryContinuation(_ interaction: InlineInteraction, sessionID: String, dataRoot: URL, turn: Turn?) async throws {
+        guard interaction.continuationFailure != nil else { throw ResolveError.alreadySettled(interaction.state.name) }
+        await resumeOnce(interaction, sessionID: sessionID, dataRoot: dataRoot, turn: turn)
+    }
     private static func continueRequest(
         _ record: inout InlineInteraction, sessionID: String, dataRoot: URL, turn: Turn, servesRunningTurn: Bool
     ) async throws -> (JSONValue?, String?) {
@@ -156,7 +166,8 @@ extension InlineInteractionResolver {
             let witness = InlineInteractionSignatureWitness.Witness(
                 sessionID: sessionID, interactionID: record.id, continuation: continuation,
                 originEnvelope: origin, interaction: record)
-            guard InlineInteractionSignatureWitness.isStillSigned(witness) else {
+            let signed = await Task.detached { InlineInteractionSignatureWitness.isStillSigned(witness) }.value
+            guard signed else {
                 throw failure("This came from your iPhone and I can't verify that phone any more. "
                     + "Sign in from the phone again, then Try again.")
             }
@@ -168,7 +179,12 @@ extension InlineInteractionResolver {
         }
         // Every replay takes authority and routing from the card. A matching
         // host contributes its other parts; the answering door contributes neither.
-        let replayTurn = turn.with(\.envelope, origin).with(\.verifiedSessionID, sessionID)
+        var replayTurn = turn.with(\.envelope, origin).with(\.verifiedSessionID, sessionID)
+        if let ceiling = record.continuation?.fileAccessCeiling {
+            replayTurn.fileAccessCeiling = ceiling
+        } else if !servesRunningTurn {
+            throw failure("This card has no recorded file-access ceiling. Raise a new request from its originating conversation before continuing.")
+        }
         var hostResult: JSONValue?
         if let continuation = record.continuation, continuation.replayedAt == nil, record.state.outcome != nil,
            continuation.mode == .retryBlockedTool,
@@ -183,7 +199,16 @@ extension InlineInteractionResolver {
             guard replayedResumeRunIds.insert(runID).inserted else {
                 throw failure("The \(toolName) call already ran, but its saved result is unavailable.")
             }
-            switch await replayBlockedTool(toolName, arguments, sessionID, replayTurn) {
+            // A call the person decided resumes as the person's own act once the person answered its card: the gate admits that exact
+            // call once, with no second ask. Any other parked call (and arguments that do not read as one object) replays as the agent's.
+            // The person's act names the call held in memory when it parked; a replayed call that differs from it is judged as the agent's.
+            var replayAs = replayTurn
+            let personParked = PersonParkedCalls.take(record.id)
+            if let personParked {
+                replayAs = replayTurn.with(\.personAct, PersonAct(by: .card(id: record.id), tool: personParked.tool, input: personParked.input,
+                    spent: []))
+            }
+            switch await replayBlockedTool(toolName, arguments, sessionID, replayAs) {
             case .dispatched(let result):
                 hostResult = result.flatMap { try? JSONValue.parse(Data($0.utf8)) }
                 record.continuation?.replayedAt = Date()
@@ -193,6 +218,8 @@ extension InlineInteractionResolver {
                 }
             case .failed(let reason):
                 replayedResumeRunIds.remove(runID)
+                // The call never ran: the person's retry of the card resumes it as theirs again.
+                if let personParked { PersonParkedCalls.park(record.id, tool: personParked.tool, input: personParked.input) }
                 try Task.checkCancellation()
                 throw failure(reason)
             }
@@ -259,7 +286,8 @@ extension InlineInteractionResolver {
         }
         // Mark the session only after its checked read and mutations succeed.
         var reconciled = true
-        for (_, interaction) in interactionsByRow(in: read.rows, lifeID: read.lifeID) {
+        let pairs = await Task.detached { interactionsByRow(in: read.rows, lifeID: read.lifeID) }.value
+        for (_, interaction) in pairs {
             // A same-life control held by the departed process needs a new tap. A card waiting on macOS held nothing there: this launch's GrantWatch
             // resumes its walk at the item it recorded.
             if case .running = interaction.state, interaction.waitingOn == nil {
@@ -288,12 +316,12 @@ extension InlineInteractionResolver {
                     continuation?.mode == .retryBlockedTool && continuation?.replayedAt == nil
                     ? continuation?.toolName
                     : nil
-                let stranded = released.failed(
-                    reason: pendingCall.map {
+                let reason = pendingCall.map {
                         "The app closed while the \($0) call was running. "
                             + "I can't tell whether that ran. Check, then Try again."
                     } ?? "I can't tell whether that resumed. Try again."
-                )
+                released.continuation?.reason = reason
+                let stranded = released.state.outcome != nil || released.state == .declined ? released : released.failed(reason: reason)
                 do {
                     try await persist(
                         stranded, sessionID: sessionID, ifRevision: interaction.revision,
@@ -308,7 +336,9 @@ extension InlineInteractionResolver {
             if interaction.continuation?.state == .waiting {
                 switch interaction.state {
                 case .settled, .declined:
-                    await resumeOnce(interaction, sessionID: sessionID, dataRoot: dataRoot, turn: nil)
+                    if interaction.continuationFailure == nil {
+                        await resumeOnce(interaction, sessionID: sessionID, dataRoot: dataRoot, turn: nil)
+                    }
                 default:
                     break
                 }

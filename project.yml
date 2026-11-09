@@ -18,6 +18,9 @@ options:
 settings:
   SWIFT_VERSION: "6.0"
   ENABLE_USER_SCRIPT_SANDBOXING: NO
+  # Both app plists start with these keys; the body stamps both from VERSION.
+  CURRENT_PROJECT_VERSION: "0.0.0"
+  MARKETING_VERSION: "0.0.0"
 
 configFiles:
   Debug: Config/NativeAgent.xcconfig
@@ -44,6 +47,39 @@ packages:
   # END generated package requirements
 
 targets:
+  NativeAgentFace:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/NativeAgentFace
+        type: syncedFolder
+      - path: Resources/AppIcon.icns
+        buildPhase: resources
+      - path: docs/data-bounds.md
+        buildPhase: resources
+    dependencies:
+      - package: NativeAgentShared
+        product: NativeAgentShared
+      - package: Sparkle
+        product: Sparkle
+    info:
+      path: Config/NativeAgentFace-Info.plist
+      properties:
+        CFBundleDisplayName: NativeAgent
+        CFBundleIconFile: AppIcon
+        CFBundleIconName: AppIcon
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_MAC_BUNDLE_ID).face
+      PRODUCT_NAME: NativeAgentFace
+      GENERATE_INFOPLIST_FILE: YES
+      INFOPLIST_KEY_LSUIElement: NO
+      INFOPLIST_KEY_NSPrincipalClass: NSApplication
+      CODE_SIGN_ENTITLEMENTS: ""
+      PROVISIONING_PROFILE_SPECIFIER: ""
+      ENABLE_HARDENED_RUNTIME: YES
+      ENABLE_DEBUG_DYLIB: NO
+      SKIP_INSTALL: YES
+
   NativeAgentWidget:
     type: app-extension
     platform: macOS
@@ -163,6 +199,13 @@ targets:
             destination: resources
             subpath: NativeAgentChrome
     dependencies:
+      - target: NativeAgentFace
+        embed: true
+        link: false
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Helpers
       - target: NativeAgentWidget
         embed: true
       - target: NativeAgentChromeRelay
@@ -270,8 +313,8 @@ targets:
         CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
         CFBundleName: NativeAgent
         # Placeholders; the stamp phase below writes VERSION and the git identity.
-        CFBundleVersion: "0.0.0-dev"
-        CFBundleShortVersionString: "0.0.0-dev"
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
         NativeAgentSourceRevision: unknown
         NativeAgentSourceDirty: false
         NativeAgentSourceContentID: unknown
@@ -282,6 +325,8 @@ targets:
         NativeAgentBackgroundTaskIDPrefix: $(NATIVEAGENT_BACKGROUND_TASK_PREFIX)
         NativeAgentDeviceSync: $(NATIVEAGENT_DEVICE_SYNC)
         NativeAgentReleasePageURL: $(NATIVEAGENT_RELEASE_PAGE_URL)
+        # Her body has no Dock icon from its first instant; the window's app owns the Dock and menus.
+        LSUIElement: true
         CFBundleIconFile: AppIcon
         CFBundleIconName: AppIcon
         CFBundlePackageType: APPL
@@ -315,7 +360,6 @@ targets:
         BGTaskSchedulerPermittedIdentifiers:
           - $(NATIVEAGENT_BACKGROUND_TASK_PREFIX).dream_cycle
           - $(NATIVEAGENT_BACKGROUND_TASK_PREFIX).rem_cycle
-          - $(NATIVEAGENT_BACKGROUND_TASK_PREFIX).self_improvement_sweep
     postBuildScripts:
       # Runs before Xcode's CodeSign step, so everything here is sealed.
       - name: Stamp version, source identity, REPO_PATH, embedding model
@@ -339,14 +383,19 @@ targets:
           content_id="${NATIVEAGENT_SOURCE_CONTENT_ID:-$(nativeagent_source_content_id "$SRCROOT")}"
           short_version="${NATIVEAGENT_BUILD_SHORT_VERSION:-$version-dev.$sha$suffix}"
           widget="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/PlugIns/NativeAgentWidget.appex"
-          for version_plist in "$plist" "$widget/Contents/Info.plist"; do
+          face="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/NativeAgentFace.app"
+          for version_plist in "$plist" "$widget/Contents/Info.plist" "$face/Contents/Info.plist"; do
             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" \
               -c "Set :CFBundleShortVersionString $short_version" "$version_plist"
           done
-          # The embedded widget's signature must seal its stamped plist.
+          # The generated plist names the window's app after its product; the menu bar reads this name.
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName NativeAgent" "$face/Contents/Info.plist"
+          # Embedded signatures seal their stamped plists.
           if [[ "${CODE_SIGNING_ALLOWED:-NO}" == YES ]]; then
             /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
               --preserve-metadata=identifier,entitlements,flags "$widget"
+            /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
+              --preserve-metadata=identifier,entitlements,flags "$face"
           fi
           /usr/libexec/PlistBuddy -c "Set :NativeAgentSourceRevision $revision" \
             -c "Set :NativeAgentSourceContentID $content_id" \

@@ -1,4 +1,5 @@
 import Foundation
+import Experiences
 import GRDB
 import NativeAgentCore
 import PersistenceCore
@@ -11,13 +12,13 @@ import NativeAgentShared
 // Blueprint: | `MemoryStorage+Projections.swift` | `MemoryStorage`, `userPromptCore`: ordered derived hooks and user prompt core |
 
 extension MemoryStorage {
-    /// Debounce USER.md regeneration from canonical mutations.
+    /// Project canonical mutations through one USER.md owner.
     public func attachUserMDGenerator(_ generator: UserMDGenerator) async {
         guard !projectionsClosed else { await generator.shutdown(); return }
         guard userMDGenerator !== generator else { return }
         let previous = self.userMDGenerator
         self.userMDGenerator = generator
-        // Retire the replaced generator's deadline and accepted work.
+        // Join every accepted write before releasing the replaced generator.
         if let previous {
             let retirement = enqueueUserMDProjection { await previous.shutdown() }
             await retirement?.value
@@ -57,7 +58,16 @@ extension MemoryStorage {
 
     func pokeUserMDRegen(persona: String) {
         guard !projectionsClosed, let gen = userMDGenerator else { return }
-        _ = enqueueUserMDProjection { _ = try? await gen.requestRegeneration(persona: persona) }
+        _ = enqueueUserMDProjection {
+            do { try await gen.requestRegeneration(persona: persona) }
+            catch { await self.recordUserProjectionFailure(error, persona: persona) }
+        }
+    }
+
+    private func recordUserProjectionFailure(_ error: Error, persona: String) {
+        let dataRoot = path.deletingLastPathComponent().deletingLastPathComponent()
+        RepairOwed.owe(dataRoot, id: "user-projection:" + UUID().uuidString, kind: .act, operation: "memory.user_projection",
+            owner: "USER.md", words: "USER.md projection request failed for \(persona): \(error)")
     }
 
     private func enqueueUserMDProjection(_ operation: @escaping @Sendable () async -> Void) -> Task<Void, Never>? {
@@ -217,40 +227,25 @@ extension MemoryStorage {
         }
     }
 
-    /// Only userIdentityKinds enter the user prompt core; chosen pins or disclosure-filtered facts supply order, and empty results never restore unfiltered
-    /// USER.md.
-    public func userPromptCore(surface: String) async throws -> [String]? {
+    /// Carry disclosure-filtered person facts with pins first in pinned order, then the remaining facts newest first.
+    public func userPromptCore(surface: String) async throws -> [String] {
         let now = Date()
         let dataRoot = path.deletingLastPathComponent().deletingLastPathComponent()
         return try await dbPool.read { db in
-            let chosen = try Bool.fetchOne(db, sql: """
-                SELECT EXISTS(SELECT 1 FROM memory_metadata
-                    WHERE key = 'user_core_chosen' AND value = 1)
-            """) ?? false
-            if !chosen {
-                let rows = try Row.fetchAll(db, sql: """
-                    SELECT * FROM memories WHERE status = 'active' AND persona_id = ?
-                        AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-                    ORDER BY created_at DESC
-                """, arguments: [MemoryV2Defaults.personaID]).map(Self.decodeMemory).filter {
-                    MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: $0), at: now)?
-                        .permits(surface: surface, personaID: nil) == true
-                }
-                return Array(UserMDGenerator.userFacts(memories: rows, now: now, dataRoot: dataRoot))
-            }
-            return try Row.fetchAll(db, sql: """
-                SELECT * FROM memories WHERE status = 'active'
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT * FROM memories WHERE status = 'active' AND persona_id = ?
                     AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-                    AND json_extract(metadata_json, '$.pinned') = 1
-                    AND json_extract(metadata_json, '$.\(Self.pendingAdmissionKey)') IS NOT 1
-                ORDER BY COALESCE(json_extract(metadata_json, '$.pinned_order'), 0), created_at, id
-            """).map(Self.decodeMemory).map(MemoryRecord.init(stored:)).filter {
-                $0.memoryKind.map(UserMDGenerator.userIdentityKinds.contains) == true
-                    && MemoryRecordDisclosurePolicy.classify($0, at: now)?.permits(surface: surface, personaID: nil) == true
-            }.map { record in
-                MemoryDataProvenance.presentation(MemorySenseProvenance.presentation(record.text, metadata: record.extras),
-                    metadata: record.extras, dataRoot: dataRoot)
+                ORDER BY CASE WHEN json_extract(metadata_json, '$.pinned') = 1 THEN 0 ELSE 1 END,
+                    CASE WHEN json_extract(metadata_json, '$.pinned') = 1
+                        THEN COALESCE(json_extract(metadata_json, '$.pinned_order'), 0) END,
+                    CASE WHEN json_extract(metadata_json, '$.pinned') = 1 THEN created_at END,
+                    CASE WHEN json_extract(metadata_json, '$.pinned') = 1 THEN id END,
+                    created_at DESC
+            """, arguments: [MemoryV2Defaults.personaID]).map(Self.decodeMemory).filter {
+                MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: $0), at: now)?
+                    .permits(surface: surface, personaID: nil) == true
             }
+            return Array(UserMDGenerator.userFacts(memories: rows, now: now, dataRoot: dataRoot))
         }
     }
 }

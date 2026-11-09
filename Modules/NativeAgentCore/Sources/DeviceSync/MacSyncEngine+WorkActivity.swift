@@ -17,7 +17,7 @@ extension MacSyncEngine {
         }
     }
 
-    private func activity(_ experience: Experience) -> MobileWorkActivity? {
+    nonisolated static func activity(_ experience: Experience) -> MobileWorkActivity? {
         // Only the person's conversations reach their phone; worker answers belong to the requesting caller.
         guard experience.kind == .heard, let answer = experience.owes["answer"], answer.to.hasPrefix("conversation:"),
               let started = DeskActivityState.movementDate(experience.at) else { return nil }
@@ -39,7 +39,18 @@ extension MacSyncEngine {
             sessionID: destination.hasPrefix("conversation:") ? String(destination.dropFirst(13)) : nil,
             startedAt: started, content: .init(
                 title: String((experience.face?.words ?? "Conversation").prefix(96)), state: state,
-                status: status, updatedAt: DeskActivityState.movementDate(experience.updatedAt) ?? started))
+                status: status, updatedAt: DeskActivityState.movementDate(experience.updatedAt) ?? started, sequence: experience.sequence))
+    }
+
+    nonisolated static func workActivity(_ id: String, dataRoot: URL) async throws -> MobileWorkActivity {
+        let store = ExperienceStore.at(dataRoot)
+        await store.drained()
+        guard id.hasPrefix("turn:"),
+              let experience = try await store.experience(String(id.dropFirst(5))),
+              let row = activity(experience) else {
+            throw DeviceSyncError.underlying(message: "Work state is unavailable for \(id); its activity remains unresolved.")
+        }
+        return row
     }
 
     func requestWorkActivityPublication() {
@@ -52,11 +63,8 @@ extension MacSyncEngine {
         let generation = snapshotLifecycleGeneration
         workActivityPublicationTask = Task {
             defer { workActivityPublicationTask = nil }
-            do {
-                try await Task.sleep(for: .milliseconds(500))
-                guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
-                await writeSnapshots(scope: .workActivity)
-            } catch {}
+            guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
+            await writeSnapshots(scope: .workActivity)
         }
     }
 
@@ -71,20 +79,21 @@ extension MacSyncEngine {
                 experiences = []
                 unavailable = error.localizedDescription
             }
-            var rows = Array(experiences.compactMap(activity)
-                .sorted { $0.content.updatedAt > $1.content.updatedAt }.prefix(64))
-            if let unavailable {
-                rows.append(.init(id: "experience:unavailable", sessionID: nil, startedAt: Date(),
-                    content: .init(title: "Work state unavailable", state: .unknown,
-                        status: unavailable, updatedAt: Date())))
+            let rows = await MobileSnapshotBuilder.shared.build {
+                Array(experiences.compactMap(Self.activity).sorted {
+                    if $0.content.updatedAt != $1.content.updatedAt { return $0.content.updatedAt > $1.content.updatedAt }
+                    return $0.id < $1.id
+                }.prefix(64))
             }
-            guard let pairing = try PairingSecret.existingSecretBase64() else { return }
+            // A failed read has a reason, not a synthetic activity with invented source dates.
+            guard let pairing = try await sync.storage.perform({ try PairingSecret.existingSecretBase64() }) else { return }
             let configuration = await sync.apns.workActivityConfiguration(dataRoot: sync.dataRoot)
             var snapshot = MobileWorkActivitySnapshot(activities: rows,
                 pairingFingerprint: WorkActivityPushRegistration.fingerprint(pairing), pushConfigured: configuration.configured,
                 pushConfigurationError: configuration.error)
-            snapshot.experiences = experiences.map(\.mobile)
+            snapshot.experiences = await MobileSnapshotBuilder.shared.build { experiences.map(\.mobile) }
             snapshot.unavailable = unavailable
+            snapshot.turnSessions = await sync.host.turnSessionsFace()
             var changed: [String: Data] = [:]
             var skipped: [String: String] = [:]
             var attempted = Set<String>()
@@ -93,9 +102,9 @@ extension MacSyncEngine {
                 lifecycleGeneration: generation, readRevision: revision,
                 changed: &changed, skipped: &skipped, attempted: &attempted)
             await commitSnapshots(changed, skipped: skipped, attempted: attempted, in: snapshotDir,
-                lifecycleGeneration: generation, readRevision: revision, scope: .workActivity)
+                lifecycleGeneration: generation, readRevision: revision)
             guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
-            if configuration.usable {
+            if configuration.usable, unavailable == nil {
                 let errors = await sync.relay.sendWorkActivities(rows, dataRoot: sync.dataRoot)
                 if !errors.isEmpty { syncError = "Live Activity push failed: \(errors.joined(separator: "; "))" }
             }

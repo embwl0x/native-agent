@@ -1,4 +1,5 @@
 import AppKit
+import Experiences
 import Foundation
 import NativeAgentShared
 import MacControl
@@ -10,9 +11,9 @@ import ChatSessionWork
 import Transcripts
 import ChatToolParsing
 import Darwin
-// Blueprint: | `AgentOpened.swift` | Application-launch attribution; observers close at work end or shutdown |
+// Blueprint: | `AgentOpened.swift` | Application-launch attribution; observers close at work end or shutdown; apps still running are a body happening |
 
-/// Attribute launches only with known person-input timing; work ending prunes stopped apps and requests a reminder, never quits apps.
+/// Attribute launches only with known person-input timing; work ending prunes stopped apps and tells the agent's body, never quits apps.
 package final class AgentOpened: @unchecked Sendable {
     package static let shared = AgentOpened()
     /// Exclude launches near person input or after input during active work, including the click that woke it.
@@ -37,7 +38,7 @@ package final class AgentOpened: @unchecked Sendable {
                 forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main
             ) { [weak self] note in
                 guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                      app.activationPolicy == .regular, app.processIdentifier != getpid(),
+                      app.activationPolicy == .regular, !PersonOnlyWindows.isOwnProcess(app.processIdentifier),
                       let name = app.localizedName else { return }
                 self?.launched(pid: app.processIdentifier, name: name, observation: id)
             }
@@ -87,10 +88,10 @@ package final class AgentOpened: @unchecked Sendable {
             return opened.values.sorted()
         }
         guard let still else { return }
-        ResidentWake.shared.request(dataRoot: dataRoot, reason: "apps you opened are still running", items: [.init(
-            id: "mac-opened:" + UUID().uuidString,
-            line: "Still running, opened by you: " + still.joined(separator: ", ")
+        // Each launch is told once (its pid leaves `untold` above), so every telling is a new occurrence with a key of its own.
+        Attention.post(Happening(.body, subject: "mac:opened", door: "mac:opened", who: "self",
+            words: "Still running, opened by you: " + still.joined(separator: ", ")
                 + ". When the job is done, quit what you opened; leave what the person had open.",
-            key: "mac-opened")])
+            once: "mac-opened:" + UUID().uuidString.lowercased()), dataRoot: dataRoot)
     }
 }

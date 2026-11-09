@@ -1,5 +1,6 @@
 import AuthoredCapabilities
 import AgentWorkspace
+import ChatTurnContracts
 import CryptoKit
 import Experiences
 import Foundation
@@ -17,7 +18,7 @@ import NativeAgentShared
 /// Malformed or throwing programs use the bounded previous/seed repair exception and owe the agent its evidence.
 struct TurnPart {
     static let id = "turn"
-    static let effects: Set<String> = ["model.call", "app", "reply.stream", "reply.end", "after"]
+    static let effects: Set<String> = ["model.call", "app", "reply.stream", "reply.end", "after", "notebook"]
 
     let dataRoot: URL
     let surface: String
@@ -47,7 +48,7 @@ struct TurnPart {
     private var failed: Set<String> = []
     /// Exclusive source-bound opened program; each event gets fresh frozen input.
     private var helper: OwnedProgramRunner.Held?
-    private var arrivals: [ResidentWake.Item] = []
+    private var arrivals: [Happening] = []
     private var heals = 0
     /// A helper failure can happen before the seed ever executes. Allow one
     /// fresh seed lease, independently of defective source recovery.
@@ -159,12 +160,108 @@ struct TurnPart {
         log.append(.object(["streamed": .string(text)]))
     }
 
-    /// Deliver each repair notice once after the affected turn ends, never into its own failed execution.
-    mutating func tellAgent() {
-        guard !arrivals.isEmpty else { return }
-        if !ResidentWake.shared.request(dataRoot: dataRoot, reason: "the agent's turn part was swapped back", items: arrivals) {
-            nativeLog("The agent's turn part: the arrival telling the agent about the swap was not kept")
+    /// Replay holds the exact delivered words and attachments before their door can relinquish its checkpoint.
+    mutating func readArrival(_ offer: ChatTurnSteering.Offer) throws {
+        let text = offer.reading.compactMap { block -> String? in
+            if case .text(let text) = block { return text }; return nil
+        }.joined(separator: "\n")
+        log.append(.object(["arrival": .object([
+            "run": .string(offer.turn.run), "turn": .string(offer.turn.id),
+            "words": .string(offer.arrival.words), "text": .string(text),
+            "attachments": try JSONValue.parse(JSONEncoder().encode(offer.arrival.attachments)),
+        ])]))
+    }
+
+    func arrivalIDs() throws -> [String: String] {
+        var ids: [String: String] = [:]
+        for row in log {
+            guard let saved = row.objectValue?["arrival"] else { continue }
+            guard case .object(let fields) = saved, case .string(let run)? = fields["run"], case .string(let turn)? = fields["turn"] else {
+                throw TurnEngineError.turnPartFailed("The saved arrival identity is incomplete; repair its turn checkpoint.")
+            }
+            ids[run] = turn
         }
+        return ids
+    }
+
+    /// Attachments are reopened through their existing checked reader; missing bytes fail with their cause.
+    func arrivalReadings() throws -> [[LLMContentBlock]] {
+        try log.compactMap { row in
+            guard let saved = row.objectValue?["arrival"] else { return nil }
+            guard case .object(let fields) = saved, case .string(let run)? = fields["run"],
+                  case .string(let words)? = fields["words"], case .string(let text)? = fields["text"],
+                  let attachments = fields["attachments"] else {
+                throw TurnEngineError.turnPartFailed("The saved arrival reading is incomplete; repair its turn checkpoint.")
+            }
+            let files = try JSONDecoder().decode([MultimodalAttachment].self, from: attachments.serializedData(pretty: false))
+            let input = try SwiftNativeChatOrchestrationClient.turnAttachmentInput(
+                message: words, attachments: files, dataRoot: dataRoot, runId: run)
+            return [.text(text)] + input.imageBlocks
+        }
+    }
+
+    /// Hearing is optional CPU judgment, with no step, effects or turn-program recovery.
+    mutating func hear(_ offer: ChatTurnSteering.Offer) async throws -> Bool {
+        let runner = OwnedProgramRunner(dataRoot: dataRoot)
+        let program = OwnedProgram(kind: .turn, id: file.id, version: file.bodyDigest, source: file.body, entry: .run, resident: true)
+        var trace: [String: JSONValue] = ["arrival": .string(offer.turn.run), "sourceDigest": .string(file.bodyDigest)]
+        var repairOwner = AttentionNotebook.url(dataRoot).path
+        do {
+            let happening: JSONValue = .object([
+                "kind": .string("arrival"), "who": .string(offer.turn.originPrincipal),
+                "door": .string(offer.turn.arrivalSurface(authorizing: offer.arrival.surface)),
+                "words": .string(offer.arrival.words),
+                "trust": .string(offer.turn.peerSteering?.isTainted == true ? "untrusted" : "trusted"),
+                "steered_by": .array((offer.turn.peerSteering?.checkpointSources ?? []).map(JSONValue.string)),
+            ])
+            let felt: JSONValue = .object(["runtime": gathered.runtime,
+                "notebook": .object(try AttentionNotebook.read(dataRoot: dataRoot))])
+            let input: JSONValue = .object(["hear": .object(["happening": happening, "felt": felt])])
+            repairOwner = SenseHostLocator.helperURL.path
+            let held = try runner.holdTurn(program)
+            let receipt = await runner.run(program, input: input, host: TurnWeigh.Host(),
+                execution: .init(turn: turn, surface: surface, deadlines: deadlines, input: input), on: held)
+            if Task.isCancelled || ChatCancelFlag.isRaised(stop) { throw CancellationError() }
+            if receipt.objectValue?["error"]?.objectValue?["origin"] == .string("javascript") { repairOwner = "abilities/turn.js" }
+            guard case .object(let out) = receipt, out["status"] == .string("ok"),
+                  case .object(let returned)? = out["returned"] else {
+                throw TurnEngineError.turnPartFailed("hear did not complete: " + (try receipt.serialize(pretty: false)))
+            }
+            repairOwner = "abilities/turn.js"
+            let cut: Bool
+            if returned["grown"] == .bool(false) {
+                trace["status"] = .string("ungrown"); cut = false
+            } else if returned["heard"] == nil || returned["heard"] == .null {
+                trace["status"] = .string("heard"); cut = false
+            } else if case .object(let said)? = returned["heard"],
+                      said["cut"] == nil || said["cut"] == .bool(false) || said["cut"] == .bool(true) {
+                trace["status"] = .string("heard"); cut = said["cut"] == .bool(true)
+            } else {
+                throw TurnEngineError.turnPartFailed("hear must return {cut: true}, {cut: false}, or nothing.")
+            }
+            trace["cut"] = .bool(cut)
+            if trace["status"] == .string("heard") {
+                RepairOwed.settle(dataRoot, operation: "turn.hear", evidence: .init(source: "abilities", id: file.bodyDigest))
+            }
+            TurnTraceBus.fireFromContext(kind: "attention.hear", surface: surface, payload: .object(trace), turn: turn)
+            return cut
+        } catch {
+            if Task.isCancelled || ChatCancelFlag.isRaised(stop) || error is CancellationError { throw CancellationError() }
+            let why = TurnTraceRedactor.redactText(error.localizedDescription)
+            trace["status"] = .string("failed"); trace["cut"] = .bool(false); trace["cause"] = .string(why)
+            TurnTraceBus.fireFromContext(kind: "attention.hear", surface: surface, payload: .object(trace), turn: turn)
+            let words = "Your hear could not judge an arrival; its boundary read remains owed. Repair the cause: " + why
+            RepairOwed.owe(dataRoot, id: "turn-hear:" + file.bodyDigest, kind: .run,
+                operation: "turn.hear", owner: repairOwner, words: words)
+            arrivals.append(Happening(.body, subject: "turn", door: "stem", who: "self", words: words,
+                once: "turn-hear:" + file.bodyDigest))
+            return false
+        }
+    }
+
+    /// Deliver each repair notice once after the affected turn ends, never into its own failed execution: its body tells the agent.
+    mutating func tellAgent() {
+        for happening in arrivals { Attention.post(happening, dataRoot: dataRoot) }
         arrivals = []
     }
 
@@ -303,6 +400,10 @@ struct TurnPart {
                 admittedCall = Self.callIdentity(current, position)
             case "reply.end":
                 ended = true
+            case "notebook":
+                guard case .object? = effect["set"] else {
+                    throw Fault(code: "malformed", why: "Its notebook effect names no {set: {…}}: the settings its weigh reads.")
+                }
             case "model.call":
                 let opening = system == nil && opened == nil
                 let supported: Set<String> = opening
@@ -468,30 +569,57 @@ struct TurnPart {
         }
         file = outcome.file
         if outcome.freshHelper { seedHelperRetried = true }
-        TurnTraceBus.fireFromContext(kind: "turn.part.recovered", surface: surface, payload: .object([
+        // A heal away from the version under trial is that trial's set aside, closed at the source.
+        var trial: (closed: JSONValue?, failure: String?) = (nil, nil)
+        if outcome.swapped {
+            trial = await Self.setTrialAside(store, version: broken.bodyDigest, why: """
+                The turn program threw (\(fault.code)) and the stem swapped back to \(Self.name(file, seed: seed)) (\(file.bodyDigest.prefix(12))).
+                """, turn: turn)
+        }
+        var recovered: [String: JSONValue] = [
             "reason": .string(fault.code), "detail": .string(fault.why),
             "fromDigest": .string(broken.bodyDigest), "sourceDigest": .string(file.bodyDigest),
             "program": .string(file.bodyDigest == seed.bodyDigest ? "seed" : outcome.swapped ? "previous" : "current"),
             "swapped": .bool(outcome.swapped),
             "freshHelper": .bool(outcome.freshHelper),
-        ]), turn: turn)
+        ]
+        if let closed = trial.closed { recovered["trial"] = closed }
+        if let failure = trial.failure { recovered["trial_error"] = .string(failure) }
+        TurnTraceBus.fireFromContext(kind: "turn.part.recovered", surface: surface, payload: .object(recovered), turn: turn)
         if outcome.freshHelper {
-            arrivals.append(.init(id: "turn-heal:seed-helper:" + broken.bodyDigest,
-                line: """
-                    Your seed turn helper failed (\(fault.code): \(fault.why)); the stem replayed the turn through the seed with a fresh helper \
-                    lease. The helper cause still needs repair.
-                    """,
-                key: "turn-heal", home: true))
+            arrivals.append(Happening(.body, subject: "turn", door: "stem", who: "self",
+                words: "Your seed turn helper failed (\(fault.code)); the stem replayed the turn through the seed with a fresh helper lease. "
+                    + "The helper cause still needs repair.",
+                once: "turn-heal:seed-helper:" + broken.bodyDigest, shows: fault.why))
         }
         if outcome.swapped {
             let from = Self.name(broken, seed: seed), to = Self.name(file, seed: seed)
             TurnObservation.record(.healed(from: from, to: to, why: fault.why), surface: surface, turn: turn)
             var line = "Your turn part \(from) failed (\(fault.code)), so I swapped in \(to) and replayed the same turn through it. " + outcome.kept
+            if trial.closed != nil { line += " Its trial is set aside." }
             let steering = (turn.peerSteering?.checkpointSources ?? []).filter { !PeerDataTaint.ownerTrusts($0) }
             if !steering.isEmpty { line += " The turn was steered by \(steering.joined(separator: ", "))." }
-            arrivals.append(.init(id: "turn-heal:" + broken.bodyDigest, line: line, key: "turn-heal", home: true))
+            arrivals.append(Happening(.body, subject: "turn", door: "stem", who: "self", words: line,
+                once: "turn-heal:" + broken.bodyDigest, shows: fault.why))
         }
         return try await rebuild()
+    }
+
+    /// Reads and closes the open trial under one store lock, only while its version is the one healed away from. A close that fails never fails
+    /// the heal: the accounting owes its own repair, and the failure is returned for the recovery trace.
+    private static func setTrialAside(_ store: AbilityStore, version: String, why: String, turn: Turn) async -> (closed: JSONValue?,
+        failure: String?) {
+        await Task.detached { () -> (closed: JSONValue?, failure: String?) in
+            do {
+                let closed = try AbilityStore.withLock { () throws -> JSONValue? in
+                    guard try store.states()[Self.id]?.objectValue?["trial"]?.objectValue?["version"]?.stringValue == version else { return nil }
+                    return try store.changeTrial(id: Self.id, .judged(verdict: "set_aside", why: why), turn: turn)
+                }
+                return (closed, nil)
+            } catch {
+                return (nil, error.localizedDescription)
+            }
+        }.value
     }
 
     private static func name(_ file: AbilityStore.File, seed: AbilityStore.File) -> String {
@@ -551,6 +679,11 @@ struct TurnPart {
                 the door and steps the result. A call inside the step would run again whenever the step replays.
                 """))
         }
+        /// No call runs inside this host, so no call has arguments to record; the refusal is the evidence.
+        func callArgumentsForEvidence(_ id: String, given: [JSONValue]) throws -> [JSONValue] {
+            _ = try doorInput(id: id, given: given).get()
+            return given
+        }
         func opensHomeItem(_ input: [String: JSONValue]) -> Bool { false }
         func secretLine(_ text: String) -> Bool { false }
         func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence {
@@ -558,5 +691,170 @@ struct TurnPart {
         }
         func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? { nil }
         func perform(_ input: [String: JSONValue], execution: OwnedProgramExecution) async -> JSONValue { .null }
+    }
+}
+
+/// The agent's turn program weighs what nobody asked about: `weigh(h, felt)` in its installed `turn.js`, run on CPU outside any turn through the same
+/// source-bound helper its turns lease. Launch never grows it: a program without `weigh` leaves the world waiting unweighed until the agent grows one.
+public enum TurnWeigh {
+    public enum Weighed: Sendable, Equatable {
+        /// Its worth (0…1 is one thought's share), and whatever else its weigh returned beside the number.
+        case worth(Double, said: JSONValue?)
+        /// The installed program has no `weigh`: what it would weigh waits.
+        case ungrown(program: String)
+        /// Its `weigh` threw or returned no worth: what it would weigh waits, and the repair is the agent's.
+        case failed(program: String, why: String)
+        /// The stem could not run it (the program unreadable, its helper did not start or answer): what it would weigh waits; the repair is the stem's.
+        case unavailable(why: String)
+    }
+
+    /// Run the installed program's `weigh` once. Only an absent slot runs the seed; an unreadable slot is a failure, never permission to run another.
+    public static func weigh(_ happening: JSONValue, felt: JSONValue, dataRoot: URL) async -> Weighed {
+        let file: AbilityStore.File
+        do { file = try AbilityStore(dataRoot: dataRoot).read(id: TurnPart.id, slot: .current) ?? seed() }
+        catch {
+            return .unavailable(why: "The turn program could not be read: \(error.localizedDescription)")
+        }
+        return await run(file, happening: happening, felt: felt, dataRoot: dataRoot)
+    }
+
+    private static func run(_ file: AbilityStore.File, happening: JSONValue, felt: JSONValue, dataRoot: URL) async -> Weighed {
+        guard file.kind == .turn else { return .failed(program: file.bodyDigest, why: "The turn slot does not hold a turn part.") }
+        let runner = OwnedProgramRunner(dataRoot: dataRoot)
+        let program = OwnedProgram(kind: .turn, id: file.id, version: file.bodyDigest, source: file.body, entry: .run, resident: true)
+        let held: OwnedProgramRunner.Held
+        do { held = try runner.holdTurn(program) } catch {
+            return .unavailable(why: "Its helper did not start: \(error.localizedDescription)")
+        }
+        let input: JSONValue = .object(["weigh": .object(["happening": happening, "felt": felt])])
+        let receipt = await runner.run(program, input: input, host: Host(),
+            execution: .init(turn: nil, surface: "attention", deadlines: OperationDeadlines(), input: input), on: held)
+        guard case .object(let out) = receipt, out["status"] == .string("ok") else {
+            // Only an exception the program's own code raised is the agent's to repair; anything else is the stem's.
+            if case .object(let fields) = receipt, case .object(let error)? = fields["error"], error["origin"] == .string("javascript") {
+                return .failed(program: file.bodyDigest, why: error["message"]?.stringValue ?? "Its weigh threw.")
+            }
+            var why = "Its weigh returned no terminal receipt."
+            if case .object(let fields) = receipt {
+                if case .object(let error)? = fields["error"], case .string(let message)? = error["message"] { why = message }
+                else if case .string(let detail)? = fields["detail"] { why = detail }
+            }
+            return .unavailable(why: why)
+        }
+        guard case .object(let returned)? = out["returned"] else {
+            return .failed(program: file.bodyDigest, why: "Its weigh entry returned nothing.")
+        }
+        if returned["grown"] == .bool(false) { return .ungrown(program: file.bodyDigest) }
+        switch returned["worth"] {
+        case .double(let worth)?:
+            return worth.isFinite ? .worth(max(0, worth), said: nil) : .failed(program: file.bodyDigest, why: "Its weigh returned \(worth).")
+        case .int(let worth)?: return .worth(Double(max(0, worth)), said: nil)
+        case .object(let said)?:
+            switch said["worth"] {
+            case .double(let worth)? where worth.isFinite: return .worth(max(0, worth), said: .object(said))
+            case .int(let worth)?: return .worth(Double(max(0, worth)), said: .object(said))
+            default: return .failed(program: file.bodyDigest, why: "Its weigh returned an object with no finite worth.")
+            }
+        default: return .failed(program: file.bodyDigest, why: "Its weigh returned no number: a worth is 0…1 per thought.")
+        }
+    }
+
+    /// The shipped seed program.
+    public static func seed() throws -> AbilityStore.File {
+        try AbilityStore.decode(Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/abilities/turn.js"))
+    }
+
+    /// The seed's own `weigh`, as its source shows it: what the agent is shown when it has an organ to grow.
+    public static func seedWeigh() throws -> String? {
+        try AbilityStore.seedFunction("weigh", of: TurnPart.id)
+    }
+
+    /// CPU judgment has no reach or effects; its supplied input is all it can read.
+    fileprivate final class Host: OwnedProgramHostProfile, Sendable {
+        func reach(_ name: String, execution: OwnedProgramExecution) async throws -> JSONValue {
+            throw SenseFailure(code: "unknown_reach", message: "weigh and hear receive everything they read; turn.\(name)() belongs to step.")
+        }
+        var actionIDs: [String] { [] }
+        var floorReasons: Set<String> { [] }
+        var scriptKey: String { "" }
+        func action(_ id: String) -> OwnedProgramAction? { nil }
+        func canonicalAction(_ id: String) -> String { id }
+        func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], OwnedProgramRunner.ScriptError> {
+            .failure(.init(reason: "effects_only", detail: "weigh and hear act on nothing; they return judgment."))
+        }
+        /// No call runs inside this host, so no call has arguments to record; the refusal is the evidence.
+        func callArgumentsForEvidence(_ id: String, given: [JSONValue]) throws -> [JSONValue] {
+            _ = try doorInput(id: id, given: given).get()
+            return given
+        }
+        func opensHomeItem(_ input: [String: JSONValue]) -> Bool { false }
+        func secretLine(_ text: String) -> Bool { false }
+        func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence {
+            .init(successful: false, waiting: false, resultClass: "refused", pending: false, effectUnconfirmed: false)
+        }
+        func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? { nil }
+        func perform(_ input: [String: JSONValue], execution: OwnedProgramExecution) async -> JSONValue { .null }
+    }
+}
+
+/// One ordered consumer handles provider movement and readable arrivals, including while the provider has no words.
+struct TurnRoundEvents: Sendable {
+    enum Event: Sendable {
+        case provider(LLMMessageStreamEvent)
+        case arrival(ChatTurnSteering.Offer)
+    }
+    let stream: AsyncThrowingStream<Event, Error>
+    private let provider: Task<Void, Never>
+    private let arrivals: Task<Void, Never>
+
+    init(provider upstream: AsyncThrowingStream<LLMMessageStreamEvent, Error>, arrivals incoming: AsyncStream<ChatTurnSteering.Offer>) {
+        let (stream, edge) = AsyncThrowingStream<Event, Error>.makeStream()
+        self.stream = stream
+        let provider = Task {
+            do {
+                for try await event in upstream {
+                    try Task.checkCancellation()
+                    edge.yield(.provider(event))
+                }
+                edge.finish()
+            } catch { edge.finish(throwing: error) }
+        }
+        let arrivals = Task {
+            for await offer in incoming {
+                if Task.isCancelled { return }
+                edge.yield(.arrival(offer))
+            }
+        }
+        self.provider = provider; self.arrivals = arrivals
+        edge.onTermination = { _ in provider.cancel(); arrivals.cancel() }
+    }
+
+    /// Cancelling only this round's forwarder closes its provider stream; the turn and its running calls are untouched.
+    func cancel() { provider.cancel(); arrivals.cancel() }
+}
+
+/// The turn program's notebook: settings its `weigh` reads ("hold the world until five"), written by its `notebook` effect and given to every weigh.
+public enum AttentionNotebook {
+    static func url(_ dataRoot: URL) -> URL { dataRoot.appendingPathComponent("attention/notebook.json") }
+
+    /// What the notebook holds; absent is empty. Unreadable bytes are a failure the caller reports.
+    public static func read(dataRoot: URL) throws -> [String: JSONValue] {
+        let data: Data
+        do { data = try Data(contentsOf: url(dataRoot)) } catch CocoaError.fileReadNoSuchFile { return [:] }
+        guard case .object(let notebook) = try JSONValue.parse(data) else {
+            throw PersistenceCoreError.ioFailure("The turn program's notebook is not a JSON object: \(url(dataRoot).path)")
+        }
+        return notebook
+    }
+
+    /// Merge `set` into the notebook; a null value removes its key.
+    static func write(_ set: [String: JSONValue], dataRoot: URL) throws {
+        let before = try read(dataRoot: dataRoot)
+        var notebook = before
+        for (key, value) in set { notebook[key] = value == .null ? nil : value }
+        guard notebook != before else { return }
+        let target = url(dataRoot)
+        try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(try JSONValue.object(notebook).serialize(pretty: false).utf8), to: target)
     }
 }

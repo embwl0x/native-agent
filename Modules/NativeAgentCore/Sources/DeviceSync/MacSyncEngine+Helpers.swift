@@ -24,7 +24,7 @@ extension MacSyncEngine {
 
     func helpersSnapshotData() async -> SnapshotGroupBuild {
         do {
-            let data = try JSONEncoder().encode(try await sync.host.helpersSnapshot())
+            let data = try await MobileSnapshotBuilder.shared.encode(sync.host.helpersSnapshot())
             guard data.count <= 192 * 1024 else {
                 return .skipped("Helpers and agents exceed the phone snapshot limit.")
             }

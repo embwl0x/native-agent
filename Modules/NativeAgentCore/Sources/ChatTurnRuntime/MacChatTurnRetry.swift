@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import TurnTrace
+import NativeAgentShared
 // Blueprint: | `MacChatTurnRetry.swift` | `MacChatTurnPresentationPort`: `admitMacChatRetry`, `runAdmittedMacChatRetry` |
 
 public struct MacChatRetryAdmission: Sendable {

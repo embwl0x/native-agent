@@ -48,13 +48,10 @@ extension AppQuietSettingsHost {
         return slack.enabled
     }
     func refreshQuietConnectors() async { _ = await appModel.refreshForSidebarItem(.connectors) }
-    func slackIngressPolicy(dataRoot: URL) throws -> (allowedChannelIds: Set<String>, allowedUserIds: Set<String>, requireMention: Bool) {
+    @concurrent nonisolated func slackIngressPolicy(dataRoot: URL) async throws -> (allowedChannelIds: Set<String>, allowedUserIds: Set<String>, requireMention: Bool) {
+        try Task.checkCancellation()
         let policy = try SlackSocketModeConfig.loadIngressPolicy(dataRoot: dataRoot)
         return (policy.allowedChannelIds, policy.allowedUserIds, policy.requireMention)
-    }
-    func afterCurrentSlackHandling(_ operation: @escaping @Sendable () async -> Void) async -> Bool {
-        // The mounted settings host holds no Slack handler completion.
-        await SlackSocketModeLoop.afterCurrentHandling(operation, deferAfterHandling: nil)
     }
     func saveSlackIngress(channels: Set<String>, users: Set<String>, mention: Bool, dataRoot: URL) async -> (ok: Bool, error: String?) {
         let result = await NativeOAuthFlow.saveSlackToken(
@@ -75,7 +72,7 @@ extension AppQuietToolHost {
             .object(["status": .string(result.succeeded ? "ok" : "failed"), "detail": .string(result.agentMessage)])
         }
         func decided(_ tool: String) {
-            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: tool, sessionID: input["__session_id"]?.scalarText,
+            BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: tool, sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: appModel.engine.dataRoot)
         }
         switch verb {
@@ -91,6 +88,12 @@ extension AppQuietToolHost {
                     "No connector is called \(wanted.isEmpty ? "that" : wanted). Pass id, one of the ids below.",
                     extra: ["ids": .array(connectors.map { .string($0.id) })])
             }
+            // A switch's change names the position it moves to; a position this verb does not move to is a switch read before a change.
+            if let value = input["value"], value != .bool(on) {
+                return AppToolExecutor.failure("stale_switch", """
+                    \(connector.name)'s switch moved since it was read: \(verb) does not turn it \(on ? "off" : "on"). Read Connectors again.
+                    """, extra: ["id": .string(connector.id)])
+            }
             guard connector.enabled != on else {
                 return .object(["status": .string("ok"), "changed": .bool(false), "id": .string(connector.id),
                                 "detail": .string("\(connector.name) is already \(on ? "on" : "off").")])
@@ -98,7 +101,7 @@ extension AppQuietToolHost {
             switch await appModel.updateConnector(connector, enabled: on) {
             case .verified:
                 if on {
-                    HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "connector.on \(connector.id)",
+                    BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "connector.on \(connector.id)",
                                            sessionID: input["__session_id"]?.scalarText,
                                            dataRoot: appModel.engine.dataRoot)
                 }
@@ -172,7 +175,7 @@ extension AppQuietToolHost {
             }
         case "telegram_test":
             return outcome(await appModel.testTelegram())
-        default:
+        case "telegram_clear_logs":
             await appModel.clearTelegramLogs()
             switch appModel.telegramClearLogsOutcome {
             case .completed(let receipt)?:
@@ -186,8 +189,11 @@ extension AppQuietToolHost {
                     extra: ["effects": .string("unknown")]
                 )
             case nil:
-                return AppToolExecutor.failure("clear_logs_busy", "A clear is already running; read app {page:\"telegram\"} in a moment.")
+                return AppToolExecutor.failure("clear_logs_busy", "A clear is already running; read app {page:\"connectors\"} in a moment.")
             }
+        // The rest are the verbs the rows of Providers, Connectors and Capabilities call; their owners run them.
+        default:
+            return await appModel.engine.connectionsVerb(verb, input: input, turn: turn)
         }
     }
 }

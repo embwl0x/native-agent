@@ -20,7 +20,9 @@ public enum TrustBackupPersistence {
         let resolvedReason = cleanReason.isEmpty ? "manual backup" : cleanReason
 
         try fm.createDirectory(at: backupRoot, withIntermediateDirectories: true)
-        try? fm.removeItem(at: backupDir)
+        guard !Self.pathEntryExists(backupDir) else {
+            throw PersistenceCoreError.ioFailure("Backup \(id) already exists; its bytes were left in place.")
+        }
         do {
             let scope = try await Self.writeBackupSnapshot(
                 id: id,
@@ -46,8 +48,16 @@ public enum TrustBackupPersistence {
             try await Self.appendBackupRecord(record, backupRoot: backupRoot)
             return record
         } catch {
-            try? fm.removeItem(at: backupDir)
-            throw error
+            let captureError = error
+            if Self.pathEntryExists(backupDir) {
+                do { try fm.removeItem(at: backupDir) }
+                catch {
+                    throw PersistenceCoreError.ioFailure(
+                        "Backup capture failed: \(captureError.localizedDescription). "
+                            + "Removing incomplete backup \(id) also failed: \(error.localizedDescription)")
+                }
+            }
+            throw captureError
         }
     }
 
@@ -76,11 +86,23 @@ public enum TrustBackupPersistence {
                 .sorted { $0.lastPathComponent < $1.lastPathComponent }
             // The data-root persona path cannot shadow the canonical live persona.
             for child in children where child.lastPathComponent != "persona" {
-                copied += try await Self.copyOffDiskEntry(child, relative: child.lastPathComponent, into: dataDir, dataRoot: root)
+                let relative = child.lastPathComponent
+                let copy: @Sendable () async throws -> [String] = {
+                    try await Self.copyOffDiskEntry(child, relative: relative, into: dataDir, dataRoot: root)
+                }
+                switch relative {
+                case "chat":
+                    // Retention moves bytes between tiers while holding this lock; capture the entire group in that transaction.
+                    copied += try await SwiftNativePersistenceCore.withFileLock(Self.chatSessionIndexPath(in: root), copy)
+                case "clock":
+                    copied += try await SwiftNativePersistenceCore.withFileLock(root.appendingNativeRelativePath("clock/times.json"), copy)
+                default:
+                    copied += try await copy()
+                }
             }
         } else {
             let ordinaryPaths = Self.backupRelativePaths.filter {
-                $0 != "memory" && !$0.hasPrefix("chat/")
+                $0 != "memory" && $0 != "clock" && !$0.hasPrefix("chat/")
             }
             for relative in ordinaryPaths {
                 let source = Self.backupDestination(relative, dataRoot: root)
@@ -102,6 +124,12 @@ public enum TrustBackupPersistence {
                 )
                 copied.append("memory")
             }
+            // Clock declarations share the times-file lock.
+            copied += try await SwiftNativePersistenceCore.withFileLock(root.appendingNativeRelativePath("clock/times.json")) {
+                // Capture the directory under the declarations' writer lock.
+                try await Self.copyLockedSnapshotItem(from: root.appendingNativeRelativePath("clock"), to: dataDir.appendingNativeRelativePath("clock"))
+                return ["clock"]
+            }
             // Retention publishes archive bytes and locators under the session index lock.
             copied += try await SwiftNativePersistenceCore.withFileLock(Self.chatSessionIndexPath(in: root)) {
                 var paths: [String] = []
@@ -120,7 +148,7 @@ public enum TrustBackupPersistence {
         }
         let scope = Self.scopeNames(for: copied)
         let links = try Self.takeBackupLinks(in: dataDir)
-        // After the links are gone, so only staged regular files are opened.
+        // Open only staged regular files after removing links.
         if offDisk {
             try Self.dropRecordDetails(in: dataDir)
             try Self.convertSQLiteCopiesToRollbackJournal(in: dataDir)
@@ -131,7 +159,7 @@ public enum TrustBackupPersistence {
             "createdAt": .string(createdAt),
             "id": .string(id),
             "integrityVersion": .int(2),
-            "scopeVersion": .int(3),
+            "scopeVersion": .int(4),
             "personaRoot": .string(personaRoot.path),
             "lifeID": .string(try DataRootLife.current(in: root)),
             // Off-disk copies carry a broader, credential-excluded scope and are never local restore targets.
@@ -152,7 +180,7 @@ public enum TrustBackupPersistence {
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         var configuration = Configuration()
         configuration.readonly = true
-        configuration.busyMode = .timeout(10)
+        configuration.busyMode = .immediateError
         let sourceQueue = try DatabaseQueue(path: source.path, configuration: configuration)
         let destinationQueue = try DatabaseQueue(path: destination.path)
         try sourceQueue.backup(to: destinationQueue)
@@ -173,7 +201,7 @@ public enum TrustBackupPersistence {
         "tools",
         "connectors",
         "oauth_tokens/x.json",
-        "scheduler/jobs.json",
+        "clock",
         "improvements",
         "workflows",
         "catalog/registry.json",

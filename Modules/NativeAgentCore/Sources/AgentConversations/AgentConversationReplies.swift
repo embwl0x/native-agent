@@ -9,6 +9,7 @@ import ApprovalInbox
 import ChatTurnContracts
 import Experiences
 import TurnTrace
+import Transcripts
 // Blueprint: | `AgentConversationReplies.swift` | Locked retained-answer delivery, inline waits and reply settlement on the existing conversation store |
 
 extension AgentConversationStore {
@@ -31,11 +32,12 @@ extension AgentConversationStore {
                   exchange.id != row.operationID || (row.deliveryState != "delivering" && row.deliveryRunID == nil) else { continue }
             if exchange.id != retained, exchange.id != row.operationID || receipt["reply_location"] == nil {
                 let original = exchange.id == row.operationID ? AgentConversationExchange.answer(receipt) : (text: nil, truncated: false)
-                let source = answer?.id == exchange.id ? (answer!.text, false)
-                    : (original.text ?? reply, original.text == nil ? exchange.replyTruncated : original.truncated)
+                let source: (String, Bool)
+                if let answer, answer.id == exchange.id { source = (answer.text, false) }
+                else { source = (original.text ?? reply, original.text == nil ? exchange.replyTruncated : original.truncated) }
                 // An upstream excerpt remains labelled in the receipt/ledger; it cannot become a complete message in the contact's thread.
                 if !source.1 {
-                    let entry = ContactThread.Entry.reply(owner: String(row.agent.dropFirst(5)), name: row.name,
+                    let entry = ContactThread.Entry.reply(owner: String(row.agent.dropFirst(5)), conversation: row.conversationID, name: row.name,
                         text: source.0, replyID: "agent-conversation:" + exchange.id, at: at, from: from, steeredBy: steeredBy)
                     // Detach from the writer’s turn context.
                     Task.detached { await ContactThread.write(entry, dataRoot: root) }
@@ -43,10 +45,18 @@ extension AgentConversationStore {
             }
             guard wake, row.personInitiated != true, row.shownInline != row.operationID + ":" + row.phase,
                   !(exchange.id == row.operationID && AgentConversationRunning.shared.watched(row.id)) else { continue }
-            ResidentWake.shared.request(dataRoot: root, reason: "what resolved", items: [.init(
-                id: "reply:" + exchange.id, line: row.name + " replied in \"" + String(row.label.prefix(60)) + "\"", thread: row.id,
-                session: row.scopeSessionID)])
+            Self.returnNews(row, scope: row.scopeSessionID, once: "reply:" + exchange.id,
+                words: row.name + " replied in \"" + String(row.label.prefix(60)) + "\"", peers: [row.agent], dataRoot: root)
         }
+    }
+
+    /// The return's owner supplies its caller: a queued refusal belongs to that send, not the active exchange. Once per key.
+    package static func returnNews(_ row: AgentConversationRecord, scope: String, once: String, words: String,
+                                   peers: [String]?, dataRoot: URL) {
+        let door = row.agent.hasPrefix("peer:") ? "contact:" + String(row.agent.dropFirst(5)) : row.agent
+        let happening = Happening(.returned, subject: "conversation:" + row.id, door: door, words: words, once: once,
+            route: scope, peers: peers)
+        Task.detached { await ContactReturns.shared.post(happening, dataRoot: dataRoot) }
     }
 
     /// A collected remote answer belongs to an inline waiter before it can become a separate turn. Serialized with the waiter's deadline release.
@@ -104,6 +114,24 @@ extension AgentConversationStore {
         }
     }
 
+    /// The contact's own held thread, opened by a call that names no caller: what is said in it waits for the contact's next call, whoever makes it.
+    /// Each caller has its own held thread beside it (`ContactCaller.conversation(peer:)`).
+    public static func heldThread(peerID: String) -> String { ContactCaller.shared(peer: peerID) }
+
+    /// The held thread a send in this session waits in: the session's own conversation when the contact opened it by calling in, the contact's own
+    /// held thread for any other session of the contact.
+    static func heldThread(session: String, peerID: String) -> String {
+        ownThread(scope: session, agent: "peer:" + peerID) ?? heldThread(peerID: peerID)
+    }
+
+    /// Who takes a held message: its own caller, or any caller of the contact once that caller is gone. A message in a thread no caller owns (the
+    /// contact's own) goes to whichever caller calls first. A caller whose process cannot be read keeps its messages until it calls again or a later
+    /// read finds it gone: unreadable is neither live nor gone.
+    static func reaches(_ held: String?, caller: String, peerID: String) throws -> Bool {
+        guard let held, held != caller, let owner = ContactCaller(conversation: held, peer: peerID) else { return true }
+        return try !owner.isLive()
+    }
+
     /// A saved send can be held without a live turn. The transcript owns its payload; repeats never write another exchange.
     public func holdReply(peer: AgentPeerContact, session: String, sendID: String, text: String) throws {
         guard session.hasPrefix(ContactThread.prefix(owner: peer.id)), UUID(uuidString: sendID) != nil else {
@@ -127,10 +155,11 @@ extension AgentConversationStore {
             }
             // Pruning publishes an exchange's terminal state on this very send row before releasing its journal entry.
             if message.sendState != nil { return }
-            let conversation = "mcp-" + peer.id
+            let conversation = Self.heldThread(session: session, peerID: peer.id)
             guard rows.count < 512 else { throw Failure(message: "The saved conversation limit has been reached; the answer stays saved.") }
             var row = AgentConversationRecord(id: sendID, scopeSessionID: session, agent: agent, name: peer.name,
-                label: "News " + String(sendID.prefix(8)), conversationID: conversation, phase: "ready", operationID: sendID, updatedAt: message.at,
+                label: Self.heldName(conversation, agent: agent, contact: peer.name), conversationID: conversation, phase: "ready",
+                operationID: sendID, updatedAt: message.at,
                 sourceSurface: "agent-bridge", operationStartedAt: message.at, expectsReply: false)
             let life = try DataRootLife.current(in: root)
             var exchange = AgentConversationExchange.started(operationID: sendID, at: message.at, message: text)
@@ -188,11 +217,13 @@ extension AgentConversationStore {
         public let at: Date
         public let text: String
         public let conversation: String?
+        /// The conversation's name: its record's label, the same for every send in that conversation.
+        public let name: String
     }
 
-    /// Claim held messages oldest-first in one serialized write so concurrent drains cannot take the same message. A claim interrupted before its response was
-    /// written remains held.
-    public func takeHeld(agent: String, fits: ([Held]) -> Bool) throws -> (taken: [Held], remaining: Int) {
+    /// Claim the held messages this caller (`caller`, the conversation it calls in) reaches, oldest-first, in one serialized write so concurrent
+    /// drains cannot take the same message. A claim interrupted before its response was written remains held.
+    public func takeHeld(agent: String, caller: String, fits: ([Held]) -> Bool) throws -> (taken: [Held], remaining: Int) {
         try locked {
             var rows = try load()
             func waiting(_ exchange: AgentConversationExchange) -> Bool {
@@ -200,9 +231,19 @@ extension AgentConversationStore {
                     || exchange.status == "delivering" && (exchange.settledAt ?? .distantPast) < AbandonedTurnReconciler.processEpoch
             }
             // The canonical contact transcript owns the accepted message. The exchange's bounded prompt is presentation only, never payload.
-            let pending = rows.filter { $0.agent == agent && ($0.exchanges ?? []).contains(where: waiting) }
-            guard !pending.isEmpty else { return ([], 0) }
+            let held = rows.filter { $0.agent == agent && ($0.exchanges ?? []).contains(where: waiting) }
+            guard !held.isEmpty else { return ([], 0) }
             guard agent.hasPrefix("peer:") else { throw Failure(message: "A held send requires its exact contact identity.") }
+            // Each conversation's caller is read once per drain.
+            var reached: [String: Bool] = [:]
+            let pending = try held.filter { row in
+                let key = row.conversationID ?? ""
+                if let known = reached[key] { return known }
+                let found = try Self.reaches(row.conversationID, caller: caller, peerID: String(agent.dropFirst(5)))
+                reached[key] = found
+                return found
+            }
+            guard !pending.isEmpty else { return ([], 0) }
             let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
             let lines = try ContactThread.lines(dataRoot: root, owner: String(agent.dropFirst(5)))
             let all = try pending.flatMap { row in
@@ -215,7 +256,7 @@ extension AgentConversationStore {
                             """)
                     }
                     return Held(row: row.id, exchange: exchange.id, at: exchange.sentAt,
-                        text: try Self.heldText(message), conversation: row.conversationID)
+                        text: try Self.heldText(message), conversation: row.conversationID, name: row.label)
                 }
             }.sorted { $0.at < $1.at }
             var taken: [Held] = []
@@ -247,10 +288,11 @@ extension AgentConversationStore {
         public static let nothing = HeldDrain(taken: [], remaining: 0, settle: { _ in })
     }
 
-    /// Drain what is held for one contact (`peer`, the contact's id without its `peer:` prefix) into the response a door is about to write. The door
-    /// calls `settle` with whether that response was written; a settlement that fails owes repair and never resends.
-    public func drainHeld(peer: String, name: String, via door: String, fits: ([Held]) -> Bool) throws -> HeldDrain {
-        let held = try takeHeld(agent: "peer:" + peer, fits: fits)
+    /// Drain what is held for one caller of a contact (`peer`, the contact's id without its `peer:` prefix; `conversation`, the one the caller calls
+    /// in) into the response a door is about to write. The door calls `settle` with whether that response was written; a settlement that fails owes
+    /// repair and never resends.
+    public func drainHeld(peer: String, conversation: String, name: String, via door: String, fits: ([Held]) -> Bool) throws -> HeldDrain {
+        let held = try takeHeld(agent: "peer:" + peer, caller: conversation, fits: fits)
         guard !held.taken.isEmpty else { return HeldDrain(taken: [], remaining: held.remaining, settle: { _ in }) }
         let taken = held.taken
         let dataRoot = fileURL.deletingLastPathComponent().deletingLastPathComponent()
@@ -276,7 +318,7 @@ extension AgentConversationStore {
         clock.dateFormat = "HH:mm"
         try locked {
             var rows = try load()
-            Self.mark(taken, in: &rows, from: { $0.status == "delivering" }) { exchange, receipt in
+            var changed = Self.mark(taken, in: &rows, from: { $0.status == "delivering" }) { exchange, receipt in
                 exchange.status = written ? "delivered" : "held"
                 exchange.settledAt = written ? now : nil
                 receipt?["status"] = .string(exchange.status)
@@ -295,18 +337,23 @@ extension AgentConversationStore {
                     var accepted = Experience.Obligation(to: "agent:" + rows[i].agent)
                     accepted.phase = .accepted
                     accepted.evidence = .init(source: "agents/conversations", id: rows[i].id)
+                    if rows[i].settledObligations?[item.exchange]?["accept"] == accepted { continue }
                     rows[i].settledObligations = rows[i].settledObligations ?? [:]
                     rows[i].settledObligations?[item.exchange, default: [:]]["accept"] = accepted
+                    changed = true
                 }
             }
+            guard changed else { return }
             try save(rows)
         }
     }
 
     /// Update only exchanges in the expected state; mirror the current send’s receipt in the same edit.
+    @discardableResult
     private static func mark(_ items: [Held], in rows: inout [AgentConversationRecord],
                              from: (AgentConversationExchange) -> Bool,
-                             _ edit: (inout AgentConversationExchange, inout [String: JSONValue]?) -> Void) {
+                             _ edit: (inout AgentConversationExchange, inout [String: JSONValue]?) -> Void) -> Bool {
+        var edited = false
         for item in items {
             guard let i = rows.firstIndex(where: { $0.id == item.row }),
                   let j = rows[i].exchanges?.firstIndex(where: { $0.id == item.exchange }),
@@ -318,7 +365,9 @@ extension AgentConversationStore {
             rows[i].exchanges?[j] = changed
             if let receipt { rows[i].receipt = .object(receipt) }
             rows[i].updatedAt = Date()
+            edited = true
         }
+        return edited
     }
 
     public func waitingMessage(agent: String, conversationID: String) throws -> String? {
@@ -414,7 +463,7 @@ extension AgentConversationStore {
             let steering: [String] = if case .array(let values)? = fields["reply_steered_by"] {
                 values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
             } else { [] }
-            let entry = ContactThread.Entry.reply(owner: owner, name: row.name, text: text,
+            let entry = ContactThread.Entry.reply(owner: owner, conversation: row.conversationID, name: row.name, text: text,
                 replyID: "agent-conversation:" + id, at: Date(), from: from, steeredBy: steering)
             try await Task.detached { try await ContactThread.attempt(entry, dataRoot: root) }.value
             line = try ContactThread.mergedLines(dataRoot: root, owner: owner, identity: identity).last(where: { $0.answers == id })
@@ -478,5 +527,25 @@ extension AgentConversationStore {
               let index = history.firstIndex(where: { $0.id == row.operationID }) else { return }
         history[index].absorb(row)
         row.exchanges = try AgentConversationExchange.bounded(history, file: file)
+    }
+}
+
+/// Resolve each return's destination before handing it to attention.
+actor ContactReturns {
+    static let shared = ContactReturns()
+    /// A helper conversation cannot receive an agent turn that speaks as the helper.
+    func post(_ happening: Happening, dataRoot: URL) async {
+        var happening = happening
+        do {
+            if try SessionConversation(dataRoot: dataRoot, includingArchived: true).isHelper(happening.route) { happening.route = nil }
+        } catch {
+            RepairOwed.owe(dataRoot, id: happening.id, kind: .message,
+                evidence: [.init(source: "agents/conversations", id: String(happening.subject.dropFirst("conversation:".count)))],
+                operation: "agent.return:" + happening.once, owner: "conversation destination",
+                words: "Contact return \(happening.once) is still owed: " + error.localizedDescription,
+                lever: "Repair the named conversation's session evidence, then return its retained reply; do not resend the message.")
+            return
+        }
+        await Attention.post(happening, dataRoot: dataRoot).value
     }
 }

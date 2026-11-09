@@ -6,7 +6,6 @@ import MacControl
 import MacIntegration
 import TriggerScheduler
 import TrustCenter
-import SchedulerExecution
 import AttentionRouting
 import DeviceSync
 import Dispatcher
@@ -28,15 +27,12 @@ public struct MacIntegrationDeliveryActions: ChatMacIntegrationToolBridge, PureT
     private let connectorActions: @Sendable () -> ConnectorActions
     private let router: @Sendable () -> AttentionRouter
     private let deviceSync: @Sendable () -> DeviceSync
-    private let scheduler: @Sendable () -> SchedulerDueJobRunner
 
     public init(connectorActions: @escaping @Sendable () -> ConnectorActions,
-                router: @escaping @Sendable () -> AttentionRouter, deviceSync: @escaping @Sendable () -> DeviceSync,
-                scheduler: @escaping @Sendable () -> SchedulerDueJobRunner) {
+                router: @escaping @Sendable () -> AttentionRouter, deviceSync: @escaping @Sendable () -> DeviceSync) {
         self.connectorActions = connectorActions
         self.router = router
         self.deviceSync = deviceSync
-        self.scheduler = scheduler
     }
 
     public func serving(turn: Turn, context: MacOperationContext) -> any MacIntegrationToolBridge {
@@ -113,68 +109,6 @@ public struct MacIntegrationDeliveryActions: ChatMacIntegrationToolBridge, PureT
         try await MacContactsExecutor.createOrUpdate(input: input, context: held().context)
     }
 
-    public func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailListRecent(input: input, context: held().context), integration:"mail",
-            dataRoot:dataRoot)
-    }
-
-    public func mailAttachment(input: [String: JSONValue]) async throws -> (filename: String, data: Data) {
-        try MacAppleScriptBridge.mailAttachment(input: input, context: held().context)
-    }
-
-    public func mailReadBatch(input: [String: JSONValue]) async throws -> JSONValue {
-        let operation = try held()
-        return await MacAssistantParts.recover(await MacAppleScriptBridge.mailBatch(input: input, effects: false, context: operation.context),
-            integration:"mail", dataRoot:dataRoot)
-    }
-
-    public func mailTriageBatch(input: [String: JSONValue]) async throws -> JSONValue {
-        let operation = try held()
-        return await MacAssistantParts.recover(await MacAppleScriptBridge.mailBatch(input: input, effects: true, context: operation.context),
-            integration:"mail", dataRoot:dataRoot)
-    }
-
-    public func mailSearch(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailSearch(input: input, context: held().context), integration:"mail", dataRoot:dataRoot)
-    }
-
-    public func mailSenders(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailSenders(input: input, context: held().context), integration:"mail",
-            dataRoot:dataRoot)
-    }
-
-    public func mailSend(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailSend(input: input, context: held().context), integration:"mail", dataRoot:dataRoot)
-    }
-
-    public func messagesRecentThreads(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.messagesRecentThreads(input: input, context: held().context), integration:"messages",
-            dataRoot:dataRoot)
-    }
-
-    public func messagesSend(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.messagesSend(input: input, context: held().context), integration:"messages",
-            dataRoot:dataRoot)
-    }
-
-    public func notesSearch(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.notesSearch(input: input, context: held().context), integration:"notes",
-            dataRoot:dataRoot)
-    }
-
-    public func notesCreate(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.notesCreate(input: input, context: held().context), integration:"notes",
-            dataRoot:dataRoot)
-    }
-
-    public func musicNowPlaying(input: [String: JSONValue]) async throws -> JSONValue {
-        try await musicPart("now_playing", input: input, turn: held().turn)
-    }
-
-    public func musicControl(input: [String: JSONValue]) async throws -> JSONValue {
-        try await musicPart("control", input: input, turn: held().turn)
-    }
-
     public func calendarCreateEvent(input: [String: JSONValue]) async throws -> JSONValue {
         try await LocalPIMConnectorActions.calendarCreateEvent(input: input, handsBack: held().context.handsBack)
     }
@@ -207,58 +141,7 @@ public struct MacIntegrationDeliveryActions: ChatMacIntegrationToolBridge, PureT
     }
 
 
-    public func mailMarkRead(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailMarkRead(input: input, context: held().context), integration:"mail",
-            dataRoot:dataRoot)
-    }
 
-    public func mailArchive(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailArchive(input: input, context: held().context), integration:"mail",
-            dataRoot:dataRoot)
-    }
-
-    public func mailDelete(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailDelete(input: input, context: held().context), integration:"mail", dataRoot:dataRoot)
-    }
-
-    public func mailReply(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailReply(input: input, context: held().context), integration:"mail", dataRoot:dataRoot)
-    }
-
-    public func mailDraft(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailDraft(input: input, context: held().context), integration:"mail", dataRoot:dataRoot)
-    }
-
-
-    public func notesModify(input: [String: JSONValue], deleting: Bool) async throws -> JSONValue {
-        await MacAssistantParts.recover(try await MacAppleScriptBridge.notesModify(input: input, deleting: deleting, context: held().context),
-            integration:"notes", dataRoot:dataRoot)
-    }
-
-
-    public func musicSearchLibrary(input: [String: JSONValue]) async throws -> JSONValue {
-        try await musicPart("search", input: input, turn: held().turn)
-    }
-
-    public func musicListLibrary(input: [String: JSONValue]) async throws -> JSONValue {
-        try await musicPart("library", input: input, turn: held().turn)
-    }
-
-    public func musicListPlaylists(input: [String: JSONValue]) async throws -> JSONValue {
-        try await musicPart("playlists", input: input, turn: held().turn)
-    }
-
-    private func musicPart(_ operation: String, input: [String: JSONValue], turn: Turn) async throws -> JSONValue {
-        try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(
-            envelope: TurnEnvelope.current(turn: turn, surface: "chat"), fileAccess: turn.fileAccess ?? "auto", turn: turn) { door in
-            switch await Parts(root: dataRoot).call(id: operation == "control" ? "music" : "music-library", input: .object([
-                "operation": .string(operation), "input": .object(input)
-            ]), invocation: door.invocation, as: JSONValue.self) {
-            case .success(let result): return result
-            case .failure(let error): throw error
-            }
-        }
-    }
 
 
     public func contactsDelete(input: [String: JSONValue]) async throws -> JSONValue {
@@ -267,32 +150,16 @@ public struct MacIntegrationDeliveryActions: ChatMacIntegrationToolBridge, PureT
 
 
     public func schedulerListJobs(input: [String: JSONValue]) async throws -> JSONValue {
-        try await ConnectorActions.runSchedulerListJobs()
+        try await ScheduledReads.list(dataRoot: dataRoot)
     }
 
     public func schedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue {
-        try await scheduler().createIntegrationJob(input: input, writer: schedulerJobWriter()) {
-            try await ConnectorActions.runSchedulerCreateJob(input: $0)
-        }
+        // Remove routing context only; every other field reaches the clock's admission.
+        try await ScheduledReads.create(input.filter { !["__session_id", "session_id"].contains($0.key) }, dataRoot: dataRoot)
     }
 
     public func schedulerCancelJob(input: [String: JSONValue]) async throws -> JSONValue {
-        try await schedulerJobWriter().cancelJob(jobId: schedulerJobID(input))
-    }
-
-    public func schedulerSetJobEnabled(input: [String: JSONValue], enabled: Bool) async throws -> JSONValue {
-        try await schedulerJobWriter().setJobEnabled(jobId: schedulerJobID(input), enabled: enabled)
-    }
-
-    public func schedulerUpdateJob(input: [String: JSONValue]) async throws -> JSONValue {
-        let id = schedulerJobID(input)
-        // Remove routing context only; preserve unknown edit fields for canonical rejection.
-        let changes = input.filter { !["job_id", "jobId", "id", "__session_id", "session_id"].contains($0.key) }
-        return try await schedulerJobWriter().updateJob(jobId: id, changes: changes)
-    }
-
-    private func schedulerJobWriter() -> SwiftNativeTriggerScheduler {
-        makeSchedulerJobWriter()
+        try await ScheduledReads.cancel(schedulerJobID(input), dataRoot: dataRoot)
     }
 
     private func schedulerJobID(_ input: [String: JSONValue]) -> String {
@@ -376,6 +243,9 @@ public struct MacNotificationPosting: NotificationPosting {
         let result = await NativeAgentNotifications.postMessage(
             title: title, body: message, soundName: soundName, router: NativeAgentEngine.live.ports.backgroundWork.attention,
             turn: turn, deadline: deadline)
+        if case .deferred = result.notificationOutcome {
+            return NotificationPostReceipt(authorization: nil, requestIdentifier: result.identifier, delivery: result.notificationOutcome)
+        }
         guard result.posted else {
             if case .unknown(_, let reason) = result.notificationOutcome {
                 throw ToolFailureError("Mac notification outcome is unknown: " + reason, effects: .unknown,
@@ -386,7 +256,7 @@ public struct MacNotificationPosting: NotificationPosting {
         }
         return NotificationPostReceipt(
             authorization: result.authorizationStatus == "provisional" ? .provisional : .authorized,
-            requestIdentifier: result.identifier
+            requestIdentifier: result.identifier, delivery: result.notificationOutcome
         )
     }
 }

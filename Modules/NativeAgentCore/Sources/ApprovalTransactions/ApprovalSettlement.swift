@@ -148,6 +148,7 @@ extension ApprovalExecution {
         }
         let settlement: ApprovalExecutionOwners.Settlement
         do {
+            let ceiling = try replay.fileAccessCeiling.get()
             let tools = effects.toolDispatchClient(
                 enforceAppAutonomy: false
             )
@@ -186,6 +187,7 @@ extension ApprovalExecution {
                 .with(\.envelope, envelope)
                 .with(\.verifiedSessionID, replay.sessionId)
                 .with(\.fileAccess, replay.fileAccess)
+                .with(\.fileAccessCeiling, ceiling)
                 .with(\.peerSteering, steer)
                 .with(\.offeredTools, [replay.toolName])
             // Replay owns one operation; conversation callbacks refine it and
@@ -327,6 +329,7 @@ extension ApprovalExecution {
                     let turn = TurnRequest(message: "", sessionID: safeSessionID, surface: replay.surface,
                         envelope: replay.envelope, verifiedSessionID: .some(safeSessionID)).turn()
                         .with(\.peerSteering, steer).with(\.fileAccess, fileAccess)
+                        .with(\.fileAccessCeiling, try replay.fileAccessCeiling.get())
                     try await continuation(dataRoot, safeSessionID, turn, """
                             The approval for \(replay.toolName) was decided. This is its receipt, not a new user request:
                             \(summary)\(resume.text.isEmpty ? "" : "\n" + resume.text)

@@ -80,12 +80,12 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
             }
         } catch { return ChatToolOutcome.failure(error: error, effects: .none) }
         // Check the user’s disabled switch at admission so preview refuses the same call as execution.
-        if let gate = Self.macIntegrationAccess(forTool: tool) {
-            do {
-                if let refusal = try await Self.switchRefusal(integration: gate.integration, mode: gate.mode,
-                                                              store: macIntegrationPermissionStore) { return refusal }
-            } catch { return ChatToolOutcome.failure(error: error, effects: .none) }
-        }
+        do {
+            if let gate = try Self.integrationGate(tool: tool, input: input, turn: turn),
+               let refusal = try await Self.switchRefusal(integration: gate.integration, mode: gate.mode, store: macIntegrationPermissionStore) {
+                return refusal
+            }
+        } catch { return ChatToolOutcome.failure(error: error, effects: .none) }
         if let refusal = await argumentRefusal(tool: tool, input: input, turn: turn) { return refusal }
         if tool == "studio_canon_resolve",
            case .failure(let refusal) = StudioCanonSeatGate.liveTurnProvenance(turn: turn, dispatchSurface: surface) {

@@ -6,10 +6,11 @@ import MacIntegration
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `DesktopChatRoute.swift` | `accessibility_permission_missing`, `settle`; Recipe-bound sends retain uncertainty and settlement. |
+import Synchronization
+// Blueprint: | `DesktopChatRoute.swift` | `accessibility_permission_missing`, `settle`; Non-main recipe-bound sends retain uncertainty and settlement. |
 
 /// Desktop chat selectors and reply reads belong to the saved recipe for the exact target chat.
-@MainActor public struct DesktopChatRoute {
+public struct DesktopChatRoute: Sendable {
     enum Blocker: String, Error {
         case offline = "{app} isn't open. Open {app} and show its chat before sending. Nothing was sent."
         case permission = "Allow NativeAgent Accessibility access so it can use {app}'s window. Nothing was sent."
@@ -20,7 +21,6 @@ import NativeAgentShared
         case heldOff
         case submission = "{app} didn't confirm the message. Check Agent's chat in {app}; it won't be resent automatically."
         case moved = "{app} left Agent's chat before answering. The message was sent; its answer will be in Agent's chat in {app}."
-        case timeout = "{app} didn't finish answering within two minutes. The message was sent; its answer will be in Agent's chat in {app}."
         case locked = "Mac is locked, nothing was sent."
         /// Resolve configured agent and app names instead of assuming a fixed persona.
         func detail(mac: MacOperationContext, _ name: String, app: String) -> String {
@@ -38,23 +38,58 @@ import NativeAgentShared
     let recipe: AgentRecipeStore.Recipe
     let bundleID: String
     let ui: AgentHostRow.DesktopChat
+    var live: AgentConversationLiveTarget?
     var appName: String { recipe.host.displayName }
     var untitled: String { ui.newChat }
-    private static var busy = false
+    private struct State: Sendable {
+        var busy = false
+        var lastChat: String?
+        var lastReply = ""
+        var pressedReturn = false
+    }
+    // Only send bookkeeping is locked. AX, input, waits and settlement run without holding it.
+    private static let state = Mutex(State())
+    private static func claim() -> Bool {
+        state.withLock {
+            guard !$0.busy else { return false }
+            $0.busy = true
+            return true
+        }
+    }
+    private static func release() { state.withLock { $0.busy = false } }
     /// Uncertain results must retain the destination chat for later reconciliation.
-    private static var lastChat: String?
-    private static var lastReply = ""
+    private static var lastChat: String? {
+        get { state.withLock { $0.lastChat } }
+        set { state.withLock { $0.lastChat = newValue } }
+    }
+    private static var lastReply: String {
+        get { state.withLock { $0.lastReply } }
+        set { state.withLock { $0.lastReply = newValue } }
+    }
     /// After Return, errors leave delivery uncertain.
-    private static var pressedReturn = false
+    private static var pressedReturn: Bool {
+        get { state.withLock { $0.pressedReturn } }
+        set { state.withLock { $0.pressedReturn = newValue } }
+    }
     private typealias AX = GrokRoutineAccessibility
 
-    public static func perform(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, plan: [String: JSONValue],
+    @concurrent public static func perform(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, plan: [String: JSONValue],
         dataRoot: URL) async -> JSONValue {
         guard case .string(let peerID)? = plan["peer_id"], case .string(let text)? = plan["text"] else {
             return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string("Missing message.")])
         }
+        let recipes: [AgentRecipeStore.Recipe]
+        do {
+            recipes = try await Task.detached {
+                try AgentRecipeStore.requireAvailable()
+                return AgentRecipeStore.recipes
+            }.value
+        } catch {
+            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                "detail": .string("The desktop recipe catalog could not be read: \(error.localizedDescription). Nothing was sent.")])
+        }
         guard case .string(let bundle)? = plan["app_bundle_id"],
-              let recipe = AgentRecipeStore.recipes.first(where: { $0.host.route == .desktopChat && $0.host.bundleIDs.contains(bundle) }),
+              let recipe = recipes.first(where: { $0.host.route == .desktopChat && $0.host.bundleIDs.contains(bundle) }),
               let ui = recipe.host.desktopChat else {
                     return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
                             "detail": .string("""
@@ -62,9 +97,13 @@ import NativeAgentShared
                                 agent.recipe and fix it with agent.recipe_write. Nothing was sent.
                                 """)])
         }
-        let route = Self(recipe: recipe, bundleID: bundle, ui: ui)
-        await route.prepareRenderer(mac: mac)
+        let route = Self(recipe: recipe, bundleID: bundle, ui: ui, live: conversation.liveTarget)
         func execute(mac: MacOperationContext) async -> JSONValue {
+            do { try await route.prepareRenderer(mac: mac) }
+            catch {
+                return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                    "detail": .string("\(route.appName)'s Accessibility preparation failed: \(error.localizedDescription). Nothing was sent.")])
+            }
             if plan["dry_run"] == .bool(true) { return await route.dryRun(turn: turn, mac: mac, peerID: peerID, dataRoot: dataRoot) }
             return await route.perform(turn: turn, mac: mac, conversation: conversation, text, peerID: peerID, plan: plan, dataRoot: dataRoot)
         }
@@ -88,17 +127,16 @@ import NativeAgentShared
 
     /// Explicit verification reads only the authored controls, without input or selector guessing. A mismatch belongs to agent.recipe_write.
     private func dryRun(turn: NativeAgentCore.Turn, mac: MacOperationContext, peerID: String, dataRoot: URL) async -> JSONValue {
-        guard !Self.busy else {
+        guard Self.claim() else {
             return .object(["status": .string("busy"), "dry_run": .bool(true), "sent": .bool(false),
                 "detail": .string("The previous desktop send is still running. Nothing was checked.")])
         }
+        defer { Self.release() }
         var name = ""
         do {
-            name = try AgentBridgeRuntime.configuredNames(dataRoot: dataRoot).agent
+            name = try await Task.detached { try AgentBridgeRuntime.configuredNames(dataRoot: dataRoot).agent }.value
             guard !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty else { throw Blocker.offline }
             guard SystemMacAXElementSource().isTrusted() else { throw Blocker.permission }
-            Self.busy = true
-            defer { Self.busy = false }
             try await controls(turn: turn, mac: mac)
             return .object(["status": .string("passed"), "dry_run": .bool(true), "sent": .bool(false),
                 "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
@@ -129,11 +167,17 @@ import NativeAgentShared
             key: "newChat", wanted: ui.newChat) }
     }
 
-    func nearest(mac: MacOperationContext, _ wanted: String, among: [String]? = nil) -> [String] {
+    func nearest(mac: MacOperationContext, _ wanted: String, among: [String]? = nil) throws -> [String] {
         func words(_ text: String) -> Set<Substring> { Set(text.lowercased().split { !$0.isLetter && !$0.isNumber }) }
         let goal = words(wanted)
-        let seen = Set((among ?? ((try? windows(mac: mac)) ?? []).flatMap { (try? walk(mac: mac, $0)) ?? [] }.flatMap { node in
-            [kAXTitleAttribute, kAXDescriptionAttribute].map { MacAXAttributeRead.text(node, $0, context: mac) } })
+        let labels: [String]
+        if let among { labels = among }
+        else {
+            labels = try windows(mac: mac).flatMap { try walk(mac: mac, $0) }.flatMap { node in
+                [kAXTitleAttribute, kAXDescriptionAttribute].map { MacAXAttributeRead.text(node, $0, context: mac) }
+            }
+        }
+        let seen = Set(labels
             .map { String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80)) }.filter { !$0.isEmpty })
         func shared(_ label: String) -> Int { goal.intersection(words(label)).count }
         return Array(seen.sorted { (shared($0), $1) > (shared($1), $0) }.prefix(5))
@@ -142,7 +186,13 @@ import NativeAgentShared
     static func quoted(_ labels: [String]) -> String { labels.map { "\u{201C}\($0)\u{201D}" }.joined(separator: ", ") }
 
     func said(mac: MacOperationContext, _ miss: Mismatch, then: String = "Nothing was sent.") -> (detail: String, fields: [String: JSONValue]) {
-        let labels = nearest(mac: mac, miss.wanted)
+        let labels: [String]
+        do { labels = try nearest(mac: mac, miss.wanted) }
+        catch {
+            return ("\(appName)'s recipe control \(miss.key) could not be resolved: \(miss.wanted). "
+                + "Reading nearby controls failed: \(error.localizedDescription). " + then,
+                ["reason": .string("recipe_mismatch"), "selector": .string(miss.key), "read_error": .string(error.localizedDescription)])
+        }
         return ("\(appName)'s window has no \u{201C}\(miss.wanted)\u{201D} (its recipe's \(miss.key))"
                     + (labels.isEmpty ? "" : "; nearest: " + Self.quoted(labels)) + ". " + then,
                 ["reason": .string("recipe_mismatch"), "selector": .string(miss.key), "labels": .array(labels.map(JSONValue.string))])
@@ -161,15 +211,23 @@ import NativeAgentShared
             return (Blocker.submission.detail(mac: mac, name, app: appName), fields)
         }
         let added = Array(rows[before...])
-        let row = added.first.map { node in
-            let own = MacAXAttributeRead.text(node, kAXTitleAttribute, context: mac) + MacAXAttributeRead.text(node, kAXDescriptionAttribute, context: mac)
-            return String((own.isEmpty ? ((try? texts(mac: mac, node)) ?? []).prefix(2).joined(separator: " ") : own).prefix(80))
-        } ?? ""
+        let row: String
+        do {
+            row = try added.first.map { node in
+                let own = MacAXAttributeRead.text(node, kAXTitleAttribute, context: mac)
+                    + MacAXAttributeRead.text(node, kAXDescriptionAttribute, context: mac)
+                if own.isEmpty { return String(try texts(mac: mac, node).prefix(2).joined(separator: " ").prefix(80)) }
+                return String(own.prefix(80))
+            } ?? ""
+        }
+        catch { return (error.localizedDescription + " " + unsure, ["reason": .string("accessibility_read_incomplete")]) }
         let addedTree: [AXUIElement]
         do { addedTree = try added.flatMap { try MacAccessibilityReader.elements(in: $0, searching: "the outgoing desktop message", context: mac) } }
         catch { return (error.localizedDescription + " " + unsure, ["reason": .string("accessibility_read_incomplete")]) }
-        let labels = nearest(mac: mac, ui.userPrefix, among: addedTree.flatMap { node in
+        let labels: [String]
+        do { labels = try nearest(mac: mac, ui.userPrefix, among: addedTree.flatMap { node in
             [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].map { MacAXAttributeRead.text(node, $0, context: mac) } })
+        } catch { return (error.localizedDescription + " " + unsure, ["reason": .string("accessibility_read_incomplete")]) }
         return ("""
             \(appName)'s chat gained \(added.count) row\(added.count == 1 ? "" : "s") after the message that \
             \(added.count == 1 ? "doesn't" : "don't") read as the agent's\u{20}
@@ -182,16 +240,16 @@ import NativeAgentShared
     private func perform(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, _ text: String, peerID: String,
         plan: [String: JSONValue], dataRoot: URL) async -> JSONValue {
         let name: String
-        do { name = try AgentBridgeRuntime.configuredNames(dataRoot: dataRoot).agent }
+        do { name = try await Task.detached { try AgentBridgeRuntime.configuredNames(dataRoot: dataRoot).agent }.value }
         catch { return .object(["status": .string("unavailable"), "reason": .string("persona_profile_unavailable"), "sent": .bool(false),
             "detail": .string(error.localizedDescription)]) }
-        guard !Self.busy else {
+        guard Self.claim() else {
             return .object(["status": .string("busy"), "sent": .bool(false), "completed": .bool(false),
                             "detail": .string("\(appName) is still answering the previous message. Nothing was sent.")])
         }
-        Self.busy = true
-        var thread: String?
+        let thread: String?
         if case .string(let saved)? = plan["conversation_id"] { thread = saved }
+        else { thread = nil }
         let store = AgentPeerStore(dataRoot: dataRoot)
         Self.lastChat = nil; Self.lastReply = ""; Self.pressedReturn = false
         // Name the configured agent in its opening message so the chat is recognizable.
@@ -199,9 +257,12 @@ import NativeAgentShared
         // The exact first message of each of the agent's chats, by title: a renamed chat is the agent's only if it opens with exactly that (never just its
         // name).
         let first: String?
-        do { first = try thread.map { try Self.firsts(peerID: peerID, dataRoot: dataRoot)[$0] } ?? message }
+        do {
+            if let thread { first = try await Task.detached { try Self.firsts(peerID: peerID, dataRoot: dataRoot)[thread] }.value }
+            else { first = message }
+        }
         catch {
-            Self.busy = false
+            Self.release()
             return .object(["status": .string("unavailable"), "sent": .bool(false), "reason": .string("desktop_identity_unavailable"),
                 "detail": .string("""
                     Saved desktop conversation identity could not be read: \(error.localizedDescription). Repair the saved identity file before \
@@ -213,14 +274,16 @@ import NativeAgentShared
         let sendDriver = mac.driver
         // Person-requested sends go now or report a blocker; only autonomous sends wait for absence.
         let byPerson = turn.personInitiatedSend?.text == text
-        func heldForMac(_ detail: String) -> JSONValue {
+        @Sendable func heldForMac(_ detail: String) async -> JSONValue {
             guard !byPerson, !Task.isCancelled, sendDriver?.handedBack != true,
                   let live = sendTarget, let row = live.recordID, let operation = live.operationID else {
                 return .object(["status": .string("unavailable"), "sent": .bool(false), "detail": .string(detail)])
             }
             do {
-                try AgentConversationStore(dataRoot: dataRoot).holdForMac(id: row, operation: operation, text: text,
-                    conversation: thread, detail: detail)
+                try await Task.detached {
+                    try AgentConversationStore(dataRoot: dataRoot).holdForMac(id: row, operation: operation, text: text,
+                        conversation: thread, detail: detail)
+                }.value
                 return .object(["status": .string("held"), "reason": .string("mac_busy"), "sent": .bool(false),
                     "completed": .bool(false), "detail": .string(detail + " Waiting for the Mac to be free; it will go then. Do not send it again.")])
             } catch {
@@ -228,49 +291,51 @@ import NativeAgentShared
                     "detail": .string(detail + " Saving the waiting message failed: " + error.localizedDescription)])
             }
         }
-        func remember(_ title: String?) throws {
-            try Self.remember(title, replacing: thread, first: first, peerID: peerID, dataRoot: dataRoot)
+        @Sendable func remember(_ title: String?) async throws {
+            try await Task.detached { try Self.remember(title, replacing: thread, first: first, peerID: peerID, dataRoot: dataRoot) }.value
         }
         var submissionConfirmed = false
-        // An uncertain send keeps its chat, so the thread resumes instead of being orphaned.
-        func uncertain(_ detail: String, _ fields: [String: JSONValue] = [:]) async -> JSONValue {
-            var result = fields.merging(["status": .string("outcome_unknown"), "completed": .bool(false),
-                "terminal": .bool(true), "reply_observation": .string("failed"), "detail": .string(detail)]) { $1 }
-            if !Self.lastReply.isEmpty { result["partial_reply"] = .string(Self.lastReply); result["untrusted_remote_data"] = .bool(true) }
-            if submissionConfirmed { result["sent"] = .bool(true) }
-            let snapshot = try? await passiveRead(mac: mac)
-            let matchingNewChat = thread == nil && snapshot.map({ opensWith($0.turns, first) }) == true ? snapshot?.title : nil
-            let chat = matchingNewChat ?? Self.lastChat
-            if let chat, chat != untitled {
-                result["conversation_id"] = .string(chat)
-                do { try remember(chat) }
-                catch { result["identity_persistence_error"] = .string("The sent conversation identity could not be saved: "
-                    + error.localizedDescription + ". Repair its identity file; do not repeat the send.") }
-            }
-            return .object(result)
-        }
         let result: Result<(String, String, JSONValue), Error>
         do {
             try Task.checkCancellation()
             guard byPerson || MacPersonInput.presence()?.here == false else {
-                Self.busy = false
-                return heldForMac(MacPersonInput.presence()?.here == true ? MacAttentionSessionStore.personUsingMac
+                Self.release()
+                return await heldForMac(MacPersonInput.presence()?.here == true ? MacAttentionSessionStore.personUsingMac
                     : "I held off because the Mac's input is not yet known to be free. Nothing was sent.")
             }
             result = .success(try await send(turn: turn, mac: mac, message, thread: thread, first: first) { submissionConfirmed = true })
         }
         catch { result = .failure(error) }
         let stopped = Task.isCancelled
-        return await settle { @MainActor in
-            defer { Self.busy = false }
+        let confirmed = submissionConfirmed
+        // An uncertain send keeps its chat, so the thread resumes instead of being orphaned.
+        @Sendable func uncertain(_ detail: String, _ fields: [String: JSONValue] = [:]) async -> JSONValue {
+            var result = fields.merging(["status": .string("outcome_unknown"), "completed": .bool(false),
+                "terminal": .bool(true), "reply_observation": .string("failed"), "detail": .string(detail)]) { $1 }
+            if !Self.lastReply.isEmpty { result["partial_reply"] = .string(Self.lastReply); result["untrusted_remote_data"] = .bool(true) }
+            if confirmed { result["sent"] = .bool(true) }
+            let chat = Self.lastChat
+            if let chat, chat != untitled {
+                result["conversation_id"] = .string(chat)
+                do { try await remember(chat) }
+                catch { result["identity_persistence_error"] = .string("The sent conversation identity could not be saved: "
+                    + error.localizedDescription + ". Repair its identity file; do not repeat the send.") }
+            }
+            return .object(result)
+        }
+        return await settle {
+            defer { Self.release() }
             do {
                 let (reply, title, observation) = try result.get()
                 let identityError: String?
-                do { try remember(title); identityError = nil }
+                do { try await remember(title); identityError = nil }
                 catch { identityError = "The answer arrived, but its conversation identity could not be saved: " + error.localizedDescription
                     + ". Repair its identity file; do not repeat the send." }
-                store.recordProof(peerID: peerID, inbound: true, outbound: true)
-                store.recordRoundTrip(peerID: peerID, workspace: title, recipe: recipe)
+                let usedRecipe = recipe
+                await Task.detached {
+                    store.recordProof(peerID: peerID, inbound: true, outbound: true)
+                    store.recordRoundTrip(peerID: peerID, workspace: title, recipe: usedRecipe)
+                }.value
                 var answered: [String: JSONValue] = ["status": .string("answered"), "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
                                 "sent": .bool(true), "completed": .bool(true), "reply": .string(reply),
                                 "conversation_id": .string(title), "continued": .bool(thread != nil), "untrusted_remote_data": .bool(true)]
@@ -280,16 +345,16 @@ import NativeAgentShared
                 return .object(answered)
             } catch {
                 if let failure = error as? MacAccessibilityReader.NativeReadFailure {
-                    if Self.pressedReturn || submissionConfirmed {
-                        return await uncertain(failure.detail + " " + (submissionConfirmed
+                    if Self.pressedReturn || confirmed {
+                        return await uncertain(failure.detail + " " + (confirmed
                             ? "The message was sent; its answer remains unconfirmed. Nothing was resent."
                             : "Return was posted; message submission is unconfirmed. Nothing was resent."))
                     }
                     return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
                         "detail": .string(failure.detail + " Nothing was sent.")])
                 }
-                if submissionConfirmed {
-                    if let blocker = error as? Blocker, [.moved, .timeout].contains(blocker) {
+                if confirmed {
+                    if let blocker = error as? Blocker, blocker == .moved {
                         return await uncertain(blocker.detail(mac: mac, name, app: appName), ["reply_observation": .string("failed"), "terminal": .bool(true)])
                     }
                     return await uncertain("""
@@ -299,7 +364,7 @@ import NativeAgentShared
                 }
                 if let covered = error as? MacScreenLock.Covered {
                     if Self.pressedReturn { return await uncertain(covered.detail + " Return was posted; submission is unconfirmed. Nothing was resent.") }
-                    if covered.code == "human_takeover", !Self.pressedReturn, !stopped { return heldForMac(covered.detail) }
+                    if covered.code == "human_takeover", !Self.pressedReturn, !stopped { return await heldForMac(covered.detail) }
                     return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(
                         covered.detail + " Nothing was sent.")])
                 }
@@ -320,13 +385,17 @@ import NativeAgentShared
                             submission is unconfirmed. Check \(name)'s chat in \(appName) before trying again; nothing was resent.
                             """)
                     }
-                    if [.moved, .timeout, .submission].contains(blocker) || Self.pressedReturn { return await uncertain(blocker.detail(mac: mac, name,
+                    if [.moved, .submission].contains(blocker) || Self.pressedReturn { return await uncertain(blocker.detail(mac: mac, name,
                         app: appName)) }
                     if blocker == .heldOff, !stopped {
                         let detail = withAgentMacDriver(mac, driver: sendDriver) { mac in MacAttentionSessionStore.sendRefusal(context: mac) }
-                        return heldForMac(detail)
+                        return await heldForMac(detail)
                     }
-                    let shown = blocker == .window ? try? await MacAccessibilityReader.read(context: mac) { mac in showing(mac: mac) } : nil
+                    let shown: String?
+                    if blocker == .window {
+                        do { shown = try await MacAccessibilityReader.read(context: mac) { mac in try showing(mac: mac) } }
+                        catch { shown = "an unreadable window: \(error.localizedDescription)" }
+                    } else { shown = nil }
                     let detail = shown.map { "\(appName) isn't showing its chat; it shows \($0). Nothing was sent." }
                     var result: [String: JSONValue] = ["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
                         "detail": .string(detail ?? blocker.detail(mac: mac, name, app: appName))]
@@ -338,7 +407,7 @@ import NativeAgentShared
                 if let refusal = error as? MacNativeActionFailure, case .driver = refusal,
                    !Self.pressedReturn, !stopped {
                     let detail = withAgentMacDriver(mac, driver: sendDriver) { mac in MacAttentionSessionStore.sendRefusal(context: mac) }
-                    return heldForMac(detail)
+                    return await heldForMac(detail)
                 }
                 // Before Return, report the specific failure without implying submission.
                 guard Self.pressedReturn else {
@@ -358,12 +427,14 @@ import NativeAgentShared
         return fields
     }
 
-    func send(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, thread: String?, first: String?,
+    @concurrent func send(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, thread: String?, first: String?,
         didSubmit: () -> Void) async throws -> (String, String, JSONValue) {
         try await unlocked(turn: turn, mac: mac)
         guard SystemMacAXElementSource().isTrusted() else { throw Blocker.permission }
         try await showWindow(turn: turn, mac: mac)
-        var (reopen, chat) = try await openThread(turn: turn, mac: mac, thread, first: first)
+        let opened = try await openThread(turn: turn, mac: mac, thread, first: first)
+        let reopen = opened.reopen
+        var chat = opened.chat
         Self.lastChat = chat
         let key = flat(message)
         func sent() throws -> Int { try turns(mac: mac, walk(mac: mac, window(mac: mac))).filter { $0.user && flat($0.text) == key }.count }
@@ -373,20 +444,19 @@ import NativeAgentShared
         }
         var rows: Int?
         let before = try await typeAndSubmit(turn: turn, mac: mac, message, chat: chat ?? untitled, reopen: reopen, ownsChat: ownsChat,
-                                             count: { rows = try? logRows(mac: mac, walk(mac: mac, window(mac: mac))).count; return try sent() })
+                                             count: { rows = try logRows(mac: mac, walk(mac: mac, window(mac: mac))).count; return try sent() })
         // An additional exact outgoing row confirms submission, not answer delivery.
         do {
-            try await until(mac: mac, seconds: 15) { try sent() > before }
+            try await until(mac: mac) { try sent() > before }
         } catch let failure as MacAccessibilityReader.NativeReadFailure { throw failure }
         catch { throw Unconfirmed(rows: rows) }
         func mine(_ turns: [ChatRow]) -> Int? {
             turns.indices.filter { turns[$0].user && flat(turns[$0].text) == key }.dropFirst(before).first
         }
         didSubmit()
-        let events = try DesktopRouteObservation(bundleID: bundleID, context: mac)
+        let events = try await DesktopRouteObservation(bundleID: bundleID, context: mac)
         defer { events.stop() }
-        var last = "", stableSince = Date()
-        let deadline = Date().addingTimeInterval(120)
+        if let live { await AgentConversationLiveHub.shared.note(live, "Waiting on \(appName)'s reply; cancel to stop waiting.") }
         repeat {
             try Task.checkCancellation()
             let snapshot = try await passiveRead(mac: mac)
@@ -397,49 +467,47 @@ import NativeAgentShared
                 guard let title, opensWith(all, first) else { throw Blocker.moved }
                 chat = title
             }
-            var wake = deadline
             if let index = mine(all) {
                 Self.lastChat = title ?? Self.lastChat
                 let after = all[(index + 1)...].prefix { !$0.user }
                 let reply = after.map(\.text).joined(separator: "\n\n")
                 Self.lastReply = reply
                 guard all[(index + 1)...].allSatisfy({ !$0.user }) else { throw Blocker.moved }
-                if reply != last { last = reply; stableSince = Date() }
                 if !reply.isEmpty, !snapshot.generating {
-                    let quiet = stableSince.addingTimeInterval(3)
-                    if Date() >= quiet { return (reply, try await settledTitle(mac: mac, chat, first: first), events.receipt(readBy: "accessibility")) }
-                    wake = min(deadline, quiet)
+                    return (reply, try await settledTitle(mac: mac, first: first),
+                        await events.receipt(readBy: "accessibility", replyComplete: true))
                 }
             }
-            if Date() >= deadline { break }
-            try await events.next(until: wake)
+            try await events.next()
         } while true
-        throw Blocker.timeout
     }
 
     /// A title or persona name alone cannot prove chat ownership; require its exact opening message.
-    static func firsts(peerID: String, dataRoot: URL) throws -> [String: String] {
+    nonisolated static func firsts(peerID: String, dataRoot: URL) throws -> [String: String] {
         let file = firstsFile(peerID: peerID, dataRoot: dataRoot)
         do { return try JSONDecoder().decode([String: String].self, from: Data(contentsOf: file)) }
         catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [:] }
     }
 
-    private static func firstsFile(peerID: String, dataRoot: URL) -> URL {
+    nonisolated private static func firstsFile(peerID: String, dataRoot: URL) -> URL {
         dataRoot.appendingPathComponent("agents/desktop-chat-" + peerID + ".json")
     }
 
     /// Replace the previous saved title when recording a rename.
-    static func remember(_ title: String?, replacing thread: String?, first: String?, peerID: String, dataRoot: URL) throws {
+    nonisolated static func remember(_ title: String?, replacing thread: String?, first: String?, peerID: String, dataRoot: URL) throws {
         guard let title, let first else { return }
         let file = firstsFile(peerID: peerID, dataRoot: dataRoot)
         var saved = try firsts(peerID: peerID, dataRoot: dataRoot)
+        let previous = saved
         if let thread, thread != title { saved[thread] = nil }
         saved[title] = first
+        guard saved != previous else { return }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(saved), to: file)
     }
 
     /// Select or create only the owned chat; renames require the exact opening turn and reopen requires a foreground list click.
-    func openThread(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ thread: String?, first: String?) async throws -> (reopen: Bool, chat: String?) {
+    @concurrent func openThread(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ thread: String?, first: String?) async throws -> (
+        reopen: Bool, chat: String?) {
         let open = try openTitle(mac: mac, walk(mac: mac, window(mac: mac)))
         if let thread, open == thread {
             guard try opensWith(turns(mac: mac, walk(mac: mac, window(mac: mac))), first) else { throw Blocker.thread }
@@ -459,19 +527,19 @@ import NativeAgentShared
         } else {
             let new = try buttons(mac: mac) { MacAXAttributeRead.text($0, kAXTitleAttribute, context: mac) == ui.newChat }
             if new.isEmpty { throw Mismatch(key: "newChat", wanted: ui.newChat) }
-            guard new.count == 1, try SystemMacAXActSource().performNative(new[0], action: kAXPressAction, turn: turn,
+            guard new.count == 1, let newChat = new.first, try SystemMacAXActSource().performNative(newChat, action: kAXPressAction, turn: turn,
                 context: mac).get() == .success else { throw Blocker.thread }
-            try await until(mac: mac, seconds: 5, else: Blocker.thread) { try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == untitled && turns(
+            try await until(mac: mac) { try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == untitled && turns(
                 mac: mac, walk(mac: mac, window(mac: mac))).isEmpty }
             return (false, nil)
         }
     }
 
-    func showSideChats(turn: NativeAgentCore.Turn, mac: MacOperationContext) async throws {
+    @concurrent func showSideChats(turn: NativeAgentCore.Turn, mac: MacOperationContext) async throws {
         if let back = try buttons(mac: mac, { MacAXAttributeRead.text($0, kAXTitleAttribute, context: mac) == ui.backToMain }).first {
             guard try SystemMacAXActSource().performNative(back, action: kAXPressAction, turn: turn,
                 context: mac).get() == .success else { throw Blocker.thread }
-            try await until(mac: mac, seconds: 5, else: Blocker.thread) { try headerTitle(mac: mac, walk(mac: mac, window(mac: mac))) == nil }
+            try await until(mac: mac) { try headerTitle(mac: mac, walk(mac: mac, window(mac: mac))) == nil }
         }
         if try sideChatsPanel(mac: mac, walk(mac: mac, window(mac: mac))) == nil {
             guard let open = try buttons(mac: mac, { MacAXAttributeRead.text($0, kAXTitleAttribute, context: mac).hasPrefix(ui.chatsButton) })
@@ -479,28 +547,17 @@ import NativeAgentShared
                 key: "chatsButton", wanted: ui.chatsButton) }
             guard try SystemMacAXActSource().performNative(open, action: kAXPressAction, turn: turn,
                 context: mac).get() == .success else { throw Blocker.window }
-            try await until(mac: mac, seconds: 5, else: Mismatch(key: "chatsPanel", wanted: ui.chatsPanel)) { try sideChatsPanel(mac: mac, walk(mac: mac,
+            try await until(mac: mac) { try sideChatsPanel(mac: mac, walk(mac: mac,
                 window(mac: mac))) != nil }
         }
     }
 
     /// Restore the prior front app after input only while foreground ownership remains ours.
-    func typeAndSubmit(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, chat: String, reopen: Bool, ownsChat: () throws -> Bool,
-        count: () throws -> Int) async throws -> Int {
+    @concurrent func typeAndSubmit(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, chat: String, reopen: Bool,
+        ownsChat: () throws -> Bool, count: () throws -> Int) async throws -> Int {
         _ = try composer(mac: mac, walk(mac: mac, window(mac: mac)))
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { throw Blocker.offline }
-        // Register before reading keyboard idle. Input renews the same two-second quiet deadline, with the existing five-second overall limit.
-        let input = try DesktopRouteObservation(bundleID: bundleID, context: mac, accessibility: false, keyboard: true)
-        let giveUp = Date().addingTimeInterval(5)
-        do {
-            defer { input.stop() }
-            while Date() < giveUp {
-                try Task.checkCancellation()
-                let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
-                if idle >= 2 { break }
-                try await input.next(until: min(giveUp, Date().addingTimeInterval(2 - idle)))
-            }
-        }
+        guard !PersonOnlyWindows.keyboardHeldByPerson else { throw Blocker.heldOff }
         try await unlocked(turn: turn, mac: mac)
         let previous = NSWorkspace.shared.frontmostApplication
         let source = SystemMacAXActSource()
@@ -517,12 +574,12 @@ import NativeAgentShared
         let before: Int
         do { before = try await typeInFront(mac: mac, message, chat: chat, reopen: reopen, ownsChat: ownsChat, count: count, app: app) }
         catch {
-            await settle { @MainActor in
+            await settle {
                 await withAgentMacDriver(mac, driver: driver) { mac in await restore(mac: mac, previous, from: app) }
             }
             throw error
         }
-        await settle { @MainActor in
+        await settle {
             await withAgentMacDriver(mac, driver: driver) { mac in await restore(mac: mac, previous, from: app) }
         }
         return before
@@ -538,31 +595,30 @@ import NativeAgentShared
         }
     }
 
-    private func typeInFront(mac: MacOperationContext, _ message: String, chat: String, reopen: Bool, ownsChat: () throws -> Bool, count: () throws -> Int,
-        app: NSRunningApplication) async throws -> Int {
+    @concurrent private func typeInFront(mac: MacOperationContext, _ message: String, chat: String, reopen: Bool, ownsChat: () throws -> Bool,
+        count: () throws -> Int, app: NSRunningApplication) async throws -> Int {
         func front() -> Bool {
             mac.driver?.allowsEmission(context: mac) == true
                 && NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
         }
         let sink = CGEventSink()
-        func click(_ node: AXUIElement) throws {
+        func click(_ node: AXUIElement) async throws {
             let frame = try frame(mac: mac, of: node)
             let point = CGPoint(x: frame.minX + frame.width * 0.35, y: frame.midY)
             guard let events = sink.clickEvents(at: point) else { throw Blocker.typing }
             for event in events {
                 guard front(), !PersonOnlyWindows.keyboardHeldByPerson else { throw Blocker.heldOff }
-                PersonOnlyWindows.beforeAgentPointer(at: point)
-                sink.postNative(event, context: mac)
+                try await sink.postNative(event, context: mac)
             }
         }
-        try await until(mac: mac, seconds: 4, else: Blocker.heldOff) { front() }
+        try await until(mac: mac) { front() }
         if reopen {
             // Only ever the agent's own entry in the side-chat list; never the main chat.
             let entries = try sideChatEntries(mac: mac, named: chat)
-            guard entries.count == 1 else { throw Blocker.thread }
-            try click(entries[0])
+            guard entries.count == 1, let entry = entries.first else { throw Blocker.thread }
+            try await click(entry)
             // Wait for the selected log to load before measuring its baseline.
-            try await until(mac: mac, seconds: 5, else: Blocker.thread) { try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == chat && !turns(mac: mac,
+            try await until(mac: mac) { try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == chat && !turns(mac: mac,
                 walk(mac: mac, window(mac: mac))).isEmpty }
         }
         // Activation may change the chat; recheck the opening message before input.
@@ -575,18 +631,24 @@ import NativeAgentShared
             throw AX.Failure(detail: "The selected chat already holds a draft, left untouched. Finish or clear it before sending.")
         }
         // Use HID input, checking frontmost ownership before each event.
-        func keys(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
+        func keys(_ code: CGKeyCode, flags: CGEventFlags = []) async throws {
             guard let events = sink.keyEvents(code, flags: flags) else { throw Blocker.typing }
             for event in events {
                 // Never emit keys while the person is typing in another window.
                 guard front(), !PersonOnlyWindows.keyboardHeldByPerson else { throw Blocker.heldOff }
-                sink.postNative(event, context: mac)
+                try await sink.postNative(event, context: mac)
                 // Only an emitted Return can make submission uncertain. A safety refusal before key-down proves nothing was sent.
                 if code == 36 { Self.pressedReturn = true }
             }
         }
-        try click(inputBox)
-        try await Task.sleep(for: .milliseconds(300))
+        try await click(inputBox)
+        try await until(mac: mac) {
+            guard front(), try ownsChat() else { throw Blocker.heldOff }
+            return try MacAXAttributeRead.checkedBool(inputBox, kAXFocusedAttribute, context: mac) == true
+        }
+        try await DesktopClipboard.shared.acquire()
+        defer { DesktopClipboard.shared.release() }
+        try Task.checkCancellation()
         let pasteboard = NSPasteboard.general
         let saved = try AX.copyPasteboard(pasteboard)
         pasteboard.clearContents()
@@ -596,40 +658,40 @@ import NativeAgentShared
             // Only put the person's clipboard back if nothing new was copied meanwhile.
             if pasteboard.changeCount == ours {
                 pasteboard.clearContents()
-                if !saved.isEmpty { pasteboard.writeObjects(saved) }
+                if !saved.isEmpty { _ = AX.restorePasteboard(saved, to: pasteboard) }
             }
         }
         guard wrote else { throw Blocker.typing }
-        // The person can switch chats during pauses; recheck before paste and Return.
+        // Recheck ownership before paste and Return.
         guard try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == chat, try ownsChat() else { throw Blocker.thread }
         let currentInput = try composerInput(mac: mac, walk(mac: mac, window(mac: mac)))
         guard CFEqual(inputBox, currentInput), try AX.composerValue(mac: mac, currentInput).isEmpty else {
             throw AX.Failure(detail: "The selected composer changed or holds a draft, left untouched. Nothing was pasted.")
         }
-        try keys(9, flags: .maskCommand)
-        try await Task.sleep(for: .milliseconds(400))
+        try await keys(9, flags: .maskCommand)
+        try await until(mac: mac) {
+            guard front(), try ownsChat(), try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == chat else { throw Blocker.heldOff }
+            guard CFEqual(currentInput, try composerInput(mac: mac, walk(mac: mac, window(mac: mac)))) else { throw Blocker.thread }
+            return flat(try AX.composerValue(mac: mac, currentInput)) == flat(message)
+        }
         guard try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == chat, try ownsChat() else { throw Blocker.thread }
         guard CFEqual(currentInput, try composerInput(mac: mac, walk(mac: mac, window(mac: mac)))),
               flat(try AX.composerValue(mac: mac, currentInput)) == flat(message) else {
             throw AX.Failure(detail: "The exact composer did not confirm the full message. Submission stopped; inspect the retained draft before another send.")
         }
-        try keys(36)
-        try await Task.sleep(for: .milliseconds(300))
+        try await keys(36)
         return before
     }
 
-    /// Read the current title after allowing a new chat’s name to appear.
-    func settledTitle(mac: MacOperationContext, _ thread: String?, first: String?) async throws -> String {
-        let events = thread == nil ? try DesktopRouteObservation(bundleID: bundleID, context: mac) : nil
-        defer { events?.stop() }
-        let deadline = Date().addingTimeInterval(thread == nil ? 8 : 0)
+    /// A named, owned chat supplies the persisted identity.
+    func settledTitle(mac: MacOperationContext, first: String?) async throws -> String {
+        let events = try await DesktopRouteObservation(bundleID: bundleID, context: mac)
+        defer { events.stop() }
         while true {
             let snapshot = try await passiveRead(mac: mac)
             guard opensWith(snapshot.turns, first) else { throw Blocker.moved }
-            if thread != nil || (snapshot.title ?? untitled) != untitled || Date() >= deadline {
-                return snapshot.title ?? thread ?? untitled
-            }
-            try await events?.next(until: deadline)
+            if let title = snapshot.title, !title.isEmpty, title != untitled { return title }
+            try await events.next()
         }
     }
 
@@ -637,11 +699,15 @@ import NativeAgentShared
 
     /// Outgoing transcript rows may establish delivery; composer values and changed chats cannot. A courier without a native reader may submit but must leave
     /// delivery unconfirmed.
-    static func outgoingOccurrences(mac: MacOperationContext, _ message: String, bundle: String, label: String) async throws -> Int? {
+    @concurrent static func outgoingOccurrences(mac: MacOperationContext, _ message: String, bundle: String, label: String) async throws -> Int? {
+        let recipes = try await Task.detached {
+            try AgentRecipeStore.requireAvailable()
+            return AgentRecipeStore.recipes
+        }.value
         guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundle,
-              let recipe = AgentRecipeStore.recipes.first(where: { $0.host.bundleIDs.contains(bundle) && $0.host.desktopChat != nil }),
+              let recipe = recipes.first(where: { $0.host.bundleIDs.contains(bundle) && $0.host.desktopChat != nil }),
               let ui = recipe.host.desktopChat else { return nil }
-        let route = Self(recipe: recipe, bundleID: bundle, ui: ui)
+        let route = Self(recipe: recipe, bundleID: bundle, ui: ui, live: nil)
         let read = try await route.passiveRead(mac: mac)
         guard read.title == label else { return nil }
         return read.turns.filter { $0.user && route.flat($0.text) == route.flat(message) }.count
@@ -651,14 +717,14 @@ import NativeAgentShared
 
     struct Read: Sendable { let turns: [ChatRow]; let title: String?; let generating: Bool }
 
-    /// Suspend cold accessibility settlement at the async caller; synchronous main-thread reads cannot wait.
-    func prepareRenderer(mac: MacOperationContext) async {
+    /// Cold accessibility settlement and the subsequent synchronous reads belong to the non-main send/read path.
+    func prepareRenderer(mac: MacOperationContext) async throws {
         guard let pid = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.processIdentifier else { return }
-        try? await SystemMacAXElementSource.prepareRenderer(pid: pid, context: mac)
+        try await SystemMacAXElementSource.prepareRenderer(pid: pid, context: mac)
     }
 
     func passiveRead(mac: MacOperationContext) async throws -> Read {
-        await prepareRenderer(mac: mac)
+        try await prepareRenderer(mac: mac)
         return try await MacAccessibilityReader.read(context: mac) { mac in
             let tree = try walk(mac: mac, window(mac: mac))
             let title = try openTitle(mac: mac, tree)
@@ -684,12 +750,12 @@ import NativeAgentShared
     }
 
     /// Report window or dialog evidence when none contains the chat; unreadable windows supply no description.
-    nonisolated func showing(mac: MacOperationContext) -> String? {
-        guard let all = try? windows(mac: mac) else { return nil }
+    nonisolated func showing(mac: MacOperationContext) throws -> String? {
+        let all = try windows(mac: mac)
         if all.isEmpty { return "no window" + (NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.isHidden == true
             ? " (it is hidden)" : "") }
-        let seen = all.compactMap { window -> String? in
-            guard let tree = try? walk(mac: mac, window) else { return "an incomplete Accessibility read" }
+        let seen = try all.compactMap { window -> String? in
+            let tree = try walk(mac: mac, window)
             let words = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac) == kAXStaticTextRole }
                 .map { MacAXAttributeRead.text($0, kAXValueAttribute, context: mac).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
             let title = MacAXAttributeRead.text(window, kAXTitleAttribute, context: mac)
@@ -705,30 +771,25 @@ import NativeAgentShared
 
     nonisolated func window(mac: MacOperationContext) throws -> AXUIElement {
         let all = try windows(mac: mac)
-        if all.count == 1 { return all[0] }
+        if all.count == 1, let window = all.first { return window }
         guard let chat = try all.first(where: { try hasLog(mac: mac, $0) }) else { throw all.isEmpty ? Blocker.window as any Error : Mismatch(key: "log",
             wanted: ui.log) }
         return chat
     }
 
     /// Unminimize or reopen the chat before attempting clicks that hidden or absent windows cannot receive.
-    func showWindow(turn: NativeAgentCore.Turn, mac: MacOperationContext) async throws {
+    @concurrent func showWindow(turn: NativeAgentCore.Turn, mac: MacOperationContext) async throws {
         let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty ? [] : try windows(mac: mac)
-        var restored = false
         for window in existing where MacAXAttributeRead.copyRaw(window, kAXMinimizedAttribute, context: mac) as? Bool == true {
             guard try SystemMacAXActSource().setNativeAttribute(window, attribute: kAXMinimizedAttribute, value: kCFBooleanFalse, turn: turn, context: mac).get(
                 ) == .success else { throw Blocker.window }
-            restored = true
         }
-        if restored { try await Task.sleep(for: .milliseconds(600)) }
         guard try !existing.contains(where: { try hasLog(mac: mac, $0) }) else { return }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { throw Blocker.offline }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
         _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
-        do { try await until(mac: mac, seconds: 8) { try windows(mac: mac).contains(where: { try hasLog(mac: mac, $0) }) } }
-        catch let failure as MacAccessibilityReader.NativeReadFailure { throw failure }
-        catch { throw (try? windows(mac: mac))?.isEmpty == false ? Mismatch(key: "log", wanted: ui.log) : Blocker.window as any Error }
+        try await until(mac: mac) { try windows(mac: mac).contains(where: { try hasLog(mac: mac, $0) }) }
     }
 
     /// Exclude message bodies from navigation walks so long logs cannot exhaust the bound; retain the log node.
@@ -751,8 +812,8 @@ import NativeAgentShared
             context: mac)
             .contains(ui.composerCore) }
         if boxes.isEmpty { throw Mismatch(key: "composerCore", wanted: ui.composerCore) }
-        guard boxes.count == 1 else { throw Blocker.window }
-        return (MacAXAttributeRead.text(boxes[0], kAXTitleAttribute, context: mac), boxes[0])
+        guard boxes.count == 1, let box = boxes.first else { throw Blocker.window }
+        return (MacAXAttributeRead.text(box, kAXTitleAttribute, context: mac), box)
     }
 
     nonisolated func composerInput(mac: MacOperationContext, _ tree: [AXUIElement]) throws -> AXUIElement {
@@ -761,10 +822,10 @@ import NativeAgentShared
             [kAXTextAreaRole, kAXTextFieldRole].contains(MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac))
                 && MacAXAttributeRead.text($0, kAXSubroleAttribute, context: mac) != kAXSearchFieldSubrole
         }
-        guard boxes.count == 1 else {
+        guard boxes.count == 1, let box = boxes.first else {
             throw AX.Failure(detail: "The exact composer's readable text field could not be identified. Its draft was left untouched; nothing was typed.")
         }
-        return boxes[0]
+        return box
     }
 
     func frame(mac: MacOperationContext, of node: AXUIElement) throws -> CGRect {
@@ -871,23 +932,20 @@ import NativeAgentShared
 
     func flat(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
 
-    /// Timeout reports the last observed recipe miss so repair keeps the exact missing label.
-    func until(mac: MacOperationContext, seconds: Double, else timeout: any Error = Blocker.submission, _ ready: () throws -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(seconds)
-        let events = try DesktopRouteObservation(bundleID: bundleID, context: mac)
+    /// Read the condition after registration, then after its source changes. Silence remains a cancellable wait.
+    @concurrent func until(mac: MacOperationContext, _ ready: () throws -> Bool) async throws {
+        let events = try await DesktopRouteObservation(bundleID: bundleID, context: mac)
         defer { events.stop() }
-        var miss: Mismatch?
+        var waitingPublished = false
         repeat {
             try Task.checkCancellation()
-            do { if try ready() { return } }
-            catch let error as MacAccessibilityReader.NativeReadFailure { throw error }
-            catch is CancellationError { throw CancellationError() }
-            catch let error as Mismatch { miss = error }
-            catch {}
-            if Date() >= deadline { break }
-            try await events.next(until: deadline)
+            if try ready() { return }
+            if let live, !waitingPublished {
+                await AgentConversationLiveHub.shared.note(live, "Waiting on \(appName)'s desktop controls; cancel to stop waiting.")
+                waitingPublished = true
+            }
+            try await events.next()
         } while true
-        throw miss.map { $0 as any Error } ?? timeout
     }
 
 }

@@ -50,7 +50,7 @@ extension ImprovementGauntletRun {
     /// Record static checks, installed proof and signature in the panel’s run contract; checks this Mac cannot run stay unavailable, never passed.
     public static func run(
         dataRoot: URL,
-        runProcess: (String, [String], URL, TimeInterval) async throws -> (status: Int32, detail: String),
+        runProcess: (String, [String], URL) async throws -> (status: Int32, detail: String),
         appendBoundedRun: (JSONValue, URL) async throws -> Void
     ) async throws -> ImprovementGauntletRun {
         func runGauntletProcessCheck(
@@ -58,10 +58,9 @@ extension ImprovementGauntletRun {
             title: String,
             executable: String,
             arguments: [String],
-            currentDirectory: URL,
-            timeout: TimeInterval
+            currentDirectory: URL
         ) async throws -> GauntletCheck {
-            let result = try await runProcess(executable, arguments, currentDirectory, timeout)
+            let result = try await runProcess(executable, arguments, currentDirectory)
             return GauntletCheck(
                 id: id,
                 title: title,
@@ -89,8 +88,7 @@ extension ImprovementGauntletRun {
                     title: "Static checks and installed runtime pass",
                     executable: "/usr/bin/env",
                     arguments: ["NATIVE_AGENT_INSTALLED_APP=\(appPath.path)", "/bin/bash", smokeScript.path, "--live"],
-                    currentDirectory: repoRoot,
-                    timeout: 240
+                    currentDirectory: repoRoot
                 ))
             } else {
                 unavailable("isolated_smoke", "Static checks and installed runtime pass", "The checkout has no smoke check script.")
@@ -104,8 +102,7 @@ extension ImprovementGauntletRun {
                 title: "Installed app verifies",
                 executable: "/usr/bin/codesign",
                 arguments: ["--verify", "--deep", "--strict", appPath.path],
-                currentDirectory: appPath.deletingLastPathComponent(),
-                timeout: 60
+                currentDirectory: appPath.deletingLastPathComponent()
             ))
         } else {
             unavailable("app_verify", "Installed app verifies", "This process is not running from an app bundle.")

@@ -382,11 +382,7 @@ extension MacSyncEngine {
                     continue
                 }
                 let msgId = staleAction.msgId
-                _ = await withCKTimeout("MacSyncEngine.processInboxFiles.staleResponseKVS") {
-                    let kvs = NSUbiquitousKeyValueStore.default
-                    kvs.set(msgId, forKey: "inbox_response_\(msgId)")
-                    return kvs.synchronize()
-                }
+                await signalInboxResponse(msgId)
                 if retainedResponse == nil {
                     await writeTransaction(
                         id: txId, action: staleAction.action, state: "unknown", error: response["message"],
@@ -534,11 +530,7 @@ extension MacSyncEngine {
                     )
                 }
                 let redeliveredMsgId = action.msgId
-                _ = await withCKTimeout("MacSyncEngine.processInboxFiles.redeliveredResponseKVS") {
-                    let kvs = NSUbiquitousKeyValueStore.default
-                    kvs.set(redeliveredMsgId, forKey: "inbox_response_\(redeliveredMsgId)")
-                    return kvs.synchronize()
-                }
+                await signalInboxResponse(redeliveredMsgId)
                 // Close out only known outcomes; refusals must not claim processed identity for work that never ran.
                 if ledgerRefusal == nil {
                     recordProcessed(action.msgId)
@@ -693,11 +685,7 @@ extension MacSyncEngine {
             }
 
             let msgId = action.msgId
-            _ = await withCKTimeout("MacSyncEngine.processInboxFiles.responseKVS") {
-                let kvs = NSUbiquitousKeyValueStore.default
-                kvs.set(msgId, forKey: "inbox_response_\(msgId)")
-                return kvs.synchronize()
-            }
+            await signalInboxResponse(msgId)
 
             guard isActive, generation == snapshotLifecycleGeneration else { return }
             lastInboxAt = Date()

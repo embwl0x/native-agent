@@ -144,16 +144,6 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             endpoints: []
         ),
         FeatureSurfaceRecord(
-            sourceId: "workflows",
-            name: "Saved Workflows",
-            description: "Saved planning templates for tasks with several steps.",
-            triggers: ["workflow", "orchestrate", "steps", "approval", "rollback"],
-            permissions: [],
-            riskClass: "approval_gated",
-            updatedAt: nowISO,
-            endpoints: []
-        ),
-        FeatureSurfaceRecord(
             sourceId: "own_lines",
             name: "The Agent's Own Lines",
             description: """
@@ -203,7 +193,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
         FeatureSurfaceRecord(
             sourceId: "auto_improvement",
             name: "Self-Improvement Center",
-            description: "Directed and recurring app-owned self-improvement, autonomous Codex worktrees, cleanup, gauntlet, and staged receipts.",
+            description: "Directed app-owned self-improvement, autonomous Codex worktrees, cleanup, gauntlet, and staged receipts.",
             triggers: ["improve", "self improve", "autonomy", "train", "gauntlet"],
             permissions: ["app_owned_worktree"],
             riskClass: "guardrailed_autonomy",
@@ -223,7 +213,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
         FeatureSurfaceRecord(
             sourceId: "eval_release_ops",
             name: "Evals, Release, and Agent Ops",
-            description: "Eval harness, release checklist, watchdog, runtime traces, production support exports, and ops health snapshots.",
+            description: "Evaluation records, release checklist, watchdog, runtime traces, production support exports, and ops health snapshots.",
             triggers: ["eval", "test", "release", "watchdog", "ops", "trace", "support export"],
             permissions: [],
             riskClass: "read_only",

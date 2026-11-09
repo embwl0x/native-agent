@@ -93,6 +93,11 @@ public actor MacChatTurnLifecycleStore {
         self.maximumRecords = max(1, maximumRecords)
     }
 
+    /// Recovery reads checkpoint bytes on this persistence actor, never on the presentation actor.
+    public func hasCheckpoint(dataRoot: URL, identity: MacChatTurnIdentity) throws -> Bool {
+        try TurnCheckpoint.read(dataRoot: dataRoot, sessionId: identity.sessionId, turnId: identity.turnId) != nil
+    }
+
     public func begin(_ state: MacChatTurnLifecycleState) async throws {
         await acquireMutation()
         defer { releaseMutation() }

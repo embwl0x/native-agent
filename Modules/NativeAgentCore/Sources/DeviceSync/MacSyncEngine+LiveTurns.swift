@@ -6,13 +6,18 @@ import Transcripts
 import Privacy
 // Blueprint: | `MacSyncEngine+LiveTurns.swift` | `MacSyncEngine`: `startLiveTurnRelay`, `stopLiveTurnRelay` |
 
+private struct LiveTurnMovement: Sendable {
+    var deltas = ICloudTextDeltaCoalescer()
+    var writing: String?
+}
+
 /// Other-door turns use their own run id and live marker so the phone can distinguish them from turns its forwarder owns.
 extension MacSyncEngine {
     func startLiveTurnRelay() {
         stopLiveTurnRelay()
         let (signals, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let mailbox = OSAllocatedUnfairLock(initialState: (
-            turns: [String: ICloudTextDeltaCoalescer](),
+            turns: [String: LiveTurnMovement](),
             pending: [String: BridgeMessage]()
         ))
         // A serial queue keeps event order and gives the yield its own stack.
@@ -29,10 +34,17 @@ extension MacSyncEngine {
                     let kind: String?
                     let sequence: Int?
                     switch event.kind {
+                    case .writing(let line):
+                        guard state.turns[run]?.writing != line else { return false }
+                        state.turns[run, default: LiveTurnMovement()].writing = line
+                        text = line
+                        kind = "writing"
+                        sequence = nil
                     case .delta(let delta):
-                        guard let flush = state.turns[run, default: ICloudTextDeltaCoalescer()].push(
+                        guard let flush = state.turns[run, default: LiveTurnMovement()].deltas.push(
                                 delta: delta
                               ) else { return false }
+                        state.turns[run]?.writing = nil
                         text = flush.text
                         kind = "text_delta"
                         sequence = flush.sequence
@@ -66,8 +78,12 @@ extension MacSyncEngine {
                         metadata["status"] = status.prefix(1).uppercased() + status.dropFirst()
                     }
                     metadata["seq"] = sequence.map(String.init)
+                    // Each changed line is new movement, even when a later call repeats earlier words: the phone deduplicates by id.
+                    let movementID = kind == "writing"
+                        ? "writing-" + UUID().uuidString
+                        : sequence.map(String.init) ?? "terminal"
                     state.pending[run] = BridgeMessage.make(
-                        id: "live-\(run)-\(sequence.map(String.init) ?? "terminal")",
+                        id: "live-\(run)-\(movementID)",
                         sender: "mac", text: text, sessionID: event.sessionId,
                         correlationID: run, metadata: metadata
                     )
@@ -92,7 +108,7 @@ extension MacSyncEngine {
                 for message in pending {
                     guard !Task.isCancelled, generation == self.snapshotLifecycleGeneration else { break }
                     guard let run = message.correlationID else { continue }
-                    let terminal = message.metadata?["kind"] != "text_delta"
+                    let terminal = ["final", "incomplete", "error", "cancelled"].contains(message.metadata?["kind"] ?? "")
                     if !terminal, mailbox.withLock({ $0.pending[run] != nil }) { continue }
                     do {
                         _ = try await self.sync.bridge.sendChatMessage(

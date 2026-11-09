@@ -9,37 +9,45 @@ import ProviderRouting
 // Blueprint: | `EngineProviderHelpers.swift` | Checked account contracts, inheritance and committed routing publication |
 @MainActor
 extension ProvidersFacade {
-    public struct SettingsSnapshot: Sendable {
-        public let routing: ProviderRoutingSnapshot
-        public let providers: [ProviderInfo]
-        public let catalog: ModelCatalogResponse?
-        public let catalogError: String?
-        public let rowSet: ProviderSurfaceRowSet
-        public var activeProviders: [String: String] { routing.activeProviders }
-        public var preferences: [String: SurfacePreference] { routing.preferences }
-        public let unavailableModels: [String: Bool]
-        public let oauthStatuses: [String: NativeOAuthFlow.SignInStatus]
-        public let codexCLISessionOffer: NativeOAuthFlow.CodexCLISessionOffer?
-    }
 
     public enum SettingsRefreshOutcome: Sendable {
-        case loaded(SettingsSnapshot)
+        case loaded(ProviderSettingsSnapshot)
         case failed(String)
     }
 
-    public func refreshSettings(refreshCatalog: Bool, cause: (Error, String) -> String) async -> SettingsRefreshOutcome {
-        if refreshCatalog {
-            guard catalogRefreshStarted == nil else { return .failed("The model catalog is already being refreshed.") }
-            catalogRefreshStarted = Date()
-            refreshFace()
+    public func refreshSettings(refreshCatalog: Bool, cause: @escaping (Error, String) -> String) async -> SettingsRefreshOutcome {
+        guard refreshCatalog else {
+            defer { refreshAccountModelsInBackground() }
+            return await loadSettings(refreshCatalog: false, cause: cause)
         }
-        defer {
-            if refreshCatalog { catalogRefreshStarted = nil; refreshFace() }
-            else { refreshAccountModelsInBackground() }
+        guard catalogRefreshTask == nil else { return .failed("The model catalog is already being refreshed.") }
+        catalogRefreshStarted = Date()
+        let task = Task<SettingsRefreshOutcome, Never> {
+            defer {
+                catalogRefreshTask = nil
+                catalogRefreshStarted = nil
+                refreshFace()
+            }
+            let result = await loadSettings(refreshCatalog: true, cause: cause)
+            return Task.isCancelled ? .failed("Model catalog refresh cancelled.") : result
         }
+        catalogRefreshTask = task
+        refreshFace()
+        return await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+    }
+
+    public func cancelCatalogRefresh() async -> String {
+        guard let task = catalogRefreshTask else { return "No model catalog refresh is running." }
+        task.cancel()
+        _ = await task.value
+        return "Model catalog refresh cancelled."
+    }
+
+    private func loadSettings(refreshCatalog: Bool, cause: (Error, String) -> String) async -> SettingsRefreshOutcome {
         return await settingsReads.read {
             await readSettings(refreshCatalog: refreshCatalog, cause: cause)
         } publish: { outcome in
+            guard !Task.isCancelled else { return }
             switch outcome {
             case .loaded(let settings): publishSettings(settings)
             case .failed(let detail): publishSettingsFailure(detail)
@@ -49,16 +57,18 @@ extension ProvidersFacade {
 
     private func readSettings(refreshCatalog: Bool, cause: (Error, String) -> String) async -> SettingsRefreshOutcome {
         do {
+            try Task.checkCancellation()
             let facade = self
             var catalog: ModelCatalogResponse?
             var catalogError: String?
             do { catalog = try await facade.modelCatalog(refresh: refreshCatalog) }
             catch { catalogError = cause(error, refreshCatalog ? "refresh the model list" : "load the model list") }
+            try Task.checkCancellation()
             let snapshot = try await facade.routing.checkedProviderSnapshot()
             let providers = try await Task.detached(priority: .userInitiated) {
                 try ProvidersFacade.connections(from: snapshot)
             }.value
-            return .loaded(try settingsSnapshot(
+            return .loaded(await settingsSnapshot(
                 routing: snapshot.routing,
                 providers: providers,
                 catalog: catalog,
@@ -70,10 +80,11 @@ extension ProvidersFacade {
         }
     }
 
-    private func settingsSnapshot(
+    /// Credential status, CLI consent and cached model availability all read storage; every caller leaves the UI actor here.
+    @concurrent private nonisolated func settingsSnapshot(
         routing: ProviderRoutingSnapshot, providers: [ProviderInfo], catalog: ModelCatalogResponse?,
         catalogError: String?, rowSet: ProviderSurfaceRowSet
-    ) throws -> SettingsSnapshot {
+    ) async -> ProviderSettingsSnapshot {
         var choices: [String: [String: Bool]] = [:]
         var unavailableModels: [String: Bool] = [:]
         for (surface, preference) in routing.preferences {
@@ -84,7 +95,7 @@ extension ProvidersFacade {
             }
             unavailableModels[surface] = choices[providerID]?[preference.model]
         }
-        return SettingsSnapshot(
+        return ProviderSettingsSnapshot(
             routing: routing, providers: providers, catalog: catalog, catalogError: catalogError,
             rowSet: rowSet,
             unavailableModels: unavailableModels,
@@ -95,16 +106,15 @@ extension ProvidersFacade {
         )
     }
 
-    /// The transaction's own routing is published before any suspended older read can return.
-    func publishCommittedRouting(_ routing: ProviderRoutingSnapshot) throws {
-        let committed = try settings.map {
-            try settingsSnapshot(routing: routing, providers: $0.providers, catalog: $0.catalog,
-                                 catalogError: $0.catalogError, rowSet: $0.rowSet)
-        }
-        settingsReads.write {
-            if let committed { publishSettings(committed) }
-        }
+    /// Retire pre-commit reads before suspending; the rebuilt snapshot shares refresh ordering so newer publications still win.
+    func publishCommittedRouting(_ routing: ProviderRoutingSnapshot) async {
+        settingsReads.write {}
         retireSessionReads()
+        guard let settings else { return }
+        _ = await settingsReads.read {
+            await settingsSnapshot(routing: routing, providers: settings.providers, catalog: settings.catalog,
+                                   catalogError: settings.catalogError, rowSet: settings.rowSet)
+        } publish: { publishSettings($0) }
     }
 }
 
@@ -124,48 +134,6 @@ extension ProvidersFacade {
     }
 
 }
-
-extension ProvidersFacade {
-    public struct AuthModePickerState: Equatable {
-        public let supportedModes: [String]
-        public let selectedMode: String
-        public let unresolvedSavedMode: String?
-
-        public var canSave: Bool { supportedModes.contains(selectedMode) }
-    }
-}
-
-extension ProvidersFacade {
-    private nonisolated static let knownModes: Set<String> = ["api_key", "oauth"]
-
-    public nonisolated static func authModePickerState(
-        advertisedModes: [String],
-        savedMode: String?
-    ) -> AuthModePickerState {
-        var seen = Set<String>()
-        let supportedModes = advertisedModes.compactMap { raw -> String? in
-            let mode = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard knownModes.contains(mode), seen.insert(mode).inserted else { return nil }
-            return mode
-        }
-        let normalizedSavedMode = savedMode?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        if let normalizedSavedMode, supportedModes.contains(normalizedSavedMode) {
-            return AuthModePickerState(
-                supportedModes: supportedModes,
-                selectedMode: normalizedSavedMode,
-                unresolvedSavedMode: nil
-            )
-        }
-        return AuthModePickerState(
-            supportedModes: supportedModes,
-            selectedMode: "",
-            unresolvedSavedMode: normalizedSavedMode?.isEmpty == false ? normalizedSavedMode : nil
-        )
-    }
-}
-
 
 extension ProvidersFacade {
     public struct SurfaceModelChoice: Identifiable, Hashable, Sendable {
@@ -318,19 +286,11 @@ extension ProvidersFacade {
     }
 }
 
-public struct ChatComposerModelGroup: Identifiable {
-    @MainActor private static var previousConnections: [ProviderInfo]?
-    @MainActor private static var previousCatalog: ModelCatalogResponse?
-    @MainActor private static var previousProvider = ""
-    @MainActor private static var previousGroups: [Self] = []
-
-    @MainActor public static func groups(
+extension ChatComposerModelGroup {
+    public static func groups(
         connections: [ProviderInfo], catalog: ModelCatalogResponse?, providerID: String
     ) -> [Self] {
-        if previousConnections == connections, previousCatalog == catalog, previousProvider == providerID {
-            return previousGroups
-        }
-        // Index the catalog once per hover; large providers make per-model searches expensive.
+        // Provider-scoped contracts and catalog descriptions form one finished menu.
         var catalogById: [String: ModelCatalogItem] = [:]
         for model in catalog?.models ?? [] where catalogById[model.id] == nil {
             catalogById[model.id] = model
@@ -365,51 +325,18 @@ public struct ChatComposerModelGroup: Identifiable {
                 return ChatComposerModelGroup(
                     id: provider.provider_id,
                     provider: provider.display_name,
-                    models: models
+                    models: models, vendorGroups: vendorGroups(for: models)
                 )
             }
-        previousConnections = connections
-        previousCatalog = catalog
-        previousProvider = providerID
-        previousGroups = groups
         return groups
     }
-    public let id: String
-    public let provider: String
-    public let models: [ModelCatalogItem]
 
-    public init(id: String, provider: String, models: [ModelCatalogItem]) {
-        self.id = id
-        self.provider = provider
-        self.models = models
-    }
-
-    /// Group large company/model catalogs by company so the picker stays navigable.
-    @MainActor private static var vendorInput: [ModelCatalogItem] = []
-    @MainActor private static var vendorOutput: [Self]?
-
-    @MainActor public var vendorGroups: [ChatComposerModelGroup]? {
+    private static func vendorGroups(for models: [ModelCatalogItem]) -> [ChatComposerModelGroup]? {
         guard models.count > 40, models.allSatisfy({ $0.id.contains("/") }) else { return nil }
-        if Self.vendorInput == models { return Self.vendorOutput }
         let byVendor = Dictionary(grouping: models) { String($0.id.prefix { $0 != "/" }) }
-        let groups = byVendor.keys
-            .map { ChatComposerModelGroup(id: $0, provider: Self.vendorName($0), models: byVendor[$0] ?? []) }
-            .sorted { $0.provider.localizedCaseInsensitiveCompare($1.provider) == .orderedAscending }
-        Self.vendorInput = models
-        Self.vendorOutput = groups
-        return groups
-    }
-
-    private static let knownVendorNames = [
-        "openai": "OpenAI", "anthropic": "Anthropic", "google": "Google", "x-ai": "xAI",
-        "meta-llama": "Meta", "mistralai": "Mistral", "qwen": "Qwen", "deepseek": "DeepSeek",
-        "z-ai": "Z.ai", "nvidia": "NVIDIA", "moonshotai": "Moonshot", "microsoft": "Microsoft",
-        "amazon": "Amazon", "cohere": "Cohere", "perplexity": "Perplexity", "minimax": "MiniMax",
-    ]
-
-    public static func vendorName(_ id: String) -> String {
-        if let known = knownVendorNames[id] { return known }
-        return id.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+        return byVendor.keys.map {
+            ChatComposerModelGroup(id: $0, provider: Self.vendorName($0), models: byVendor[$0] ?? [])
+        }.sorted { $0.provider.localizedCaseInsensitiveCompare($1.provider) == .orderedAscending }
     }
 }
 
@@ -421,6 +348,7 @@ extension ProvidersFacade {
     public static func runQuietProvider(
         verb: String, input: [String: JSONValue], dataRoot: URL, turn: Turn,
         refresh: () async -> (accounts: [ProviderInfo], failure: String?),
+        cancelRefresh: () async -> String,
         list: () async throws -> [ProviderInfo],
         test: (String) async throws -> NativeAgentShared.ProviderTestResult,
         authMode: (ProviderInfo) -> (canSave: Bool, selectedMode: String),
@@ -429,6 +357,9 @@ extension ProvidersFacade {
         disconnect: (String) async -> (ok: Bool, detail: String)
     ) async -> JSONValue {
         let retry = " Try again; read \(AppToolExecutor.doorDoctor) if it keeps failing."
+        if verb == "cancel_refresh" {
+            return .object(["status": .string("ok"), "detail": .string(await cancelRefresh())])
+        }
         if verb == "refresh_models" {
             let refreshed = await refresh()
             if let detail = refreshed.failure {
@@ -527,7 +458,7 @@ extension ProvidersFacade {
                     "\(outcome.detail) app {page:\"providers\"} shows where \(name) stands.",
                     extra: ["provider": .string(id), "effects": .string("unknown")])
             }
-            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "provider.disconnect \(id)",
+            BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "provider.disconnect \(id)",
                                    sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: dataRoot)
             return .object(["status": .string("ok"), "provider": .string(id), "changed": .bool(true),

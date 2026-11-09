@@ -32,7 +32,7 @@ initializes missing inner-life choices, including reflection with a ceiling
 of two calls. This initialization preserves saved choices.
 
 The source supports event ingestion, persistence, workspace selection,
-capsules, affect, cares, replay and reflection. It does not support the
+capsules, affect, cares, attention, replay and reflection. It does not support the
 old text-extracted task prediction/commitment system.
 The live Observatory remains available at **Diagnostics → Cognition**, including
 its workspace inclusion controls. The count-based experiment lifecycle, faculty
@@ -47,7 +47,15 @@ marked as app or script paths.
 
 - **One continuity owner:** `CognitiveSubstrate` owns its field and artifacts.
   `OrganismKernel` owns somatic state. Derived attention and turn projections
-  must not become a third state authority.
+  must not become a third state authority: what is on the agent's mind is the
+  field's own `drive` (worth not yet attended, on care anchors and happening
+  subjects), never a second record-sum. The record (`Experiences`) holds what
+  happened and what each thought attended; the field holds what gathers.
+- **The agent thinks when its mind is worth a thought:** a message opens a
+  turn, an owed happening opens a thought at once, and the field ignites a
+  thought where drive reaches one. Nothing else opens one: no tick, no timer,
+  no rest streak, no pacing
+  ([Subconscious](SUBCONSCIOUS.md#attention)).
 - **Canonical memory and persona stay separate:** cognitive references,
   proposals and affect do not establish canonical facts or rewrite persona.
   Replay reads existing Dream/REM output; canonical growth remains with its
@@ -68,10 +76,13 @@ These boundaries are represented by `CognitiveSubstrate.swift`,
 ## 2. Mechanism owners
 
 [SUBCONSCIOUS](SUBCONSCIOUS.md) owns event admission, state bounds, checked
-restore, frozen capsules, reflection and inspection. [COGNITION_WIRING](COGNITION_WIRING.md)
+restore, frozen capsules, attention, reflection and inspection. [COGNITION_WIRING](COGNITION_WIRING.md)
 owns turn connections, background admission and authority boundaries.
 `CognitiveSubstrate.frozenRead` and `NativeCognitionRuntime.prepareTurnProjection`
 are the fixed-time read owners; the loop's confirmed-delivery boundary commits presentation.
+`Experiences/Attention.swift` is the one intake for happenings; `CognitiveSubstrate+Attention.swift`
+lands worth as drive, ignites and attends; `Cognition/NativeCognitionRuntime+Attention.swift` joins them
+to the agent's `weigh` and mind stream.
 
 ## 3. Evidence limits
 

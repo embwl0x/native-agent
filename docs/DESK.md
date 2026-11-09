@@ -5,22 +5,32 @@ ledger, a separate list; an empty ledger says nothing about the Desk.
 
 What they means to do later lives here as a MY QUEUE intention, filed with
 `queue.add {text, when, until?, say?, action?}`. Its `DeskStep` owns the words,
-moment or rhythm, ending, fixed words, habit and origin. `queue.update` changes
+moment or rhythm, ending, fixed words, habit and origin. Promise capture also
+attaches a step to the existing agent-assigned
+row when it restates that work; it uses the same readiness and settlement as
+MY QUEUE. Its canonical `promiseCaptures` identities survive refiling, closure
+and archive so unfinished reflection cannot create the same source again.
+A reference refresh containing only other evidence retains the captured step.
+Attaching a captured step updates the row's title to the same words and peer
+provenance used for a newly filed step and its approval follow-up.
+`queue.update` changes
 named fields; `queue.done` and `queue.drop` settle it by its exact handle or
 number. Words never select a different step. A committed closure keeps its
 receipt if checkpoint cleanup fails, with the cleanup cause in
-`settlement_failures`. The scheduler owns body
-rhythms, not a second queue of reminders or turns. The [intention contract](INTENTIONS.md)
-owns the form, readiness, delivery and launch migration. Imported scheduler
-steps retain their job identity and first unconsumed occurrence, including
-calendar seconds; until the one-time migration commits,
-they are held and cannot be archived. Later restored scheduler jobs never
-reimport: they remain stopped records with one keyed system Desk notice asking
-their to use `queue.add` if still wanted. Existing intentions stay as they are;
-restore-specific archive identity lookup and retention are removed. Disabled
-legacy definitions retain words, timing and pause with their migration
-disposition. A stopped
-import names the evidence they must reconcile before refiling it.
+`settlement_failures`. Repeating `queue.done`, `queue.drop` or `queue.update`
+against a terminal step returns `already_done` or `already_dropped` with its
+saved completion time and evidence, without changing it. Live steps supply
+their outcome, notes and refs; archived steps, looked up by exact handle,
+supply their outcome, retained refs, decisions and artifacts. The archive
+does not retain visible numbers or notes. An unknown id remains `not_found`;
+absence is not completion evidence. An unreadable required archive remains a
+storage failure, never `not_found`.
+Each step's time is a `moment:<handle>` time on the one
+clock; what comes due is posted once as a `moment` happening, never a second queue
+of reminders or turns. The [intention contract](INTENTIONS.md) owns the form,
+readiness and delivery. A step imported from a scheduler job keeps its job identity
+(`scheduledJobID`), so the same job never files a second step. A stopped import names the
+evidence to reconcile before refiling it.
 
 Each item's `workAttempts` ledger holds both pursuit and owner-cadence work.
 Only current attempt records enter that ledger; retired reservation formats
@@ -95,8 +105,15 @@ Bare defer days include the named day. Snooze choices therefore say
 midnight; a full timestamp keeps its exact instant.
 
 `desk.add` takes an optional `summary`. `desk.close` takes `reason`, the same word
-`queue.done` and `queue.drop` take; `summary` and `outcome_summary` are refused
-there. Wait explanations use `note`.
+`queue.done` and `queue.drop` take. For `desk.close`, reason names the owner's
+explicit instruction or the fresh canonical commit/receipt/observed result
+proving the tracked outcome; the instruction alone suffices without claiming
+the underlying work happened. `queue.done` uses reason for why the step is done.
+The shared door records any unique declared interpretation of another supplied
+name. Wait explanations use `note`.
+Desk actions keep `handle`, queue actions keep `id`, and page reads keep `item`;
+the shared door binds a single alternative address word to the schema's sole
+declared one when that declared field is absent, before validation and Trust.
 
 `desk.wait {handle, on:"User", note?}` puts an item in **waiting on User** in
 one call. `on:"owner"` names the owner without needing their name.
@@ -111,6 +128,11 @@ An owner wait contributes to the page's waiting-on-owner count through
 
 Desk stores eight states: `watch`, `flag`, `now`, `next`, `todo`, `done`, `blocked`
 and `canceled`. Only `done` and `canceled` are terminal.
+Every newly created item starts at `watch` (displayed as "watching"), including
+one whose `kind` is `plan`; kind and work state are separate. The store's
+`createItem` reduction owns that default. The textual board uses the kind as
+the status token for a top-level item still at `watch`, so a new plan reads
+`plan` there while its structured status remains `watch`.
 
 `on` also accepts an observed Desk handle/number or experience id (a card,
 message, reply delivery or repair), or a nonempty list of those dependency
@@ -118,6 +140,21 @@ ids. These waits retain automatic release when the named conditions settle.
 The wait action has its own typed guide. Unknown identifier-shaped conditions
 are refused; a single person's name is a person wait. `note` explains either
 kind of wait.
+
+A single conversation id also names a wait, whether it belongs to a saved chat
+session or an agent conversation. `desk.wait` uses the same exact agent-conversation
+resolver as `agent.read` (record id, protocol conversation id or contact-session id)
+and conversation page item reads. It checks chat identities in the session
+index rather than guessing from a transcript filename. An unavailable identity owner is reported unless the other
+owner positively resolves that conversation. This is a durable waiting status,
+not a blocking tool call: if no message comes, the item stays waiting until its
+status is changed.
+
+The **Replies owed** finding counts the completion delivery owner's `owed` and
+`sent_unconfirmed` records. Its `reply_delivery` refs name the exact ids accepted
+by `repair.let_go {id, reason}`. Release consults that delivery owner under its
+lock, even before the advisory experience projection arrives; the finding's
+next reconciliation reads the saved release and removes that reply from its count.
 
 The Desk page lists each item under one heading: Waiting on the owner,
 Blocked, or In play. Its count explains the `desk.wait` call that puts an item
@@ -138,8 +175,9 @@ A task the person starts (the Mac's new-task sheet, the phone's
 `submitDeskTask`, the Shortcuts intent) creates a Desk item and starts a
 [line of theirs](agent-communication.md#jobs) with `desk:` set to that item
 (`NativeAgentEngine.submitDeskTask`, `EngineRuntime/EngineDesk.swift`). The
-line's ending wakes their own work conversation, where they settles the item
-themselves.
+line's ending is a `returned` happening with no conversation route, so it opens a
+thought in the agent's mind stream, where the agent settles the item
+(`AgentJobStem.swift`).
 A job that carries a Desk item is that item's movement: Desk activity, the live
 strip, the widget's **Working on…** line and the phone's `desk.json` evidence
 come from their jobs (`DeskMovementPresentation.evidence`,

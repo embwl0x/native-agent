@@ -118,8 +118,7 @@ public actor BotRunner {
     /// A true result records the hold before any provider work or daily reservation.
     @discardableResult
     public func run(bot id: UUID, requestID: UUID? = nil, parent: Turn?, scope: BotRunScope,
-                    holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { _ in false },
-                    deadlineExceeded: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ShelfEntry? {
+                    holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { _ in false }) async throws -> ShelfEntry? {
         let claimed: BotRunQueue.ClaimedRun
         do { claimed = try await queue.claimWhenAvailable(bot: id, requestID: requestID, scope: scope) }
         catch BotRunAdmissionError.paused { return nil }
@@ -160,7 +159,7 @@ public actor BotRunner {
         turn.session = bot.sessionID
         turn.botEventProvenance = claimed.provenance
         return try await perform(bot, message: message, requestID: claimed.runID,
-            turn: turn, scope: scope.entering(id), judgesCondition: !ask.isEmpty, deadlineExceeded: deadlineExceeded)
+            turn: turn, scope: scope.entering(id), judgesCondition: !ask.isEmpty)
     }
 
     /// Return status and cause with the reply so a failed empty answer cannot read as success.
@@ -220,27 +219,14 @@ public actor BotRunner {
 
     private func perform(_ bot: BotDefinition, message: String, requestID: UUID,
                          turn: Turn, scope: BotRunScope, asked: Bool = false,
-                         judgesCondition: Bool = false,
-                         deadlineExceeded: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ShelfEntry {
+                         judgesCondition: Bool = false) async throws -> ShelfEntry {
         let start = Date()
         let clock = ContinuousClock.now
         var outcome: BotTurnReply
         do {
-            let session = self.session
             // The claim is released only after the session has settled.
-            let queue = self.queue
-            outcome = try await BotRunnerDeadline.settled(seconds: bot.budget.seconds, onDeadline: {
-                do {
-                    try queue.markDeadlineExceeded(bot: bot.id, requestID: requestID)
-                    await deadlineExceeded("\(bot.name) exceeded its run limit and is still finishing.")
-                } catch {
-                    nativeLog("bot deadline claim unavailable: %@", String(describing: error))
-                    await deadlineExceeded("\(bot.name) exceeded its run limit; its claim could not be updated: \(error)")
-                }
-            }) {
-                try await session(bot, message, turn, scope,
-                    BotRunOptions(conditionSessionID: judgesCondition ? bot.sessionID : nil))
-            }
+            outcome = try await session(bot, message, turn, scope,
+                BotRunOptions(conditionSessionID: judgesCondition ? bot.sessionID : nil))
         } catch {
             outcome = BotTurnReply(reply: "", status: error is CancellationError ? .stopped : error is BotRunnerError ? .interrupted : .failed,
                 detail: String(describing: error))

@@ -169,6 +169,8 @@ public struct MemoryPatch: Sendable {
     public var metadata: JSONValue?
     /// Merge narrow metadata patches in the same transaction so service-side read/replace cannot overwrite concurrent writes.
     public var metadataMerge: [String: JSONValue]?
+    /// The agent's restatement of how it knows the memory; the store turns each telling into a root and owns the result.
+    public var restating: [MemoryRoot.Telling]?
 
     public init(
         content: String? = nil,

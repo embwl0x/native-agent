@@ -62,14 +62,20 @@ final class MobileLocalStorage: @unchecked Sendable {
         submit(key: key) { [self] in
             do {
                 let payload = value()
-                defaults.set(try JSONEncoder().encode(payload), forKey: key)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                let data = try encoder.encode(payload)
+                if defaults.data(forKey: key) != data { defaults.set(data, forKey: key) }
                 errors[key] = nil
             } catch { errors[key] = error; onError(error) }
         }
     }
 
     func remove(key: String) {
-        submit(key: key) { [self] in defaults.removeObject(forKey: key); errors[key] = nil }
+        submit(key: key) { [self] in
+            if defaults.object(forKey: key) != nil { defaults.removeObject(forKey: key) }
+            errors[key] = nil
+        }
     }
 
     @MainActor func flush() async throws {
@@ -88,8 +94,14 @@ final class MobileLocalStorage: @unchecked Sendable {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
                 do {
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.sortedKeys]
+                    let data = try encoder.encode(value)
+                    do {
+                        if try Data(contentsOf: file) == data { continuation.resume(); return }
+                    } catch CocoaError.fileReadNoSuchFile { /* First committed checkpoint. */ }
                     try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try JSONEncoder().encode(value).write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                    try data.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
                     continuation.resume()
                 } catch { continuation.resume(throwing: error) }
             }
@@ -125,6 +137,7 @@ struct QueuedChatSend: Identifiable, Codable, Sendable {
     /// Preserve replacement intent even if the app closes before preparation.
     var suppressRemoteUserAppend: Bool = false
     var replacementAssistantMessageID: UUID? = nil
+    var steeringFailure: String? = nil
 
     var preview: String {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -339,10 +352,8 @@ final class ChatStore {
     var pendingICloudPlaceholders: [String: UUID] = [:]
     /// Locally minted send IDs keep Stop scoped while transport is awaiting acceptance.
     var inFlightSendIDs: Set<String> = []
-    var pendingTimeouts: [String: Task<Void, Never>] = [:]
-    var replyStatusTask: Task<Void, Never>?
     var sendTask: Task<Void, Never>?
-    var timedOutPendingIds: [String: UUID] = [:]
+    var retiredPendingPlaceholders: [String: UUID] = [:]
     /// Retain steered queue entries until the Mac evidences reading them or gives them back.
     var steeringQueuedIDs: Set<UUID> = []
     var resolvedICloudReplyIds: Set<String> = []
@@ -353,7 +364,7 @@ final class ChatStore {
     var pagedSessionsWithOlder: Set<String> = []
     static weak var visibleStore: ChatStore?
 
-    static let snapshotTruncationMarker = "[truncated for iPhone snapshot]"
+    nonisolated static let snapshotTruncationMarker = "[truncated for iPhone snapshot]"
 
     /// Throttle refresh attempts for two seconds, including attempts still in progress.
     var lastRefreshAt: Date = .distantPast
@@ -383,8 +394,7 @@ final class ChatStore {
         return queuedSends.filter {
             (queueSessionKey($0.sessionID) == key || !canDeliverQueuedSend($0))
                 && !inFlightSendIDs.contains($0.id.uuidString)
-                && (pendingExchanges[$0.id.uuidString]?.deliveryConfirmationDeadline == nil
-                    || pendingExchanges[$0.id.uuidString]?.deliveryUnconfirmed == true)
+                && pendingExchanges[$0.id.uuidString]?.deliveryAccepted != true
                 && !(pendingExchanges[$0.id.uuidString]?.deliveryUnconfirmed == true && $0.preparedMessage == nil)
         }
     }
@@ -407,5 +417,4 @@ final class ChatStore {
 
 
     /// Silence releases the composer while observation of the same request continues.
-    let iCloudReplyTimeoutSeconds: UInt64 = 180
 }

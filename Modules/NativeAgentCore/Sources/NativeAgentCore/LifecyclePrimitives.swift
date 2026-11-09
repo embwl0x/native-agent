@@ -2,63 +2,12 @@ import Foundation
 import NativeAgentShared
 import os
 
-// Blueprint: | `LifecyclePrimitives.swift` | `ScopedWaiter`, `OnceByKey`, `BoundedWait`: parking, keyed once and bounded waits |
+// Blueprint: | `LifecyclePrimitives.swift` | `ScopedWaiter`, `BoundedWait`: parking and bounded waits |
 
 // MARK: - ScopedWaiter
 
 /// The one way a task parks; continuation bodies never touch isolated state. Shared with the phone; Core callers retain the same ScopedWaiter identity.
 public typealias ScopedWaiter = NativeAgentShared.ScopedWaiter
-
-// MARK: - OnceByKey
-
-/// Runs an async operation at most once per key per process, with every later caller awaiting the SAME run to completion. Unlike a bare `[Key: Task]` memo
-/// table, the in-flight `Task` (and everything its closure captured — typically a whole store/executor instance) is dropped once the run finishes; only a
-/// completion marker is kept.
-public actor OnceByKey<Key: Hashable & Sendable> {
-    private enum State {
-        case running(Task<Void, Error>)
-        case done
-    }
-
-    private var states: [Key: State] = [:]
-    public init() {}
-
-    /// Failed operations leave the key pending, and every waiting caller sees the failure before it can cross its admission barrier.
-    public func runChecked(_ key: Key, _ operation: @escaping @Sendable () async throws -> Void) async throws {
-        switch states[key] {
-        case .done:
-            return
-        case .running(let task):
-            try await task.value
-        case nil:
-            let task = Task { [weak self] in
-                do {
-                    try await operation()
-                    await self?.markDone(key)
-                } catch {
-                    await self?.clearFailed(key)
-                    throw error
-                }
-            }
-            // Safe against a fast operation: `markDone` needs this actor, and this call holds it until the `await` below, so the assignment can never clobber
-            // the marker.
-            states[key] = .running(task)
-            try await task.value
-        }
-    }
-
-    /// The run itself releases its captures before its waiting callers resume.
-    private func markDone(_ key: Key) {
-        guard case .running = states[key] else { return }
-        states[key] = .done
-    }
-
-    private func clearFailed(_ key: Key) {
-        guard case .running = states[key] else { return }
-        states[key] = nil
-    }
-
-}
 
 // MARK: - BoundedWait
 

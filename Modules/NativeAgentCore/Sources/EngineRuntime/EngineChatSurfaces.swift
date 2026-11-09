@@ -10,7 +10,9 @@ import ChatSessionWork
 import ChatTurnContracts
 import ChatTurnRuntime
 import ChatToolRuntime
+import ChatToolParsing
 import MacControl
+import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import SlackBot
@@ -20,6 +22,16 @@ import ToolExecution
 // Blueprint: | `EngineChatSurfaces.swift` | Slack and Telegram ingress; speech permission episodes use the body attention port |
 
 extension NativeAgentEngine {
+    /// A matter's row as the Inbox draws it now, read again first: nil when the face drew without it; thrown with the face's own cause
+    /// when it did not draw.
+    @MainActor func inboxRow(_ matter: String) async throws -> PartFace.Row? {
+        let snapshot = await pages.refresh(page: "inbox")
+        guard let face = snapshot?.drawnFace else {
+            throw snapshot?.error ?? PartCallError(code: "inbox_unread", message: "The Inbox has not been read yet.")
+        }
+        return face.sections.flatMap(\.rows).first { $0.id == matter }
+    }
+
     public static let telegramUnconfiguredReason =
         "telegram not configured (no enabled bot token in telegram/config.json)"
 
@@ -29,7 +41,7 @@ extension NativeAgentEngine {
         do {
             return try SlackSocketModeLoop.ifConfigured(
                 dataRoot: dataRoot,
-                chatClient: { _ in NativeAgentEngine.live.chatClient(profile: .slack) },
+                chatClient: { NativeAgentEngine.live.chatClient(profile: .slack) },
                 // Reply delivery does not wait for the Mac UI to reload.
                 turnCompleted: { sessionID in
                     Task { @MainActor in
@@ -79,18 +91,18 @@ extension NativeAgentEngine {
         let approvalFiler = TelegramApprovalFiler(
             dataRoot: dataRoot,
             token: cfg.botToken,
-            promptSender: { token, chatId, approval, toolName, payload in
+            promptSender: { token, chatId, approval, buttons in
                 try await TelegramApprovalFiler.sendTelegramApprovalPrompt(
-                    token: token, chatId: chatId, approval: approval,
-                    toolName: toolName, payload: payload,
-                    send: TelegramPollLoop.defaultSendMessageWithReplyMarkupReturningId
+                    token: token, chatId: chatId, approval: approval, buttons: buttons,
+                    send: TelegramPollLoop.defaultSendConsentWithReplyMarkupReturningId
                 )
             },
-            approvalResolver: { id, decision, provenance in
-                _ = try await NativeAgentEngine.live.ports.backgroundWork.approvals.resolveApproval(
-                    id: id, decision: decision.rawValue, provenance: provenance, turn: provenance.resolvingTurn
-                )
-            }
+            // A Telegram card is its matter's Inbox row: drawn from the Inbox as it reads now, answered by the row's own call.
+            inbox: TelegramInboxDoor(row: { matter in try await NativeAgentEngine.live.inboxRow(matter) },
+                act: { matter, action, chat, sender in
+                    try await NativeAgentEngine.live.pages.act(page: "inbox", row: matter, action: action, door: TelegramApprovalFiler.door,
+                                                               device: sender, chat: chat)
+                })
         )
         ApprovalChatCards.useTelegram(approvalFiler)
         // Retain the profile, filer and stateless graph for the loop lifetime; resolve routing and policy for each turn.
@@ -110,7 +122,25 @@ extension NativeAgentEngine {
         let telegramBot = SwiftNativeTelegramBot(
             dataRoot: dataRoot,
             completenessDeps: TelegramBotCompletenessDeps(
-                routing: TelegramProviderRoutingBridge(routing: providerRouting),
+                routing: TelegramProviderRoutingBridge(routing: providerRouting, dataRoot: dataRoot, choose: { setting, value, turn in
+                    // The verified command is the person's exact Providers call, under its original update/callback identity.
+                    let sender = try TelegramCommandSender(turn: turn, dataRoot: dataRoot)
+                    try sender.requireOwner()
+                    guard let envelope = sender.turn.envelope else { throw TelegramBotError.invalidRequest }
+                    let input: [String: JSONValue] = ["action": .string("provider.choose"),
+                        "args": .object(["group": .string("chat"), "setting": .string(setting), "value": value])]
+                    let act = PersonAct(by: .tap(door: "telegram", device: envelope.verifiedUserId,
+                        chat: envelope.verifiedChatId, page: "providers", row: "providers.chat_" + setting), tool: "app", input: input)
+                    let decided = sender.turn.with(\.personAct, act)
+                    let reply = try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: envelope,
+                        fileAccess: sender.turn.fileAccess ?? "auto",
+                        turn: decided, traced: true) { door in try await door.perform("app", input) }
+                    let result = ToolResult(reply)
+                    if result.outcome != .succeeded || result.carriesFailureEvidence {
+                        throw TelegramBotError.underlying(ChatToolOutcome.explanation(reply)
+                            ?? "The Providers choice did not complete. Read Providers before another change.")
+                    }
+                }),
                 memory: TelegramMemoryWriterBridge(dataRoot: dataRoot),
                 restart: TelegramRestartBridge(dataRoot: dataRoot, deferredRestart: { reason in
                     await AppRelaunch.shared.requestRestartDeferringTerminate(

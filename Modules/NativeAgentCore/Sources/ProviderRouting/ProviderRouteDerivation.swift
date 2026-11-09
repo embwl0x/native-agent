@@ -335,22 +335,6 @@ extension SwiftNativeProviderRouting {
         }
     }
 
-
-    /// The same route-specific descriptor supplies every effort consumer.
-    public nonisolated static func modelReasoningEfforts(provider: Provider, modelID: String) throws -> [String] {
-        let providerID = provider.id
-        guard case .array(let models)? = provider.modelCatalog,
-              let selected = models.first(where: {
-                  guard case .object(let row) = $0 else { return false }
-                  return row["id"] == .string(modelID)
-              }),
-              case .object(let row) = selected,
-              case .array(let values)? = row["supported_reasoning_efforts"],
-              values.allSatisfy({ $0.stringValue != nil }) else {
-            throw ProviderRoutingError.configurationFailed("\(providerID)'s thinking capabilities for \(modelID) are unavailable. Reload Providers.")
-        }
-        return values.compactMap(\.stringValue)
-    }
     /// Missing model/window evidence stays nil.
     nonisolated static func contextLength(of modelID: String, in rows: [[String: JSONValue]]) -> Int? {
         let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -371,6 +355,7 @@ extension SwiftNativeProviderRouting {
         if lower.hasPrefix("grok") { return "xai_oauth_direct" }
         // Subscription IDs must resolve on the Kimi Code route.
         if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(lower) { return "kimi-code" }
+        if FirstPartyModelCatalog.descriptor(for: lower, providerID: "meta") != nil { return "meta" }
         // Moonshot by declared id: its shipped rows and its live catalog, never a prefix.
         if FirstPartyModelCatalog.descriptor(for: lower, providerID: "moonshot") != nil
             || dataRoot.map({ MoonshotModelCatalog.isKnownCatalogModelID(lower, dataRoot: $0) }) == true {

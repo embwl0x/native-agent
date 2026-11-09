@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `QuietAdminPreferences.swift` | `ShotgunPreference`, `MoodTintPreference`, `SimpleViewMode`; Shared checked view and appearance preferences |
 
 /// Driving in the visible chat moves the window aside into a floating chat; fresh installs enable this preference.
@@ -16,13 +17,7 @@ public enum MoodTintPreference {
 }
 
 /// The shared view-mode key selects Simple, Advanced or Agent; Agent exposes the agent's window and is never the unset default.
-public enum SimpleViewMode {
-    public static let key = "nativeagent.viewMode"
-    public static let simple = "simple"
-    public static let advanced = "advanced"
-    public static let agent = "agent"
-    public static let choices = [simple, advanced, agent]
-
+extension SimpleViewMode {
     public static func checkedCurrent(_ defaults: UserDefaults = .standard) throws -> String {
         if let value = defaults.object(forKey: key) {
             guard let saved = value as? String, choices.contains(saved) else { throw QuietSettingError.unavailable(

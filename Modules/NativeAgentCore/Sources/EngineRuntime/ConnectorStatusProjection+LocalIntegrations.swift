@@ -31,28 +31,25 @@ enum MacAssistantParts {
         }
     }
 
-    static func watchCatalog(dataRoot: URL) async throws -> [MacAssistantWatchRecipe] {
-        try await read(id: "mac-watch-catalog", dataRoot: dataRoot, as: [MacAssistantWatchRecipe].self)
+    /// A part-answered door verb run for a native owner: the door's own gates and cards judge it, and the verb's result comes back.
+    static func verb(_ action: String, input: [String: JSONValue], dataRoot: URL, envelope: TurnEnvelope, turn: Turn? = nil) async throws -> JSONValue {
+        try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: envelope, fileAccess: turn?.fileAccess ?? "auto", turn: turn) { door in
+            CanonicalToolNameDispatcher.actionResult(try await door.perform("app", ["action": .string(action), "args": .object(input)]), action: action)
+        }
+    }
+
+    static func watchCatalog(dataRoot: URL) async throws -> MacAssistantWatchCatalog {
+        try await read(id: "mac-watch-catalog", dataRoot: dataRoot, as: MacAssistantWatchCatalog.self)
     }
 
     /// Admitting a part does not admit its effects; each effect needs its own originating gate chain.
     static func read<Value: Codable & Sendable>(id: String, dataRoot: URL, as type: Value.Type) async throws -> Value {
-        // A catalog read is the app's own native work: an authored part runs only under a turn that names it.
-        let turn = Turn().with(\.envelope, .native("connectors:" + id))
-        let invocation = ChatToolInvocation()
-        let execution = AppActionExecution(invocation: invocation, deadlines: invocation.deadlines,
-            turnWork: .init(toolInvocation: invocation))
-        let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot, turn: turn, execution: execution) { tool, _, _, _ in
-            tool == id ? nil : .object([
-                "status": .string("refused"), "reason": .string("read_only"),
-                "detail": .string("This read returns data; effects require their own explicit action."),
-                "effects": .string("none")])
-        }
-        let result = await Parts(root: dataRoot).call(id: id, input: .object([:]),
-            invocation: .init(host: host, execution: .init(turn: turn, surface: "catalog", deadlines: invocation.deadlines)), as: type)
-        switch result {
-        case .success(let recipes): return recipes
-        case .failure(let error): throw error
+        try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native("connectors:" + id), fileAccess: "read_only") { door in
+            switch await Parts(root: dataRoot).call(id: id, input: .object([:]), within: .init(actions: [], capabilities: []),
+                invocation: door.invocation, as: type) {
+            case .success(let value): return value
+            case .failure(let error): throw error
+            }
         }
     }
 
@@ -153,14 +150,18 @@ public struct AppConnectorStatusPlatform: Sendable {
     }
 
     private let subject: @Sendable () -> String
-    let chooseSharedFolder: (@MainActor @Sendable () async throws -> (name: String, path: String, writable: Bool)?)?
-    let showBrowser: (@MainActor @Sendable () async throws -> Void)?
+    let chooseSharedFolder: (@MainActor @Sendable (UUID?) async throws -> (name: String, path: String, writable: Bool)?)?
+    /// Opens the stem's secure paste for a Grok Bot contact's routine credentials (the contact's id).
+    let showGrokSecureSetup: (@MainActor @Sendable (String) async throws -> Void)?
+    let showProviderSetup: (@MainActor @Sendable (ProviderInfo, URL) async throws -> Void)?
     public init(subject: @escaping @Sendable () -> String,
-                chooseSharedFolder: (@MainActor @Sendable () async throws -> (name: String, path: String, writable: Bool)?)? = nil,
-                showBrowser: (@MainActor @Sendable () async throws -> Void)? = nil) {
+                chooseSharedFolder: (@MainActor @Sendable (UUID?) async throws -> (name: String, path: String, writable: Bool)?)? = nil,
+                showGrokSecureSetup: (@MainActor @Sendable (String) async throws -> Void)? = nil,
+                showProviderSetup: (@MainActor @Sendable (ProviderInfo, URL) async throws -> Void)? = nil) {
         self.subject = subject
         self.chooseSharedFolder = chooseSharedFolder
-        self.showBrowser = showBrowser
+        self.showGrokSecureSetup = showGrokSecureSetup
+        self.showProviderSetup = showProviderSetup
     }
     public var agentSubject: String { subject() }
 
@@ -170,41 +171,16 @@ public struct AppConnectorStatusPlatform: Sendable {
 public struct AppConnectorActionPlatform: ConnectorActionPlatform {
     let dataRoot: URL
     private let statusPlatform: AppConnectorStatusPlatform
-    private let router: @Sendable () -> AttentionRouter
     private let macAssistant: any MacAssistantStatusClient
     private let notification: @Sendable (String, String, Turn) async -> [String: JSONValue]
 
     public init(dataRoot: URL, statusPlatform: AppConnectorStatusPlatform,
-                router: @escaping @Sendable () -> AttentionRouter, macAssistant: any MacAssistantStatusClient,
+                macAssistant: any MacAssistantStatusClient,
                 notification: @escaping @Sendable (String, String, Turn) async -> [String: JSONValue]) {
         self.dataRoot = dataRoot
         self.statusPlatform = statusPlatform
-        self.router = router
         self.macAssistant = macAssistant
         self.notification = notification
-    }
-
-    public func attentionRouter() -> AttentionRouter { router() }
-
-    public func macAction(_ action: ConnectorPlatformAction, input: [String: JSONValue], turn: Turn) async throws -> JSONValue {
-        let context = MacOperationContext(dataRoot: dataRoot)
-        switch action {
-        case .calendarListUpcoming: return try await LocalPIMConnectorActions.calendarListUpcoming(input: input, handsBack: context.handsBack)
-        case .remindersListDueToday: return try await MacAssistantParts.dueReminders(input: input, dataRoot: dataRoot, turn: turn, context: context)
-        case .mailListRecent: return await MacAssistantParts.recover(try await MacAppleScriptBridge.mailListRecent(input: input, context: context),
-            integration:"mail",
-            dataRoot:dataRoot)
-        case .messagesRecentThreads: return await MacAssistantParts.recover(try await MacAppleScriptBridge.messagesRecentThreads(input: input,
-            context: context),
-            integration:"messages", dataRoot:dataRoot)
-        case .notesListRecent: return await MacAssistantParts.recover(try await MacAppleScriptBridge.notesListRecent(input: input, context: context),
-            integration:"notes",
-            dataRoot:dataRoot)
-        case .notesSearch: return await MacAssistantParts.recover(try await MacAppleScriptBridge.notesSearch(input: input, context: context),
-            integration:"notes",
-            dataRoot:dataRoot)
-        case .contactsSearch: return try await MacContactsExecutor.search(input: input, context: context)
-        }
     }
 
     public func spotlight(input: [String: JSONValue], turn: Turn) async throws -> MacControlResult {

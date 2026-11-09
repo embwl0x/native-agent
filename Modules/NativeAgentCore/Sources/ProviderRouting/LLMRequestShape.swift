@@ -30,9 +30,6 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
     public let historyMessageCount: Int
     public let historyMessageChars: Int
     public let volatileBlockChars: Int
-    public let volatileFullBlockBytes: Int
-    public let volatileDeltaBlockBytes: Int
-    public let volatileKeyframe: Bool
     public let volatileDelivery: String
     public let historyContextWindow: String
     /// Role/content digests expose head drift even when message sizes match.
@@ -53,9 +50,6 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
         historyMessageCount: Int,
         historyMessageChars: Int,
         volatileBlockChars: Int,
-        volatileFullBlockBytes: Int = 0,
-        volatileDeltaBlockBytes: Int = 0,
-        volatileKeyframe: Bool = false,
         volatileDelivery: String,
         historyContextWindow: String,
         messageCount: Int = 0,
@@ -71,9 +65,6 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
         self.historyMessageCount = historyMessageCount
         self.historyMessageChars = historyMessageChars
         self.volatileBlockChars = volatileBlockChars
-        self.volatileFullBlockBytes = volatileFullBlockBytes
-        self.volatileDeltaBlockBytes = volatileDeltaBlockBytes
-        self.volatileKeyframe = volatileKeyframe
         self.volatileDelivery = volatileDelivery
         self.historyContextWindow = historyContextWindow
         self.messageCount = messageCount
@@ -92,9 +83,6 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
             "historyMessageCount": .int(Int64(historyMessageCount)),
             "historyMessageChars": .int(Int64(historyMessageChars)),
             "volatileBlockChars": .int(Int64(volatileBlockChars)),
-            "volatileFullBlockBytes": .int(Int64(volatileFullBlockBytes)),
-            "volatileDeltaBlockBytes": .int(Int64(volatileDeltaBlockBytes)),
-            "volatileKeyframe": .bool(volatileKeyframe),
             "volatileDelivery": .string(volatileDelivery),
             "historyContextWindow": .string(historyContextWindow),
             "messageCount": .int(Int64(messageCount)),

@@ -29,16 +29,17 @@ extension AppToolExecutor {
     public static let doorToolNames = ["app"]
     /// The rail's inbox means Notifications, while door inbox reads notes from the Today sheet.
     static let doorInbox = QuietToolPage.inbox
-    @MainActor var doorPages: [QuietToolPage] { get throws { [Self.doorInbox] + (try presentation.pages) } }
-    @MainActor var doorPageIndex: [String: QuietToolPage] { get throws { try Dictionary(doorPages.map { ($0.id, $0) }, uniquingKeysWith: { first,
+    @MainActor var doorPages: [QuietToolPage] { get async throws { [Self.doorInbox] + (try await presentation.pages) } }
+    @MainActor var doorPageIndex: [String: QuietToolPage] { get async throws { try await Dictionary(doorPages.map { ($0.id, $0) }, uniquingKeysWith: { first,
         _ in first }) } }
     /// Resolve mounted presentation for "visible" before ordinary page lookup; "current" means the Advanced sidebar page.
-    @MainActor func doorPage(_ raw: String) -> QuietToolPage? {
+    @MainActor func doorPage(_ raw: String) async -> QuietToolPage? {
         let key = AppDoorNames.resolve(raw)
         if key == "inbox" { return Self.doorInbox }
         if key == "current" { return presentation.currentPage }
         // Context receipts and agent_view read outside the index; the latter must not resolve as the agents contact page.
-        return QuietToolPage.unindexed.first { $0.id == key } ?? presentation.page(named: key)
+        if let page = QuietToolPage.unindexed.first(where: { $0.id == key }) { return page }
+        return await presentation.page(named: key)
     }
     public static let doorDoctor = "Doctor (app {page:\"diagnostics\", item:\"doctor\"})"
     /// Keys beginning with __ belong to the gate chain.
@@ -53,10 +54,50 @@ extension AppToolExecutor {
         return page.isEmpty || page == "home"
     }
     static let doorScriptKey = "__script"
+    /// Repair only an unambiguous batch shape. Conflicting or unreadable values stay beside the door's declared schema.
+    static func doorBatchAdvice(_ entries: JSONValue, input: [String: JSONValue]) throws -> JSONValue {
+        func shape() throws -> JSONValue {
+            guard let schema = appToolSchemas().first(where: { $0.name == "app" }) else {
+                throw ToolFailureError("The app input schema is unavailable; repair the door declaration.", effects: .none)
+            }
+            return .array([.object(["input_schema": try JSONValue.parse(schema.parametersJSON),
+                "supplied_input": .object(input.filter { !$0.key.hasPrefix("__") })])])
+        }
+        let list: [JSONValue]
+        switch entries {
+        case .array(let calls): list = calls
+        case .object: list = [entries]
+        default: return try shape()
+        }
+        guard (1...AppScriptRunner.actionLimit).contains(list.count) else { return try shape() }
+        let shared = input.filter {
+            !$0.key.hasPrefix("__") && !["actions", "preview", "expected_version"].contains($0.key) && $0.value != .null
+        }
+        var calls: [JSONValue] = []
+        for entry in list {
+            guard case .object(var call) = entry,
+                  call.keys.allSatisfy({ doorKeys.contains($0) || $0.hasPrefix("__") }),
+                  shared.allSatisfy({ call[$0.key] == nil || call[$0.key] == .null || call[$0.key] == $0.value }) else {
+                return try shape()
+            }
+            call.merge(shared) { current, supplied in current == .null ? supplied : current }
+            if call["args"] != nil, call["args"] != .null,
+               !["action", "page", "item", "find", "script"].contains(where: { !doorText(call[$0]).isEmpty }) {
+                return try shape()
+            }
+            calls.append(.object(call))
+        }
+        var call: [String: JSONValue] = ["actions": .array(calls)]
+        for key in ["preview", "expected_version"] { call[key] = input[key] }
+        return .object(call)
+    }
     /// Door refusals precede execution and name the correcting call.
     static func doorRefusal(_ reason: String, _ detail: String, remedy kind: String, _ instruction: String,
                             next: [String: JSONValue]? = nil, extra: [String: JSONValue] = [:]) -> JSONValue {
         var extra = extra
+        if extra["try_instead"] == nil, ["correct_arguments", "correct_route"].contains(kind), let next {
+            extra["try_instead"] = .object(next)
+        }
         extra["remedy"] = .object([
             "kind": .string(kind), "instruction": .string(instruction),
             "next_call": next.map { .object(["tool": .string("app"), "input": .object($0)]) } ?? .null,
@@ -87,20 +128,133 @@ extension AppToolExecutor {
             nextCall: next.map { .object(["tool": .string("app"), "input": .object($0)]) }, tap: tap)
         return failure(reason, detail, extra: extra)
     }
+    @MainActor
+    func runRecordRead(input: [String: JSONValue]) async -> JSONValue {
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        return await Self.readRecord(input, root: root)
+    }
+
+    /// Store lookup, reads and JSON parsing run away from the UI actor; the store alone owns the SQL and event fold.
+    @concurrent private static func readRecord(_ input: [String: JSONValue], root: URL) async -> JSONValue {
+        guard case .string(let grain)? = input["of"], ["experiences", "details"].contains(grain) else {
+            return failure("invalid_args", "record.read requires of:experiences or of:details.")
+        }
+        let filters: Set<String> = grain == "experiences" ? ["id", "id_prefix", "kind", "open_only"]
+            : ["subject", "subject_prefix", "kind", "source", "since"]
+        let accepted = filters.union(["of", "limit"])
+        let misplaced = input.keys.filter { !$0.hasPrefix("__") && !accepted.contains($0) }.sorted()
+        guard misplaced.isEmpty else {
+            return failure("invalid_args", "These filters do not apply to \(grain): \(misplaced.joined(separator: ", ")).")
+        }
+        for key in filters.subtracting(["open_only"]) where input[key] != nil {
+            guard case .string? = input[key] else { return failure("invalid_args", "\(key) must be a string; omit it to leave it unfiltered.") }
+        }
+        let limit: Int
+        switch input["limit"] {
+        case nil: limit = 20
+        case .int(let value)? where value > 0:
+            guard let count = Int(exactly: value) else { return failure("invalid_args", "limit is too large for this Mac.") }
+            limit = count
+        default: return failure("invalid_args", "limit must be a positive integer; omit it for 20.")
+        }
+        do {
+            try Task.checkCancellation()
+            let store = ExperienceStore.at(root)
+            if grain == "experiences" {
+                let kind: Experience.Kind?
+                if let text = input["kind"]?.stringValue {
+                    guard let value = Experience.Kind(rawValue: text) else {
+                        return failure("invalid_args", "Experience kind must be heard, answer, act, decision, run, message, happening or thought.")
+                    }
+                    kind = value
+                } else { kind = nil }
+                let openOnly: Bool
+                switch input["open_only"] {
+                case nil: openOnly = false
+                case .bool(let value)?: openOnly = value
+                default: return failure("invalid_args", "open_only must be a boolean; omit it to read open and closed experiences.")
+                }
+                let page = try await store.recordedExperiences(id: input["id"]?.stringValue, idPrefix: input["id_prefix"]?.stringValue,
+                    kind: kind, openOnly: openOnly, limit: limit)
+                try Task.checkCancellation()
+                let items = try page.items.map { experience -> JSONValue in
+                    guard case .object(var fields) = try JSONValue.fromEncodable(experience) else { throw CocoaError(.coderInvalidValue) }
+                    fields["open"] = .bool(experience.isOpen)
+                    fields["face"] = try JSONValue.fromEncodable(experience.face)
+                    fields["outcome"] = try JSONValue.fromEncodable(experience.outcome)
+                    fields["happening"] = try JSONValue.fromEncodable(experience.happening)
+                    return .object(fields)
+                }
+                return .object(["status": .string("ok"), "of": .string(grain), "matched_total": .int(Int64(page.total)),
+                    "returned": .int(Int64(items.count)), "has_more": .bool(page.total > items.count),
+                    "items": .array(items), "effects": .string("none")])
+            }
+            let since: Date?
+            if let text = input["since"]?.stringValue {
+                guard let date = NativeTimestampFormat.parseISO8601FractionalFirst(text) else {
+                    return failure("invalid_args", "since must be an ISO 8601 timestamp with a timezone.")
+                }
+                since = date
+            } else { since = nil }
+            let source = input["source"]?.stringValue, subject = input["subject"]?.stringValue, kind = input["kind"]?.stringValue
+            let page = try await store.recordedDetails(.init(sources: source.map { [$0] },
+                subjects: subject.map { [$0] }, kinds: kind.map { [$0] }, from: since,
+                limit: limit, newestFirst: true, subjectPrefix: input["subject_prefix"]?.stringValue))
+            try Task.checkCancellation()
+            var items: [JSONValue] = [], gaps: [JSONValue] = []
+            for detail in page.items {
+                var fields: [String: JSONValue] = ["seq": .int(detail.seq), "at": .string(NativeTimestampFormat.fractionalZulu(detail.at)),
+                    "source": .string(detail.source), "kind": .string(detail.kind), "subject": .string(detail.subject),
+                    "once": try JSONValue.fromEncodable(detail.once)]
+                do {
+                    guard detail.row.count <= ExperienceStore.maxRowBytes else {
+                        throw ExperienceStore.DetailError.tooLarge(detail.kind, detail.row.count)
+                    }
+                    fields["row"] = try JSONValue.parse(detail.row)
+                    items.append(.object(fields))
+                } catch {
+                    fields["error"] = .string(error.localizedDescription)
+                    fields["remedy"] = Repair.remedy(owner: "experiences/experiences.sqlite",
+                        nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("doctor.run")])]), tap: nil)
+                    gaps.append(.object(fields))
+                }
+            }
+            return .object(["status": .string(gaps.isEmpty ? "ok" : "partial"), "of": .string(grain),
+                "matched_total": .int(Int64(page.total)), "returned": .int(Int64(items.count)), "selected": .int(Int64(page.items.count)),
+                "has_more": .bool(page.total > page.items.count), "items": .array(items), "gaps": .array(gaps), "effects": .string("none")])
+        } catch {
+            return ownedFailure(error, code: "record_unreadable", owner: "experiences/experiences.sqlite",
+                instruction: "Inspect the experience store's cause with Doctor; an unreadable record does not establish missing history.",
+                next: ["action": .string("doctor.run")], effects: .none)
+        }
+    }
+
     /// Only explicit release with a reason or a successful operation settles owed repair.
     @MainActor
     func runRepairLetGo(input: [String: JSONValue]) async -> JSONValue {
+        if Task.isCancelled { return ChatToolOutcome.failure(error: CancellationError(), tool: "app", effects: ToolFailureError.Effects.none) }
         var id = (input["id"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let reason = (input["reason"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = (input["operation_prefix"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        if !prefix.isEmpty { return await letGoRepairs(operationPrefix: prefix, reason: reason, alsoNamed: id, root: root) }
         guard !id.isEmpty, !reason.isEmpty else {
             return Self.doorRefusal("invalid_args", "Pass id (from an OWED line on your home) and reason. Nothing was let go.",
                 remedy: "correct_arguments", "Call repair.let_go with id and reason.")
         }
-        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let store = ExperienceStore.at(root)
         do {
+            // The delivery lifecycle owns the debt. Desk can see it before its advisory experience projection has landed.
+            let released = try await CodexCompletionLifecycle.letGoReplies(deliveryIDs: [id], outcome: reason, dataRoot: root,
+                configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root))
+            if released.contains(id) {
+                return .object(["status": .string("ok"), "id": .string(id), "let_go": .string(reason), "effects": .string("occurred")])
+            }
+            try Task.checkCancellation()
             await store.drained()
+            try Task.checkCancellation()
             var owed = try await store.experience(id)
+            try Task.checkCancellation()
             // A named subject may settle only the unique open repair whose operation ends with that subject.
             if owed == nil {
                 let named = try await store.open().filter { debt in
@@ -108,12 +262,13 @@ extension AppToolExecutor {
                 }
                 if named.count == 1 { owed = named[0]; id = named[0].id }
             }
-            // Reply debt settles through its delivery owner so experience and Desk state agree.
+            try Task.checkCancellation()
             if let owed, owed.owes["deliver"]?.phase.isSettled == false,
                owed.evidence.contains(where: { $0.source == "codex-completion-lifecycle" }) {
-                try await CodexCompletionLifecycle.letGoReplies(deliveryIDs: [id], outcome: reason, dataRoot: root,
-                    configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root))
-                return .object(["status": .string("ok"), "id": .string(id), "let_go": .string(reason), "effects": .string("occurred")])
+                return Self.doorRefusal("delivery_unavailable", "The reply's experience still shows delivery owed, "
+                    + "but its delivery owner could not confirm an open reply for \(id). Nothing was let go.",
+                    remedy: "inspect", "Read the retained delivery before repairing its record; do not resend the reply.",
+                    next: ["action": .string("agent.jobs")])
             }
             // Release obsolete reply debt through its redelivery checkpoint so recovery cannot deliver it again.
             if let owed, id.hasPrefix(Experience.answer(run: "")),
@@ -138,24 +293,62 @@ extension AppToolExecutor {
             try await store.append([.claim(.init(claim: "let go: " + reason, evidence: [])),
                                     .letGo(key: "repair", reason: .abandoned)], to: id)
             return .object(["status": .string("ok"), "id": .string(id), "let_go": .string(reason), "effects": .string("occurred")])
+        } catch is CancellationError {
+            return ChatToolOutcome.failure(error: CancellationError(), tool: "app", effects: .unknown)
         } catch {
-            return Self.doorRefusal("unreadable", "The experience store could not be read or written: \(error.localizedDescription) Nothing was let go.",
-                owner: "experiences/experiences.sqlite", next: ["action": .string("doctor.run")])
+            return Self.doorRefusal("unreadable", "Reply or repair settlement could not complete: \(error.localizedDescription) "
+                + "Read its current state before trying again.",
+                owner: "reply delivery lifecycle / experiences/experiences.sqlite", next: ["action": .string("doctor.run")],
+                extra: ["effects": .string("unknown")])
         }
     }
-    @MainActor func runBackgroundRepair(tool: String, input: [String: JSONValue], workspace: WorkspaceOperation) async -> JSONValue {
+    /// Every open repair whose operation starts with the prefix goes through the one-id path, so each keeps that path's checks.
+    private func letGoRepairs(operationPrefix prefix: String, reason: String, alsoNamed id: String, root: URL) async -> JSONValue {
+        guard id.isEmpty, !reason.isEmpty else {
+            return Self.doorRefusal("invalid_args", "Pass operation_prefix or id, not both, and a reason. Nothing was let go.",
+                remedy: "correct_arguments", "Call repair.let_go with operation_prefix and reason.")
+        }
+        let store = ExperienceStore.at(root)
+        let ids: [String]
+        do {
+            await store.drained()
+            try Task.checkCancellation()
+            ids = try await store.open().filter { debt in
+                RepairOwed.isOwed(debt) && RepairDebt(debt).operation?.hasPrefix(prefix) == true
+            }.map(\.id)
+            try Task.checkCancellation()
+        } catch is CancellationError {
+            return ChatToolOutcome.failure(error: CancellationError(), tool: "app", effects: ToolFailureError.Effects.none)
+        } catch {
+            return Self.doorRefusal("unreadable", "Open repairs could not be read: \(error.localizedDescription) Nothing was let go.",
+                owner: "experiences/experiences.sqlite", next: ["action": .string("doctor.run")], extra: ["effects": .string("none")])
+        }
+        guard !ids.isEmpty else {
+            return Self.doorRefusal("not_owed", "No open repair's operation starts with \(prefix). Nothing was let go.",
+                remedy: "inspect", "Read the OWED lines on your home for the operations still owed.", next: ["page": .string("home")])
+        }
+        var released = 0
+        var refused: [JSONValue] = []
+        var unverifiedEffects = false
+        for each in ids {
+            if Task.isCancelled { break }
+            let result = await runRepairLetGo(input: ["id": .string(each), "reason": .string(reason)])
+            if case .object(let fields) = result, fields["effects"] == .string("unknown") { unverifiedEffects = true }
+            if case .object(let fields) = result, fields["status"] == .string("ok") { released += 1 } else {
+                refused.append(.object(["id": .string(each), "result": result]))
+            }
+        }
+        return .object(["status": .string(Task.isCancelled ? "cancelled" : refused.isEmpty ? "ok" : "partial"),
+            "operation_prefix": .string(prefix), "unattempted": .int(Int64(ids.count - released - refused.count)),
+            "let_go": .string(reason), "released": .int(Int64(released)), "refused_count": .int(Int64(refused.count)),
+            "refused": .array(Array(refused.prefix(10))), "effects": .string(unverifiedEffects ? "unknown" : released > 0 ? "occurred" : "none")])
+    }
+    @MainActor func runTurnReconcile(input: [String: JSONValue]) async -> JSONValue {
         let root = quietHost()?.dataRootOverride ?? securityCenter.dataRoot
         do {
-            let detail: String
-            switch tool {
-            case "turn_reconcile":
-                try await AbandonedTurnReconciliationHook.reconcile(dataRoot: root,
-                    sessionId: Self.doorText(input["session_id"]), turnId: Self.doorText(input["turn_id"]))
-                detail = "The saved turn was reconciled."
-            default:
-                detail = try ResidentWake.shared.accept(workspace: workspace, dataRoot: root, id: input["id"]?.scalarText)
-            }
-            return .object(["status": .string("ok"), "detail": .string(detail)])
+            try await AbandonedTurnReconciliationHook.reconcile(dataRoot: root,
+                sessionId: Self.doorText(input["session_id"]), turnId: Self.doorText(input["turn_id"]))
+            return .object(["status": .string("ok"), "detail": .string("The saved turn was reconciled.")])
         } catch { return ChatToolOutcome.failure(error: error) }
     }
     /// Read-only actions named as pages/items run directly; changes return a corrected call because they require explicit execution.
@@ -196,21 +389,21 @@ extension AppToolExecutor {
     static func doorActionCorrection(_ name: String, input: [String: JSONValue], turn: Turn) async throws -> JSONValue? {
         let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let args = if case .object(let args)? = input["args"] { args } else { [String: JSONValue]() }
-        let call = try (AppActions.action(key, turn: turn) ?? AppActions.pagePrefixedAction(key, turn: turn)).map { ["action": JSONValue.string($0.id),
-            "args": input["args"]
-            ?? .object(args)] }
-        guard var call else { return nil }
+        guard let action = try AppActions.action(key, turn: turn) ?? AppActions.pagePrefixedAction(key, turn: turn) else { return nil }
+        var call = ["action": JSONValue.string(action.id), "args": input["args"] ?? .object(args)]
         for key in ["preview", "expected_version"] { if let value = input[key] { call[key] = value } }
         TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T16"), "site": .string(
             "AppToolExecutor+AppDoor.swift:doorActionCorrection")]), turn: turn)
-        return doorRefusal("action_route", "Use the corrected app call. Nothing ran.",
+        let advice = try AppActions.callAdvice(action, input: call,
+            discovery: AppActions.discovery(action, dataRoot: PersistenceCore.defaultDataRoot()).objectValue ?? [:])
+        return doorRefusal("action_route", "Use try_instead's app call or declared argument shape. Nothing ran.",
             remedy: "correct_route", "Make next_call instead.", next: call,
-            extra: ["resolved": call["action"] ?? .null])
+            extra: ["resolved": call["action"] ?? .null, "try_instead": advice])
     }
     /// User/posture refusals run nothing; retrying without changing the cause cannot help.
     static let doorFloorReasons: Set<String> = [
         "owners_call", "owner_only", "trust_mode_read_only", "trust_mode_unreadable", "owners_screen", "owner_is_in_it",
-        "trust_posture_needs_full_mac", "full_mac_only", "opens_for_owner", "owners_ears", "owners_draft",
+        "opens_for_owner", "owners_ears", "owners_draft",
         // Remote or unknown-origin cards remain user-owned.
         "not_yours_to_answer", "origin_unverifiable",
         // Direct person-only actions remain so under Full Mac, including browser sign-in.
@@ -256,11 +449,40 @@ extension AppToolExecutor {
     func runAppDoor(input rawInput: [String: JSONValue], surface: String, inProcess: Bool = false, turn: Turn,
         execution: AppActionExecution) async throws -> JSONValue {
         var input = rawInput
-        let workspace = ChatWorkspaceBinding.operation(turn: turn, invocation: execution.invocation)
         if AppDoorNames.resolve(Self.doorText(input["page"])) == "visible", input["action"] == nil {
             guard let visible = presentation.visiblePageInput else { return Self.unattachedFailure() }
             input.merge(visible) { _, visible in visible }
         }
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let resolved = try await AppActions.resolvedAction(Self.doorText(input["action"]), dataRoot: root, turn: turn)
+        let form: String?
+        if let resolved {
+            guard let schema = resolved.discovery["args_schema"] else {
+                throw ToolFailureError("\(resolved.action.id)'s input schema is unavailable. Nothing ran.", effects: .none,
+                    code: "tool_schema_unavailable")
+            }
+            form = try ToolSignature.call(resolved.action.id, schema.serializedData(pretty: false))
+        } else { form = nil }
+        let result: JSONValue
+        do {
+            result = try await runAppDoorCall(input: input, resolvedAction: resolved, surface: surface, inProcess: inProcess,
+                turn: turn, execution: execution)
+        } catch is CancellationError { throw CancellationError() }
+        catch { result = ChatToolOutcome.failure(error: error, tool: "app") }
+        guard let resolved, let form else { return result }
+        let reply = ToolResult(result)
+        var receipt = result.objectValue ?? ["result": result,
+            "status": .string(ChatToolOutcome.statusWord(result, verdict: reply.outcome)),
+            "execution": .string(reply.outcome == .succeeded ? "executed" : "attempted")]
+        receipt["action"] = receipt["action"] ?? .string(resolved.action.id)
+        receipt["argument_form"] = .string(form)
+        return .object(receipt)
+    }
+    @MainActor
+    private func runAppDoorCall(input rawInput: [String: JSONValue], resolvedAction: (action: AppAction, discovery: [String: JSONValue])?,
+        surface: String, inProcess: Bool, turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+        var input = rawInput
+        let workspace = ChatWorkspaceBinding.operation(turn: turn, invocation: execution.invocation)
         // Approval replay carries the same receipt into this action's explicit execution.
         if let saved = input.removeValue(forKey: "__undo_receipt") {
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -298,7 +520,6 @@ extension AppToolExecutor {
             return AgentWorkspace.resolvedRead(result, as: step.label)
         }
         let action = Self.doorText(input["action"])
-        let resolvedAction = try await AppActions.resolvedAction(action, dataRoot: root, turn: turn)
         // A bare item names its unique owner; ambiguity is explicit, including a home room.
         if Self.doorText(input["page"]).isEmpty, case .string? = input["item"], !Self.doorText(input["item"]).isEmpty {
             let named = Self.doorText(input["item"])
@@ -345,7 +566,7 @@ extension AppToolExecutor {
                 return AgentWorkspace.resolvedRead(try await runAppDoor(input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution),
                                          as: page + "." + item)
             }
-            if let page = doorPage(named) {
+            if let page = await doorPage(named) {
                 input["page"] = .string(page.id)
                 input.removeValue(forKey: "item")
                 return AgentWorkspace.resolvedRead(try await runAppDoor(input: input, surface: surface, inProcess: inProcess, turn: turn,
@@ -371,9 +592,11 @@ extension AppToolExecutor {
             let beside = input.filter { $0.key != "actions" && $0.value != .null }
             guard case .array(let list) = entries,
                   beside.keys.allSatisfy({ $0.hasPrefix("__") || ["preview", "expected_version"].contains($0) }) else {
+                let advice = try Self.doorBatchAdvice(entries, input: input)
                 return Self.doorRefusal("invalid_actions",
                     "actions is a list of app calls ({action, args}, {page}, {item}) and takes only preview and expected_version beside it. Nothing was run.",
-                    remedy: "correct_arguments", "Move the other keys into the entries.")
+                    remedy: "correct_arguments", "Use try_instead's actions call, or its declared shape with your supplied values.",
+                    next: advice.objectValue, extra: ["try_instead": advice])
             }
             return try await doorMany(list, base: beside, turn: turn, execution: execution)
         }
@@ -423,12 +646,13 @@ extension AppToolExecutor {
         let find = Self.doorText(input["find"])
         let page = Self.doorText(input["page"])
         var item = Self.doorText(input["item"])
-        if !page.isEmpty, item.isEmpty, doorPage(page) == nil, let correction = try await Self.doorActionCorrection(page, input: input, turn: turn) {
+        let pageOwner = await doorPage(page)
+        if !page.isEmpty, item.isEmpty, pageOwner == nil, let correction = try await Self.doorActionCorrection(page, input: input, turn: turn) {
             return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
         }
         // A guide names its action, and the action its page: guide:<id> reads with or without page, and from a page that is not the action's own (a room,
         // Senses) it reads from the action's.
-        if item.hasPrefix("guide:"), page.isEmpty || doorPage(page) == nil,
+        if item.hasPrefix("guide:"), page.isEmpty || pageOwner == nil,
            let named = (try await AppActions.resolvedAction(String(item.dropFirst("guide:".count)), dataRoot: root, turn: turn))?.action, named.page != "*" {
             var call = input
             call["page"] = .string(named.page)
@@ -442,7 +666,7 @@ extension AppToolExecutor {
         let homeItem = Self.opensHomeItem(input)
         // A script reads pages; it never opens an item anywhere but a real page.
         if input[Self.doorScriptKey] == .bool(true), input["item"].map({ $0 != .null }) == true,
-           homeItem || doorPage(page) == nil {
+           homeItem || pageOwner == nil {
             return Self.doorRefusal("action_required",
                 "A script opens an item only on a real page; a home item can send or change something. Nothing was read or done.",
                 remedy: "none", "Call the item's named action through app instead.")
@@ -499,7 +723,7 @@ extension AppToolExecutor {
             execution: execution) {
             return result
         }
-        guard let resolved = doorPage(page) else {
+        guard let resolved = pageOwner else {
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             let scope = input["__session_id"]?.scalarText ?? turn.verifiedSessionID ?? ""
             let kind = await AgentScreen.classify(workspace: workspace, page, dataRoot: root, scope: scope)
@@ -521,19 +745,20 @@ extension AppToolExecutor {
             }
             return Self.doorRefusal("unknown_page", "No page is called that.", remedy: "read_index",
                 "Read {} for the pages; nothing was done.", next: [:],
-                extra: ["requested": .string(page), "pages": .array(try doorPages.map { .string($0.id) })])
+                extra: ["requested": .string(page), "pages": .array(try await doorPages.map { .string($0.id) })])
         }
         switch input["args"] {
         case .object(let args)?:
             let acceptsLimit = resolved.id == "chat" && !item.isEmpty && !item.hasPrefix("guide:")
-            let acceptsOffset = resolved.id == "tools" && item != "census" && item != "actions" && !item.hasPrefix("guide:")
+            let acceptsOffset = (resolved.id == "tools" || resolved.id == "make" && item.isEmpty)
+                && item != "census" && item != "actions" && !item.hasPrefix("guide:")
             let allowed = Set((acceptsLimit ? ["limit"] : []) + (acceptsOffset ? ["offset"] : []))
             if let stray = args.keys.sorted().first(where: { !allowed.contains($0) }) {
                 // Single-subject pages use item so the scope remains explicit.
                 let subject = ["context": "conversation id", "agent_view": "room"][resolved.id]
                 let named: String = { if case .string(let v)? = args[stray] { return v }; return item }()
                 return Self.doorRefusal("unknown_arg", "A \(resolved.id) page read does not accept args.\(stray). Nothing was read.",
-                    remedy: "correct_arguments", acceptsOffset ? "Pass args.offset (a nonnegative integer) to continue this named Tools read."
+                    remedy: "correct_arguments", acceptsOffset ? "Pass args.offset (a nonnegative integer) to continue this \(resolved.title) read."
                         : acceptsLimit ? "Remove that argument; this conversation read accepts only args.limit (integer)."
                         : subject.map { "Name the \($0) as item: {page: \"\(resolved.id)\", item: \"<\($0)>\"}; without item it reads the one on screen." }
                         ?? "Read the page without args. Use find for action arguments.",
@@ -544,7 +769,7 @@ extension AppToolExecutor {
             if let offset = args["offset"] {
                 guard case .int(let n) = offset, n >= 0 else {
                     return Self.doorRefusal("bad_input", "args.offset must be a nonnegative integer. Nothing was read.",
-                        remedy: "correct_arguments", "Pass the next_offset from this Tools read.", extra: ["argument_path": .string("args.offset")])
+                        remedy: "correct_arguments", "Pass the next_offset from this \(resolved.title) read.", extra: ["argument_path": .string("args.offset")])
                 }
             }
             if let limit = args["limit"], limit != .null,
@@ -560,25 +785,16 @@ extension AppToolExecutor {
                 extra: ["argument_path": .string("args")])
         }
         let catalog = item == "actions"
-        // Resolve conversation titles only when exactly one matches.
-        if resolved.id == "chat", !item.isEmpty, !catalog, !item.hasPrefix("guide:") {
-            let rows = try HumanConversationIndex.rows(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-            if !rows.contains(where: { $0["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) == item }) {
-            let named = rows.filter { $0["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })?.caseInsensitiveCompare(item) == .orderedSame }
-            if named.count == 1, let id = named[0]["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) { item = id }
-            }
-        }
         if resolved.id == "desk", !item.isEmpty, !catalog, !item.hasPrefix("guide:") {
-            return Self.doorItemRead(try await doorDo("desk.read", resolved: try await AppActions.resolvedAction("desk.read", dataRoot: root, turn: turn),
-                input: ["args": .object(["handle": .string(item)])],
-                                                      surface: surface, inProcess: inProcess, turn: turn, execution: execution), page: resolved, item: item)
+            return Self.doorItemRead(try await runAppDoor(input: ["action": .string("desk.read"), "args": .object(["handle": .string(item)])],
+                surface: surface, inProcess: inProcess, turn: turn, execution: execution), page: resolved, item: item)
         }
         let offset: Int64 = if case .int(let value)? = input["args"]?.objectValue?["offset"] { value } else { 0 }
         let result = Self.doorItemRead(try await doorRead(page: resolved, item: catalog ? "" : item, offset: Int(offset), surface: surface,
             turn: turn, execution: execution),
             page: resolved, item: catalog ? ""
             : item)
-        guard case .object(var read) = result, read["status"] == .string("ok") else { return result }
+        guard case .object(var read) = result, read["status"] == .string("ok") || read["status"] == .string("partial") else { return result }
         if resolved.id == "tools", item != "census" {
             read["stopped_run_ids"] = .array(try PartRunStore.waitingIDs(root: root).map(JSONValue.string))
             read["resume_note"] = .string("""
@@ -598,7 +814,7 @@ extension AppToolExecutor {
         if resolved.id == "chat", case .object(let composer)? = read["item"],
            let id = composer["conversation"]?.scalarText {
             let args: [String: JSONValue] = if case .object(let given)? = input["args"] { given } else { [:] }
-            read["conversation"] = await HumanConversationReader.open(turn: turn, sessionID: id,
+            read["conversation"] = await ConversationReader.open(turn: turn, id: id,
                 limit: args["limit"]?.scalarText.flatMap { Int($0) },
                 dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         }
@@ -636,7 +852,7 @@ extension AppToolExecutor {
                     """
             }.joined(separator: " "))
         }
-        return .object(read)
+        return Self.pageReadResult(page: resolved.id, fields: read)
     }
 }
 /// Preview shares execution checks and refuses invalid/user-only calls before any card can be filed.

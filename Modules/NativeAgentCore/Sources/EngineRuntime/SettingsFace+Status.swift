@@ -1,14 +1,14 @@
 import AppToolRuntime
 import Cognition
 import Foundation
+import MacControl
 import MacIntegration
 import MemoryV2
 import NativeAgentShared
 // Blueprint: | `SettingsFace+Status.swift` | Settings runtime evidence and remedies read cognition, Trust, Mac permissions and memory owners |
 
 extension NativeAgentEngine {
-    @MainActor
-    func settingsFaceStatus() async throws -> [PartFace.Section] {
+    @concurrent func settingsFaceStatus() async throws -> [PartFace.Section] {
         var rows: [PartFace.Row] = []
         do { _ = try await trust.load() }
         catch is CancellationError { throw CancellationError() }
@@ -18,7 +18,14 @@ extension NativeAgentEngine {
         }
         await cognitionView.refreshVitals()
         try Task.checkCancellation()
-        let status = SettingsInnerLifeStatus.state(runtime: cognitionView.subconsciousRuntime, reflectionRoute: cognitionView.reflectionRoute)
+        let permissions: Result<MacIntegrationPermissionStore.Snapshot, Error>
+        do { permissions = .success(try await MacIntegrationPermissionStore(dataRoot: dataRoot).snapshotChecked()) }
+        catch is CancellationError { throw CancellationError() }
+        catch { permissions = .failure(error) }
+        let state = await MainActor.run {
+            (runtime: cognitionView.subconsciousRuntime, route: cognitionView.reflectionRoute, embeddingsError: memory.embeddingsError)
+        }
+        let status = SettingsInnerLifeStatus.state(runtime: state.runtime, reflectionRoute: state.route)
         let tone: PartFace.Tone
         switch status.tone {
         case .neutral: tone = .quiet
@@ -30,24 +37,30 @@ extension NativeAgentEngine {
         let actions: [PartFace.Action]?
         switch status.recovery {
         case .configureProvider: (open, actions) = ("page:providers", nil)
-        case .selectModel: (open, actions) = ("page:personality/minds", nil)
-        case .reapply: (open, actions) = (nil, [.init(id: "enable-inner-life", label: "Enable again")])
+        case .selectModel: (open, actions) = ("page:personality", nil)
+        // Enable again is the inner life's own switch turned on: the same call its switch makes.
+        case .reapply: (open, actions) = (nil, [.init(id: "enable-inner-life", label: "Enable again",
+                                                      call: settingSetCall("settings.inner_life", .bool(true)))])
         case nil: (open, actions) = (nil, nil)
         }
         rows.append(.init(id: "inner-life-status", title: "Inner life now", detail: status.detail,
                           value: status.text, tone: tone, open: open, actions: actions))
-        await macIntegration.refresh()
         try Task.checkCancellation()
         let macDetail: String
-        if let problem = macIntegration.permissionLoadError { macDetail = problem }
-        else if macIntegration.permissions.isEmpty { macDetail = "Mac access has not been read." }
-        else if macIntegration.permissions.values.contains(where: { $0.read || $0.write }) {
-            macDetail = "On — macOS still asks for each app."
-        } else { macDetail = "Off. Choose what I may reach." }
+        let macTone: PartFace.Tone
+        switch permissions {
+        case .success(let snapshot):
+            macDetail = snapshot.permissions.values.contains(where: { $0.read || $0.write })
+                ? "On — macOS still asks for each app." : "Off. Choose what I may reach."
+            macTone = .plain
+        case .failure(let error):
+            macDetail = UserFacingError.message(error, action: "load the saved Mac Integration permissions")
+            macTone = .failed
+        }
         rows.append(.init(id: "mac-access", title: "Use my Mac", detail: macDetail,
-                          tone: macIntegration.permissionLoadError == nil ? .plain : .failed, open: "page:mac_integration"))
+                          tone: macTone, open: "page:trust"))
         // The switch reports the request; this row reports the serving backend and its actual load failure.
-        if let snapshot = memory.embeddingSnapshot {
+        if let snapshot = await memory.readEmbeddingSnapshot() {
             let meaning: String
             switch snapshot.effectiveBackend {
             case ManagedEmbeddingProvider.coreMLBackend: meaning = "On — I find memories by what they mean."
@@ -61,7 +74,7 @@ extension NativeAgentEngine {
                               open: "page:memories"))
         } else {
             rows.append(.init(id: "semantic-status", title: "Memory lookup unavailable",
-                              detail: memory.embeddingsError ?? "The embedding runtime has not loaded.", tone: .failed, open: "page:memories"))
+                              detail: state.embeddingsError ?? "The embedding runtime has not loaded.", tone: .failed, open: "page:memories"))
         }
         do {
             let proposals = try await memory.proposals(status: "pending")

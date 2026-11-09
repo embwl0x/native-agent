@@ -13,23 +13,10 @@ import Transcripts
 /// Encode app-owned mirror types directly so device sync cannot invent a second wire shape.
 public typealias DeviceSyncSnapshotRows = any Encodable & Sendable
 
-/// A Desk task the phone starts: its item and the agent's line that carries it.
-public struct DeviceSyncDeskTask: Sendable {
-    public var job: String
-    public var desk_handle: String
-    public var desk_alias: String
-
-    public init(job: String, desk_handle: String, desk_alias: String) {
-        self.job = job
-        self.desk_handle = desk_handle
-        self.desk_alias = desk_alias
-    }
-}
-
 public protocol DeviceSyncHost: Sendable {
     func helpersSnapshot() async throws -> MobileHelpersSnapshot
-    func helperAction(action: String, payload: [String: String]) async throws -> [String: String]
-    func agentThreadAction(action: String, payload: [String: String], turn: Turn) async throws -> [String: String]
+    /// The phone's agent thread: a read, or the person's own words sent through the door as the verified `device`'s act.
+    func agentThreadAction(action: String, payload: [String: String], device: String) async throws -> [String: String]
     /// One Desk/authority read per pass; failed groups keep their own errors.
     func workOverview() async -> (
         overview: WorkOverview, deskItems: [DeskItem]?,
@@ -42,11 +29,19 @@ public protocol DeviceSyncHost: Sendable {
     @MainActor func surfaceLayout() -> SurfaceLayoutAvailability
     /// Every page's published face (the phone shows them all).
     @MainActor func pageFaces() async -> [String: PartFaceSnapshot]
+    func faceRead(_ request: DocumentRequest, cursor: Int, revision: String?, device: String) async throws -> FaceReadPage
     @MainActor func faceAction(page: String, row: String, action: String, value: String?, device: String) async throws -> String?
+    @MainActor func faceOutcome(page: String, row: String, action: String, value: String?, values: [String: PartFace.Value]?,
+                               formRevision: String?, device: String,
+                               expecting: PartFace.Call, operation: UUID, undoOf: UUID?, checking: Bool) async throws -> FaceActOutcome
+    /// Installed phones 61/63 still send decision envelopes. These adapters reach the current decision/row owners, never another executor.
+    func decidePhoneApproval(id: String, decision: String, device: String) async throws -> ApprovalRecord
+    @MainActor func answerPhoneInteraction(_ fields: [String: String], device: String) async throws -> [String: String]
     func getChatMessages(sessionId: String) async throws -> [ChatMessageRecord]
     func getOtherRoomExchanges() async throws -> [OtherRoomExchange]
     func getHealth() async throws -> RuntimeHealth
     func turnSummariesSnapshotData() async -> Data?
+    func turnSessionsFace() async -> TurnSessionsFace?
     func pendingMemoryProposals() async throws -> DeviceSyncSnapshotRows
     func getSkills() async throws -> DeviceSyncSnapshotRows
     func activeMemories() async throws -> [MemoryV2.MemoryRecord]
@@ -57,39 +52,19 @@ public protocol DeviceSyncHost: Sendable {
     func trustSnapshotData() async throws -> Data
     func macIntegrationPermissionsSnapshot() async throws -> [String: [String: Bool]]
     func telegramSnapshot() async throws -> MobileTelegramSnapshot
-    func disconnectTelegram() async throws -> MobileTelegramSnapshot
     func getPersonality() async throws -> PersonalityProfile
     func knowledgeGraphSnapshotData() async throws -> Data
     func getRunsStrict() async -> [RunRecord]?
-    func schedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue
-    /// Phone settings read and write through the same registry as the Mac page controls.
-    @MainActor func appSettings() async throws -> [MobileAppSetting]
-    @MainActor func setAppSetting(id: String, value: String, actionID: String, clientID: String) async throws -> MobileAppSetting
-    func applyMobileTrustAction(_ request: MobileTrustAction) async throws -> Data
-    func setConnectorEnabled(id: String, enabled: Bool) async throws -> DeviceSyncSnapshotRows
     func disconnectConnector(id: String) async throws -> DeviceSyncSnapshotRows
-    func submitDeskTask(title: String, objective: String) async throws -> DeviceSyncDeskTask
-    func acceptMemoryProposal(proposalID: String) async throws -> MemoryV2.MemoryRecord
-    func rejectMemoryProposal(proposalID: String, reason: String) async throws
-    func deleteMemory(id: String) async throws
-    func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord
-    func inboxAction(_ id: String, action: String) async throws
-    @MainActor func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String]
     func cancelChatSession(sessionId: String, runIDs: [String]) async throws
-    func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String?) async throws
-    @MainActor func startProviderSignIn(_ id: String, requestID: String) -> [String: String]
     @MainActor func providerSignInStates() -> [String: [String: String]]
-    func testProvider(_ id: String) async throws -> NativeAgentShared.ProviderTestResult
-    func clearProvider(_ id: String) async throws
-    func setActiveProvider(surface: String, providerId: String) async throws
     func saveSurfaceSelection(
         surface: String,
         model: String,
         reasoningEffort: String?,
         serviceTier: String?,
         providerID: String?) async throws -> ProviderRoutingSnapshot
-    @MainActor func pinnedChatSessionIDs() -> [String]
-    @MainActor func savePinnedChatSessionIDs(_ ids: [String]) throws
+    @MainActor func closePinnedChatSession(_ sessionID: String) async throws -> Bool
     /// Remote control must pass through the app's Mac control route.
     func remoteMacControl(payload: [String: String], turn: Turn) async throws -> [String: String]
 

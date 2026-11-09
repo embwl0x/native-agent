@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacFourVerbs+Navigation.swift` | `MacFourVerbs`: `go`, `webURL`; landing targets the recipient returned by Launch Services |
+// Blueprint: | `MacFourVerbs+Navigation.swift` | `MacFourVerbs`: Launch Services recipient landing; event-judged sight when arrival is unconfirmed |
 
 extension MacFourVerbs {
     // MARK: 3 — LEGS
@@ -67,7 +67,8 @@ extension MacFourVerbs {
                     verificationDestination = Self.string(out["bundle_identifier"]) ?? trimmed
                     landingApp = verificationDestination
                     // The exact-pid continuation path reports "pid"; the by-name path reports "process_identifier".
-                    landedOnSelf = (out["process_identifier"]?.integerValue ?? out["pid"]?.integerValue) == Int64(getpid())
+                    landedOnSelf = PersonOnlyWindows.isOwnProcess(
+                        (out["process_identifier"]?.integerValue ?? out["pid"]?.integerValue).flatMap(Int32.init(exactly:)))
                     moved = front ? "Switched to \(trimmed)."
                         : out["launched"] == .bool(true) ? "Launched \(trimmed) without activating it."
                         : "\(trimmed) is already running; its windows were left as they were."
@@ -113,7 +114,7 @@ extension MacFourVerbs {
             if front { detail["front"] = .string("by Launch Services") }
             return detail
         }
-        // Going to ourselves is navigation: the arrival is the receipt. Only reading our own window over Accessibility deadlocks, so nothing is read.
+        // Arrival is navigation's receipt; person-only UI is never read through Accessibility.
         if landedOnSelf {
             var detail = Self.operationDetail(result)
             detail["status"] = .string(front ? "focused" : "running")
@@ -127,6 +128,10 @@ extension MacFourVerbs {
                 : "I couldn't complete the request to go to \(trimmed).",
                 detail: opened ? openedDetail(Self.operationDetail(result)) : Self.operationDetail(result))
         }
+        let output = Self.object(result.output)
+        let landingPID = (output["process_identifier"]?.integerValue ?? output["pid"]?.integerValue).flatMap(Int32.init(exactly:))
+        let landingSignals = MacWaitSignals(effects: effectObserverSource, activation: appActivationSource, pid: landingPID)
+        defer { landingSignals.stop() }
         var landing = await sight(part: nil, app: landingApp, turn: turn, context: context)
         let needsSettlement: Bool
         switch landing {
@@ -135,8 +140,12 @@ extension MacFourVerbs {
             || reply.detail["error"] == .string("no_frontmost_window")
         }
         if settlesAsynchronously, needsSettlement {
-            await clock.sleep(seconds: 0.5)
-            landing = await sight(part: nil, app: landingApp, turn: turn, context: context)
+            _ = await macSettle("go_landing", signals: landingSignals, patience: 0.5) {
+                guard !Task.isCancelled else { return false }
+                landing = await sight(part: nil, app: landingApp, turn: turn, context: context)
+                guard case .seen(let hit) = landing else { return false }
+                return Self.destination(verificationDestination, matches: hit) == true
+            }
         }
         switch landing {
         case .blind(let reply):
@@ -152,7 +161,7 @@ extension MacFourVerbs {
             return MacFourVerbsReply(
                 ok: result.ok && reply.ok,
                 text: (result.ok ? moved : "I couldn't confirm that I got to \(trimmed).")
-                    + " " + (ownWindow ? "My own window uses in-process page inspection." : reply.text),
+                    + " " + (ownWindow ? "My own window uses app page inspection." : reply.text),
                 detail: detail
             )
         case .seen(let hit):

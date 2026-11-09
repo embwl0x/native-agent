@@ -88,6 +88,8 @@ public actor CognitiveSubstrate {
     var dreamResidue: CognitiveDreamResidue?
     /// One residue per night, keyed by committed dream id or local calendar day.
     var dreamResidueClaims: Set<String> = []
+    /// Unsettled attention rows share the field's checkpoint: a saved application always retains its replay identity.
+    var attentionLanding: AttentionLanding?
     /// Bound recall nudges to one per node per hour.
     var lastRefeltAt: [UUID: Date] = [:]
     /// Per-RECORD re-feel refractory beside the per-node one: every recall turn mints a fresh node naming the same record.
@@ -232,15 +234,6 @@ public actor CognitiveSubstrate {
         }
     }
 
-    /// "watch|care id" → last wake and consecutive readings that moved nothing.
-    struct CareWatchRest {
-        var at: Date
-        var streak = 0
-        /// The journal's fold watermark: refolding never counts a reading twice.
-        var lived: UInt64 = 0
-    }
-    var careWatchWoke: [String: CareWatchRest] = [:]
-
     /// All name-dependent projections share the checked profile owner.
     func oweUserNameRead(_ error: Error) {
         RepairOwed.owe(conversationDataRoot, id: "profile-name:" + UUID().uuidString, kind: .run,
@@ -341,6 +334,7 @@ public actor CognitiveSubstrate {
         dirtyRevision &+= 1
         residentRestoreIsAuthoritative = true
         field.clear()
+        attentionLanding = nil
         episodes.removeAll(keepingCapacity: false)
         schemaProposals.removeAll(keepingCapacity: false)
         cares.removeAll(keepingCapacity: false)
@@ -373,7 +367,6 @@ public actor CognitiveSubstrate {
         // Landing and presentation ledgers describe the field being cleared.
         landingScores.removeAll(keepingCapacity: false)
         capsulePresentationState = CognitiveCapsulePresentationState()
-        careWatchWoke.removeAll(keepingCapacity: false)
         // Invalidate caring context, ledgers and in-flight verdicts; none may dose after Clear.
         clearCaringState()
         capsulePresentationDirty = false

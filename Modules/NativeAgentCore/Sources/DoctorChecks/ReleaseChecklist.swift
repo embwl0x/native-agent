@@ -1,7 +1,7 @@
 import Foundation
 // Blueprint: | `ReleaseChecklist.swift` | `ReleaseChecklist` struct |
 
-public struct ReleaseChecklistItem: Identifiable, Codable, Hashable {
+public struct ReleaseChecklistItem: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var title: String = ""
     public var status: String = ""
@@ -17,7 +17,7 @@ public struct ReleaseChecklistItem: Identifiable, Codable, Hashable {
     }
 }
 
-public struct ReleaseChecklist: Codable, Hashable {
+public struct ReleaseChecklist: Codable, Hashable, Sendable {
     public var status: String = ""
     public var items: [ReleaseChecklistItem] = []
     public var createdAt: String = ""

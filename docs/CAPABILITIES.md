@@ -7,8 +7,8 @@ Reload Providers repairs that source. Action discovery and policy admission
 likewise require a checked complete catalog; an unreadable owner reports
 unavailable rather than removing its actions from a successful inventory.
 
-Capability inventory comes from current features, abilities, saved workflows
-and connector actions. Retired pack records no longer appear as available or
+Capability inventory comes from current features, abilities and connector
+actions. Retired pack records no longer appear as available or
 installed capabilities. Catalog source and trust-root reads use only saved
 typed records; they create no local pack source, root or signing key. Missing
 lists have no saved rows; unreadable or malformed lists report their named
@@ -94,9 +94,32 @@ or `Label: value` / `Label=value` fragments. Every supplied entry is validated
 before navigation, filling or submission; an unsupported value or malformed
 nonempty fragment refuses the batch and identifies the offending field.
 
-After Chrome navigation reports verified completion, the attached page goes
-directly to the snapshot reader. Chrome's own tab completion and landed URL
-verify HTTP(S), internal, file and PDF navigation without a DOM reader.
+Chrome navigation, explicit snapshots and passive news share the document's
+event owner: main/feed/article prose arriving in the DOM. Resource completions
+cannot admit an unreadable shell; arrival uses no network observer or main-world
+hooks. Content evidence and its time live with the document across worker restarts.
+The worker reattaches to that live reader. History and fragment
+navigation reset route content evidence; only readable text added or
+changed in post-route mutation records proves content, and removal can clear it.
+Observer attachment cannot reuse unchanged prose. There is no
+navigation, snapshot, picture or frame-layout deadline. Stop, navigation
+errors, ownership loss and connection closure retain their causes; absent
+events leave the tool pending with Stop available. Committed HTTP(S) PDFs and
+images arrive by exact-document MIME, including after extension restart without
+network history or prose. Internal and other non-HTTP pages retain completed-tab
+evidence. Resource completion remains separate from content.
+Navigation receipts measure dispatch, commit, content arrival
+and read return. Observed stages survive later errors or cancellation;
+unobserved stages stay null. Pagination reports
+`has_more` with the exact offset-bearing `next`; only named unread parts and
+their causes make a read `partial`. Settled/unsettled read labels are absent.
+Missing or malformed gap metadata retains captured content and raw evidence;
+coverage remains unknown and cannot establish a completed verdict.
+The DOM collector retains its node, text and transport budgets. Only an
+explicit page wait observes a requested quiet interval.
+Reader/storage failures and cancellation retain their existing causes.
+Subframe commits invalidate only their frame's routes, preserving sibling
+content and pending captures; changing optional frames retain named gaps.
 Chrome internal pages (`chrome://`, `about:`) return their URL and title with
 `read_mode: "none"` and "Chrome allows no reader on its internal pages" as one
 text line; snapshot and look attempt no picture. Other restricted pages and the
@@ -121,8 +144,8 @@ case-insensitively. The existing two-second SQLite progress deadline bounds quer
 work, not filesystem I/O. Full Mac and file-read admission remain required;
 the extension has no history action or `history` permission. Capture/read failures
 never select another reader or profile.
-Actions that may start an as-yet unverified navigation retain the
-navigation-settled observation.
+Actions that may start a navigation read the current ready document through
+the same snapshot reader.
 
 `files.read` returns `content_sha256` for a whole-file read. A replacement
 through `files.write` with `expected_content_sha256` hashes the entire existing
@@ -138,6 +161,11 @@ discovers actions; `action` with `args` executes one. Actions come from
 irreversibility and screen movement.
 
 Pages and results carry detail without expanding the provider's tool list.
+`record.read` reaches their own experiences and details through `ExperienceStore`,
+with exact and prefix filters, newest-first pages, full match counts and whole
+detail JSON rows. It is read-only, including on missing storage; the
+[experience contract](EXPERIENCE.md#reading-their-own-record) owns its arguments,
+row cap and explicit unreadable-row gaps.
 Retired names are refused with translated `app` calls. There is no tool
 loading/unloading workflow or separate workspace tool; workspace items are
 part of app home.
@@ -301,7 +329,7 @@ connectors and agent communication under the saved policy.
   expose perception and action. Perception, document, clipboard, filesystem and
   Spotlight reads bypass motor persistence and replay while retaining policy admission.
   Interactive AX reads and mutations share capability-based renderer preparation,
-  checked readback and a per-process Enhanced settle at the source; passive reads
+  checked capability readback and event-backed content readiness; passive reads
   never write mode flags. See [renderer perception](USER_GUIDE.md#turn-on-mac-computer-control-and-the-activity-watcher)
   for empty/unknown topology, assistive/system exclusions and window-animation effects.
   An optional AX attribute's error `-25200` is an element's named
@@ -309,6 +337,9 @@ connectors and agent communication under the saved policy.
   Act-time name reads have the same scope. A failed own-name read, including
   `AXTitle`, marks the label unreadable without trying another label attribute,
   caption or hint; unsupported/no-value attributes remain absent.
+  Missing `AXEnabled` stays unknown in perception. A disabled control says so,
+  so an AX action refuses `false` and a failed read, with its cause; a control
+  that publishes no `AXEnabled` (TextEdit's text area) is not disabled.
   A separate caption read's failure
   yields one caption gap and `label_source:"unreadable"` on the control;
   sibling attributes are never reported as its own, and another name is not
@@ -404,8 +435,18 @@ connectors and agent communication under the saved policy.
   capture provenance within one five-second disclosure budget. AX, ScreenCaptureKit
   and window-server geometry use the window selector's shared two-point tolerance
   per origin/size component; native window identity remains required. Missing, changed,
-  late or incomplete evidence returns `redaction_coverage_unavailable` without
-  an image. Released images report both inspected node counts and the union's
+  late or incomplete evidence withholds the image with
+  `image_unavailable_reason:"redaction_coverage_unavailable"` and a named
+  `image_withheld_reason`, retaining the text observation for automatic and
+  explicit pixel requests. A subrole gap alone requires a finite element frame
+  and masks it completely; caption and geometry failures still withhold pixels.
+  Text roles with an unreadable subrole contribute no value to text looks,
+  including values read as another control's caption or a native selector label.
+  Window OCR runs on every look under caption redaction, without the whole-window
+  walk; when a picture is released it uses the same mask union and omits any
+  intersecting row. Unproven capture geometry or OCR positions withhold all recognized
+  text for that capture with a named cause, retaining the AX observation.
+  Released images report both inspected node counts and the union's
   mask count in `pixel_coverage`. Superseded views discard pixels and marks;
   superseded looks return no action handles. LatestRead remains the publication owner and the shared
   frame lifetime remains 180 seconds. Selected marks/text report omissions and
@@ -480,7 +521,10 @@ connectors and agent communication under the saved policy.
   round trip and restores it once through settlement. A missing or ambiguous
   explicit window refuses; ordinary activation has no Apple Event substitute,
   and failed key-window admission never raises the old target. Our own app is
-  restored through AppKit activation without self-AX inspection.
+  restored through AppKit activation without self-AX inspection. Direct AppKit
+  activation rechecks driver authority on the main actor immediately before
+  emission and waits only after macOS accepts the request; a refusal returns
+  its cause without waiting for an activation event.
   AX mutation receipts retain native cause, code and emission stage; a failed
   reply after attempted emission is an unknown result, never evidence of no
   effect. The duplicate `fallback_reason` result channel is removed.
@@ -652,10 +696,19 @@ connectors and agent communication under the saved policy.
   in `directory_gaps` and makes the inventory partial; it does not override a
   descendant app's bundle/location/Launch Services classification. Directory gaps
   and app rows publish in the same snapshot. Synchronous consumers report not ready during initial
-  gathering; async request waits end at four seconds or the inherited call
-  deadline, whichever comes first, leaving the query alive. Resident arrival
+  gathering; async requests await the gather event, query failure, shutdown or
+  caller cancellation, subject to any inherited call deadline. The index adds
+  no cold-gather timer. Resident arrival
   observation ends with its consumer lifetime; the engine shuts down the query
   only after producers, admitted turns and resident consumers have settled.
+  Mac location reads return a held CoreLocation fix with its age, or await a
+  CoreLocation callback when no fix is held. The location owner adds no answer
+  timer. An empty callback is unknown; an error reports its own cause without
+  substituting a held fix. Full Disk Access probes distinguish access denial
+  (`EACCES`/`EPERM`) from other probe errors, which remain unknown with the
+  POSIX cause available in the permission snapshot and card. The Settings dock
+  reads that snapshot off the main actor and refreshes its displayed cause;
+  unknown probe failures do not ask the person to enable Full Disk Access.
 - **Connectors:** the Slack and Telegram doors are built in. Any other service
   (GitHub, Notion, Gmail, Google Calendar, X, AgentMail, TradingView, and
   Slack beyond its door, among them) is
@@ -667,7 +720,7 @@ connectors and agent communication under the saved policy.
   owns pure previews, settlement, bounded WebKit waits and checked IPC readiness.
 - **Web search:** `web.search` searches SearXNG and returns its results or an explicit failure with setup or repair guidance. A malformed result is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
 - **Web search:** `web.search` searches SearXNG and returns its results or an explicit failure with setup or repair guidance. A malformed result or `unresponsive_engines` entry is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
-- **Private web reads:** `web.read` (`read_page`) extracts the retained HTML as
+- **Web reads:** `web.read` (`read_page`) extracts the retained HTTP HTML as
   paragraphs, list items and table rows, with each content link inline as
   `title → url` (a URL label appears once). HN stories keep their points and
   comments link in one row; comments keep their author line and paragraphs.
@@ -684,6 +737,22 @@ connectors and agent communication under the saved policy.
   normal permissions and limited retention. Neither continuation recovers bytes
   beyond the response bound. Network failures name `no_such_host`,
   `connection_refused` or `timeout` when those are the cause.
+  A successful thin/JavaScript-gated extraction selects Chrome's rendered
+  reader through its normal app door in a new NativeAgent background tab.
+  This also applies from workspace: the nested navigation owns its page readback
+  and settlement evidence.
+  The reply says `used_browser:true`, retains HTTP evidence/receipt under
+  `http_read`, and carries Chrome's actual page or blocker. `text_reader` says
+  `browser` only when Chrome's served text has more non-whitespace characters
+  than the selected HTTP text, measuring both exact returned strings, including
+  an authored `sense_page`; otherwise it says `http`, retains HTTP text at the top,
+  and attaches the browser's empty/shorter/unmeasured read or failure under
+  `browser_read` with partial status. Chrome may use the
+  signed-in session; consent is never accepted or dismissed. HTTP failures do
+  not select Chrome. Rendered `find` starts at the first matching element;
+  `around` applies only to HTTP passages. Chrome's document arrival, read budgets,
+  overlays, image names and continuations follow the
+  [Chrome surface contract](../Extensions/NativeAgentChrome/README.md).
 - **Maps:** `maps.search` accepts the location in `query` after near/in/around
   when a separate `near` is absent/empty, and reports the split in `query_split`.
   `maps.route` returns every step with path-segment distances and explicit
@@ -702,6 +771,11 @@ Make allocates positive, increasing artifact versions with checked arithmetic;
 exhausted version numbers refuse the append without changing its metadata.
 Decoded refs must match their lookup; local version filenames and resolved
 destinations must stay inside that ref's Make folder, including through symlinks.
+The registered Make page reads all retained refs newest first in pages of 25,
+with `next_call`/`args.offset`; an item's ref reads its versions. Unreadable or
+missing metadata names that ref as unavailable beside healthy rows; unreadable
+membership fails the shelf read. Page reads and `make.read` share the metadata
+owner off the main actor. Unknown refs point to `page:"make"`.
 Studio recall counting validates stored counters and checks increments; invalid
 or exhausted counters stay byte-preserved and counting is reported unavailable.
 Returned recall entries survive a counting failure. The counter owner records
@@ -819,6 +893,14 @@ they cannot execute through Chat. Picker failures retain forward intent and
 report each projection's checked state, without compensating writes. The
 [provider admission contract](INTERNAL_WORKINGS.md) owns catalog credential
 binding and route-specific control evidence, including unknown Moonshot controls.
+Meta's pay-as-you-go API-key route offers Muse Wonder 1.0 and Muse Spark 1.3
+through the shared Anthropic-format Messages transport, native streamed tools,
+client-side text/tool history and low/medium/high/xhigh effort controls. Returned
+thinking blocks replay across tool rounds through the shared bounded in-memory
+ledger; they are not persisted in conversation history. Providers, onboarding and the iPhone read the same shipped catalog
+and checked routing; keys are entered on
+the Mac. See [Meta setup and limits](USER_GUIDE.md#meta-model-api).
+
 Quiet account settings, model/effort choices, Fast writes and image-model
 readback use the checked routing snapshot. Unreadable routing returns its
 repair evidence instead of an empty account or default choice. A missing

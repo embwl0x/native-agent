@@ -46,7 +46,6 @@ final class ToolLoopTraceObservation: Sendable {
             && !ChatToolOutcome.isWaitingOnPerson(reply.payload, verdict: reply.outcome)
     }
 }
-
 extension TurnEngineResult.LoopCounters {
     var tracePayload: [String: JSONValue] {
         [
@@ -134,86 +133,5 @@ public enum ToolDispatchDeadline {
                 an unknown outcome, never permission to repeat the write.
                 """,
             recovery: .reconcile)
-    }
-}
-
-// MARK: - Provider-facing result ceiling
-
-/// Page oversized live results into whole JSON sections so one response cannot consume the remaining window.
-/// Keep ordinary receipt projections and recover existing output before repeating any operation.
-enum ProviderToolResultPage {
-    static let defaultMaxUTF8Bytes = 48_000
-
-    static func project(
-        toolName: String,
-        content: String,
-        sessionId: String? = nil,
-        turnId: String? = nil,
-        originalResultClass: ChatToolOutcome.ExactResultClass? = nil,
-        appDoor: Bool = false
-    ) async -> String {
-        let limit = defaultMaxUTF8Bytes
-        guard content.utf8.count > limit else { return content }
-        do {
-        let parsed = try? JSONValue.parse(Data(content.utf8))
-        let originalResultClass = originalResultClass ?? (content.utf8.count <= ProviderToolResultRecoveryStore.maxEntryBytes
-            ? parsed.map({ ToolResult($0).outcome }) ?? .unknown : .unknown)
-        let recovery = try await ProviderToolResultRecoveryStore.shared.store(
-            content: content,
-            parsed: parsed,
-            toolName: toolName,
-            sessionId: sessionId,
-            turnId: turnId,
-            originalResultClass: originalResultClass,
-            sectionBudget: min(ToolResultSections.pageBudget, limit - 3_000)
-        )
-        let budget = min(ToolResultSections.pageBudget, limit - 3_000)
-        var fields: [String: JSONValue]
-        if let recovery, case .object(let page) = await ProviderToolResultRecoveryStore.shared.page(
-            handle: recovery.handle, page: 0, sessionId: sessionId, turnId: turnId,
-            query: ""
-        ) {
-            fields = page
-            fields["recovery_tool"] = .string(appDoor ? "app result.page" : "tool_result_page")
-            if appDoor, case .string(let detail)? = fields["detail"] {
-                fields["detail"] = .string(ToolNameAliases.foldedProse(detail))
-            }
-            fields["retained_bytes"] = .int(Int64(recovery.bytes))
-        } else {
-            fields = ["sections": .array(ToolResultSections.pages(sections: try ToolResultSections.projection(content: content, value: parsed,
-                budget: budget), query: "", budget: budget)[0]),
-                "detail": .string("""
-                    Only the displayed whole sections are included. The original could not be retained. Inspect an existing saved result; missing \
-                    output does not establish failure.
-                    """)]
-        }
-        fields["provider_projection"] = .string("bounded_tool_result")
-        fields["tool"] = .string(appDoor ? ToolNameAliases.appAction(toolName) ?? toolName : toolName)
-        fields["original_result_class"] = .string(originalResultClass.rawValue)
-        fields["verification_scope"] = .string("tool_response_not_external_outcome")
-        fields["original_characters"] = .int(Int64(content.count))
-        fields["original_bytes"] = .int(Int64(content.utf8.count))
-        fields["full_result_retained"] = .bool(recovery != nil)
-        fields["retention_reason"] = .string(recovery == nil ? "retention_unavailable" : "response_exceeds_inline_limit")
-        // Keep exact live home controls outside paged reading evidence; never reconstruct or replay controls from retained content.
-        if toolName == "app", case .object(var frame)? = parsed {
-            fields["version"] = frame["version"]
-            // Put a home-item send's receipt above the room view so its own outcome remains visible.
-            if case .object(let view)? = frame["view"] { frame.merge(view) { top, _ in top } }
-            let keys: Set<String> = ["status", "workspace", "path", "actions", "windows", "places", "desktop"]
-            let navigation = JSONValue.object(frame.filter { keys.contains($0.key) })
-            var candidate = fields
-            candidate["navigation"] = navigation
-            if let encoded = try? JSONValue.object(candidate).serialize(pretty: false), encoded.utf8.count <= limit {
-                fields = candidate
-            }
-        }
-        return try JSONValue.object(fields).serialize(pretty: false)
-        } catch {
-            return """
-                Tool result projection is unavailable because its values could not be encoded: \(error.localizedDescription). This does not establish \
-                whether the tool's effects occurred. Inspect the saved result and repair its producing owner before repeating an action.
-                """
-        }
     }
 }

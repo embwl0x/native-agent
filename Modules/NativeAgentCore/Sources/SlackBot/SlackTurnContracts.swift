@@ -4,8 +4,8 @@ import NativeAgentCore
 // Blueprint: | `SlackTurnContracts.swift` | `SlackInboundFile` struct |
 
 struct SlackInboundFile: Sendable, Codable, Equatable {
-    let downloadURL: String
-    let mimeType: String
+    let downloadURL: String?
+    let mimeType: String?
     let name: String?
     let byteSize: Int?
 }
@@ -132,14 +132,10 @@ typealias SlackProgressChat = @Sendable (
     _ handler: SlackHandler
 ) async throws -> SlackSocketModeReply
 
-/// One accepted handler's turn and injected receipt-settlement dependency.
-public typealias SlackAfterHandling = @Sendable (@escaping @Sendable () async -> Void) async -> Void
-
+/// One accepted handler's turn.
 public struct SlackHandler: Sendable {
     public let turn: Turn
-    public let deferAfterHandling: SlackAfterHandling?
-    public init(turn: Turn, deferAfterHandling: SlackAfterHandling?) {
+    public init(turn: Turn) {
         self.turn = turn
-        self.deferAfterHandling = deferAfterHandling
     }
 }

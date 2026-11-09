@@ -1,19 +1,11 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import Privacy
-// Blueprint: | `Research+Lab.swift` | `SwiftNativeResearchClient`: authored briefs; native evidence and receipts |
-
-/// Authored content only. Identity, source evidence and publication remain native.
-public struct ResearchLabProposal: Codable, Sendable {
-    public let sources: [ResearchSearchResult]
-    public let brief: String
-}
+// Blueprint: | `Research+Lab.swift` | `SwiftNativeResearchClient`: saved research runs, read whole or refused |
 
 extension SwiftNativeResearchClient {
     // MARK: research lab
 
-    /// Lock-free so the read-modify-write below can hold the file lock.
     public func researchLabRuns() async throws -> [ResearchLabRun] {
         let raw = try await SwiftNativePersistenceCore.readJSON(labRunsPath, ifMissing: .array([]))
         guard case .array(let rows) = raw else {
@@ -34,114 +26,5 @@ extension SwiftNativeResearchClient {
             return a.0 < b.0                      // stable: preserve input order on ties
         }
         return sorted.map { $0.1 }
-    }
-
-    public func runResearchLab(objective rawObjective: String, maxResults rawMax: Int, turn: Turn,
-        compose: @Sendable (JSONValue) async throws -> ResearchLabProposal) async throws -> ResearchLabRun {
-        let objective = rawObjective.trimmingCharacters(in: .whitespacesAndNewlines)
-        if objective.isEmpty {
-            throw ResearchClientError.malformedResponse("Research objective is required")
-        }
-        var results: [ResearchSearchResult] = []
-        var searchError = ""
-        var failure: String?
-        var engines: [String] = []
-        var gaps: [String] = []
-        do {
-            let resp = try await search(query: objective)
-            results = resp.results
-            engines = resp.unresponsiveEngines
-            gaps = resp.gaps
-            if resp.enginesFailed {
-                failure = "engines_failed"
-                searchError = "Search engines returned no sources: " + engines.joined(separator: "; ")
-            }
-        } catch where Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
-            throw CancellationError()
-        } catch {
-            switch error {
-            case ResearchClientError.notConfigured:
-                failure = "not_configured"
-                searchError = "SearXNG base URL is not configured"
-            default:
-                failure = "search_failed"
-                searchError = error.localizedDescription
-            }
-        }
-
-        try Task.checkCancellation()
-        let connector = try Self.checkedSearxngBaseURL(root: receiptsDir.deletingLastPathComponent())?.isEmpty == false
-            ? "searxng" : "none"
-        let proposed = try await compose(.object([
-            "objective": .string(objective), "maxResults": .int(Int64(rawMax)),
-            "search": .object([
-                "availability": .string(failure == nil ? "available" : "unavailable"),
-                "reason": failure.map(JSONValue.string) ?? .null, "error": .string(searchError),
-                "results": .array(results.map { $0.toJSON() }),
-                "unresponsiveEngines": .array(engines.map(JSONValue.string)),
-                "gaps": .array(gaps.map(JSONValue.string)),
-            ]),
-        ]))
-        // A part authors the run, never its source evidence or native identity.
-        guard proposed.sources.allSatisfy({ results.contains($0) }) else {
-            throw ResearchClientError.malformedResponse("Research Lab part selected sources outside this search")
-        }
-        let issues = [searchError].filter { !$0.isEmpty } + gaps
-        let run = ResearchLabRun(
-            id: UUID().uuidString.lowercased(),
-            objective: objective,
-            status: failure == "not_configured" ? "needs_connector" : (failure == nil ? "completed" : "failed"),
-            query: objective,
-            sources: proposed.sources,
-            brief: proposed.brief,
-            createdAt: Self.isoTimestamp(Date()),
-            connector: connector,
-            error: issues.isEmpty ? nil : issues.joined(separator: "; ")
-        )
-        // Once accepted, save the run and its feed/trace settlement even if Stop arrives.
-        let result: Result<ResearchLabRun, Error> = await settle {
-            do { try await self.commitResearchLab(run, turn: turn); return .success(run) }
-            catch { return .failure(error) }
-        }
-        return try result.get()
-    }
-
-    private func commitResearchLab(_ run: ResearchLabRun, turn: Turn) async throws {
-        // Read/insert/cap/write stays one native transaction; no part runs under the lock.
-        let labRunsPath = self.labRunsPath
-        let writeBack: @Sendable () async throws -> Void = {
-            var existing = try await self.researchLabRuns()
-            existing.insert(run, at: 0)
-            let capped = existing.prefix(100).map { $0.toJSON() }
-            try await SwiftNativePersistenceCore.writeJSON(.array(capped), to: labRunsPath)
-        }
-        try await SwiftNativePersistenceCore.withFileLock(labRunsPath, writeBack)
-
-        // In-process runs must publish both activity and trace receipts so both readers stay complete.
-        let activityStatus = run.error == nil ? "ok" : "warn"
-        let detail = Self.pythonCodepointPrefix(NativeAgentSecretRedactor.redactText(run.objective), 120)
-        let activityPayload: JSONValue = .object([
-            "researchRunId": .string(run.id),
-            "sourceCount": .int(Int64(run.sources.count)),
-        ])
-        try await recordActivity(
-            kind: "research",
-            title: "Research lab run",
-            detail: detail,
-            status: activityStatus,
-            payload: activityPayload
-        )
-
-        let tracePayload: JSONValue = .object([
-            "researchRunId": .string(run.id),
-            "status": .string(run.status),
-            "sourceCount": .int(Int64(run.sources.count)),
-        ])
-        try await recordTrace(
-            kind: "research.run",
-            title: detail,
-            payload: tracePayload,
-            turn: turn
-        )
     }
 }

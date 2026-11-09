@@ -14,7 +14,6 @@ import Transcripts
 @MainActor
 public protocol QuietChatTranscriptPort: MacChatSessionStore {
     associatedtype Message: MacChatRetryMessage, ChatTurnFailureMessage, Sendable
-    func messages(for sessionId: String) -> [Message]
     func structureVersion(for sessionId: String) -> UInt64
     func setMessages(_ messages: [Message], for sessionId: String)
     func loadMessages(sessionId: String, cached: Bool) async throws -> [Message]
@@ -34,17 +33,24 @@ public protocol QuietChatSessionCommandPort: MacChatTurnPresentationPort {
     var quietPinnedChatSessionIDs: [String] { get }
     func selectChatSession(_ row: NativeAgentShared.ChatSession) async
     func renameChatSession(id: String, title: String) async
-    func pinChatSessionForDetachedWindow(_ sessionId: String)
-    func unpinQuietChatSession(_ sessionId: String) -> Bool?
+    func pinChatSessionForDetachedWindow(_ sessionId: String) async -> Bool
+    func unpinQuietChatSession(_ sessionId: String) async -> Bool?
     func clearQuietChatMessages(sessionId: String) async -> (succeeded: Bool, agentMessage: String)
     func archiveQuietChat(sessionId: String) async -> (succeeded: Bool, agentMessage: String)
     func exportQuietChat(session: NativeAgentShared.ChatSession?, sessionId: String, messages: [Transcript.Message]) async throws -> ChatExportResult
     func publishChatSnapshot()
-    func quietChatIsDetached(_ sessionId: String) -> Bool
-    func openQuietChatWindow(sessionId: String)
-    func closeQuietChatWindow(sessionId: String)
     func isQuietSyntheticNotice(_ message: Transcript.Message) -> Bool
     func regenerateAssistantMessage(_ message: Transcript.Message, parent: Turn) async
+}
+
+/// Window ownership captured by the presentation that receives the command.
+public struct QuietChatSessionScope: Sendable {
+    public var selectedSessionID: String
+    public var detachedSessionIDs: Set<String>
+    public init(selectedSessionID: String, detachedSessionIDs: Set<String>) {
+        self.selectedSessionID = selectedSessionID
+        self.detachedSessionIDs = detachedSessionIDs
+    }
 }
 
 /// Session intake shares the canonical turn runtime without selecting conversations; a caller cannot interrupt or wait on itself.
@@ -55,25 +61,21 @@ public enum QuietChatSessionCommands {
 
     @MainActor
     public static func run<Host: QuietChatSessionCommandPort>(
-        verb: String, input: [String: JSONValue], reachesUser: Bool, appModel: Host, turn: Turn
+        verb: String, input: [String: JSONValue], reachesUser: Bool, appModel: Host, turn: Turn,
+        scope: QuietChatSessionScope? = nil
     ) async -> JSONValue {
         let session: ChatSessionRef
-        switch fence(verb: verb, input: input, reachesUser: reachesUser, appModel: appModel, turn: turn) {
+        switch fence(verb: verb, input: input, reachesUser: reachesUser, appModel: appModel, turn: turn, scope: scope) {
         case .failure(let refusal): return refusal.json
         case .success(let found?): session = found
         case .success(nil):
             if verb == "new" { return await newChat(title: text(input["title"]), appModel: appModel) }
             if verb == "list" { return await list(input, appModel: appModel) }
-            return stopOthers(calling: text(input["__session_id"]), reachesUser: reachesUser, appModel: appModel)
+            return stopOthers(calling: text(input["__session_id"]), reachesUser: reachesUser, appModel: appModel, scope: scope)
         }
         switch verb {
         case "show":
-            let changed = appModel.activeChatSessionId != session.id
-            await appModel.selectChatSession(session.row)
-            guard appModel.activeChatSessionId == session.id else {
-                return failure("show_failed", "The window did not switch: \(appModel.statusForAgent)", session, effects: "unknown")
-            }
-            return ok(session, changed: changed, "\(session.title) is now the conversation the chat page shows.")
+            return failure("window_presentation_required", "This command needs the window's checked presentation owner.", session)
         case "rename":
             let title = text(input["title"])
             guard !title.isEmpty else { return failure("missing_title", "Pass the new name in title.", session) }
@@ -84,13 +86,15 @@ public enum QuietChatSessionCommands {
             return ok(ChatSessionRef(row: now), changed: session.title != title, "Renamed from \(session.title) to \(title).")
         case "pin":
             let was = appModel.quietPinnedChatSessionIDs.contains(session.id)
-            appModel.pinChatSessionForDetachedWindow(session.id)
+            guard await appModel.pinChatSessionForDetachedWindow(session.id) else {
+                return failure("pin_failed", appModel.statusForAgent, session, effects: "unknown")
+            }
             guard appModel.quietPinnedChatSessionIDs.contains(session.id) else {
                 return failure("pin_failed", "Saving the pinned tab was not verified.", session, effects: "unknown")
             }
             return ok(session, changed: !was, "\(session.title) is pinned as a tab.")
         case "unpin":
-            switch appModel.unpinQuietChatSession(session.id) {
+            switch await appModel.unpinQuietChatSession(session.id) {
             case true?:
                 return ok(session, changed: true, "\(session.title) is no longer a pinned tab.")
             case false?:
@@ -101,7 +105,7 @@ public enum QuietChatSessionCommands {
         case "clear":
             let result = await appModel.clearQuietChatMessages(sessionId: session.id)
             guard result.succeeded else { return failure("clear_failed", result.agentMessage, session, effects: "unknown") }
-            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "chat.clear \(session.id)",
+            BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "chat.clear \(session.id)",
                                    sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             return ok(session, changed: true, "Every message in \(session.title) is gone for good.")
@@ -136,17 +140,8 @@ public enum QuietChatSessionCommands {
                     instruction: "Read this conversation and resolve the export error before exporting another copy.",
                     next: ["page": .string("chat"), "item": .string(session.id)], effects: .unknown)
             }
-        case "detach":
-            appModel.openQuietChatWindow(sessionId: session.id)
-            guard appModel.quietChatIsDetached(session.id) else {
-                return failure("detach_failed", "Its window did not open; the conversation list may still be loading. Try again in a moment.", session,
-                    effects: "unknown")
-            }
-            return ok(session, changed: true, "\(session.title) is open in its own window.")
-        case "close_window":
-            let was = appModel.quietChatIsDetached(session.id)
-            appModel.closeQuietChatWindow(sessionId: session.id)
-            return ok(session, changed: was, was ? "Closed the window of \(session.title)." : "\(session.title) had no window of its own.")
+        case "detach", "close_window":
+            return failure("window_presentation_required", "This command needs the window's checked presentation owner.", session)
         default:
             return AppToolExecutor.failure("unknown_verb", "No chat_session verb is called that.")
         }
@@ -155,13 +150,14 @@ public enum QuietChatSessionCommands {
     /// Preview and execution use the same effect-free owner/session fences.
     @MainActor
     public static func fence<Host: QuietChatSessionCommandPort>(
-        verb: String, input: [String: JSONValue], reachesUser: Bool, appModel: Host, turn: Turn
+        verb: String, input: [String: JSONValue], reachesUser: Bool, appModel: Host, turn: Turn,
+        scope: QuietChatSessionScope? = nil
     ) -> Result<ChatSessionRef?, Refusal> {
         if ["new", "list"].contains(verb) || (verb == "stop" && text(input["session_id"]).lowercased() == "others") {
             return .success(nil)
         }
         let session: ChatSessionRef
-        switch resolve(text(input["session_id"]), appModel: appModel, turn: turn) {
+        switch resolve(text(input["session_id"]), appModel: appModel, turn: turn, scope: scope) {
         case .success(let found): session = found
         case .failure(let refusal): return .failure(refusal)
         }
@@ -173,13 +169,19 @@ public enum QuietChatSessionCommands {
                 session
             )))
         }
-        if !reachesUser, ["stop", "archive", "regenerate", "clear"].contains(verb), userIsIn(session.id, appModel) {
+        if !reachesUser, ["stop", "archive", "regenerate", "clear"].contains(verb) {
+            guard let scope else {
+                return .failure(Refusal(json: failure("window_scope_unavailable",
+                    "The person's visible conversations have not been read. Nothing was interrupted.", session)))
+            }
+            if userIsIn(session.id, scope: scope) {
             return .failure(Refusal(json: failure(
                 "owner_is_in_it",
                 "The person is in \(session.title) (on screen or in its own window), and they did not start this turn. "
                 + "Ask them first, or leave it to them.",
                 session
             )))
+            }
         }
         guard session.id == text(input["__session_id"]) else { return .success(session) }
         if ["stop", "archive", "regenerate", "clear"].contains(verb) {
@@ -245,14 +247,19 @@ public enum QuietChatSessionCommands {
     }
 
     @MainActor
-    public static func userIsIn<Host: QuietChatSessionCommandPort>(_ sessionId: String, _ appModel: Host) -> Bool {
-        sessionId == appModel.activeChatSessionId || appModel.quietChatIsDetached(sessionId)
+    public static func userIsIn(_ sessionId: String, scope: QuietChatSessionScope) -> Bool {
+        sessionId == scope.selectedSessionID || scope.detachedSessionIDs.contains(sessionId)
     }
 
     @MainActor
-    private static func stopOthers<Host: QuietChatSessionCommandPort>(calling: String, reachesUser: Bool, appModel: Host) -> JSONValue {
+    private static func stopOthers<Host: QuietChatSessionCommandPort>(
+        calling: String, reachesUser: Bool, appModel: Host, scope: QuietChatSessionScope?
+    ) -> JSONValue {
+        guard let scope else {
+            return AppToolExecutor.failure("window_scope_unavailable", "The person's visible conversations have not been read. Nothing was stopped.")
+        }
         let others = appModel.otherRunningChatSessionIDs.filter {
-            $0 != calling && (reachesUser || !appModel.quietChatIsDetached($0))
+            $0 != calling && $0 != scope.selectedSessionID && (reachesUser || !scope.detachedSessionIDs.contains($0))
         }
         for id in others { appModel.stopChatStream(sessionId: id) }
         return .object([
@@ -272,12 +279,9 @@ public enum QuietChatSessionCommands {
         if isRunning(session.id, appModel) {
             return failure("still_running", "\(session.title) is still replying. Stop it first (verb stop), or wait.", session)
         }
-        var messages = appModel.chatCommandTranscripts.messages(for: session.id)
-        if messages.isEmpty,
-           let loaded = try? await appModel.chatCommandTranscripts.loadMessages(sessionId: session.id, cached: true) {
-            appModel.chatCommandTranscripts.setMessages(loaded, for: session.id)
-            messages = loaded
-        }
+        let messages: [Host.Transcript.Message]
+        do { messages = try await appModel.chatCommandTranscripts.loadMessages(sessionId: session.id, cached: true) }
+        catch { return failure("transcript_unavailable", error.localizedDescription, session) }
         guard let last = messages.last(where: { $0.role == "assistant" }) else {
             return failure("nothing_to_regenerate", "\(session.title) has no reply to regenerate yet.", session)
         }
@@ -325,10 +329,13 @@ public enum QuietChatSessionCommands {
 
     /// This chat resolves to the originating bridge/phone/Telegram conversation; only an absent origin uses the visible conversation.
     @MainActor
-    public static func resolve<Host: QuietChatSessionCommandPort>(_ raw: String, appModel: Host, turn: Turn?) -> Result<ChatSessionRef, Refusal> {
+    public static func resolve<Host: QuietChatSessionCommandPort>(
+        _ raw: String, appModel: Host, turn: Turn?, scope: QuietChatSessionScope? = nil
+    ) -> Result<ChatSessionRef, Refusal> {
         let sessions = appModel.chatCommandTranscripts.sessions
         let asking = turn?.verifiedSessionID.flatMap { id in sessions.contains { $0.id == id } ? id : nil }
-        let wanted = raw.isEmpty ? (asking ?? appModel.activeChatSessionId) : raw
+        let selected = scope.map(\.selectedSessionID) ?? appModel.activeChatSessionId
+        let wanted = raw.isEmpty ? (asking ?? selected) : raw
         guard !wanted.isEmpty else {
             return .failure(Refusal(json: AppToolExecutor.failure(
                 "no_conversation", "No conversation is on screen. Pass session_id; chat.list lists them."

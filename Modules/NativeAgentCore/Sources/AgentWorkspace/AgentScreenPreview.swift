@@ -19,7 +19,7 @@ package enum AgentWorkspaceScreenPreview {
     }
 
     public static let watchedPaths = [
-        "agents/peers.json", "agents/conversations.json", "agents/grok-requests", "agents/resident-wake.json", "chat/sessions.json",
+        "agents/peers.json", "agents/conversations.json", "agents/grok-requests", "chat/sessions.json",
         "desk/desk_ops.jsonl", "desk/desk_ops_base.json", "bots/definitions",
         "bots/shelf-index.json", "bots/run-queue.json", "workflows/approvals/requests.json",
         "memory/memory.sqlite", "memory/memory.sqlite-wal", "memory/profile.json", "agents/jobs.json",

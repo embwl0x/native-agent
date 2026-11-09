@@ -2,6 +2,8 @@ import Foundation
 import Darwin
 import NativeAgentShared
 import AppKit
+import CoreGraphics
+import ImageIO
 import ChromeControl
 import Browser
 import Dispatcher
@@ -17,202 +19,40 @@ import PersistenceCore
 import Privacy
 import ToolRegistry
 import Senses
-import SQLite3
 import TrustCenter
-// Blueprint: | `AppToolExecutor+Browser.swift` | `AppToolExecutor`: `runBrowserTool`, `freshChromePage`, `chromeFollowUpCheck`, `runChromeHistory`; follow-ups stop on Trust receipt failure; Chrome internal reads return one text line with read_mode none; chrome.look and DOM-inaccessible Chrome/PDF snapshot reads deliver the owned tab's bounded picture through the shared file-reader image slot, with source dimensions, explicit picture mode, independent debugger cleanup errors and raw Chrome provenance; PDF text remains unread with no independent fetch; action readback preserves non-DOM receipts; history reads only a stable private copy of the admitted Default profile History/WAL/journal under Full Mac/file-read authority, independent of extension connection; SQLite opens only the copy read-only, aggregates all qualifying visits before limiting domains, and bounds returned rows and query work; `RetainedBrowserRead` keeps the visible read's full capture and receipt beside its rejected view; scroll readback carries the tab-bound viewport observation, with no timed delta retries |
+// Blueprint: | `AppToolExecutor+Browser.swift` | `AppToolExecutor`: `runBrowserTool`, `freshChromePage`, `chromeFollowUpCheck`; one transient Screen preview after a Chrome door call, masking returned pictures locally from capture-relative geometry or showing the background read's served text without recapture; follow-ups stop on Trust receipt failure; Chrome internal reads return one text line with read_mode none; chrome.look and DOM-inaccessible Chrome/PDF snapshot reads deliver the owned tab's bounded picture through the shared file-reader image slot, with source dimensions, explicit picture mode, independent debugger cleanup errors and raw Chrome provenance; PDF text remains unread with no independent fetch; action readback preserves non-DOM receipts; `RetainedBrowserRead` keeps the visible read's full capture and receipt beside its rejected view; scroll readback carries the tab-bound viewport observation, with no timed delta retries |
 
 /// Browser acts reread the same tab and clear the same Trust gate as direct calls.
 extension AppToolExecutor {
-    @MainActor
-    func runChromeHistory(input: [String: JSONValue], surface: String, turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
-        let mode = input["mode"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "recent"
-        guard ["top_domains", "search", "recent"].contains(mode) else {
-            return Self.failure("invalid_mode", "mode must be top_domains, search or recent (recent when omitted).")
-        }
-        let query = input["query"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if mode == "search", query.isEmpty { return Self.failure("missing_query", "search requires nonempty query text to match titles or URLs.") }
-        var since: Date?
-        if let value = input["since"] {
-            guard case .string(let text) = value, let date = NativeTimestampFormat.parseISO8601FractionalFirst(text) else {
-                return Self.failure("invalid_since", "since must be an ISO 8601 timestamp with a timezone.")
-            }
-            since = date
-        }
-        if mode == "top_domains", since == nil { return Self.failure("missing_since",
-            "top_domains requires since, the inclusive start of the visit-count period.") }
-        let limit: Int64
-        switch input["limit"] {
-        case nil: limit = 15
-        case .int(let value)? where value > 0: limit = min(value, 50)
-        default: return Self.failure("invalid_limit", "limit must be a positive integer; default 15, maximum 50.")
-        }
-        let source = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Google/Chrome/Default/History")
-        let origin = AppChatToolDispatcher.securityOrigin(turn: turn, surface: surface)
-        let envelope = await securityCenter.evaluateTool(tool: "read_file", input: ["path": .string(source.path)],
-            origin: origin, enforceAutonomy: enforceAutonomySecurity, turn: turn)
-        try await securityCenter.record(envelope)
-        let admission = await securityCenter.fullMacYoloAuthority(origin: origin, turn: turn)
-        guard admission.admitted, envelope.fullMacYoloAuthority == .admitted,
-              envelope.decision != .block, !envelope.requiresApproval else {
-            return Self.failure("history_read_denied", """
-                Chrome history requires admitted Full Mac and file-read permission. Check Trust and file access at the Mac; no history was read and no card \
-                was raised.
-                """)
-        }
-        // Read exactly the profile admitted above, regardless of which profile owns an extension connection. The live database stays Chrome's.
-        guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.Chrome") != nil else {
-            return .object(["status": .string("absent"), "detail": .string("Google Chrome is not installed on this Mac."),
-                "source": .string("sqlite_snapshot")])
-        }
-        let start = since.map { ($0.timeIntervalSince1970 + 11_644_473_600) * 1_000_000 } ?? 0
-        return try await Task.detached(priority: .utility) {
-            func checked(_ url: URL) throws -> URL {
-                let resolved = url.resolvingSymlinksInPath()
-                if let reason = MacControlSensitivePathFence.reason(forPath: url.path)
-                    ?? MacControlSensitivePathFence.reason(forPath: resolved.path) {
-                    throw MacControlError.sensitivePathDenied(reason)
-                }
-                let values = try resolved.resourceValues(forKeys: [.isRegularFileKey])
-                guard values.isRegularFile == true else { throw MacControlError.ioFailure("Chrome History must be a regular file.") }
-                return resolved
-            }
-            // Attribute reads distinguish absence from a permission failure.
-            let history: URL
-            do { history = try checked(source) }
-            catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
-                return .object(["status": .string("absent"), "detail": .string("Chrome's Default profile History is absent on this Mac."),
-                    "source": .string("sqlite_snapshot")])
-            }
-            // One optimistic capture of the whole SQLite file set. Any write, replacement or sidecar arrival/removal during the copy refuses the capture; never
-            // query a torn copy or retry another source.
-            func identity(_ url: URL) throws -> [Int64]? {
-                var info = stat()
-                guard lstat(url.path, &info) == 0 else {
-                    let code = errno
-                    if code == ENOENT { return nil }
-                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
-                }
-                _ = try checked(url)
-                guard info.st_mode & S_IFMT == S_IFREG else {
-                    throw MacControlError.ioFailure("Chrome history snapshot members must be regular files, not links.")
-                }
-                return [Int64(info.st_dev), Int64(bitPattern: info.st_ino), info.st_size,
-                    Int64(info.st_mtimespec.tv_sec), Int64(info.st_mtimespec.tv_nsec),
-                    Int64(info.st_ctimespec.tv_sec), Int64(info.st_ctimespec.tv_nsec)]
-            }
-            let members = [history, URL(fileURLWithPath: history.path + "-wal"), URL(fileURLWithPath: history.path + "-journal")]
-            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("chrome-history-" + UUID().uuidString, isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
-                attributes: [.posixPermissions: 0o700])
-            func readSnapshot(_ copy: URL) throws -> JSONValue {
-                var db: OpaquePointer?
-                let opened = sqlite3_open_v2(copy.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil)
-                defer { sqlite3_close(db) }
-                func failure(_ code: Int32) -> Error {
-                    MacControlError.ioFailure(code == SQLITE_INTERRUPT
-                        ? "Chrome history query exceeded its 2-second deadline; narrow since or query."
-                        : "Chrome history could not be read: " + (db.map { String(cString: sqlite3_errmsg($0)) } ?? "SQLite open failed"))
-                }
-                guard opened == SQLITE_OK else { throw failure(opened) }
-                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-                let domainFunction = sqlite3_create_function_v2(db, "history_domain", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, values in
-                    guard let text = sqlite3_value_text(values?[0]), let url = URL(string: String(cString: text)),
-                          ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let host = url.host?.lowercased() else {
-                        sqlite3_result_null(context); return
-                    }
-                    sqlite3_result_text(context, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-                }, nil, nil, nil)
-                guard domainFunction == SQLITE_OK else { throw failure(domainFunction) }
-                let matchFunction = sqlite3_create_function_v2(db, "history_matches", 3, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, values in
-                    func text(_ index: Int) -> String { sqlite3_value_text(values?[index]).map { String(cString: $0) } ?? "" }
-                    let query = text(2)
-                    sqlite3_result_int(context, text(0).range(of: query, options: .caseInsensitive) != nil
-                        || text(1).range(of: query, options: .caseInsensitive) != nil ? 1 : 0)
-                }, nil, nil, nil)
-                guard matchFunction == SQLITE_OK else { throw failure(matchFunction) }
-                let sql = mode == "top_domains"
-                    ? """
-                        SELECT history_domain(u.url) AS domain, count(*), max(v.visit_time) FROM visits v JOIN urls u ON u.id = v.url WHERE v.visit_time >= \
-                        ?1 AND domain IS NOT NULL GROUP BY domain ORDER BY count(*) DESC, max(v.visit_time) DESC, domain LIMIT ?3
-                        """
-                    : "SELECT title, url, last_visit_time, visit_count FROM urls WHERE last_visit_time > 0 AND last_visit_time >= ?1"
-                        + (mode == "search" ? " AND history_matches(title, url, ?2)" : "") + " ORDER BY last_visit_time DESC, id DESC LIMIT ?3"
-                var statement: OpaquePointer?
-                let prepared = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
-                defer { sqlite3_finalize(statement) }
-                guard prepared == SQLITE_OK else { throw failure(prepared) }
-                sqlite3_bind_double(statement, 1, start)
-                if mode == "search" { sqlite3_bind_text(statement, 2, query, -1, transient) }
-                sqlite3_bind_int64(statement, 3, limit)
-                let iso = ISO8601DateFormatter()
-                iso.timeZone = .current
-                func date(_ column: Int32) -> JSONValue {
-                    .string(iso.string(from: Date(timeIntervalSince1970: sqlite3_column_double(statement, column) / 1_000_000 - 11_644_473_600)))
-                }
-                func text(_ column: Int32) -> JSONValue {
-                    .string(UntrustedText.neutralized(sqlite3_column_text(statement, column).map { String(cString: $0) } ?? ""))
-                }
-                var deadline = ProcessInfo.processInfo.systemUptime + 2
-                return try withUnsafeMutablePointer(to: &deadline) { deadline in
-                    sqlite3_progress_handler(db, 1000, { context in
-                        guard let context else { return 1 }
-                        return ProcessInfo.processInfo.systemUptime >= context.assumingMemoryBound(to: Double.self).pointee ? 1 : 0
-                    }, deadline)
-                    defer { sqlite3_progress_handler(db, 0, nil, nil) }
-                    var rows: [JSONValue] = []
-                    var step = sqlite3_step(statement)
-                    while step == SQLITE_ROW {
-                        rows.append(mode == "top_domains"
-                            ? .object(["domain": text(0), "visit_count": .int(sqlite3_column_int64(statement, 1)), "last_visit": date(2)])
-                            : .object(["title": text(0), "url": text(1), "last_visit": date(2), "visit_count": .int(sqlite3_column_int64(statement, 3))]))
-                        step = sqlite3_step(statement)
-                    }
-                    guard step == SQLITE_DONE else { throw failure(step) }
-                    return .object(["status": .string("ok"), "mode": .string(mode), "rows": .array(rows),
-                        "count": .int(Int64(rows.count)), "limit": .int(limit), "at_limit": .bool(rows.count == limit),
-                        "source": .string("sqlite_snapshot"),
-                        "coverage": .string("""
-                            Stable private SQLite snapshot of the admitted Chrome Default profile History and its WAL/journal, independent of extension \
-                            connection; excludes incognito and deleted history. Top-domain counts aggregate all qualifying visits since since before limiting \
-                            returned domains; page visit counts are lifetime totals. Times are local ISO 8601; at_limit means more rows may exist.
-                            """)])
-                }
-            }
-            let result = Result<JSONValue, Error> {
-                let before = try members.map(identity)
-                guard before[0] != nil else { throw MacControlError.ioFailure("Chrome History disappeared before snapshot capture.") }
-                for (member, stamp) in zip(members, before) where stamp != nil {
-                    try FileManager.default.copyItem(at: member, to: directory.appendingPathComponent(member.lastPathComponent))
-                }
-                guard try members.map(identity) == before else {
-                    throw MacControlError.ioFailure("""
-                        Chrome history changed during snapshot capture; no history was read. Read again when the profile is quiet.
-                        """)
-                }
-                return try readSnapshot(directory.appendingPathComponent(history.lastPathComponent))
-            }
-            do { try FileManager.default.removeItem(at: directory) }
-            catch {
-                let cause = if case .failure(let failure) = result { " Read also failed: " + failure.localizedDescription } else { "" }
-                throw MacControlError.ioFailure("Chrome history temporary snapshot could not be deleted: \(error.localizedDescription)." + cause)
-            }
-            return try result.get()
-        }.value
-    }
-
     private static let chromePageActions: Set<String> = [
         "browser.chrome_navigate", "browser.chrome_click", "browser.chrome_fill", "browser.chrome_type",
         "browser.chrome_select", "browser.chrome_keypress", "browser.chrome_set_checked",
         "browser.chrome_double_click", "browser.chrome_drag", "browser.chrome_scroll",
     ]
-    /// Wait for navigation-capable acts to settle before readback.
-    private static let chromeMayNavigate: Set<String> = [
-        "browser.chrome_navigate", "browser.chrome_click", "browser.chrome_keypress", "browser.chrome_double_click",
-    ]
 
     public func runBrowserTool(actionId: String, input: [String: JSONValue], surface: String, turn: Turn,
         execution: AppActionExecution) async throws -> JSONValue {
+        // One preview after the whole door call, including form batches and navigation/readback.
+        // Inventory, setup, history and dry runs do not publish. Close publishes its receipt, without capture.
+        let previews = turn.screenPreview != nil && !Self.inputBool(input["dry_run"], default: false)
+            && (Self.chromePageActions.contains(actionId)
+                || ["browser.chrome_snapshot", "browser.chrome_look", "browser.chrome_wait", "browser.chrome_media",
+                    "browser.chrome_close_tab"].contains(actionId))
+        let preview = previews ? ChromeScreenPreviewCall() : nil
+        do {
+            let result = try await runBrowserToolCall(actionId: actionId, input: input, surface: surface, turn: turn,
+                execution: execution, preview: preview)
+            preview?.didReturn(result)
+            if let preview { await publishChromeScreenPreview(preview, actionId: actionId, surface: surface, turn: turn, execution: execution) }
+            return result
+        } catch {
+            if let preview { await publishChromeScreenPreview(preview, actionId: actionId, surface: surface, turn: turn, execution: execution) }
+            throw error
+        }
+    }
+
+    private func runBrowserToolCall(actionId: String, input: [String: JSONValue], surface: String, turn: Turn,
+        execution: AppActionExecution, preview: ChromeScreenPreviewCall?) async throws -> JSONValue {
         let dryRun = Self.inputBool(input["dry_run"], default: false)
         let fields: ChromeFields?
         if ["browser.chrome_fill", "browser.chrome_navigate"].contains(actionId) { fields = try Self.chromeFields(input) }
@@ -226,9 +66,17 @@ extension AppToolExecutor {
             { @Sendable capture in retained.remember(capture) }
         }
         let invocation = readExecution
-        let browserTurn = turn.with(\.chromeOrigin, origin)
+        var previewTurn = turn.with(\.chromeOrigin, origin)
+        if let preview {
+            // Keep the pane's own masked copy until the complete door call settles.
+            previewTurn.screenPreview = { update in preview.rememberPicture(update) }
+        }
+        let browserTurn = previewTurn
         func run(_ id: String, _ input: [String: JSONValue]) async throws -> JSONValue {
-            try await browserActionRunner(id, dryRun, input, browserTurn, invocation)
+            preview?.willRun(input)
+            let result = try await browserActionRunner(id, dryRun, input, browserTurn, invocation)
+            preview?.didRun(result)
+            return result
         }
         // Direct calls include the fresh page; workspace calls keep structured results.
         let direct = !dryRun && execution.lookSource != "workspace"
@@ -249,12 +97,6 @@ extension AppToolExecutor {
             } else {
                 let saved = try SenseNativePages.chromeContinuationArguments(more, scope: scope, tab: Self.chromeTabID(input["tab_id"]))
                 input.merge(saved) { _, stored in stored }
-            }
-        }
-        if direct, actionId == "browser.chrome_snapshot", input["max_nodes"] == nil || input["max_nodes"] == .null {
-            if await chrome().conversationSnapshotView(turn.verifiedSessionID,
-                tabID: Self.chromeTabID(input["tab_id"])) == nil {
-                input["max_nodes"] = .int(150)
             }
         }
         // Resolve labels, missing snapshot ids and field options only from this tab's last served page.
@@ -283,9 +125,11 @@ extension AppToolExecutor {
            case .int(let tab)? = receipt["tabId"] {
             let fresh = await freshChromePage(after: actionId, tab: tab,
                 sequence: receipt["userSequence"], input: input, surface: surface,
-                navigationVerified: actionId == "browser.chrome_navigate"
-                    && receipt["outcome"] == .string("succeeded") && receipt["verification"] == .string("verified"),
+                navigationDocument: actionId == "browser.chrome_navigate" ? obj["documentId"] : nil,
+                navigationURL: actionId == "browser.chrome_navigate" ? obj["url"] : nil,
+                navigationTimingOrigin: actionId == "browser.chrome_navigate" ? receipt["timings"]?.objectValue?["startedAtMs"] : nil,
                 scrollCursor: actionId == "browser.chrome_scroll" ? obj["readCursor"] : nil, turn: turn, run: run)
+            obj = Self.chromeNavigationReadTiming(obj, snapshot: fresh.snapshot)
             var page = fresh.text
             if actionId == "browser.chrome_scroll", let before {
                 // Text already read is not proof that the viewport stayed the same. The page compares the exact scrolled viewport during this read, including
@@ -342,34 +186,106 @@ extension AppToolExecutor {
         return .object(obj)
     }
 
+    /// The preview reply stays here: no file, receipt, sense, image sink or tool result receives its bytes.
+    private func publishChromeScreenPreview(_ call: ChromeScreenPreviewCall, actionId: String, surface: String,
+        turn: Turn, execution: AppActionExecution) async {
+        guard call.attempted, let publish = turn.screenPreview else { return }
+        if actionId == "browser.chrome_close_tab" {
+            let result = call.result?.objectValue
+            let caption = MacScreenPreviewCaption.browser(activity: result?["tabClosed"] == .bool(true) ? "Closed" : "Close not confirmed for",
+                title: result?["title"]?.scalarText, url: result?["url"]?.scalarText)
+            await publish(MacScreenPreviewUpdate(image: nil, caption: caption, at: Date(), replacesImage: true))
+            return
+        }
+        if let picture = call.picture {
+            await publish(picture)
+            return
+        }
+        let activity: String
+        switch actionId {
+        case "browser.chrome_navigate": activity = "Navigation"
+        case "browser.chrome_snapshot": activity = "Reading"
+        case "browser.chrome_look": activity = "Looking"
+        case "browser.chrome_wait": activity = "Waiting"
+        case "browser.chrome_fill", "browser.chrome_type": activity = "Editing"
+        case "browser.chrome_select": activity = "Selecting"
+        case "browser.chrome_keypress": activity = "Keyboard action"
+        case "browser.chrome_set_checked": activity = "Checkbox action"
+        case "browser.chrome_double_click": activity = "Double click"
+        case "browser.chrome_drag": activity = "Drag"
+        case "browser.chrome_scroll": activity = "Scrolling"
+        case "browser.chrome_media": activity = "Media action"
+        default: activity = "Click"
+        }
+        var image: CGImage?
+        var readText = call.readText
+        let read = call.result?.objectValue
+        var caption = MacScreenPreviewCaption.browser(activity: activity, title: read?["title"]?.scalarText, url: read?["url"]?.scalarText)
+        do {
+            guard let tab = call.tabID else { throw ChromeControlRuntimeError.conversationContext("No worked tab was identified.") }
+            let reply = try await chrome().performInConversation(.preview,
+                payload: ["tabId": .int(tab), "maxWidth": .int(Int64(MacScreenPreviewFrame.maxWidth)), "hasReadText": .bool(readText != nil)],
+                verifiedSessionID: turn.verifiedSessionID,
+                turn: turn.with(\.chromeOrigin, AppChatToolDispatcher.securityOrigin(turn: turn, surface: surface)),
+                context: execution.macOperation(dataRoot: securityCenter.dataRoot))
+            guard case .object(let envelope) = reply, case .object(let frame)? = envelope["result"],
+                  frame["tabId"] == .int(tab), let state = frame["state"]?.scalarText else {
+                throw ChromeControlRuntimeError.invalidResponse
+            }
+            if state == "unavailable" { readText = nil }
+            // The shared caption redactor handles titles; typed values and URL query strings never enter this line.
+            if state == "frame" || readText == nil {
+                caption = MacScreenPreviewCaption.browser(activity: activity, title: frame["title"]?.scalarText, url: frame["url"]?.scalarText)
+            }
+            if state == "frame" {
+                guard frame["format"] == .string("jpeg"), let encoded = frame["data"]?.scalarText,
+                      encoded.utf8.count <= 900_000, let data = Data(base64Encoded: encoded),
+                      let source = CGImageSourceCreateWithData(data as CFData, nil),
+                      let decoded = CGImageSourceCreateImageAtIndex(source, 0, nil),
+                      decoded.width <= MacScreenPreviewFrame.maxWidth,
+                      let resized = MacScreenPreviewFrame.previewImage(from: decoded) else {
+                    throw ChromeControlRuntimeError.invalidResponse
+                }
+                image = resized
+            } else {
+                guard state == "background" || state == "unavailable", let reason = frame["reason"]?.scalarText, !reason.isEmpty else {
+                    throw ChromeControlRuntimeError.invalidResponse
+                }
+                caption += " — " + reason
+            }
+        } catch {
+            caption += " — " + MacScreenPreviewCaption.unavailable(error.localizedDescription)
+        }
+        await publish(MacScreenPreviewUpdate(image: image, caption: caption, at: Date(), replacesImage: true, readText: readText))
+    }
+
+    static func chromeNavigationReadTiming(_ result: [String: JSONValue], snapshot: JSONValue?) -> [String: JSONValue] {
+        guard case .object(var receipt)? = result["receipt"], case .object(var timings)? = receipt["timings"],
+              let returned = snapshot?.objectValue?["navigationReadReturnedMs"], returned != .null else { return result }
+        timings["readReturnedMs"] = returned
+        receipt["timings"] = .object(timings)
+        var result = result
+        result["receipt"] = .object(receipt)
+        return result
+    }
+
     /// Readback stays on the same tab as the act.
     func freshChromePage(
         after actionId: String, tab: Int64, sequence: JSONValue?, input: [String: JSONValue], surface: String,
-        navigationVerified: Bool = false,
+        navigationDocument: JSONValue? = nil, navigationURL: JSONValue? = nil, navigationTimingOrigin: JSONValue? = nil,
         scrollCursor: JSONValue? = nil, turn: Turn,
         run: (String, [String: JSONValue]) async throws -> JSONValue
     ) async -> (snapshot: JSONValue?, text: String, projection: ChromePageText.VisiblePageText?) {
         let followUp = await chromeFollowUpCheck("browser.chrome_snapshot", surface: surface, turn: turn)
         if let stop = followUp.stop { return (nil, "No page attached: " + stop, nil) }
-        if !navigationVerified, Self.chromeMayNavigate.contains(actionId) {
-            let waitAdmission = await chromeFollowUpCheck("browser.chrome_wait", surface: surface, turn: turn)
-            if let stop = waitAdmission.stop { return (nil, "No page attached: " + stop, nil) }
-            // Verified navigation already observed completion. Other acts can start a load after their reply, so retain that observation. Twice at most: a
-            // quiet window can close before a slow load starts. The read itself waits for the load and says when it had not finished.
-            for _ in 0..<2 {
-                let waited: JSONValue
-                do { waited = try await run("browser.chrome_wait", [
-                    "tab_id": .int(tab), "expected_user_sequence": sequence ?? .null,
-                    "condition": .string("navigation_settled"), "settle_ms": .int(400), "timeout_ms": .int(8_000),
-                ]) } catch { return (nil, "The action already returned, but navigation observation failed: " + error.localizedDescription
-                    + ". Read this tab before continuing; do not repeat the action.", nil) }
-                guard case .object(let wait) = waited, wait["outcome"] == .string("not_settled") else { break }
-            }
-        }
         do {
             let scope = input["scope"]?.scalarText
-            var read: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(150),
+            var read: [String: JSONValue] = ["tab_id": .int(tab), "expected_user_sequence": sequence ?? .null,
                 "scope": .string(scope == "page" ? "page" : "main_content")]
+            for key in ["max_nodes", "max_text_chars", "find"] where input[key] != nil { read[key] = input[key] }
+            read["__chrome_document_id"] = navigationDocument
+            read["__chrome_page_url"] = navigationURL
+            read["__chrome_navigation_started_at_ms"] = navigationTimingOrigin
             if actionId == "browser.chrome_scroll" {
                 guard let scrollCursor, case .object(let cursor) = scrollCursor,
                       case .string? = cursor["viewportObservationId"] else {
@@ -387,7 +303,8 @@ extension AppToolExecutor {
             }
             mirrorChromePage(snapshot, projection: projection, turn: turn)
             guard let page = projection.text else {
-                return (snapshot, "The fresh page could not be read. Call browser.chrome_snapshot.", projection)
+                let cause = ChatToolOutcome.explanation(snapshot).map { " (" + ChromePageText.safe($0) + ")" } ?? ""
+                return (nil, "The fresh page could not be read" + cause + ". Call browser.chrome_snapshot.", projection)
             }
             return (snapshot, page, projection)
         } catch {
@@ -418,7 +335,8 @@ extension AppToolExecutor {
             if case .object(let original) = raw, original["nodes"] != nil, case .object(let fields) = receipt {
                 servedRaw = .object(original.merging(fields) { _, new in new })
             } else { servedRaw = receipt }
-            if case .object(let receiptFields) = receipt, receiptFields["ok"] == .bool(false) {
+            if case .object(let receiptFields) = receipt,
+               receiptFields["ok"] == .bool(false) || ["read_window_empty", "find_not_observed"].contains(receiptFields["reason"]?.stringValue ?? "") {
                 return SenseDoor.signedRaw(servedRaw, line: "raw view · builtin-chrome · no readable content in this window")
             }
         }
@@ -514,7 +432,6 @@ extension AppToolExecutor {
         dryRun: Bool,
         input: [String: JSONValue],
         chrome: @Sendable () -> ChromeControlRuntime,
-        macPersonAway: @Sendable () -> Bool,
         motorActionObserver: @Sendable (MotorActionReadModel) async -> Void,
         platform: BrowserToolPlatformPort, dataRoot: URL, turn: Turn, execution: AppActionExecution
     ) async throws -> JSONValue {
@@ -552,7 +469,7 @@ extension AppToolExecutor {
             guard !dryRun else {
                 return .object(["status": .string("dry_run"), "action": .string(actionId)])
             }
-            return try await runChromeControlTool(actionId: actionId, input: input, chrome: chrome, macPersonAway: macPersonAway,
+            return try await runChromeControlTool(actionId: actionId, input: input, chrome: chrome,
                 motorActionObserver: motorActionObserver, turn: turn, context: context, execution: execution)
         }
         if actionId == "browser.status" {
@@ -584,7 +501,6 @@ extension AppToolExecutor {
         actionId: String,
         input: [String: JSONValue],
         chrome: @Sendable () -> ChromeControlRuntime,
-        macPersonAway: @Sendable () -> Bool,
         motorActionObserver: @Sendable (MotorActionReadModel) async -> Void, turn: Turn, context: MacOperationContext, execution: AppActionExecution
     ) async throws -> JSONValue {
         if actionId == "browser.chrome_select" {
@@ -598,9 +514,9 @@ extension AppToolExecutor {
         }
         let explicitClose = actionId == "browser.chrome_close_tab"
         let effect: ChromeControlEffect
-        let payload: [String: JSONValue]
+        var payload: [String: JSONValue]
         do {
-            (effect, payload) = try chromeControlRequest(actionId: actionId, input: input, macPersonAway: macPersonAway)
+            (effect, payload) = try chromeControlRequest(actionId: actionId, input: input)
         } catch {
             guard explicitClose, case .object(var failure) = ChatToolOutcome.failure(error: error, tool: actionId) else { throw error }
             failure["effects"] = .string("none")
@@ -608,17 +524,20 @@ extension AppToolExecutor {
             return .object(failure)
         }
         do {
+            if turn.screenPreview != nil, effect == .look || effect == .snapshot {
+                payload["screenPreviewMaxWidth"] = .int(Int64(MacScreenPreviewFrame.maxWidth))
+            }
             let response = try await chrome().performInConversation(
                 effect, payload: payload, verifiedSessionID: turn.verifiedSessionID, turn: turn, context: context)
             guard case .object(let object) = response,
                   let result = object["result"] else { throw ChromeControlRuntimeError.invalidResponse }
             if effect == .look {
-                return try chromeReadResult(result, actionId: actionId, imageSink: execution.localImageSink, turn: turn)
+                return try await chromeReadResult(result, actionId: actionId, imageSink: execution.localImageSink, turn: turn)
             }
             if effect == .snapshot, case .object(let capture) = result {
                 let mode: JSONValue? = if case .object(let reading)? = capture["reading"] { reading["mode"] } else { nil }
                 if capture["format"] == .string("jpeg") || mode == .string("none") {
-                    return try chromeReadResult(result, actionId: actionId, imageSink: execution.localImageSink, turn: turn)
+                    return try await chromeReadResult(result, actionId: actionId, imageSink: execution.localImageSink, turn: turn)
                 }
             }
             // Admit the extension's actual action receipt as a motor consequence.
@@ -649,7 +568,7 @@ extension AppToolExecutor {
         }
     }
 
-    private static func chromeReadResult(_ result: JSONValue, actionId: String, imageSink: LocalToolImage.Sink?, turn: Turn) throws -> JSONValue {
+    private static func chromeReadResult(_ result: JSONValue, actionId: String, imageSink: LocalToolImage.Sink?, turn: Turn) async throws -> JSONValue {
         if case .object(let capture) = result, case .object(let reading)? = capture["reading"], reading["mode"] == .string("none") {
             guard case .int(let tab)? = capture["tabId"], tab >= 0, reading["domAccessible"] == .bool(false),
                   case .string(let reason)? = reading["reason"], case .string(let url)? = capture["url"],
@@ -657,6 +576,8 @@ extension AppToolExecutor {
             let line = [title, url, reason].filter { !$0.isEmpty }.map(ChromePageText.safe).joined(separator: " — ")
             return SenseDoor.signedRaw(.object(["ok": .bool(true), "status": .string("completed"),
                 "tool": .string(actionId), "read_mode": .string("none"), "reading": .object(reading),
+                "rendering": capture["rendering"] ?? .null,
+                "navigationReadReturnedMs": capture["navigationReadReturnedMs"] ?? .null,
                 "text": .string(line), "url": .string(url), "title": .string(title), "tab_id": .int(tab),
                 "user_sequence": capture["userSequence"] ?? .null, "effect": .string("read"), "read_only": .bool(true)]),
                 line: "raw view · builtin-chrome · internal page has no reader")
@@ -672,6 +593,8 @@ extension AppToolExecutor {
         fields["tool"] = .string(actionId)
         fields["read_mode"] = .string("picture")
         fields["reading"] = capture["reading"]
+        fields["rendering"] = capture["rendering"]
+        fields["navigationReadReturnedMs"] = capture["navigationReadReturnedMs"]
         fields["cleanupError"] = capture["cleanupError"]
         fields["effect"] = .string("read")
         fields["read_only"] = .bool(true)
@@ -692,14 +615,28 @@ extension AppToolExecutor {
                 Verified capture metadata only; this call has no image slot. To see the pixels, use chrome.look or chrome.snapshot from a turn.
                 """)
         }
+        if let publish = turn.screenPreview {
+            // Only geometry crosses beside the original JPEG. Paint a local copy before resizing or publication.
+            let image: CGImage?
+            if let geometry = capture["geometry"], geometry.objectValue != nil,
+               let source = CGImageSourceCreateWithData(data as CFData, nil),
+               let decoded = CGImageSourceCreateImageAtIndex(source, 0, nil) {
+                image = MacScreenPreviewFrame.previewImage(from: decoded, painting: geometry)
+            } else { image = nil }
+            var caption = MacScreenPreviewCaption.browser(activity: actionId == "browser.chrome_snapshot" ? "Reading" : "Looking",
+                title: capture["title"]?.scalarText, url: capture["url"]?.scalarText)
+            if image == nil { caption += " — preview unavailable: no masked copy of the returned picture" }
+            await publish(MacScreenPreviewUpdate(image: image,
+                caption: caption,
+                at: Date(), replacesImage: true))
+        }
         return SenseDoor.signedRaw(.object(fields), line: "raw view · builtin-chrome · owned tab picture")
     }
 
     /// Empty optional strings mean omission at the provider boundary, not an override of extension routing.
     public static func chromeControlRequest(
         actionId: String,
-        input: [String: JSONValue],
-        macPersonAway: @Sendable () -> Bool
+        input: [String: JSONValue]
     ) throws -> (ChromeControlEffect, [String: JSONValue]) {
         let effect: ChromeControlEffect
         var payload: [String: JSONValue] = [:]
@@ -725,18 +662,23 @@ extension AppToolExecutor {
         case "browser.chrome_navigate":
             effect = .navigate
             payload["url"] = .string(string("url") ?? "")
+            if let newTab = input["new_tab"], newTab != .null { payload["newTab"] = newTab }
         case "browser.chrome_snapshot":
             effect = .snapshot
-            // Explicit limits remain capped. Omitted limits use this tab's last reading view; its first raw read retains the 80 / 12,000 app defaults, and its
-            // first direct read still gets 150 nodes.
-            if let value = integer("max_nodes") { payload["maxNodes"] = .int(Int64(min(value, 200))) }
-            if let value = integer("max_text_chars") { payload["maxTextChars"] = .int(Int64(min(value, 40_000))) }
+            payload["navigationStartedAtMs"] = input["__chrome_navigation_started_at_ms"]
+            if let document = string("__chrome_document_id") { payload["expectedDocumentId"] = .string(document) }
+            if let url = string("__chrome_page_url") { payload["expectedURL"] = .string(url) }
+            // The extension protocol owns bounds/defaults for every read.
+            if let value = integer("max_nodes") { payload["maxNodes"] = .int(Int64(value)) }
+            if let value = integer("max_text_chars") { payload["maxTextChars"] = .int(Int64(value)) }
+            if let value = string("find") { payload["find"] = .string(value) }
             if let value = string("scope") { payload["scope"] = .string(value) }
             if let value = string("more") {
                 guard case .object(let cursor) = try JSONValue.parse(Data(value.utf8)) else {
                     throw SenseFailure(code: "invalid_address", message: "Chrome more must be the supplied page-position continuation.")
                 }
                 payload["readCursor"] = .object(cursor)
+                if payload["tabId"] == nil { payload["tabId"] = cursor["tabId"] }
             }
         case "browser.chrome_look":
             effect = .look
@@ -779,8 +721,6 @@ extension AppToolExecutor {
         case "browser.chrome_scroll":
             effect = .scroll
             payload = [
-                // A background scroll renders only while the person is away.
-                "renderHidden": .bool(macPersonAway()),
                 "deltaX": .int(Int64(integer("delta_x") ?? 0)),
                 "deltaY": .int(Int64(integer("delta_y") ?? 0)),
             ]
@@ -831,8 +771,8 @@ extension AppToolExecutor {
         // Page acknowledgement leaves verification pending until the effect is observed.
         case .string("page_acknowledged"): verification = .pending
         case .string("not_verified"):
-            // A `not_quiet` deadline leaves navigation verification pending, not negatively verified.
-            verification = outcome == "not_quiet" ? .pending : .unverified
+            // An unsettled deadline leaves navigation verification pending, not negatively verified.
+            verification = outcome == "not_settled" ? .pending : .unverified
         default: verification = .unknown
         }
         let expectedNextEvidence: String
@@ -875,4 +815,51 @@ private final class RetainedBrowserRead: @unchecked Sendable {
     private var value: BrowserVisibleCapture?
     var capture: BrowserVisibleCapture? { lock.withLock { value } }
     func remember(_ capture: BrowserVisibleCapture) { lock.withLock { value = capture } }
+}
+
+/// Call-local addressing from actual dispatches, never a second conversation-tab cache.
+private final class ChromeScreenPreviewCall: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started = false
+    private var tab: Int64?
+    private var returnedPicture: MacScreenPreviewUpdate?
+    private var settledResult: JSONValue?
+    private var returnedReadText: String?
+    var attempted: Bool { lock.withLock { started } }
+    var tabID: Int64? { lock.withLock { tab } }
+    var picture: MacScreenPreviewUpdate? { lock.withLock { returnedPicture } }
+    var result: JSONValue? { lock.withLock { settledResult } }
+    var readText: String? { lock.withLock { returnedReadText } }
+
+    /// Use the actual served view (including a site's sense and action readback), never a new DOM read.
+    func didReturn(_ result: JSONValue) {
+        let page = result.objectValue?["page"] ?? result
+        let text: String?
+        if case .string(let value) = page { text = value }
+        else { text = page.objectValue?["sense_page"]?.scalarText ?? page.objectValue?["text"]?.scalarText }
+        let bounded = text.flatMap { MacScreenPreviewReadText.screenful(NativeAppSecretRedactor.redactText($0)) }
+        lock.withLock { returnedReadText = bounded }
+    }
+
+    func rememberPicture(_ update: MacScreenPreviewUpdate) {
+        lock.withLock { returnedPicture = update }
+    }
+
+    func willRun(_ input: [String: JSONValue]) {
+        lock.withLock {
+            started = true
+            returnedPicture = nil
+            settledResult = nil
+            if case .int(let id)? = input["tab_id"] { tab = id }
+        }
+    }
+
+    func didRun(_ result: JSONValue) {
+        lock.withLock { settledResult = result }
+        guard case .object(let fields) = result else { return }
+        let receipt = fields["receipt"]?.objectValue
+        if case .int(let id)? = fields["tabId"] ?? fields["tab_id"] ?? receipt?["tabId"] {
+            lock.withLock { tab = id }
+        }
+    }
 }

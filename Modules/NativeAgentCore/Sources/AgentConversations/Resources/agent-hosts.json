@@ -1,0 +1,576 @@
+[
+  {
+    "id": "omp",
+    "displayName": "OMP",
+    "description": "The local OMP bridge lane.",
+    "aliases": [
+      "oh-my-pi"
+    ],
+    "installMarkers": [],
+    "configPath": "",
+    "format": "sessionMCP",
+    "restartRequired": false,
+    "restartNote": "The running bridge binds this lane to its contact; no restart is needed.",
+    "documentation": "",
+    "requiresWorkspace": false,
+    "settingsSupported": true,
+    "bundleIDs": [],
+    "a2aPorts": [],
+    "searchPaths": [],
+    "executables": [
+      "omp"
+    ]
+  },
+  {
+    "id": "chatgpt-dot",
+    "displayName": "ChatGPT Dot",
+    "description": "Your ChatGPT agent, distinct from Codex. In-house messaging checks the running app and Dot's current conversation before sending.",
+    "aliases": [
+      "dot",
+      "openai dot",
+      "chatgpt agent"
+    ],
+    "installMarkers": [],
+    "configPath": "~/.config/nativeagent-link/contacts/chatgpt-dot.env",
+    "format": "shellEnvironment",
+    "restartRequired": false,
+    "restartNote": "Nothing to restart. Give Dot the local message command.",
+    "documentation": "",
+    "requiresWorkspace": false,
+    "settingsSupported": false,
+    "declaredRoute": "chatgpt-dot-ipc",
+    "bundleIDs": [
+      "com.openai.codex"
+    ],
+    "a2aPorts": [],
+    "searchPaths": [],
+    "discoveryWords": [
+      "dot"
+    ]
+  },
+  {
+    "id": "grok-bot",
+    "displayName": "Grok Bot",
+    "description": "A cloud assistant that answers through its desktop app.",
+    "aliases": [
+      "grok"
+    ],
+    "installMarkers": [],
+    "configPath": "",
+    "format": "sessionMCP",
+    "restartRequired": false,
+    "restartNote": "Grok Bot asks before running the local reply command under its current policy.",
+    "documentation": "https://cursor.com/help/grok-bot/routines",
+    "requiresWorkspace": false,
+    "settingsSupported": false,
+    "declaredRoute": "grok-bot",
+    "bundleIDs": [
+      "com.anysphere.sand"
+    ],
+    "a2aPorts": [],
+    "searchPaths": [],
+    "discoveryWords": [
+      "grok"
+    ]
+  },
+  {
+    "id": "muse",
+    "displayName": "Muse",
+    "description": "Meta's assistant, reached through its Mac app in a chat of its own.",
+    "aliases": [
+      "meta muse",
+      "meta ai"
+    ],
+    "installMarkers": [],
+    "configPath": "",
+    "format": "sessionMCP",
+    "restartRequired": false,
+    "restartNote": "Nothing to restart.",
+    "documentation": "https://muse.meta.com",
+    "requiresWorkspace": false,
+    "settingsSupported": false,
+    "declaredRoute": "desktop-chat",
+    "bundleIDs": [
+      "com.meta.endo"
+    ],
+    "a2aPorts": [],
+    "searchPaths": [],
+    "discoveryWords": [
+      "muse",
+      "endo"
+    ],
+    "desktopChat": {
+      "newChat": "New side chat",
+      "backToMain": "Back to main chat",
+      "chatsButton": "Side chats",
+      "chatsPanel": "Side chats",
+      "log": "Chat messages",
+      "composerCore": "Attach file Dictate a message",
+      "userPrefix": "User message: ",
+      "assistantPrefix": "Assistant message: ",
+      "userLabel": "You:",
+      "assistantMarker": "Copy response",
+      "stop": "Stop",
+      "unreadSuffix": " Unread updates",
+      "actionsSuffix": " More thread actions",
+      "current": "AXARIACurrent",
+      "currentValue": "page",
+      "contentRole": "AXWebArea"
+    }
+  },
+  {
+    "id": "claude-code",
+    "displayName": "Claude Code",
+    "description": "A coding assistant that works in the terminal.",
+    "aliases": [
+      "claude code",
+      "claude-code",
+      "claudecode",
+      "claude cli",
+      "cc"
+    ],
+    "installMarkers": [
+      "~/.local/bin/claude",
+      "/opt/homebrew/bin/claude",
+      "/usr/local/bin/claude",
+      "~/.claude/local/claude"
+    ],
+    "configPath": "~/.claude.json",
+    "format": "jsonMCPServers",
+    "restartRequired": true,
+    "restartNote": "required — it reads this file when a session starts, so a session that is already open keeps its current servers until it is restarted.",
+    "documentation": "https://code.claude.com/docs/en/mcp",
+    "requiresWorkspace": false,
+    "settingsSupported": true,
+    "bundleIDs": [],
+    "a2aPorts": [],
+    "configPaths": [
+      "~/.claude.json"
+    ],
+    "commandLine": {
+      "executable": "claude",
+      "arguments": [
+        "-p",
+        "--output-format",
+        "json",
+        "--name",
+        "{{session_name}}",
+        "--",
+        "{{message}}"
+      ],
+      "continuation": [
+        "-p",
+        "--output-format",
+        "json",
+        "--resume",
+        "{{session}}",
+        "--",
+        "{{message}}"
+      ],
+      "capturesThreadID": true,
+      "jsonResultReply": true,
+      "resultFields": {
+        "reply": "result",
+        "session": "session_id",
+        "status": "subtype",
+        "success": "success",
+        "error": "is_error",
+        "errors": "errors"
+      },
+      "automaticMCPProbe": false,
+      "permissionFlags": "claude",
+      "timeoutSeconds": 300,
+      "documentation": "https://code.claude.com/docs/en/headless",
+      "minimumVersion": "2.1.76"
+    },
+    "searchPaths": [],
+    "executables": [
+      "claude"
+    ],
+    "discoveryWords": [
+      "claude"
+    ],
+    "messagingPermissionsPath": "~/.claude/settings.json",
+    "messagingPermissionSyntax": "doubleUnderscore"
+  },
+  {
+    "id": "codex",
+    "displayName": "Codex",
+    "description": "A coding agent that can work on projects on this Mac.",
+    "aliases": [
+      "codex cli",
+      "codex-cli",
+      "openai codex"
+    ],
+    "installMarkers": [
+      "~/.local/bin/codex",
+      "/opt/homebrew/bin/codex",
+      "/usr/local/bin/codex"
+    ],
+    "configPath": "~/.codex/config.toml",
+    "format": "codexTOML",
+    "restartRequired": true,
+    "restartNote": "required — its documentation says a change to this file is picked up when Codex restarts.",
+    "documentation": "https://learn.chatgpt.com/docs/extend/mcp?surface=cli",
+    "requiresWorkspace": false,
+    "settingsSupported": true,
+    "bundleIDs": [
+      "com.openai.codex"
+    ],
+    "a2aPorts": [],
+    "configPaths": [
+      "~/.codex/config.toml"
+    ],
+    "commandLine": {
+      "executable": "codex",
+      "arguments": [
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-o",
+        "{{reply_file}}",
+        "--",
+        "{{message}}"
+      ],
+      "continuation": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "-o",
+        "{{reply_file}}",
+        "--",
+        "{{session}}",
+        "{{message}}"
+      ],
+      "replyFileName": "reply.txt",
+      "capturesThreadID": true,
+      "jsonResultReply": false,
+      "automaticMCPProbe": true,
+      "stream": "codex",
+      "permissionFlags": "codex",
+      "timeoutSeconds": 300,
+      "documentation": "https://learn.chatgpt.com/docs/non-interactive-mode"
+    },
+    "searchPaths": [],
+    "discoveryWords": [
+      "codex"
+    ]
+  },
+  {
+    "id": "antigravity-cli",
+    "displayName": "Antigravity CLI",
+    "description": "Google's current terminal agent for Gemini with continuing conversations.",
+    "aliases": [
+      "antigravity",
+      "agy",
+      "gemini"
+    ],
+    "installMarkers": [],
+    "configPath": "~/.gemini/config/mcp_config.json",
+    "format": "jsonMCPServers",
+    "restartRequired": false,
+    "restartNote": "Each message starts the CLI with the current connection settings and resumes the requested conversation.",
+    "documentation": "https://www.antigravity.google/docs/mcp",
+    "requiresWorkspace": false,
+    "settingsSupported": true,
+    "bundleIDs": [],
+    "a2aPorts": [],
+    "commandLine": {
+      "executable": "agy",
+      "arguments": [
+        "--mode",
+        "plan",
+        "--sandbox",
+        "--disable-slash-commands",
+        "--output-format",
+        "stream-json",
+        "--print={{message}}"
+      ],
+      "continuation": [
+        "--mode",
+        "plan",
+        "--sandbox",
+        "--disable-slash-commands",
+        "--output-format",
+        "stream-json",
+        "--conversation",
+        "{{session}}",
+        "--print={{message}}"
+      ],
+      "capturesThreadID": true,
+      "jsonResultReply": true,
+      "resultFields": {
+        "reply": "response",
+        "session": "conversation_id",
+        "status": "status",
+        "success": "SUCCESS"
+      },
+      "automaticMCPProbe": false,
+      "stream": "antigravity",
+      "timeoutSeconds": 300,
+      "documentation": "https://www.antigravity.google/docs/cli/headless/"
+    },
+    "searchPaths": [],
+    "discoveryWords": [
+      "antigravity"
+    ],
+    "messagingPermissionsPath": "~/.gemini/antigravity-cli/settings.json",
+    "messagingPermissionSyntax": "mcpCall"
+  },
+  {
+    "id": "claude-desktop",
+    "displayName": "Claude Desktop",
+    "description": "A chat app for talking with Claude.",
+    "aliases": [
+      "claude app"
+    ],
+    "installMarkers": [
+      "/Applications/Claude.app",
+      "~/Applications/Claude.app"
+    ],
+    "configPath": "~/Library/Application Support/Claude/claude_desktop_config.json",
+    "format": "jsonMCPServers",
+    "restartRequired": true,
+    "restartNote": "Quit Claude Desktop completely and reopen it to load the new connection.",
+    "documentation": "https://code.claude.com/docs/en/mcp",
+    "requiresWorkspace": false,
+    "settingsSupported": true,
+    "bundleIDs": [
+      "com.anthropic.claudefordesktop"
+    ],
+    "a2aPorts": [],
+    "configPaths": [
+      "~/Library/Application Support/Claude/claude_desktop_config.json"
+    ],
+    "searchPaths": []
+  },
+  {
+    "id": "lm-studio",
+    "displayName": "LM Studio",
+    "description": "An app for running and chatting with local models.",
+    "aliases": [
+      "lmstudio"
+    ],
+    "installMarkers": [
+      "/Applications/LM Studio.app"
+    ],
+    "configPath": "~/.lmstudio/mcp.json",
+    "format": "jsonMCPServers",
+    "restartRequired": false,
+    "restartNote": "No restart needed; LM Studio loads connections when this file is saved.",
+    "documentation": "https://lmstudio.ai/blog/lmstudio-v0.3.17",
+    "requiresWorkspace": false,
+    "settingsSupported": true,
+    "bundleIDs": [
+      "ai.elementlabs.lmstudio"
+    ],
+    "a2aPorts": [],
+    "searchPaths": [],
+    "discoveryWords": [
+      "lmstudio",
+      "ollama"
+    ]
+  },
+  {
+    "id": "cursor",
+    "displayName": "Cursor",
+    "description": "A code editor with an AI assistant.",
+    "aliases": [
+      "cursor global"
+    ],
+    "installMarkers": [
+      "/Applications/Cursor.app",
+      "~/Applications/Cursor.app"
+    ],
+    "configPath": "~/.cursor/mcp.json",
+    "format": "jsonMCPServers",
+    "restartRequired": true,
+    "restartNote": "Restart Cursor to load the new connection.",
+    "documentation": "https://cursor.com/docs/mcp",
+    "requiresWorkspace": false,
+    "settingsSupported": true,
+    "bundleIDs": [
+      "com.todesktop.230313mzl4w4u92"
+    ],
+    "a2aPorts": [],
+    "configPaths": [
+      "~/.cursor/mcp.json"
+    ],
+    "searchPaths": [],
+    "discoveryWords": [
+      "cursor"
+    ]
+  },
+  {
+    "id": "cursor-workspace",
+    "displayName": "Cursor Workspace",
+    "description": "An AI coding assistant connected to one project folder.",
+    "aliases": [
+      "cursor project"
+    ],
+    "installMarkers": [
+      "/Applications/Cursor.app",
+      "~/Applications/Cursor.app"
+    ],
+    "configPath": ".cursor/mcp.json",
+    "format": "jsonMCPServers",
+    "restartRequired": true,
+    "restartNote": "Reopen the selected folder in Cursor to load the new connection.",
+    "documentation": "https://cursor.com/docs/mcp",
+    "requiresWorkspace": true,
+    "settingsSupported": true,
+    "bundleIDs": [
+      "com.todesktop.230313mzl4w4u92"
+    ],
+    "a2aPorts": [],
+    "searchPaths": []
+  },
+  {
+    "id": "cursor-cli",
+    "displayName": "Cursor CLI",
+    "description": "A terminal coding assistant from Cursor.",
+    "aliases": [
+      "cursor-agent"
+    ],
+    "installMarkers": [
+      "~/.local/bin/cursor-agent"
+    ],
+    "configPath": "",
+    "format": "sessionMCP",
+    "restartRequired": false,
+    "restartNote": "No restart needed; connection starts an ACP session with reply tools.",
+    "documentation": "https://github.com/agentclientprotocol/registry/blob/main/cursor/agent.json",
+    "requiresWorkspace": false,
+    "settingsSupported": false,
+    "bundleIDs": [],
+    "a2aPorts": [],
+    "acp": {
+      "executable": "cursor-agent",
+      "arguments": [
+        "acp",
+        "--mode=ask",
+        "--sandbox=enabled"
+      ],
+      "documentation": "https://cursor.com/docs/cli/acp",
+      "permissionMode": "ask",
+      "referenceVersion": "2026.09.15",
+      "environment": {},
+      "protocolVersion": 1
+    },
+    "searchPaths": []
+  },
+  {
+    "id": "zed",
+    "displayName": "Zed",
+    "description": "A code editor with a built-in agent panel.",
+    "aliases": [],
+    "installMarkers": [
+      "/Applications/Zed.app"
+    ],
+    "configPath": "~/.config/zed/settings.json",
+    "format": "jsonContextServers",
+    "restartRequired": false,
+    "restartNote": "No app restart is needed; check the connection in Zed's AI settings.",
+    "documentation": "https://zed.dev/docs/ai/mcp",
+    "requiresWorkspace": false,
+    "settingsSupported": true,
+    "bundleIDs": [
+      "dev.zed.Zed"
+    ],
+    "a2aPorts": [],
+    "configPaths": [
+      "~/.config/zed/settings.json"
+    ],
+    "searchPaths": [],
+    "discoveryWords": [
+      "zed"
+    ],
+    "messagingPermissionsPath": "~/.config/zed/settings.json",
+    "messagingPermissionSyntax": "toolDefaults"
+  },
+  {
+    "id": "goose",
+    "displayName": "Goose",
+    "description": "A local assistant for coding and other tasks.",
+    "aliases": [
+      "goose cli"
+    ],
+    "installMarkers": [
+      "/Applications/Goose.app",
+      "~/.local/bin/goose"
+    ],
+    "configPath": "",
+    "format": "sessionMCP",
+    "restartRequired": false,
+    "restartNote": "No restart needed; connection starts an ACP session with reply tools.",
+    "documentation": "https://github.com/agentclientprotocol/registry/blob/main/goose/agent.json",
+    "requiresWorkspace": false,
+    "settingsSupported": false,
+    "bundleIDs": [],
+    "a2aPorts": [],
+    "acp": {
+      "executable": "goose",
+      "arguments": [
+        "acp"
+      ],
+      "documentation": "https://block-goose.mintlify.app/advanced/acp-protocol",
+      "permissionMode": "chat",
+      "referenceVersion": "1.51.0",
+      "environment": {
+        "GOOSE_MODE": "chat"
+      },
+      "protocolVersion": 1
+    },
+    "searchPaths": [],
+    "discoveryWords": [
+      "goose"
+    ]
+  },
+  {
+    "id": "hermes",
+    "displayName": "Hermes",
+    "description": "A local agent with its own memory, tools and models.",
+    "aliases": [
+      "hermes agent",
+      "nous hermes"
+    ],
+    "installMarkers": [
+      "/Applications/Hermes.app",
+      "~/.local/bin/hermes"
+    ],
+    "configPath": "",
+    "format": "sessionMCP",
+    "restartRequired": false,
+    "restartNote": "No restart needed; connection starts an ACP session with reply tools.",
+    "documentation": "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
+    "requiresWorkspace": false,
+    "settingsSupported": false,
+    "bundleIDs": [
+      "com.nousresearch.hermes"
+    ],
+    "a2aPorts": [],
+    "acp": {
+      "executable": "hermes",
+      "arguments": [
+        "acp"
+      ],
+      "documentation": "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
+      "permissionMode": "default",
+      "referenceVersion": "0.21.3",
+      "environment": {},
+      "protocolVersion": 1,
+      "modes": [
+        "default",
+        "accept_edits",
+        "dont_ask"
+      ],
+      "supportsLoad": true,
+      "supportsResume": true
+    },
+    "searchPaths": [],
+    "discoveryWords": [
+      "hermes"
+    ]
+  }
+]

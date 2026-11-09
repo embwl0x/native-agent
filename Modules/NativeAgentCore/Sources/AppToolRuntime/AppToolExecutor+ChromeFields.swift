@@ -77,10 +77,21 @@ extension AppToolExecutor {
                     """)])
         }
         let byNumber = node.range(of: #"^\d+$"#, options: .regularExpression) != nil
+        // Existence and ability to act are different facts. In particular the
+        // reader deliberately advertises no actions behind a modal.
+        let observed = ChromePageMirror.find(node, wants: [], in: page)
+        func unavailable(_ row: ChromePageMirror.Row) -> JSONValue {
+            let reason = row.actionBlock?.reason ?? "This row does not offer the requested action."
+            return .object(["ok": .bool(false), "error": .string(row.actionBlock?.code ?? "node_not_actionable"),
+                "reason": .string("Row " + (row.number ?? "\"" + ChromePageText.safe(row.label) + "\"") + ": " + reason
+                    + " Read the page again with chrome.snapshot before choosing another control. Nothing was sent.")])
+        }
+        if actionId != "browser.chrome_wait", case .row(let shown) = observed, shown.actionBlock != nil { return unavailable(shown) }
         var row: ChromePageMirror.Row?
         if byNumber {
             if given.isEmpty { input["snapshot_id"] = .string(page.snapshotID) }
             guard let found = ChromePageMirror.find(node, wants: wants, in: page).row else {
+                if case .row(let shown) = observed { return unavailable(shown) }
                 let numbers = page.rows.compactMap { $0.number.flatMap(Int.init) }.sorted()
                 let range = if let first = numbers.first, let last = numbers.last { "Valid rows on this page: \(first)–\(last)." }
                     else { "This page has no numbered rows." }
@@ -93,9 +104,7 @@ extension AppToolExecutor {
                 } else {
                     nextInput = ["action": .string("chrome.snapshot"), "args": .object(["tab_id": .int(page.tab)])]
                 }
-                let reason = page.rows.contains(where: { $0.number == node })
-                    ? "Row \(node) on this page cannot perform this action. Nothing was sent."
-                    : "No row \(node) on this page. \(instruction) Nothing was sent."
+                let reason = "No row \(node) was shown in this read. \(instruction) Nothing was sent."
                 return .object(["ok": .bool(false), "error": .string("no_such_row"), "reason": .string(reason),
                     "remedy": .object(["kind": .string("reread"), "instruction": .string(instruction),
                         "next_call": .object(["tool": .string("app"), "input": .object(nextInput)])])])
@@ -112,8 +121,16 @@ extension AppToolExecutor {
                     "reason": .string("More than one row that can \(verb) matches \"\(ChromePageText.safe(node))\": "
                         + ChromePageMirror.named(rows) + ". Use its row number or its whole label. Nothing was sent.")])
             case .none:
+                switch observed {
+                case .row(let shown): return unavailable(shown)
+                case .ambiguous(let rows):
+                    return .object(["ok": .bool(false), "error": .string("ambiguous_row"),
+                        "reason": .string("More than one observed row matches \"\(ChromePageText.safe(node))\": "
+                            + ChromePageMirror.named(rows) + ". Use its row number. Nothing was sent.")])
+                case .none: break
+                }
                 return .object(["ok": .bool(false), "error": .string("no_such_row"),
-                    "reason": .string("No row named \"\(ChromePageText.safe(node))\" that can \(verb) on the page last read ("
+                    "reason": .string("No row named \"\(ChromePageText.safe(node))\" was observed on the page last read ("
                         + ChromePageText.safe(page.title) + "). Use its row number, or read the page again with browser.chrome_snapshot. Nothing was sent.")])
             }
             row = found
@@ -186,6 +203,7 @@ extension AppToolExecutor {
     public func runChromeFieldsCall(actionId: String, input: [String: JSONValue], fields: ChromeFields, direct: Bool,
                              surface: String, turn: Turn, execution: AppActionExecution, run: ChromeRun) async throws -> JSONValue {
         var tab = Self.chromeTabID(input["tab_id"])
+        var navigationDocument: JSONValue?, navigationURL: JSONValue?, navigationTimingOrigin: JSONValue?
         var head: [String] = []
         var receipts: [JSONValue] = []
         if actionId == "browser.chrome_navigate" {
@@ -196,6 +214,8 @@ extension AppToolExecutor {
             guard case .object(let row) = opened, row["outcome"] == .string("succeeded"),
                   case .int(let granted)? = row["tabId"] else { return opened }
             tab = granted
+            navigationDocument = row["documentId"]; navigationURL = row["url"]
+            navigationTimingOrigin = row["receipt"]?.objectValue?["timings"]?.objectValue?["startedAtMs"]
             head.append(Self.chromeReceiptLine(actionId, row))
         }
         let session = turn.verifiedSessionID
@@ -213,8 +233,16 @@ extension AppToolExecutor {
         var seen = ChromePageMirror.page(tab: tab, dataRoot: securityCenter.dataRoot, session: session)
         func read() async throws -> ChromePageMirror.Page {
             // Offscreen fields still belong to the same form.
-            let snapshot = try await run("browser.chrome_snapshot", ["tab_id": tab.map(JSONValue.int) ?? .null, "max_nodes": .int(200), "scope": .string(
-                "page")])
+            var read: [String: JSONValue] = ["tab_id": tab.map(JSONValue.int) ?? .null, "scope": .string("page")]
+            read["__chrome_document_id"] = navigationDocument
+            read["__chrome_page_url"] = navigationURL
+            read["__chrome_navigation_started_at_ms"] = navigationTimingOrigin
+            let snapshot = try await run("browser.chrome_snapshot", read)
+            receipts = receipts.map { receipt in
+                guard case .object(let row) = receipt else { return receipt }
+                return .object(Self.chromeNavigationReadTiming(row, snapshot: snapshot))
+            }
+            navigationTimingOrigin = nil
             guard case .object(let row) = snapshot, case .int(let id)? = row["tabId"],
                   case .string(let snapshotID)? = row["snapshotId"], !snapshotID.isEmpty else {
                 throw ToolFailureError("Chrome page unavailable: " + (ChatToolOutcome.explanation(snapshot)
@@ -222,6 +250,8 @@ extension AppToolExecutor {
                     effects: .none, owner: "Chrome page snapshot", code: "chrome_page_unavailable")
             }
             tab = id
+            // Only the first read belongs to navigation's observed identity.
+            navigationDocument = nil; navigationURL = nil
             mirrorChromePage(snapshot, projection: ChromePageText.project(snapshot, turn: turn), turn: turn)
             guard let page = ChromePageMirror.page(tab: id, dataRoot: securityCenter.dataRoot, session: session),
                   page.snapshotID == snapshotID else {
@@ -248,11 +278,20 @@ extension AppToolExecutor {
         // Find every field (and the button) first: a missing or ambiguous name leaves the form untouched. Then fill in page order.
         var plan: [(label: String, value: String, index: Int)] = []
         var missing: [String] = [], unclear: [String] = []
+        func fieldIssue(_ target: String) -> String {
+            switch ChromePageMirror.find(target, wants: [], in: page, seen: seen) {
+            case .row(let row): return row.actionBlock?.reason ?? "The observed row does not offer this action."
+            case .ambiguous(let rows): return "More than one observed row matches: " + ChromePageMirror.named(rows) + "."
+            case .none: return "No matching row was observed in this read."
+            }
+        }
         func check(_ label: String, _ wants: Set<String>) -> Int? {
             switch ChromePageMirror.find(label, wants: wants, in: page, seen: seen) {
-            case .row(let row): return page.rows.firstIndex(of: row)
+            case .row(let row):
+                if let block = row.actionBlock { missing.append("\"" + ChromePageText.safe(label) + "\": " + block.reason); return nil }
+                return page.rows.firstIndex(of: row)
             case .ambiguous(let rows): unclear.append("\"" + ChromePageText.safe(label) + "\" could be " + ChromePageMirror.named(rows))
-            case .none: missing.append("\"" + ChromePageText.safe(label) + "\"")
+            case .none: missing.append("\"" + ChromePageText.safe(label) + "\": " + fieldIssue(label))
             }
             return nil
         }
@@ -263,7 +302,7 @@ extension AppToolExecutor {
         if !missing.isEmpty || !unclear.isEmpty {
             // The agent's row numbers stay those of the page it saw: this unseen whole-page read must not become what n12 means next call.
             if let seen, seen.snapshotID != page.snapshotID { ChromePageMirror.publish(seen, dataRoot: securityCenter.dataRoot, session: session) }
-            return refused("Nothing was filled. " + (missing.isEmpty ? "" : "No field with that name on " + ChromePageText.safe(page.title) + ": "
+            return refused("Nothing was filled. " + (missing.isEmpty ? "" : "Fields unavailable on " + ChromePageText.safe(page.title) + ": "
                 + missing.joined(separator: ", ") + ". ") + (unclear.isEmpty ? "" : "More than one row matches: " + unclear.joined(separator: "; ") + ". ")
                 + "Use the label as the page shows it (for a choice, the option itself, e.g. \"Medium\") or its row number.")
         }
@@ -284,8 +323,9 @@ extension AppToolExecutor {
             case .row(let match): row = match
             case .ambiguous(let rows): lines.append("✗ " + shown + ": the page changed and more than one row matches (" + ChromePageMirror.named(rows)
                 + "); not sent"); return false
-            case .none: lines.append("✗ " + shown + ": no longer on the page"); return false
+            case .none: lines.append("✗ " + shown + ": " + fieldIssue(target)); return false
             }
+            if let block = row.actionBlock { lines.append("✗ " + shown + ": " + block.reason + " Nothing was sent."); return false }
             var call = extra
             call["tab_id"] = .int(page.tab); call["snapshot_id"] = .string(page.snapshotID); call["node_id"] = .string(row.node)
             call["expected_user_sequence"] = input["expected_user_sequence"]
@@ -316,7 +356,7 @@ extension AppToolExecutor {
                     + "; remaining fields were not sent. Read this tab again before continuing."); ok = false; break }
             }
             guard let row = ChromePageMirror.find(item.label, wants: valueActs, in: page, seen: seen).row, let tool = tool(for: row) else {
-                lines.append("✗ " + ChromePageText.safe(item.label) + ": no longer on the page, or no longer one row"); ok = false; break
+                lines.append("✗ " + ChromePageText.safe(item.label) + ": " + fieldIssue(item.label)); ok = false; break
             }
             var extra: [String: JSONValue]
             switch tool {

@@ -53,13 +53,13 @@ extension SwiftNativeMacControl {
     /// Share self-refusal wording so every read gives the same recovery direction.
     static let selfInspectionError = "self_inspection_unsupported"
     static let selfInspectionNote =
-        "NativeAgent's own UI cannot be read through Accessibility: AppKit re-entry deadlocks it. "
+        "NativeAgent's own UI is person-only and cannot be read through Accessibility. "
         + "Use app {page:\"current\"} for pages, settings and actions; page.screenshot for an image; "
         + "setting.set for controls; chat.* for drafts, sending, model, Think and cards; page.show to select a page. "
         + "desk.read, mind.inner_state and agent.introspect read NativeAgent's state. mac.look reads other apps."
     func runningAppProjection(context: MacOperationContext) -> [String: JSONValue] {
         let front = accessibilitySource(context: context).frontmostApp()?.processIdentifier
-        let apps = accessibilitySource(context: context).runningApps().sorted {
+        let apps = accessibilitySource(context: context).runningApps().filter(\.isDockApp).sorted {
             if ($0.processIdentifier == front) != ($1.processIdentifier == front) { return $0.processIdentifier == front }
             return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
@@ -89,7 +89,7 @@ extension SwiftNativeMacControl {
         case windowGone
         case windowDrifted(String)
         case rendererUnavailable(String)
-        /// Refuse self-process AX walks before any read: AppKit re-entry can deadlock the main thread.
+        /// Refuse person-only UI before resolving an AX root.
         case selfProcess
     }
     /// Anchor optional PID/window requests to the named process and composite identity; missing selectors use the frontmost app or first process window.
@@ -111,11 +111,11 @@ extension SwiftNativeMacControl {
     }
     private func anchoredSnapshotRead(limits: MacAXLimits, pid: Int32?, window: MacAXWindowIdentity?,
         complete: Bool, section: String?, context: MacOperationContext) -> MacAnchoredRead {
-        // Refuse before resolving any element to prevent in-process AppKit re-entry deadlock.
-        if pid == getpid() { return .selfProcess }
+        // The body and its window share the person-only boundary.
+        if PersonOnlyWindows.isOwnProcess(pid) { return .selfProcess }
         #if canImport(ApplicationServices) && os(macOS)
         if accessibilitySource(context: context) is SystemMacAXElementSource,
-           let target = pid ?? accessibilitySource(context: context).frontmostApp()?.processIdentifier, target != getpid() {
+           let target = pid ?? accessibilitySource(context: context).frontmostApp()?.processIdentifier, !PersonOnlyWindows.isOwnProcess(target) {
             do { try SystemMacAXElementSource.ensureRenderer(AXUIElementCreateApplication(target), refresh: true, context: context) }
             catch { return .rendererUnavailable(error.localizedDescription) }
         }
@@ -149,7 +149,7 @@ extension SwiftNativeMacControl {
             )
         } else {
             if let front = accessibilitySource(context: context).frontmostApp(),
-               front.processIdentifier == getpid() {
+               PersonOnlyWindows.isOwnProcess(front.processIdentifier) {
                 return .selfProcess
             }
             guard let front = accessibilitySource(context: context).frontmostApp(),

@@ -71,9 +71,14 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(name: "read_page", toolClass: .read,
                 description: """
-                    Read public http(s) privately, without a browser, signed-in session or consent. find returns up to eight matching paragraphs \
+                    Read public http(s) text. A thin JavaScript shell is read through Chrome in another NativeAgent background tab under the normal browser \
+                    gates, retaining the HTTP receipt separately and saying used_browser:true. text_reader names browser only when it has more readable \
+                    content; otherwise HTTP text stays at the top with the browser result and cause attached. \
+                    Chrome may use your signed-in session; consent is never \
+                    accepted or dismissed. HTTP failures remain failures. In an HTTP read, find returns up to eight matching paragraphs \
                     with surroundings; without find the whole extracted text is returned (paged when large). full:true with find returns the whole \
-                    text instead. Includes requested/final URL, extraction outcome and omissions from the 1 MB response bound (32 MB for a PDF). \
+                    text instead; in Chrome it starts at the first observed matching element (around applies to HTTP passages only). Includes requested/final \
+                    URL, extraction outcome and omissions from the 1 MB response bound (32 MB for a PDF). \
                     Other binary formats are unsupported. Every successful fetch writes a limited-retention source receipt: source_receipt.path and \
                     purpose explain the retained text and coverage for inspection/citation without refetching; files.read requires normal \
                     permissions. A missing receipt proves neither an empty source nor a need to refetch. DNS, refused connections and timeouts \

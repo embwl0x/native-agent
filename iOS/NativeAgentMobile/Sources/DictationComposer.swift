@@ -7,7 +7,7 @@ struct DictationTranscript: View {
     @State private var height: CGFloat = 22
 
     private var mode: String {
-        if input.isFinalizing { return "Finishing…" }
+        if input.isFinalizing { return "Waiting for final recognition · Cancel to discard" }
         guard input.isVoiceNote else { return "Dictating" }
         return input.isLocked ? "Voice note" : "Slide left to cancel · up to lock"
     }

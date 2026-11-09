@@ -48,7 +48,7 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     public let fingerprintTintHalfLife: TimeInterval = 300
     /// Asymmetric warm-with-the-user baseline lift on fingerprint valence.
     public let personaValenceLift: Double = 0.10
-    /// Below this intensity the fingerprint stays silent — feeling-silence stays silence.
+    /// Below this intensity no expressive fingerprint word is chosen; the frame still describes the available mood and body.
     public let feltIntensityFloor: Double = 0.14
 
     // MARK: - Felt object and ambivalence
@@ -75,13 +75,6 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     public let uncertaintyHalfLife: TimeInterval = 45 * 60
     public let taskPressureHalfLife: TimeInterval = 45 * 60
     public let socialWarmthHalfLife: TimeInterval = 90 * 60
-
-    // MARK: - Capsule cadence
-
-    /// Same-family readings allowed by the cadence verdict. Live delivery also requires its pre-reset run to equal one.
-    public let fingerprintFamilyRepeatLimit: Int = 4
-    /// Wait before permitting an over-limit same-family cadence verdict. Expiry alone does not satisfy live assembly's first-run gate.
-    public let fingerprintSuppressionWindow: TimeInterval = 20 * 60
 
     // MARK: - Felt session bridge
 

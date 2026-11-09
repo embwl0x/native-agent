@@ -13,10 +13,6 @@ extension SwiftToolDispatcher {
             .replacingOccurrences(of: "[context.expand ", with: "")
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "]")))
         if locator.hasPrefix("history:") {
-            guard let sessionID = turn.verifiedSessionID ?? turn.session,
-                  !sessionID.isEmpty else {
-                throw AutonomyGateError.toolDenied(reason: "History expansion requires the current conversation.")
-            }
             if let offset = input["offset"], offset != .null {
                 guard case .int(let value) = offset, value >= 0 else {
                     throw ContextExpansionError.invalidCharacterOffset
@@ -24,7 +20,6 @@ extension SwiftToolDispatcher {
             }
             let maximum = max(1, min(Self.jsonInt(input["max_characters"]) ?? 8_000, 12_000))
             let result = try await impl_read_chat_message(input: [
-                "session_id": .string(sessionID),
                 "message_id": .string(String(locator.dropFirst("history:".count))),
                 "offset": input["offset"] ?? .int(0),
                 "limit": .int(Int64(maximum)),
@@ -135,8 +130,7 @@ extension SwiftToolDispatcher {
             "receipt_id": .string(result.receipt.id),
         ]
         let sources = prepared.packet.selectedItems.first { $0.pointer == pointer }?.untrustedSources ?? []
-        let provenance = JSONValue.object(["peer_sources": .array(sources.map(JSONValue.string))])
-        fields.merge(MemoryDataProvenance.fields(in: provenance)) { _, value in value }
+        fields.merge(MemoryDataProvenance.fields(steeredBy: MemoryDataProvenance.steering(sources))) { _, value in value }
         return .object(fields)
     }
 }

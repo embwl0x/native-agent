@@ -1,7 +1,8 @@
 import SwiftUI
+import Foundation
 import Combine
 import NativeAgentShared
-// Blueprint: | `DiagnosticsView.swift` | Diagnostics: the Mac's diagnostics face (checks, status, runs), then this iPhone's own readback: recent pushes, unverified Mac records and the connection |
+// Blueprint: | `DiagnosticsView.swift` | Mac diagnostics face and phone push, verification, refusal and connection evidence |
 
 // MARK: - Diagnostics
 
@@ -11,93 +12,63 @@ struct DiagnosticsView: View {
     @ObservedObject private var cloudReplies = iCloudBridge.shared
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
-    @State private var pushReceipts = PushReceiptLedger.load()
+    @State private var pushReceipts: PushReceiptLedger.Reading?
     @State private var pushed: FaceDestination?
 
     var body: some View {
         let face = sync.faces["diagnostics"]?.face
         AlivePage(title: face?.title ?? "Diagnostics", line: face?.line) {
             MobileFaceRows(page: "diagnostics") { pushed = $0 }
-            Section {
-                if let failure = pushReceipts.failure { Text(failure) }
-                else if pushReceipts.entries.isEmpty { Text("No pushes recorded on this iPhone.") }
-                ForEach(pushReceipts.entries.prefix(8)) { entry in
-                    LabeledContent(entry.source) {
-                        Text(entry.receivedAt, style: .relative)
-                    }
-                }
-            } header: { AliveEyebrow("Recent pushes") }
-            let held = cloudReplies.failingMacRecords.values.filter(\.held).sorted { $0.firstRefusedAt < $1.firstRefusedAt }
-            if !held.isEmpty {
-                Section {
-                    ForEach(held, id: \.message.id) { entry in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(entry.message.metadata?["kind"] ?? "chat").font(.headline)
-                            Text(entry.reason)
-                            Text("Refused \(entry.attempts) times since \(entry.firstRefusedAt.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption)
-                            Text(entry.message.id).font(.caption).textSelection(.enabled)
-                        }
-                    }
-                } header: { AliveEyebrow("Mac records this iPhone holds") }
-            }
-            if let failure = cloudReplies.unverifiedRecordsError {
-                Section { Text(failure) } header: { AliveEyebrow("Verification history unavailable") }
-            }
-            if !cloudReplies.unverifiedRecords.isEmpty {
-                Section {
-                    ForEach(cloudReplies.unverifiedRecords) { record in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(record.kind).font(.headline)
-                            Text("Sender: \(record.sender)")
-                            Text(record.timestamp, style: .date)
-                            Text(record.timestamp, style: .time)
-                            Text(record.reason).font(.caption)
-                            Text("Pairing version: \(record.pairingVersion)").font(.caption)
-                            Text(record.id).font(.caption).textSelection(.enabled)
-                        }
-                    }
-                } header: { AliveEyebrow("Unverified Mac records") }
-            }
-            Section {
-                MobileReadingStat(
-                    label: "State",
-                    value: AliveConnection.line(bridgeClient.connection),
-                    systemImage: "antenna.radiowaves.left.and.right"
-                )
-
-                MobileReadingStat(
-                    label: "Pairing",
-                    value: pairingStore.usesICloudTransport ? "iCloud" : "Not paired",
-                    systemImage: "network"
-                )
-
-                if let lastSeen = bridgeClient.lastSeenAt {
-                    LabeledContent("Last seen") {
-                        Text(lastSeen, style: .relative).foregroundStyle(.secondary)
-                    }
-                }
-                // Age advanced data from its own delivery; cache reads cannot refresh it.
-                let syncState = StatusConnectionPresentation.syncState(
-                    lastSyncedAt: iCloudSyncEngine.shared.transportDeliveryAt(screenGroup: "runs")
-                )
-                MobileReadingStat(
-                    label: "Last synced",
-                    value: StatusConnectionPresentation.cardValue(for: syncState),
-                    systemImage: "arrow.triangle.2.circlepath"
-                )
-                if let detail = StatusConnectionPresentation.detail(for: syncState) {
-                    Text(detail)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-            } header: { AliveEyebrow("Connection") }
+            FaceView(face: localFace, door: ReadOnlyFaceDoor(), session: sync.pageSessions.page("phone-diagnostics"))
         }
         .navigationDestination(item: $pushed) { $0.view }
-        .task { _ = await sync.refreshRunsSnapshot() }
-        .onAppear { pushReceipts = PushReceiptLedger.load() }
-        .onReceive(NotificationCenter.default.publisher(for: PushReceiptLedger.didChange).receive(on: RunLoop.main)) { _ in
-            pushReceipts = PushReceiptLedger.load()
+        .task {
+            pushReceipts = await Self.readPushReceipts()
+            _ = await sync.refreshRunsSnapshot()
         }
+        .onReceive(NotificationCenter.default.publisher(for: PushReceiptLedger.didChange).receive(on: RunLoop.main)) { _ in
+            Task { pushReceipts = await Self.readPushReceipts() }
+        }
+    }
+
+    @concurrent nonisolated private static func readPushReceipts() async -> PushReceiptLedger.Reading {
+        PushReceiptLedger.load()
+    }
+
+    private var localFace: PartFace {
+        let pushRows: [PartFace.Row]
+        if let reading = pushReceipts {
+            if let failure = reading.failure { pushRows = [.init(id: "failure", title: failure, tone: .failed)] }
+            else if reading.entries.isEmpty { pushRows = [.init(id: "empty", title: "No pushes recorded on this iPhone.")] }
+            else { pushRows = reading.entries.prefix(8).map { .init(id: $0.id, title: $0.source, at: $0.receivedAt.ISO8601Format()) } }
+        } else { pushRows = [.init(id: "waiting", title: "Reading this iPhone's push receipts…")] }
+        var sections: [PartFace.Section] = [.init(id: "pushes", title: "Recent pushes", rows: pushRows)]
+        let refused = cloudReplies.failingMacRecords.values.sorted { $0.firstRefusedAt < $1.firstRefusedAt }
+        if !refused.isEmpty {
+            sections.append(.init(id: "refused", title: "Mac records this iPhone holds", rows: refused.map { entry in
+                .init(id: entry.message.id, title: entry.message.metadata?["kind"] ?? "chat", detail: entry.reason,
+                    value: entry.message.id, at: entry.firstRefusedAt.ISO8601Format())
+            }))
+        }
+        if let error = cloudReplies.unverifiedRecordsError {
+            sections.append(.init(id: "verification-error", title: "Verification history unavailable", rows: [
+                .init(id: "cause", title: error, tone: .failed)
+            ]))
+        }
+        if !cloudReplies.unverifiedRecords.isEmpty {
+            sections.append(.init(id: "unverified", title: "Unverified Mac records", rows: cloudReplies.unverifiedRecords.map { record in
+                .init(id: record.id, title: record.kind, detail: record.reason,
+                    value: "Sender: \(record.sender) · Pairing version: \(record.pairingVersion) · \(record.id)",
+                    at: record.timestamp.ISO8601Format())
+            }))
+        }
+        var rows: [PartFace.Row] = [.init(id: "state", title: "State", value: AliveConnection.line(bridgeClient.connection)),
+            .init(id: "pairing", title: "Pairing", value: pairingStore.usesICloudTransport ? "iCloud" : "Not paired")]
+        if let lastSeen = bridgeClient.lastSeenAt { rows.append(.init(id: "seen", title: "Last seen", at: lastSeen.ISO8601Format())) }
+        let state = StatusConnectionPresentation.syncState(lastSyncedAt: sync.transportDeliveryAt(screenGroup: "runs"))
+        rows.append(.init(id: "sync", title: "Last synced", detail: StatusConnectionPresentation.detail(for: state),
+            value: StatusConnectionPresentation.cardValue(for: state)))
+        sections.append(.init(id: "connection", title: "Connection", rows: rows))
+        return .init(sections: sections)
     }
 }

@@ -1,13 +1,12 @@
 import AuthoredCapabilities
 import Foundation
 import Senses
-import AgentWorkspace
 import CryptoKit
+import Desk
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import Transcripts
-import Desk
 import Experiences
 import PersonaEngine
 import MemoryV2
@@ -43,7 +42,8 @@ extension SwiftNativeChatOrchestrationClient {
         turn: Turn, work: ChatTurnWork
     ) async throws -> StructuredChatExecution {
         let persona = PersonaSelection.current() ?? persona
-        let fileAccess = FileAccessGatedDispatcher.sharedFileAccess(fileAccess)
+        let requestedFileAccess = fileAccess
+        let fileAccess = FileAccessGatedDispatcher.sharedFileAccess(requestedFileAccess)
         // Each structured execution owns its served-version evidence, even when its caller has a ledger.
         return try await holding(work.with(\.senseReads, SenseTurnReads())) { work in
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -55,7 +55,13 @@ extension SwiftNativeChatOrchestrationClient {
         // Transport and enqueue pins keep the canonical transcript identity stable before work starts, whether or not the user row already exists.
         let runId = turn.run
         let boundTurnId = turn.id
-        let turn = turn.with(\.session, resolvedSession)
+        var acceptedTurn = turn.with(\.session, resolvedSession)
+        acceptedTurn.fileAccess = requestedFileAccess
+        acceptedTurn.fileAccess = fileAccess
+        // A thought may offer hidden steering but write its own opening row when it runs; that row remains its input owner.
+        if !suppressUserAppend { acceptedTurn.rows.hiddenInput = nil }
+        acceptedTurn.rows.hiddenInput?.persona = persona
+        let turn = acceptedTurn
         return try await TurnTraceContext.$turnId.withValue(boundTurnId) {
         return try await SessionTurnDelivery.withDelivery(dataRoot: dataRoot, sessionID: resolvedSession,
             runID: runId, surface: surface, observer: progress,turn: turn) { progress in
@@ -75,34 +81,15 @@ extension SwiftNativeChatOrchestrationClient {
         do {
         let admittedAt = clock()
         await ChatTurnSteering.shared.noteTurnActivity(for: dataRoot, at: admittedAt)
-        let carried: [MyQueue.Entry]
-        var queueUnavailable = false
-        if turn.execution?.transcriptRowKind == nil {
-            let projection = await (cognitiveRuntime as? any MyQueueTurnProjectionProviding)?.queueTurnCandidates()
-            let candidates = projection?.candidates
-            queueUnavailable = candidates == nil && projection?.refreshPendingAfterWrite == true
-            carried = candidates.map { MyQueueReady.forTurn(items: $0, session: resolvedSession, door: surface,
-                personTurn: turn.originPrincipal == "person", at: admittedAt)
-                .filter { turn.envelope?.workIdentity != "carry." + $0.item.handle } } ?? []
-        } else { carried = [] }
-        // Queue-item steering applies only when that item's decision resumes its work.
+        // Reading intentions does not add their steering principals to the turn.
         let taint = turn.peerSteering
-        func executeCarriedTurn(turn: Turn, work: ChatTurnWork) async throws -> ProducedChatTurn {
+        func executeTurn(turn: Turn, work: ChatTurnWork) async throws -> ProducedChatTurn {
         // Trust gates image blocks; extracted PDF text enters modelMessage while the persisted user row keeps message.
         let attachmentInput = try Self.turnAttachmentInput(
             message: message, attachments: attachments, dataRoot: dataRoot,
             queryUserMessage: turn.queryUserMessage, runId: runId)
         let imageBlocks = attachmentInput.imageBlocks
         var modelMessage = attachmentInput.userMessage
-        if queueUnavailable { modelMessage += "\n\n[MY QUEUE is unavailable; no queued step was admitted with this message.]" }
-        if !carried.isEmpty {
-            let items = carried.map { entry in
-                var arrival = ResidentWake.carriedArrival(entry.item, crossing: admittedAt, dataRoot: dataRoot)
-                arrival.reason = "what you carry"
-                return arrival
-            }
-            modelMessage += "\n\n" + ResidentWake.text(items, live: true)
-        }
         if turn.execution?.transcriptRowKind == nil,
            let contract = turn.botContract {
             modelMessage = contract.instructions + "\n\nMessage for this turn:\n" + modelMessage
@@ -213,7 +200,8 @@ extension SwiftNativeChatOrchestrationClient {
             let saved = try SwiftNativeTurnEngine.continuation(dataRoot: root, runId: runId, sessionId: resolvedSession, surface: surface,
                 userMessage: message, fileAccess: fileAccess, capabilityProfile: continuationCapabilityProfile, turn: turn)
             if let saved, let unwritten = TurnCheckpointWriter.persist(
-                SwiftNativeTurnEngine.checkpoint(saved, turnId: boundTurnId, sessionId: resolvedSession), dataRoot: root) {
+                SwiftNativeTurnEngine.checkpoint(saved, turnId: boundTurnId, sessionId: resolvedSession,
+                    hiddenInput: turn.rows.hiddenInput), dataRoot: root) {
                 modelMessage += "\n\n[" + unwritten + "]"
             }
         }
@@ -293,6 +281,9 @@ extension SwiftNativeChatOrchestrationClient {
             )
             if case .delta(let text) = redactedEvent {
                 ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId, .delta(text))
+            }
+            if case .writing(let writing) = redactedEvent, let writing {
+                ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId, .writing(writing.line))
             }
             await progress(redactedEvent)
         }
@@ -374,7 +365,8 @@ extension SwiftNativeChatOrchestrationClient {
         return ProducedChatTurn(result: result, context: providerCtx, personaFingerprint: threadedCtx.personaFingerprint,
             attachments: ChatGeneratedImageArtifacts.attachments(
                 from: result.toolDispatches, chosen: replyChoices.paths, dataRoot: dataRoot),
-            answerID: turn.replyRow?.messageId(turn: boundTurnId, session: resolvedSession) ?? UUID().uuidString)
+            answerID: turn.replyRow?.messageId(turn: boundTurnId, session: resolvedSession) ?? UUID().uuidString,
+            cognitiveProjection: cognitiveProjection)
         }
         var envelope = TurnEnvelope.current(turn: turn, surface: surface)
         envelope.answerExperienceID = heardID
@@ -383,7 +375,7 @@ extension SwiftNativeChatOrchestrationClient {
                 try await withSessionContextMeasurement(sessionId: resolvedSession, model: model,
                     providerID: turn.admission?.provider, surface: surface, runId: runId, progress: progress,
                     turn: turn, work: work) { work in
-                    try await executeCarriedTurn(turn: turn.with(\.peerSteering, taint), work: work)
+                    try await executeTurn(turn: turn.with(\.peerSteering, taint), work: work)
 
                 }
             }
@@ -483,20 +475,19 @@ extension SwiftNativeChatOrchestrationClient {
         return CognitiveSubstrate.peerIdentity(metadata: metadata, dataRoot: dataRoot).map(CognitiveCareProvenance.personKey)
     }
 
-    /// Only verified user turns advance the gap; wakes, peers, bridges and other senders cannot claim the user's return.
-    static func isUsersTurn(surface: String, sessionId: String, dataRoot: URL, turn: Turn) -> Bool {
-        let envelope = turn.envelope
-        guard turn.origin == nil,
-              (envelope?.agent ?? "").isEmpty,
+    /// Direct-conversation ingress proof shared by owner-turn stamps and pinned conversation requests; the caller checks its current request context.
+    /// Wakes, peers, bridges and other senders cannot claim the user's return.
+    public static func isUsersTurn(surface: String, sessionId: String, dataRoot: URL, turn: Turn) -> Bool {
+        guard let envelope = turn.envelope, turn.origin == nil,
+              envelope.agent == nil,
               SessionConversation.kind(sessionId, dataRoot: dataRoot)?.isPersonConversation == true else { return false }
         switch surface.lowercased() {
         case "chat":
-            return envelope?.declaredRemote != true
+            return envelope.declaredRemote == false
         case "ios":
-            return envelope?.commandSignatureVerified == true
-                || turn.envelope?.commandSignatureVerified == true
+            return envelope.commandSignatureVerified == true
         case "telegram":
-            guard let sender = envelope?.verifiedUserId ?? turn.envelope?.verifiedUserId,
+            guard let sender = envelope.verifiedUserId,
                   let owner = telegramOwnerId(dataRoot: dataRoot) else { return false }
             return sender.trimmingCharacters(in: .whitespacesAndNewlines) == owner
         default:
@@ -534,6 +525,7 @@ extension SwiftNativeChatOrchestrationClient {
             runtimeContext: runtimeContext
         )
         projectedContext.cognitiveRuntimeContext = runtimeContext
+        projectedContext.cognitiveFeelingFrame = projection?.capsule?.feelingFrame
         // Projection bookkeeping commits only after the provider accepts this material.
         return projectedContext
     }
@@ -560,6 +552,13 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     static let cognitiveHeaderLine = "[CognitiveSubstrate] private — it colors you; never quote it."
+
+    func commitRepliedCognitiveTurnProjection(
+        _ prepared: (request: CognitiveCapsuleRequest, projection: CognitionAtTurn)?
+    ) async {
+        guard let prepared, let cognitiveRuntime else { return }
+        await cognitiveRuntime.commitReplyFeeling(prepared.projection, request: prepared.request)
+    }
 
     static func cognitiveRuntimeContext(
         capsule: CognitiveCapsule?,

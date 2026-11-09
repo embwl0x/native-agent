@@ -42,6 +42,7 @@ public enum ChatTurnFailure: Equatable {
     /// Retain unnamed actions when execution evidence says steps ran but no receipt identifies them.
     case acted([String])
     case unknown
+    case classificationFailed(String)
 
     /// Only the same failed tail read by `consecutiveFailures` may drive this decision.
     public static func read<Message: ChatTurnFailureMessage>(_ messages: [Message]) -> (message: Message, failure: ChatTurnFailure)? {
@@ -60,7 +61,9 @@ public enum ChatTurnFailure: Equatable {
         // The card must preserve the core's unknown-outcome warning when steps may have run.
         if meta?.providerRefusal == true, meta?.providerRefusalDraft != true { return .unknown }
         var seen = Set<String>()
-        let actions = toolRows.compactMap { actionTitle($0.metadata) }.filter { seen.insert($0).inserted }
+        let actions: [String]
+        do { actions = try toolRows.compactMap { try actionTitle($0.metadata) }.filter { seen.insert($0).inserted } }
+        catch { return .classificationFailed(error.localizedDescription) }
         if !actions.isEmpty { return .acted(actions) }
         // Only a proven pre-dispatch refusal or an unwritten pre-model user row can establish that the model never received the request.
         if toolRows.isEmpty, meta?.providerRefusalDraft == true || meta?.syntheticUserRowPersisted == false {
@@ -112,6 +115,8 @@ public enum ChatTurnFailure: Equatable {
             return "It stopped after doing something: \(names.joined(separator: ", ")). Trying again could do it again."
         case .unknown:
             return "I can't tell whether it finished. Check what it did before trying again."
+        case .classificationFailed(let cause):
+            return "I can't classify what ran: \(cause). Check what it did before trying again."
         }
     }
 
@@ -120,12 +125,14 @@ public enum ChatTurnFailure: Equatable {
     public var retryNeedsConfirmation: Bool {
         switch self {
         case .notSent, .stoppedNoActions: return false
-        case .acted, .unknown: return true
+        case .acted, .unknown, .classificationFailed: return true
         }
     }
 
     public var confirmationMessage: String {
         switch self {
+        case .classificationFailed(let cause):
+            return "I can't classify what ran: \(cause). Starting over could repeat a step. Check its outcome before continuing."
         case .acted(let names) where !names.isEmpty:
             return "It already did: \(names.joined(separator: ", ")). Starting over could do that again. "
                 + "Continue from here starts a new turn that is told what already ran."
@@ -139,14 +146,14 @@ public enum ChatTurnFailure: Equatable {
         "Continue from where you stopped. Don't repeat any step that already ran."
 
     /// Only engine-verified read-only calls are safe to repeat; unknown, unparseable or unregistered calls may have acted.
-    private static func actionTitle<Metadata: ChatTurnFailureMetadata>(_ meta: Metadata?) -> String? {
+    private static func actionTitle<Metadata: ChatTurnFailureMetadata>(_ meta: Metadata?) throws -> String? {
         let name = meta?.toolName ?? ""
         guard name == "app" else {
             return ParallelToolDispatch.isParallelSafe(internalToolName: name, turn: nil) ? nil : ToolActivityPresentation.title(name)
         }
         let json = meta?.inputJSON ?? ""
         if case .object(let fields)? = try? JSONValue.parse(Data(json.utf8)) {
-            if RunawayOutputDetector.isAppReadOnly(fields, turn: nil) { return nil }
+            if try AppActionBinding.isAppReadOnly(fields, turn: nil) { return nil }
             return ToolActivityPresentation.title(ToolNameAliases.shown(name, input: .object(fields)).name)
         }
         // Clipped arguments may hide any effect, so classify them as acted; a leading action ID can name but never disprove that effect.

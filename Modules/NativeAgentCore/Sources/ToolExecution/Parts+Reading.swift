@@ -88,7 +88,7 @@ extension Parts {
         }
         var read = row.filter { ["id", "kind", "version", "name", "description", "status", "unavailableReason", "triggers", "origin", "overrides",
             "disabledBy", "disabledReason",
-                                 "validation_evidence", "candidate_validation_evidence", "learned"].contains($0.key) }
+                                 "validation_evidence", "candidate_validation_evidence", "learned", "run_counts"].contains($0.key) }
         if row["status"] == .string("unavailable") { return .object(read) }
         read["status"] = .string("ok"); read["ability_status"] = row["status"] ?? .null
         var declares: [String: JSONValue] = [:]
@@ -98,6 +98,7 @@ extension Parts {
             declares.removeValue(forKey: "wake"); declares.removeValue(forKey: "resident"); declares["mode"] = row["mode"]
         }
         read["declares"] = .object(declares)
+        if row["kind"] == .string("turn") { read.merge(try turnReading()) { _, turn in turn } }
         var versions: [String: JSONValue] = [:]
         for (key, field) in [("current", "codeFingerprint"), ("waiting", "candidateDigest"), ("previous", "previousVersion"),
                              ("last_clean", "lastCleanVersion")] { versions[key] = row[field] ?? .null }
@@ -173,14 +174,14 @@ extension Parts {
         for row in rows.dropFirst(start).prefix(40) {
             let id = Self.string(row, "id") ?? ""
             var item = row.filter { ["id", "kind", "version", "name", "description", "status", "unavailableReason"].contains($0.key) }
-            item["runs"] = row["useCount"] ?? .int(0)
+            item["run_counts"] = row["run_counts"]
             let last = row["lastUsedAt"]
             if case .double(let stamp)? = last {
                 item["last_run_at"] = .string(NativeTimestampFormat.plainZulu(Date(timeIntervalSinceReferenceDate: stamp)))
             } else { item["last_run_at"] = last ?? .null }
-            // Recent model-round counts expose the part's own learned cost.
-            if case .array(let rounds)? = row["learned"]?.objectValue?["use"]?.objectValue?["rounds_per_use"], !rounds.isEmpty {
-                item["rounds_per_use"] = .array(rounds)
+            // The current version's rounds histogram (model rounds → uses) exposes the part's own learned cost.
+            if case .object(let rounds)? = row["learned"]?.objectValue?["use"]?.objectValue?["rounds_per_use"], !rounds.isEmpty {
+                item["rounds_per_use"] = .object(rounds)
             }
             item["next_call"] = .object(Self.runs(row)
                 ? ["action": .string("authored." + id), "args": .object([:])]

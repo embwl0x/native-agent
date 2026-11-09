@@ -27,7 +27,6 @@ enum MobileIntentRuntime {
     static func agent() async throws -> MobileAgentEntity {
         try prepare()
         await iCloudBridge.shared.deviceIncomingSetupTask?.value
-        await iCloudBridge.shared.setupTask?.value
         await iCloudSyncEngine.shared.refreshLightweightSnapshots()
         let sync = iCloudSyncEngine.shared
         guard let fingerprint = AgentNameCache.fingerprint(sync.pairingStore?.iCloudPairingSecret),
@@ -52,10 +51,9 @@ enum MobileIntentRuntime {
         return id
     }
 
-    static func reply(to text: String, sessionID: String? = nil, timeout: TimeInterval) async throws -> String {
+    static func reply(to text: String, sessionID: String? = nil) async throws -> String {
         try prepare()
         await iCloudBridge.shared.deviceIncomingSetupTask?.value
-        await iCloudBridge.shared.setupTask?.value
         await ChatStore.shared.restorationTask?.value
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw failure("Enter a message to send.")
@@ -94,16 +92,13 @@ enum MobileIntentRuntime {
         }
         let client = MacBridgeClient()
         _ = try await client.sendMessage(text, sessionID: session, messageID: id)
-        let deadline = Date().addingTimeInterval(timeout)
-        while result == nil, Date() < deadline {
+        await bridge.pollIncomingNow()
+        while result == nil {
             try Task.checkCancellation()
-            await bridge.pollIncomingNow()
-            if result != nil { break }
-            await waiters.wait(id, timeout: min(ChatStore.iCloudReplyNudgeFloorSeconds, max(0, deadline.timeIntervalSinceNow)))
+            guard await waiters.wait(id) else { throw CancellationError() }
         }
         if let result { return try result.get() }
-        throw failure(
-            "Your message was sent, but the Mac has not replied yet. Open NativeAgent to read the reply; running this shortcut again sends a new message.")
+        throw CancellationError()
     }
 
     static func pendingApprovals() async throws -> [ApprovalRequest] {
@@ -118,15 +113,12 @@ enum MobileIntentRuntime {
     }
 
     static func decide(id: String, approve: Bool) async throws {
-        guard let row = try await pendingApprovals().first(where: { $0.id == id }) else {
+        guard try await pendingApprovals().contains(where: { $0.id == id }) else {
             throw failure("This approval is no longer pending in the synced snapshot.")
         }
-        guard ActivityScreenPresentation.canDecideRemotely(action: row.action) else {
-            throw failure(ApprovalText.agentDecision)
-        }
+        // The approval's card is its Inbox row (an approval's matter is its own id): the Mac runs that row's action, or refuses it.
         try await withDeliveryConsumers {
-            if approve { _ = try await iCloudSyncEngine.shared.approveApproval(id: id) }
-            else { _ = try await iCloudSyncEngine.shared.rejectApproval(id: id) }
+            _ = try await iCloudSyncEngine.shared.faceAction(page: "inbox", row: id, action: approve ? "approve" : "reject", value: nil)
         }
         await iCloudSyncEngine.shared.refreshApprovalsSnapshot()
     }

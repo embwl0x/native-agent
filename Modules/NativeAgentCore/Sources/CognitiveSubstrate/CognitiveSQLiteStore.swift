@@ -22,7 +22,7 @@ struct CognitiveReceiptWrite: Sendable, Equatable {
 
 /// Cares are uncapped living state; the night fades unused cares and seeds remain. Owed reflections stay outside history pruning until settlement.
 private let cognitiveUnprunedArtifactKinds: Set<String> = [
-    "care", "care_migration", "care_retired_migration", "standing_view", "thought_seed",
+    "care", "care_migration", "care_retired_migration", "standing_view", "thought_seed", "attention_landing",
 ]
 
 // Retention floors only order eviction; spend protected rows when necessary to enforce the hard cap.
@@ -106,8 +106,8 @@ public actor CognitiveSQLiteStore {
             newStore = false
         } catch CocoaError.fileReadNoSuchFile { newStore = true }
         var config = Configuration()
-        // A busy timeout lets concurrent SQLite holders release the lock before an affect/node checkpoint fails.
-        config.busyMode = .timeout(2)
+        // The queue serializes its writer; another owner's lock is an actual contention error.
+        config.busyMode = .immediateError
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA foreign_keys = ON")
         }
@@ -240,15 +240,20 @@ public actor CognitiveSQLiteStore {
         artifacts: [CognitiveArtifactWrite],
         deletedArtifactIDs: [UUID],
         receipts: [CognitiveReceiptWrite],
-        maxNodes: Int,
         maxArtifacts: Int,
         maxReceipts: Int = 10_000,
         at now: Date
     ) async throws {
         try await dbQueue.write { db in
-            try db.execute(sql: "DELETE FROM cognitive_nodes")
+            let ids = nodes.map { $0.id.uuidString }
+            if ids.isEmpty {
+                try db.execute(sql: "DELETE FROM cognitive_nodes")
+            } else {
+                let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
+                try db.execute(sql: "DELETE FROM cognitive_nodes WHERE id NOT IN (\(placeholders))", arguments: StatementArguments(ids))
+            }
             for node in nodes {
-                try Self.insertNode(db, node: node, at: now)
+                try Self.upsertNode(db, node: node, at: now)
             }
 
             for artifact in artifacts {
@@ -261,20 +266,6 @@ public actor CognitiveSQLiteStore {
                 )
             }
 
-            // Exact snapshots are already bounded, but keep the store boundary defensive if a malformed caller ever exceeds the configured cap.
-            let nodeCap = max(1, maxNodes)
-            try db.execute(
-                sql: """
-                DELETE FROM cognitive_nodes
-                WHERE id IN (
-                    SELECT id FROM cognitive_nodes
-                    ORDER BY salience ASC, activation ASC, last_activated_at ASC, id ASC
-                    LIMIT MAX((SELECT COUNT(*) FROM cognitive_nodes) - ?, 0)
-                )
-                """,
-                arguments: [nodeCap]
-            )
-            let deletedNodes = db.changesCount
             let deletedArtifacts = try Self.pruneArtifacts(
                 db,
                 maxArtifacts: maxArtifacts,
@@ -295,12 +286,10 @@ public actor CognitiveSQLiteStore {
                 maxReceipts: maxReceipts,
                 protectedMinimums: cognitiveProtectedReceiptMinimums
             )
-            if deletedNodes > 0 || deletedArtifacts > 0 || deletedReceipts > 0 {
+            if deletedArtifacts > 0 || deletedReceipts > 0 {
                 try Self.insertReceipt(db, kind: "prune", payload: .object([
-                    "deletedNodes": .int(Int64(deletedNodes)),
                     "deletedArtifacts": .int(Int64(deletedArtifacts)),
                     "deletedReceipts": .int(Int64(deletedReceipts)),
-                    "maxNodes": .int(Int64(maxNodes)),
                     "maxArtifacts": .int(Int64(maxArtifacts)),
                     "maxReceipts": .int(Int64(maxReceipts)),
                 ]), at: now)
@@ -455,6 +444,14 @@ public actor CognitiveSQLiteStore {
         artifact: CognitiveArtifactWrite,
         at now: Date
     ) throws {
+        // An empty attention journal removes only its existing marker; ordinary snapshots never create empty journal rows.
+        if artifact.kind == "attention_landing", artifact.payload.objectValue?["pending"] == .null {
+            guard try String.fetchOne(db, sql: "SELECT id FROM cognitive_artifacts WHERE id = ? AND kind = ?",
+                                     arguments: [artifact.id.uuidString, artifact.kind]) != nil else { return }
+            try db.execute(sql: "DELETE FROM cognitive_artifacts WHERE id = ? AND kind = ?",
+                           arguments: [artifact.id.uuidString, artifact.kind])
+            return
+        }
         try db.execute(
             sql: """
             INSERT INTO cognitive_artifacts (
@@ -466,6 +463,8 @@ public actor CognitiveSQLiteStore {
                 score = excluded.score,
                 payload_json = excluded.payload_json,
                 updated_at = excluded.updated_at
+            WHERE cognitive_artifacts.kind <> excluded.kind OR cognitive_artifacts.status <> excluded.status
+               OR cognitive_artifacts.score <> excluded.score OR cognitive_artifacts.payload_json <> excluded.payload_json
             """,
             arguments: [
                 artifact.id.uuidString,
@@ -479,7 +478,12 @@ public actor CognitiveSQLiteStore {
         )
     }
 
-    private static func insertNode(_ db: Database, node: CognitiveNode, at now: Date) throws {
+    private static func upsertNode(_ db: Database, node: CognitiveNode, at now: Date) throws {
+        guard node.drive.isFinite, node.drive >= 0 else {
+            throw CognitiveSQLiteReadError.malformedRow(
+                table: "cognitive_nodes", id: node.id.uuidString, detail: "drive must be finite and nonnegative"
+            )
+        }
         try db.execute(
             sql: """
             INSERT INTO cognitive_nodes (
@@ -487,8 +491,25 @@ public actor CognitiveSQLiteStore {
                 activation, salience, confidence, source_class,
                 created_at, last_activated_at, decay_half_life,
                 summary, metadata_json, updated_at,
-                emotional_valence, emotional_arousal, emotional_warmth, lived_seq
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                emotional_valence, emotional_arousal, emotional_warmth, lived_seq, drive
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind, subject_type = excluded.subject_type, subject_id = excluded.subject_id,
+                subject_label = excluded.subject_label, activation = excluded.activation, salience = excluded.salience,
+                confidence = excluded.confidence, source_class = excluded.source_class, created_at = excluded.created_at,
+                last_activated_at = excluded.last_activated_at, decay_half_life = excluded.decay_half_life,
+                summary = excluded.summary, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at,
+                emotional_valence = excluded.emotional_valence, emotional_arousal = excluded.emotional_arousal,
+                emotional_warmth = excluded.emotional_warmth, lived_seq = excluded.lived_seq, drive = excluded.drive
+            WHERE cognitive_nodes.kind IS NOT excluded.kind OR cognitive_nodes.subject_type IS NOT excluded.subject_type
+               OR cognitive_nodes.subject_id IS NOT excluded.subject_id OR cognitive_nodes.subject_label IS NOT excluded.subject_label
+               OR cognitive_nodes.activation IS NOT excluded.activation OR cognitive_nodes.salience IS NOT excluded.salience
+               OR cognitive_nodes.confidence IS NOT excluded.confidence OR cognitive_nodes.source_class IS NOT excluded.source_class
+               OR cognitive_nodes.created_at IS NOT excluded.created_at OR cognitive_nodes.last_activated_at IS NOT excluded.last_activated_at
+               OR cognitive_nodes.decay_half_life IS NOT excluded.decay_half_life OR cognitive_nodes.summary IS NOT excluded.summary
+               OR cognitive_nodes.metadata_json IS NOT excluded.metadata_json OR cognitive_nodes.emotional_valence IS NOT excluded.emotional_valence
+               OR cognitive_nodes.emotional_arousal IS NOT excluded.emotional_arousal OR cognitive_nodes.emotional_warmth IS NOT excluded.emotional_warmth
+               OR cognitive_nodes.lived_seq IS NOT excluded.lived_seq OR cognitive_nodes.drive IS NOT excluded.drive
             """,
             arguments: [
                 node.id.uuidString,
@@ -510,6 +531,7 @@ public actor CognitiveSQLiteStore {
                 node.emotionalArousal,
                 node.emotionalWarmth,
                 node.livedSeq.map { try sqliteCounter($0, named: "node lived_seq") },
+                node.drive,
             ]
         )
     }
@@ -603,7 +625,7 @@ public actor CognitiveSQLiteStore {
                 guard tables == 6 else { throw CognitivePersistenceError.storeUnavailable }
                 _ = try Row.fetchAll(db, sql: """
                     SELECT id, kind, subject_type, subject_id, subject_label, activation, salience, confidence, source_class, created_at, last_activated_at, \
-                    decay_half_life, summary, metadata_json, updated_at, emotional_valence, emotional_arousal, emotional_warmth, lived_seq FROM \
+                    decay_half_life, summary, metadata_json, updated_at, emotional_valence, emotional_arousal, emotional_warmth, lived_seq, drive FROM \
                     cognitive_nodes LIMIT 0
                     """)
                 _ = try Row.fetchAll(db, sql: "SELECT id, kind, status, score, payload_json, created_at, updated_at FROM cognitive_artifacts LIMIT 0")
@@ -639,7 +661,8 @@ public actor CognitiveSQLiteStore {
                     emotional_valence REAL NOT NULL DEFAULT 0,
                     emotional_arousal REAL NOT NULL DEFAULT 0,
                     emotional_warmth REAL NOT NULL DEFAULT 0,
-                    lived_seq INTEGER
+                    lived_seq INTEGER,
+                    drive REAL NOT NULL DEFAULT 0
                 );
                 CREATE INDEX idx_cognitive_nodes_kind ON cognitive_nodes(kind);
                 CREATE INDEX idx_cognitive_nodes_subject ON cognitive_nodes(subject_type, subject_id);

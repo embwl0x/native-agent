@@ -328,12 +328,16 @@ public final class ActivityWatchController {
 
     /// Persist before propagating: failed writes must never leave capture under consent absent from disk.
     @discardableResult
-    public func apply(_ change: @escaping @MainActor (inout ActivityPolicy) -> Void) async -> Bool {
+    public func apply(expecting baseline: ActivityPolicy? = nil, _ change: @escaping @MainActor (inout ActivityPolicy) -> Void) async -> Bool {
         guard !shuttingDown else { return false }
         let previous = policyTask
         let task = Task { [self] in
             _ = await previous?.value
             guard isPolicyAvailable else { return false }
+            if let baseline, baseline != policy {
+                await recordIssue("Activity settings changed while editing. Read them and apply the edit again.", severity: .critical)
+                return false
+            }
             var next = policy
             change(&next)
             return await persist(next)
@@ -343,6 +347,7 @@ public final class ActivityWatchController {
     }
 
     private func persist(_ next: ActivityPolicy) async -> Bool {
+        if next == policy { return true }
         do {
             let policyStore = policyStore
             try await Task.detached(priority: .utility) { try policyStore.save(next) }.value

@@ -11,6 +11,7 @@ import DreamREMCycle
 import MacControl
 import Context
 import CognitiveSubstrate
+import Experiences
 import Transcripts
 // Blueprint: | `TurnContextPreparation.swift` | Admitted route, frozen facts and bounded attention input |
 extension SwiftNativeTurnEngine {
@@ -120,6 +121,20 @@ extension SwiftNativeTurnEngine {
             dataRoot: remPinsDataRoot
         )
         trace.setFlag("memory.crossSessionRecall", crossSessionRecall)
+        // An unread recall input is a fact of this turn, never an empty successful
+        // read and never a reason to replace the context owner or retry the read.
+        var recallUnavailableReasons: [String] = []
+        let recallRepairRoot = remPinsDataRoot ?? defaultDataRoot()
+        func noteRecallUnavailable(_ error: Error, input: String, operation: String, owner: String, repairRequired: Bool = true) {
+            let reason = error.localizedDescription.split(whereSeparator: \.isNewline).joined(separator: " ")
+            recallUnavailableReasons.append("\(input): \(reason)")
+            trace.setLabel(operation + ".unavailable", reason)
+            if repairRequired && (error as? NativeSemanticQueryError)?.repairRequired != false {
+                RepairOwed.owe(recallRepairRoot, id: UUID().uuidString, kind: .run,
+                    operation: operation, owner: owner, words: reason,
+                    nextCall: "app {\"action\":\"doctor.run\"}")
+            }
+        }
         let readyQueryEmbedding: ContextQueryEmbeddingValue?
         if contextFlowMode == .active, crossSessionRecall,
            !semanticQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -129,14 +144,26 @@ extension SwiftNativeTurnEngine {
                 }
                 readyQueryEmbedding = try await queryEmbeddingTicket.checkedValue(within: Self.queryEmbeddingWaitNanos)
             } catch {
+                if error is CancellationError { throw error }
                 try Task.checkCancellation()
-                throw TurnEngineError.contextLoadFailed(underlying: error)
+                readyQueryEmbedding = nil
+                noteRecallUnavailable(error, input: "semantic recall", operation: "context.semantic_query", owner: "memory.embedding")
             }
         } else {
             readyQueryEmbedding = nil
         }
         trace.setFlag("contextFlow.semanticQueryReady", readyQueryEmbedding != nil)
-        let userMemoryCore: [String]?
+        if let readyQueryEmbedding {
+            RepairOwed.settle(recallRepairRoot, operation: "context.semantic_query",
+                evidence: .init(source: "memory.embedding", id: readyQueryEmbedding.modelFingerprint))
+        }
+        // The selector's recall gate excludes memory and graph sources. Other
+        // context still comes from the same published generation and lease.
+        let semanticRecallEnabled = crossSessionRecall && (contextFlowMode != .active
+            || semanticQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || readyQueryEmbedding != nil)
+        let userMemoryCore: [String]
+        var userCoreUnavailable = false
         if !crossSessionRecall {
             userMemoryCore = []
         } else if let dataRoot = remPinsDataRoot {
@@ -147,10 +174,24 @@ extension SwiftNativeTurnEngine {
                 if error is CancellationError { throw error }
                 try Task.checkCancellation()
                 trace.setLabel("memory.userCoreErrorType", String(reflecting: type(of: error)))
-                throw TurnEngineError.contextLoadFailed(underlying: error)
+                userCoreUnavailable = true
+                // The named gap withholds generated facts without substituting the stored projection.
+                userMemoryCore = []
+                noteRecallUnavailable(error, input: "user memory", operation: "memory.user_core", owner: "memory/memory.sqlite")
             }
         } else {
-            userMemoryCore = nil
+            userMemoryCore = []
+            userCoreUnavailable = true
+            noteRecallUnavailable(
+                ToolFailureError("The user memory data root is unavailable.", effects: .none,
+                    owner: "memory/memory.sqlite", code: "memory_user_core_unavailable", recovery: .repair),
+                input: "user memory", operation: "memory.user_core", owner: "memory/memory.sqlite"
+            )
+        }
+        trace.setFlag("memory.userCoreUnavailable", userCoreUnavailable)
+        if crossSessionRecall, remPinsDataRoot != nil, !userCoreUnavailable {
+            RepairOwed.settle(recallRepairRoot, operation: "memory.user_core",
+                evidence: .init(source: "memory/memory.sqlite", id: "userPromptCore"))
         }
         let contextFlowRequest = ContextTurnRequest(
             surface: ContextSurface(rawValue: surface),
@@ -175,7 +216,7 @@ extension SwiftNativeTurnEngine {
             // Required persona documents already ride the stable segment; do not duplicate them in the volatile packet.
             stableSegmentCarriesRequiredDocuments: true,
             userMemoryCore: userMemoryCore,
-            memoryRecallEnabled: crossSessionRecall,
+            memoryRecallEnabled: semanticRecallEnabled,
             // The same number the renderer cuts at, so the selector publishes a
             // pointer for exactly the atoms that get cut.
             packetAtomExpandThresholdChars:
@@ -216,7 +257,8 @@ extension SwiftNativeTurnEngine {
             } catch {
                 try Task.checkCancellation()
                 trace.record(.contextFlowPrepare, since: start)
-                // Failed context preparation must end the turn; a stand-in prompt cannot represent the agent's missing knowledge.
+                // Recall gaps were named above. Required context still must prepare;
+                // a stand-in prompt cannot replace a failed generation or persona.
                 throw TurnEngineError.contextLoadFailed(underlying: error)
             }
         }
@@ -226,9 +268,8 @@ extension SwiftNativeTurnEngine {
         let resolvedPersonaID: String?
         let compiledPersonaPrompt: String
         let personaStartNs = DispatchTime.now().uptimeNanoseconds
-        // Keep the USER preamble stable and daily facts dynamic so new memory does not invalidate the cached history prefix.
-        // Without a memory root, retain the whole stored document, which changes only with the document.
-        let stableUserCore = userMemoryCore.map { _ in [String]() }
+        // Only the USER preamble belongs in the stable prefix; the same bounded facts ride the dynamic packet on every turn.
+        let stableUserCore: [String] = []
         let stableDocuments = Self.stablePrefixPersonaDocuments(preparedContextTurn)
         do {
             if let preparedContextTurn {
@@ -311,10 +352,10 @@ extension SwiftNativeTurnEngine {
             try Task.checkCancellation()
             throw TurnEngineError.personaLoadFailed(underlying: error)
         }
-        // Keep USER's preamble stable and pinned facts dynamic under the same projection contract.
+        // Share the bounded person picture with persona readers and recall precoverage.
         let userDocument = personaMap["USER"]
         if let userDocument {
-            personaMap["USER"] = UserMDAutogenMarkers.promptText(userDocument, pinnedCore: userMemoryCore)
+            personaMap["USER"] = UserMDAutogenMarkers.promptText(userDocument, userMemoryCore: userMemoryCore)
         }
         // REM-approved pins take precedence over overlapping recalls.
         let remStartNs = DispatchTime.now().uptimeNanoseconds
@@ -322,9 +363,12 @@ extension SwiftNativeTurnEngine {
         if let dataRoot = remPinsDataRoot {
             do {
                 remPins = REMPinsReader.latest(try REMPinsReader.read(dataRoot: dataRoot), latestN: 3)
+                RepairOwed.settle(dataRoot, operation: "rem_pins.read",
+                    evidence: .init(source: "rem_pins.json", id: "turn_pins"))
             } catch {
-                trace.record(.remPinsRead, since: remStartNs)
-                throw error
+                if error is CancellationError { throw error }
+                try Task.checkCancellation()
+                noteRecallUnavailable(error, input: "REM pins", operation: "rem_pins.read", owner: "rem_pins.json")
             }
         }
         trace.record(.remPinsRead, since: remStartNs)
@@ -377,12 +421,18 @@ extension SwiftNativeTurnEngine {
                     surface: surface
                 )
                 trace.setMemoryRecallOutcome(.succeeded(hitCount: recalled.count))
+                RepairOwed.settle(recallRepairRoot, operation: "memory.turn_recall",
+                    evidence: .init(source: "memory/memory.sqlite", id: "recall"))
             } catch {
+                if error is CancellationError { throw error }
                 try Task.checkCancellation()
                 trace.setMemoryRecallOutcome(.failed(
                     errorType: String(reflecting: type(of: error))
                 ))
-                throw TurnEngineError.contextLoadFailed(underlying: error)
+                let repairRequired = await memory.recallRepairRequired(for: error)
+                try Task.checkCancellation()
+                noteRecallUnavailable(error, input: "memory recall", operation: "memory.turn_recall", owner: "memory/memory.sqlite",
+                    repairRequired: repairRequired)
             }
         } else {
             trace.setMemoryRecallOutcome(.notConfigured)
@@ -434,11 +484,18 @@ extension SwiftNativeTurnEngine {
             try Task.checkCancellation()
             throw TurnEngineError.toolCatalogLoadFailed(underlying: error)
         }
-        // The stem gathers inputs; turn.js owns prompt composition and ordering.
-        let intentions = try await intentionsContext(now: currentTurnClock, sessionID: sessionID, turn: turn)
+        // The stem gathers inputs and composes the prompt strings turn.js receives.
+        let intentions: String
+        do {
+            intentions = try await intentionsContext(now: currentTurnClock, sessionID: sessionID, surface: surface, turn: turn)
+        } catch let unavailable as IntentionsContextUnavailable {
+            try Task.checkCancellation()
+            intentions = "MY QUEUE is unavailable; no queued step was admitted this turn."
+            noteRecallUnavailable(unavailable, input: "intentions", operation: unavailable.operation, owner: unavailable.owner)
+        }
         let renderStartNs = DispatchTime.now().uptimeNanoseconds
-        // A pinned USER core establishes the person and suppresses first-run invitations.
-        let established = !(userMemoryCore ?? []).isEmpty
+        // A person picture establishes the person and suppresses first-run invitations.
+        let established = !userMemoryCore.isEmpty
         let deliveredRows = Self.deliveredRecalledMemoryRows(recalled, budget: turnBudget)
         let personaPrompt = Self.renderPersonaPrompt(
             compiledPersonaPrompt: compiledPersonaPrompt,
@@ -446,24 +503,28 @@ extension SwiftNativeTurnEngine {
             userMemoryCore: stableUserCore,
             surfaceGuidance: preparedContextTurn?.kernel.surfaceGuidance ?? ""
         )
-        let pinnedUser = userDocument.map {
-            UserMDAutogenMarkers.pinnedSection($0, pinnedCore: userMemoryCore)
+        let userPicture = userDocument.map {
+            UserMDAutogenMarkers.userSection($0, userMemoryCore: userMemoryCore)
         } ?? ""
         let contextPacket = preparedContextTurn.map(Self.renderContextPacket) ?? ""
         let macContext = work.invocation.macContext(dataRoot: remPinsDataRoot ?? defaultDataRoot())
         let continuationContext = turn.envelope?.macContinuation?.modelContext(context: macContext) ?? ""
-        let packetSections: [String] = [pinnedUser, intentions, contextPacket, continuationContext]
+        let recallNotice = recallUnavailableReasons.isEmpty ? "" : "Recall was unavailable this turn (\(recallUnavailableReasons.joined(separator: "; ")))."
+            + " This is not evidence that a memory exists or does not exist."
+        let episodic = try await episodicContext(sessionID: sessionID,
+            crossSessionRecall: crossSessionRecall, now: currentTurnClock, turn: turn)
+        let packetSections: [String] = [userPicture, episodic.life, intentions, contextPacket, continuationContext, recallNotice]
         let packet = packetSections.filter { !$0.isEmpty }.joined(separator: "\n\n")
         // The agent's own line with written instructions is the one they write; everything else it reaches is the agent's.
         let reach = TurnReach(
             persona: turn.lineInstructions ?? personaPrompt,
-            expression: .object(["established": .bool(established)]),
+            expression: .object(["established": userCoreUnavailable ? .null : .bool(established)]),
             pins: remPins.map(\.text),
             recall: Self.renderRecalledMemoryBlock(deliveredRows) ?? "",
             packet: packet
         )
         trace.record(.promptRender, since: renderStartNs)
-        let baseContext = TurnContext(
+        var baseContext = TurnContext(
             surface: surface,
             personaID: resolvedPersonaID,
             personaDocs: personaMap,
@@ -480,6 +541,8 @@ extension SwiftNativeTurnEngine {
             fluidContextTurn: preparedContextTurn,
             turnReach: reach
         )
+        baseContext.privateWorkingMemory = episodic.working
+        baseContext.recentLifeActs = episodic.acts
         var finalContext: TurnContext
         let quietHoursActive: Bool = {
             guard let quietHours = quietHoursSnapshot else { return false }

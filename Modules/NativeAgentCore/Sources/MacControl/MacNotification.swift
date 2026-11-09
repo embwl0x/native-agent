@@ -39,9 +39,13 @@ extension SwiftNativeMacControl {
             )
         }
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
+        if var held = receipt.delivery.deferredFields {
+            held["notificationId"] = receipt.requestIdentifier.map(JSONValue.string) ?? .null
+            return MacControlResult(ok: true, action: "notify", output: .object(held), error: nil, durationMs: durationMs)
+        }
         let receiptFields: [String: JSONValue] = [
             "submission": .string("accepted_for_delivery"),
-            "access": .string(receipt.authorization.rawValue),
+            "access": receipt.authorization.map { .string($0.rawValue) } ?? .null,
             "request_id": receipt.requestIdentifier.map { .string($0) } ?? .null,
             "delivery_observed": .bool(false),
         ]

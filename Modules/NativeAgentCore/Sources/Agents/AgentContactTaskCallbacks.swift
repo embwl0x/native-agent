@@ -41,14 +41,11 @@ extension AgentContactTasks {
             guard let id = params["id"] as? String, !id.isEmpty else { throw AgentContactPushConfig.invalid }
             // Keep the live config through the retained read so it cannot be restored by deletion.
             try updateCallbacks(taskID, owner: owner) { $0[id] = nil }
-            if let config = pushConfigs[taskID]?.removeValue(forKey: id) { try? AgentPeerCredentials.deleteSecret(account: config.account) }
+            if let config = pushConfigs[taskID]?.removeValue(forKey: id) { try AgentPeerCredentials.deleteSecret(account: config.account) }
             let key = taskID + ":" + id
-            if let restoration = pushRestorations.removeValue(forKey: key) {
-                restoration.worker.cancel()
-            }
             if let delivery = pushDeliveries.removeValue(forKey: key) {
                 delivery.worker.cancel()
-                // Join an already-started bounded POST before acknowledging deletion.
+                // Join the actual POST before acknowledging deletion.
                 await delivery.worker.value
             }
             return .object([:])
@@ -74,13 +71,18 @@ extension AgentContactTasks {
         }
     }
     func notifyPush(_ task: AgentContactTask, only owed: Set<String>? = nil) {
-        guard bridgeIsActive, (try? DataRootLife.isCurrent(task.lifeID, in: dataRoot)) == true else { return }
+        guard bridgeIsActive else { return }
+        do { guard try DataRootLife.isCurrent(task.lifeID, in: dataRoot) else { return } }
+        catch { callbackRepair(task.id, operation: "life", error: error); return }
         guard let configs = pushConfigs[task.id]?.filter({ owed?.contains($0.key) ?? true }), !configs.isEmpty else { return }
         // Callbacks carry locators and state only; artifacts require the peer’s authenticated task API.
         let event: [String: Any] = ["taskId": task.id, "contextId": task.context,
                                    "status": ["state": task.state.rawValue]]
-        guard let canonical = try? NativeAgentA2AWire.project(event, version: "1.0"),
-              let payload = try? JSONSerialization.data(withJSONObject: ["statusUpdate": canonical]) else { return }
+        let payload: Data
+        do {
+            let canonical = try NativeAgentA2AWire.project(event, version: "1.0")
+            payload = try JSONSerialization.data(withJSONObject: ["statusUpdate": canonical])
+        } catch { callbackRepair(task.id, operation: "encode", error: error); return }
         for config in configs.values {
             let key = task.id + ":" + config.id
             let previous = pushDeliveries[key]
@@ -95,27 +97,30 @@ extension AgentContactTasks {
                     await previous?.worker.value
                 } onCancel: { previous?.worker.cancel() }
                 guard self.bridgeIsActive, !Task.isCancelled, self.pushConfigs[task.id]?[config.id]?.generation == config.generation else { return }
-                let accepted = await config.deliver(payload)
+                let failure: String?
+                do { try await config.deliver(payload); failure = nil }
+                catch { failure = (error as? AgentContactFailure)?.message ?? error.localizedDescription }
                 // Deletion or replacement while the POST was pending owns the outcome now.
                 guard self.bridgeIsActive, !Task.isCancelled, self.pushConfigs[task.id]?[config.id]?.generation == config.generation else { return }
-                self.recordCallback(task, config: config, accepted: accepted)
+                self.recordCallback(task, config: config, failure: failure)
             })
         }
     }
     /// Persist callback outcomes so owed failures survive relaunch; retire secrets only after accepted terminal updates.
-    private func recordCallback(_ sent: AgentContactTask, config: AgentContactPushConfig, accepted: Bool) {
+    private func recordCallback(_ sent: AgentContactTask, config: AgentContactPushConfig, failure: String?) {
         do {
             // Eviction cannot make a sent snapshot current; patch the live record before any reread that could restore callbacks.
             var task = try records[sent.id]?.task ?? get(sent.id, owner: sent.owner)
             guard var callback = task.callbacks?[config.id], callback.account == config.account else { return }
-            if accepted { callback.delivered = sent.state.rawValue }
-            callback.failure = accepted ? nil : "The callback did not accept the \(sent.state.rawValue) update after three attempts."
+            if failure == nil { callback.delivered = sent.state.rawValue }
+            callback.failure = failure
+            guard task.callbacks?[config.id] != callback else { return }
             task.callbacks?[config.id] = callback
             try retain(task)
             records[sent.id]?.task = task
-            if accepted, sent.state.terminal { try? AgentPeerCredentials.deleteSecret(account: config.account) }
+            if failure == nil, sent.state.terminal { try AgentPeerCredentials.deleteSecret(account: config.account) }
         }
-        catch { nativeLog("[a2a] callback outcome could not be saved for %@: %@", sent.id, error.localizedDescription) }
+        catch { callbackRepair(sent.id, operation: "outcome", error: error) }
     }
     private func updateCallbacks(_ taskID: String, owner: String, _ change: (inout [String: AgentContactCallback]) -> Void) throws {
         var task = try get(taskID, owner: owner)
@@ -128,66 +133,47 @@ extension AgentContactTasks {
     /// Resume callbacks only when the task’s durable state is newer than its accepted update.
     func restoreCallbacks(_ task: AgentContactTask) {
         var owed: Set<String> = []
-        guard bridgeIsActive, (try? DataRootLife.isCurrent(task.lifeID, in: dataRoot)) == true else { return }
+        guard bridgeIsActive else { return }
+        do { guard try DataRootLife.isCurrent(task.lifeID, in: dataRoot) else { return } }
+        catch { callbackRepair(task.id, operation: "life", error: error); return }
         for (id, callback) in task.callbacks ?? [:] where pushConfigs[task.id]?[id] == nil {
             // Accepted terminal callbacks have deliberately retired their secret.
             if task.state.terminal, callback.delivered == task.state.rawValue { continue }
-            let key = task.id + ":" + id
-            guard pushRestorations[key] == nil else { continue }
             do {
                 let config = try AgentContactPushConfig.restored(callback, id: id, taskId: task.id)
                 pushConfigs[task.id, default: [:]][id] = config
                 if callback.delivered != task.state.rawValue { owed.insert(id) }
             } catch {
-                recordRestorationFailure(task, id: id, account: callback.account, attempt: 1, error: error)
-                retryRestoration(task, id: id, account: callback.account)
+                recordRestorationFailure(task, id: id, account: callback.account, error: error)
             }
         }
         if !owed.isEmpty { notifyPush(task, only: owed) }
     }
 
-    private func recordRestorationFailure(_ sent: AgentContactTask, id: String, account: String, attempt: Int, error: Error) {
+    private func recordRestorationFailure(_ sent: AgentContactTask, id: String, account: String, error: Error) {
         do {
             // Read the durable owner without get(), which itself restores callbacks.
             guard var task = try records[sent.id]?.task ?? retainedTasks(id: sent.id, owner: sent.owner).first,
                   var callback = task.callbacks?[id], callback.account == account else { return }
             let cause = (error as? AgentContactFailure)?.message ?? error.localizedDescription
-            let next = attempt < 3 ? "Recovery will retry within this bounded pass." : "Recovery will retry on the next task read or bridge activation."
-            callback.failure = "Callback restoration failed: \(cause) No update was accepted. Recovery attempt \(attempt) of 3. \(next)"
+            let failure = "Callback restoration failed: \(cause). Repair its Keychain entry, then read the task or activate the bridge to restore it."
+            guard callback.failure != failure else { return }
+            callback.failure = failure
             task.callbacks?[id] = callback
             try retain(task)
             records[task.id]?.task = task
         } catch {
-            nativeLog("[a2a] callback restoration failure could not be saved for %@: %@", sent.id, error.localizedDescription)
+            callbackRepair(sent.id, operation: "restore", error: error)
         }
     }
 
-    private func retryRestoration(_ sent: AgentContactTask, id: String, account: String) {
-        let key = sent.id + ":" + id
-        let generation = UUID()
-        pushRestorations[key] = (generation, Task {
-            defer {
-                if self.pushRestorations[key]?.generation == generation { self.pushRestorations.removeValue(forKey: key) }
-            }
-            for (index, delay) in [1, 2].enumerated() {
-                do { try await Task.sleep(for: .seconds(delay)) } catch { return }
-                guard self.bridgeIsActive, !Task.isCancelled,
-                      (try? DataRootLife.isCurrent(sent.lifeID, in: self.dataRoot)) == true else { return }
-                do {
-                    guard let task = try self.records[sent.id]?.task ?? self.retainedTasks(id: sent.id, owner: sent.owner).first,
-                          let callback = task.callbacks?[id], callback.account == account,
-                          self.pushConfigs[task.id]?[id] == nil else { return }
-                    if task.state.terminal, callback.delivered == task.state.rawValue { return }
-                    let config = try AgentContactPushConfig.restored(callback, id: id, taskId: task.id)
-                    self.pushConfigs[task.id, default: [:]][id] = config
-                    if callback.delivered != task.state.rawValue { self.notifyPush(task, only: [id]) }
-                    return
-                } catch {
-                    self.recordRestorationFailure(sent, id: id, account: account, attempt: index + 2, error: error)
-                }
-            }
-        })
+    private func callbackRepair(_ taskID: String, operation: String, error: Error) {
+        RepairOwed.owe(dataRoot, id: "callback:" + taskID, kind: .message,
+            operation: "contact.callback." + operation + ":" + taskID, owner: taskID,
+            words: "The retained callback's \(operation) failed: " + error.localizedDescription + ". Its update remains owed.",
+            lever: "Repair the named callback or retained task, then read this task to resume its owed update.")
     }
+
     /// Owed terminal callbacks survive eviction and share the same persisted recovery set.
     func retainedTasksAwaitingRecovery() throws -> [AgentContactTask] {
         let tasks = try retainedTasks(requireComplete: true)

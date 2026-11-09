@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
+import Synchronization
 // Blueprint: | `MacControl+OperationSupport.swift` | Bounded response waits retain actual-exit ownership, produced output and unknown effects |
 
 enum MacControlExecutionSignal: Sendable, Equatable {
@@ -10,12 +11,26 @@ enum MacControlExecutionSignal: Sendable, Equatable {
     case cancellationRequested
 }
 
-final class MacControlInFlightExecution: @unchecked Sendable {
+final class MacControlInFlightExecution: Sendable {
+    struct Settlement: Sendable {
+        let response: MacControlResult
+        let failure: Error?
+
+        var confirmation: Result<Void, Error> {
+            if let failure { return .failure(failure) }
+            return .success(())
+        }
+    }
+
+    private struct State: Sendable {
+        var settlement: Settlement?
+        var waiters: [UUID: ContinuationOnce<Result<Void, Error>>] = [:]
+    }
+
     let task: Task<MacControlResult, Error>
     private let signal = ContinuationOnce<MacControlExecutionSignal>()
-    private let lock = NSLock()
-    private var retainedResult: Result<MacControlResult, Error>?
-    var settledResult: Result<MacControlResult, Error>? { lock.withLock { retainedResult } }
+    private let state = Mutex(State())
+    var settledResult: MacControlResult? { state.withLock { $0.settlement?.response } }
 
     init(task: Task<MacControlResult, Error>) {
         self.task = task
@@ -25,9 +40,29 @@ final class MacControlInFlightExecution: @unchecked Sendable {
         await signal.wait(budget: context.waitBudget, cancellingWith: context.expired ? .deadline : .cancellationRequested,
             onCancel: { self.task.cancel() })
     }
-    func finish(_ result: Result<MacControlResult, Error>) {
-        lock.withLock { retainedResult = result }
+    func finish(_ settlement: Settlement) {
+        let waiters = state.withLock {
+            $0.settlement = settlement
+            let waiters = Array($0.waiters.values)
+            $0.waiters.removeAll()
+            return waiters
+        }
+        for waiter in waiters { waiter.resume(settlement.confirmation) }
         signal.resume(.result)
+    }
+
+    /// Each cancellation caller waits on actual settlement, independently of the original response signal.
+    func waitForSettlement() async throws {
+        let id = UUID()
+        let waiter = ContinuationOnce<Result<Void, Error>>()
+        let completed = state.withLock { state -> Settlement? in
+            if let settlement = state.settlement { return settlement }
+            state.waiters[id] = waiter
+            return nil
+        }
+        if let completed { waiter.resume(completed.confirmation) }
+        defer { state.withLock { $0.waiters.removeValue(forKey: id) } }
+        try await waiter.wait(cancellingWith: .failure(CancellationError())).get()
     }
 
     func requestCancellation() {

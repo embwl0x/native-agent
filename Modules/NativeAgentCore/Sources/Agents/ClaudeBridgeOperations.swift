@@ -1,4 +1,5 @@
 import Foundation
+import Experiences
 import NativeAgentShared
 import Darwin
 import Network
@@ -122,26 +123,41 @@ extension ClaudeBridgeRuntime {
                     }
                     admitted = true
                 }
-                // A bridge tool call is outermost work: it starts its own ceiling.
-                let result = try await TurnDeadline.withThrowingDeadline(seconds: Double(Self.toolWorkDeadlineSeconds),
-                                                                         deadlines: OperationDeadlines()) { deadlines in
-                    try await self.runToolOperation(id) {
-                        do {
-                            let result = try await tools.dispatch(tool: name, input: inputJV, surface: requestTurn.surface, turn: turn,
-                                invocation: ChatToolInvocation().with(\.deadlines, deadlines))
-                            if let taskID { try await tasks.finishTool(taskID, owner: principal.id, result: result) }
-                            return result
-                        } catch {
-                            // Settle only at dispatch exit. The HTTP timeout cannot claim a still-running tool has failed.
-                            if let taskID {
-                                let status = Task.isCancelled || error is CancellationError || error is TurnDeadline.DeadlineExceeded
-                                    ? "outcome_unknown" : "failed"
-                                try? await tasks.finishTool(taskID, owner: principal.id,
-                                    result: .object(["status": .string(status), "detail": .string(String(describing: error))]))
+                let result = try await self.runToolOperation(id) {
+                    let result: JSONValue
+                    do {
+                        result = try await tools.dispatch(tool: name, input: inputJV, surface: requestTurn.surface, turn: turn,
+                            invocation: ChatToolInvocation())
+                    } catch {
+                        // Only dispatch exit settles retained tool work.
+                        if let taskID {
+                            let status = Task.isCancelled || error is CancellationError
+                                ? "outcome_unknown" : "failed"
+                            let dispatchCause = String(describing: error)
+                            do {
+                                try await tasks.finishTool(taskID, owner: principal.id,
+                                    result: .object(["status": .string(status), "detail": .string(dispatchCause)]))
+                            } catch {
+                                RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message,
+                                    operation: "bridge.tool.settle:" + taskID, owner: taskID,
+                                    words: "Tool dispatch failed: " + dispatchCause
+                                        + "; saving its outcome also failed: " + error.localizedDescription,
+                                    lever: "Repair the named retained task's outcome before repeating this tool call.")
                             }
+                        }
+                        throw error
+                    }
+                    if let taskID {
+                        do { try await tasks.finishTool(taskID, owner: principal.id, result: result) }
+                        catch {
+                            RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message,
+                                operation: "bridge.tool.settle:" + taskID, owner: taskID,
+                                words: "Tool dispatch returned, but saving its result failed: " + error.localizedDescription,
+                                lever: "Repair this retained task's result from its original execution evidence; do not repeat the tool call.")
                             throw error
                         }
                     }
+                    return result
                 }
                 let resultAny = result.foundationObject
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
@@ -154,19 +170,15 @@ extension ClaudeBridgeRuntime {
                 ])
             } catch {
                 if admitted, let taskID, self.closeUnstartedTool(id) {
-                    try? await tasks.finishTool(taskID, owner: principal.id,
-                        result: .object(["status": .string("failed"), "detail": .string(String(describing: error))]))
-                }
-                if error is TurnDeadline.DeadlineExceeded {
-                    guard workLatch.claim() else { return }
-                    self.publishEvent(kind: "tool_timeout", payload: [
-                        "name": name, "surface": surface, "seconds": Self.toolWorkDeadlineSeconds,
-                    ])
-                    self.writeJSON(conn, status: 504, obj: [
-                        "error": "work_timeout", "name": name, "seconds": Self.toolWorkDeadlineSeconds,
-                        "outcome": "unknown",
-                    ])
-                    return
+                    do {
+                        try await tasks.finishTool(taskID, owner: principal.id,
+                            result: .object(["status": .string("failed"), "detail": .string(String(describing: error))]))
+                    } catch {
+                        RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message,
+                            operation: "bridge.tool.settle:" + taskID, owner: taskID,
+                            words: "Tool admission failed and its receipt could not settle: " + error.localizedDescription,
+                            lever: "Repair this retained task's receipt before repeating the tool call.")
+                    }
                 }
                 self.publishEvent(kind: "tool_failed", payload: [
                     "name": name,

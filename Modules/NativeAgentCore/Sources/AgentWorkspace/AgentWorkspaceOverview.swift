@@ -29,8 +29,7 @@ extension AgentWorkspaceNavigation {
     /// Explicitly selecting an app window brings that app forward through the normal Mac owner. Refresh/Back/restoration remain observations only.
     static func windowAction(_ place: AgentWorkspaceLocation) -> AgentWorkspaceAction {
         if case .browserBookmark(_, let title, let tabID) = place, let tabID {
-            return .open(.record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tabID),
-                "max_nodes": .int(80), "max_text_chars": .int(10000)], title: title))
+            return .open(.record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tabID)], title: title))
         }
         if case .record("screen", let input, let title) = place, case .string(let app)? = input["app"] {
             return .perform(tool: "go", input: ["name": .string(app)], title: title, textField: nil, isEffect: true)
@@ -183,8 +182,8 @@ extension AgentWorkspaceNavigation {
             case "recall_memory", "recall_search": return "Memory"
             case "read_skill": return "Skill"
             case "work_context", "desk_read", "task_ledger_list": return "Work"
-            case "messages_recent_threads": return "Messages"
-            case "mail_list_recent": return "Mail"
+            case "messages.recent": return "Messages"
+            case "mail.recent": return "Mail"
             case "shelf_entry": return "Helper result"
             case "bot_list": return "Helper"
             case "screen": return "App window"

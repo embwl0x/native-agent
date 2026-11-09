@@ -52,7 +52,7 @@ struct DreamPendingWork: Codable, Sendable {
 
     var isSettled: Bool {
         publication == nil && lessons.isEmpty && reflection == nil && reflectionReceipt == nil && reflectionAcknowledgment == nil
-            && care == nil && affect == nil && studioEntries.isEmpty && completion == nil
+            && care == nil && affect == nil && studioEntries.isEmpty && (completion == nil || completedSteps?["dreamCompleted"] != nil)
     }
 
     var identityMarker: String { Self.identityPrefix + id.uuidString + " -->" }
@@ -118,6 +118,39 @@ struct DreamPendingWork: Codable, Sendable {
                 mindEpoch: mindEpoch, selfStoryRefs: selfStoryRefs, selfChangeRefs: selfChangeRefs,
                 selfPeople: selfPeople, traits: traits, story: story, people: people)
         }
+    }
+}
+
+extension FileBackedDreamDiary {
+    /// Publication and its original completion input belong to the same section journal, independent of tone and body effects.
+    public static func savedCompletion(dataRoot: URL, since: Date, through: Date) throws -> CognitiveSleepDreamReading.Completion? {
+        let files: [URL]
+        do {
+            files = try FileManager.default.contentsOfDirectory(at: DreamPendingWork.directory(dataRoot), includingPropertiesForKeys: nil)
+                .filter { $0.pathExtension == "json" }
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
+        }
+        var latest: CognitiveSleepDreamReading.Completion?
+        var failures: [String] = []
+        for file in files {
+            do {
+                let work = try JSONDecoder().decode(DreamPendingWork.self, from: Data(contentsOf: file))
+                guard file.lastPathComponent == work.id.uuidString + ".json" else {
+                    throw PersistenceCoreError.ioFailure("dream work identity differs from its path")
+                }
+                guard work.publication == nil, work.completedSteps?["publication"] == "done",
+                      let completion = work.completion, completion.occurredAt >= since, completion.occurredAt <= through else { continue }
+                if latest.map({ $0.occurredAt < completion.occurredAt }) ?? true {
+                    latest = .init(id: work.id, occurredAt: completion.occurredAt)
+                }
+            } catch {
+                failures.append("\(file.path) completion unavailable: \(error)")
+            }
+        }
+        if let latest { return latest }
+        if !failures.isEmpty { throw PersistenceCoreError.ioFailure(failures.joined(separator: "; ")) }
+        return nil
     }
 }
 
@@ -315,13 +348,12 @@ extension DreamCycleRunner {
                     }
                     try work.save(in: dataRoot)
                 }
-                if let completion = work.completion {
+                if let completion = work.completion, work.completedSteps?["dreamCompleted"] == nil {
                     try Task.checkCancellation()
                     do {
                         let result = try await deliver(.completion(occurredAt: completion.occurredAt,
                             feltSummary: completion.feltSummary), work: work, sink: delivery)
                         try finishDelivery(result, step: "dreamCompleted", work: &work)
-                        work.completion = nil
                     } catch {
                         work.note("dreamCompleted", error: error)
                         errors.append("\(file.path) dream completion owed: \(error)")

@@ -5,17 +5,16 @@ import UIKit
 import NativeAgentShared
 #if canImport(CloudKit)
 import CloudKit
-import CloudKit
 // Blueprint: | `MobilePushNotifications.swift` | `NativeAgentPushTokenSyncCache` struct; `load`, `shouldSync` |
 #endif
 
 struct NativeAgentPushTokenSyncCache {
-    struct PairingIdentity: Codable, Equatable {
+    struct PairingIdentity: Codable, Equatable, Sendable {
         var secretHash: String?
         var secretVersion: Int64
     }
 
-    struct Fingerprint: Codable, Equatable {
+    struct Fingerprint: Codable, Equatable, Sendable {
         var tokenHash: String
         var environment: String
         var bundleId: String
@@ -30,8 +29,6 @@ struct NativeAgentPushTokenSyncCache {
     }
 
     static let defaultsKey = "NativeAgentMobile.lastSyncedAPNSToken"
-    static let tokenSyncRefreshInterval: TimeInterval = 10 * 60
-
     var defaults: UserDefaults = .standard
 
     func load() throws -> Record? {
@@ -46,15 +43,9 @@ struct NativeAgentPushTokenSyncCache {
         return try JSONDecoder().decode(Record.self, from: data)
     }
 
-    func shouldSync(
-        _ fingerprint: Fingerprint,
-        now: Date = Date(),
-        refreshInterval: TimeInterval = Self.tokenSyncRefreshInterval
-    ) throws -> Bool {
+    func shouldSync(_ fingerprint: Fingerprint) throws -> Bool {
         guard let record = try load() else { return true }
-        guard record.fingerprint == fingerprint else { return true }
-        guard now.timeIntervalSince(record.syncedAt) >= 0 else { return true }
-        return now.timeIntervalSince(record.syncedAt) >= refreshInterval
+        return record.fingerprint != fingerprint
     }
 
     func markSynced(_ fingerprint: Fingerprint, now: Date = Date()) throws {
@@ -91,7 +82,7 @@ struct NativeAgentPushTokenSyncCache {
     }
 }
 
-enum NativeAgentAPNSEnvironment: String, Equatable {
+enum NativeAgentAPNSEnvironment: String, Equatable, Sendable {
     case development
     case production
 }
@@ -140,9 +131,9 @@ enum NativeAgentAPNSEnvironmentResolver {
     }
 }
 
-/// Synchronize timeout and normal completion so UIKit's background-fetch callback fires exactly once.
-final class NativeAgentRemotePushCompletionGate: @unchecked Sendable {
-    private let lock = NSLock()
+/// UIKit completion belongs to one recovery owner, including OS withdrawal of background execution.
+@MainActor
+final class NativeAgentRemotePushCompletionGate {
     private var completed = false
     private var appliedData = false
     private let completionHandler: (UIBackgroundFetchResult) -> Void
@@ -151,47 +142,81 @@ final class NativeAgentRemotePushCompletionGate: @unchecked Sendable {
         self.completionHandler = completionHandler
     }
 
-    func noteAppliedData() {
-        lock.lock()
-        appliedData = true
-        lock.unlock()
-    }
+    func noteAppliedData() { appliedData = true }
 
     func complete(_ result: UIBackgroundFetchResult) {
-        lock.lock()
-        guard !completed else {
-            lock.unlock()
+        guard !completed else { return }
+        completed = true
+        completionHandler(appliedData ? .newData : result)
+    }
+}
+
+@MainActor
+private final class NativeAgentPushRecovery {
+    private let application: UIApplication
+    private let completion: NativeAgentRemotePushCompletionGate
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var task: Task<Void, Never>?
+
+    init(application: UIApplication, completion: NativeAgentRemotePushCompletionGate) {
+        self.application = application
+        self.completion = completion
+    }
+
+    func start(userInfo: [AnyHashable: Any]) {
+        backgroundTask = application.beginBackgroundTask(
+            withName: "NativeAgent push recovery", expirationHandler: Self.expirationHandler(for: self))
+        guard backgroundTask != .invalid else {
+            completion.complete(.noData)
             return
         }
-        completed = true
-        let finalResult: UIBackgroundFetchResult = appliedData ? .newData : result
-        lock.unlock()
-        // UIKit requires the background-fetch completion callback on the main thread.
-        if Thread.isMainThread {
-            completionHandler(finalResult)
-        } else {
-            // Keep UIKit's completion on its originating main thread.
-            nonisolated(unsafe) let handler = completionHandler
-            DispatchQueue.main.async { handler(finalResult) }
+        task = Task {
+            let recovery = DeviceSyncRecovery(didApplyData: { [completion] in
+                Task { @MainActor in completion.noteAppliedData() }
+            })
+            PushReceiptLedger.record(userInfo: userInfo)
+            PhoneSenses.shared.wake()
+            if recovery.isActive, await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo, recovery: recovery) {
+                completion.noteAppliedData()
+            }
+            if recovery.isActive { _ = await iCloudSyncEngine.shared.refreshActivitySnapshot(recovery: recovery) }
+            completion.complete(.noData)
+            endBackgroundExecution()
+            task = nil
         }
+    }
+
+    private func expire() {
+        task?.cancel()
+        completion.complete(.noData)
+        endBackgroundExecution()
+    }
+
+    private nonisolated static func expirationHandler(for owner: NativeAgentPushRecovery) -> @Sendable () -> Void {
+        { [weak owner] in Task { @MainActor in owner?.expire() } }
+    }
+
+    private func endBackgroundExecution() {
+        guard backgroundTask != .invalid else { return }
+        application.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
     }
 }
 
 final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
-    private static let backgroundPushDeadlineNanoseconds: UInt64 = 25_000_000_000
     func application(
         _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
         let token = deviceToken.map { String(format: "%02x", $0) }.joined()
         let bundleId = Bundle.main.bundleIdentifier ?? "io.github.embwl0x.nativeagent.ios"
-        guard let apnsEnvironment = NativeAgentAPNSEnvironmentResolver.current() else {
-            NSLog("[NativeAgentMobile] APNS token sync skipped: signed aps-environment could not be resolved")
-            return
-        }
-        let environment = apnsEnvironment.rawValue
         NSLog("[NativeAgentMobile] APNS token registered suffix=%@", String(token.suffix(8)))
         Task { @MainActor in
+            guard let apnsEnvironment = await Task.detached(operation: { NativeAgentAPNSEnvironmentResolver.current() }).value else {
+                iCloudSyncEngine.shared.syncError = "The signed APNS environment could not be read. Install the current signed iPhone app."
+                return
+            }
+            let environment = apnsEnvironment.rawValue
             guard let pairingStore = iCloudSyncEngine.shared.pairingStore,
                   pairingStore.iCloudPairingSecret != nil else {
                 NSLog("[NativeAgentMobile] APNS token sync deferred until iCloud pairing")
@@ -199,7 +224,6 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
             }
             let deviceId = UIDevice.current.identifierForVendor?.uuidString
                 ?? UIDevice.current.name
-            let cache = NativeAgentPushTokenSyncCache()
             let pairing = NativeAgentPushTokenSyncCache.pairingIdentity(
                 secret: pairingStore.iCloudPairingSecret,
                 secretVersion: pairingStore.knownSecretVersion
@@ -212,8 +236,8 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
                 pairing: pairing
             )
             do {
-                if try !cache.shouldSync(fingerprint) {
-                    NSLog("[NativeAgentMobile] APNS token sync skipped recently refreshed suffix=%@", String(token.suffix(8)))
+                let needsSync = try await Task.detached { try NativeAgentPushTokenSyncCache().shouldSync(fingerprint) }.value
+                if !needsSync {
                     return
                 }
                 _ = try await iCloudSyncEngine.shared.registerPushToken(
@@ -222,7 +246,7 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
                     bundleId: bundleId,
                     deviceId: deviceId
                 )
-                try cache.markSynced(fingerprint)
+                try await Task.detached { try NativeAgentPushTokenSyncCache().markSynced(fingerprint) }.value
                 NSLog("[NativeAgentMobile] APNS token synced to Mac")
             } catch {
                 iCloudSyncEngine.shared.syncError = "APNS token sync: \(error.localizedDescription)"
@@ -245,33 +269,8 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
-        let completionGate = NativeAgentRemotePushCompletionGate(completionHandler)
-        // Recovery and acknowledgment must share the same push deadline.
-        let deadline = Date().addingTimeInterval(
-            Double(Self.backgroundPushDeadlineNanoseconds) / 1_000_000_000
-        )
-        let timeoutTask = Task {
-            try? await Task.sleep(nanoseconds: Self.backgroundPushDeadlineNanoseconds)
-            guard !Task.isCancelled else { return }
-            completionGate.complete(.noData)
-        }
-        Task { @MainActor in
-            let recovery = DeviceSyncRecovery(deadline: deadline, didApplyData: { completionGate.noteAppliedData() })
-            PushReceiptLedger.record(userInfo: userInfo)
-            PhoneSenses.shared.wake()
-            if recovery.hasTime,
-               await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo, recovery: recovery) {
-                completionGate.noteAppliedData()
-            }
-            if recovery.hasTime {
-                _ = await withCKTimeout("NativeAgentMobile.push.activitySnapshot", seconds: max(0, deadline.timeIntervalSinceNow)) {
-                    guard recovery.hasTime else { return }
-                    _ = await iCloudSyncEngine.shared.refreshActivitySnapshot(recovery: recovery)
-                }
-            }
-            timeoutTask.cancel()
-            completionGate.complete(.noData)
-        }
+        let completion = NativeAgentRemotePushCompletionGate(completionHandler)
+        NativeAgentPushRecovery(application: application, completion: completion).start(userInfo: userInfo)
     }
 }
 

@@ -111,7 +111,7 @@ extension FileSystemActions {
                 )
             }
         } catch let failure as VerifiedPath.Failure {
-            return errResult(failure.message, code: "path_not_allowed")
+            return errResult(failure.message, code: failure.code, path: searchPath)
         } catch {
             return errResult(
                 "The authorized path could not be verified before the search.",

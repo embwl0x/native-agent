@@ -8,15 +8,19 @@ import Observation
 import ChatTurnRuntime
 import ChatTurnContracts
 import ChatToolRuntime
+import AuthoredCapabilities
+import ChatToolParsing
 import PersistenceCore
 import ToolRegistry
 import ToolExecution
 import Senses
+import TelegramBot
 import PersonaEngine
 import AgentWorkspace
 import Desk
 import MacControl
-// Blueprint: | `EngineTools.swift` | `PartDoor`, `withPartDoor`; Explicit turn, host and originating gated chain for native part calls |
+import Privacy
+// Blueprint: | `EngineTools.swift` | `PartDoor`, `withPartDoor`; gated native calls and owner-supplied page outcomes |
 
 /// A native operation holds its turn and dependencies, including in callbacks it keeps.
 public struct PartDoor: Sendable {
@@ -204,20 +208,23 @@ public final class ToolsFacade {
         continuation: DeskContinuationTurn? = nil,
         admitModel: (@Sendable (Turn?) async throws -> Turn)? = nil,
         execution suppliedExecution: AppActionExecution? = nil,
+        traced: Bool = false,
         operation: @Sendable (PartDoor) async throws -> Value) async throws -> Value {
         let surface = envelope.surface
-        let turn = (parent ?? Turn(session: ResidentWake.session).with(\.verifiedSessionID, ResidentWake.session))
+        // A native operation with no turn of its own acts on the agent's own line, its mind stream.
+        let turn = (parent ?? Turn(session: Happening.stream).with(\.verifiedSessionID, Happening.stream))
             .with(\.envelope, envelope).with(\.fileAccess, fileAccess)
         let engine = NativeAgentEngine.forRoot(dataRoot)
         let filer: any ApprovalFiler = approvalFiler ?? NativeAgentChatApprovalFiler(dataRoot: dataRoot)
         let perform: PartDoor.Dispatch = { name, arguments, turn, execution in
             let scopedTools = engine.toolDispatchClient(enforceAppAutonomy: false, actionExecution: execution)
             let invocation = execution.invocation.with(\.authoredCall, execution.authoredCall)
-            let chain = makeGatedToolDispatchClient(tools: scopedTools, fileAccess: fileAccess,
+            let gated = makeGatedToolDispatchClient(tools: scopedTools, fileAccess: fileAccess,
                 approvalFiler: filer, dataRoot: self.dataRoot, verifiedSessionId: turn.verifiedSessionID,
                 approvedReplay: approvedReplay,
+                tracePeerTurn: traced,
                 work: .init(handsBack: execution.handsBack, admissionOnly: execution.admissionOnly, toolInvocation: invocation))
-            return try await chain.dispatch(tool: name, input: arguments, surface: surface, turn: turn, invocation: invocation)
+            return try await gated.dispatch(tool: name, input: arguments, surface: surface, turn: turn, invocation: invocation)
         }
         // A native ingress without a supplied operation starts one here; callers with an operation keep it whole.
         let invocation = ChatToolInvocation()
@@ -231,7 +238,99 @@ public final class ToolsFacade {
         let tools = engine.toolDispatchClient(enforceAppAutonomy: false, actionExecution: execution)
         return try await tools.withAuthoredProgramHost(surface: surface, turn: turn, execution: execution) { turn, execution in
             guard let host = execution.host else { throw PartError.invalid("The part door has no host.") }
-            return try await operation(PartDoor(turn: turn, host: host, dispatch: perform, execution: execution))
+            return try await ProviderToolResultPage.holding(turn: turn, sessionId: turn.verifiedSessionID ?? turn.session) { turn in
+                try await operation(PartDoor(turn: turn, host: host, dispatch: perform, execution: execution))
+            }
+        }
+    }
+
+    /// The person's tap on a row runs the row's call through the person's door: their envelope at the door they tapped (the phone's signed,
+    /// with the device its router verified; Telegram's verified sender and chat), on the agent's own line, and as their own decision of that
+    /// exact call when the stem composed the row (`PersonAct`). The agent's call of the same row is the same `app` call through its own
+    /// turn's door, judged by the same law. The reply retains the owner's words, effects and page-specific settlement metadata.
+    public nonisolated func personTap(_ call: PartFace.Call, _ tap: PartFaces.Tap) async throws -> FaceActOutcome {
+        let work = "face:" + tap.page + "/" + tap.row + "/" + tap.action
+        let envelope: TurnEnvelope = switch tap.door {
+        case "phone": TurnEnvelope(surface: "ios", verifiedUserId: tap.device, commandSignatureVerified: tap.device != nil, workIdentity: work)
+        case "telegram": TurnEnvelope(surface: "telegram", verifiedChatId: tap.chat, verifiedUserId: tap.device, workIdentity: work)
+        default: .personOnMac(work)
+        }
+        let input = call.input
+        // The person at the Telegram door is its owner (`TelegramBotConfig.ownerUserId`); another allowed sender's tap is an ask, as the
+        // agent's own call is, and a card, which only the person answers, refuses it. With no single owner Telegram carries no person's act.
+        var decided = tap.decided
+        if tap.door == "telegram" {
+            let owner = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false)?.ownerUserId
+            if owner == nil || tap.device != owner.map(String.init) {
+                guard tap.page != "inbox" else {
+                    throw PartCallError(code: "not_the_person", message: owner == nil
+                        ? "Telegram has no single owner, so no one answers cards there: answer it on the Mac or the phone. Allowing exactly one "
+                            + "Telegram user (Connectors › Telegram › allowed user IDs) makes that user the person there. Nothing changed."
+                        : "Only the person answers this card. Nothing changed.")
+                }
+                decided = false
+            }
+        }
+        let act = decided ? PersonAct(by: .tap(door: tap.door, device: tap.device, chat: tap.chat, page: tap.page, row: tap.row),
+            tool: "app", input: input) : nil
+        var turn = Turn(session: Happening.stream).with(\.verifiedSessionID, Happening.stream).with(\.personAct, act)
+        turn[FacePresentationPart.self] = tap.renderer
+        let readOnly = try AppActionBinding.action(input: input, turn: turn)?.read == true
+        // The tap's call leaves the same act receipt the agent's call of it leaves.
+        let reply = try await withPartDoor(envelope: envelope, turn: turn, traced: true) { door in try await door.perform("app", input) }
+        let result = ToolResult(reply)
+        let fields = reply.objectValue ?? [:]
+        let owner = fields["result"]?.objectValue ?? fields
+        // Receipt envelopes hold the action's own reply in result; unwrapped replies are action values themselves.
+        let words = fields["result"].flatMap(ChatToolOutcome.explanation) ?? ChatToolOutcome.explanation(reply)
+        let effects: FaceEffects = switch result.effects {
+        case .none?: .none
+        case .occurred?, .partial?: .known
+        case .unknown?: .unknown
+        case nil: readOnly ? .none : (result.outcome == .succeeded && !result.isOpen ? .known : .unknown)
+        }
+        let failure: WireFailure?
+        if result.outcome.isFailure || result.carriesFailureEvidence {
+            failure = WireFailure(code: fields["reason"]?.stringValue ?? result.status ?? "failed",
+                message: words ?? result.failure ?? call.action + " did not run.", cause: result.failure, effects: effects,
+                fields: owner["argument_path"]?.stringValue.map { [$0: words ?? call.action + " did not run."] })
+        } else { failure = nil }
+        let settlement = try owner["pageSettlement"].map {
+            try JSONDecoder().decode(FaceActSettlement.self, from: $0.serializedData(pretty: false))
+        }
+        return FaceActOutcome(words: failure == nil ? words : nil, failure: failure, effects: effects,
+                              accepted: result.outcome == .succeeded && !result.isOpen,
+                              committed: settlement?.committed, undo: settlement?.undo)
+    }
+
+    /// Every face the app draws runs through one door: the part's sandboxed face call inside `withPartDoor`, origin `background:faces`.
+    @concurrent public nonisolated func face(id: String, input: JSONValue, version: String,
+                                            documentRead: Bool = false) async -> PartCallResult<PartFace> {
+        let prepared: NativeAgentSecretRedactor.FaceInput
+        do { prepared = try await Parts(root: dataRoot).prepareFace(id: id, input: input) }
+        catch { return .failure(.init(code: error is CancellationError ? "cancelled" : "input_limit", message: error.localizedDescription)) }
+        do {
+            return try await withPartDoor(envelope: .native("background:faces")) { door in
+                await Parts(root: dataRoot).face(id: id, input: prepared, version: version, invocation: door.invocation, documentRead: documentRead)
+            }
+        } catch { return .failure(.init(code: "door_unavailable", message: error.localizedDescription)) }
+    }
+
+    /// A declared read enters the ordinary app door, with no person's act and no permission to invoke a write.
+    @concurrent public nonisolated func pageRead(_ call: PartFace.Call, envelope: TurnEnvelope, turn: Turn? = nil) async throws -> JSONValue {
+        try await withPartDoor(envelope: envelope, fileAccess: turn?.fileAccess ?? "auto", turn: turn) { door in
+            guard try AppActionBinding.action(input: call.input, turn: door.turn)?.read == true else {
+                throw PartCallError(code: "not_a_read", message: "\(call.action) does not declare this call read-only; the document did not run it.")
+            }
+            let reply = try await door.perform("app", call.input)
+            let result = ToolResult(reply)
+            if result.outcome == .succeeded, result.hasReadEvidence(completeOnly: true), !result.isOpen,
+               let value = reply.objectValue?["result"] {
+                return value
+            }
+            // Pending, unconfirmed and failed reads retain their owner's whole outcome,
+            // including continuation and remedy, in the projection's frozen input.read.
+            return reply
         }
     }
 

@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SlackWebAPI.swift` | `requireConfiguredToken`; checked HTTP replies, uploads and reconciliation with ConnectorActionReceipt proofs |
+// Blueprint: | `SlackWebAPI.swift` | Canonical text sends; strict response envelopes and delivery evidence |
 
 /// Slack Web API HTTP mechanics, replies and uploads. Callers own token grants, setup validation, reconciliation sessions and connection-proof policy.
 public enum SlackWebAPI {
@@ -37,14 +37,13 @@ public enum SlackWebAPI {
         let input = input.filter { $0.value != .null && $0.value != .string("") }
         let channel = input["channel"]?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let text = (input["text"] ?? input["message"])?.scalarText?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let text = (input["text"] ?? input["message"])?.scalarText ?? ""
         guard !channel.isEmpty else {
             throw NSError(domain: "NativeAgentSlack", code: -400, userInfo: [
                 NSLocalizedDescriptionKey: "slack.post_message requires channel"
             ])
         }
-        guard !text.isEmpty else {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(domain: "NativeAgentSlack", code: -400, userInfo: [
                 NSLocalizedDescriptionKey: "slack.post_message requires text"
             ])
@@ -86,6 +85,61 @@ public enum SlackWebAPI {
             action: updatingMessageTs == nil ? "slack.post_message" : "slack.update_message",
             response: try await response(for: request, dataRoot: dataRoot, session: replySession)
         )
+    }
+
+    /// Conservative UTF-16 bound also fits Slack's 40,000-character ceiling, including a single enormous grapheme.
+    static func messageParts(_ text: String) -> [String] {
+        var parts: [String] = [], part = ""
+        var units = 0
+        func append(_ piece: String, width: Int) {
+            if width > 35_000 - units {
+                if !part.isEmpty { parts.append(part) }
+                part = ""; units = 0
+            }
+            part += piece
+            units += width
+        }
+        for character in text {
+            let piece = String(character)
+            let width = piece.utf16.count
+            if width <= 35_000 { append(piece, width: width) }
+            else {
+                // A grapheme may itself exceed the whole message budget; scalar splits still guarantee progress.
+                for scalar in piece.unicodeScalars {
+                    append(String(scalar), width: scalar.value > 0xFFFF ? 2 : 1)
+                }
+            }
+        }
+        if !part.isEmpty { parts.append(part) }
+        return parts
+    }
+
+    private static func checkedResponse(_ envelope: JSONValue) throws -> [String: JSONValue] {
+        guard let response = envelope.objectValue?["response"]?.objectValue,
+              response["ok"]?.boolValue != nil else {
+            throw SlackSocketModeError.api("Slack response envelope is malformed; acceptance remains unknown. Inspect the saved delivery before resending.")
+        }
+        return response
+    }
+
+    static func hasTruncationWarning(_ envelope: JSONValue) throws -> Bool {
+        let response = try checkedResponse(envelope)
+        if response["warning"]?.stringValue == "message_truncated" { return true }
+        guard case .array(let warnings)? = response["response_metadata"]?.objectValue?["warnings"] else { return false }
+        return warnings.contains(.string("message_truncated"))
+    }
+
+    /// Only explicit non-acceptance permits replay. Slack's internal_error/fatal_error may follow partial success.
+    static func isProvenMessageRejection(_ envelope: JSONValue) throws -> Bool {
+        let response = try checkedResponse(envelope)
+        if let status = response["httpStatus"]?.exactIntegerValue, status >= 500 || status == 408 { return false }
+        guard response["ok"]?.boolValue == false, let error = response["error"]?.stringValue else { return false }
+        return Set([
+            "invalid_auth", "not_authed", "token_expired", "token_revoked",
+            "missing_scope", "no_permission", "not_in_channel", "channel_not_found",
+            "is_archived", "no_text", "msg_too_long", "invalid_arguments",
+            "invalid_metadata", "metadata_too_large", "ratelimited", "rate_limited",
+        ]).contains(error)
     }
 
     static func uploadFile(
@@ -154,7 +208,7 @@ public enum SlackWebAPI {
             withJSONObject: [["id": fileId, "title": filename]],
             options: []
         )
-        let filesJSON = String(data: filesData, encoding: .utf8) ?? "[{\"id\":\"\(fileId)\"}]"
+        let filesJSON = String(decoding: filesData, as: UTF8.self)
         var completeForm: [String: String] = [
             "files": filesJSON,
             "channel_id": channel,
@@ -205,21 +259,17 @@ public enum SlackWebAPI {
 
     public static func response(for request: URLRequest, session: URLSession) async throws -> [String: Any] {
         let (data, resp) = try await session.data(for: request)
-        var parsed: [String: Any]
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            parsed = object
-        } else {
-            parsed = [
-                "ok": false,
-                "error": "non_json_response",
-                "rawPreview": String(data: data.prefix(300), encoding: .utf8) ?? "",
-            ]
+        guard var parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw SlackSocketModeError.api("Slack returned non-object JSON; inspect transport and delivery evidence before resending.")
         }
 
         if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
             parsed["ok"] = false
             parsed["error"] = (parsed["error"] as? String) ?? "http_\(http.statusCode)"
             parsed["httpStatus"] = http.statusCode
+        }
+        guard parsed["ok"] as? Bool != nil else {
+            throw SlackSocketModeError.api("Slack response omitted its acceptance result; inspect delivery evidence before resending.")
         }
         return parsed
     }
@@ -338,21 +388,16 @@ public enum SlackWebAPI {
 }
 
 private enum SlackTokenRedactor {
-    private static let slackToken = try! NSRegularExpression(
-        pattern: "\\b(?:xox[baprs]-[A-Za-z0-9-]{20,}|xapp-[A-Za-z0-9-]{20,}|xoxe(?:\\.xoxp)?-[A-Za-z0-9-]{20,})\\b",
-        options: []
-    )
+    private static let slackToken = "\\b(?:xox[baprs]-[A-Za-z0-9-]{20,}|xapp-[A-Za-z0-9-]{20,}|xoxe(?:\\.xoxp)?-[A-Za-z0-9-]{20,})\\b"
+
+    static func redactText(_ raw: String) -> String {
+        raw.replacingOccurrences(of: slackToken, with: "[REDACTED_SLACK_TOKEN]", options: .regularExpression)
+    }
 
     static func redactValue(_ value: JSONValue) -> JSONValue {
         switch value {
         case .string(let raw):
-            let range = NSRange(location: 0, length: (raw as NSString).length)
-            return .string(slackToken.stringByReplacingMatches(
-                in: raw,
-                options: [],
-                range: range,
-                withTemplate: "[REDACTED_SLACK_TOKEN]"
-            ))
+            return .string(TurnSecretRedactor.redactText(redactText(raw)))
         case .array(let items):
             return .array(items.map { redactValue($0) })
         case .object(let object):

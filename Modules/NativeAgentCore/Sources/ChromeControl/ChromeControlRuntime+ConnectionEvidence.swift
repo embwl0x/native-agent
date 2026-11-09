@@ -90,7 +90,7 @@ extension ChromeControlRuntime {
             try Task.checkCancellation()
             if readyChannel != nil, let seen = facts.extensionSeenAt, seen >= selectedAt,
                let files = extensionFiles, files.path == ChromeExtensionFolder.visible.path,
-               acceptedExtensionMatchesFolder == true { return true }
+               acceptedExtensionMatchesShipped == true { return true }
             if let at = handshakeAt, at >= selectedAt, facts.handshakeResult == "rejected" { break }
             if await transportAvailable() == false { break }
         }

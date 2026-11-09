@@ -45,8 +45,7 @@ extension AppToolExecutor {
         dreamEnabled: () async throws -> Bool,
         runDream: () async -> (succeeded: Bool, status: String, error: String?, busy: [String]),
         previewDream: () async -> QuietMindOutcome,
-        runREM: () async -> (succeeded: Bool, message: String),
-        runGrowth: () async -> (succeeded: Bool, note: String)
+        runREM: () async -> (succeeded: Bool, message: String)
     ) async -> QuietMindOutcome {
         if input["preview"] == .bool(true) {
             if verb == "dream" { return await previewDream() }
@@ -89,13 +88,6 @@ extension AppToolExecutor {
             return (true, feedback.message + " Its proposals wait in Approvals.", [:])
         case "body":
             return await quietMindBody()
-        case "self_improvement":
-            guard UserDefaults.standard.object(forKey: "selfImprovementEnabled") as? Bool ?? true else {
-                return (false, "Personal growth is off. setting.set with setting personality.self_improvement, value true turns it on; then run again.", [:])
-            }
-            let run = await runGrowth()
-            if run.succeeded { return (true, run.note, [:]) }
-            return (false, run.note + Self.quietMindRetry, [:])
         default: break
         }
         await runtime.bootstrap()
@@ -150,6 +142,15 @@ extension AppToolExecutor {
             return (outcome.ok, outcome.detail, ["source": .string(source)])
         case "think_now":
             return background(await runtime.runMicrocycle(reason: "mind_run think_now"), "Thinking")
+        case "workspace":
+            guard case .bool(let enabled)? = input["value"] else {
+                return (false, "mind.workspace takes value true or false.", [:])
+            }
+            let detail = await runtime.observatoryDetail()
+            if (detail.summary.ablations["workspace"] != false) != enabled {
+                await runtime.setAblation("workspace", enabled: enabled)
+            }
+            return (true, enabled ? "Workspace included." : "Workspace excluded.", [:])
         case "reflect":
             guard config.reflectiveCallsEnabled else {
                 return (false, "Reflection is off. setting.set with setting settings.reflection, value true turns it on.", [:])
@@ -232,7 +233,7 @@ extension AppToolExecutor {
     }
 
     public static func recordQuietMindDecision(_ tool: String, input: [String: JSONValue], dataRoot: URL, turn: Turn) {
-        HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: tool,
+        BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: tool,
                               sessionID: input["__session_id"]?.scalarText, dataRoot: dataRoot)
     }
 }

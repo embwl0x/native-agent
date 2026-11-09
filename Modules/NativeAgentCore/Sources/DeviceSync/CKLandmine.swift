@@ -25,12 +25,14 @@ public func nativeAgentHasCloudKitServiceEntitlement() -> Bool {
     DeviceCloudKitPreflight.hasCloudKitEntitlement()
 }
 
-public func nativeAgentCloudKitAccountStatus(label: String) async -> String {
+public func nativeAgentCloudKitAccountStatus() async -> String {
     guard nativeAgentCloudKitAccountProbeEnabled() else { return "iCloud account not checked (diagnostic probe disabled)" }
     #if canImport(CloudKit)
-    return await withCKTimeout(label) {
-        nativeAgentCloudKitAccountWords(try await CKContainer.default().accountStatus())
-    } ?? "iCloud didn't answer in time"
+    do {
+        return nativeAgentCloudKitAccountWords(try await CKContainer.default().accountStatus())
+    } catch {
+        return "iCloud account check failed: \(error.localizedDescription)"
+    }
     #else
     return "iCloud isn't available"
     #endif
@@ -52,7 +54,7 @@ private func nativeAgentCloudKitAccountWords(_ status: CKAccountStatus) -> Strin
 extension MemoryV2NativeStackSnapshot {
     public static func load(dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> Self {
         var snap = await read(dataRoot: dataRoot)
-        snap.cloudKitAccountStatus = await nativeAgentCloudKitAccountStatus(label: "MemoryV2NativeStackSnapshot.cloudKitAccount")
+        snap.cloudKitAccountStatus = await nativeAgentCloudKitAccountStatus()
 
         return snap
     }

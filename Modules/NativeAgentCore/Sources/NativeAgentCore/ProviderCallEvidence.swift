@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ProviderCallEvidence.swift` | Provider lifecycle evidence and learned first-output deadlines |
+// Blueprint: | `ProviderCallEvidence.swift` | Payload-free provider lifecycle and first-output timing evidence |
 
 /// Payload-free evidence emitted by the shared provider router around one real adapter invocation. The call id is minted before the adapter starts and is
 /// reused for its terminal phase, so the organism can predict an outcome before observing it instead of inferring provider health after the fact.
@@ -89,38 +89,6 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
 
 public protocol LLMCallLifecycleObserving: Sendable {
     func observeProviderCall(_ event: LLMCallLifecycleEvent) async
-    /// Asked once as a stream starts: how long this provider has taken to its first output on this model and stream kind, for a request this size.
-    func firstOutputDeadline(provider: String, model: String, streamKind: String?, requestBytes: Int) async -> FirstOutputDeadline
-}
-
-/// A provider's slowest first output (text, thinking or tool, the adapter's `ttftMs`) over its retained streamed calls. Below `callsNeeded` calls the slowest
-/// is not yet evidence and the deadline is unmeasured.
-public struct FirstOutputDeadline: Sendable, Equatable {
-    public static let callsNeeded = 100
-    public let calls: Int
-    public let slowest: TimeInterval?
-    /// The slowest first output per input byte among those calls: what reading (upload and prefill) has cost this provider at its worst.
-    public let slowestPerByte: Double?
-    public let requestBytes: Int
-
-    public init(calls: Int, slowest: TimeInterval?, slowestPerByte: Double? = nil, requestBytes: Int = 0) {
-        self.calls = calls
-        self.slowest = slowest
-        self.slowestPerByte = slowestPerByte
-        self.requestBytes = requestBytes
-    }
-
-    /// The slowest first output preserves real slow starts; larger inputs scale it up.
-    public var seconds: TimeInterval? {
-        guard calls >= Self.callsNeeded, let slowest, slowest.isFinite, slowest >= 0,
-              requestBytes >= 0 else { return nil }
-        let perByte = slowestPerByte ?? 0
-        guard perByte.isFinite, perByte >= 0 else { return nil }
-        let seconds = max(slowest, perByte * Double(requestBytes))
-        // A learned deadline must fit the clock that will wait for it.
-        guard UInt64(exactly: (seconds * 1_000_000_000).rounded(.up)) != nil else { return nil }
-        return seconds
-    }
 }
 
 extension LLMMessage {

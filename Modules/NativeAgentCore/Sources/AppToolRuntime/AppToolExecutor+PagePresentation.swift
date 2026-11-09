@@ -1,10 +1,48 @@
 import ChatToolParsing
 import Dispatcher
 import Foundation
+import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `AppToolExecutor+PagePresentation.swift` | screenshot results with an explicit image sink and quiet page/read rendering |
+// Blueprint: | `AppToolExecutor+PagePresentation.swift` | screenshot results, quiet page reads, and a door-only page's read (summary, actions, Trust's access rows) |
+
+/// Where a door-only page's access is set: on Trust (with Trust's snapshot as the door last read it, nil when Trust never published), or
+/// nowhere of its own.
+public enum DoorPageAccess {
+    case trust(PartFaceSnapshot?)
+    case notOnTrust
+}
 
 extension AppToolExecutor {
+    /// A door-only page has no screen: it is a group of the door's actions. It reads as its summary, the actions registered on it and, for
+    /// a page whose access the person sets on Trust, the Trust page's own rows for it (`integration.<page>.*`), as Trust draws them.
+    /// Trust's words for a face that did not draw stand in for those rows; a page Trust draws no row for says so.
+    @MainActor public static func doorPageRead(_ page: QuietToolPage, access: DoorPageAccess, turn: Turn?) -> [JSONValue] {
+        func section(_ heading: String, _ lines: [String]) -> JSONValue {
+            .object(["heading": .string(heading), "lines": .array(lines.map(JSONValue.string))])
+        }
+        var content = [section(page.title, [page.summary])]
+        do {
+            let registered = try AppActions.on(page: page.id, turn: turn).filter { $0.page == page.id }.map(\.id)
+            content.append(section("Registered actions", registered.isEmpty ? ["None."] : registered))
+        } catch {
+            content.append(.object(["heading": .string("Registered actions"), "lines": .array([]), "status": .string("unavailable"),
+                "reason": .string("action_catalog_unavailable"), "detail": .string(error.localizedDescription),
+                "remedy": Repair.remedy(owner: "Registered actions", nextCall: nil, tap: nil,
+                    instruction: "Repair the action catalog before reading this page's registered actions.")]))
+        }
+        guard case .trust(let trust) = access else { return content }
+        guard let snapshot = trust else { return content + [section("Access in Trust", ["Trust has not published its page."])] }
+        let prefix = "integration." + page.id + "."
+        let rows = ((snapshot.levers ?? []) + (snapshot.drawnFace?.sections ?? [])).flatMap(\.rows).filter { $0.id.hasPrefix(prefix) }
+        func lines(_ words: String) -> [String] { words.components(separatedBy: "\n").filter { !$0.isEmpty } }
+        if snapshot.drawnFace == nil, rows.isEmpty {
+            return content + [section("Access in Trust", lines(snapshot.text(title: "Trust", door: true)))]
+        }
+        guard !rows.isEmpty else { return content + [section("Access in Trust", ["Trust draws no switch for \(page.title)."])] }
+        return content + [section("Access in Trust", lines(PartFace(sections: [.init(id: "access", rows: rows)]).text(door: true)))]
+    }
+
     /// PNG outputs: excluded from local/off-disk backup, export and phone sync; listed in PrivacyMap. The returned path is a live output artifact.
     public static func pageScreenshotResult(
         page: QuietToolPage, tabKey: String, dataRoot: URL,

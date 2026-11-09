@@ -144,15 +144,8 @@ public struct DreamREMGatePolicy: Sendable, Equatable {
         "Enable the REM cycle toggle in Dreams to run REM consolidation."
 }
 
-/// Use shared local-clock scheduling so nightly dreams name the preceding calendar day.
+/// Civil date keys name a night by its start.
 public enum DreamREMSchedule {
-    public static let dreamHour = 3
-    public static let dreamMinute = 30
-
-    /// Keep REM timing here; app-side scheduling must forward rather than duplicate constants.
-    public static let remHour = 4
-    public static let remMinute = 30
-
     public static func localCalendar() -> Calendar {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = .current
@@ -167,14 +160,7 @@ public enum DreamREMSchedule {
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
-    /// A nightly dream belongs to the preceding local day because it reflects the day that ended.
-    public static func dreamEntryDateKey(
-        now: Date = Date(),
-        calendar: Calendar = localCalendar()
-    ) -> String {
-        let previous = calendar.date(byAdding: .day, value: -1, to: now) ?? now.addingTimeInterval(-86_400)
-        return todayKey(now: previous, calendar: calendar)
-    }
+
 }
 
 // MARK: - FileBackedDreamDiary
@@ -228,6 +214,17 @@ public struct FileBackedDreamDiary: Sendable {
         }
     }
 
+    /// Include empty and absent traversal directories so later diary membership changes can reach the watcher.
+    public func observationPaths() throws -> [URL] {
+        var failure: (any Error)?
+        let discovery = diaryFiles(in: .includingArchives, matching: .markdown) { _, error in
+            let code = (error as? CocoaError)?.code
+            if code != .fileReadNoSuchFile && code != .fileNoSuchFile { failure = error }
+        }
+        if let failure { throw failure }
+        return discovery.directories + discovery.files.map(\.url)
+    }
+
     /// Read and stat once so callers judge missing metadata against one observation.
     private func materialize(_ file: DiaryFile, date: String) throws -> DreamEntry {
         let text = try String(contentsOf: file.url, encoding: .utf8)
@@ -255,11 +252,13 @@ public struct FileBackedDreamDiary: Sendable {
     private func diaryFiles(
         in location: Location, matching filenames: Filenames,
         onFailure: (URL, any Error) -> Void
-    ) -> (files: [DiaryFile], storage: String) {
+    ) -> (files: [DiaryFile], storage: String, directories: [URL]) {
         var found: [DiaryFile] = []
         var storage = "readable"
+        var directories: [URL] = []
         // An unreadable existing directory is failure; only an absent directory is an empty diary.
         func names(in directory: URL) -> [String] {
+            directories.append(directory)
             do { return try fm.contentsOfDirectory(atPath: directory.path) } catch {
                 if directory == diaryDir {
                     var isDirectory: ObjCBool = false
@@ -287,7 +286,7 @@ public struct FileBackedDreamDiary: Sendable {
                 collect(in: archive.appendingPathComponent(year, isDirectory: true))
             }
         }
-        return (found, storage)
+        return (found, storage, directories)
     }
 
     /// Distinguish empty diary from unreadable listing.
@@ -408,7 +407,7 @@ public actor SwiftNativeDreamREMCycle {
         self.dataRoot = dataRoot
         let effectiveGate = try gate ?? DreamREMGatePolicy(policy: SwiftNativeTrustCenter(dataRoot: dataRoot).loadSavedPolicyChecked())
         let llm = makeResidentProviderLLMClient(
-            dataRoot: dataRoot, lifecycleObserver: lifecycleObserver, stallOnlyTransport: true)
+            dataRoot: dataRoot, lifecycleObserver: lifecycleObserver)
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
         // Manual and scheduled paths share memory, felt tone and mood wiring.
         self.dreamRunner = DreamCycleRunner(
@@ -441,11 +440,12 @@ public actor SwiftNativeDreamREMCycle {
         return try await dreamRunner.runNightlyDreamCycle(trigger: .manual, preview: true)
     }
 
-    public func runDream(force: Bool, trigger: DreamTrigger, delivery: DreamEffectSink? = nil) async throws -> DreamReport {
+    public func runDream(force: Bool, trigger: DreamTrigger, delivery: DreamEffectSink? = nil,
+                         parent: Turn? = nil, beganAt: Date = Date()) async throws -> DreamReport {
         try requireLiveProviders()
         let report: DreamReport
         do {
-            report = try await dreamRunner.runNightlyDreamCycle(force: force, trigger: trigger, delivery: delivery)
+            report = try await dreamRunner.runNightlyDreamCycle(force: force, trigger: trigger, delivery: delivery, parent: parent, beganAt: beganAt)
         } catch {
             await RepairOwed.owe(dataRoot, id: "dream-repair:" + UUID().uuidString, kind: .run,
                 operation: "dream", owner: "dream cycle", words: error.localizedDescription,

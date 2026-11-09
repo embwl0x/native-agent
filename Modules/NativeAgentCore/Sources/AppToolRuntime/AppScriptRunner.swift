@@ -9,6 +9,7 @@ import MacControl
 import MacIntegration
 import MemoryV2
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import Privacy
 import PersonaEngine
@@ -24,6 +25,32 @@ enum AppScriptRunner {
     static let actionLimit = OwnedProgramRunner.actionLimit
     typealias Perform = @Sendable ([String: JSONValue], Turn, AppActionExecution) async -> JSONValue
     typealias ScriptError = OwnedProgramRunner.ScriptError
+
+    /// The named call envelope is shared by source admission and live execution. Unknown expressions are checked when they arrive.
+    private static func namedCallProblem(_ given: [OwnedProgram.Calls.Argument]) -> (reason: String, detail: String)? {
+        guard let first = given.first else { return nil }
+        let named: Bool
+        switch first {
+        case .object, .value(.object): named = true
+        default: named = false
+        }
+        guard named else { return nil }
+        guard given.count <= 2 else {
+            return ("invalid_args", "A named call takes its args object and at most one options object; extra arguments are not accepted.")
+        }
+        guard let second = given.dropFirst().first else { return nil }
+        let keys: [String]
+        switch second {
+        case .object(let fields): keys = Array(fields.keys)
+        case .value(.object(let fields)): keys = Array(fields.keys)
+        case .unknown: return nil
+        default: return ("invalid_args", "The second argument of a named call must be an options object with expected_version or preview.")
+        }
+        if let stray = keys.sorted().first(where: { !["expected_version", "preview"].contains($0) }) {
+            return ("unknown_option", "The second object takes expected_version or preview, not \(stray).")
+        }
+        return nil
+    }
 
     static func run(source: String, preview: Bool, dataRoot: URL, surface: String, turn: Turn, execution: AppActionExecution,
         perform: @escaping Perform) async -> JSONValue {
@@ -51,14 +78,26 @@ enum AppScriptRunner {
             return .success(["action": .string(id), "args": given.first ?? .object([:]),
                              AppToolExecutor.doorScriptKey: .bool(true)])
         }
+        func argumentFailure(_ reason: String, _ detail: String) -> ScriptError {
+            do {
+                let contract = try AppActions.discovery(action, dataRoot: dataRoot).objectValue ?? [:]
+                return ScriptError(reason: reason, detail: detail,
+                    tryInstead: AppActions.callAdvice(action, input: ["args": .null], discovery: contract))
+            } catch {
+                return ScriptError(reason: "action_schema_unavailable", detail: "\(detail) \(error.localizedDescription)")
+            }
+        }
         var input: [String: JSONValue] = ["action": .string(action.id)]
+        if let problem = namedCallProblem(given.map(OwnedProgram.Calls.Argument.value)) {
+            return .failure(argumentFailure(problem.reason, problem.detail))
+        }
         if case .object(let named)? = given.first {
             input["args"] = .object(named)
             if let refusal = secretRefusal(action, named) { return .failure(refusal) }
             if given.count > 1, case .object(let options) = given[1] {
                 if let stray = options.keys.first(where: { !["expected_version", "preview"].contains($0) }) {
-                    return .failure(ScriptError(reason: "unknown_option",
-                        detail: "The second object takes expected_version or preview, not \(stray)."))
+                    return .failure(argumentFailure("unknown_option",
+                        "The second object takes expected_version or preview, not \(stray)."))
                 }
                 input.merge(options) { _, new in new }
             }
@@ -68,7 +107,7 @@ enum AppScriptRunner {
         while positional.last == .null { positional.removeLast() }
         let specs = action.argSpecs
         guard positional.count <= specs.count else {
-            return .failure(ScriptError(reason: "invalid_args", detail: "\(action.id) takes \(specs.count) args: \(action.line)"))
+            return .failure(argumentFailure("invalid_args", "\(action.id) takes \(specs.count) args: \(action.line)"))
         }
         var args: [String: JSONValue] = [:]
         for (value, spec) in zip(positional, specs) where value != .null {
@@ -81,12 +120,14 @@ enum AppScriptRunner {
     }
 
     /// Saved source refuses credential shapes and declared credential args; ordinary typing uses the same recursive detector as every script input.
-    private static func secretRefusal(_ action: AppAction, _ args: [String: JSONValue]) -> ScriptError? {
+    static func secretRefusal(_ action: AppAction, _ args: [String: JSONValue]) -> ScriptError? {
         guard NativeAgentSecretRedactor.secretPath(.object(args)) != nil
             || action.secretArgs.contains(where: { args[$0].map { $0 != .null && $0 != .string("") } ?? false })
         else { return nil }
         return ScriptError(reason: "secret_in_script",
-            detail: "Pass a key as a single app action, not in a script: \(action.id) was not run.")
+            detail: action.id == "chat.working_memory"
+                ? "Hold a private choice with a single app action; recorded script source cannot contain it. chat.working_memory was not run."
+                : "Pass a key as a single app action, not in a script: \(action.id) was not run.")
     }
 
 
@@ -123,10 +164,16 @@ enum AppScriptRunner {
         var actionIDs: [String] { get throws { try AppActions.checkedInventory(dataRoot: dataRoot, turn: catalogTurn).actions.map(\.id) } }
         var floorReasons: Set<String> { AppToolExecutor.doorFloorReasons }
         var scriptKey: String { AppToolExecutor.doorScriptKey }
-        func nearestActions(_ id: String) async throws -> [String] {
-            let pages = Dictionary(QuietToolPage.all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-            return try await AppActions.ranked(id, pages: pages, dataRoot: dataRoot,
-                memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot), turn: catalogTurn).actions.filter { !$0.isItemRead }.prefix(3).map(\.id)
+        func callAdvice(_ id: String, given: [OwnedProgram.Calls.Argument]?) async throws -> JSONValue {
+            var input: [String: JSONValue] = ["args": .null]
+            if let given, given.count == 1 { input["args"] = given[0].value ?? .null }
+            if let action = try resolved(id) {
+                return try AppActions.callAdvice(action, input: input,
+                    discovery: AppActions.discovery(action, dataRoot: dataRoot).objectValue ?? [:])
+            }
+            let pages = Dictionary(([QuietToolPage.inbox] + QuietToolPage.all).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            return try await AppActions.callAdvice(id, input: input, pages: pages, dataRoot: dataRoot,
+                memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot), turn: catalogTurn)
         }
         func action(_ id: String) throws -> OwnedProgramAction? {
             if let action = try resolved(id) {
@@ -141,6 +188,17 @@ enum AppScriptRunner {
         /// Part calls accept named arguments or the positional order declared by their action.
         func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], ScriptError> {
             AppScriptRunner.doorInput(id: id, given: given, dataRoot: dataRoot, turn: catalogTurn)
+        }
+        func callArgumentsForEvidence(_ id: String, given: [JSONValue]) throws -> [JSONValue] {
+            let input = try doorInput(id: id, given: given).get()
+            let evidence = MacInjectionArgRedaction.redacted(tool: "app", input: input, turn: catalogTurn)
+            guard let args = evidence["args"] else {
+                throw ScriptError(reason: "argument_evidence_unavailable", detail: "\(id)'s call has no arguments to record. Nothing ran.")
+            }
+            var kept = [args]
+            let options = evidence.filter { ["preview", "expected_version"].contains($0.key) }
+            if !options.isEmpty { kept.append(.object(options)) }
+            return kept
         }
         func opensHomeItem(_ input: [String: JSONValue]) -> Bool { AppToolExecutor.opensHomeItem(input) }
         func secretLine(_ text: String) -> Bool { MacInjectionArgRedaction.namesAppDoorSecretAction(text) }
@@ -162,6 +220,13 @@ enum AppScriptRunner {
         /// Unwrap object results while keeping model guidance, remedies and provenance outside the program's data.
         func answer(_ receipt: JSONValue) -> JSONValue {
             guard case .object(var fields) = receipt else { return receipt }
+            let formEnvelope: Set<String> = ["action", "result", "status", "execution", "argument_form", "understood", "effect", "read_only", "irreversible"]
+            if fields["action"] != nil, fields["argument_form"] != nil, fields.keys.allSatisfy(formEnvelope.contains),
+               let result = fields["result"], result.objectValue == nil {
+                return result
+            }
+            fields.removeValue(forKey: "argument_form")
+            fields.removeValue(forKey: "understood")
             if fields["action"] != nil, case .object(let result)? = fields["result"] {
                 fields.removeValue(forKey: "result")
                 fields.merge(result) { _, own in own }
@@ -178,9 +243,17 @@ enum AppScriptRunner {
                 execution = execution.receiving(invocation)
                 execution.deadlines = invocation.deadlines
             }
+            execution.valueCall = program.valueIdentity
+            execution.valueReach = program.valueReach
             guard !execution.handsBack else { return await call(input, turn, execution) }
             let requester = turn.partID.map { "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot))'s \($0)" }
             return await call(input, turn.with(\.requester, requester), execution)
+        }
+        func recordRefusal(_ result: JSONValue, input: [String: JSONValue], turn: Turn, surface: String) async -> JSONValue {
+            await settle {
+                await ChatToolDispatchTracer.traceUndispatched(turn: turn, tool: "app", input: input, surface: surface,
+                    result: result, dataRoot: dataRoot)
+            }
         }
         func validationPerform(_ input: [String: JSONValue], fixture: OwnedProgramFixtures, execution: OwnedProgramExecution) async -> JSONValue {
             if let validation { return await validation(input, fixture) }
@@ -195,6 +268,7 @@ enum AppScriptRunner {
             return nil
         }
         func callProblem(_ id: String, given: [OwnedProgram.Calls.Argument], schema ownSchema: JSONValue?) throws -> String? {
+            if let problem = AppScriptRunner.namedCallProblem(given) { return problem.detail }
             let action = try resolved(id)
             guard let schema = try ownSchema ?? action.flatMap({ try AppActions.discovery($0, dataRoot: dataRoot)
                 .objectValue?["args_schema"] }) else { return nil }
@@ -202,17 +276,22 @@ enum AppScriptRunner {
             func normalize(_ argument: Argument, schema: JSONValue, root: Bool = false) -> Argument {
                 switch argument {
                 case .object(let fields):
+                    let fields = if root, ownSchema == nil, let action {
+                        AppActions.boundArguments(action, fields, schema: schema, known: { $0.value }, make: Argument.value,
+                            accepts: { $0.problem(schema: $1) == nil }).args
+                    } else if root { ToolArguments.itemAddress(fields, schema: schema).args }
+                    else { fields }
                     let known = fields.compactMapValues(\.value)
                     let values: [String: JSONValue]
                     if root, ownSchema == nil, let action {
                         values = AppToolExecutor.doorValidationArgs(action,
-                            AppToolExecutor.normalizedCallArguments(action, known, schema: schema, recordShims: false,
-                                complete: known.count == fields.count))
+                            AppToolExecutor.normalizedBoundArguments(action, known, schema: schema, recordShims: false))
                     } else { values = ToolArguments.normalized(known, schema: schema, recordShims: false) }
                     var result = values.mapValues(Argument.value)
                     let properties = schema.objectValue?["properties"]?.objectValue ?? [:]
                     for (key, value) in fields where value.value == nil {
-                        result[key] = properties[key].map { normalize(value, schema: $0) } ?? value
+                        if root, ownSchema == nil, let action, AppToolExecutor.retainsRawArgumentValues(action) { result[key] = value }
+                        else { result[key] = properties[key].map { normalize(value, schema: $0) } ?? value }
                     }
                     return .object(result)
                 case .array(let items):
@@ -255,11 +334,7 @@ enum AppScriptRunner {
                     return nil
                 }
             }
-            // Static Contacts inspection retains known raw values beside unknown expressions; live owner admission handles unknowns.
-            let checked: Argument
-            if ownSchema == nil, let action, MacContactsExecutor.parameters(for: action.tool) != nil {
-                checked = .object(corrected)
-            } else { checked = normalize(.object(corrected), schema: schema, root: true) }
+            let checked = normalize(.object(corrected), schema: schema, root: true)
             return checked.problem(schema: schema)
         }
         /// Only primitive admissions supply a body; the gate decides when it runs.

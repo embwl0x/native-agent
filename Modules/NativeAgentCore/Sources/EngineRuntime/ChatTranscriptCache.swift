@@ -92,19 +92,27 @@ public actor ChatTranscriptCache {
         for session in sessions {
             try Task.checkCancellation()
             let revision = ChatShellOpeningLine.revision(for: session)
-            if let hit = cached[session.id], hit.revision == revision {
+            if let hit = cached[session.id], hit.revision == revision, hit.issue == nil {
                 projections[session.id] = hit
             } else {
-                var projection = try ChatShellOpeningLine.read(sessionID: session.id, dataRoot: dataRoot)
-                projection.revision = revision
-                projection.lastTurn = try ChatShellOpeningLine.readLastTurn(sessionID: session.id, dataRoot: dataRoot)
-                projections[session.id] = projection
+                do {
+                    var projection = try ChatShellOpeningLine.read(sessionID: session.id, dataRoot: dataRoot)
+                    projection.revision = revision
+                    projection.lastTurn = try ChatShellOpeningLine.readLastTurn(sessionID: session.id, dataRoot: dataRoot)
+                    projections[session.id] = projection
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    projections[session.id] = .init(revision: revision,
+                        issue: UserFacingError.cause(error, action: "read this conversation's transcript"))
+                }
             }
         }
         return projections
     }
 
-    func history(at path: URL, cached: Bool = true) async throws -> SessionHistoryReadResult {
+    func history(at path: URL, cached: Bool = true, limit: Int? = nil) async throws
+        -> (history: SessionHistoryReadResult, cacheHit: Bool) {
         let key = path.path
         let before = Self.identity(at: path)
         if before == nil || entries[key]?.identity != before {
@@ -113,15 +121,16 @@ public actor ChatTranscriptCache {
         }
         if cached, let history = entries[key]?.history {
             touch(key)
-            return history
+            return (history, true)
         }
         let root = path.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let history = try await SessionHistoryReader(dataRoot: root).messagesWithStats(forSessionId: path.deletingPathExtension().lastPathComponent)
+        let history = try await SessionHistoryReader(dataRoot: root).messagesWithStats(
+            forSessionId: path.deletingPathExtension().lastPathComponent, limit: limit)
         // A writer may advance during the load; return this read without certifying a different revision.
-        if let before, Self.identity(at: path) == before, history.stats.mode != "read_failed" {
+        if !history.stats.truncated, let before, Self.identity(at: path) == before, history.stats.mode != "read_failed" {
             store(Entry(identity: before, history: history), for: key)
         }
-        return history
+        return (history, false)
     }
 
     private func store(_ entry: Entry, for key: String) {

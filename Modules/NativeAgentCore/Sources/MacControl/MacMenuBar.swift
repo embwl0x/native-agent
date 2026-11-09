@@ -88,7 +88,7 @@ public enum MacMenuBar {
 
     private static func readChecked(source: any MacAXElementSource, pid: Int32, top: String?,
                                     until stop: ((Item) -> Bool)?, matchingPath: [String]?, depth: Int, context: MacOperationContext) throws -> Reading {
-        guard pid != getpid() else {
+        guard !PersonOnlyWindows.isOwnProcess(pid) else {
             return Reading(items: [], truncated: false, unavailable: "self_process")
         }
         guard source.isTrusted() else {

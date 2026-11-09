@@ -81,12 +81,7 @@ extension CognitionHost {
     }
 
     public func readoutFace(id: String, input: JSONValue, version: String, dataRoot: URL) async -> PartCallResult<PartFace> {
-        let invocation = ChatToolInvocation()
-        let work = ChatTurnWork(toolInvocation: invocation)
-        let execution = AppActionExecution(invocation: invocation, deadlines: work.deadlines, turnWork: work)
-        let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot, turn: nil, execution: execution) { _, _, _, _ in nil }
-        return await Parts(root: dataRoot).face(id: id, input: input, version: version,
-            invocation: .init(host: host, execution: .init(turn: nil, surface: "cognition:readout", deadlines: execution.deadlines)))
+        await NativeAgentEngine.forRoot(dataRoot).tools.face(id: id, input: input, version: version)
     }
 
     public func inQuietHours(at date: Date, dataRoot: URL) -> Bool {
@@ -105,10 +100,6 @@ extension CognitionHost {
 
     public func pursuitChoiceTotal(for item: DeskItem, now: Date) -> Double? {
         DeskPursuitChoice.score(for: item, now: now)?.total
-    }
-
-    public func schedulerJobRows(at path: URL) throws -> [JSONValue] {
-        try SwiftNativeTriggerScheduler.readJobsChecked(at: path)
     }
 
     public func archiveSupersededMorningBriefs(dataRoot: URL) async {

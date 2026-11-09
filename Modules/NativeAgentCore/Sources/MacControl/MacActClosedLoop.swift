@@ -84,6 +84,8 @@ public enum MacActScrollDirection: String, Sendable, Equatable {
 public enum MacActClosedLoop {
     public static let notificationKinds: [String] = [
         "AXValueChanged",
+        "AXSelectedTextChanged",
+        "AXMainWindowChanged",
         "AXFocusedUIElementChanged",
         "AXFocusedWindowChanged",
         "AXWindowCreated",
@@ -100,9 +102,6 @@ public enum MacActClosedLoop {
     public static let defaultWaitMs = 300
     /// Bound waits so an unresponsive UI returns none_observed instead of hanging the turn.
     public static let maxWaitMs = 2000
-    /// Collect a short notification burst so a value change followed by a title change cannot produce a half-effect diff.
-    public static let quietWindowMs = 80
-    public static let maxReportedNotifications = 12
     public static let maxDiffRows = 10
 
     /// Refuse non-editable targets rather than activating them through a typing approximation.
@@ -390,20 +389,17 @@ public enum MacActClosedLoop {
         public let firstNotificationMs: Int?
         public let notifications: [String]
         public let notificationCount: Int
-        public let dropped: Int
 
         public init(
             observed: Bool,
             firstNotificationMs: Int?,
             notifications: [String],
-            notificationCount: Int,
-            dropped: Int
+            notificationCount: Int
         ) {
             self.observed = observed
             self.firstNotificationMs = firstNotificationMs
             self.notifications = notifications
             self.notificationCount = notificationCount
-            self.dropped = dropped
         }
     }
 
@@ -420,42 +416,10 @@ public enum MacActClosedLoop {
     /// Navigation gets a larger default than immediate value changes because folder loads take longer; the deadline still ends early on a transition.
     public static let navigationWaitMs = 1500
 
-    public static func waitForEffect(
-        collector: MacAXEffectCollector,
-        waitMs: Int,
-        quietMs: Int = quietWindowMs,
-        startedAt: Date,
-        clock: @escaping @Sendable () -> Date,
-        /// Wait for one of these kinds or the deadline; empty accepts any notification.
-        until: Set<String> = []
-    ) async -> EffectWait {
-        let deadline = startedAt.addingTimeInterval(Double(waitMs) / 1000.0)
-        while !Task.isCancelled, clock() < deadline {
-            let notifications = collector.snapshot()
-            if !notifications.isEmpty,
-               until.isEmpty || notifications.contains(where: { until.contains($0.kind) }) { break }
-            _ = await collector.waitForSignal(seconds: deadline.timeIntervalSince(clock()))
-        }
-        guard let first = collector.first() else {
-            return EffectWait(
-                observed: false,
-                firstNotificationMs: nil,
-                notifications: [],
-                notificationCount: 0,
-                dropped: collector.droppedCount()
-            )
-        }
-        if !Task.isCancelled, quietMs > 0 {
-            try? await Task.sleep(nanoseconds: UInt64(quietMs) * 1_000_000)
-        }
-        let all = collector.snapshot()
-        return EffectWait(
-            observed: true,
-            firstNotificationMs: max(0, Int(first.at.timeIntervalSince(startedAt) * 1000)),
-            notifications: Array(all.prefix(maxReportedNotifications).map(\.kind)),
-            notificationCount: all.count,
-            dropped: collector.droppedCount()
-        )
+    static func effectWait(collector: MacAXEffectCollector, startedAt: Date) -> EffectWait {
+        EffectWait(observed: collector.count() > 0,
+            firstNotificationMs: collector.first().map { max(0, Int($0.at.timeIntervalSince(startedAt) * 1000)) },
+            notifications: collector.kinds(), notificationCount: collector.count())
     }
 
     // MARK: - The Open command

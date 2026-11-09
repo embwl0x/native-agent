@@ -49,9 +49,6 @@ extension Expansion {
         let signature: String
         let call: [String: JSONValue]
         let nature: Nature
-        /// Never wait longer for it than the round it would save.
-        let within: Double
-        let expected: Double
         let why: JSONValue
     }
 

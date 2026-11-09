@@ -3,6 +3,7 @@ import Foundation
 import MacIntegration
 import NativeAgentShared
 import PersistenceCore
+import ProviderRouting
 import ApprovalTransactions
 // Blueprint: | `InlineDecisions.swift` | Owner-backed controls and honest receipts. |
 
@@ -196,7 +197,9 @@ public enum InlineCards {
     ) -> InlineCardModel {
         // A missing control cannot honestly offer an action.
         let deadControl = !descriptor.isActionable && interaction.state.isOpen
-        let cardState = deadControl ? .unknown : state(interaction.state)
+        let continuationFailed = interaction.continuationFailure != nil
+        let cardState: InlineCardState = continuationFailed ? .failed : deadControl ? .unknown : state(interaction.state)
+        let receipt = outcome(interaction, deadControl: deadControl, repeatCount: repeatCount)
 
         return InlineCardModel(
             id: interaction.id,
@@ -212,12 +215,12 @@ public enum InlineCards {
                 : interaction.declineConsequence,
             state: cardState,
             persistenceNote: interaction.persistenceNote,
-            fields: fields(interaction, descriptor),
+            fields: continuationFailed ? [] : fields(interaction, descriptor),
             signInLabel: InlineInteractionRegistry.providerSignIn(for: descriptor.target)
                 .flatMap { descriptor.control == .providerAPIKey ? "Sign in with \($0.displayShort)" : nil }
                 ?? (interaction.secret?.signIn == nil ? nil : "Sign in"),
             // Detailed service policies belong on the full page, beyond the card's controls.
-            fullSetupLabel: descriptor.control == .connectorManualToken ? "Open full setup" : nil,
+            fullSetupLabel: !continuationFailed && descriptor.control == .connectorManualToken ? "Open full setup" : nil,
             choices: interaction.options.map {
                 InlineCardChoice(
                     id: $0.id, title: $0.label, note: $0.detail,
@@ -235,13 +238,17 @@ public enum InlineCards {
             busyLabel: busyLabel(interaction.kind),
             busyNote: busyNote(interaction, descriptor.control),
             restartNote: restartNote(interaction),
-            outcome: outcome(interaction, deadControl: deadControl, repeatCount: repeatCount, name: descriptor.displayName).text,
-            outcomeMeta: outcome(interaction, deadControl: deadControl, repeatCount: repeatCount, name: descriptor.displayName).meta
-                ?? (deadControl ? descriptor.unavailableReason : nil),
+            outcome: interaction.continuationFailure.map {
+                let reason = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                return "Failed to continue: " + (reason.isEmpty ? "no cause was recorded." : reason)
+            } ?? receipt.text,
+            outcomeMeta: continuationFailed
+                ? [receipt.text, receipt.meta].compactMap { $0 }.joined(separator: "\n\n")
+                : receipt.meta ?? (deadControl ? descriptor.unavailableReason : nil),
             // Only running work owns Stop; a need is waiting on the person.
             canStop: false,
             // Retry is the shared lifecycle's; a build with no control for it cannot offer one.
-            canRetry: descriptor.isActionable && interaction.state.isRetryable
+            canRetry: continuationFailed || (descriptor.isActionable && interaction.state.isRetryable)
         )
     }
 
@@ -302,14 +309,7 @@ public enum InlineCards {
         case .connectorManualToken:
             return descriptor.connectorFields
         case .providerAPIKey:
-            let signIn = InlineInteractionRegistry.providerSignIn(for: descriptor.target)
-            if signIn != nil, signIn?.pasteLabel == nil { return [] }
-            return [InlineCardField(
-                label: signIn?.pasteLabel ?? "\(descriptor.displayName) API key",
-                placeholder: "Paste the key",
-                helper: "Your key stays on this Mac. It never goes into the chat.",
-                isSecret: true
-            )]
+            return [] // A provider row points to protected Mac entry; it never collects a value.
         default:
             return []
         }
@@ -428,14 +428,9 @@ public enum InlineCards {
             return ("What happens",
                     "Providers opens on the \(name) group so you can pick the model there.")
         case .providerAPIKey:
-            if InlineInteractionRegistry.providerSignIn(for: descriptor.target) != nil {
-                return ("What happens",
-                        "Signing in opens your browser, the same sign-in as onboarding. "
-                        + "Nothing counts as done until \(name) is ready in Providers.")
-            }
             return ("What happens",
-                    "The key is checked with \(name), then saved in Providers. "
-                    + "A key \(name) rejects is not saved and does not count as done.")
+                    "Enter the key or sign in in the protected entry on the Mac. "
+                    + "Nothing counts as done until the saved \(name) connection is verified in Providers.")
         case .capabilityFlag:
             return ("What happens",
                     "\(name) is switched on in Trust, the same switch as the one on that page.")
@@ -525,8 +520,7 @@ public enum InlineCards {
     private static func outcome(
         _ interaction: InlineInteraction,
         deadControl: Bool,
-        repeatCount: Int = 1,
-        name: String = ""
+        repeatCount: Int = 1
     ) -> (text: String?, meta: String?) {
         // Repeat counts share one receipt line across rendered and page presentations.
         func counted(_ text: String) -> String {
@@ -535,12 +529,12 @@ public enum InlineCards {
         if deadControl { return (counted(interaction.title), nil) }
         switch interaction.state {
         case .stopped(let reason):
-            return ("Stopped", reason)
+            let cause = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (counted("Stopped: " + (cause.isEmpty ? "no reason was recorded." : cause)), nil)
         case .settled(let settled):
-            return (counted(settled.summary.isEmpty ? interaction.title : settled.summary),
+            let summary = settled.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (counted("Done: " + (summary.isEmpty ? "no change summary was recorded." : summary)),
                     settled.scope == .thisRequestOnly ? "This request only" : nil)
-        case .declined where [.connector, .apiKey].contains(interaction.kind) && !name.isEmpty:
-            return (counted("\(name) skipped"), nil)
         case .declined:
             // A declined receipt keeps the promised consequence, never the ask's title.
             let consequence = InlineInteraction.lowercasedLead(
@@ -548,13 +542,14 @@ public enum InlineCards {
             )
             return (counted(consequence.isEmpty ? "Not now" : "Not now \u{2014} " + consequence), nil)
         case .superseded:
-            return (nil, nil)
+            return (counted("Superseded: a newer request replaced this card."), nil)
         case .failed(let reason):
             // The failure reason is the outcome, never the ask's title.
             let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (counted(trimmed.isEmpty ? "It didn't go through." : trimmed), nil)
-        case .unknown:
-            return (counted(interaction.title), interaction.kind == .unknown ? interaction.why : "Outcome unknown.")
+            return (counted("Failed: " + (trimmed.isEmpty ? "no cause was recorded." : trimmed)), nil)
+        case .unknown(let savedState):
+            return (counted("Unknown: this build cannot interpret the saved state “\(savedState)”."),
+                    interaction.kind == .unknown ? interaction.why : nil)
         case .pending, .running:
             return (nil, nil)
         }

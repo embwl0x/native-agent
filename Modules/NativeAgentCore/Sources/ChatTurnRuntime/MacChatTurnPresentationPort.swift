@@ -6,17 +6,17 @@ import MacControl
 
 public enum MacChatTurnPresentationEvent: Sendable {
     case status(String)
-    case intakeClosed
     case activity(MacChatTurnActivity)
 }
 
-/// Presentation remains app-owned; Core calls at transaction boundaries while tokens use the stream port.
+/// The turn's body owner supplies transcript and status publication at transaction boundaries; tokens use the stream port.
 @MainActor
 public protocol MacChatTurnPresentationPort: AnyObject, Sendable {
     var macChatTurns: MacChatTurnRuntime { get }
     var activeChatSessionId: String { get }
     var knownChatSessionIDs: Set<String> { get }
-    func chatHasConversationRows(sessionId: String) -> Bool
+    func chatHasConversationRows(sessionId: String) throws -> Bool
+    func prepareMacChatTranscript(sessionId: String) async throws
     func captureMacWorkContinuation(_ text: String, taskReference: String) async -> MacWorkContinuation?
     func animateMacChatMutation(_ mutation: () -> Void)
     func presentMacChatTurn(_ event: MacChatTurnPresentationEvent)

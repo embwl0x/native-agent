@@ -33,6 +33,16 @@ public final class ConnectorReadiness: Sendable {
     @ObservationIgnored @MainActor lazy var workspacesRead = LatestRead()
     @ObservationIgnored @MainActor lazy var actionsRead = LatestRead()
     @ObservationIgnored @MainActor weak var facePages: PartFaces?
+    @ObservationIgnored @MainActor private var settingsFeed: SettingsFeedProjection?
+
+    @MainActor public func bindSettingsFeed(_ feed: SettingsFeedProjection) {
+        settingsFeed = feed
+        publishSettings()
+    }
+
+    @MainActor private func publishSettings() {
+        settingsFeed?.updateConnectors(slackPolicy)
+    }
 
     public init(root: URL, platform: AppConnectorStatusPlatform) {
         self.root = root
@@ -59,6 +69,7 @@ public final class ConnectorReadiness: Sendable {
             accounts = snapshot.0
             secrets = snapshot.1
             slackPolicy = snapshot.2
+            publishSettings()
         }
         await refreshFace()
         return snapshot.0
@@ -265,16 +276,11 @@ public final class ConnectorReadiness: Sendable {
                 row["runtimeDetail"] = .string("slack_runtime_error: \(detail). Inspect Slack connection status and its delivery receipts before resending.")
             } else if snapshot.connected {
                 row["runtimeStatus"] = .string("connected")
-                row["runtimeDetail"] = .string("Socket Mode heartbeat is current.")
+                row["runtimeDetail"] = .string("Socket Mode has a running socket connection.")
             } else {
                 row["runtimeStatus"] = .string("disconnected")
                 row["runtimeDetail"] = .string("Socket Mode last reported a disconnected state.")
             }
-        case .stale(let snapshot):
-            row["runtimeStatus"] = .string("stale")
-            row["runtimeDetail"] = .string(["slack_runtime_stale: Socket Mode heartbeat expired. Inspect Slack connection status before relying on delivery.",
-                snapshot.lastError].compactMap { $0 }.joined(separator: " "))
-            row["runtimeUpdatedAt"] = .string(snapshot.updatedAt)
         case .unavailable(let detail):
             row["runtimeStatus"] = .string("unavailable")
             row["runtimeDetail"] = .string("slack_runtime_state_unavailable: \(detail). Repair slack/state.json before relying on connection status.")

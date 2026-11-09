@@ -45,7 +45,9 @@ public enum BotRunConversation {
                     throw StandingBotsError.invalidValue("question must be a nonblank string")
                 }
             }
-            bot = try definitions.get(botReference(input, definitions: definitions))
+            bot = try definitions.get(botReference(input, definitions: definitions, dataRoot: dataRoot))
+        } catch let error as ToolFailureError {
+            throw error
         } catch {
             throw ToolFailureError(ChatToolOutcome.errorMessage(error), argumentPath: "$.id",
                 accepted: "id: a helper UUID or exact name from bot.list; optional question: a nonblank string.", effects: .none)

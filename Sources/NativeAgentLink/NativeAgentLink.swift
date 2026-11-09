@@ -141,7 +141,8 @@ private enum BridgeHTTP {
     }
 
     /// One POST only: recover lost acknowledgements by ID, never resend. Forward SSE notifications while awaiting the final response.
-    static func post(_ payload: [String: Any], descriptor: BridgeDescriptor,
+    /// `caller` names the host that started this relay; the one-shot commands name none.
+    static func post(_ payload: [String: Any], descriptor: BridgeDescriptor, caller: ContactCaller? = nil,
                      forward: (@Sendable ([String: Any]) -> Void)? = nil) async throws -> [String: Any]? {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = [:]
@@ -160,6 +161,7 @@ private enum BridgeHTTP {
         request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("2025-11-25", forHTTPHeaderField: "MCP-Protocol-Version")
         request.setValue("1", forHTTPHeaderField: "X-NativeAgent-Relay-SSE")
+        if let caller { request.setValue(caller.headerValue, forHTTPHeaderField: ContactCaller.header) }
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
         do { (bytes, response) = try await session.bytes(for: request) }
@@ -176,8 +178,9 @@ private enum BridgeHTTP {
             var parser = SSEEventParser()
             do {
                 for try await byte in bytes {
-                    guard let event = try parser.consume(byte: byte, maximumBytes: 1_048_576),
-                          let object = try? JSONSerialization.jsonObject(with: Data(event.data.utf8)) as? [String: Any],
+                    guard let event = try parser.consume(byte: byte, maximumBytes: BridgeCore.mcpResponseFrameByteCap) else { continue }
+                    guard event.data.utf8.count <= BridgeCore.mcpResponseByteCap else { throw LinkFailure.response }
+                    guard let object = try? JSONSerialization.jsonObject(with: Data(event.data.utf8)) as? [String: Any],
                           let message = clean(object) else { continue }
                     if message["method"] != nil { forward?(message) } else { return message }
                 }
@@ -186,13 +189,13 @@ private enum BridgeHTTP {
             catch { throw LinkFailure.transport }
             throw LinkFailure.response
         }
-        guard http.mimeType == "application/json", http.expectedContentLength <= 1_048_576 else {
+        guard http.mimeType == "application/json", http.expectedContentLength <= Int64(BridgeCore.mcpResponseByteCap) else {
             throw LinkFailure.response
         }
         var data = Data()
         do {
             for try await byte in bytes {
-                guard data.count < 1_048_576 else { throw LinkFailure.response }
+                guard data.count < BridgeCore.mcpResponseByteCap else { throw LinkFailure.response }
                 data.append(byte)
             }
         } catch let failure as LinkFailure { throw failure }
@@ -223,7 +226,7 @@ private struct NativeAgentLink {
 
     static let usage = """
     nativeagent-link message <text> [--session id] [--request id] [--contact id]
-    nativeagent-link reply --session id --request id [--offset n] [--contact id]
+    nativeagent-link reply --session id --request id [--offset n] [--artifact id] [--contact id]
     nativeagent-link reply --contact id < reply.json
     nativeagent-link mcp
 
@@ -282,8 +285,12 @@ private struct NativeAgentLink {
                     guard exactUUID(value), value == value.lowercased() else { throw LinkFailure.invalidArguments }
                     contact = value
                 case "--offset":
-                    guard operation == "reply", let offset = Int(value), (0...1_048_576).contains(offset) else { throw LinkFailure.invalidArguments }
+                    guard operation == "reply", let offset = Int(value), offset >= 0 else { throw LinkFailure.invalidArguments }
                     arguments["offset"] = offset
+                case "--artifact":
+                    guard operation == "reply", value.utf8.count == 64,
+                          value.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { throw LinkFailure.invalidArguments }
+                    arguments["artifact_id"] = value
                 default: throw LinkFailure.invalidArguments
                 }
             }
@@ -364,6 +371,15 @@ private struct NativeAgentLink {
 
     /// The app owns MCP semantics; framing/auth stay here. Concurrent requests keep pings live during reply waits; EOF waits for all answers.
     static func relay() async {
+        // Each host session starts its own relay: its parent names the conversation every call of this relay is in.
+        // A host whose process cannot be read names no caller: the relay still carries its calls, in the contact's own conversation.
+        let caller: ContactCaller?
+        do { caller = try ContactCaller.parent() }
+        catch {
+            FileHandle.standardError.write(Data((error.localizedDescription
+                + " This relay's calls go on in the contact's own conversation, shared with other callers that name none.\n").utf8))
+            caller = nil
+        }
         await withDiscardingTaskGroup { group in
             var line = Data()
             while true {
@@ -382,12 +398,12 @@ private struct NativeAgentLink {
                 defer { line.removeAll(keepingCapacity: true) }
                 if line.isEmpty { continue }
                 let request = line
-                group.addTask { await relayOne(request) }
+                group.addTask { await relayOne(request, caller: caller) }
             }
         }
     }
 
-    private static func relayOne(_ request: Data) async {
+    private static func relayOne(_ request: Data, caller: ContactCaller?) async {
         guard let payload = try? JSONSerialization.jsonObject(with: request) as? [String: Any] else {
             output(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Invalid JSON object"]])
             return
@@ -395,7 +411,7 @@ private struct NativeAgentLink {
         let id = payload["id"]
         do {
             // Only requests wait across app restart; notifications cannot be held for a response.
-            let response = try await id == nil ? postToBridge(payload) : postWhenBridgeReturns(payload)
+            let response = try await id == nil ? postToBridge(payload, caller: caller) : postWhenBridgeReturns(payload, caller: caller)
             if let id {
                 guard let response, response["jsonrpc"] as? String == "2.0",
                       let responseID = response["id"] as? NSObject,
@@ -418,20 +434,20 @@ private struct NativeAgentLink {
         }
     }
 
-    private static func postToBridge(_ payload: [String: Any]) async throws -> [String: Any]? {
-        try await BridgeHTTP.post(payload, descriptor: BridgeDescriptor.load(), forward: { output($0) })
+    private static func postToBridge(_ payload: [String: Any], caller: ContactCaller?) async throws -> [String: Any]? {
+        try await BridgeHTTP.post(payload, descriptor: BridgeDescriptor.load(), caller: caller, forward: { output($0) })
     }
 
     /// Wait for descriptor republication across relaunch; stay inside the SDK's 60 s request and host's 30 s startup deadlines.
-    private static func postWhenBridgeReturns(_ payload: [String: Any]) async throws -> [String: Any]? {
-        do { return try await postToBridge(payload) } catch LinkFailure.bridgeAbsent {}
+    private static func postWhenBridgeReturns(_ payload: [String: Any], caller: ContactCaller?) async throws -> [String: Any]? {
+        do { return try await postToBridge(payload, caller: caller) } catch LinkFailure.bridgeAbsent {}
         // Arm the initial retry edge before looking so relaunch cannot be missed.
         let changes = FileChangeEvents(paths: [URL(fileURLWithPath: BridgeDescriptor.path)])
         let budget: Duration = payload["method"] as? String == "initialize" ? .seconds(20) : .seconds(30)
         let deadline = Task { try? await Task.sleep(for: budget); changes.cancel() }
         defer { deadline.cancel(); changes.cancel() }
         for await _ in changes.stream {
-            do { return try await postToBridge(payload) } catch LinkFailure.bridgeAbsent {}
+            do { return try await postToBridge(payload, caller: caller) } catch LinkFailure.bridgeAbsent {}
         }
         throw LinkFailure.bridgeAbsent
     }

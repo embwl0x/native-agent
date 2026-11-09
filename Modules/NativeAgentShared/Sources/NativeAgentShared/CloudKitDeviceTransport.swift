@@ -21,85 +21,20 @@ enum DeviceCloudKitSubscriptionID {
     }
 }
 
-// MARK: - Device timeout policies
-
-struct DeviceCKLandmineTimeout: LocalizedError, Sendable {
-    let label: String
-    let seconds: TimeInterval
-    var errorDescription: String? {
-        "CK call \(label) timed out after \(seconds)s; cloudd unhealthy?"
-    }
-}
-
-/// CloudKit bounds its own requests (60 s); this guard only catches a cloudd that never answers.
-/// A slow iCloud is not a hung one: lookups can take 8 s, and a tighter guard fails every subscription, pull and send.
-public let deviceCKHangSeconds: TimeInterval = 30
-
-func withDeviceCKTimeout<T: Sendable>(
+/// CloudKit completion or cancellation settles the call; failures retain their original cause.
+func withDeviceCKOperation<T: Sendable>(
     _ label: String,
-    seconds: TimeInterval = deviceCKHangSeconds,
-    recovery: DeviceSyncRecovery = .init(),
-    onFailure: (@Sendable (Error) async -> Void)? = nil,
-    _ work: @Sendable @escaping () async throws -> T
-) async -> T? {
-    guard recovery.hasTime else { return nil }
-    let seconds = recovery.seconds(upTo: seconds)
-    let state = ContinuationOnce<Result<T, Error>?>()
-    let timeoutNanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
-    let workTask = Task<Void, Never>(priority: .utility) {
-        do {
-            guard recovery.hasTime else { throw CancellationError() }
-            state.resume(.success(try await work()))
-        }
-        catch { state.resume(.failure(error)) }
-    }
-
-    switch await state.cloudKitRace(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds) {
-    case .success(let value): return value
-    case .failure(let error):
-        await onFailure?(error)
-        nativeLog("[ck-device] \(label) failed: \(error)"); return nil
-    case .timedOut:
-        nativeLog("[ck-device] \(label) timed out after \(formatCKTimeoutSeconds(seconds)); cloudd unhealthy?")
-        return nil
-    case .cancelled:
-        return nil
-    }
-}
-
-func withDeviceCKTimeoutThrowing<T: Sendable>(
-    _ label: String,
-    seconds: TimeInterval = deviceCKHangSeconds,
-    recovery: DeviceSyncRecovery = .init(),
     onFailure: (@Sendable (Error) async -> Void)? = nil,
     beforeDispatch: @Sendable () async throws -> Void = {},
-    cancelWorkOnTimeout: Bool = true,
     _ work: @Sendable @escaping () async throws -> T
 ) async throws -> T {
     try Task.checkCancellation()
-    guard recovery.hasTime else { throw CancellationError() }
-    let seconds = recovery.seconds(upTo: seconds)
     try await beforeDispatch()
-    let state = ContinuationOnce<Result<T, Error>?>()
-    let timeoutNanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
-    let workTask = Task<Void, Never>(priority: .utility) {
-        do {
-            state.resume(.success(try await work()))
-        }
-        catch { state.resume(.failure(error)) }
-    }
-
-    switch await state.cloudKitRace(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds, timeoutOnCancellation: true,
-                                    cancelWorkOnTimeout: cancelWorkOnTimeout) {
-    case .success(let value): return value
-    case .failure(let error):
+    do { return try await work() }
+    catch {
         await onFailure?(error)
+        nativeLog("[ck-device] \(label) failed: \(error)")
         throw error
-    case .timedOut:
-        nativeLog("[ck-device] \(label) timed out after \(formatCKTimeoutSeconds(seconds)); cloudd unhealthy?")
-        throw DeviceCKLandmineTimeout(label: label, seconds: seconds)
-    case .cancelled:
-        throw CancellationError()
     }
 }
 
@@ -110,10 +45,17 @@ final class DeviceCKRecordNameHolder: @unchecked Sendable {
     private var names: [String] = []
     // Backlog means a full fetched page, regardless of how many records expired.
     private var fetched = 0
+    private var failure: Error?
     func noteFetched() { lock.lock(); fetched += 1; lock.unlock() }
     func add(_ name: String) { lock.lock(); names.append(name); lock.unlock() }
-    func snapshot() -> (names: [String], fetched: Int) {
-        lock.lock(); defer { lock.unlock() }; return (names, fetched)
+    func fail(_ error: Error) {
+        lock.lock(); defer { lock.unlock() }
+        if failure == nil { failure = error }
+    }
+    func snapshot() throws -> (names: [String], fetched: Int) {
+        lock.lock(); defer { lock.unlock() }
+        if let failure { throw failure }
+        return (names, fetched)
     }
 }
 
@@ -123,12 +65,10 @@ struct DeviceCKSweepPage: Sendable {
     let fetched: Int
 }
 
-/// What one record type's sweep achieved. `deleted` counts CONFIRMED deletions only: a delete batch that timed out may or may not have been applied
-/// by the server, so it is reported as unknown rather than as zero.
+/// One record family's confirmed deletions and remaining backlog.
 struct DeviceCKSweepOutcome {
     var deleted = 0
     var backlog = false
-    var deleteTimedOut = false
 }
 
 /// Thread-safe per-page accumulator for pull's recordMatchedBlock. The CK callback runs on CloudKit's own queue, so the holder locks its own appends.
@@ -323,8 +263,8 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
 
     // MARK: account status
 
-    public func accountStatus() async -> String {
-        return await withDeviceCKTimeout("CloudKitDeviceTransport.accountStatus", onFailure: accountFailureReporter) {
+    public func accountStatus() async throws -> String {
+        return try await withDeviceCKOperation("CloudKitDeviceTransport.accountStatus", onFailure: accountFailureReporter) {
             let s = try await CKContainer(identifier: self.containerIdentifier).accountStatus()
             switch s {
             case .available: return "available"
@@ -334,7 +274,7 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
             case .couldNotDetermine: return "unknown"
             @unknown default: return "unknown"
             }
-        } ?? "unknown"
+        }
     }
 
     // MARK: helpers
@@ -470,8 +410,7 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
         return out
     }
 
-    func performModifyRecords(_ op: CKModifyRecordsOperation, resourceTimeout: TimeInterval = 15) async throws {
-        op.configuration.timeoutIntervalForResource = resourceTimeout
+    func performModifyRecords(_ op: CKModifyRecordsOperation) async throws {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 op.modifyRecordsResultBlock = { result in
@@ -555,7 +494,7 @@ public extension DeviceSyncTransportResolver {
     }
 }
 
-/// Sendable value carriers for the pairing/status singleton drains (returned across the withDeviceCKTimeout race boundary).
+/// Sendable results of pairing and status reads.
 enum PairingSlot: Sendable { case empty, holds(Data) }
 /// Where a Mac stands on the account's Mac pairing record.
 enum PairingClaim: Sendable { case unread, held, elsewhere }

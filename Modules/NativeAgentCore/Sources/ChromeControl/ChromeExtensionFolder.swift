@@ -86,7 +86,7 @@ public enum ChromeExtensionFolder {
         // Copying can replace same-version bytes. Observe after that write.
         status = await chrome.setupConnectionStatus(fresh: true, context: context)
         if status.state == .connected, status.diagnostics["extension_path"] == .string(folder.path),
-           status.diagnostics["extension_code_matches_folder"] == .bool(true) { return folder }
+           await chrome.acceptedExtensionMatchesShipped == true { return folder }
         let current = context.driver
         let driver: MacDriverBinding
         if let current { driver = current }

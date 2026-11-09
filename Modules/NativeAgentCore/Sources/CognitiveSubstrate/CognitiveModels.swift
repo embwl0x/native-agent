@@ -23,6 +23,10 @@ public enum CognitiveNodeKind: String, Sendable, Equatable, CaseIterable {
     case appLifecycle
     /// Felt resolutions name their resolved path so body feelings retain aboutness.
     case feltResolution
+    /// A care's anchor in the field: worth that touches the care gathers here and fades on the care's depth.
+    case care
+    /// A happening's own subject, where worth that touches no care gathers.
+    case happening
 }
 
 public struct CognitiveSubjectReference: Codable, Sendable, Hashable, Equatable {
@@ -62,6 +66,8 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
     private var _emotionalWarmth: Double
     /// The last moment that stamped or reconsolidated this feeling; nil carries no fold evidence.
     public var livedSeq: UInt64? = nil
+    /// Worth landed here that no thought has attended yet. Never clamped; it fades on the node's half-life and a thought attending the node drains it.
+    public var drive: Double = 0
 
     /// How positive/negative the moment felt. −1 (aversive) … +1 (positive), 0 neutral.
     public var emotionalValence: Double {
@@ -130,7 +136,7 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
             return explicit
         }
         switch kind {
-        case .toolObservation, .providerHealth, .appLifecycle, .feltResolution:
+        case .toolObservation, .providerHealth, .appLifecycle, .feltResolution, .care, .happening:
             return .system
         case .conversationFocus, .correction:
             return .live
@@ -167,8 +173,6 @@ public struct CognitiveSubstrateSnapshot: Sendable, Equatable {
 /// consuming cadence or continuity state.
 public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     public var fingerprintFamily: String?
-    public var fingerprintCount: Int
-    public var fingerprintLastSurfacedAt: Date?
     /// A gap cue that lost its slot remains owed on the user's next turn.
     public var owedSinceGap: Date?
     public var lastSessionBridgeAt: Date?
@@ -211,8 +215,6 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
 
     public init(
         fingerprintFamily: String? = nil,
-        fingerprintCount: Int = 0,
-        fingerprintLastSurfacedAt: Date? = nil,
         owedSinceGap: Date? = nil,
         lastSessionBridgeAt: Date? = nil,
         soundRutSignature: String? = nil,
@@ -229,8 +231,6 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         careLineRest: [String: CareLineRest] = [:]
     ) {
         self.fingerprintFamily = fingerprintFamily
-        self.fingerprintCount = max(0, fingerprintCount)
-        self.fingerprintLastSurfacedAt = fingerprintLastSurfacedAt
         self.owedSinceGap = owedSinceGap
         self.lastSessionBridgeAt = lastSessionBridgeAt
         self.soundRutSignature = soundRutSignature

@@ -16,15 +16,14 @@ public actor ChatGPTAccountModelRefresh {
         let accessToken: String
     }
     private var flights: [CredentialKey: Task<Bool, Error>] = [:]
-    private var failedAt: [CredentialKey: Date] = [:]
+    private var failures: [CredentialKey: any Error] = [:]
 
     public static func cacheURL(dataRoot: URL) -> URL {
         dataRoot.appendingPathComponent("codex_home", isDirectory: true)
             .appendingPathComponent("models_cache.json")
     }
 
-    /// Missing/unreadable/unbound caches are stale; successful reads last 24 hours. Automatic failures cool down for five minutes; explicit refresh
-    /// bypasses it.
+    /// Passive maintenance fetches an absent or differently bound cache; explicit refresh always asks the account.
     @discardableResult
     public func refresh(dataRoot: URL, force: Bool = false) async throws -> Bool {
         let root = dataRoot.standardizedFileURL
@@ -33,59 +32,49 @@ public actor ChatGPTAccountModelRefresh {
         guard authPath.standardizedFileURL == NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: root).standardizedFileURL else { return false }
         guard let token = try ChatGPTTransport.storedAccessToken(at: authPath) else { return false }
         var key = CredentialKey(root: root, accessToken: token)
-        if !force {
-            if let failure = failedAt[key], Date().timeIntervalSince(failure) < 300 { return false }
-            if try Self.isFresh(dataRoot: root, authPath: authPath) { return false }
-        }
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 45
-        let session = URLSession(configuration: config)
-        defer { session.invalidateAndCancel() }
-        let adapter = ChatGPTTransport(session: session, authPathOverride: authPath)
-        let context: CodexOAuthAccessContext
+        if !force, let failure = failures[key] { throw failure }
         do {
             try Self.validateCachePath(dataRoot: root, authPath: authPath)
-            context = try await adapter.codexAccessContext()
-        } catch {
-            failedAt[key] = Date()
-            throw error
-        }
-        // Token renewal is serialized by the adapter; discovery joins using the token it will actually send, including its failure cooldown.
-        key = CredentialKey(root: root, accessToken: context.accessToken)
-        if let flight = flights[key] { return try await flight.value }
-        if !force {
-            if let failure = failedAt[key], Date().timeIntervalSince(failure) < 300 { return false }
-            if try Self.isFresh(dataRoot: root, authPath: authPath) { return false }
-        }
-        let flight = Task {
-            try await Self.fetch(dataRoot: root, authPath: authPath, context: context, session: session)
-        }
-        flights[key] = flight
-        defer { flights[key] = nil }
-        do {
-            let changed = try await flight.value
-            failedAt = failedAt.filter { $0.key.root != root }
+            if !force, try Self.isBound(dataRoot: root, authPath: authPath, token: token) { return false }
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForRequest = .infinity
+            config.timeoutIntervalForResource = .infinity
+            config.waitsForConnectivity = true
+            let session = URLSession(configuration: config)
+            defer { session.invalidateAndCancel() }
+            let adapter = ChatGPTTransport(session: session, authPathOverride: authPath)
+            let context = try await adapter.codexAccessContext()
+            // Token renewal is serialized by the adapter; join discovery for the credential actually sent.
+            key = CredentialKey(root: root, accessToken: context.accessToken)
+            if let flight = flights[key] {
+                return try await withTaskCancellationHandler { try await flight.value } onCancel: { flight.cancel() }
+            }
+            if !force, let failure = failures[key] { throw failure }
+            if !force, try Self.isBound(dataRoot: root, authPath: authPath, token: context.accessToken) { return false }
+            let flight = Task {
+                try await Self.fetch(dataRoot: root, authPath: authPath, context: context, session: session)
+            }
+            flights[key] = flight
+            defer { flights[key] = nil }
+            let changed = try await withTaskCancellationHandler { try await flight.value } onCancel: { flight.cancel() }
+            failures.removeValue(forKey: key)
             return changed
         } catch {
-            failedAt = failedAt.filter { $0.key.root != root }
-            failedAt[key] = Date()
+            failures[key] = error
             throw error
         }
     }
 
-    private static func isFresh(dataRoot: URL, authPath: URL) throws -> Bool {
-        guard let bytes = try? Data(contentsOf: cacheURL(dataRoot: dataRoot)),
-              let cache = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-              let stamp = cache["fetched_at"] as? String,
+    private static func isBound(dataRoot: URL, authPath: URL, token: String) throws -> Bool {
+        let bytes: Data
+        do { bytes = try Data(contentsOf: cacheURL(dataRoot: dataRoot)) }
+        catch CocoaError.fileReadNoSuchFile { return false }
+        guard let cache = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
               let account = cache["nativeagent_account_id"] as? String,
-              let token = try ChatGPTTransport.storedAccessToken(at: authPath),
-              account == (try? ChatGPTTransport(authPathOverride: authPath)
-                .currentAccountID(accessToken: token)),
-              let models = cache["models"] as? [[String: Any]], !models.isEmpty else { return false }
-        guard let fetched = NativeTimestampFormat.parseISO8601FractionalFirst(stamp) else { return false }
-        let age = Date().timeIntervalSince(fetched)
-        return age >= 0 && age < 86_400
+              cache["models"] is [[String: Any]] else {
+            throw failure("The saved ChatGPT model catalog is malformed. Refresh its models in Providers.")
+        }
+        return account == (try ChatGPTTransport(authPathOverride: authPath).currentAccountID(accessToken: token))
     }
 
     private static func validateCachePath(dataRoot: URL, authPath: URL) throws {
@@ -109,17 +98,17 @@ public actor ChatGPTAccountModelRefresh {
         guard let endpoint = URL(string:
             "https://chatgpt.com/backend-api/codex/models?client_version=\(clientVersion)") else { throw URLError(.badURL) }
         var request = URLRequest(url: endpoint)
+        request.timeoutInterval = .infinity
         request.setValue("Bearer \(context.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue(context.accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
         request.setValue(ChatGPTTransport.codexBackendOriginator, forHTTPHeaderField: "originator")
         request.setValue(ChatGPTTransport.codexBackendUserAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let (bytes, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw failure("ChatGPT account model refresh failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)).")
-        }
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard http.statusCode == 200 else { throw failure("ChatGPT account model refresh failed (HTTP \(http.statusCode)).") }
         guard var cache = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-              let models = cache["models"] as? [[String: Any]], !models.isEmpty,
+              let models = cache["models"] as? [[String: Any]],
               models.allSatisfy({ ($0["slug"] as? String)?.isEmpty == false
                 && $0["display_name"] is String
                 && $0["supported_reasoning_levels"] is [[String: Any]] }) else {

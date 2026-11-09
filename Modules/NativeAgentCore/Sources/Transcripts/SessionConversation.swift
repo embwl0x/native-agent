@@ -65,6 +65,16 @@ public struct SessionConversation: Sendable {
         return try Self(rows: ChatSessionRetention.archiveIndexRows(dataRoot: dataRoot)).kind(sessionID)
     }
 
+    /// An exact locator reads the row that owns it, hot before archived; a name resolves only when one current row has that title.
+    package static func checkedRow(_ id: String, dataRoot: URL, matchingTitle: Bool = false) throws -> [String: JSONValue]? {
+        let hot = try ChatSessionIndexFile.loadObjectRowsForMutation(at: dataRoot.appendingPathComponent("chat/sessions.json"))
+        if let row = hot.first(where: { $0["id"] == .string(id) }) { return row }
+        if let row = try ChatSessionRetention.archiveIndexRows(dataRoot: dataRoot).last(where: { $0["id"] == .string(id) }) { return row }
+        guard matchingTitle else { return nil }
+        let named = hot.filter { $0["title"]?.stringValue?.caseInsensitiveCompare(id) == .orderedSame }
+        return named.count == 1 ? named[0] : nil
+    }
+
     public static func kind(_ session: ChatSession) -> ChatThreadKind {
         kind(threadKind: session.threadKind, source: session.source, sourceKey: session.sourceKey)
     }
@@ -115,6 +125,8 @@ public struct SessionConversation: Sendable {
         try await ChatSessionIndexFile.mutate(at: path) { rows in
             if let index = rows.firstIndex(where: { $0["id"] == .string(sessionID) }) {
                 rows[index]["threadKind"] = .string(kind.rawValue)
+                // The session's owner (the one that mints it) names its source; another declarer only reads it.
+                if createIfMissing { rows[index]["source"] = .string(source) }
             } else if createIfMissing {
                 rows.append(["id": .string(sessionID), "title": .string(title), "source": .string(source),
                              "threadKind": .string(kind.rawValue),

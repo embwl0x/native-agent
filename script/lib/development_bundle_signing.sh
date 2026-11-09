@@ -76,6 +76,18 @@ _nativeagent_sign_nested_plain() {
   local bundle="$1" identity="$2"
   local signing_root
   signing_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+  if [[ ! -d "$bundle/Contents/Helpers/NativeAgentFace.app" ]]; then
+    echo '[sign] Missing NativeAgentFace renderer' >&2
+    return 1
+  fi
+  local face_sparkle="$bundle/Contents/Helpers/NativeAgentFace.app/Contents/Frameworks/Sparkle.framework"
+  if [[ ! -d "$face_sparkle" ]]; then
+    echo '[sign] Missing NativeAgentFace Sparkle framework' >&2
+    return 1
+  fi
+  codesign --force --deep --sign "$identity" --options runtime --timestamp=none "$face_sparkle" || return 1
+  codesign --force --sign "$identity" --options runtime --timestamp=none \
+    "$bundle/Contents/Helpers/NativeAgentFace.app" || return 1
   if [[ ! -f "$bundle/Contents/MacOS/NativeAgentSenseHost" ]]; then
     echo '[sign] Missing NativeAgentSenseHost helper' >&2
     return 1

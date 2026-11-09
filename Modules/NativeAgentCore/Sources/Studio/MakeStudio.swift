@@ -5,7 +5,7 @@ import Observation
 import AuthoredCapabilities
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MakeStudio.swift` | Root-scoped artifact metadata, native decoding, durable version allocation and previews; generated-image registration is editable `Resources/abilities/make-generated.js`, composing native raw generation results with `make.add` (prompt/model metadata retained); `MakeRegistration` explicitly carries native generation receipt paths to that registration call, and the registration primitive admits those verified app outputs while arbitrary files retain the workspace fence; `MakeStudio.Shelf` owns watcher/coalescing lifetime and publishes its read results through `LatestRead`; each preview file/revision owns L0 `PartFaces` for editable `Resources/abilities/make-title.js` (HTML title → prompt → filename); native unavailable/failed status accompanies the face, views only read their preview's snapshots; shutdown drains projections and cancellation never rearms a retired shelf |
+// Blueprint: | `MakeStudio.swift` | Root-scoped artifacts, versions and previews; LatestRead shelf; file/revision title feed slots; shutdown drain |
 
 /// Native receipts admitted for one registration operation. Parts cannot supply this evidence in their input.
 public struct MakeRegistration: Sendable {
@@ -98,6 +98,68 @@ public struct MakeStudio: Sendable {
             .max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") }
     }
 
+    /// The page and make.read share the metadata owner and its exact version paths.
+    public func receipt(_ meta: Meta) -> JSONValue {
+        .object(["status": .string("ok"), "ref": .string(meta.ref),
+            "versions": .array(meta.versions.map { version in
+                var row: [String: JSONValue] = ["n": .int(Int64(version.n)), "path": .string(url(meta.ref, version).path),
+                    "created": .string(version.created)]
+                if let prompt = version.prompt { row["prompt"] = .string(prompt) }
+                if let model = version.model { row["model"] = .string(model) }
+                if let madeBy = version.madeBy { row["made_by"] = .string(madeBy) }
+                return .object(row)
+            })])
+    }
+
+    /// Read membership afresh; a ref's unreadable metadata is its own row, never an omitted made thing.
+    public func shelfPage(offset: Int) throws -> JSONValue {
+        let refs: [String]
+        let readState: String
+        do {
+            refs = try FileManager.default.contentsOfDirectory(atPath: root.path).filter(Self.isRef)
+            readState = "read"
+        } catch CocoaError.fileReadNoSuchFile {
+            refs = []
+            readState = "not_created"
+        }
+        var rows: [(ref: String, created: Date?, value: JSONValue)] = []
+        for ref in refs {
+            do {
+                guard let meta = try readMeta(ref), let latest = meta.versions.last else {
+                    throw Refusal(reason: "metadata_missing", message: "No retained version metadata was found for this ref.")
+                }
+                guard let created = NativeTimestampFormat.parseISO8601(latest.created) else {
+                    throw Refusal(reason: "invalid_metadata", message: "The newest version's created timestamp is not an ISO-8601 date.")
+                }
+                var row: [String: JSONValue] = ["ref": .string(ref), "version": .int(Int64(latest.n)),
+                    "version_count": .int(Int64(meta.versions.count)), "created": .string(latest.created),
+                    "path": .string(url(ref, latest).path),
+                    "next_call": .object(["page": .string("make"), "item": .string(ref)])]
+                if let madeBy = latest.madeBy { row["made_by"] = .string(madeBy) }
+                rows.append((ref, created, .object(row)))
+            } catch {
+                rows.append((ref, nil, .object(["ref": .string(ref), "status": .string("unavailable"),
+                    "path": .string(folder(ref).appendingPathComponent("meta.json").path), "detail": .string(error.localizedDescription),
+                    "next_call": .object(["page": .string("make"), "item": .string(ref)])])))
+            }
+        }
+        rows.sort {
+            switch ($0.created, $1.created) {
+            case let (left?, right?) where left != right: return left > right
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: return $0.ref < $1.ref
+            }
+        }
+        let start = min(max(0, offset), rows.count), end = start + min(25, rows.count - start)
+        return .object(["status": .string("ok"), "page": .string("make"), "items": .array(rows[start..<end].map(\.value)),
+            "read_state": .string(readState),
+            "total": .int(Int64(rows.count)), "count": .int(Int64(end - start)), "offset": .int(Int64(start)),
+            "unavailable_count": .int(Int64(rows.filter { $0.created == nil }.count)),
+            "has_more": .bool(end < rows.count), "next_offset": end < rows.count ? .int(Int64(end)) : .null,
+            "next_call": end < rows.count ? .object(["page": .string("make"), "args": .object(["offset": .int(Int64(end))])]) : .null])
+    }
+
     @discardableResult
     public func add(_ file: URL, ref: String? = nil, prompt: String? = nil, model: String? = nil,
                     madeBy: String? = nil) throws -> (ref: String, version: Version) {
@@ -148,7 +210,7 @@ extension MakeStudio {
     public struct Preview: Sendable {
         public let file: URL
         public let revision: Int
-        public let titleFaces: PartFaces?
+        public let titleKey: FaceKey?
         public let image: NSImage?
         public let imageFailure: String?
     }
@@ -241,12 +303,14 @@ extension MakeStudio {
         private var stopped = false
         @ObservationIgnored private lazy var latest = LatestRead()
         @ObservationIgnored private nonisolated let project: PartFaces.Call
+        private nonisolated let feed: FaceFeedSource
         @ObservationIgnored private var titleProjections: [String: (faces: PartFaces, task: Task<Void, Never>)] = [:]
         @ObservationIgnored private var titleOrder: [String] = []
         @ObservationIgnored private var previewReads: [UUID: Task<Preview, Never>] = [:]
 
-        public nonisolated init(dataRoot: URL, project: @escaping PartFaces.Call) {
+        public nonisolated init(dataRoot: URL, feed: FaceFeedSource, project: @escaping PartFaces.Call) {
             studio = MakeStudio(dataRoot: dataRoot)
+            self.feed = feed
             self.project = project
         }
 
@@ -254,7 +318,7 @@ extension MakeStudio {
         public nonisolated func folder(_ ref: String) -> URL { studio.folder(ref) }
 
         public func preview(_ ref: String, _ version: Version, revision: Int) async -> Preview {
-            if stopped || Task.isCancelled { return Preview(file: file(ref, version), revision: revision, titleFaces: nil, image: nil,
+            if stopped || Task.isCancelled { return Preview(file: file(ref, version), revision: revision, titleKey: nil, image: nil,
                 imageFailure: "Image preview preparation stopped.") }
             let id = UUID()
             let read = Task { await preparePreview(ref, version, revision: revision) }
@@ -291,7 +355,8 @@ extension MakeStudio {
             let (input, unavailable, image, imageFailure) = await withTaskCancellationHandler { await read.value } onCancel: { read.cancel() }
             // Scope sources per file and revision so concurrent previews cannot publish each other's titles.
             let key = "\(file.path) \(revision)"
-            let faces = titleProjections[key]?.faces ?? PartFaces(dataRoot: studio.dataRoot, call: project)
+            let titleKey = PageFaceKey.makeTitle(file: file, revision: revision)
+            let faces = titleProjections[key]?.faces ?? PartFaces(dataRoot: studio.dataRoot, feed: feed, key: { _ in titleKey }, call: project)
             if !stopped, !Task.isCancelled {
                 let previous = titleProjections[key]?.task
                 previous?.cancel()
@@ -304,19 +369,45 @@ extension MakeStudio {
                 titleOrder.removeAll { $0 == key }
                 titleOrder.append(key)
                 while titleOrder.count > 4 {
-                    if let gone = titleProjections.removeValue(forKey: titleOrder.removeFirst()) { gone.task.cancel(); _ = gone.faces.stop() }
+                    if let gone = titleProjections.removeValue(forKey: titleOrder.removeFirst()) {
+                        gone.task.cancel()
+                        await gone.faces.close()
+                    }
                 }
             }
-            return Preview(file: file, revision: revision, titleFaces: faces, image: image, imageFailure: imageFailure)
+            return Preview(file: file, revision: revision, titleKey: titleKey, image: image, imageFailure: imageFailure)
         }
 
         public func meta(_ ref: String?) -> MakeStudio.Meta? {
             ref.map { metadata[$0] } ?? newest
         }
 
+        public var allMetadata: [MakeStudio.Meta] {
+            metadata.values.sorted {
+                let left = $0.versions.last?.created ?? "", right = $1.versions.last?.created ?? ""
+                return left == right ? $0.ref < $1.ref : left < right
+            }
+        }
+
         public func start() {
             guard !stopped, !loaded else { return }
             changed(studio.root)
+        }
+
+        public func prepareCapture() async throws {
+            start()
+            if let refresh { await refresh.value }
+            try Task.checkCancellation()
+            if stopped { throw Refusal(reason: "make_stopped", message: "The Make shelf has closed.") }
+            if let fault { throw Refusal(reason: "make_unavailable", message: fault) }
+            guard loaded else { throw Refusal(reason: "make_unread", message: "The Make shelf has supplied no completed reading.") }
+        }
+
+        public func flushPreviewTitle(_ ref: String, version: Version, revision: Int) async {
+            let key = "\(file(ref, version).path) \(revision)"
+            guard let projection = titleProjections[key] else { return }
+            await projection.task.value
+            await projection.faces.flush()
         }
 
         /// Retire shelf reads at engine shutdown so they cannot rearm observers.
@@ -336,12 +427,11 @@ extension MakeStudio {
             for projection in projections { projection.task.cancel() }
             titleProjections.removeAll()
             titleOrder.removeAll()
-            let faceDrains = projections.map { $0.faces.stop() }
             return Task.detached {
                 await settle {
                     for read in reads { _ = await read.value }
                     for projection in projections { await projection.task.value }
-                    for drain in faceDrains { await drain.value }
+                    for projection in projections { await projection.faces.close() }
                     if let refreshDrain { await refreshDrain.value }
                 }
             }

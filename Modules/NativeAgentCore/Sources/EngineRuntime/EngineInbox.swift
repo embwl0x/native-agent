@@ -9,6 +9,8 @@ import TriggerScheduler
 import Cognition
 import BackgroundWork
 import Experiences
+import ApprovalTransactions
+import Privacy
 // Blueprint: | `EngineInbox.swift` | Root-specific ForPerson inbox reading, face-change subscription lifetime and checked trigger publication |
 
 extension InboxItemRecord {
@@ -20,73 +22,38 @@ extension InboxItemRecord {
 @Observable
 public final class InboxFacade {
     public nonisolated let dataRoot: URL
-    public private(set) var items: [InboxItemRecord] = [] {
-        didSet { itemsDidChange?() }
-    }
-    public private(set) var loadError: String?
-    public private(set) var hasLoadedSnapshot = false
-    public var isLoading: Bool { pendingItemReads > 0 }
-    private var pendingItemReads = 0
+    private nonisolated let reading: InboxReadings
     public private(set) var triggerRows: [TriggerConfig] = []
     public private(set) var triggersRead = false
     public private(set) var triggerError: String?
     public var isLoadingTriggers: Bool { pendingTriggerReads > 0 }
     private var pendingTriggerReads = 0
-    @ObservationIgnored private lazy var itemRead = LatestRead()
     @ObservationIgnored private lazy var triggerRead = LatestRead()
     @ObservationIgnored var faceChanges: Task<Void, Never>?
 
     isolated deinit { faceChanges?.cancel() }
 
-    public var refreshErrorText: String? {
-        loadError.map { _ in
-            items.isEmpty ? "Couldn't read your notes. Try Refresh."
-                : "Couldn't refresh, so these notes may be out of date. Try Refresh."
-        }
-    }
-
-    public enum ContentPresentation { case loading, unavailable, empty, content }
-
-    public func contentPresentation(hasVisibleItems: Bool) -> ContentPresentation {
-        if hasVisibleItems { return .content }
-        if loadError != nil { return .unavailable }
-        return hasLoadedSnapshot ? .empty : .loading
-    }
-    @ObservationIgnored public var itemsDidChange: (@MainActor () -> Void)?
-
-    public nonisolated init(dataRoot: URL) {
+    public nonisolated init(dataRoot: URL, counts: CountsFeedProjection) {
         self.dataRoot = dataRoot
+        self.reading = InboxReadings(dataRoot: dataRoot, counts: counts)
     }
 
     /// Failed owner reads retain proven rows with loadError; the phone receives the same checked reading.
-    public func list(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
-        pendingItemReads += 1
-        defer { pendingItemReads -= 1 }
-        let result: Result<[InboxItemRecord], Error> = await itemRead.read({
-            do { return .success(try await self.read()) }
-            catch { return .failure(error) }
-        }) { result in
-            switch result {
-            case .success(let loaded):
-                if items != loaded { items = loaded }
-                hasLoadedSnapshot = true
-                loadError = nil
-            case .failure(let error):
-                loadError = UserFacingError.message(error, action: "read your inbox")
-            }
-        }
-        let loaded = try result.get()
-        return unreadOnly ? loaded.filter(\.isUnread) : loaded
+    public nonisolated func list(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
+        try await reading.list(unreadOnly: unreadOnly)
     }
 
-    private nonisolated func read() async throws -> [InboxItemRecord] {
-        try await ForPerson.at(dataRoot).inbox()
+    public nonisolated func changes() async -> AsyncStream<Void> {
+        await reading.changes()
     }
 
-    public func refresh() async { _ = try? await list() }
+    public nonisolated func refresh() async {
+        do { _ = try await list() }
+        catch { /* The checked reading retains the source's cause in its face. */ }
+    }
 
     /// Mounted inbox surfaces must share one source and revision.
-    public func observe() async {
+    public nonisolated func observe() async {
         for await _ in await ForPerson.at(dataRoot).changes() {
             guard !Task.isCancelled else { return }
             await self.refresh()
@@ -94,8 +61,81 @@ public final class InboxFacade {
     }
 
     /// The read action already committed; publish its owner's current reading, including any answer that landed meanwhile.
-    public func markRead(_ id: String) {
+    public nonisolated func markRead(_ id: String) {
         Task { await refresh() }
+    }
+}
+
+/// The inbox owns its admitted rows; every caller returns its own read and every face receives this owner's finished value.
+private actor InboxReadings {
+    private let dataRoot: URL
+    private let counts: CountsFeedProjection
+    private let latest = LatestRead()
+    private var face = InboxCountsFace()
+    private var reads: Set<UUID> = []
+    private var observers: [UUID: AsyncStream<Void>.Continuation] = [:]
+
+    init(dataRoot: URL, counts: CountsFeedProjection) {
+        self.dataRoot = dataRoot
+        self.counts = counts
+    }
+
+    deinit { for observer in observers.values { observer.finish() } }
+
+    func changes() -> AsyncStream<Void> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            observers[id] = continuation
+            continuation.onTermination = { [weak self] _ in Task { await self?.removeObserver(id) } }
+        }
+    }
+
+    private func removeObserver(_ id: UUID) { observers.removeValue(forKey: id) }
+
+    func list(unreadOnly: Bool) async throws -> [InboxItemRecord] {
+        let id = UUID()
+        reads.insert(id)
+        face.isReading = true
+        await counts.updateInbox(face)
+        let result: Result<[InboxItemRecord], Error> = await latest.read({
+            do { return .success(try await ForPerson.at(dataRoot).inbox()) }
+            catch { return .failure(error) }
+        }) { result in
+            let previous = face
+            switch result {
+            case .success(let rows):
+                face.rows = rows.map(Self.disclosed)
+                face.noteIDs = rows.filter {
+                    $0.isUnread && $0.source != InlineInteractionDelivery.source && !$0.hasLinkedApproval
+                }.map(\.id)
+                face.unread = .init(value: rows.filter(\.isUnread).count)
+            case .failure(let error):
+                face.unread.issue = NativeAppSecretRedactor.redactText(UserFacingError.message(error, action: "read your inbox"))
+            }
+            if face != previous { for continuation in observers.values { continuation.yield() } }
+        }
+        reads.remove(id)
+        face.isReading = !reads.isEmpty
+        await counts.updateInbox(face)
+        let rows = try result.get()
+        return unreadOnly ? rows.filter(\.isUnread) : rows
+    }
+
+    private static func disclosed(_ row: InboxItemRecord) -> InboxItemRecord {
+        let redact = NativeAppSecretRedactor.redactText
+        var result = InboxItemRecord(
+            id: row.id, created_at: row.created_at, source: row.source, severity: row.severity,
+            title: redact(row.title), summary: redact(row.summary), detail: row.detail.map(redact),
+            relatedWorkshopExecutionId: row.relatedWorkshopExecutionId, related_approval_id: row.related_approval_id,
+            related_paths: row.related_paths, related_groups: row.related_groups?.map {
+                .init(id: $0.id, title: redact($0.title), count: $0.count, item_ids: $0.item_ids, source: $0.source)
+            }, actions: row.actions.map { .init(id: $0.id, label: redact($0.label), description: $0.description.map(redact)) },
+            status: row.status, read_at: row.read_at, chat_session_id: row.chat_session_id,
+            presentation: row.presentation.map {
+                .init(icon: $0.icon, badge: redact($0.badge), words: redact($0.words), actLabel: $0.actLabel.map(redact))
+            }, interaction_session_id: row.interaction_session_id, interaction_id: row.interaction_id)
+        result.relatedDelegationID = row.relatedDelegationID
+        return result
     }
 }
 
@@ -161,57 +201,5 @@ extension InboxFacade {
 extension InboxRelatedGroup {
     public func matches(_ item: InboxItemRecord) -> Bool {
         matches(itemID: item.id, title: item.title)
-    }
-}
-
-/// Project card actions once at the Desk boundary so every offered button invokes its exact native operation.
-public enum InboxVisibleActionsPresentation {
-    private static let hiddenActionIDs: Set<String> = ["view", "read", "reply"]
-
-    public static func actions(for item: InboxItemRecord) -> [InboxActionRecord] {
-        guard !item.isHiddenFromDefaultInbox else { return [] }
-        var seen: Set<String> = []
-        var visible: [InboxActionRecord] = []
-
-        for action in InboxActionVocabulary.actions(declared: item.actions, approvalLinked: item.hasLinkedApproval) {
-            let canonicalID = InboxActionVocabulary.normalizedAction(action.id
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased())
-            guard !hiddenActionIDs.contains(canonicalID),
-                  InboxActionVocabulary.nativeActionIDs.contains(canonicalID)
-            else { continue }
-
-            let label = action.label.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !label.isEmpty, seen.insert(canonicalID).inserted else { continue }
-            visible.append(InboxActionRecord(
-                id: canonicalID,
-                label: label,
-                description: action.description
-            ))
-        }
-        return visible
-    }
-}
-
-
-/// Reading is not resolving: share OwnerAttentionPolicy with the overview and retain unresolved cards, including owner-restored cards, in the latest
-/// checked revision.
-public enum InboxNeedsYou {
-    public struct Sections {
-        public let needsYou: [InboxItemRecord]
-        public let rest: [InboxItemRecord]
-
-        public var isEmpty: Bool { needsYou.isEmpty && rest.isEmpty }
-    }
-
-    public static func sections(
-        everywhere: [InboxItemRecord],
-        lane: [InboxItemRecord]
-    ) -> Sections {
-        let needsYou = everywhere
-            .filter(\.requiresOwnerInput)
-            .sorted { $0.created_at > $1.created_at }
-        let claimed = Set(needsYou.map(\.id))
-        return Sections(needsYou: needsYou, rest: lane.filter { !claimed.contains($0.id) })
     }
 }

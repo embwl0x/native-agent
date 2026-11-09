@@ -10,11 +10,11 @@ import Transcripts
 /// Opening a life room runs its canonical owner read on demand; Home never runs it.
 enum AgentWorkspaceLife {
     static let destinations: [AgentWorkspaceDestination] = [
-        .init(id: "music", title: "Music", summary: "What's playing, playback, playlists and the library.", tool: "music_now_playing"),
+        .init(id: "music", title: "Music", summary: "What's playing, playback, playlists and the library.", tool: "music.now_playing"),
     ]
 
     static let readTools: Set<String> = [
-        "music_now_playing", "music_search_library", "music_list_playlists", "music_list_library",
+        "music.now_playing", "music.search", "music.playlists", "music.library",
     ]
 
     /// Keep detail reads in their full frame so room rendering cannot clip their content.
@@ -22,7 +22,7 @@ enum AgentWorkspaceLife {
         if tool == "mac_reminders_read" { return nil }
         if tool.hasPrefix("mac_calendar_") { return "calendar" }
         if tool.hasPrefix("mac_reminders_") { return "reminders" }
-        return tool.hasPrefix("music_") ? "music" : nil
+        return tool.hasPrefix("music.") ? "music" : nil
     }
 
     static func project(workspace: WorkspaceOperation, tool: String, input: [String: JSONValue], result: JSONValue, dataRoot: URL) async -> WorkspacePage {
@@ -34,13 +34,13 @@ enum AgentWorkspaceLife {
             native = row
             if native["status"] == nil { native["status"] = .string("failed") }
         }
-        let required = ["music_search_library":"results","music_list_library":"tracks","music_list_playlists":"playlists"][tool]
+        let required = ["music.search":"results","music.library":"tracks","music.playlists":"playlists"][tool]
         if let required, row[required]?.arrayValue == nil, problem(native) == nil, native["error"] == nil {
             native["status"] = .string("unavailable")
             native["error"] = .string("Music source did not supply its " + required + " array.")
         }
-        if ["music_now_playing", "music_control"].contains(tool), problem(native) == nil, native["error"] == nil {
-            let playback = tool == "music_control" ? row["now_playing"]?.objectValue : result.objectValue
+        if ["music.now_playing", "music.control"].contains(tool), problem(native) == nil, native["error"] == nil {
+            let playback = tool == "music.control" ? row["now_playing"]?.objectValue : result.objectValue
             let track = playback?["track"]
             let explicitTrack = track == .null || text(track?.objectValue?["name"]) != nil
             if let failure = playback.flatMap(problem) {
@@ -60,7 +60,7 @@ enum AgentWorkspaceLife {
             let track = object(value), key = "track:" + String(index)
             if let name = text(track["name"]) {
                 items[key] = .init(title:name,content:.object(["who":track["artist"] ?? .null,"summary":track["album"] ?? .null]),actions:[])
-                actions[key+":play"] = effect("play",tool:"music_control",input:["action":.string("play"),"track":.string(name),"artist":track["artist"]
+                actions[key+":play"] = effect("play",tool:"music.control",input:["action":.string("play"),"track":.string(name),"artist":track["artist"]
                     ?? .string("")])
             }
         }
@@ -68,14 +68,14 @@ enum AgentWorkspaceLife {
             let list = object(value), key = "playlist:" + String(index)
             if let name = text(list["name"]) {
                 items[key] = .init(title:name,content:value,actions:[])
-                actions[key+":play"] = effect("play",tool:"music_control",input:["action":.string("play"),"playlist":.string(name)])
+                actions[key+":play"] = effect("play",tool:"music.control",input:["action":.string("play"),"playlist":.string(name)])
             }
         }
-        for verb in ["play","pause","stop","next","previous"] { actions[verb] = effect(verb,tool:"music_control",input:["action":.string(verb)]) }
-        actions["playlist"] = typed("playlist",tool:"music_control",input:["action":.string("play")],field:"playlist",effect:true)
-        actions["track"] = typed("track",tool:"music_control",input:["action":.string("play")],field:"track",effect:true)
-        actions["find"] = typed("find",tool:"music_search_library",field:"query")
-        actions["playlists"] = read("playlists",tool:"music_list_playlists",input:["limit":.int(24)])
+        for verb in ["play","pause","stop","next","previous"] { actions[verb] = effect(verb,tool:"music.control",input:["action":.string(verb)]) }
+        actions["playlist"] = typed("playlist",tool:"music.control",input:["action":.string("play")],field:"playlist",effect:true)
+        actions["track"] = typed("track",tool:"music.control",input:["action":.string("play")],field:"track",effect:true)
+        actions["find"] = typed("find",tool:"music.search",field:"query")
+        actions["playlists"] = read("playlists",tool:"music.playlists",input:["limit":.int(24)])
         let failed = problem(native) != nil || native["error"] != nil
         return await WorkspaceReadout.project(workspace: workspace, input:.object(["mode":.string("music"),"tool":.string(tool),"state":.string(
             failed ? "unavailable" : "available"),
@@ -148,7 +148,7 @@ extension AgentScreen {
         guard let room = AgentWorkspaceLife.room(for: tool) else { return nil }
         // A calendar or reminder change keeps its receipt frame unless its list was read back (the record carries the receipt).
         if case .receipt = place, tool.hasPrefix("mac_") { return nil }
-        let readStatus = tool == "music_control" ? (AgentWorkspaceLife.object(shown.content)["status"] ?? status) : status
+        let readStatus = tool == "music.control" ? (AgentWorkspaceLife.object(shown.content)["status"] ?? status) : status
         var lines = textRoom(workspace: workspace, room, place: place, projection: shown, status: readStatus, dataRoot: dataRoot, scope: scope).components(
             separatedBy: "\n")
         if let receipt {

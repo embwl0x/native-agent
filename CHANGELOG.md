@@ -4,6 +4,15 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.16 — always on (2026-11-09)
+
+- It hears you: a message mid-answer stops the model's stream, keeps the words said and answers you; calls that have not started yield to your words; a running call is never cut
+- Thoughts carry what the agent last concluded on the same subject; when it sleeps and takes its hour is its own judgment, with a body rule at 48 hours
+- One renderer: every page, form, long document, long list and setup screen is drawn one way on Mac and iPhone; the interface runs apart from the agent, whose process no longer holds window code
+- The chat you are in shows what the agent is doing elsewhere; Mac control acts wait on app signals; the agent's Chrome tab keeps rendering
+- Meta by API key; iPhone sync reads while open and no longer rests on push, and typing costs far less
+- A message from the iPhone tells the agent you're on the phone and carries fresh readings of the senses you turned on
+
 ## 0.6.15 — one living app (2026-11-05)
 
 - Every page is one face the agent keeps current from launch, drawn the same on Mac and iPhone; the agent reads the page the person sees
@@ -163,7 +172,7 @@ Reverse-chronological. Each phase: 1–2 lines.
 - The app door does many actions in one call with per-action receipts; refusals name the next step; Diagnostics shows rounds per turn and the heaviest asks.
 
 ### A body that heals itself
-- Recipes as data for every agent host and A2A peer; discovery of any installed agent; heal on contact with one bound retry; every Doctor finding has an owner and a route, readings never wake anyone, warnings name their harm; the harness queue and daily body report; stalls cut at the provider's learned first-output deadline with an honest sentence.
+- Recipes as data for every agent host and A2A peer; discovery of any installed agent; heal on contact with one bound retry; every Doctor finding has an owner and a route, readings never wake anyone, warnings name their harm; the body queue and daily body report; stalls cut at the provider's learned first-output deadline with an honest sentence.
 
 ### The mind and the calls
 - Memory holds memories only; judgment loop (misses → lessons → growth); every model call carries a purpose; rule-shaped calls are rules.
@@ -819,7 +828,7 @@ Cleaned public-source identity and release hygiene: tracked local build/signing/
 Added gated `CognitiveSubstrate` infrastructure through Phase 10: SQLite snapshot/restore, workspace, capsule preview, prediction ledger, affect, thought seeds, replay references, reflection receipts, observatory snapshots, and an explicit chat-event observer seam. It remains default-off with no background provider calls, prompt injection, MemoryV2 writes, or persona mutation.
 
 ## Consolidation window (2026-05-12)
-Tightened iOS remote responsiveness, made memory/self-improvement approval paths final, auto-ran and auto-implemented safe harness learning with receipts/scoring, added capability foundry backlog implementation, and refreshed docs around the current direction/handoff instead of stale sprint snapshots.
+Tightened iOS remote responsiveness, made memory/self-improvement approval paths final, auto-ran and auto-implemented safe body learning with receipts/scoring, added capability foundry backlog implementation, and refreshed docs around the current direction/handoff instead of stale sprint snapshots.
 
 ## Phase 13 (2026-05-09)
 Closed 12 chronic audit-skip items: centralized REPO_PATH marker validation, Swift /var symlink fix, startup retention pruning for traces/runs/memory_proposals, iOS iCloud routing for spotlight+shortcut, self_test through connector receipt path, spotlight loopback trigger fix, ContentView dynamic slash dispatch, ToolInputForm Sendable safety, removed dead _select_glob_match, fixed ResolvedPolicy.reason for explicit_override, updated README/approval-schema/threat-model, added CHANGELOG/CONTRIBUTING/SECURITY/LICENSE stubs.

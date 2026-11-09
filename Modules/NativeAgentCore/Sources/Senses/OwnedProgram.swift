@@ -39,8 +39,9 @@ public struct OwnedProgram: Codable, Sendable, Equatable {
     }
 
     public var sourceLimit: Int { AbilityStore.sourceLimit }
-    public var returnLimit: Int { isPart || kind == .turn ? 4 * 1024 * 1024 : OwnedProgramRunner.returnLimit }
-    public var inputLimit: Int { isPart || kind == .turn ? returnLimit : OwnedProgramRunner.inputLimit }
+    /// Admission bounds input and captured fixtures, never clips produced returns.
+    public var materialLimit: Int { isPart || kind == .turn ? 4 * 1024 * 1024 : OwnedProgramRunner.inputLimit }
+    public var inputLimit: Int { materialLimit }
     public var isPart: Bool { [.part, .tool, .skill].contains(kind) }
     public var storeKind: AbilityStore.Kind? { isPart ? .part : AbilityStore.Kind(rawValue: kind.rawValue) }
     /// Journal strict calls for resume replay and interpret their receipts exactly.
@@ -209,6 +210,7 @@ public protocol OwnedProgramHostProfile: Sendable {
     func action(_ id: String) throws -> OwnedProgramAction?
     func canonicalAction(_ id: String) throws -> String
     func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], OwnedProgramRunner.ScriptError>
+    func callArgumentsForEvidence(_ id: String, given: [JSONValue]) throws -> [JSONValue]
     func opensHomeItem(_ input: [String: JSONValue]) -> Bool
     func secretLine(_ text: String) -> Bool
     func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence
@@ -259,16 +261,26 @@ public struct OwnedProgramExecution: Sendable {
     public var readContent: OwnedProgramRunner.ReadContent?
     public var dependencySnapshot: (id: String, version: String, shapes: JSONValue)?
     public var valueIdentity: (id: String, version: String)?
+    public struct ValueReach: Sendable {
+        public let id: String
+        public let actions: Set<String>
+        public let capabilities: Set<String>
+        public init(id: String, actions: Set<String>, capabilities: Set<String>) {
+            self.id = id; self.actions = actions; self.capabilities = capabilities
+        }
+    }
+    public var valueReach: ValueReach?
     public var deadline: ContinuousClock.Instant?
     public var deadlines: OperationDeadlines
     public var onActivity: (@Sendable () -> Void)?
     public init(turn: Turn?, surface: String, deadlines: OperationDeadlines, input: JSONValue? = nil, preview: Bool = false, wake: JSONValue? = nil,
                 options: OwnedProgramRunOptions = .init(), readContent: OwnedProgramRunner.ReadContent? = nil,
                 dependencySnapshot: (id: String, version: String, shapes: JSONValue)? = nil,
-                valueIdentity: (id: String, version: String)? = nil, deadline: ContinuousClock.Instant? = nil,
+                valueIdentity: (id: String, version: String)? = nil, valueReach: ValueReach? = nil, deadline: ContinuousClock.Instant? = nil,
                 onActivity: (@Sendable () -> Void)? = nil) {
         self.turn = turn; self.surface = surface; self.input = input; self.preview = preview; self.wake = wake; self.options = options
         self.readContent = readContent; self.dependencySnapshot = dependencySnapshot; self.valueIdentity = valueIdentity;
+        self.valueReach = valueReach
             self.deadline = deadline; self.onActivity = onActivity
         self.deadlines = deadlines
     }

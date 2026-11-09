@@ -1,7 +1,7 @@
 # Git pathspecs for repository-owned Mac build inputs. Keep assembly changes here
 # with project.yml/Package.swift; ordinary repository notes are not build inputs.
 Sources
-Modules/*/Sources
+:(glob)Modules/*/Sources/**
 Modules/*/Package.swift
 Package.swift
 Package.resolved

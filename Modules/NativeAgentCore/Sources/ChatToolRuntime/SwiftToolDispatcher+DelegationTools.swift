@@ -30,9 +30,8 @@ extension SwiftToolDispatcher {
             evidenceStatus = "ok"
         }
         let jobs = snapshot.jobs
-        let stalled = jobs.filter { $0.stalled }
         // Settlement is the projector's evidence, independent of a recorded execution completion time.
-        let open = jobs.filter { $0.completedAt == nil && $0.stallBasis != .terminal }
+        let open = jobs.filter { $0.completedAt == nil && !$0.deliverySettled }
         var response: [String: JSONValue] = [
             "status": .string(evidenceStatus),
             "source_availability": .array(sources.map(\.json)),
@@ -44,7 +43,6 @@ extension SwiftToolDispatcher {
             "has_more": .bool(offset < matchedCount && jobs.count < matchedCount - offset),
             "detail": .string(fullDetail ? "full" : "compact"),
             "open_count": .int(Int64(open.count)),
-            "stalled_count": .int(Int64(stalled.count)),
             // Confirmed loss and unknown delivery must remain distinct.
             "delivery_lost_count": .int(Int64(jobs.filter { $0.deliveryOutcome == "lost" }.count)),
             "delivery_unknown_count": .int(Int64(jobs.filter { $0.deliveryOutcome == "unknown" }.count)),

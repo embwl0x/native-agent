@@ -5,20 +5,6 @@ import ChatTurnRuntime
 import NativeAgentShared
 // Blueprint: | `MacChatTurnApproval.swift` | canonical turn approval projection, card visibility and inline authority state |
 
-/// A turn's approval projected from the canonical inbox, with only proven decisions represented as approved or denied.
-public struct MacChatTurnCardApproval: Sendable, Equatable {
-    public let approvalId: String
-    public let toolName: String
-    public let reason: String?
-    public var inputSummary: String? = nil
-    /// Name peer requesters from Trust; the person's own approvals need no requester label.
-    public var requester: String? = nil
-    public let outcome: ApprovalRequest.Outcome
-
-    /// Only a pending request can be decided from here.
-    public var isActionable: Bool { outcome == .pending }
-}
-
 public enum TurnApprovalRead {
     /// An exact-turn approval carries this session and was requested no earlier than the turn opened. Deduplicated rows use lastRequestedAt, since their
     /// creation can belong to an earlier turn. Unreadable provenance fails closed. Pending wins, then newest request, then id for deterministic selection.
@@ -56,7 +42,7 @@ public enum TurnApprovalRead {
         guard let chosen else { return nil }
         return MacChatTurnCardApproval(
             approvalId: chosen.candidate.row.id,
-            toolName: displayAction(chosen.candidate.row),
+            act: displayAction(chosen.candidate.row),
             reason: nonEmpty(chosen.candidate.row.reason).map {
                 ToolActivityPresentation.approvalText(
                     ApprovalActionText.reason($0, tool: chosen.candidate.row.action),
@@ -158,22 +144,12 @@ public enum TurnApprovalRead {
     }
 
     private static func displayAction(_ row: ApprovalRecord) -> String {
-        nonEmpty(row.action).map(ToolActivityPresentation.title) ?? nonEmpty(row.title) ?? "this action"
+        row.call?.act ?? nonEmpty(row.action).map(ToolActivityPresentation.title) ?? nonEmpty(row.title) ?? "this action"
     }
 
     private static func nonEmpty(_ raw: String?) -> String? {
         guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty else { return nil }
         return trimmed
-    }
-}
-
-extension MacChatTurnCardApproval {
-    /// Keep unproven outcomes visible after the turn; proven decisions remain available in Approvals.
-    public var keepsCardVisible: Bool {
-        switch outcome {
-        case .pending, .expired, .unresolved: return true
-        case .approved, .denied: return false
-        }
     }
 }

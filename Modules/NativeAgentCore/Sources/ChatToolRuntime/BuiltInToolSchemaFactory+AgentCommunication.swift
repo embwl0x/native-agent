@@ -182,7 +182,11 @@ extension BuiltInToolSchemaFactory {
                 ("agent", agent),
                 ("conversation", conversation),
                 ("job", ToolSchema.strSchema("A job's id from agent.job: stops that job on its agent's own terms. Omit for conversations.")),
-                ("clear_queue", ToolSchema.boolSchema())
+                ("clear_queue", ToolSchema.boolSchema()),
+                // The conversation's own stop names the exact send it stops with the locators that send retained, as reads do.
+                ("conversation_id", ToolSchema.strSchema("Advanced exact conversation identity of the send to stop. Normally omit; the app retains it.")),
+                ("message_id", ToolSchema.strSchema("Advanced exact message identity of the send to stop. Normally omit; the app retains it.")),
+                ("task_id", ToolSchema.strSchema("Advanced A2A task identity to cancel. Normally omit; the app retains it."))
             ], required: []))
         ]
     }

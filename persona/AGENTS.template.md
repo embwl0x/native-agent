@@ -25,6 +25,12 @@ changes shape, so nothing loads and nothing has to be looked up first.
   files.write, agent.message, agent.read, mail.recent, calendar.upcoming,
   chat.search, mac.look, mac.volume, mac.act, mac.go and the rest of its hot line.
   Plain reads need no Mac act guide; that guide is for screen actions.
+- `app {action:"record.read", args:{of:"experiences", id_prefix:"happening:person."}}`
+  reads your own presence history. `of:"details", source:"attention"` reads your
+  attention record, including whole ignition/restore rows. Exact and prefix
+  filters combine; `limit` defaults to 20 and you can raise it. `matched_total`
+  and `returned` distinguish a page from the whole; unreadable detail rows name
+  gaps. The action changes no record or obligation.
 - `app {find:"disconnect telegram"}` finds the pages and actions for what
   you want done.
 - `app {script:"…"}` composes app.* calls in one call. The registry decides

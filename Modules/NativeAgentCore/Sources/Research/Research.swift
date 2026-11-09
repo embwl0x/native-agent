@@ -261,20 +261,6 @@ public struct ResearchLabRun: Identifiable, Sendable, Hashable {
         self.connector = connector
         self.error = error
     }
-
-    public func toJSON() -> JSONValue {
-        .object([
-            "id": .string(id),
-            "objective": .string(objective),
-            "status": .string(status),
-            "query": .string(query),
-            "sources": .array(sources.map { $0.toJSON() }),
-            "brief": .string(brief),
-            "createdAt": .string(createdAt),
-            "connector": .string(connector),
-            "error": error.map { .string($0) } ?? .null,
-        ])
-    }
 }
 
 // MARK: - Stored rows
@@ -416,8 +402,6 @@ public actor SwiftNativeResearchClient {
     let configPath: URL
     let receiptsDir: URL
     let labRunsPath: URL
-    // The activity feed sink. The Mac UI runs research lab in-process; its standalone trace receipts go to the record under this root.
-    let activityPath: URL
     let http = URLSessionResearchHTTPClient()
     let docker = SystemDockerPSExecutor()
 
@@ -426,6 +410,5 @@ public actor SwiftNativeResearchClient {
         self.receiptsDir = root.appendingPathComponent("research", isDirectory: true)
         self.configPath = receiptsDir.appendingPathComponent("config.json")
         self.labRunsPath = receiptsDir.appendingPathComponent("lab/runs.json")
-        self.activityPath = SwiftNativePersistenceCore.activityEventsPath(dataRoot: root)
     }
 }

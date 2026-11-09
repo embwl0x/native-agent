@@ -15,7 +15,7 @@ import NativeAgentShared
 package final class AgentMemo: @unchecked Sendable {
     package static let shared = AgentMemo()
     private let lock = NSLock()
-    private var store: [String: (stamp: [String], value: Any, generation: Int, used: Date, at: Date)] = [:]
+    private var store: [String: (stamp: [String], value: Any, generation: Int, identity: UUID, used: Date, at: Date)] = [:]
     private var generation = 0
     private var observations: [String: (id: UUID, revision: Int, used: Date, task: Task<Void, Never>)] = [:]
     private var stopped = false
@@ -66,7 +66,7 @@ package final class AgentMemo: @unchecked Sendable {
         guard !stopped else { return }
         generation += 1
         let now = Date()
-        store[key] = (stamp, value, generation, now, now)
+        store[key] = (stamp, value, generation, UUID(), now, now)
         prune(now)
     }
 
@@ -101,14 +101,14 @@ package final class AgentMemo: @unchecked Sendable {
     }
 
     /// Expose stamp currency alongside the retained value.
-    func peek<T>(_ key: String, stamp: [String]? = nil) -> (value: T, current: Bool, at: Date)? {
+    func peek<T>(_ key: String, stamp: [String]? = nil) -> (value: T, current: Bool, at: Date, identity: UUID)? {
         lock.withLock {
             let now = Date()
             prune(now)
             store[key]?.used = now
             observations[key]?.used = now
             let current = stamp ?? [String(observations[key]?.revision ?? 0)]
-            return store[key].flatMap { entry in (entry.value as? T).map { ($0, entry.stamp == current, entry.at) } }
+            return store[key].flatMap { entry in (entry.value as? T).map { ($0, entry.stamp == current, entry.at, entry.identity) } }
         }
     }
 
@@ -148,10 +148,15 @@ package final class AgentMemo: @unchecked Sendable {
                         let watcher = FileChangeWatcher(paths: watched) { _ in invalidate() }
                         invalidate()
                         await withTaskCancellationHandler {
+                            var lastReadRevision: Int?
                             for await _ in events.stream {
                                 guard !Task.isCancelled else { break }
-                                guard paths() == watched else { break }
                                 let revision = lock.withLock { observations[key]?.revision ?? 0 }
+                                if revision == lastReadRevision {
+                                    if paths() != watched { break }
+                                    continue
+                                }
+                                lastReadRevision = revision
                                 let value: Result<T, Error>
                                 do { value = .success(try await compute()) }
                                 catch { value = .failure(error) }
@@ -163,6 +168,8 @@ package final class AgentMemo: @unchecked Sendable {
                                 if lock.withLock({ !stopped && observations[key]?.id == id }), !Task.isCancelled {
                                     NotificationCenter.default.post(name: AgentWorkspaceScreenPreview.didChange, object: nil)
                                 }
+                                // Read canonical content even while directory entries change; then rebind the watch's reach.
+                                if paths() != watched { break }
                             }
                         } onCancel: { watcher.cancel() }
                         watcher.cancel()

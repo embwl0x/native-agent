@@ -414,6 +414,11 @@ extension SchedulerJobNormalizer {
         return Date(timeIntervalSince1970: epoch)
     }
 
+    /// The first occurrence of `fields` after `date`, or the grammar's own refusal of them.
+    public static func checkedNextOccurrence(_ fields: [String: JSONValue], after date: Date) throws -> Date {
+        Date(timeIntervalSince1970: try nextFromSchedule(fields, afterEpoch: date.timeIntervalSince1970, now: { date }))
+    }
+
     /// An `every` rhythm's interval, which counts from where it was filed; nil for calendar rhythms.
     public static func rhythmInterval(_ rhythm: JSONValue) -> TimeInterval? {
         guard case .object(let fields) = rhythm, scheduleType(fields) == "every",

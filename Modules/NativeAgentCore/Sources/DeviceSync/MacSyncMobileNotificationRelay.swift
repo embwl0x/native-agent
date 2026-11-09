@@ -160,20 +160,23 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                         guard case .object(var entry) = value else { throw CocoaError(.propertyListReadCorrupt) }
                         guard var registration = try WorkActivityPushRegistration.read(entry["workActivity"]),
                               registration.pairing == fingerprint else { return }
+                        let before = registration
                         registration.retireInactiveStarts(activeIDs: eligibleStartIDs, now: Date())
+                        if registration == before { return }
                         entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
                         root[deviceID] = .object(entry)
                         try await SwiftNativePersistenceCore.writeJSON(.object(root), to: path)
                     }
                     guard original.enabled else { continue }
-                    let removed = original.activityTokens.keys.filter { !ids.contains($0) }.compactMap { id -> MobileWorkActivity? in
-                        guard var content = original.lastContents[id] else { return nil }
-                        content.state = .unknown
-                        content.status = "Tracking ended — open the app"
-                        content.updatedAt = Date()
-                        return MobileWorkActivity(id: id, sessionID: nil, startedAt: content.updatedAt, content: content)
+                    var reconciled: [MobileWorkActivity] = []
+                    for id in original.activityTokens.keys.sorted() where !ids.contains(id) {
+                        do {
+                            reconciled.append(try await MacSyncEngine.workActivity(id, dataRoot: dataRoot))
+                        } catch {
+                            errors.append("Live Activity \(id) is unresolved: \(error.localizedDescription)")
+                        }
                     }
-                    for row in rows + removed {
+                    for row in rows + reconciled {
                         if Task.isCancelled { return errors }
                         let failure: String? = try await SwiftNativePersistenceCore.withFileLock(lock) {
                             var root = try Self.readObjectStore(path)
@@ -184,12 +187,13 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                                   let currentPairing = try PairingSecret.existingSecretBase64(),
                                   WorkActivityPushRegistration.fingerprint(currentPairing) == fingerprint else { return nil }
                             if registration.lastContents[row.id] == row.content { return nil }
-                            if let previous = registration.lastContents[row.id], previous.updatedAt > row.content.updatedAt { return nil }
+                            if let previous = registration.lastContents[row.id]?.sequence,
+                               let incoming = row.content.sequence, incoming < previous { return nil }
                             let token: String
                             let event: String
                             if let activityToken = registration.activityTokens[row.id] {
                                 token = activityToken
-                                event = row.content.state.isTerminal || !ids.contains(row.id) ? "end" : "update"
+                                event = row.content.state.isTerminal ? "end" : "update"
                             } else {
                                 guard ids.contains(row.id), !row.content.state.isTerminal, row.staleDate > Date(),
                                       !registration.startedIDs.contains(row.id), let startToken = registration.startToken else { return nil }
@@ -339,7 +343,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         } catch {
             throw ToolFailureError("Notification publication \(path.path) is unavailable: \(error.localizedDescription)",
                 effects: .unknown, owner: "phone notifications",
-                nextCall: ToolFailureError.call("app", ["page": .string("pairing")]),
+                nextCall: ToolFailureError.call("app", ["page": .string("connectors")]),
                 code: "notification_publication_unavailable",
                 instruction: """
                     Preserve the publication bytes and repair their read/write failure or the producer's conflicting event identity before retrying. An \

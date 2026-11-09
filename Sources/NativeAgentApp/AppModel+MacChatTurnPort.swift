@@ -22,7 +22,7 @@ extension AppModel: MacChatTurnPresentationPort {
     func captureMacWorkContinuation(_ text: String, taskReference: String) async -> MacWorkContinuation? {
         guard UserMessageIntentSignals.isTakeOver(text) else { return nil }
         let front = NSWorkspace.shared.frontmostApplication
-        let app = front?.processIdentifier == getpid() ? (NSApp.delegate as? AppDelegate)?.previousWorkApp : front
+        let app = PersonOnlyWindows.isOwnProcess(front?.processIdentifier) ? (NSApp.delegate as? AppDelegate)?.previousWorkApp : front
         if let refusal = await MacControlGate.continuationCaptureRefusal(dataRoot: engine.dataRoot) {
             return .unsupported(refusal, taskReference: taskReference)
         }
@@ -34,9 +34,13 @@ extension AppModel: MacChatTurnPresentationPort {
             context: MacOperationContext(dataRoot: engine.dataRoot))
     }
 
-    func chatHasConversationRows(sessionId: String) -> Bool {
+    func chatHasConversationRows(sessionId: String) throws -> Bool {
         FirstRunWelcomeTransaction.hasConversationRows(
-            engine.transcripts.messages(for: sessionId), syntheticErrorIDPrefix: Self.syntheticErrorIDPrefix)
+            try engine.transcripts.completeDisplayedMessages(for: sessionId), syntheticErrorIDPrefix: Self.syntheticErrorIDPrefix)
+    }
+    func prepareMacChatTranscript(sessionId: String) async throws {
+        _ = try await engine.transcripts.loadMessages(sessionId: sessionId, cached: true)
+        _ = try engine.transcripts.completeDisplayedMessages(for: sessionId)
     }
 
     func cancelICloudChatTurnForControlHandoff(sessionId: String) {
@@ -71,22 +75,18 @@ extension AppModel: MacChatTurnPresentationPort {
             activityIdentity: activityIdentity, turn: turn, port: self, client: macChatClient,
             missingProviderGuidance: missingProviderChatGuidance(),
             errorAdvice: UserFacingError.advice,
-            finishReplyPresentation: {
-                try? await Task.sleep(for: .seconds(NativeAgentMotion.standardDuration))
-            }
+            finishReplyPresentation: {}
         )
     }
 
     func animateMacChatMutation(_ mutation: () -> Void) {
-        withAnimation(NativeAgentMotion.arrive, mutation)
+        mutation()
     }
 
     func presentMacChatTurn(_ event: MacChatTurnPresentationEvent) {
         switch event {
         case .status(let message):
             statusText = message
-        case .intakeClosed:
-            break
         case .activity(let activity):
             // Keep tool results in the existing notice/toast contract so they do not add duplicate chatter.
             guard case .notice(let kind) = activity.source,

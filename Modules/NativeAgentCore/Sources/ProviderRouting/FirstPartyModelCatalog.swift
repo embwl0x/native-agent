@@ -200,11 +200,20 @@ public enum FirstPartyModelCatalog {
     /// Exact subscription IDs must resolve before Moonshot classification; Moonshot's own IDs stay outside this set.
     public static let kimiCodeModelIDSet: Set<String> = Set(kimiCodeModels.map { $0.id })
 
+    /// Standard pay-as-you-go models; Contributor mode requires a separate data-use choice.
+    public static let metaModels: [FirstPartyModelDescriptor] = [
+        // The Messages wire declares low through xhigh; its history accepts user/assistant roles only.
+        .init(id: "muse-wonder-1.0", name: "Muse Wonder 1.0", contextLength: 1_048_576, supportsJSONMode: true,
+            defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"]),
+        .init(id: "muse-spark-1.3", name: "Muse Spark 1.3", contextLength: 1_048_576, supportsJSONMode: true,
+            defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"]),
+    ]
+
     public static func descriptor(for modelID: String) -> FirstPartyModelDescriptor? {
         let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         // Provider-neutral context budgeting must be conservative when the same model id has different public/account windows. Provider pickers still use
         // their exact catalog; this lookup chooses the smallest verified window so Fluid Context cannot overfill either transport.
-        return (publicOpenAIModels + anthropicModels + xAIModels + moonshotModels + kimiCodeModels)
+        return (publicOpenAIModels + anthropicModels + xAIModels + moonshotModels + kimiCodeModels + metaModels)
             .filter { $0.id.lowercased() == id }
             .min { $0.contextLength < $1.contextLength }
     }
@@ -231,6 +240,7 @@ public enum FirstPartyModelCatalog {
             return xAIModels
         case "moonshot": return moonshotModels
         case "kimi-code": return kimiCodeModels
+        case "meta": return metaModels
         default: return []
         }
     }
@@ -350,7 +360,7 @@ public enum FirstPartyExecutionControls {
             return .providerError(message:
                 "\(providerID): model declined to answer (stop_reason=refusal)")
         }
-        return .transient(message:
+        return .underlying(message:
             "\(providerID): stream completed with no \(expectedOutput) "
             + "(stop_reason=\(reason))")
     }

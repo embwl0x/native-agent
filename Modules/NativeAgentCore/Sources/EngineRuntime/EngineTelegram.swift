@@ -15,11 +15,24 @@ import NativeAgentShared
 public final class TelegramFacade {
     public nonisolated let dataRoot: URL
     public var status: TelegramPresentationSnapshot?
+    public private(set) var statusIssue: String?
     @ObservationIgnored private let statusRead = LatestRead()
 
     @discardableResult
     public func refresh(manager: BackgroundLoopLifetimes = .shared) async throws -> TelegramPresentationSnapshot {
-        try await statusRead.read({ try await load(manager: manager) }, publish: { status = $0 })
+        let result: Result<TelegramPresentationSnapshot, Error> = await statusRead.read({
+            do { return .success(try await load(manager: manager)) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            switch result {
+            case .success(let loaded):
+                status = loaded
+                statusIssue = nil
+            case .failure(let error):
+                statusIssue = error.localizedDescription
+            }
+        })
+        return try result.get()
     }
 
     public nonisolated init(dataRoot: URL) { self.dataRoot = dataRoot }

@@ -27,9 +27,11 @@ public struct MobileWorkActivity: Codable, Equatable, Identifiable, Sendable {
         public var state: State
         public var status: String
         public var updatedAt: Date
+        public var sequence: Int64?
 
-        public init(title: String, state: State, status: String, updatedAt: Date) {
+        public init(title: String, state: State, status: String, updatedAt: Date, sequence: Int64? = nil) {
             self.title = title; self.state = state; self.status = status; self.updatedAt = updatedAt
+            self.sequence = sequence
         }
     }
 
@@ -49,6 +51,7 @@ public struct MobileWorkActivitySnapshot: Codable, Sendable {
     public var experienceRevision: Int? = 1
     public var experiences: [Experience]? = nil
     public var unavailable: String? = nil
+    public var turnSessions: TurnSessionsFace? = nil
     public var activities: [MobileWorkActivity]
     public var pairingFingerprint: String
     public var pushConfigured: Bool

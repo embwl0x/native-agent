@@ -9,6 +9,7 @@ import ChatTurnRuntime
 import ChatTurnContracts
 import ChatToolRuntime
 import ChatToolParsing
+import ChromeControl
 import Cognition
 import Desk
 import Foundation
@@ -22,14 +23,16 @@ import ToolExecution
 import TurnTrace
 import NativeAgentShared
 import AppKit
-// Blueprint: | `EnginePartWake.swift` | `EnginePartWake`, `start`, `deliver`, `run`, `readsOnly`, `reindex`, `held`, `resumed`, `holdBack`, `tainted_signal`, `changed`, `changed_more`, `person.away`, `person.here`, `network.down`, `network.up`, `AgentOpened` |
+// Blueprint: | `EnginePartWake.swift` | `EnginePartWake`, `start`, `deliver`, `run`, `readsOnly`, `reindex`, `held`, `resumed`, `holdBack`, `tainted_signal`, `changed`, `changed_more`, `person.away`, `person.here`, `network.down`, `network.up`, `chrome.tab_taken`, `AgentOpened` |
 
 /// Deliver source signals after their own work settles, including durable turn terminals. Schedules belong to TriggerScheduler and file watches to
 /// senses; this owner never polls. Autonomy and unreadable catalogs hold wakes without consuming their input; source subscriptions retain their helper
 /// generation. Each unattended run gets its own resident gate chain, approval route, current Trust and source taint; approvals wait through quiet hours.
-/// Suppress self-write and self-turn echoes, and serialize arrivals through one ResidentWake thread.
+/// Suppress self-write and self-turn echoes. Part runs and carried habits run in their own session, never a conversation or the agent's mind stream.
 actor EnginePartWake {
     static let shared = EnginePartWake()
+    /// The session every part run and carried habit runs and traces in.
+    static let session = "parts"
     /// Unreadable catalogs leave the signal index unavailable, never empty.
     private var index: [String: [AbilityStore.File]]?
     private var watched: [String: [URL]] = [:]
@@ -97,11 +100,11 @@ actor EnginePartWake {
                 "session_id": (info["sessionId"] as? String).map(JSONValue.string) ?? .null]
             if let steer = info["agent"] as? String { payload["agent"] = .string(steer) }
             let starter = info["part"] as? String
-            let resident = info["sessionId"] as? String == ResidentWake.session
             let wake = payload
             Task {
                 guard await Self.holdsDetail(seq: seq, turn: turn, kind: kind, dataRoot: root) else { return }
-                if resident { Task { await EngineCarriedHabits.record(turn: turn, dataRoot: root) } }
+                // The carried-habit owner reads the turn's own trace to decide whether it carried a step.
+                Task { await EngineCarriedHabits.record(turn: turn, dataRoot: root) }
                 await Self.shared.signalled("turn.ended", except: starter, wake, dataRoot: root, epoch: epoch)
             }
         })
@@ -152,6 +155,11 @@ actor EnginePartWake {
             Task { await Self.shared.network(up, dataRoot: root, epoch: epoch) }
         })
         _ = NetworkSense.isUp
+        observers.append(center.addObserver(forName: ChromeTabTaken.happened, object: nil, queue: nil) { note in
+            // Read provenance at the act: the agent's own hands selecting a tab are not the person taking it.
+            guard !NativeAgentMotorEpoch.isAgentDriven(), let taken = note.userInfo?["taken"] as? ChromeTabTaken else { return }
+            Task { await Self.shared.tabTaken(taken, dataRoot: root, epoch: epoch) }
+        })
         // Resume each part with the code and state that knows what it held.
         await deliver("resumed", [:], dataRoot: root, epoch: epoch)
     }
@@ -164,7 +172,7 @@ actor EnginePartWake {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         // A newer callback can run during suspension; never overwrite its receipt with an older reading.
         if let current = PersonPresence.read(dataRoot: dataRoot).transition {
-            signalPresence(current.here, payload: ["idle_seconds": .double(idle)], dataRoot: dataRoot)
+            postPresence(current, payload: ["idle_seconds": .double(idle)], dataRoot: dataRoot)
         }
         await NativeAgentEngine.cognitionRuntime(for: dataRoot).carriedPresenceChanged()
     }
@@ -172,17 +180,29 @@ actor EnginePartWake {
     private func phonePresence(source: String?, at: Date?, dataRoot: URL, epoch: UUID) async {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         let reading = PersonPresence.read(dataRoot: dataRoot)
-        if source == "motion", let at, let transition = reading.transition, transition.here == false, transition.since == at {
-            signalPresence(false, payload: ["source": .string("phone motion")], dataRoot: dataRoot)
+        if let transition = reading.transition {
+            await NativeAgentEngine.cognitionRuntime(for: dataRoot).rhythmPresenceChanged(here: transition.here)
+        }
+        guard lifecycle == epoch, !Task.isCancelled else { return }
+        let current = PersonPresence.read(dataRoot: dataRoot)
+        if source == "motion", let at, let transition = current.transition, transition.here == false, transition.since == at {
+            postPresence(transition, payload: ["source": .string("phone motion")], dataRoot: dataRoot)
         }
         await NativeAgentEngine.cognitionRuntime(for: dataRoot).carriedPresenceChanged()
     }
 
-    private func signalPresence(_ here: Bool, payload: [String: JSONValue], dataRoot: URL) {
-        guard lastSignalledPresence != here else { return }
+    /// Presence signals the parts with source evidence and posts a world happening. The transition alone owns the happening's words and
+    /// occurrence key.
+    private func postPresence(_ transition: (here: Bool, since: Date), payload: [String: JSONValue], dataRoot: URL) {
+        guard lastSignalledPresence != transition.here else { return }
         // Record before posting or suspending because both source callbacks share this actor.
-        lastSignalledPresence = here
-        AbilityStore(dataRoot: dataRoot).signal(here ? "person.here" : "person.away", payload)
+        lastSignalledPresence = transition.here
+        let signal = transition.here ? "person.here" : "person.away"
+        AbilityStore(dataRoot: dataRoot).signal(signal, payload)
+        let happening = Happening(.world, subject: "person", door: "presence",
+            words: transition.here ? "The person is back at the Mac." : "The person stepped away.",
+            once: signal + ":" + String(Int(transition.since.timeIntervalSince1970)), signal: signal)
+        Attention.post(happening, dataRoot: dataRoot)
     }
 
     private func network(_ up: Bool, dataRoot: URL, epoch: UUID) {
@@ -190,9 +210,23 @@ actor EnginePartWake {
         AbilityStore(dataRoot: dataRoot).signal(up ? "network.up" : "network.down", ["is_up": .bool(up)])
     }
 
+    /// The person taking a tab signals the parts and posts a world happening, so the agent can hear it before its next call on that tab fails.
+    private func tabTaken(_ taken: ChromeTabTaken, dataRoot: URL, epoch: UUID) {
+        guard lifecycle == epoch, !Task.isCancelled else { return }
+        let signal = "chrome.tab_taken"
+        var payload: [String: JSONValue] = ["tab_id": .int(taken.tabID), "reason": .string(taken.reason)]
+        if let host = taken.host { payload["host"] = .string(host) }
+        AbilityStore(dataRoot: dataRoot).signal(signal, payload)
+        let happening = Happening(.world, subject: "chrome.tab", door: "chrome",
+            words: "The person took your Chrome tab \(taken.tabID)" + (taken.host.map { " (" + $0 + ")" } ?? "") + ".",
+            once: signal + ":" + String(taken.tabID) + ":" + taken.at, signal: signal)
+        Attention.post(happening, dataRoot: dataRoot)
+    }
+
     private func awake(_ awake: Bool, dataRoot: URL, epoch: UUID) async {
         guard lifecycle == epoch else { return }
-        await NativeAgentEngine.cognitionRuntime(for: dataRoot).rhythmAwakeChanged(awake: awake)
+        let here = awake ? PersonPresence.read(dataRoot: dataRoot).transition?.here : nil
+        await NativeAgentEngine.cognitionRuntime(for: dataRoot).rhythmAwakeChanged(awake: awake, here: here)
     }
 
     func stop() async {
@@ -421,11 +455,12 @@ actor EnginePartWake {
     private static func run(_ file: AbilityStore.File, input: [String: JSONValue], dataRoot: URL) async {
         let wake = "wake-" + UUID().uuidString.lowercased()
         let taint = PeerDataTaint()
-        if case .string(let agent)? = input["agent"], !PeerTrust.ownerTrusts(agent, dataRoot: dataRoot) { taint.mark(peer: agent) }
+        // Every sender is recorded; a trusted one lands among the answered principals and steers nothing.
+        if case .string(let agent)? = input["agent"] { taint.mark(peer: agent) }
         let work = "wake:" + file.id
-        let turn = Turn(id: wake, run: wake, session: ResidentWake.session)
-            .with(\.envelope, .native(work)).with(\.verifiedSessionID, ResidentWake.session)
-            .with(\.partID, file.id).with(\.peerSteering, taint).with(\.speechInitiative, taint.isTainted ? .scheduled : .intention)
+        let turn = Turn(id: wake, run: wake, session: Self.session)
+            .with(\.envelope, .native(work)).with(\.verifiedSessionID, Self.session)
+            .with(\.partID, file.id).with(\.peerSteering, taint)
         // Tainted signals may reach only read-only parts; effectful parts skip with a trace because a card itself is a decision.
         let readOnly: Bool
         do {
@@ -439,9 +474,16 @@ actor EnginePartWake {
                     Wake admission could not read the action catalog: \(error.localizedDescription). Repair the catalog before this part handles another \
                     peer-steered wake.
                     """).value
-            TurnTraceBus.fire(TurnTraceEvent(turnId: wake, kind: "part.wake", sessionId: ResidentWake.session, surface: "chat",
-                payload: .object(["part": .string(file.id), "result": .object(["status": .string("unavailable"),
-                    "reason": .string("action_catalog_unavailable"), "detail": .string(error.localizedDescription), "effects": .string("none")])]), turn: turn))
+            let refused: JSONValue = .object(["status": .string(file.kind == .part ? "refused" : "unavailable"),
+                "checker": .string("wake_admission"),
+                "reason": .string("action_catalog_unavailable"), "detail": .string(error.localizedDescription), "effects": .string("none"),
+                "remedy": Repair.remedy(owner: "action catalog", nextCall: nil, tap: nil,
+                    instruction: "Repair the reported catalog source before this part handles another peer-steered wake.")])
+            let result = if file.kind == .part {
+                await receipt(refused, call: ["action": .string("authored." + file.id)], turn: turn, dataRoot: dataRoot)
+            } else { refused }
+            TurnTraceBus.fire(TurnTraceEvent(turnId: wake, kind: "part.wake", sessionId: Self.session, surface: "chat",
+                payload: .object(["part": .string(file.id), "result": result]), turn: turn))
             return
         }
         if taint.isTainted, !readOnly {
@@ -453,34 +495,35 @@ actor EnginePartWake {
                 ? names.compactMap { $0 }.map { "Trust > Connected agents > " + $0 }.joined(separator: "; ") : nil
             let failure = CapabilityLifecycle.peerRefusal(peer, tap: tap)
             nativeLog("[wake] %@ skipped a tainted %@ signal: it can write", file.id, String(describing: input["signal"]))
-            let result: JSONValue = .object(["status": .string("skipped"), "reason": .string("tainted_signal"),
+            let refused: JSONValue = .object(["status": .string(file.kind == .part ? "refused" : "skipped"), "reason": .string("tainted_signal"),
+                "checker": .string("wake_peer_admission"), "effects": .string("none"),
                 "detail": .string(failure.message), "remedy": Repair.why(owner: failure.owner ?? "peer \(peer) (not elevated)",
                     tap: failure.tap ?? "Trust > Connected agents (steering peer unidentified)")])
+            let result = if file.kind == .part {
+                await receipt(refused, call: ["action": .string("authored." + file.id)], turn: turn, dataRoot: dataRoot)
+            } else { refused }
             TurnTraceBus.fire(TurnTraceEvent(turnId: wake, kind: "part.wake",
-                sessionId: ResidentWake.session, surface: "chat",
+                sessionId: Self.session, surface: "chat",
                 payload: .object(["part": .string(file.id), "input": .object(input), "result": result]), turn: turn))
             return
         }
-        // A watch's signal is its pacing, as an intention's moment is: its notices skip the hourly quota and stay
-        // deduplicated. A peer-steered signal keeps the quota.
         let result = await throughOwnDoor(work: work, turn: turn, dataRoot: dataRoot, wake: .object(input)) { door in
             if file.kind == .sense { return try await sense(file.id, input: .object(["wake": .object(input)]), turn: door.turn) }
             // Provide wake material through `input.wake`, never the part’s own input.
             let call: [String: JSONValue] = ["action": .string("authored." + file.id), "args": .object([:])]
             return try await door.perform("app", call)
         }
-        // Every unattended run must leave a resident-session trace.
+        if file.kind == .part {
+            _ = await receipt(result, call: ["action": .string("authored." + file.id)], turn: turn, dataRoot: dataRoot)
+        }
+        // Every unattended run leaves a trace in the parts session.
         TurnTraceBus.fire(TurnTraceEvent(turnId: wake, kind: "part.wake",
-            sessionId: ResidentWake.session, surface: "chat",
+            sessionId: Self.session, surface: "chat",
             payload: .object(["part": .string(file.id), "input": .object(input), "result": Self.outcome(result)]), turn: turn))
     }
 
     /// Retain carried steering when admitting a habit as the agent’s own call.
     static func runCarried(_ step: DeskStep, handle: String, dataRoot: URL) async -> JSONValue {
-        guard await UnattendedWork.allowed(dataRoot: dataRoot) else {
-            return .object(["status": .string("refused"), "reason": .string("autonomy_off"),
-                "detail": .string("The habit did not run: Autonomy is off."), "effects": .string("none")])
-        }
         guard let call = DeskStep.plannedAction(step.action)?.objectValue else {
             return .object(["status": .string("refused"), "reason": .string("invalid_action"), "effects": .string("none"),
                 "detail": .string("The stored habit is not {action,args?}; repair or drop it with queue.update.")])
@@ -491,15 +534,30 @@ actor EnginePartWake {
         taint.keep(line: step.words)
         let run = "habit-" + UUID().uuidString.lowercased()
         let work = "carry." + handle
-        let turn = Turn(id: run, run: run, session: ResidentWake.session)
-            .with(\.envelope, .native(work)).with(\.verifiedSessionID, ResidentWake.session)
-            .with(\.partID, part).with(\.peerSteering, taint).with(\.speechInitiative, .intention)
+        let turn = Turn(id: run, run: run, session: Self.session)
+            .with(\.envelope, .native(work)).with(\.verifiedSessionID, Self.session)
+            .with(\.partID, part).with(\.peerSteering, taint)
+        guard await UnattendedWork.allowed(dataRoot: dataRoot) else {
+            return await receipt(.object(["status": .string("refused"), "reason": .string("autonomy_off"),
+                "checker": .string("unattended_work"), "detail": .string("The habit did not run: Autonomy is off."), "effects": .string("none"),
+                "remedy": Repair.why(owner: "Autonomy", tap: "Trust > Autonomy",
+                    instruction: "Only the person can turn Autonomy on; leave this habit waiting until they do.")]),
+                call: call, turn: turn, dataRoot: dataRoot)
+        }
         let result = await throughOwnDoor(work: work, turn: turn, dataRoot: dataRoot) { door in
             try await door.perform("app", call)
         }
-        TurnTraceBus.fire(TurnTraceEvent(turnId: run, kind: "habit.run", sessionId: ResidentWake.session, surface: "chat",
+        let retained = await receipt(result, call: call, turn: turn, dataRoot: dataRoot)
+        TurnTraceBus.fire(TurnTraceEvent(turnId: run, kind: "habit.run", sessionId: Self.session, surface: "chat",
             payload: .object(["workIdentity": .string(work), "call": .object(call), "result": Self.outcome(result)]), turn: turn))
-        return result
+        return retained
+    }
+
+    /// Door-entry failures and wake refusals use the dispatch owner without rerunning the refused work.
+    private static func receipt(_ result: JSONValue, call: [String: JSONValue], turn: Turn, dataRoot: URL) async -> JSONValue {
+        guard ToolResult(result).outcome.isFailure, result.objectValue?["dispatch_receipt_id"] == nil else { return result }
+        return await ChatToolDispatchTracer.traceUndispatched(turn: turn, tool: "app", input: call, surface: "chat", result: result,
+            dataRoot: dataRoot)
     }
 
     /// Share one unattended posture and gate chain across signalled parts and carried moments, without a planning model.

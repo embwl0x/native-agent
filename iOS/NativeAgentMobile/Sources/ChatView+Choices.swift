@@ -1,264 +1,153 @@
 import SwiftUI
-import UIKit
-import Speech
-import PhotosUI
+import Foundation
 import NativeAgentShared
-import UniformTypeIdentifiers
-// Blueprint: | `ChatView+Choices.swift` | Mac-owned model configuration and ChatView option controls |
+// Blueprint: | `ChatView+Choices.swift` | Shared Chat option forms over the Mac-owned model tuple and local file-access choice |
 
 extension ChatView {
-    // Every model control reads the shared Mac-owned tuple, including receipts.
     private var selectedModel: String { sync.surfaceModels["ios"]?.model ?? "" }
-
-    private var selectedReasoningEffort: String { sync.surfaceModels["ios"]?.reasoningEffort ?? "high" }
-
-    private var selectedFastMode: Bool { sync.surfaceModels["ios"]?.serviceTier == "priority" }
-
     private var selectedProviderId: String { sync.surfaceModels["ios"]?.providerID ?? "" }
+    private var selectedReasoningEffort: String { sync.surfaceModels["ios"]?.reasoningEffort ?? "high" }
+    private var selectedFastMode: Bool { sync.surfaceModels["ios"]?.serviceTier == "priority" }
+    private var choicesSession: FacePageSession { sync.pageSessions.page("phone-chat-options") }
 
     var runtimeControls: ChatRuntimeControls {
-        ChatRuntimeControls(
-            model: selectedModel,
-            reasoningEffort: selectedReasoningEffort,
-            serviceTier: selectedFastMode ? "priority" : "default",
-            fileAccess: ChatRuntimeControlPresentation.normalizedFileAccessID(selectedFileAccess),
-            providerId: selectedProviderId
-        )
+        .init(model: selectedModel, reasoningEffort: selectedReasoningEffort, serviceTier: selectedFastMode ? "priority" : "default",
+            fileAccess: ChatRuntimeControlPresentation.normalizedFileAccessID(selectedFileAccess), providerId: selectedProviderId)
     }
 
     var configurationControls: some View {
-            VStack(alignment: .leading, spacing: 0) {
-                Menu {
-                    ForEach(selectableProviders) { provider in
-                        Section(provider.display_name) {
-                            ForEach(selectableModelIDs(for: provider), id: \.self) { model in
-                                Button {
-                                    selectModel(model, providerID: provider.provider_id)
-                                } label: {
-                                    let title = provider.models.first(where: { $0.id == model }).map(ProviderWords.modelName) ?? modelLabel(model)
-                                    if selectedProviderId == provider.provider_id && selectedModel == model {
-                                        Label(title, systemImage: "checkmark")
-                                    } else {
-                                        Text(title)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Divider()
-                    Button {
-                        Task {
-                            if let message = (await sync.refreshProviderControlsSnapshot()).feedbackMessage {
-                                SystemToastCenter.shared.push(error: message)
-                            }
-                        }
-                    } label: {
-                        Label("Refresh Models", systemImage: "arrow.clockwise")
-                    }
-                } label: {
-                    controlPill("Model", title: isChatSample ? "Claude Fable 5.1 · extended context" : modelLabel(selectedModel))
-                }
+        FaceView(face: choicesFace, door: choicesDoor, session: choicesSession)
+    }
 
-                AliveDivider()
-                Menu {
-                    ForEach(reasoningOptions, id: \.id) { option in
-                        Button {
-                            let requestedModel = selectedModel
-                            let requestedProvider = selectedProviderId
-                            let requestedServiceTier = selectedFastMode ? "priority" : "default"
-                            Task {
-                                do {
-                                    try await sync.configureSurfaceSelection(
-                                        surface: "ios",
-                                        providerId: requestedProvider,
-                                        model: requestedModel,
-                                        reasoningEffort: option.id,
-                                        serviceTier: requestedServiceTier
-                                    )
-                                } catch {
-                                    SystemToastCenter.shared.push(
-                                        error: "Couldn't set reasoning to \(option.label): \(error.localizedDescription)"
-                                    )
-                                }
-                            }
-                        } label: {
-                            Label(option.label, systemImage: selectedReasoningEffort == option.id ? "checkmark" : "brain")
-                        }
-                    }
-                } label: {
-                    controlPill("Thinking", title: reasoningOptions.isEmpty
-                        ? (selectedModelInfo?.supported_reasoning_efforts?.isEmpty == true ? "Not supported" : "Unavailable — refresh models")
-                        : reasoningLabel(selectedReasoningEffort))
-                }
-                .disabled(reasoningOptions.isEmpty)
+    private struct ModelChoice {
+        let provider: String
+        let model: String
+        let label: String
+        var id: String { "\(provider.utf8.count):" + provider + model }
+    }
 
-                AliveDivider()
-                Menu {
-                    Button { setFastMode(false) } label: {
-                        Label("Normal", systemImage: selectedFastMode ? "circle" : "checkmark")
-                    }
-                    Button { setFastMode(true) } label: {
-                        Label("Fast", systemImage: selectedFastMode ? "checkmark" : "bolt.fill")
-                    }
-                    .disabled(!selectedModelSupportsFast)
-                } label: {
-                    controlPill(
-                        "Speed",
-                        title: ChatRuntimeControlPresentation.processingModeTitle(fastMode: selectedFastMode)
-                    )
-                }
-                .accessibilityLabel("Processing mode: \(selectedFastMode ? "Fast" : "Normal")")
-
-                AliveDivider()
-                Menu {
-                    ForEach(fileAccessOptions, id: \.id) { option in
-                        Button {
-                            selectedFileAccess = option.id
-                        } label: {
-                            Label(option.label, systemImage: selectedFileAccess == option.id ? "checkmark" : option.icon)
-                        }
-                    }
-                } label: {
-                    controlPill("File access", title: fileAccessLabel(selectedFileAccess))
-                }
+    private var modelChoices: [ModelChoice] {
+        sync.providers.filter { $0.auth_status.eligible }.flatMap { provider in
+            var models = provider.models.map(\.id).filter { !$0.isEmpty }
+            if provider.provider_id == selectedProviderId, !selectedModel.isEmpty, !models.contains(selectedModel) { models.append(selectedModel) }
+            return Set(models).sorted().map { model in
+                ModelChoice(provider: provider.provider_id, model: model,
+                    label: provider.display_name + " · " + (provider.models.first(where: { $0.id == model }).map(ProviderWords.modelName) ?? model))
             }
-            .aliveCard()
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-        .tint(AlivePalette.text)
-    }
-
-    private func controlPill(_ label: String, title: String) -> some View {
-        HStack(spacing: 12) {
-            Text(label)
-                .font(.body)
-                .foregroundStyle(AlivePalette.text)
-            Spacer(minLength: 8)
-            Text(title)
-                .font(.body)
-                .foregroundStyle(AlivePalette.secondary)
-                .multilineTextAlignment(.trailing)
-                .fixedSize(horizontal: false, vertical: true)
-            Image(systemName: "chevron.up.chevron.down")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(AlivePalette.secondary)
-        }
-        .aliveRow()
-        .frame(minHeight: 44)
-        .contentShape(Rectangle())
-    }
-
-    private var selectableProviders: [ProviderInfo] {
-        sync.providers
-            .filter { $0.auth_status.eligible }
-            .sorted { $0.display_name.localizedCaseInsensitiveCompare($1.display_name) == .orderedAscending }
-    }
-
-    private func selectableModelIDs(for provider: ProviderInfo) -> [String] {
-        var ids = Set(provider.models.map(\.id).filter { !$0.isEmpty })
-        if provider.provider_id == selectedProviderId, !selectedModel.isEmpty {
-            ids.insert(selectedModel)
-        }
-        return ids.sorted { lhs, rhs in
-            if lhs == selectedModel { return true }
-            if rhs == selectedModel { return false }
-            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
         }
     }
 
-    private func selectModel(_ model: String, providerID: String) {
-        let effort = selectedReasoningEffort
-        let tier = selectedFastMode ? "priority" : "default"
-        Task {
+    private var modelInfo: ProviderModelInfo? {
+        sync.providers.first(where: { $0.provider_id == selectedProviderId })?.models.first(where: { $0.id == selectedModel })
+    }
+
+    private func choiceSection(_ id: String, label: String, value: String, options: [PartFace.Control.Option]) -> PartFace.Section {
+        .init(id: id, rows: [], block: .init(kind: "form", key: id,
+            fields: [.init(id: "value", label: label, kind: "choice", value: .string(value), required: true, options: options)],
+            submit: [.init(id: "save", label: "Set " + label.lowercased(), call: .init("phone.chat." + id, [
+                "provider": .string(selectedProviderId), "model": .string(selectedModel),
+                "effort": .string(selectedReasoningEffort), "tier": .string(selectedFastMode ? "priority" : "default")
+            ]), unavailable: options.isEmpty ? "Read the current model catalog before choosing." : nil)]))
+    }
+
+    private var choicesFace: PartFace {
+        let selected = ModelChoice(provider: selectedProviderId, model: selectedModel, label: "").id
+        let efforts = (modelInfo?.supported_reasoning_efforts ?? []).map { effort in
+            PartFace.Control.Option(id: effort, label: defaultReasoningEffortOptions.first(where: { $0.id == effort })?.label ?? effort.capitalized)
+        }
+        var tiers = [PartFace.Control.Option(id: "default", label: "Normal")]
+        if modelInfo?.supports_fast == true { tiers.append(.init(id: "priority", label: "Fast")) }
+        return .init(sections: [
+            choiceSection("model", label: "Model", value: selected, options: modelChoices.map { .init(id: $0.id, label: $0.label) }),
+            choiceSection("effort", label: "Thinking", value: selectedReasoningEffort, options: efforts),
+            choiceSection("tier", label: "Speed", value: selectedFastMode ? "priority" : "default", options: tiers),
+            choiceSection("files", label: "File access", value: ChatRuntimeControlPresentation.normalizedFileAccessID(selectedFileAccess),
+                options: ICloudChatFileAccessPolicy.Mode.allCases.compactMap { mode in
+                    switch mode {
+                    case .auto: .init(id: mode.rawValue, label: "Auto")
+                    case .readOnly: .init(id: mode.rawValue, label: "Read only")
+                    case .workspace: .init(id: mode.rawValue, label: "Workspace")
+                    case .full: .init(id: mode.rawValue, label: "Full Mac")
+                    case .none: nil
+                    }
+                }),
+            .init(id: "catalog", rows: [.init(id: "refresh", title: "Models", actions: [
+                .init(id: "refresh", label: "Refresh Models", call: .init("phone.chat.refresh"))
+            ])])
+        ])
+    }
+
+    private var choicesDoor: ClosureFaceDoor {
+        ClosureFaceDoor(open: { _ in }, cancellationLabel: "Cancel waiting", waitingOn: "the Mac's model selection") { submission in
             do {
-                try await sync.configureSurfaceSelection(
-                    surface: "ios", providerId: providerID, model: model,
-                    reasoningEffort: effort, serviceTier: tier
-                )
-            } catch {
-                SystemToastCenter.shared.push(
-                    error: "Couldn't switch to \(modelLabel(model)): \(error.localizedDescription)"
-                )
-            }
+                if submission.checking || submission.expectedCall.action == "phone.chat.refresh" {
+                    let result = await sync.refreshProviderControlsSnapshot()
+                    guard result.outcome == .refreshed else {
+                        throw choiceFailure(result.feedbackMessage ?? "The Mac's model controls could not be read.")
+                    }
+                    if submission.expectedCall.action == "phone.chat.refresh" {
+                        return .init(words: "Model catalog refreshed.", effects: .none, accepted: true)
+                    }
+                    let current: String?
+                    switch submission.expectedCall.action {
+                    case "phone.chat.model": current = ModelChoice(provider: selectedProviderId, model: selectedModel, label: "").id
+                    case "phone.chat.effort": current = selectedReasoningEffort
+                    case "phone.chat.tier": current = selectedFastMode ? "priority" : "default"
+                    case "phone.chat.files": current = ChatRuntimeControlPresentation.normalizedFileAccessID(selectedFileAccess)
+                    default: current = nil
+                    }
+                    guard let current, submission.values?["value"] == .string(current) else {
+                        return .init(words: "The current choice does not confirm the submitted change. Read the choices above.", effects: .unknown)
+                    }
+                    return .init(words: "The current choice confirms this change.", effects: .known, accepted: true,
+                        committed: [.init(id: "value", value: .string(current))])
+                }
+                guard let value = submission.values?["value"]?.stringValue else { throw choiceFailure("Choose an offered chat option.") }
+                if submission.expectedCall.action == "phone.chat.files" {
+                    guard ICloudChatFileAccessPolicy.Mode.allCases.contains(where: { $0 != .none && $0.rawValue == value }) else {
+                        throw choiceFailure("Choose an offered file access mode.")
+                    }
+                    if selectedFileAccess != value { selectedFileAccess = value }
+                    return .init(effects: .known, accepted: true, committed: [.init(id: "value", value: .string(value))])
+                }
+                let args = submission.expectedCall.args
+                guard let provider = args["provider"]?.stringValue, let model = args["model"]?.stringValue,
+                      let effort = args["effort"]?.stringValue, let tier = args["tier"]?.stringValue,
+                      provider == selectedProviderId, model == selectedModel, effort == selectedReasoningEffort,
+                      tier == (selectedFastMode ? "priority" : "default") else {
+                    throw choiceFailure("The Mac's model selection changed. Read its current choices before submitting.")
+                }
+                var pickedProvider = provider, pickedModel = model, pickedEffort = effort, pickedTier = tier
+                switch submission.expectedCall.action {
+                case "phone.chat.model":
+                    guard let choice = modelChoices.first(where: { $0.id == value }) else { throw choiceFailure("That model is unavailable.") }
+                    pickedProvider = choice.provider; pickedModel = choice.model
+                case "phone.chat.effort":
+                    guard modelInfo?.supported_reasoning_efforts?.contains(value) == true else {
+                        throw choiceFailure("That thinking level is unavailable.")
+                    }
+                    pickedEffort = value
+                case "phone.chat.tier":
+                    guard value == "default" || value == "priority" && modelInfo?.supports_fast == true else {
+                        throw choiceFailure("Fast mode is unavailable for this model.")
+                    }
+                    pickedTier = value
+                default: throw choiceFailure("This chat option is unavailable.")
+                }
+                if pickedProvider != provider || pickedModel != model || pickedEffort != effort || pickedTier != tier {
+                    try await sync.configureSurfaceSelection(surface: "ios", providerId: pickedProvider, model: pickedModel,
+                        reasoningEffort: pickedEffort, serviceTier: pickedTier)
+                }
+                return .init(words: "Chat option saved.", effects: .known, accepted: true, committed: [.init(id: "value", value: .string(value))])
+            } catch { return .phoneFailure(error) }
         }
     }
 
-    private func setFastMode(_ enabled: Bool) {
-        guard enabled != selectedFastMode else { return }
-        guard !enabled || selectedModelSupportsFast else {
-            SystemToastCenter.shared.push(error: "Fast mode is not available for \(modelLabel(selectedModel)).")
-            return
-        }
-        let providerID = selectedProviderId
-        let model = selectedModel
-        let effort = selectedReasoningEffort
-        Task {
-            do {
-                try await sync.configureSurfaceSelection(
-                    surface: "ios", providerId: providerID, model: model,
-                    reasoningEffort: effort, serviceTier: enabled ? "priority" : "default"
-                )
-            } catch {
-                SystemToastCenter.shared.push(
-                    error: "Couldn't change processing mode: \(error.localizedDescription)"
-                )
-            }
-        }
-    }
-
-    private var reasoningOptions: [ReasoningEffortOption] {
-        let labels = Dictionary(uniqueKeysWithValues: defaultReasoningEffortOptions.map { ($0.id, $0) })
-        return (selectedModelInfo?.supported_reasoning_efforts ?? []).map { effort in
-            labels[effort] ?? ReasoningEffortOption(id: effort, label: effort.capitalized)
-        }
-    }
-
-    private var selectedModelInfo: ProviderModelInfo? {
-        sync.providers
-            .first(where: { $0.provider_id == selectedProviderId })?
-            .models
-            .first(where: { $0.id == selectedModel })
-    }
-
-    private var selectedModelSupportsFast: Bool {
-        selectedModelInfo?.supports_fast == true
-    }
-
-    private var fileAccessOptions: [(id: String, label: String, icon: String)] {
-        // Do not offer `none`: the file gate cannot enforce that wire value across all file tools.
-        ICloudChatFileAccessPolicy.Mode.allCases.compactMap { mode -> (id: String, label: String, icon: String)? in
-            switch mode {
-            case .auto: (mode.rawValue, "Auto", "wand.and.stars")
-            case .readOnly: (mode.rawValue, "Read only", "eye")
-            case .workspace: (mode.rawValue, "Workspace", "folder")
-            case .full: (mode.rawValue, "Full Mac", "bolt.trianglebadge.exclamationmark")
-            case .none: nil
-            }
-        }
-    }
-
-    private func modelLabel(_ id: String) -> String {
-        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            // Without an explicit pick, the Mac's Chat group owns resolution; do not invent a model name.
-            return sync.providers.isEmpty ? "Waiting for the Mac's choice" : "Same as Mac"
-        }
-        return sync.providers
-            .flatMap(\.models)
-            .first(where: { $0.id == id })?
-            .name ?? id
-    }
-
-    private func reasoningLabel(_ id: String) -> String {
-        reasoningOptions.first(where: { $0.id == id })?.label ?? "Thinking"
-    }
-
-    private func fileAccessLabel(_ id: String) -> String {
-        let normalized = ChatRuntimeControlPresentation.normalizedFileAccessID(id)
-        return fileAccessOptions.first(where: { $0.id == normalized })?.label ?? "Unavailable file access"
+    private func choiceFailure(_ words: String) -> WireFailure {
+        .init(code: "chat_choice_unavailable", message: words, cause: nil, effects: .none)
     }
 }
 
-/// A model's name as the person reads it: its published name, else its id.
 enum ProviderWords {
     static func modelName(_ model: ProviderModelInfo) -> String {
         let name = model.name.trimmingCharacters(in: .whitespacesAndNewlines)

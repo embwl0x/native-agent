@@ -113,7 +113,7 @@ struct ChromeExtensionFiles {
     static func codeDigest(folder: URL, manifest: [String: Any], paths: inout Set<URL>) -> String? {
         var queue = ["manifest.json"]
         if let background = manifest["background"] as? [String: Any], let worker = background["service_worker"] as? String { queue.append(worker) }
-        for script in manifest["content_scripts"] as? [[String: Any]] ?? [] { queue.append(contentsOf: script["js"] as? [String] ?? []) }
+        queue.append("src/page-agent.js")
         guard let imports = try? NSRegularExpression(pattern: #"from\s*["'](\.{1,2}/[^"']+\.js)["']|import\s*["'](\.{1,2}/[^"']+\.js)["']"#) else { return nil }
         var files: [String: Data] = [:]
         var seen = Set<String>()

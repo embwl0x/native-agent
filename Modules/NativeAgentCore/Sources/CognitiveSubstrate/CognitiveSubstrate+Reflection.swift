@@ -5,26 +5,15 @@ import Transcripts
 import NativeAgentShared
 // Blueprint: | `CognitiveSubstrate+Reflection.swift` | `CognitiveSubstrate`: `planReflectionChecked`, frozen causes and receipts |
 
-public enum CognitiveReflectionDemand: String, Sendable, Equatable {
-    /// A requested reflection still obeys the spend ceiling but never needs unresolved-load admission.
-    case requested
-    /// Unattended reflection requires unresolved load under the shared spend ceiling.
-    case spontaneous
-}
-
 /// Keep admission reasons and readings so a skipped reflection is explainable.
 public struct CognitiveReflectionAdmission: Sendable, Equatable {
     public var admitted: Bool
     public var reason: String
-    public var demand: CognitiveReflectionDemand
-    public var load: Double
-    public var threshold: Double
     public var callsInWindow: Int
     public var ceiling: Int
 
     public var detail: String {
-        "\(reason) (load \(String(format: "%.2f", load))/\(String(format: "%.2f", threshold)), "
-            + "spend \(callsInWindow)/\(ceiling) per 24h)"
+        "\(reason) (spend \(callsInWindow)/\(ceiling) per 24h)"
     }
 }
 
@@ -34,16 +23,14 @@ public enum CognitiveReflectionPlan: Sendable {
 }
 
 extension CognitiveSubstrate {
-    /// Requested calls need budget; spontaneous calls also need unresolved load. Return the refusal cause rather than an unexplained nil.
+    /// Return the admission cause with its receipt budget and reservation evidence.
     public func planReflectionChecked(
         reason: String,
-        demand: CognitiveReflectionDemand = .requested,
-        material: [String: CognitiveReflectionCause]? = nil,
-        sameSourceCooldown: TimeInterval? = nil
+        material: [String: CognitiveReflectionCause]? = nil
     ) async -> CognitiveReflectionPlan {
         await waitForMaintenanceTransition()
         let epoch = mindEpoch
-        let admission = await reflectionAdmission(demand: demand)
+        let admission = await reflectionAdmission()
         guard admission.admitted else { return .refused(admission) }
         let now = dependencies.now()
         let read = await frozenRead(at: now)
@@ -119,25 +106,13 @@ extension CognitiveSubstrate {
             return .refused(refused)
         }
         // Recheck admission after frozenRead suspends: actor reentrancy permits another claim or a changed budget.
-        let recheck = await reflectionAdmission(demand: demand)
+        let recheck = await reflectionAdmission()
         guard recheck.admitted else { return .refused(recheck) }
         guard epoch == mindEpoch else {
             var refused = recheck
             refused.admitted = false
             refused.reason = "Reflection material was cleared during planning"
             return .refused(refused)
-        }
-        // The cooldown prevents repeated reflection on identical material across triggers.
-        if let sameSourceCooldown {
-            let cutoff = now.addingTimeInterval(-sameSourceCooldown)
-            if reflectionReceipts.values.contains(where: {
-                !$0.cancelled && $0.createdAt >= cutoff && $0.request.material.mapValues(\.text) == causes.mapValues(\.text)
-            }) {
-                var skip = recheck
-                skip.admitted = false
-                skip.reason = "same source material reflected on within \(Int(sameSourceCooldown / 3600))h"
-                return .refused(skip)
-            }
         }
         let reservation = ReflectionReservation(id: dependencies.makeUUID(), since: dependencies.now())
         reflectionReservation = reservation
@@ -328,7 +303,6 @@ extension CognitiveSubstrate {
     public static let reflectionRefusalDisabled = "reflection_disabled"
     public static let reflectionRefusalCeilingReached = "reflection_cost_ceiling_reached"
     public static let reflectionRefusalInFlight = "reflection_in_flight"
-    public static let reflectionRefusalLoadBelowThreshold = "reflection_load_below_threshold"
     static let reflectionAdmittedReason = "admitted"
 
     /// A rolling window lets quiet hours leave room for harder hours without freeing slots at midnight.
@@ -340,19 +314,10 @@ extension CognitiveSubstrate {
         return reflectionReceipts.values.filter { $0.createdAt > cutoff }.count
     }
 
-    /// Only open cares contribute unresolved pressure.
-    func reflectionUnresolvedLoad(at now: Date) -> Double {
-        cares.values.filter { $0.fadedAt == nil && $0.open != nil }
-            .reduce(0) { $0 + Self.carePressure($1, at: now) }
-    }
-
-    /// Read load only for spontaneous demand; a person's request cannot be refused because cares are quiet.
-    public func reflectionAdmission(
-        demand: CognitiveReflectionDemand = .spontaneous
-    ) async -> CognitiveReflectionAdmission {
+    /// Evidence-driven reflection shares the receipt budget and reservation.
+    public func reflectionAdmission() async -> CognitiveReflectionAdmission {
         let now = dependencies.now()
         let ceiling = configuration.dailyReflectionCallBudget
-        let threshold = configuration.reflectionLoadThreshold
         let spent = reflectionCallsInCostWindow(at: now)
         var refusal: String?
         if !configuration.enabled || !configuration.reflectiveCallsEnabled || ceiling <= 0 {
@@ -363,16 +328,9 @@ extension CognitiveSubstrate {
                   now.timeIntervalSince(reservation.since) < Self.reflectionInFlightMaximumAge {
             refusal = Self.reflectionRefusalInFlight
         }
-        let load = refusal == nil && demand == .spontaneous ? reflectionUnresolvedLoad(at: now) : 0
-        if refusal == nil, demand == .spontaneous, !(load > 0 && load >= threshold) {
-            refusal = Self.reflectionRefusalLoadBelowThreshold
-        }
         return CognitiveReflectionAdmission(
             admitted: refusal == nil,
             reason: refusal ?? Self.reflectionAdmittedReason,
-            demand: demand,
-            load: load,
-            threshold: threshold,
             callsInWindow: spent,
             ceiling: ceiling
         )

@@ -19,6 +19,7 @@ import PersistenceCore
 import StandingBots
 import Transcripts
 import os
+import Experiences
 
 // Blueprint: | `AgentConversationContinuation.swift` | Read delayed replies without resending. |
 
@@ -54,27 +55,6 @@ public struct AgentConversationContinuation: Sendable {
             ownerInstanceId: CodexCompletionLifecycle.processOwnerInstanceId, dataRoot: dataRoot)
     }
 
-    public func nextDeadline(after now: Date) -> Date? {
-        let rows: [AgentConversationRecord]
-        let peers: [AgentPeerContact]
-        do {
-            rows = try store.records()
-            peers = try AgentPeerStore(dataRoot: dataRoot).list()
-        }
-        catch {
-            nativeLog("Conversation continuation deadline unavailable: %@", error.localizedDescription)
-            return nil
-        }
-        let active = replyWork.withLock { Set($0.tasks.keys) }
-        let dotAgents = Set(peers.filter { $0.ability == nil && ChatGPTDotIPCTransport.owns($0) }.map { "peer:" + $0.id })
-        let ordinary = rows.filter { !active.contains($0.agent) && !dotAgents.contains($0.agent)
-            && ($0.notice != nil || $0.automaticRead && ($0.deliveryState == "delivering"
-                || $0.phase == "waiting" && !$0.agent.hasPrefix("bot-run:"))) }
-            .map { $0.nextReadAt ?? now }.min()
-        return [ordinary, AgentLocalHealth.nextRefresh(dataRoot, now: now)]
-            .compactMap { $0 }.min()
-    }
-
     /// Resume through the original gated chain without an approval filer; card-requiring sends stay held with their reason.
     private func resumeQueues(workspace: WorkspaceOperation) async throws {
         try Task.checkCancellation()
@@ -82,32 +62,35 @@ public struct AgentConversationContinuation: Sendable {
         await AgentDiscoverySession.shared.watchInstalls(dataRoot: dataRoot)
         try Task.checkCancellation()
         ChatGPTDotIPCTransport.listen(dataRoot: dataRoot)
-        do { try await dot.resumeAdmissions() }
-        catch is CancellationError { throw CancellationError() }
-        catch { nativeLog("Dot admission recovery failed: %@", error.localizedDescription) }
+        try await dot.resumeAdmissions()
         try Task.checkCancellation()
         AgentConversationWatches.start()
-        await AgentConversationLiveHub.shared.start()
         try Task.checkCancellation()
         let store = store
         await AgentA2APushReceiver.shared.installInvalidator(owner: pushOwner) { peer, task in
-            for row in (try? store.records()) ?? [] where row.agent == "peer:" + peer
-                && row.automaticRead && row.phase == "waiting"
-                && (row.readInput?["task_id"] == .string(task) || row.receiptField("task_id") == .string(task)) {
-                _ = try? store.update(id: row.id, operationID: row.operationID, touch: false) { $0.nextReadAt = Date() }
+            do {
+                for row in try store.records() where row.agent == "peer:" + peer
+                    && row.automaticRead && row.phase == "waiting"
+                    && (row.readInput?["task_id"] == .string(task) || row.receiptField("task_id") == .string(task)) {
+                    _ = try store.update(id: row.id, operationID: row.operationID, touch: false) { $0.nextReadAt = Date() }
+                }
+            } catch {
+                RepairOwed.owe(dataRoot, id: "contact-push:" + peer, kind: .message,
+                    operation: "contact.push.invalidate:" + peer, owner: task,
+                    words: "The contact's task changed, but its waiting conversation could not be marked for reading: "
+                        + error.localizedDescription,
+                    lever: "Repair the conversation store, then read this retained task; do not resend its message.")
             }
         }
         try Task.checkCancellation()
         if !queuesResumed.withLock({ $0 }) {
             // Read retained waiting tasks once at startup after registering their invalidation source. The task owns current state.
-            let now = Date()
             for row in try store.records() where row.agent.hasPrefix("peer:")
                 && row.automaticRead && row.phase == "waiting"
-                && string(row.readInput?["task_id"] ?? row.receiptField("task_id")) != nil
-                && (row.nextReadAt ?? .distantPast) > now {
+                && string(row.readInput?["task_id"] ?? row.receiptField("task_id")) != nil {
                 _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
                     if $0.automaticRead && $0.phase == "waiting" && $0.nextReadAt == row.nextReadAt {
-                        $0.nextReadAt = now
+                        $0.nextReadAt = Date()
                     }
                 }
             }
@@ -193,12 +176,11 @@ public struct AgentConversationContinuation: Sendable {
     package func tick(workspace: WorkspaceOperation) async throws {
         try await resumeQueues(workspace: workspace)
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
-        let now = Date()
         let dotAgents = Set(try AgentPeerStore(dataRoot: dataRoot).list().filter { $0.ability == nil && ChatGPTDotIPCTransport.owns(
             $0) }.map { "peer:" + $0.id })
         let due = try store.records().filter {
             !dotAgents.contains($0.agent) && ($0.notice != nil || $0.automaticRead && ($0.phase == "waiting" || $0.deliveryState == "delivering"))
-                && Self.readIsDue($0, at: now)
+                && Self.hasPendingRead($0)
         }
         // Each contact owns its ordered replies; a turn never holds another contact's arrival behind reconciliation.
         for contact in Set(due.map(\.agent)) {
@@ -211,7 +193,10 @@ public struct AgentConversationContinuation: Sendable {
                     catch is CancellationError { read = false }
                     catch {
                         read = false
-                        nativeLog("Conversation reply handling for %@ failed: %@", contact, error.localizedDescription)
+                        RepairOwed.owe(dataRoot, id: "contact-reply:" + contact, kind: .message,
+                            operation: "contact.reply.read:" + contact, owner: contact,
+                            words: "Conversation reply handling failed: " + error.localizedDescription + ". Its saved reply remains owed.",
+                            lever: "Repair the named conversation or delivery evidence, then read that contact again.")
                     }
                     await settle {
                         let rearm = replyWork.withLock { state in
@@ -219,7 +204,7 @@ public struct AgentConversationContinuation: Sendable {
                             let pending = state.pending.remove(contact) != nil
                             return !state.stopped && (read || pending)
                         }
-                        // Reproject the contact's canonical nextReadAt after releasing its work, without an artificial retry wake.
+                        // A source change that arrived during the read gets one follow-up after this task releases ownership.
                         if rearm { StoreChangeBus.shared.emit(.init(store: .replyDelivery, path: store.fileURL)) }
                     }
                 }
@@ -236,7 +221,7 @@ public struct AgentConversationContinuation: Sendable {
             guard let row = try store.records().filter({
                 $0.agent == contact && !read.contains($0.operationID)
                     && ($0.notice != nil || $0.automaticRead && ($0.phase == "waiting" || $0.deliveryState == "delivering"))
-                    && Self.readIsDue($0, at: Date())
+                    && Self.hasPendingRead($0)
             }).sorted(by: { ($0.nextReadAt ?? .distantPast) < ($1.nextReadAt ?? .distantPast) }).first else { return rearm }
             read.insert(row.operationID)
             // Delegate notices belong to the asking chat and must not change the thread’s send state.
@@ -247,20 +232,18 @@ public struct AgentConversationContinuation: Sendable {
                                       notice: notice)
                 } catch is CancellationError { throw CancellationError() }
                 catch {
-                    _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
-                        $0.nextReadAt = Date().addingTimeInterval(60)
-                    }
+                    try attention(row, "The retained notice could not be delivered: " + error.localizedDescription
+                        + ". Repair its delivery evidence before handling this notice again.")
                 }
                 continue
             }
-            guard let operationStartedAt = row.operationStartedAt else {
+            guard row.operationStartedAt != nil else {
                 try attention(row, """
                     The accepted operation's start time is unavailable. Repair its saved operation evidence before continuing; no message was \
                     repeated.
                     """)
                 continue
             }
-            let readingUntil = Date().addingTimeInterval(30)
             do {
                 if row.agent.hasPrefix("bot-run:") {
                     if try await handleBotRun(row) { rearm = true }
@@ -280,7 +263,7 @@ public struct AgentConversationContinuation: Sendable {
                 }
                 // A write-triggered wake must not busy-poll its own store.
                 _ = try store.update(id: row.id, operationID: row.operationID) {
-                    $0.nextReadAt = readingUntil
+                    $0.nextReadAt = nil
                 }
                 if row.deliveryState == "delivering", let receipt = row.receipt {
                     try await deliver(row, receipt: receipt, peer: peer)
@@ -313,11 +296,6 @@ public struct AgentConversationContinuation: Sendable {
                     if fields["needs_input"] == .bool(true), let task = fields["task_id"] {
                         $0.readInput?["task_id"] = task
                     }
-                    if $0.nextReadAt == readingUntil {
-                        // The retained task is the one state reader. Pushes only invalidate it sooner; delivery evidence never selects a different receive
-                        // mechanism.
-                        $0.nextReadAt = Date().addingTimeInterval(Date().timeIntervalSince(operationStartedAt) > 300 ? 60 : 15)
-                    }
                 }
                 if settled, row.personInitiated == true {
                     // Person-initiated answers settle in their thread without running an agent turn.
@@ -328,32 +306,18 @@ public struct AgentConversationContinuation: Sendable {
                     try await deliver(row, receipt: cached, peer: peer)
                     continue
                 }
-                if Date().timeIntervalSince(operationStartedAt) > 24 * 60 * 60 {
-                    try attention(row, "The contact has not supplied a finished reply. Its original message remains available; it was not sent again.",
-                        receipt: cached)
-                }
             } catch is CancellationError { throw CancellationError() }
             catch {
-                // Read failure is safe to retry; a delivery failure is not. The lifecycle below records ambiguity before this boundary.
-                if row.agent.hasPrefix("bot-run:") {
-                    try attention(row, "The helper's exact result could not be read: \(error.localizedDescription). Repair its request or result evidence.")
-                } else if Date().timeIntervalSince(operationStartedAt) > 24 * 60 * 60 {
-                    try attention(row, "The contact's reply could not be recovered within a day. The original message has not been repeated.")
-                } else {
-                    _ = try store.update(id: row.id, operationID: row.operationID) {
-                        if $0.nextReadAt == readingUntil || $0.nextReadAt == row.nextReadAt {
-                            $0.nextReadAt = Date().addingTimeInterval(60)
-                        }
-                    }
-                }
+                try attention(row, "The retained reply could not be read or delivered: " + error.localizedDescription
+                    + ". Repair this conversation's evidence before reading it again; its original message was not repeated.")
             }
         }
     }
 
-    private static func readIsDue(_ row: AgentConversationRecord, at now: Date) -> Bool {
+    private static func hasPendingRead(_ row: AgentConversationRecord) -> Bool {
         // A pending helper result follows its queue/shelf owner; saved read dates cannot hold that owner's event.
         if row.notice == nil, row.agent.hasPrefix("bot-run:"), row.deliveryState != "delivering" { return true }
-        return (row.nextReadAt ?? .distantPast) <= now
+        return row.nextReadAt != nil
     }
 
     private func deliver(_ row: AgentConversationRecord, receipt: JSONValue, peer: AgentPeerContact? = nil,
@@ -375,8 +339,8 @@ public struct AgentConversationContinuation: Sendable {
             return current
         }
         let deliveryID = "agent-conversation:" + row.operationID + (notice.map { ":" + $0.event } ?? "")
-        // Run reply arrivals in the contact’s own session while returning the answer to the original asking door.
-        let session = peer.map { ContactThread.session(owner: $0.id) } ?? row.scopeSessionID
+        // Run reply arrivals in the session of the contact's conversation while returning the answer to the original asking door.
+        let session = peer.map { ContactThread.session(owner: $0.id, conversation: row.conversationID) } ?? row.scopeSessionID
         let route = AgentBridgeCompletionRoute(asking: row, turnSessionId: session)
         let retainedReply: ContactThread.Line?
         if notice == nil, peer != nil {
@@ -406,14 +370,13 @@ public struct AgentConversationContinuation: Sendable {
             origin = ChatMessageOrigin(surface: turnSurface, agent: "agent", authored: .agent, replyTo: deliveryID)
             incoming = incomingText(receipt, peer: peer, label: row.label, retainedText: retainedReply?.text)
         } else { throw StandingBotsError.invalidValue("A reply must have an identified author.") }
-        let isTerminalCompletion = notice?.event.hasPrefix("stalled:") != true
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         let digest = try await lifecycle.cachedRequestDigest(deliveryId: deliveryID)
             ?? SHA256.hash(data: try encoder.encode(receipt)).map { String(format: "%02x", $0) }.joined()
         let answered: Answered
         do {
             answered = try await answer(deliveryID, digest: digest, session: session, route: route, principal: row.agent,
-                                        runID: retainedReply?.run, notify: isTerminalCompletion, start: {
+                                        runID: retainedReply?.run, start: {
                 // Once the turn owns the event, glance and arrivals must not repeat it.
                 _ = try store.update(id: row.id, operationID: row.operationID, touch: notice == nil) {
                     if notice == nil { $0.phase = "ready"; $0.deliveryState = "delivering"; $0.receipt = receipt }
@@ -426,40 +389,24 @@ public struct AgentConversationContinuation: Sendable {
                     suppressUserAppend: retainedReply != nil,
                     envelope: turnEnvelope, verifiedSessionID: session, replyRoute: route.chatToolReplyRoute,
                     origin: origin, pinnedRunID: runID, codexCompletion: binding, threadKind: .agent,
-                    ownedSessionID: peer.map { ContactThread.session(owner: $0.id) })
+                    ownedSessionID: peer.map { ContactThread.session(owner: $0.id, conversation: row.conversationID) })
                 let admitted = try await TurnAdmission.admittedRun(turn: request.turn(),
                     arrival: request.arrival(retainedReply != nil ? .saved : .shown), dataRoot: dataRoot, waitForCapacity: true) { turn in
                     (try await request.chat(on: client, holding: turn), turn)
                 }
                 if notice == nil, case .ran(let (response, _)) = admitted {
-                    _ = try? store.update(id: row.id, operationID: row.operationID) { $0.deliveryRunID = response.runId }
+                    _ = try store.update(id: row.id, operationID: row.operationID) { $0.deliveryRunID = response.runId }
                 }
                 return admitted
             }
-        } catch is TurnAdmission.Full {
-            if notice != nil {
-                // Unstarted work has not been handed to the agent.
-                _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
-                    if $0.shownInline == $0.operationID + ":" + $0.phase { $0.shownInline = nil }
-                    $0.nextReadAt = Date().addingTimeInterval(30)
-                }
-                return
-            }
-            _ = try store.update(id: row.id, operationID: row.operationID) {
-                $0.phase = "waiting"
-                // Retry admission using this exact frozen reply/digest; rereading the peer could change the claimed payload.
-                $0.deliveryState = "delivering"
-                $0.automaticRead = true
-                $0.nextReadAt = Date().addingTimeInterval(30)
-            }
-            return
         } catch {
             if let notice {
                 // Do not rerun uncertain execution or mark it handed over.
                 FileHandle.standardError.write(Data(("AgentConversationContinuation: delegation notice turn "
                     + "\(deliveryID) interrupted; not rerun: \(error.localizedDescription)\n").utf8))
-                try? told(row, notice, handed: false)
-            } else { try? attention(row, "Reply handling was interrupted. The peer reply is retained; no message was repeated.", receipt: receipt) }
+                try told(row, notice, handed: false)
+            } else { try attention(row, "Reply handling was interrupted: " + error.localizedDescription
+                + ". The peer reply is retained; no message was repeated.", receipt: receipt) }
             throw error
         }
         if let notice { return try told(row, notice) }
@@ -467,6 +414,9 @@ public struct AgentConversationContinuation: Sendable {
         case .held:
             // Never a second turn for one event; the thread itself is untouched.
             try attention(row, "Reply handling was interrupted. The original reply is retained; no second turn or message was started.", receipt: receipt)
+        case .settled(let result?) where result.status == "steered":
+            // The reading turn owns its answer and checkpoint; only this arrival is settled here.
+            try await finish(row, delivered: true, runID: nil, sessionID: session)
         case .settled(let result):
             try await finish(row, delivered: result?.status == "completed" || result?.status == "sent_unconfirmed", runID: row.deliveryRunID,
                 sessionID: session,
@@ -487,7 +437,7 @@ public struct AgentConversationContinuation: Sendable {
 
     /// Claim, run and cache each answer once; release admission before delivering it to the asking door.
     func answer(_ deliveryID: String, digest: String, session: String, route: AgentBridgeCompletionRoute, principal: String,
-                runID: String? = nil, notify: Bool = true, start: () throws -> Void = {},
+                runID: String? = nil, start: () throws -> Void = {},
                 run: (_ runID: String, _ binding: CodexCompletionTranscriptBinding) async throws
                     -> TurnAdmission.Admitted<(ChatTurnRuntime.ChatResponse, Turn)>)
         async throws -> Answered {
@@ -509,7 +459,7 @@ public struct AgentConversationContinuation: Sendable {
                 try start()
                 enteredRun = true
                 let admitted = try await run(runID, CodexCompletionTranscriptBinding(deliveryId: deliveryID, requestDigest: digest,
-                    model: "", reasoningEffort: nil, isTerminalCompletion: notify))
+                    model: "", reasoningEffort: nil))
                 let produced: (ChatTurnRuntime.ChatResponse, Turn)
                 switch admitted {
                 case .ran(let ran): produced = ran
@@ -537,7 +487,7 @@ public struct AgentConversationContinuation: Sendable {
         return .delivered(await AgentBridgeCompletionRouter.deliverAnswer(turn: turn, deliveryId: deliveryID, requestDigest: digest,
             text: ChatResponse.answerOnly(response.output, workingCommentaryCharacters: response.workingCommentaryCharacters),
             attachments: response.attachments ?? [], route: route, client: clients.bridgeChatClient(),
-            sender: completionSender, lifecycle: lifecycle, notifyRequestedResult: notify), runID: response.runId)
+            sender: completionSender, lifecycle: lifecycle), runID: response.runId)
     }
 
     /// The event is the agent's now: clear it, leaving the thread's own state (a stalled send is still owed its answer) as it is.
@@ -689,8 +639,8 @@ public struct AgentConversationContinuation: Sendable {
                 try await clients.bridgeChatClient().appendAnswerForAskingChat(sessionID: row.scopeSessionID,
                     text: line, attachments: [], surface: row.sourceSurface, deliveryID: "requested-result:" + deliveryID,
                     mechanicalRow: .botReceipt, turn: turn)
-                ResidentWake.shared.request(dataRoot: dataRoot, reason: "what resolved", items: [.init(
-                    id: "reply:" + row.operationID, line: line, thread: row.id, session: row.scopeSessionID)])
+                AgentConversationStore.returnNews(row, scope: row.scopeSessionID, once: "reply:" + row.operationID,
+                    words: line, peers: nil, dataRoot: dataRoot)
                 // A bot receipt is written directly, never a turn, so it is never read by another.
                 return .ran((ChatResponse(runId: runID, model: "native", output: line,
                     sessionId: row.scopeSessionID, providerCallCount: 0), turn))
@@ -711,7 +661,7 @@ public struct AgentConversationContinuation: Sendable {
         } else {
             _ = try store.update(id: row.id, operationID: row.operationID) {
                 $0.phase = "waiting"; $0.deliveryState = "delivering"; $0.automaticRead = true
-                $0.nextReadAt = Date().addingTimeInterval(30)
+                $0.nextReadAt = nil
             }
         }
     }
@@ -733,7 +683,7 @@ public struct AgentConversationContinuation: Sendable {
 
     private func finish(_ row: AgentConversationRecord, delivered: Bool, runID: String?, sessionID: String, sentUnconfirmed: Bool = false) async throws {
         // Delivery of an earlier completion must not overwrite a conversation the agent has already advanced.
-        _ = try? store.update(id: row.id, operationID: row.operationID) {
+        _ = try store.update(id: row.id, operationID: row.operationID) {
             $0.phase = delivered ? "ready" : "attention"
             $0.deliveryState = sentUnconfirmed ? "sent_unconfirmed" : delivered ? "delivered" : "attention"
             $0.deliveryRunID = runID; $0.automaticRead = false; $0.nextReadAt = nil

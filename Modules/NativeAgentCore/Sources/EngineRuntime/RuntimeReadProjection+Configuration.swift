@@ -2,22 +2,40 @@ import DoctorChecks
 import Foundation
 import TelegramBot
 import Research
-import Observation
 import NativeAgentCore
 import NativeAgentShared
 import ProviderRouting
 // Blueprint: | `RuntimeReadProjection+Configuration.swift` | `RuntimeReadouts.Configuration`, `LatestRead`; Checked saved configuration |
 
 extension RuntimeReadouts {
-    @MainActor @Observable
+    @MainActor
     public final class Configuration {
-        public private(set) var searxngBaseURL = ""
-        @ObservationIgnored private let latest = LatestRead()
+        public var searxngBaseURL: String { checkedSearchURL ?? "" }
+        private let latest = LatestRead()
+        private var settingsFeed: SettingsFeedProjection?
+        private var checkedSearchURL: String?
+        private var searchIssue: String?
+        public func bindSettingsFeed(_ feed: SettingsFeedProjection) {
+            settingsFeed = feed
+            feed.updateSearch(checkedSearchURL, issue: searchIssue)
+        }
         public nonisolated init() {}
         @discardableResult
         public func readSearXNG(dataRoot: URL) async throws -> String {
-            try await latest.read({ try SwiftNativeResearchClient.checkedSearxngBaseURL(root: dataRoot) ?? "" },
-                                  publish: { searxngBaseURL = $0 })
+            let result: Result<String, Error> = await latest.read({
+                await Task.detached(priority: .userInitiated) {
+                    Result { try SwiftNativeResearchClient.checkedSearxngBaseURL(root: dataRoot) ?? "" }
+                }.value
+            }, publish: { result in
+                switch result {
+                case .success(let value):
+                    checkedSearchURL = value
+                    searchIssue = nil
+                case .failure(let error): searchIssue = error.localizedDescription
+                }
+                settingsFeed?.updateSearch(checkedSearchURL, issue: searchIssue)
+            })
+            return try result.get()
         }
     }
 

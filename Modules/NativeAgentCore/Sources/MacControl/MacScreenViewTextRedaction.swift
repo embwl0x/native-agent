@@ -477,8 +477,11 @@ public enum MacScreenViewTextRedaction {
     public static func inspectSecretFields(source: any MacAXElementSource, root: MacAXElementRef,
         deadline: Date, nonnegativeFrames: Bool = true, context: MacOperationContext) throws -> [MacAXNode] {
         try context.holding(\.readDeadline, deadline) { context in
+            // A list can publish every row and cell as visible with frames far off the window (Music's library): they cannot appear in the window's pixels.
+            let bounds = source.attributes(of: root, context: context)?.frame
             let snapshot = MacAccessibilityReader.walk(source: source, root: root, limits: .whole,
-                read: { ref, context in try source.checkedMaskingAttributes(of: ref, context: context) }, deadline: deadline, stopAtCut: true, context: context)
+                read: { ref, context in try source.checkedMaskingAttributes(of: ref, context: context) }, deadline: deadline, stopAtCut: true,
+                skipping: { ref, context in bounds.map { source.liesWhollyOutside(ref, bounds: $0, context: context) } ?? false }, context: context)
             guard !snapshot.truncated else {
                 throw SenseFailure(code: "redaction_coverage_unavailable",
                     message: "AX inspection was cut: \(snapshot.truncationReasons.joined(separator: ", ")). "
@@ -490,7 +493,7 @@ public enum MacScreenViewTextRedaction {
                 // Static prose and container captions can reveal secrets too.
                 guard MacScreenViewBuilder.isMarkable(attributes)
                     || MacScreenViewBuilder.textRoles.contains(attributes.role)
-                    || attributes.title != nil || attributes.value != nil else { continue }
+                    || attributes.title != nil || attributes.value != nil || !attributes.attributeGaps.isEmpty else { continue }
                 guard let frame = attributes.frame,
                       (!nonnegativeFrames || frame.w >= 0 && frame.h >= 0),
                       [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite) else {
@@ -525,7 +528,7 @@ public enum MacScreenViewTextRedaction {
             }
             let control = MacScreenViewBuilder.isMarkable(attributes)
             let name = control ? MacScreenViewBuilder.inferLabel(for: node, in: names).label : attributes.title
-            if withheld(name, under: nil) || withheld(attributes.value, under: name)
+            if !attributes.attributeGaps.isEmpty || withheld(name, under: nil) || withheld(attributes.value, under: name)
                 || (control && MacScreenViewBuilder.isSecretField(role: attributes.role, subrole: attributes.subrole,
                         label: name, value: attributes.value)) {
                 frames.append(frame)

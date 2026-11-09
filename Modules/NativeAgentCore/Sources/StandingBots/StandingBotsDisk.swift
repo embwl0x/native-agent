@@ -122,19 +122,14 @@ struct StandingBotsDisk: Sendable {
         case .manual: return .distantFuture
         case .interval(let seconds): return date.addingTimeInterval(max(seconds, minimumInterval))
         case .cron(let expression):
-            let value: JSONValue = .object(["schedule": .object([
-                "type": .string("cron"), "expression": .string(expression)
-            ])])
             do {
-                // Apply the spacing floor to actual runs; configuration time cannot prove execution.
+                // Apply the spacing floor to actual runs; configuration time cannot prove execution. Past the minute `due` claimed too: in a fall-back hour
+                // a run finishing at the second 01:01 must not be handed the second 01:59.
                 let after = max(date.timeIntervalSince1970,
                     lastRunAt.map { $0.addingTimeInterval(minimumInterval).timeIntervalSince1970.nextDown }
-                        ?? date.timeIntervalSince1970)
-                guard let epoch = try SchedulerJobRuntime.nextRunEpochAfterNow(for: value,
-                    beyond: due?.timeIntervalSince1970, now: { Date(timeIntervalSince1970: after) }) else {
-                    throw StandingBotsError.invalidValue("cron has no next occurrence")
-                }
-                return Date(timeIntervalSince1970: epoch)
+                        ?? date.timeIntervalSince1970, due?.timeIntervalSince1970 ?? date.timeIntervalSince1970)
+                return try SchedulerJobNormalizer.checkedNextOccurrence(["type": .string("cron"), "expression": .string(expression)],
+                                                                        after: Date(timeIntervalSince1970: after))
             } catch { throw StandingBotsError.invalidValue("cron: \(error)") }
         }
     }

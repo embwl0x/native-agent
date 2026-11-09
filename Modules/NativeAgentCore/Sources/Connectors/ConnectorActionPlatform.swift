@@ -3,13 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import MacControl
 import MacIntegration
-import AttentionRouting
-// Blueprint: | `ConnectorActionPlatform.swift` | `ConnectorActionPlatform` protocol; `attentionRouter`, `macAction` |
-
-public enum ConnectorPlatformAction: Sendable {
-    case calendarListUpcoming, remindersListDueToday, mailListRecent, messagesRecentThreads
-    case notesListRecent, notesSearch, contactsSearch
-}
+// Blueprint: | `ConnectorActionPlatform.swift` | `ConnectorActionPlatform` protocol; `spotlight`, `postMessage`, `statusEvidence`, `runGit` |
 
 public struct ConnectorActionStatusEvidence: Sendable {
     public let connectorStatus: String?
@@ -24,8 +18,6 @@ public struct ConnectorActionStatusEvidence: Sendable {
 }
 
 public protocol ConnectorActionPlatform: Sendable {
-    func attentionRouter() -> AttentionRouter
-    func macAction(_ action: ConnectorPlatformAction, input: [String: JSONValue], turn: Turn) async throws -> JSONValue
     func spotlight(input: [String: JSONValue], turn: Turn) async throws -> MacControlResult
     func postMessage(title: String, body: String, turn: Turn) async -> [String: JSONValue]
     func macAssistantStatusClient() -> any MacAssistantStatusClient

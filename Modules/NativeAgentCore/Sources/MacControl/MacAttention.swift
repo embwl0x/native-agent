@@ -238,40 +238,53 @@ public actor MacAttentionSessionStore {
     }
 
     public nonisolated func takeUserControl() {
-        let (changed, held) = driverState.withLock {
-            let captured = ($0.agentDriving, $0.inputBinding)
+        let held = driverState.withLock {
+            let captured = $0.inputBinding
             $0.agentDriving = false
             $0.driverGeneration &+= 1
             $0.inputBinding = nil
             return captured
         }
         held?.releaseHeldInputs()
-        if changed { Task { await self.publishDriver() } }
+        Task { await self.publishDriver() }
     }
 
     public nonisolated func userHandoffGeneration() -> UInt64? {
         #if canImport(AppKit) && os(macOS)
         guard Thread.isMainThread, let event = NSApp.currentEvent,
               [.leftMouseUp, .keyDown].contains(event.type),
-              let input = event.cgEvent, MacPersonInput.isPerson(input)
+              let input = event.cgEvent, NativePersonInput.isPerson(input)
         else { return nil }
-        return driverState.withLock { $0.driverGeneration }
+        return handoffGeneration
         #else
         return nil
         #endif
     }
 
     /// Only the person's explicit UI handoff calls this, or a bind under the Full Mac they granted; never a tool or view on its own.
-    public func giveAgentControl(userGeneration: UInt64) {
+    @discardableResult public func giveAgentControl(userGeneration: UInt64) -> Bool {
         ensureDriverObservation(eventSource: defaultMacAttentionEventSource())
-        guard observation != nil else { return }
+        guard observation != nil else { return false }
         let changed = driverState.withLock {
-            guard $0.driverGeneration == userGeneration else { return false }
-            $0.driverGeneration &+= 1
+            guard $0.driverOpen, !$0.agentDriving, $0.driverGeneration == userGeneration else { return false }
+            let (next, overflow) = $0.driverGeneration.addingReportingOverflow(1)
+            guard !overflow else { return false }
+            $0.driverGeneration = next
             $0.agentDriving = true
             return true
         }
         if changed { publishDriver() }
+        return changed
+    }
+
+    public nonisolated var handoffGeneration: UInt64 { driverState.withLock { $0.driverGeneration } }
+
+    public func controlPresentation() async throws -> MacControlFace {
+        let fullMac = try await Self.savedFullMac()
+        let (allowed, generation) = driverState.withLock { ($0.agentDriving, $0.driverGeneration) }
+        let handoff = observation != nil && !allowed && !fullMac
+        return MacControlFace(driverAllowed: allowed, handoffWouldChange: handoff,
+            handoffGeneration: generation, driver: nil, state: .ready)
     }
 
     public func bindDriver(eventSource: any MacAttentionEventSource = defaultMacAttentionEventSource()) async throws -> MacDriverBinding {

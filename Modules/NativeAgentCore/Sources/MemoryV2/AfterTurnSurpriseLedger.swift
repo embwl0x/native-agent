@@ -27,19 +27,19 @@ public struct AfterTurnChannelOutcome: Codable, Sendable, Equatable {
     public let affect: Bool
     public let caring: Bool
     public let cares: Bool
-    /// Nil when a retained judgment never measured promises.
+    /// New promises or person-quoted settlements; nil when a retained judgment never measured promises.
     public let promises: Bool?
     /// All five channels were measured, with facts asked and readable.
     public let complete: Bool
     public var nothingNew: Bool { complete && !facts && !affect && !caring && !cares && promises == false }
 
-    /// Any memory, affect, caring, care or promise change makes the complete judgment nonempty.
+    /// Any memory, affect, caring, care, promise or settlement change makes the complete judgment nonempty.
     public init(interpretation: AfterTurnInterpretation, factsAsked: Bool) {
         facts = interpretation.memories.contains { $0.action != .skip }
         affect = !interpretation.affect.isNoOp
         caring = interpretation.caring.kind != nil
         cares = !interpretation.cares.isEmpty
-        promises = !interpretation.promises.isEmpty
+        promises = !interpretation.promises.isEmpty || !interpretation.settled.isEmpty
         complete = factsAsked
     }
 
@@ -285,11 +285,6 @@ actor AfterTurnSurpriseLedger {
                       judgedBy: judgedBy)
     }
 
-    /// Of these owed turns (session, turn), the ones that were deferred.
-    func deferredTurns(dataRoot: URL, among turns: [(session: String, turn: String)]) -> Set<String> {
-        let book = self.book(dataRoot)
-        return Set(turns.map { $0.session + "\u{0}" + $0.turn }.filter { book.rows[$0]?.deferred == true })
-    }
 }
 
 extension SwiftNativeMemoryV2 {

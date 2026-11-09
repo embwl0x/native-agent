@@ -79,7 +79,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         self.showOptionalFields = self.required.isEmpty
     }
 
-    private static let harnessFields: Set<String> = ["__session_id", "current_session_id", "sender", "surface"]
+    private static let turnRoutingFields: Set<String> = ["__session_id", "current_session_id", "sender", "surface"]
 
     // Exact-helper settings present ordinary editable fields; the form packs the owner's object only at submission, under the same schema.
     private var helperFields: [String: JSONValue]? {
@@ -93,7 +93,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
     var properties: [String: JSONValue] {
         if let helperFields { return helperFields }
         guard case .object(let root) = parameters, case .object(let values)? = root["properties"] else { return [:] }
-        return values.filter { !Self.harnessFields.contains($0.key) && bound[$0.key] == nil
+        return values.filter { !Self.turnRoutingFields.contains($0.key) && bound[$0.key] == nil
             && !(tool == "write_file" && bound["expected_content_sha256"] != nil && $0.key == "append") }
     }
 
@@ -101,7 +101,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         if helperFields != nil { return [] }
         guard case .object(let root) = parameters, case .array(let names)? = root["required"] else { return [] }
         return Set(names.compactMap { if case .string(let name) = $0 { return name }; return nil })
-            .subtracting(bound.keys).subtracting(Self.harnessFields)
+            .subtracting(bound.keys).subtracting(Self.turnRoutingFields)
     }
 
     var singleTextField: String? {
@@ -385,9 +385,9 @@ struct AgentWorkspaceForm: Sendable, Equatable {
 
     /// Explicit input owners only. Generic capability forms, browser page snapshots, credentials and approval/connection payloads deliberately stay resident.
     var canPersist: Bool {
-        let allowed: Set<String> = ["write_file", "commit_memory", "recall_memory", "mail_search",
+        let allowed: Set<String> = ["write_file", "commit_memory", "recall_memory", "mail.search",
             "desk_note", "desk_update_item", "desk_set_status", "desk_add_ref", "desk_add_item",
-            "mail_send", "mail_reply", "messages_send", "chat_reply", "agent_message",
+            "mail.send", "mail.reply", "messages.send", "chat_reply", "agent_message",
             "mac_calendar_create_event", "mac_reminders_create", "mac_reminders_query", "mac_reminders_update", "image_generate", "bot_create", "bot_update"]
         let stableTargets: Set<String> = ["path", "expected_content_sha256", "name", "id", "handle", "memory_id", "message_id", "expected_message_id",
             "thread_id", "conversation_session_id", "agent", "conversation"]
@@ -428,7 +428,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
             }
             let form = AgentWorkspaceForm(stored: self)
             guard form.canPersist, Set(values.keys).isSubset(of: Set(form.properties.keys)),
-                  Set(values.keys).isDisjoint(with: AgentWorkspaceForm.harnessFields) else {
+                  Set(values.keys).isDisjoint(with: AgentWorkspaceForm.turnRoutingFields) else {
                 throw Failure(message: "The saved draft contains unsupported fields. Its bytes were preserved.")
             }
             return form

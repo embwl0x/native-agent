@@ -72,27 +72,15 @@ enum AgentNameCache {
 @Observable
 final class iCloudSyncEngine {
     static let shared = iCloudSyncEngine()
+    let pageSessions = FacePageSessions()
 
     // MARK: - Published snapshots
 
-    var deskItems: [MobileDeskItem] = []
     var workOverview: WorkOverview?
-    var schedulerSnapshot: MobileSchedulerSnapshot?
-    var schedulerJobReceiptTimes: [String: Double] = [:]
-    var schedulerError: String?
-    var appSettingRows: [MobileAppSetting] = []
-    var appSettingsLoading = false
-    var appSettingsSaving: Set<String> = []
-    var appSettingsFailure: String?
-    var helperDetails: [UUID: MobileHelperEdit] = [:]
     var agentThreads: [String: MobileAgentThread] = [:]
-    /// Missing Desk omission metadata means no report arrived, never that nothing was omitted.
-    var deskBounds: MobileDeskProjectionReport?
-    var deskReadingCopies: [String: MobileDeskItemReadingCopy] = [:]
     var skills: [SkillManifestEntry] = []
     var tools: [MobileToolCatalogRecord] = []
     var knowledgeGraph: KGEntityResponse?
-    var memories: [MemoryRecord] = []
     var memoryProposals: [MemoryProposalRecord] = []
     var snapshotReadRevisions: [String: Double] = [:]
     var recordReadbackRevisions: [String: [String: Double]] = [:]
@@ -102,7 +90,7 @@ final class iCloudSyncEngine {
     private var personalityPairing: String?
     private var snapshotPairing: String?
 
-    /// Bind Drive and CloudKit cache bytes to one pairing; never adopt unscoped files across pairing changes or relaunch.
+    /// Bind CloudKit cache bytes to one pairing; never adopt unscoped files across pairing changes or relaunch.
     static func cachedSnapshotDirectory(in directory: URL, pairing secret: Data?) -> URL {
         directory.appendingPathComponent("pairings", isDirectory: true)
             .appendingPathComponent(AgentNameCache.fingerprint(secret) ?? "unpaired", isDirectory: true)
@@ -128,27 +116,16 @@ final class iCloudSyncEngine {
         lifecycleGeneration &+= 1
         refreshInFlight = false
         refreshQueued = false
-        if prefersCloudKitSnapshotCache {
+        if snapshotDir != nil {
             snapshotDir = cloudKitSnapshotCacheDirectory(pairing: secret)
-        } else if let driveSnapshotRoot {
-            snapshotDir = fingerprint == nil ? nil : Self.cachedSnapshotDirectory(in: driveSnapshotRoot, pairing: secret)
         }
-        deskItems = []
         workOverview = nil
-        schedulerSnapshot = nil
-        schedulerJobReceiptTimes = [:]
-        schedulerError = nil
-        appSettingsRead.write { appSettingRows = [] }
-        appSettingsFailure = nil
-        helperDetails = [:]
+        faces = [:]
         agentThreads = [:]
         PhoneTurnActivity.shared.workCorrelations = [:]
-        deskBounds = nil
-        deskReadingCopies = [:]
         skills = []
         tools = []
         knowledgeGraph = nil
-        memories = []
         memoryProposals = []
         snapshotReadRevisions = [:]
         snapshotHealth = [:]
@@ -179,7 +156,7 @@ final class iCloudSyncEngine {
         groupTransportDeliveryAt = Self.loadGroupDeliveryClocks(pairing: fingerprint)
         staleSnapshotGroups = [:]
         cloudKitCatchUpIncomplete = false
-        cloudKitCatchUpFailures = 0
+        cloudKitCatchUpFailure = nil
         syncError = nil
         inboxSnapshotLoaded = false
         approvalsSnapshotLoaded = false
@@ -261,16 +238,14 @@ final class iCloudSyncEngine {
     var staleSnapshotGroups: [String: String] = [:]
     /// Coalesced/partial catch-up remains owed until a complete remote pull and successful cache refresh.
     var cloudKitCatchUpIncomplete = false
-    /// Warn only after catch-up reads fail twice running: one the next read heals is not the person's news,
-    /// and a running read or one merged into the 0.75 s foreground receive remains owed.
-    var cloudKitCatchUpFailures = 0
-    var cloudKitCatchUpFailed: Bool { cloudKitCatchUpFailures >= 2 }
+    /// Retain the completed read's cause until catch-up succeeds or the connection is reset.
+    var cloudKitCatchUpFailure: DeviceSyncError?
     private var snapshotSyncError: String?
     var syncError: String? {
         get {
-            snapshotSyncError ?? (cloudKitCatchUpFailed
-                ? "Mac updates are still catching up. Showing the last received data. Open Connection in Settings to check the Mac link."
-                : nil)
+            let catchUpError = cloudKitCatchUpFailure.map { "Mac updates could not be read: \($0.localizedDescription)" }
+            let errors = [snapshotSyncError, catchUpError].compactMap { $0 }
+            return errors.isEmpty ? nil : errors.joined(separator: "\n")
         }
         set { snapshotSyncError = newValue }
     }
@@ -288,11 +263,7 @@ final class iCloudSyncEngine {
 
     // MARK: - Private
 
-    let kvs = NSUbiquitousKeyValueStore.default
     var snapshotDir: URL?
-    var driveSnapshotRoot: URL?
-    var prefersCloudKitSnapshotCache = false
-    var inboxDir: URL?
     var responsesDir: URL?
     var transactionDir: URL?
     var isSetUp = false
@@ -301,6 +272,8 @@ final class iCloudSyncEngine {
     /// Invalidates reads/cache writes across teardown or transport root changes.
     var lifecycleGeneration: UInt64 = 0
     @ObservationIgnored let snapshotRead = LatestRead()
+    @ObservationIgnored let organismRead = LatestRead()
+    @ObservationIgnored let telegramRead = LatestRead()
     @ObservationIgnored let trustRead = LatestRead()
     var snapshotHealth: [String: SnapshotReadHealth] = [:]
     @ObservationIgnored let memoryRead = LatestRead()
@@ -309,7 +282,6 @@ final class iCloudSyncEngine {
     @ObservationIgnored let approvalsRead = LatestRead()
     @ObservationIgnored let transcriptsRead = LatestRead()
     @ObservationIgnored let sessionListRead = LatestRead()
-    @ObservationIgnored let appSettingsRead = LatestRead()
     var pairingStore: PairingStore? {
         didSet { invalidateSnapshots(pairing: pairingStore?.iCloudPairingSecret) }
     }
@@ -318,7 +290,6 @@ final class iCloudSyncEngine {
     var sendingTransactions: Set<String> = []
 
     // Ledger persistence is part of send acceptance; bound synchronous coordinated-I/O waits before releasing send ownership.
-    var transactionWriteTimeoutSeconds: TimeInterval = 5
 
     init(personality: PersonalityProfile? = nil) { self.personality = personality }
 }
@@ -328,7 +299,6 @@ final class iCloudSyncEngine {
 enum SyncError: LocalizedError {
     case notSetup
     case notSigned
-    case timeout(String)
     case responseUnconfirmed(String)
     case persistence(String)
     case busy(String)
@@ -341,9 +311,9 @@ enum SyncError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notSetup:         return "iCloud sync not initialized. Enable iCloud Drive and reconnect."
+        case .notSetup:         return "iCloud sync not initialized. Reconnect to CloudKit."
         case .notSigned:        return IOSPairingPresentation.notSignedSyncMessage
-        case .timeout(let msg), .responseUnconfirmed(let msg): return msg
+        case .responseUnconfirmed(let msg): return msg
         case .persistence(let msg): return msg
         case .busy(let msg):    return msg
         case .approvalRequired(let msg, _): return msg

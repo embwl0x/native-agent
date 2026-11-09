@@ -3,6 +3,9 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
+#if canImport(Darwin)
+import Darwin
+#endif
 #if canImport(ApplicationServices)
 import ApplicationServices
 #endif
@@ -17,7 +20,7 @@ import CryptoKit
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `MacChromiumAccessibility.swift` | Bundle-based renderer identity; shared bounded AX activation retains failures and passive authority |
+// Blueprint: | `MacChromiumAccessibility.swift` | Renderer identity and activation; descendant events wake async content judging; synchronous reads never sleep |
 /// Classification serves page presentation, never activation admission.
 public enum MacChromiumAccessibility {
     /// An INACTIVITY window. Observed renderer nodes/text growth renews it without any total duration ceiling; AX notifications only trigger another read.
@@ -85,14 +88,14 @@ public enum MacChromiumAccessibility {
     }
 }
 /// One process-state owner for source preparation, shared by readers and acts. Flags are never cleared on a target change: another AT may rely on them.
-public final class MacChromiumAccessibilityState: @unchecked Sendable {
+public final class MacChromiumAccessibilityState: Sendable {
     public static let shared = MacChromiumAccessibilityState()
     struct ProcessState: Sendable {
         let launch: Date
         var prepared = false
         var manualRequested = false
-        var settleUntil: Date?
-        var enhancedSettled = false
+        var settling = false
+        var settleAdmitted = false
         var evidence: [String: JSONValue] = [:]
     }
     private let processes = OSAllocatedUnfairLock(initialState: [Int32: ProcessState]())
@@ -104,28 +107,188 @@ public final class MacChromiumAccessibilityState: @unchecked Sendable {
     }
     func store(pid: Int32, state: ProcessState) {
         processes.withLock { states in
-            // Metadata cleanup must not mutate a target app.
-            states = states.filter { NSRunningApplication(processIdentifier: $0.key)?.launchDate == $0.value.launch }
+            // Only the kernel's explicit no-process result retires another process's metadata.
+            states = states.filter { kill($0.key, 0) == 0 || errno != ESRCH }
             states[pid] = state
         }
     }
     func evidence(pid: Int32) -> [String: JSONValue] {
-        guard let launch = NSRunningApplication(processIdentifier: pid)?.launchDate else { return [:] }
-        return state(pid: pid, launch: launch).evidence
+        do {
+            let launch = try macProcessStart(pid)
+            return state(pid: pid, launch: launch).evidence
+        } catch {
+            return ["status": .string("unavailable"), "message": .string(error.localizedDescription)]
+        }
     }
 }
 #if canImport(ApplicationServices) && os(macOS)
+/// A process's identity across relaunches. Launch Services gives some apps no launchDate, so this reads the kernel's start time, which every process has.
+private func macProcessStart(_ pid: Int32) throws -> Date {
+    var info = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.stride
+    var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+    guard sysctl(&name, 4, &info, &size, nil, 0) == 0 else {
+        let failure = errno
+        throw MacAccessibilityReader.NativeReadFailure(detail:
+            "Cannot read renderer process \(pid)'s kernel identity (errno \(failure): \(String(cString: strerror(failure)))). "
+            + "Check that the app is running and restore process-table access before reading it again.")
+    }
+    guard size == MemoryLayout<kinfo_proc>.stride, info.kp_proc.p_pid == pid else {
+        throw MacAccessibilityReader.NativeReadFailure(detail:
+            "Renderer process \(pid)'s kernel identity is missing or incomplete (\(size) bytes). Read the running app again before continuing.")
+    }
+    let start = info.kp_proc.p_starttime
+    return Date(timeIntervalSince1970: TimeInterval(start.tv_sec) + TimeInterval(start.tv_usec) / 1_000_000)
+}
+
+/// Every descendant notification wakes the content judge; notifications themselves never establish readiness.
+private final class MacRendererEvents: MacAXEffectObserverSource, MacAXEffectObservation, Sendable {
+    private struct State: Sendable {
+        var first: MacAXEffectNotification?
+        var failure: Error?
+        var notify: (@Sendable (MacAXEffectNotification) -> Void)?
+        var stopped = false
+    }
+    private let state: OSAllocatedUnfairLock<State>
+    private let source: MacAppSourceEvents?
+    private let channel: Task<Void, Never>?
+    private let pid: Int32
+    let launch: Date
+    let subscriptionFailure: String?
+    var failure: Error? { state.withLock { $0.failure } }
+
+    init(pid: Int32, context: MacOperationContext) throws {
+        let launch = try macProcessStart(pid)
+        self.pid = pid
+        self.launch = launch
+        let state = OSAllocatedUnfairLock(initialState: State())
+        self.state = state
+        let source: MacAppSourceEvents
+        do {
+            source = try MacAppSourceEvents(pid: pid, context: context) { kind in
+                let notification = MacAXEffectNotification(kind: kind, at: Date())
+                let notify: (@Sendable (MacAXEffectNotification) -> Void)? = state.withLock { state in
+                    guard !state.stopped else { return nil }
+                    if state.first == nil { state.first = notification }
+                    return state.notify
+                }
+                notify?(notification)
+            }
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            // Activation may be what makes notifications available. Keep this settle's missing observation explicit.
+            subscriptionFailure = (error as? SenseFailure)?.message ?? error.localizedDescription
+            self.source = nil
+            channel = nil
+            return
+        }
+        subscriptionFailure = nil
+        self.source = source
+        channel = Task {
+            do {
+                // Descendant callbacks carry every wake before coalescing; this task handles channel closure, not readiness.
+                for try await _ in source.stream { try Task.checkCancellation() }
+                try Task.checkCancellation()
+                throw MacAccessibilityReader.NativeReadFailure(detail: "Renderer observation closed before preparation settled.")
+            } catch {
+                let notify: (@Sendable (MacAXEffectNotification) -> Void)? = state.withLock { state in
+                    guard !state.stopped else { return nil }
+                    state.failure = error
+                    return state.notify
+                }
+                // Channel closure is a wake to inspect the failure, never an AX readiness event.
+                notify?(.init(kind: "renderer_channel_closed", at: Date()))
+            }
+        }
+    }
+
+    func install(pid: Int32, kinds _: [String],
+                 onNotification: @escaping @Sendable (MacAXEffectNotification) -> Void) -> (any MacAXEffectObservation)? {
+        guard pid == self.pid, source != nil else { return nil }
+        let pending = state.withLock { state -> MacAXEffectNotification? in
+            state.notify = onNotification
+            if state.failure != nil { return MacAXEffectNotification(kind: "renderer_channel_closed", at: Date()) }
+            return state.first
+        }
+        if let pending { onNotification(pending) }
+        return self
+    }
+
+    func stop() {
+        let stop = state.withLock { state in
+            guard !state.stopped else { return false }
+            state.stopped = true
+            state.notify = nil
+            return true
+        }
+        guard stop else { return }
+        channel?.cancel()
+        source?.cancel()
+    }
+
+    deinit { stop() }
+}
+
 extension SystemMacAXElementSource {
 
-    /// Suspend cold preparation at async entries so the main execution lane stays free; synchronous clients retain bounded admission.
-    package static func prepareRenderer(pid: Int32, context: MacOperationContext) async throws {
+    /// Arm before activation; wait outside the AX lane so descendants can announce their first content.
+    @concurrent package static func prepareRenderer(pid: Int32, context: MacOperationContext) async throws {
         guard context.observationMode != .passive else { return }
         try await context.holding(\.readDeadline, context.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds)) { context in
-            while let until = try rendererPreparation(pid: pid, refresh: true, context: context) {
-                try Task.checkCancellation()
-                let remaining = until.timeIntervalSinceNow
-                if remaining > 0 { try await Task.sleep(for: .seconds(remaining)) }
+            var events: MacRendererEvents?
+            defer { events?.stop() }
+            let waiting = try rendererPreparation(pid: pid, refresh: true, context: context) {
+                if events == nil { events = try MacRendererEvents(pid: pid, context: context.with(\.preparingRenderer, true)) }
             }
+            guard waiting else { return }
+            guard let events else {
+                throw MacAccessibilityReader.NativeReadFailure(detail: "Renderer preparation did not establish its observation state.")
+            }
+            let signals = MacWaitSignals(effects: events, activation: defaultMacAppActivationObserverSource(), pid: pid)
+            defer { signals.stop() }
+            var readFailure: Error?
+            var contentReady = false
+            let patience = min(2, min(context.readDeadline?.timeIntervalSinceNow ?? 2, context.wallDate?.timeIntervalSinceNow ?? 2))
+            let end = await macSettle("renderer", signals: signals, patience: max(0, patience)) {
+                if events.failure != nil { return true }
+                do {
+                    contentReady = try rendererContent(pid: pid, launch: events.launch, context: context)
+                    return contentReady
+                } catch {
+                    readFailure = error
+                    return true
+                }
+            }
+            try Task.checkCancellation()
+            if case .stopped = end { throw context.cancellationError }
+            if let error = events.failure { throw error }
+            if let readFailure { throw readFailure }
+            let result: Result<Void, Error> = MacAXExecutionLane.sync {
+                Result {
+                    guard try macProcessStart(pid) == events.launch else {
+                        throw MacAccessibilityReader.NativeReadFailure(detail: "Renderer process changed during accessibility preparation.")
+                    }
+                    let owner = MacChromiumAccessibilityState.shared
+                    var state = owner.state(pid: pid, launch: events.launch)
+                    state.settling = false
+                    state.settleAdmitted = true
+                    state.prepared = true
+                    let reason = contentReady ? "content" : "patience"
+                    state.evidence["settle_ended_by"] = .string(reason)
+                    if let failure = events.subscriptionFailure {
+                        state.evidence["settle_observation"] = .object([
+                            "status": .string("unavailable"), "message": .string(failure),
+                            "waiting_for": .string("content_or_patience"),
+                        ])
+                    } else {
+                        state.evidence["settle_observation"] = .object(["status": .string("installed")])
+                    }
+                    let observed = state.evidence["enhanced_readback"] == .bool(true) ? "enabled" : "tree_observed"
+                    state.evidence["status"] = .string(reason == "patience" ? "settle_unobserved" : observed)
+                    owner.store(pid: pid, state: state)
+                }
+            }
+            try result.get()
         }
     }
     static func ensureRenderer(_ element: AXUIElement, refresh: Bool = false, context: MacOperationContext) throws {
@@ -137,27 +300,31 @@ extension SystemMacAXElementSource {
         // System-wide focus probes have pid 0 and no app mode to activate.
         guard pid > 0 else { return }
         try MacAccessibilityReader.withReadBudget(context: context) { context in
-            while let until = try rendererPreparation(pid: pid, refresh: refresh, context: context) {
-                try Task.checkCancellation()
-                let remaining = until.timeIntervalSinceNow
-                // No notification wait, no repeated provider or input workload. The fixed cold settle is charged to the caller's read deadline.
-                if remaining > 0 {
-                    guard !Thread.isMainThread else {
-                        throw MacAccessibilityReader.NativeReadFailure(detail: """
-                            Renderer accessibility is still settling. Read the app again after two seconds; no AX action was attempted. The main lane was not \
-                            blocked.
-                            """)
-                    }
-                    Thread.sleep(forTimeInterval: min(0.05, remaining))
-                }
+            if try rendererPreparation(pid: pid, refresh: refresh, context: context) {
+                throw MacAccessibilityReader.NativeReadFailure(detail: """
+                    Renderer accessibility is still settling; no AX action was attempted. Prepare the app at its async entry before continuing.
+                    """)
             }
         }
     }
-    private static func rendererPreparation(pid: Int32, refresh: Bool, context: MacOperationContext) throws -> Date? {
-        let result: Result<Date?, Error> = MacAXExecutionLane.sync {
+    private static func rendererContent(pid: Int32, launch: Date, context: MacOperationContext) throws -> Bool {
+        let result: Result<Bool, Error> = MacAXExecutionLane.sync {
+            Result {
+                guard try macProcessStart(pid) == launch else {
+                    throw MacAccessibilityReader.NativeReadFailure(detail: "Renderer process changed during accessibility preparation.")
+                }
+                guard let deadline = context.readDeadline, Date() < deadline else { return false }
+                return try rendererTopology(app: AXUIElementCreateApplication(pid), deadline: deadline).hasContent
+            }
+        }
+        return try result.get()
+    }
+    private static func rendererPreparation(pid: Int32, refresh: Bool, context: MacOperationContext,
+                                            beforeActivation: (() throws -> Void)? = nil) throws -> Bool {
+        let result: Result<Bool, Error> = MacAXExecutionLane.sync {
             Result { try context.holding(\.preparingRenderer, true) { context in
                 try Task.checkCancellation()
-                guard pid != getpid(), pid > 0 else { return nil }
+                guard !PersonOnlyWindows.isOwnProcess(pid), pid > 0 else { return false }
                 guard let running = NSRunningApplication(processIdentifier: pid), !running.isTerminated else {
                     throw MacAccessibilityReader.NativeReadFailure(detail: "Renderer accessibility needs a live pid.")
                 }
@@ -167,35 +334,22 @@ extension SystemMacAXElementSource {
                 guard running.activationPolicy == .regular,
                       !systemNames.contains(executable?.lastPathComponent ?? ""),
                       running.bundleIdentifier?.hasPrefix("com.apple.VoiceOver") != true,
-                      running.bundleIdentifier?.hasPrefix("com.apple.Accessibility") != true else { return nil }
+                      running.bundleIdentifier?.hasPrefix("com.apple.Accessibility") != true else { return false }
                 guard let bundleURL = running.bundleURL else {
                     throw MacAccessibilityReader.NativeReadFailure(
                         detail: "Renderer accessibility needs the app's bundle location; system-app classification is unknown."
                     )
                 }
-                guard !bundleURL.standardizedFileURL.path.hasPrefix("/System/") else { return nil }
-                // System apps (Finder has no launch date) left above; a renderer app keys its state by launch.
-                guard let launch = running.launchDate else {
-                    throw MacAccessibilityReader.NativeReadFailure(detail: "Renderer accessibility needs the app's launch identity.")
-                }
+                guard !bundleURL.standardizedFileURL.path.hasPrefix("/System/") else { return false }
+                // System apps left above; a renderer app keys its state by its process start.
+                let launch = try macProcessStart(pid)
                 let owner = MacChromiumAccessibilityState.shared
                 var state = owner.state(pid: pid, launch: launch)
                 let deadline = context.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds)
                 guard Date() < deadline else {
                     throw MacAccessibilityReader.NativeReadFailure(detail: "Renderer accessibility preparation exhausted the reader time budget.")
                 }
-                if let until = state.settleUntil {
-                    guard until < deadline else {
-                        throw MacAccessibilityReader.NativeReadFailure(
-                            detail: "Renderer accessibility is still settling; no AX action was attempted. Read again with a fresh budget."
-                        )
-                    }
-                    if Date() < until { return until }
-                    state.settleUntil = nil
-                    state.enhancedSettled = true
-                    state.prepared = false // verify Enhanced again after the debounce
-                }
-                if state.prepared && !refresh { return nil }
+                if state.prepared && !refresh { return false }
                 let app = AXUIElementCreateApplication(pid)
                 _ = AXUIElementSetMessagingTimeout(app, Float(min(0.25, deadline.timeIntervalSinceNow)))
                 defer { _ = AXUIElementSetMessagingTimeout(app, 0) }
@@ -208,7 +362,7 @@ extension SystemMacAXElementSource {
                     return .init(detail: detail)
                 }
                 func checkIdentity() throws {
-                    guard NSRunningApplication(processIdentifier: pid)?.launchDate == launch else {
+                    guard try macProcessStart(pid) == launch else {
                         throw fail("Renderer process changed during accessibility preparation; read the new process before acting.")
                     }
                     guard !Task.isCancelled, Date() < deadline else {
@@ -233,8 +387,8 @@ extension SystemMacAXElementSource {
                         if status == .attributeUnsupported || status == .noValue { return nil }
                         throw fail("Renderer readback of \(flag.rawValue) is unreadable (AX error \(status.rawValue)).")
                     }
-                    guard let raw, CFGetTypeID(raw) == CFBooleanGetTypeID() else { return nil }
-                    return CFBooleanGetValue(raw as! CFBoolean)
+                    guard let raw, CFGetTypeID(raw) == CFBooleanGetTypeID(), let value = raw as? Bool else { return nil }
+                    return value
                 }
                 let manual = try settable(.manualAccessibility)
                 let enhanced = try settable(.enhancedUserInterface)
@@ -242,7 +396,7 @@ extension SystemMacAXElementSource {
                     state.prepared = true
                     state.evidence = ["status": .string("unsupported")]
                     owner.store(pid: pid, state: state)
-                    return nil
+                    return false
                 }
                 // Probe topology only, not names, app families or field values. An unreadable/capped search is unknown, never empty.
                 let probe = try rendererTopology(app: app, deadline: deadline)
@@ -276,36 +430,42 @@ extension SystemMacAXElementSource {
                     }
                     return readback
                 }
+                var activated = false
                 if manual, probe.empty == true, !state.manualRequested {
-                    if try boolean(.manualAccessibility) != true { _ = try enable(.manualAccessibility) }
+                    try beforeActivation?()
+                    if try boolean(.manualAccessibility) != true {
+                        _ = try enable(.manualAccessibility)
+                        activated = true
+                    }
                     state.manualRequested = true
+                    state.settleAdmitted = false
+                    state.settling = true
                 }
                 if enhanced, enhancedBefore == false || (probe.webArea && enhancedBefore != true) {
-                    // Reject too little budget BEFORE the write.
-                    guard deadline.timeIntervalSinceNow > 2.1 else {
-                        throw fail("""
-                            Enhanced accessibility needs two seconds to settle; the remaining reader budget is too small. No Enhanced write was attempted.
-                            """)
-                    }
+                    try beforeActivation?()
                     _ = try enable(.enhancedUserInterface)
+                    activated = true
                     state.evidence["enhanced_readback"] = .bool(true)
-                    state.settleUntil = Date().addingTimeInterval(2)
-                    state.evidence["status"] = .string("settling")
-                    state.evidence["settle_seconds"] = .int(2)
-                } else if enhancedBefore == true, !state.enhancedSettled {
-                    guard deadline.timeIntervalSinceNow > 2.1 else {
-                        throw fail("Enhanced accessibility was already on, but its settle could not fit in the remaining reader budget.")
-                    }
-                    state.settleUntil = Date().addingTimeInterval(2)
-                    state.evidence["status"] = .string("settling")
-                    state.evidence["settle_seconds"] = .int(2)
-                } else {
-                    state.evidence["status"] = .string(enhancedBefore == true ? "enabled" : "tree_observed")
+                    state.settleAdmitted = false
+                    state.settling = true
                 }
+                let after = activated ? try rendererTopology(app: app, deadline: deadline) : probe
+                state.evidence["after"] = after.json
+                if after.hasContent {
+                    state.settleAdmitted = true
+                    state.settling = false
+                    state.evidence["settle_ended_by"] = .string("content")
+                } else if !state.settleAdmitted {
+                    try beforeActivation?()
+                    state.settling = true
+                }
+                let observed = state.evidence["enhanced_readback"] == .bool(true) ? "enabled" : "tree_observed"
+                let unobserved = !after.hasContent && state.evidence["settle_ended_by"] == .string("patience")
+                state.evidence["status"] = .string(state.settling ? "settling" : unobserved ? "settle_unobserved" : observed)
                 try checkIdentity()
-                state.prepared = true
+                state.prepared = !state.settling
                 owner.store(pid: pid, state: state)
-                return state.settleUntil
+                return state.settling
             } }
         }
         return try result.get()
@@ -317,7 +477,8 @@ extension SystemMacAXElementSource {
         var complete = true
         var content = false
         var webContent = false
-        var empty: Bool? { complete ? !(webArea ? webContent : content) : nil }
+        var hasContent: Bool { webArea ? webContent : content }
+        var empty: Bool? { complete ? !hasContent : nil }
         var json: JSONValue { .object([
             "elements": .int(Int64(nodes)), "roles": .array(roles.sorted().map(JSONValue.string)),
             "empty": empty.map(JSONValue.bool) ?? .null,

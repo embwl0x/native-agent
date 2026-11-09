@@ -1,56 +1,47 @@
 import Foundation
+import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import TriggerScheduler
-// Blueprint: | `BotRunnerScheduler.swift` | `BotRunnerScheduler` actor; `effectiveSchedule` shares reconciled timing and admission with live deadlines |
+import Experiences
+// Blueprint: | `BotRunnerScheduler.swift` | `BotRunnerScheduler`: helper cadence declarations, queued runs and durable scheduling failures |
 
-/// Definitions remain canonical; persisted reservations project into the shared deadline owner.
+/// A helper's cadence is one time on the one clock, `helper:<id>`, declared from its definition; the clock delivers it here and the helper runs. A requested
+/// run (by hand, or an event) runs as soon as it is queued. Helpers think for themselves; only their clock is the clock's.
 public actor BotRunnerScheduler {
-    private struct Job: Codable, Equatable {
-        let revision: Date
-        var next: Date
-        var reason: String? = nil
-        var failureID: UUID? = nil
-        var minimumInterval: TimeInterval? = nil
-        var scheduledFrom: Date? = nil
-        var lastRunAt: Date? = nil
-        var missed: BotMissedRun? = nil
-        /// Preserve the resolving zone so cron times can follow the Mac when it moves.
-        var zone: String? = TimeZone.autoupdatingCurrent.identifier
-        /// `next` and the zone it was resolved in are only ever written together.
-        mutating func plan(_ date: Date) { next = date; zone = TimeZone.autoupdatingCurrent.identifier }
-    }
-    /// Capture construction time: lazy static initialization would misclassify every overdue job as app downtime.
-    private let startedAt = Date()
+    static let clockOwner = "helper"
+
+    private let dataRoot: URL
     private let disk: StandingBotsDisk
     private let definitions: BotDefinitionStore
     private let runner: BotRunner
     private let queue: BotRunQueue
-    private let shelf: ShelfStore
     private let events: BotEventStore
-    /// Recheck unattended authority on admission; manual requests carry the user's explicit authority.
-    /// Roots without a trust policy use the supplied default.
+    /// Recheck unattended authority on admission; manual requests carry the person's explicit authority.
     private let isAutonomyEnabled: @Sendable () async -> Bool
-    public private(set) var failure: String?
     private var inFlight: [UUID: Task<Void, Never>] = [:]
-    private var isShutDown = false
-    private var settled: [String] = []
-    private var deadlineFailures: [UUID: String] = [:]
+    private var attached = false
+    /// Failed rows keep only their own cadence undeclared this launch; nil means the shared migration input could not be read at all.
+    private var carryOverHeld: Set<UUID>? = []
+    /// Retain the gate's observed reason; rereading a toggled switch could invent a different refusal.
+    private var lastUnattendedHold: [UUID: (reason: BotMissedRun.Reason, detail: String?)] = [:]
 
     public init(
         dataRoot: URL,
         session: @escaping BotRunnerSession,
         isAutonomyEnabled: @escaping @Sendable () async -> Bool = { true }
     ) {
+        self.dataRoot = dataRoot
         self.isAutonomyEnabled = isAutonomyEnabled
         disk = StandingBotsDisk(dataRoot: dataRoot)
-        shelf = ShelfStore(dataRoot: dataRoot)
         events = BotEventStore(dataRoot: dataRoot)
         definitions = BotDefinitionStore(dataRoot: dataRoot)
         runner = BotRunner(dataRoot: dataRoot, session: session)
         queue = BotRunQueue(dataRoot: dataRoot)
     }
 
-    private var path: URL { disk.root.appendingPathComponent("runner-jobs.json") }
+    /// An occurrence that did not run, kept per helper until the next one replaces it.
+    private var missedPath: URL { disk.root.appendingPathComponent("missed-runs.json") }
 
     public struct BotSchedule: Sendable {
         public let dates: [UUID: Date]
@@ -58,364 +49,282 @@ public actor BotRunnerScheduler {
         public let unattended: Bool
     }
 
-    /// Read-only projection must not mutate deadlines, claims or missed occurrences.
+    /// Read-only projection: each live helper's next time on the clock and its last missed occurrence.
     public func effectiveSchedule() async throws -> BotSchedule {
         let unattended = await isAutonomyEnabled()
         let bots = try definitions.list()
-        let jobs = try disk.locked {
-            var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-            try reconcile(bots, jobs: &jobs)
-            return jobs
-        }
-        return projection(bots, jobs: jobs, unattended: unattended)
-    }
-
-    private func projection(_ bots: [BotDefinition], jobs: [String: Job], unattended: Bool) -> BotSchedule {
+        let times = try await OneClock.at(dataRoot).times(owner: Self.clockOwner)
         let dates = bots.compactMap { bot -> (UUID, Date)? in
-            guard unattended, !bot.paused, inFlight[bot.id] == nil,
-                  let job = jobs[bot.id.uuidString], job.reason == nil, job.next != .distantFuture else { return nil }
-            return (bot.id, job.next)
+            guard unattended, !bot.paused, inFlight[bot.id] == nil, let time = times.first(where: { $0.id == Self.timeID(bot.id) }) else { return nil }
+            return (bot.id, time.next)
         }
-        let missed = jobs.compactMap { key, job -> (UUID, BotMissedRun)? in
-            guard let id = UUID(uuidString: key), let missed = job.missed else { return nil }
-            return (id, missed)
-        }
+        let missed = try disk.locked { try disk.read([String: BotMissedRun].self, at: missedPath) ?? [:] }
         return BotSchedule(dates: Dictionary(dates, uniquingKeysWith: { first, _ in first }),
-                          missed: Dictionary(missed, uniquingKeysWith: { first, _ in first }), unattended: unattended)
+                           missed: Dictionary(missed.compactMap { key, value in UUID(uuidString: key).map { ($0, value) } },
+                                              uniquingKeysWith: { first, _ in first }),
+                           unattended: unattended)
     }
 
-    /// One cadence bounds lateness, with the minimum-spacing floor preventing overly short windows.
-    private static func lateness(_ bot: BotDefinition) throws -> TimeInterval {
-        let minimum = try BotRunLimits.checkedMinimumInterval()
-        guard case .interval(let seconds) = bot.cadence else { return minimum }
-        return max(seconds, minimum)
-    }
+    static func timeID(_ id: UUID) -> String { clockOwner + ":" + id.uuidString }
 
-    private func next(_ bot: BotDefinition, after date: Date, lastRunAt: Date? = nil, beyond due: Date? = nil) throws -> Date {
-        try StandingBotsDisk.nextOccurrence(bot, after: date, lastRunAt: lastRunAt, beyond: due)
-    }
-
-    /// Manual work preserves the civil schedule unless minimum spacing requires moving the next occurrence.
-    private func completed(_ id: UUID, at date: Date, reschedule: Bool = true, beyond due: Date? = nil) throws {
-        let bot = try definitions.get(id)
-        try disk.locked {
-            var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-            // Completion disproves a current block but cannot erase an earlier missed occurrence.
-            let missed = jobs[id.uuidString]?.missed
-            let cleared = missed?.reason == .blocked ? nil : missed
-            if !reschedule {
-                guard var job = jobs[id.uuidString] else { return }
-                job.missed = cleared
-                job.lastRunAt = date
-                if job.next < date.addingTimeInterval(try BotRunLimits.checkedMinimumInterval()) {
-                    job.plan(try next(bot, after: date, lastRunAt: date))
-                    job.scheduledFrom = date
-                }
-                jobs[id.uuidString] = job
-                return try disk.write(jobs, at: path)
-            }
-            jobs[id.uuidString] = Job(revision: bot.updatedAt, next: try next(bot, after: date, lastRunAt: date, beyond: due),
-                                      minimumInterval: try BotRunLimits.checkedMinimumInterval(),
-                                      scheduledFrom: date, lastRunAt: date,
-                                      missed: cleared)
-            try disk.write(jobs, at: path)
+    /// Cron follows the clock's calendar rhythm path; intervals keep the helper's spacing floor and remain absolute instants.
+    private static func rhythm(_ cadence: BotCadence) -> JSONValue? {
+        switch cadence {
+        case .cron(let expression): return .object(["type": .string("cron"), "expression": .string(expression)])
+        case .manual, .interval: return nil
         }
     }
 
-    private func reconcile(_ bots: [BotDefinition], jobs: inout [String: Job]) throws {
-        let minimumInterval = try BotRunLimits.checkedMinimumInterval()
-        let ids = Set(bots.map { $0.id.uuidString })
-        jobs = jobs.filter { ids.contains($0.key) }
-        for bot in bots where !bot.paused {
-            let key = bot.id.uuidString
-            var replan = jobs[key]?.revision != bot.updatedAt || jobs[key]?.minimumInterval != minimumInterval
-            // Preserve pending cron wall time in the new zone; in-flight work replans on completion.
-            // A missing resolving zone requires fresh planning.
-            if !replan, case .cron = bot.cadence, inFlight[bot.id] == nil, var job = jobs[key],
-               job.reason == nil, job.zone != TimeZone.autoupdatingCurrent.identifier {
-                // Replan times inside the spacing floor and civil minutes skipped by DST.
-                if let old = job.zone.flatMap(TimeZone.init(identifier:)),
-                   let carried = SchedulerJobRuntime.wallClock(job.next, from: old, to: .autoupdatingCurrent),
-                   SchedulerJobRuntime.wallClock(carried, from: .autoupdatingCurrent, to: old)
-                       == SchedulerJobRuntime.wallClock(job.next, from: old, to: old),
-                   carried >= (job.lastRunAt ?? .distantPast).addingTimeInterval(minimumInterval) {
-                    job.plan(carried); jobs[key] = job
-                } else { replan = true }
-            }
-            if replan {
-                let anchor = jobs[key]?.revision == bot.updatedAt
-                    ? (jobs[key]?.scheduledFrom ?? max(bot.updatedAt, Date())) : bot.updatedAt
-                // Rescheduling cannot erase evidence of an occurrence that never ran.
-                let missed = jobs[key]?.missed
-                let lastRunAt = jobs[key]?.lastRunAt
-                do { jobs[key] = Job(revision: bot.updatedAt, next: try next(bot, after: anchor, lastRunAt: lastRunAt),
-                                     minimumInterval: minimumInterval,
-                                     scheduledFrom: anchor, lastRunAt: lastRunAt,
-                                     missed: missed) }
-                catch { jobs[key] = Job(revision: bot.updatedAt, next: .distantFuture,
-                                        reason: String(describing: error), failureID: UUID(), minimumInterval: minimumInterval,
-                                        lastRunAt: lastRunAt, missed: missed) }
-            }
+    /// Once, at launch: the clock delivers each helper's time here, the clock's helper times follow the definitions from now on, and requested runs
+    /// left queued run. On the first launch on the clock, each helper keeps the next occurrence bots/runner-jobs.json held.
+    public func attach(carryingOver: Bool?) async -> Bool {
+        guard !attached else { return false }
+        attached = true
+        var carried = true
+        switch carryingOver {
+        case true?: carried = await carryOver()
+        case false?: break
+        case nil: carryOverHeld = nil; carried = false
         }
-        guard jobs.values.allSatisfy({ $0.next.timeIntervalSince1970.isFinite && $0.revision.timeIntervalSince1970.isFinite
-            && ($0.lastRunAt?.timeIntervalSince1970.isFinite ?? true) }) else {
-            throw StandingBotsError.corruptStore("bot scheduler dates")
+        await OneClock.at(dataRoot).handle(Self.clockOwner) { [weak self] time, occurrence in await self?.deliver(time, occurrence: occurrence) }
+        await changed()
+        Task.detached { [weak self] in
+            for await _ in NotificationCenter.default.notifications(named: BotRunQueue.didChange) { await self?.changed() }
         }
+        return carried
     }
 
-    private func reconciled(_ bots: [BotDefinition]) throws -> [String: Job] {
-        let jobs = try disk.locked {
-            var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-            let previous = jobs
-            try reconcile(bots, jobs: &jobs)
-            // Rewriting an unchanged watched file would wake deadline projection indefinitely.
-            if jobs != previous {
-                try disk.write(jobs, at: path)
-            }
-            return jobs
-        }
-        for bot in bots {
-            guard let job = jobs[bot.id.uuidString], let reason = job.reason, let id = job.failureID else { continue }
-            failure = "Bot scheduling unavailable: \(reason)"
-            var entry = ShelfEntry(id: id, botId: bot.id, briefVersion: bot.briefVersion,
-                runAt: job.revision, coverageStart: job.revision, coverageEnd: job.revision,
-                headline: "Could not check", findings: "", changedSinceLastGood: "Unknown: invalid schedule.",
-                uncertainties: [reason], runHealth: .failed, spend: ShelfSpend(tokens: 0, seconds: 0))
-            entry.sessionID = bot.sessionID
-            do {
-                try shelf.append(entry)
-            } catch StandingBotsError.alreadyExists { /* Already reported this definition revision. */ }
-        }
-        return jobs
+    /// A definition or the queue changed: the clock follows the definitions, and queued requests run.
+    private func changed() async {
+        await declareTimes()
+        await runRequests()
     }
 
-    /// Record and skip expired occurrences; retrying them would bypass unattended authority.
-    private func noteMissed(_ bots: [BotDefinition], autonomyEnabled: Bool) {
-        let now = Date()
-        let live = bots.filter { !$0.paused }
-        guard !live.isEmpty else { return }
-        do {
-            try disk.locked {
-                var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-                var changed = false
-                for bot in live {
-                    let key = bot.id.uuidString
-                    guard var job = jobs[key], job.reason == nil, job.next != .distantFuture,
-                          now.timeIntervalSince(job.next) > (try Self.lateness(bot)) else { continue }
-                    job.missed = BotMissedRun(dueAt: job.next, reason: Self.reason(
-                        due: job.next, autonomyEnabled: autonomyEnabled, startedAt: startedAt))
-                    job.plan(try next(bot, after: now, lastRunAt: job.lastRunAt, beyond: job.next))
-                    job.scheduledFrom = now
-                    jobs[key] = job
-                    changed = true
-                }
-                if changed { try disk.write(jobs, at: path) }
-            }
-        } catch { failure = "Bot scheduling unavailable: \(error)" }
-    }
+    // MARK: - The clock's helper times
 
-    /// Quiet time between source changes is not evidence that the app slept.
-    private static func reason(due: Date, autonomyEnabled: Bool, startedAt: Date) -> BotMissedRun.Reason {
-        guard autonomyEnabled else { return .autonomyOff }
-        if due < startedAt { return .appClosed }
-        return .notRun
-    }
-
-    /// Retain the gate's observed reason; rereading a toggled switch could invent a different refusal.
-    private var lastUnattendedHold: [UUID: (reason: BotMissedRun.Reason, detail: String?)] = [:]
-
-    /// Recheck after the claim wait using its locked definition; record any hold before spending.
-    private func holdUnattendedRun(bot id: UUID, paused: Bool) async throws -> Bool {
-        let enabled = await isAutonomyEnabled()
-        let stopped = isShutDown || Task.isCancelled
-        guard stopped || !enabled || paused else { return false }
-        let detail = stopped ? "Background work stopped" : (enabled ? "the bot is paused" : "Autonomy is off")
-        // A pause uses the not-run reason with the gate's own words.
-        lastUnattendedHold[id] = enabled ? (.notRun, detail) : (.autonomyOff, nil)
-        try events.hold(bot: id, detail: detail)
-        return true
-    }
-
-    private func recordMissed(_ id: UUID, due: Date, reason: BotMissedRun.Reason,
-                              detail: String? = nil) throws {
-        try disk.locked {
-            var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-            guard var job = jobs[id.uuidString] else { return }
-            job.missed = BotMissedRun(dueAt: due, reason: reason, detail: detail)
-            jobs[id.uuidString] = job
-            try disk.write(jobs, at: path)
-        }
-    }
-
-    public func nextDeadline(after now: Date) async -> Date? {
-        guard !isShutDown else { return nil }
+    /// Each helper that runs on a cadence (not paused, not deleted, not manual) holds one time; a time whose definition changed is declared again from
+    /// the new definition, and a time with no such helper is withdrawn.
+    private func declareTimes() async {
+        guard let held = carryOverHeld else { return }
+        let clock = OneClock.at(dataRoot)
         do {
             let bots = try definitions.list()
-            let jobs = try reconciled(bots)
-            if try queue.pending().keys.contains(where: { inFlight[$0] == nil && jobs[$0.uuidString]?.reason == nil }) { return now }
-            // Refused jobs cannot remain deadlines: they would wake and refuse forever.
-            return projection(bots, jobs: jobs, unattended: await isAutonomyEnabled()).dates.values.min()
-        } catch { failure = "Bot scheduling unavailable: \(error)"; return nil }
+            let declared = try await clock.times(owner: Self.clockOwner)
+            var wanted: Set<String> = []
+            for bot in bots where !bot.paused && bot.deleted != true && bot.cadence != .manual {
+                let id = Self.timeID(bot.id)
+                wanted.insert(id)
+                if held.contains(bot.id) { continue }
+                let revision = JSONValue.double(bot.updatedAt.timeIntervalSince1970)
+                let rhythm = Self.rhythm(bot.cadence)
+                do {
+                    var time: OneClock.Time
+                    if let previous = declared.first(where: { $0.id == id }), previous.payload?.objectValue?["revision"] == revision {
+                        if previous.rhythm == rhythm { continue }
+                        // Add calendar provenance to an unchanged declaration without moving or skipping its pending occurrence.
+                        time = previous
+                        time.rhythm = rhythm
+                    } else {
+                        time = .init(id: id, rhythm: rhythm, next: try StandingBotsDisk.nextOccurrence(bot, after: Date()),
+                                     payload: .object(["revision": revision]))
+                    }
+                    try await clock.declare(time)
+                } catch {
+                    try recordMissed(bot.id, due: Date(), reason: .blocked, detail: "Its clock declaration failed: \(error)")
+                }
+            }
+            for time in declared where !wanted.contains(time.id) { try await clock.withdraw(time.id) }
+            await RepairOwed.settle(dataRoot, operation: "helper:declarations",
+                                   evidence: .init(source: "clock", id: Self.clockOwner)).value
+        } catch {
+            await failed(operation: "helper:declarations", error: error)
+        }
     }
 
-    public func shutdown() async {
-        isShutDown = true
-        let tasks = Array(inFlight.values)
-        for task in tasks { task.cancel() }
-        // Retain claims through all settlement; concurrent shutdown callers join the same work.
-        for task in tasks { await task.value }
+    /// One occurrence: the next one is declared first, so the cadence holds whatever this run does; then the helper runs if unattended work is on.
+    private func deliver(_ time: OneClock.Time, occurrence due: Date) async {
+        guard let id = UUID(uuidString: String(time.id.dropFirst(Self.clockOwner.count + 1))) else {
+            await failed(operation: "helper:occurrence:" + time.id,
+                         error: StandingBotsError.corruptStore("Invalid helper clock identity \(time.id)"))
+            return
+        }
+        do {
+            guard let bot = try definitions.list().first(where: { $0.id == id }), !bot.paused, bot.deleted != true, bot.cadence != .manual else {
+                await declareTimes()
+                return
+            }
+            let now = Date()
+            try await OneClock.at(dataRoot).declare(.init(id: time.id, rhythm: Self.rhythm(bot.cadence),
+                                                          next: try StandingBotsDisk.nextOccurrence(bot, after: now, lastRunAt: now, beyond: due),
+                                                          payload: time.payload))
+            guard await isAutonomyEnabled() else { return try recordMissed(id, due: due, reason: .autonomyOff) }
+            guard inFlight[id] == nil else {
+                return try recordMissed(id, due: due, reason: .notRun, detail: "its previous run was still working")
+            }
+            lastUnattendedHold.removeValue(forKey: id)
+            inFlight[id] = Task {
+                defer { self.finished(id) }
+                do {
+                    let holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { claimed in
+                        try await self.holdUnattendedRun(bot: id, paused: claimed.paused)
+                    }
+                    if try await runner.run(bot: id, parent: nil, scope: BotRunScope(), holdUnattended: holdUnattended) != nil {
+                        try self.completed(id)
+                    } else if let held = lastUnattendedHold[id] {
+                        try recordMissed(id, due: due, reason: held.reason, detail: held.detail)
+                    } else {
+                        try recordMissed(id, due: due, reason: .notRun)
+                    }
+                } catch { await rejected(id, due: due, error: error) }
+            }
+        } catch {
+            await rejected(id, due: due, error: error)
+        }
     }
 
-    public func runDue() async -> [String] {
-        guard !isShutDown, await BotRunGate.isReady(), !isShutDown, !Task.isCancelled else { return [] }
-        failure = deadlineFailures.values.sorted().first
-        let completed = settled
-        settled.removeAll()
+    // MARK: - Requested runs
+
+    /// Runs each queued request (by hand or an event) that is not already running. An event rechecks unattended authority after its wait.
+    private func runRequests() async {
+        guard await BotRunGate.isReady() else { return }
         do {
             let bots = try definitions.list()
-            let reconciledJobs = try reconciled(bots)
-            let requests = try queue.pending()
-            for (id, request) in requests {
-                guard inFlight[id] == nil else { continue }
+            for (id, request) in try queue.pending() where inFlight[id] == nil {
                 let requestID = request.runID
                 guard bots.contains(where: { $0.id == id }) else {
-                    try queue.rejectPending(
-                        bot: id, requestID: requestID,
-                        detail: "This helper is deleted or unavailable in the checked definition list. No helper turn ran."
-                    )
+                    try queue.rejectPending(bot: id, requestID: requestID,
+                        detail: "This helper is deleted or unavailable in the checked definition list. No helper turn ran.")
                     continue
                 }
-                try Task.checkCancellation()
-                guard reconciledJobs[id.uuidString]?.reason == nil else {
-                    try queue.rejectPending(bot: id, requestID: requestID, detail: """
-                        This helper's schedule is invalid: \(reconciledJobs[id.uuidString]?.reason ?? "schedule unavailable"). No helper turn \
-                        ran.
-                        """)
-                    continue
-                }
-                // Recheck unattended authority after queue delay or restart; manual requests remain explicitly authorized.
                 if request.isEvent {
                     let enabled = await isAutonomyEnabled()
-                    guard !isShutDown, !Task.isCancelled else { return completed }
                     let paused = try definitions.get(id).paused
                     if !enabled || paused {
-                        try queue.rejectPending(
-                            bot: id, requestID: requestID,
-                            detail: enabled ? "The bot is paused. No helper turn ran." : "Autonomy is off. No helper turn ran."
-                        )
+                        try queue.rejectPending(bot: id, requestID: requestID,
+                            detail: enabled ? "The bot is paused. No helper turn ran." : "Autonomy is off. No helper turn ran.")
                         try events.hold(bot: id, detail: enabled ? "the bot is paused" : "Autonomy is off")
                         continue
                     }
                 }
-                // Claim waits can outlast authority changes; queued requests bypass the claim's pause guard.
+                guard inFlight[id] == nil else { continue }
                 let isEvent = request.isEvent
                 let holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { claimed in
                     guard isEvent else { return false }
                     return try await self.holdUnattendedRun(bot: id, paused: claimed.paused)
                 }
-                try Task.checkCancellation()
                 inFlight[id] = Task {
                     defer { self.finished(id) }
                     do {
-                        if let entry = try await runner.run(bot: id, requestID: requestID, parent: nil, scope: BotRunScope(),
-                                                            holdUnattended: holdUnattended,
-                                                            deadlineExceeded: { await self.reportDeadline(id, detail: $0) }) {
-                            try self.completed(id, at: Date(), reschedule: isEvent)
-                            settled.append("bot:\(entry.botId.uuidString)")
+                        if try await runner.run(bot: id, requestID: requestID, parent: nil, scope: BotRunScope(), holdUnattended: holdUnattended) != nil {
+                            try self.completed(id)
                         }
-                    } catch { rejected(id, due: Date(), error: error) }
+                    } catch { await rejected(id, due: Date(), error: error) }
                 }
             }
-            let autonomyEnabled = await isAutonomyEnabled()
-            guard !isShutDown, !Task.isCancelled else { return completed }
-            let scheduledBots = try definitions.list()
-            let scheduledJobs = try reconciled(scheduledBots)
-            noteMissed(scheduledBots, autonomyEnabled: autonomyEnabled)
-            guard autonomyEnabled else { return completed }
-            let now = Date()
-            for bot in scheduledBots where !bot.paused && scheduledJobs[bot.id.uuidString].map({ $0.next <= now }) == true {
-                guard inFlight[bot.id] == nil else { continue }
-                try Task.checkCancellation()
-                guard scheduledJobs[bot.id.uuidString]?.reason == nil else { continue }
-                guard await isAutonomyEnabled(), !isShutDown, !Task.isCancelled else { break }
-                let live = try definitions.list()
-                guard let fresh = live.first(where: { $0.id == bot.id }), !fresh.paused else { continue }
-                do {
-                let reserved: Date? = try disk.locked {
-                    var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-                    try reconcile(live, jobs: &jobs)
-                    let key = fresh.id.uuidString
-                    let now = Date()
-                    guard let job = jobs[key], job.next <= now else { return nil }
-                    let due = job.next
-                    // Reserve across processes before provider work; crash recovery skips the occurrence to prevent replay.
-                    jobs[key] = Job(revision: fresh.updatedAt,
-                                    next: try next(fresh, after: now.addingTimeInterval(BotRunLimits.maximumSeconds), lastRunAt: now, beyond: due),
-                                    minimumInterval: try BotRunLimits.checkedMinimumInterval(),
-                                    scheduledFrom: now.addingTimeInterval(BotRunLimits.maximumSeconds),
-                                    lastRunAt: jobs[key]?.lastRunAt,
-                                    missed: jobs[key]?.missed)
-                    try disk.write(jobs, at: path)
-                    return due
-                }
-                // Manual work satisfies coincident due work to avoid duplicate execution.
-                if let due = reserved, requests[bot.id] == nil {
-                    try Task.checkCancellation()
-                    inFlight[bot.id] = Task {
-                    defer { self.finished(bot.id) }
-                    do {
-                        // Recheck after claim waits so disabling unattended work prevents reservation and spend.
-                        let botID = bot.id
-                        lastUnattendedHold.removeValue(forKey: botID)
-                        let holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { claimed in
-                            try await self.holdUnattendedRun(bot: botID, paused: claimed.paused)
-                        }
-                        if let entry = try await runner.run(bot: bot.id, parent: nil, scope: BotRunScope(), holdUnattended: holdUnattended,
-                                                          deadlineExceeded: { await self.reportDeadline(bot.id, detail: $0) }) {
-                            try self.completed(bot.id, at: Date(), beyond: due)
-                            settled.append("bot:\(entry.botId.uuidString)")
-                        } else if let held = lastUnattendedHold[botID] {
-                            try recordMissed(bot.id, due: due, reason: held.reason,
-                                             detail: held.detail)
-                        } else {
-                            try recordMissed(bot.id, due: due, reason: .notRun)
-                        }
-                    } catch { rejected(bot.id, due: due, error: error) }
-                    }
-                }
-                } catch is CancellationError { throw CancellationError() }
-                catch { failure = "Bot run unavailable: \(error)" }
-            }
-        } catch { failure = "Bot run unavailable: \(error)" }
-        return completed
+            await RepairOwed.settle(dataRoot, operation: "helper:requests",
+                                   evidence: .init(source: "helper-queue", id: disk.root.appendingPathComponent("run-queue.json").path)).value
+        } catch {
+            await failed(operation: "helper:requests", error: error)
+        }
     }
 
-    private func reportDeadline(_ id: UUID, detail: String) {
-        deadlineFailures[id] = detail
-        failure = detail
+    // MARK: - Outcomes
+
+    /// Recheck after the claim wait using its locked definition; record any hold before spending.
+    private func holdUnattendedRun(bot id: UUID, paused: Bool) async throws -> Bool {
+        let enabled = await isAutonomyEnabled()
+        guard Task.isCancelled || !enabled || paused else { return false }
+        let detail = Task.isCancelled ? "Background work stopped" : (enabled ? "the bot is paused" : "Autonomy is off")
+        lastUnattendedHold[id] = enabled ? (.notRun, detail) : (.autonomyOff, nil)
+        try events.hold(bot: id, detail: detail)
+        return true
     }
 
-    private func rejected(_ id: UUID, due: Date, error: Error) {
+    /// Completion disproves a current block but cannot erase an earlier missed occurrence.
+    private func completed(_ id: UUID) throws {
+        try disk.locked {
+            var missed = try disk.read([String: BotMissedRun].self, at: missedPath) ?? [:]
+            guard missed[id.uuidString]?.reason == .blocked else { return }
+            missed.removeValue(forKey: id.uuidString)
+            try disk.write(missed, at: missedPath)
+        }
+    }
+
+    private func recordMissed(_ id: UUID, due: Date, reason: BotMissedRun.Reason, detail: String? = nil) throws {
+        try disk.locked {
+            var missed = try disk.read([String: BotMissedRun].self, at: missedPath) ?? [:]
+            let record = BotMissedRun(dueAt: due, reason: reason, detail: detail)
+            guard missed[id.uuidString] != record else { return }
+            missed[id.uuidString] = record
+            try disk.write(missed, at: missedPath)
+        }
+    }
+
+    private func rejected(_ id: UUID, due: Date, error: Error) async {
         do {
             switch error {
-            case let admission as BotRunAdmissionError:
-                try recordMissed(id, due: due, reason: .queueBusy)
-                failure = "Bot request rejected: \(admission.rawValue)"
-            case BotRunnerError.cannotRun(let problem):
-                try recordMissed(id, due: due, reason: .blocked, detail: problem)
-                failure = "Bot request rejected: \(problem)"
-            case BotRunnerError.dailySpendLimit:
-                try recordMissed(id, due: due, reason: .overBudget)
-                failure = "Bot request rejected: \(BotRunnerError.dailySpendLimit.description)"
-            default: failure = "Bot run unavailable: \(error)"
+            case is BotRunAdmissionError: try recordMissed(id, due: due, reason: .queueBusy)
+            case BotRunnerError.cannotRun(let problem): try recordMissed(id, due: due, reason: .blocked, detail: problem)
+            case BotRunnerError.dailySpendLimit: try recordMissed(id, due: due, reason: .overBudget)
+            default: try recordMissed(id, due: due, reason: .blocked, detail: String(describing: error))
             }
-        } catch { failure = "Bot scheduling unavailable: \(error)" }
+            await RepairOwed.settle(dataRoot, operation: "helper:outcome:" + id.uuidString,
+                                   evidence: .init(source: "helper-missed", id: id.uuidString)).value
+        } catch let recordingError {
+            await failed(operation: "helper:outcome:" + id.uuidString,
+                         error: StandingBotsError.corruptStore("Could not record \(error): \(recordingError)"))
+        }
+    }
+
+    private func failed(operation: String, error: any Error) async {
+        await RepairOwed.owe(dataRoot, id: operation, kind: .run, operation: operation, owner: disk.root.path,
+                             words: "The helper scheduler could not complete \(operation): \(error.localizedDescription)",
+                             lever: "Repair the helper definitions, queue or missed-runs.json in \(disk.root.path), then reopen NativeAgent.").value
     }
 
     private func finished(_ id: UUID) {
         inFlight.removeValue(forKey: id)
-        deadlineFailures.removeValue(forKey: id)
         lastUnattendedHold.removeValue(forKey: id)
         NotificationCenter.default.post(name: BotRunQueue.didChange, object: disk.root.deletingLastPathComponent())
+    }
+
+    // MARK: - Carrying runner-jobs.json over
+
+    /// The first launch on the clock, once: each helper's next occurrence (and its last missed one) in bots/runner-jobs.json becomes its clock time, so
+    /// nothing fires twice or is skipped. A helper already on the clock keeps its time; the file is never read again.
+    private func carryOver() async -> Bool {
+        struct Saved: Decodable { let revision: Date; let next: Date; let missed: BotMissedRun? }
+        do {
+            let saved = try disk.locked { try disk.read([String: Saved].self, at: disk.root.appendingPathComponent("runner-jobs.json")) } ?? [:]
+            let clock = OneClock.at(dataRoot)
+            let declared = Set(try await clock.times(owner: Self.clockOwner).map(\.id))
+            let bots = try definitions.list()
+            var complete = true
+            for (key, job) in saved {
+                guard let id = UUID(uuidString: key) else {
+                    complete = false
+                    nativeLog("helper %@ carry-over has an unreadable id; its source stays intact for repair and relaunch", key)
+                    continue
+                }
+                guard let bot = bots.first(where: { $0.id == id }), !declared.contains(Self.timeID(id)) else { continue }
+                do {
+                    if let missed = job.missed { try recordMissed(id, due: missed.dueAt, reason: missed.reason, detail: missed.detail) }
+                    // A next occurrence planned for an older definition is planned again from the current one.
+                    guard job.revision == bot.updatedAt, job.next != .distantFuture else { continue }
+                    try await clock.carryOver(.init(id: Self.timeID(id), rhythm: Self.rhythm(bot.cadence), next: job.next,
+                                                  payload: .object(["revision": .double(bot.updatedAt.timeIntervalSince1970)])))
+                } catch {
+                    complete = false
+                    carryOverHeld?.insert(id)
+                    nativeLog("helper %@ carry-over is incomplete; its cadence awaits repair and relaunch: %@", key, String(describing: error))
+                }
+            }
+            return complete
+        } catch {
+            carryOverHeld = nil
+            nativeLog("helper carry-over is incomplete; saved times stay intact and undeclared cadences wait for repair and relaunch: %@",
+                      String(describing: error))
+            return false
+        }
     }
 }

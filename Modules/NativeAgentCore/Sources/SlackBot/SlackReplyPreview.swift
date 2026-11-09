@@ -10,8 +10,6 @@ actor SlackReplyPreview {
     private var pending: String?
     private var closed = false
     private var worker: Task<Void, Never>?
-    private var spacing: Task<Void, Error>?
-    private var lastSend = Date.distantPast
 
     init(publish: @escaping @Sendable (String) async throws -> Void,
          failure: @escaping @Sendable (Error) async -> Void) {
@@ -29,17 +27,8 @@ actor SlackReplyPreview {
 
     private func flush() async {
         while !closed, pending != nil {
-            // chat.update permits 50+ calls/minute. First words have no delay.
-            let wait = 1.2 - Date().timeIntervalSince(lastSend)
-            if wait > 0 {
-                let delay = Task { try await Task.sleep(for: .seconds(wait)) }
-                spacing = delay
-                _ = try? await delay.value
-                spacing = nil
-            }
             guard !closed, let snapshot = pending else { break }
             pending = nil
-            lastSend = Date()
             do { try await publish(snapshot) }
             catch {
                 closed = true
@@ -52,7 +41,6 @@ actor SlackReplyPreview {
     func finish() async {
         closed = true
         pending = nil
-        spacing?.cancel()
         // Do not cancel an admitted post: preserve its actual identity/outcome.
         await worker?.value
     }

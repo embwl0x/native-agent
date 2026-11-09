@@ -10,12 +10,8 @@ extension SwiftNativeApprovalInbox {
     public static let skillScriptPreviewLimit = 300_000
 
     /// These decisions admit code as the owner's. Every deciding surface must show the saved review; a shortened notification cannot offer approval.
-    public nonisolated static func requiresExecutableReview(action: String, payload: JSONValue) -> Bool {
-        if action == skillScriptInstallAction { return true }
-        guard action == "self_improvement.apply", case .object(let fields) = payload,
-              case .object(let apply)? = fields["apply"], apply["op"] == .string("enable_skill"),
-              case .string? = apply["reviewedDigest"] else { return false }
-        return true
+    public nonisolated static func requiresExecutableReview(action: String) -> Bool {
+        action == skillScriptInstallAction
     }
 
     @discardableResult
@@ -52,6 +48,6 @@ extension SwiftNativeApprovalInbox {
 
 extension ApprovalRecord {
     public var requiresExecutableReview: Bool {
-        SwiftNativeApprovalInbox.requiresExecutableReview(action: action, payload: payload)
+        SwiftNativeApprovalInbox.requiresExecutableReview(action: action)
     }
 }

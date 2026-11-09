@@ -112,6 +112,11 @@ public struct CodexCompletionReadout: Decodable, Sendable {
     delivery?.delivery == "route_journal" && ["completed", "sent_unconfirmed"].contains(delivery?.status ?? "")
   }
 
+  /// Desk's owed-reply count and explicit release share the delivery owner's vocabulary.
+  public static func replyIsOwed(_ status: String?) -> Bool {
+    status == "owed" || status == "sent_unconfirmed"
+  }
+
   public var permitsDelivery: Bool { phase != "stopped" && delivery?.status != "let_go" }
 
   package func reading(life: String) -> Self {

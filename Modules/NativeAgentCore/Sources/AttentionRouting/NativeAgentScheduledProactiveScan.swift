@@ -89,12 +89,6 @@ public enum NativeAgentScheduledProactiveScan {
         }
 
         let inboxRows = try await ForPerson.at(dataRoot).inbox()
-        let schedulerRows = try await SwiftNativeTriggerScheduler(root: dataRoot).listJobs()
-        let schedulerIssues = try schedulerRows.compactMap { row -> ScheduledJob? in
-            let job = try ScheduledJob(row: row)
-            let status = try JSONRow(row).optionalString("lastRunStatus")
-            return job.enabled && status == "error" ? job : nil
-        }
         let pendingApprovals = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .pending).count
 
         let deskStaleDays = arguments.staleDays
@@ -103,7 +97,6 @@ public enum NativeAgentScheduledProactiveScan {
         let surfacedIDs = alreadySurfacedOpportunityIDs(inboxRows)
         var live = try liveOpportunities(
             inboxRows: inboxRows,
-            schedulerIssues: schedulerIssues,
             pendingApprovals: pendingApprovals,
             dataRoot: dataRoot
         )
@@ -134,7 +127,6 @@ public enum NativeAgentScheduledProactiveScan {
 
     private static func liveOpportunities(
         inboxRows: [InboxItemRecord],
-        schedulerIssues: [ScheduledJob],
         pendingApprovals: Int,
         dataRoot: URL
     ) throws -> [Opportunity] {
@@ -158,24 +150,6 @@ public enum NativeAgentScheduledProactiveScan {
                 score: actionableInbox.count >= 3 ? 0.74 : 0.62,
                 relatedPaths: [],
                 relatedMatters: memberIDs
-            ))
-        }
-
-        if !schedulerIssues.isEmpty {
-            let names = schedulerIssues.prefix(3).map(\.name)
-            let id = stableID(kind: "scheduler_health", seed: names.joined(separator: "|") + "|\(schedulerIssues.count)")
-            opportunities.append(Opportunity(
-                id: id,
-                kind: "scheduler_health",
-                title: "Review scheduler errors",
-                summary: "\(schedulerIssues.count) scheduled job(s) have actionable error status.",
-                detail: names.isEmpty
-                    ? "Current scan found scheduler rows with actionable errors."
-                    : "Current scan found scheduler rows with actionable errors: \(names.joined(separator: ", ")).",
-                source: source(kind: "scheduler_health", id: id),
-                severity: "important",
-                score: 0.68,
-                relatedPaths: [dataRoot.appendingPathComponent("scheduler/jobs.json").path]
             ))
         }
 

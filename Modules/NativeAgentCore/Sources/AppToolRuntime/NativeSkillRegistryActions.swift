@@ -5,9 +5,9 @@ import ToolExecution
 import NativeAgentCore
 import ChatTurnContracts
 import ChatToolParsing
-// Blueprint: | `NativeSkillRegistryActions.swift` | owner-facing enable/disable through `Parts`; `enableSkill`, `disableSkill` |
+// Blueprint: | `NativeSkillRegistryActions.swift` | owner-facing enable through `Parts`; `enableSkill` |
 
-/// Every owner-facing install, approval and improvement apply shares the Parts lifecycle.
+/// Every owner-facing install and approval shares the Parts lifecycle.
 public enum NativeSkillRegistryActions {
 
     /// Keep only the exact reviewedDigest; a version changed since review requires a new decision.
@@ -20,16 +20,6 @@ public enum NativeSkillRegistryActions {
             throw ToolFailureError(outcome.text,
                 effects: reply.effects == .some(.none) ? .none : .unknown,
                 code: "part_enable_incomplete")
-        }
-    }
-
-    public static func disableSkill(name: String, dataRoot: URL, turn: Turn) async throws {
-        let outcome = Parts(root: dataRoot).disable(name, reason: nil, fullMac: false, ownerAuthorized: true, turn: turn)
-        guard outcome.ok else {
-            let reply = ToolResult(.object(outcome.fields))
-            throw ToolFailureError(outcome.text,
-                effects: reply.effects == .some(.none) ? .none : .unknown,
-                code: "part_disable_incomplete")
         }
     }
 }

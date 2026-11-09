@@ -6,15 +6,16 @@ import PersistenceCore
 #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
 import ApplicationServices
 import AppKit
-// Blueprint: | `MacAppSourceEvents.swift` | Event-backed AX coverage retains gaps; complete traversal prunes; bounded content-stall signals |
+// Blueprint: | `MacAppSourceEvents.swift` | Descendant AX notifications and coalesced reads retain coverage gaps; bounded content-stall signals |
 #endif
 
 /// Subscribe to descendants because most AX changes do not propagate to application observers. Partial coverage retains working subscriptions and names gaps;
-/// notifications request reads, never prove exhaustive coverage. Coalesce bursts on the main run loop without clock-driven renewal.
+/// notifications request reads, never prove exhaustive coverage. Coalesce bursts on the AX run loop without clock-driven renewal.
 public final class MacAppSourceEvents: @unchecked Sendable {
     public let stream: AsyncThrowingStream<Void, Error>
     private let context: MacOperationContext
     private let continuation: AsyncThrowingStream<Void, Error>.Continuation
+    private let onNotification: (@Sendable (String) -> Void)?
 
     #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
     private let pid: Int32
@@ -76,8 +77,10 @@ public final class MacAppSourceEvents: @unchecked Sendable {
         #endif
     }
 
-    public init(pid: Int32, context: MacOperationContext) throws {
+    /// Receives descendant kinds before coalescing; the callback must not perform AX work.
+    public init(pid: Int32, context: MacOperationContext, onNotification: (@Sendable (String) -> Void)? = nil) throws {
         self.context = context
+        self.onNotification = onNotification
         let pair = AsyncThrowingStream<Void, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
         stream = pair.stream
         continuation = pair.continuation
@@ -97,13 +100,27 @@ public final class MacAppSourceEvents: @unchecked Sendable {
 
     public func cancel() {
         #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
-        MacAXExecutionLane.sync { self.stop(error: nil) }
+        MacAXExecutionLane.async { self.stop(error: nil) }
         #else
         continuation.finish()
         #endif
     }
 
-    deinit { cancel() }
+    deinit {
+        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
+        // Explicit cancellation retains this owner through lane cleanup; a retired source needs no further lane transaction at final release.
+        if !stopped { MacAXExecutionLane.sync { self.stop(error: nil) } }
+        #endif
+    }
+
+    @concurrent public static func open(bundleID: String, context: MacOperationContext) async throws -> MacAppSourceEvents {
+        try Task.checkCancellation()
+        let source = try MacAppSourceEvents(bundleID: bundleID, context: context)
+        do { try Task.checkCancellation(); return source }
+        catch { source.cancel(); throw error }
+    }
+
+    @concurrent public func readCoverage() async -> JSONValue { coverage }
 
     /// Read the subscription owner, never a caller's mirror of its health.
     public var coverage: JSONValue {
@@ -126,16 +143,18 @@ public final class MacAppSourceEvents: @unchecked Sendable {
             guard !stopped, stallTimer == nil else { return }
             stallSeconds = seconds
             readDeadline = context.readDeadline
-            let timer = DispatchSource.makeTimerSource(queue: .main)
+            let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
             stallTimer = timer
             timer.setEventHandler { [weak self] in
-                guard let self, !self.stopped, let deadline = self.stallDeadline else { return }
-                // Content growth may have reset the deadline after the old timer fired but before its handler reached the AX execution lane.
-                guard DispatchTime.now() >= deadline else {
-                    self.stallTimer?.schedule(deadline: deadline)
-                    return
+                MacAXExecutionLane.async { [weak self] in
+                    guard let self, !self.stopped, let deadline = self.stallDeadline else { return }
+                    // A content-growth event may renew the deadline before its queued handler reaches the AX thread.
+                    guard DispatchTime.now() >= deadline else {
+                        self.stallTimer?.schedule(deadline: deadline)
+                        return
+                    }
+                    self.continuation.yield(())
                 }
-                self.continuation.yield(())
             }
             resetStallDeadline()
             timer.resume()
@@ -166,7 +185,7 @@ public final class MacAppSourceEvents: @unchecked Sendable {
     #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
     /// All mutable state and every AX transaction belong to MacAXExecutionLane.
     private func install() throws {
-        guard pid != getpid(), let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
+        guard !PersonOnlyWindows.isOwnProcess(pid), let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
             throw SenseFailure(code: "source_unavailable", message: "The app is no longer running or cannot observe itself.")
         }
         guard AXIsProcessTrusted() else {
@@ -184,14 +203,14 @@ public final class MacAppSourceEvents: @unchecked Sendable {
             throw failure("create", status)
         }
         observer = created
-        try withSubscriptionBudget(context: context) { context in try reconcileTree(context: context) }
-        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
+        try withSubscriptionAuthority(context: context) { context in try reconcileTree(context: context) }
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(created), .commonModes)
         workspaceToken = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: nil
         ) { [weak self] notification in
             guard let self, let ended = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   ended.processIdentifier == self.pid else { return }
-            MacAXExecutionLane.sync {
+            MacAXExecutionLane.async {
                 self.stop(error: SenseFailure(code: "source_unavailable", message: "The observed app stopped running."))
             }
         }
@@ -204,11 +223,12 @@ public final class MacAppSourceEvents: @unchecked Sendable {
 
     private func received(_ kind: String) {
         guard !stopped else { return }
+        onNotification?(kind)
         treeChanged = treeChanged || Self.structuralKinds.contains(kind)
         focusChanged = focusChanged || kind == kAXFocusedUIElementChangedNotification
         guard !deliveryScheduled else { return }
         deliveryScheduled = true
-        DispatchQueue.main.async { [weak self] in
+        MacAXExecutionLane.async { [weak self] in
             guard let self, !self.stopped else { return }
             let renew = { (context: MacOperationContext) throws -> Void in
                 self.deliveryScheduled = false
@@ -233,23 +253,18 @@ public final class MacAppSourceEvents: @unchecked Sendable {
             }
             MacAXExecutionLane.sync {
                 do {
-                    // This notification owns a new bounded read, independent of the request that installed it.
-                    try self.withSubscriptionBudget(context: self.context.settling(), renew)
+                    try self.withSubscriptionAuthority(context: self.context.settling(), renew)
                     self.continuation.yield(())
                 } catch { self.stop(error: error) }
             }
         }
     }
 
-    /// A GCD renewal cannot inherit the construction task's lifetime or budget.
-    private func withSubscriptionBudget<Value>(context: MacOperationContext, _ operation: (MacOperationContext) throws -> Value) throws -> Value {
-        let deadline = Date().addingTimeInterval(MacAXLimits.readSeconds)
-        return try context.holding(\.readDeadline, min(context.readDeadline ?? deadline, deadline)) { context in
-            guard AXIsProcessTrusted() else {
-                throw SenseFailure(code: "source_denied", message: "App observation lost macOS Accessibility permission.")
-            }
-            return try operation(context)
+    private func withSubscriptionAuthority<Value>(context: MacOperationContext, _ operation: (MacOperationContext) throws -> Value) throws -> Value {
+        guard AXIsProcessTrusted() else {
+            throw SenseFailure(code: "source_denied", message: "App observation lost macOS Accessibility permission.")
         }
+        return try operation(context)
     }
 
     private func gap(_ element: AXUIElement, _ operation: String, _ cause: String) {
@@ -467,7 +482,7 @@ public final class MacAppSourceEvents: @unchecked Sendable {
             self.workspaceToken = nil
         }
         if let observer {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .commonModes)
             for rows in subscriptions.values {
                 for row in rows {
                     for kind in row.kinds where MacAXAttributeRead.prepareMessage(row.element, context: context) {

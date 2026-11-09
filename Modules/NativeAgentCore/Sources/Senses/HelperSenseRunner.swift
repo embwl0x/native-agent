@@ -233,9 +233,12 @@ public actor HelperSenseRunner: SenseWatchReporting {
             if record.status == .on, !record.verbsEnabled { for i in page.things.indices { page.things[i].verbs = [] } }
             if case .read = request, record.status == .on, let registry = SensesHub.shared.registry {
                 do {
-                    if try AbilityStore(dataRoot: dataRoot).read(id: record.id) == nil {
+                    // Native reads have no JS runner accounting, even when a lifecycle override gives them an ability file.
+                    if record.language == .native {
                         try await registry.recordUse(senseID: record.id, version: record.version, turn: turn)
-                        provenance.uses += 1
+                        let (uses, overflow) = provenance.uses.addingReportingOverflow(1)
+                        guard !overflow else { throw SenseFailure(code: "accounting_error", message: "Sense use count overflow.") }
+                        provenance.uses = uses
                     }
                 } catch { return .failed(Self.failure(error, provenance: provenance)) }
             }

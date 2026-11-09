@@ -1,156 +1,203 @@
+import AuthoredCapabilities
+import ChatTurnContracts
 import Foundation
 import MemoryV2
+import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `MemoriesFace.swift` | Memories face and actions over canonical MemoryFacade reads and writes |
+import PersistenceCore
+// Blueprint: | `MemoriesFace.swift` | Owner-backed memory facts, row calls, review levers, search and refresh |
 
 extension NativeAgentEngine {
-    @MainActor func memoriesFace() async throws -> (PartFace, UInt64) {
+    /// What the Memories page is drawn from: the facts `native-memories` reads, the keys its rows may carry, and the person's key levers —
+    /// Forget on every memory read here and Keep / Don't keep on every waiting proposal — which no face can omit. Every read that fails is a
+    /// named unavailable fact; only cancellation throws, so the levers never depend on the part.
+    @concurrent func memoriesPacket(surface: String? = nil) async throws -> PartFaces.Packet {
         let epoch = UInt64(Date().timeIntervalSince1970 * 1000)
-        var sections: [PartFace.Section] = []
+        var facts: [String: JSONValue] = [:]
+        var keys: [String: JSONValue] = [:]
+        var memoryLevers: [String: PartFace.Row] = [:]
+        var memoryOrder: [String] = []
+        var proposalLevers: [PartFace.Row] = []
+        // Read source state before shaping any row; kept and searched rows share the same trust read below.
         var kept: [MemoryV2.MemoryRecord]?
-        var waiting: [ProposalRecord]?
-        do { kept = try await memory.refreshMemories() }
+        do { kept = try await memory.refreshMemories().filter { permitsMemory($0, surface: surface) } }
         catch is CancellationError { throw CancellationError() }
-        catch { sections.append(MemoriesFaceText.issue("kept", title: "Saved memories unavailable", error: error)) }
-        do { waiting = try await memory.proposals(status: "pending") }
+        catch { facts["kept"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)]) }
+        await memory.refreshSearch()
+        try Task.checkCancellation()
+        let search = await MainActor.run {
+            (query: memory.searchQuery, results: memory.searchResults, error: memory.searchError,
+             loading: memory.searchIsLoading, resultQuery: memory.searchResultQuery)
+        }
+        let query = search.query
+        var found: [MemoryV2.MemoryRecord]?
+        var searchFailure: String?
+        if let query, query.count >= 3 {
+            if let results = search.results {
+                do { found = try await memory.activeMemories(ids: results.map(\.id)).filter { permitsMemory($0, surface: surface) } }
+                catch is CancellationError { throw CancellationError() }
+                catch { searchFailure = error.localizedDescription }
+            }
+        }
+        try Task.checkCancellation()
+        let trust = MemoryDataProvenance.reading((kept ?? []).map(\.extras) + (found ?? []).map(\.extras))
+        func memories(_ records: [MemoryV2.MemoryRecord]) -> JSONValue {
+            .array(records.map { record -> JSONValue in
+                let id = PartFace.Value.string(record.id)
+                let pin: PageKeyAction = record.pinned == true ? .calls("unpin", "memory.rewrite", ["id": id, "pinned": .bool(false)])
+                    : .calls("pin", "memory.pin", ["id": id])
+                keys["memory:" + record.id] = .object(["open": .string(MemoriesFaceTarget.memory(record.id).link),
+                    "actions": .array([pin.json])])
+                if memoryLevers[record.id] == nil {
+                    memoryOrder.append(record.id)
+                    let excerpt = TodayWords.line(ContextSecretContentPolicy.redactedFragment(record.text), limit: 96)
+                    memoryLevers[record.id] = .init(id: "memory:" + record.id, title: excerpt.isEmpty ? "An empty note" : excerpt,
+                        actions: [.init(id: "forget", label: "Forget this…", role: .destructive, call: PartFace.Call("memory.forget", ["id": id]))])
+                }
+                return memoriesFact(record, trust: trust)
+            })
+        }
+        func unavailable(_ reason: String) -> JSONValue { .object(["state": .string("unavailable"), "reason": .string(reason)]) }
+
+        if let kept { facts["kept"] = .object(["state": .string("available"), "memories": memories(kept)]) }
+        do {
+            let waiting = try await memory.proposals(status: "pending").filter { permitsProposal($0, surface: surface) }
+            facts["waiting"] = .object(["state": .string("available"), "proposals": .array(waiting.map { proposal -> JSONValue in
+                let review = { (decision: String) in PartFace.Call("memory.review", ["id": .string(proposal.id), "decision": .string(decision)]) }
+                let title = ContextSecretContentPolicy.redactedFragment(proposal.content)
+                proposalLevers.append(.init(id: "proposal:" + proposal.id, title: title,
+                    at: ContextSecretContentPolicy.redactedFragment(proposal.createdAt), tone: .attention,
+                    actions: [.init(id: "accept", label: "Keep", role: .primary, call: review("accept")),
+                              .init(id: "reject", label: "Don't keep", role: .destructive, call: review("reject"))]))
+                return .object(["id": .string(proposal.id), "content": .string(proposal.content), "createdAt": .string(proposal.createdAt),
+                    "kind": faceText(proposal.metadata?.objectValue?["kind"]?.stringValue)])
+            })])
+        }
         catch is CancellationError { throw CancellationError() }
-        catch { sections.append(MemoriesFaceText.issue("waiting", title: "Proposals unavailable", error: error)) }
+        catch { facts["waiting"] = unavailable(error.localizedDescription) }
         await memory.refreshRejectedHistory()
         let statusFailures = await memory.refreshStatuses()
         try Task.checkCancellation()
 
-        if let waiting, !waiting.isEmpty {
-            // The waiting style draws words only; list rows keep both decisions reachable.
-            sections.append(.init(id: "waiting", title: "Waiting for you", style: .list, rows: waiting.map { proposal in
-                .init(id: "proposal:" + proposal.id, title: proposal.content,
-                      detail: MemoriesFaceText.proposalKind(proposal), at: proposal.createdAt, tone: .attention,
-                      actions: [.init(id: "accept", label: "Keep", role: .primary),
-                                .init(id: "reject", label: "Don't keep", role: .destructive)])
-            }))
-        }
-
-        let query = memory.searchQuery?.trimmingCharacters(in: .whitespacesAndNewlines)
-        // The page's own search: what the person types is searched on return, as the Mac's search field always did.
-        sections.append(.init(id: "find", style: .list, rows: [
-            .init(id: "search-field", title: "Search what I've kept", control: .field(query ?? "", placeholder: "At least three letters")),
-        ]))
+        facts["query"] = faceText(query.flatMap { $0.isEmpty ? nil : $0 })
+        keys["search-field"] = .object(["set": .object(PartFace.Call("memories.search").input)])
         if let query, query.count >= 3 {
-            // Re-rank the current store, including older/new matches and recovery from a failed query. Publication never credits recall usage.
-            await memory.search(query: query, recordingUsage: false)
-            try Task.checkCancellation()
-            var rows: [PartFace.Row] = []
-            if let results = memory.searchResults {
-                do { rows = try await memory.activeMemories(ids: results.map(\.id)).map { MemoriesFaceText.memoryRow($0, root: dataRoot) } }
-                catch is CancellationError { throw CancellationError() }
-                catch { rows.append(.init(id: "search-records-error", title: "Search records unavailable",
-                                         detail: error.localizedDescription, tone: .failed)) }
-            }
-            if let error = memory.searchError {
-                rows.insert(.init(id: "search-error", title: "Search unavailable", detail: error, tone: .failed), at: 0)
-            } else if memory.searchIsLoading || memory.searchResults == nil {
-                rows.append(.init(id: "search-unread", title: "Search results have not arrived.", tone: .quiet))
-            } else if rows.isEmpty {
-                rows.append(.init(id: "search-empty", title: "Nothing I've kept matches that.", tone: .quiet))
-            }
-            sections.append(.init(id: "search", title: "What I found", style: .list,
-                                  footer: memory.searchResultQuery.map { "Results for ‘" + $0 + "’." }, rows: rows))
-            sections.append(.init(id: "search-query", style: .list, rows: [
-                .init(id: "search", title: "Search: “" + query + "”", actions: [.init(id: "clear", label: "Show all memories")])
-            ]))
-        } else if let kept {
-            let ordered = MemoriesFaceText.ordered(kept)
-            let pinned = ordered.filter { $0.pinned == true }
-            let recent = ordered.filter { $0.pinned != true }
-            if !pinned.isEmpty {
-                sections.append(.init(id: "pinned", title: "Pinned", style: .list, rows: pinned.map { MemoriesFaceText.memoryRow($0, root: dataRoot) }))
-            }
-            if !recent.isEmpty {
-                sections.append(.init(id: "recent", title: "What I've kept", style: .list, rows: recent.map { MemoriesFaceText.memoryRow($0, root: dataRoot) }))
-            } else if kept.isEmpty {
-                sections.append(.init(id: "empty", style: .note, rows: [.init(id: "empty", title: "It fills up as we talk.")]))
-            }
-        }
+            var records: JSONValue = .null
+            if let found { records = .object(["state": .string("available"), "memories": memories(found)]) }
+            if let searchFailure { records = unavailable(searchFailure) }
+            facts["search"] = .object(["records": records, "error": faceText(search.error), "loading": .bool(search.loading),
+                "resultQuery": faceText(search.resultQuery)])
+            keys["search"] = .object(["actions": .array([PageKeyAction.calls("clear", "memories.search", ["value": .string("")]).json])])
+        } else { facts["search"] = .null }
 
-        if let error = memory.rejectedHistoryError {
-            sections.append(.init(id: "rejected-error", style: .list, rows: [
-                .init(id: "rejected-error", title: "Rejected history unavailable", detail: error, tone: .failed)
-            ]))
-        } else if !memory.rejectedProposals.isEmpty {
-            sections.append(.init(id: "rejected", title: "Things I let go", style: .list, rows: memory.rejectedProposals.map { proposal in
-                .init(id: "rejected:" + proposal.id, title: TodayWords.line(proposal.content, limit: 96),
-                      detail: "I didn't keep this", at: proposal.createdAt, tone: .quiet,
-                      open: MemoriesFaceTarget.rejected(proposal.id).link)
-            }))
+        let rejected = await MainActor.run { (memory.rejectedHistoryError, memory.rejectedProposals) }
+        if let error = rejected.0 { facts["rejected"] = unavailable(error) }
+        else {
+            facts["rejected"] = .object(["state": .string("available"), "proposals": .array(rejected.1.filter {
+                permitsProposal($0, surface: surface)
+            }.map { proposal -> JSONValue in
+                keys["rejected:" + proposal.id] = .object(["open": .string(MemoriesFaceTarget.rejected(proposal.id).link)])
+                return .object(["id": .string(proposal.id), "content": .string(proposal.content), "createdAt": .string(proposal.createdAt)])
+            })])
         }
-        for failure in statusFailures {
-            sections.append(MemoriesFaceText.issue("status-" + failure.endpoint, title: failure.label, error: failure.error))
+        // Corrections by lesson, this week against last, from the one owner of the miss ledger; an unreadable ledger is named, never zero.
+        let weeks = (this: MemoryRecoveryReadout.isoWeek(), last: MemoryRecoveryReadout.isoWeek(ago: 1))
+        do {
+            let lessons = try await MemoryRecoveryReadout.misses(dataRoot: dataRoot, weeks: [weeks.this, weeks.last], surface: surface)
+            facts["misses"] = .object(["state": .string("available"), "lessons": .array(lessons.map { lesson in
+                .object(["lesson": .string(lesson.lesson), "thisWeek": .int(Int64(lesson.count(week: weeks.this))),
+                         "lastWeek": .int(Int64(lesson.count(week: weeks.last))),
+                         "latest": lesson.misses.first.map { miss in
+                             JSONValue.object(["text": .string(miss.text), "at": .string(miss.at)])
+                         } ?? JSONValue.null])
+            })])
         }
-        sections.append(.init(id: "details", title: "Upkeep and details", style: .list, rows: [
-            .init(id: "graph", title: "Knowledge graph", symbol: "circle.hexagonpath", open: MemoriesFaceTarget.graph.link),
-            .init(id: "upkeep", title: "Memory status and Spotlight", detail: "Search model, saved-memory status and reindexing.",
-                  symbol: "brain", open: MemoriesFaceTarget.upkeep.link),
-            .init(id: "refresh", title: "Read my memories again", actions: [.init(id: "refresh", label: "Check again")])
-        ]))
-        let line: String
-        if let kept {
-            let total = statusFailures.isEmpty ? memory.totalCount.map { " of \($0) saved" } ?? " · total unavailable" : " · total unavailable"
-            line = "\(kept.count) memories loaded" + total + "."
-        } else { line = "Saved memories could not be read." }
-        return (.init(title: "Memories", line: line, sections: sections), epoch)
+        catch is CancellationError { throw CancellationError() }
+        catch { facts["misses"] = unavailable(error.localizedDescription) }
+        facts["statusFailures"] = .array(statusFailures.map { failure in
+            .object(["endpoint": .string(failure.endpoint), "label": .string(failure.label), "reason": .string(failure.error.localizedDescription)])
+        })
+        facts["total"] = await memory.totalCount.map { JSONValue.int(Int64($0)) } ?? .null
+        facts["momentSource"] = .string(MemoryMoments.sourcePrefix)
+        keys["graph"] = .object(["open": .string(MemoriesFaceTarget.graph.link)])
+        keys["upkeep"] = .object(["open": .string(MemoriesFaceTarget.upkeep.link)])
+        keys["refresh"] = .object(["actions": .array([PageKeyAction.calls("refresh", "memories.refresh").json])])
+        facts["keys"] = .object(keys)
+        // Redact every published field here, including nested roots and failure reasons, before a part can flatten or clip it.
+        // Character clusters come only from these safe words; raw memory text must not survive through that derived field either.
+        var texts: [String] = []
+        facts = facts.mapValues { value in
+            value.mapStrings { text in
+                let safe = ContextSecretContentPolicy.redactedFragment(text)
+                texts.append(safe)
+                return safe
+            }
+        }
+        facts["clusters"] = .array(memoriesClusters(texts).map(JSONValue.string))
+        let keyLevers = [PartFace.Section(id: "waiting", title: "Waiting for you", style: .list, rows: proposalLevers),
+                         PartFace.Section(id: "kept", title: "What I've kept", style: .list, rows: memoryOrder.compactMap { memoryLevers[$0] })]
+        return PartFaces.Packet(facts: .object(facts), epoch: epoch, keyLevers: keyLevers)
     }
 
-    @MainActor func memoriesAct(row: String, action: String, value: String?) async throws -> String? {
-        if row == "search-field", action == "set" {
-            let words = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard words.isEmpty || words.count >= 3 else {
-                throw PartCallError(code: "short_query", message: "Search needs at least three letters; nothing was searched.")
-            }
-            await memory.search(query: words)
-            return nil
-        }
-        guard value == nil else { throw PartCallError(code: "bad_value", message: "This memory action takes no value.") }
-        if row == "refresh", action == "refresh" { return nil }
-        if row == "search", action == "clear" {
-            await memory.search(query: "")
-            return nil
-        }
-        if row.hasPrefix("proposal:") {
-            let id = String(row.dropFirst("proposal:".count))
-            guard try await memory.proposals(status: "pending").contains(where: { $0.id == id }) else {
-                throw PartCallError(code: "stale_proposal", message: "This proposal is no longer waiting for review; nothing changed.")
-            }
-            switch action {
-            case "accept": _ = try await memory.accept(proposalID: id)
-            case "reject": try await memory.reject(proposalID: id, reason: "")
-            default: throw PartCallError(code: "no_action", message: "That proposal has no action called \(action).")
-            }
-            await approvals.refresh()
-            await refreshMemoriesSearch()
-            return action == "accept" ? "Kept it." : "Left it."
-        }
-        if row.hasPrefix("memory:") {
-            let id = String(row.dropFirst("memory:".count))
-            // Saved destinations include graduated rows; do not resolve them through recall eligibility.
-            guard try await memory.activeMemories(limit: nil).contains(where: { $0.id == id }) else {
-                throw PartCallError(code: "stale_memory", message: "This memory is unavailable in the current store; nothing changed.")
-            }
-            let message: String
-            switch action {
-            case "pin", "unpin":
-                try await memory.setPinned(action == "pin", id: id)
-                message = action == "pin" ? "Memory pinned" : "Memory unpinned"
-            case "forget":
-                try await memory.delete(id: id)
-                message = "Forgotten."
-            default: throw PartCallError(code: "no_action", message: "That memory has no action called \(action).")
-            }
-            await refreshMemoriesSearch()
-            return message
-        }
-        throw PartCallError(code: "no_action", message: "This row has no action called \(action).")
+    private func permitsMemory(_ record: MemoryV2.MemoryRecord, surface: String?) -> Bool {
+        guard let surface else { return true }
+        return MemoryRecordDisclosurePolicy.classify(record)?.permits(surface: surface, personaID: nil) == true
     }
 
-    @MainActor private func refreshMemoriesSearch() async {
-        if let query = memory.searchQuery, query.count >= 3 { await memory.search(query: query) }
+    private func permitsProposal(_ proposal: ProposalRecord, surface: String?) -> Bool {
+        guard let surface else { return true }
+        return MemoryRecordDisclosurePolicy.classify(personaID: proposal.personaId, status: "active", lifecycle: nil,
+            tags: nil, metadata: proposal.metadata)?.permits(surface: surface, personaID: nil) == true
+    }
+
+    /// One kept memory as measured facts: its words, pin and lifecycle, the time its row shows (and whether that time reads), the time it is
+    /// ordered by, the run that wrote it, the provenance its owners derive (a later-wrong sense's warning, the named untrusted sources) and its roots.
+    private func memoriesFact(_ record: MemoryV2.MemoryRecord, trust: PeerDataTaint.TrustRead) -> JSONValue {
+        let updated = record.updatedAt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stamp = updated.flatMap { $0.isEmpty ? nil : $0 } ?? record.createdAt
+        let ordered = record.updatedAt.flatMap { UserDisplayFormatters.parseISOTimestamp($0) } ?? UserDisplayFormatters.parseISOTimestamp(record.createdAt)
+        return .object([
+            "id": .string(record.id), "text": .string(record.text), "pinned": .bool(record.pinned == true),
+            "lifecycle": .string(MemoryLifecycle.normalized(record.lifecycle)),
+            "at": faceText(stamp.isEmpty ? nil : stamp), "atReadable": .bool(UserDisplayFormatters.parseISOTimestamp(stamp) != nil),
+            // Seconds since 1970 at full precision, so the face orders exactly as the store's times compare.
+            "orderSeconds": ordered.map { JSONValue.double($0.timeIntervalSince1970) } ?? .null,
+            "source": faceText(record.sourceRunId),
+            "warning": faceText(MemorySenseProvenance.warning(in: record.extras)),
+            "from": .array(MemoryDataProvenance.sources(in: record.extras, trust: trust).map(JSONValue.string)),
+            // One line per moment the agent came to know it, in its own words, with whether an untrusted principal steered that moment.
+            "roots": MemoryDataProvenance.rootsJSON(record.extras, trust: trust),
+        ])
+    }
+
+
+    /// Characters the face must count as one though JavaScript sees several code units (as Today's packet measures them), longest first.
+    private func memoriesClusters(_ texts: [String]) -> [String] {
+        var found = Set<String>()
+        for text in texts {
+            for version in [text, TodayWords.plain(text)] {
+                for character in version where String(character).utf16.count > 1 { found.insert(String(character)) }
+            }
+        }
+        return found.sorted { $0.utf16.count != $1.utf16.count ? $0.utf16.count > $1.utf16.count : $0 < $1 }
+    }
+
+    /// The Memories page's search (`memories.search`): three letters or more, or empty to show every memory.
+    @MainActor func memoriesSearch(_ input: [String: JSONValue]) async throws -> String {
+        guard case .string(let raw)? = input["value"] else {
+            throw PartCallError(code: "invalid_value", message: "Search takes value: the words to search for, or empty; nothing was searched.")
+        }
+        let words = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard words.isEmpty || words.count >= 3 else {
+            throw PartCallError(code: "short_query", message: "Search needs at least three letters; nothing was searched.")
+        }
+        await memory.search(query: words)
+        return words.isEmpty ? "Memories shows every memory." : "Memories searched for \u{201C}\(words)\u{201D}."
+    }
+
+    /// The kept memories read again (`memories.refresh`); the page then reads its packet from them.
+    @MainActor func memoriesRefresh() async throws -> String {
+        let kept = try await memory.refreshMemories()
+        return "Read \(kept.count) kept \(kept.count == 1 ? "memory" : "memories") again."
     }
 }

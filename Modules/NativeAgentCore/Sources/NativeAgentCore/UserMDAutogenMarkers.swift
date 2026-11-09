@@ -12,25 +12,23 @@ public enum UserMDAutogenMarkers {
 
     /// The person picture rides every turn, so cap UTF-8 bytes at recall's floor allowance: five rows of 1,200 characters. Keep this bound aligned with
     /// ContextBudgetPolicy.floorRecallRowLimit and floorMemoryRowChars, which this target cannot import. Excess facts remain in memory; only carried facts are
-    /// precovered. Nil core preserves the whole document until the first pin; empty core carries only prose.
+    /// precovered. Pins lead the same ordered fact selection; an empty core carries only prose.
     public static let promptByteCap = 5 * 1_200
 
-    public static func promptText(_ document: String, pinnedCore: [String]?) -> String {
-        guard let pinnedCore else { return document }
-        let carried = carry(document, pinnedCore: pinnedCore)
+    public static func promptText(_ document: String, userMemoryCore: [String]) -> String {
+        let carried = carry(document, userMemoryCore: userMemoryCore)
         return ([carried.preamble].filter { !$0.isEmpty } + carried.facts.map { "- " + $0 })
             .joined(separator: "\n\n")
     }
 
-    /// The pinned facts `promptText` carries (same order, same cap), as their own section for the turn's dynamic tail. The stable segment holds only what
-    /// changes when the agent's documents change; what memory adds rides after.
-    public static func pinnedSection(_ document: String, pinnedCore: [String]?) -> String {
-        guard let pinnedCore else { return "" }
-        let facts = carry(document, pinnedCore: pinnedCore).facts
-        return facts.isEmpty ? "" : "# USER (pinned)\n" + facts.map { "- " + $0 }.joined(separator: "\n\n")
+    /// The facts `promptText` carries (same order, same cap), as their own section for the turn's dynamic tail. Only the document's preamble rides the stable
+    /// segment; memory changes leave its bytes alone.
+    public static func userSection(_ document: String, userMemoryCore: [String]) -> String {
+        let facts = carry(document, userMemoryCore: userMemoryCore).facts
+        return facts.isEmpty ? "" : "# USER\n" + facts.map { "- " + $0 }.joined(separator: "\n\n")
     }
 
-    private static func carry(_ document: String, pinnedCore: [String]) -> (preamble: String, facts: [String]) {
+    private static func carry(_ document: String, userMemoryCore: [String]) -> (preamble: String, facts: [String]) {
         let preamble: String
         if let start = document.range(of: preambleStart),
            let end = document.range(of: preambleEnd, range: start.upperBound..<document.endIndex) {
@@ -50,7 +48,7 @@ public enum UserMDAutogenMarkers {
             result.append(character)
             bytes += size
         }
-        for fact in pinnedCore {
+        for fact in userMemoryCore {
             let size = (result.isEmpty && facts.isEmpty ? 0 : 2) + "- ".utf8.count + fact.utf8.count
             guard bytes + size <= budget else { break }
             facts.append(fact)

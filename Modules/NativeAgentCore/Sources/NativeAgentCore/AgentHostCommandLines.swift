@@ -41,26 +41,6 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
 
     public var continuesConversations: Bool { !continuation.isEmpty }
 
-    public init(executable: String, arguments: [String], continuation: [String] = [],
-                replyFileName: String? = nil, capturesThreadID: Bool = false, jsonResultReply: Bool = false,
-                resultFields: [String: String]? = nil,
-                automaticMCPProbe: Bool = true, stream: Stream? = nil, permissionFlags: PermissionFlags? = nil,
-                timeoutSeconds: Int, documentation: String, minimumVersion: String? = nil) {
-        self.executable = executable
-        self.arguments = arguments
-        self.continuation = continuation
-        self.replyFileName = replyFileName
-        self.capturesThreadID = capturesThreadID
-        self.jsonResultReply = jsonResultReply
-        self.resultFields = resultFields
-        self.automaticMCPProbe = automaticMCPProbe
-        self.stream = stream
-        self.permissionFlags = permissionFlags
-        self.timeoutSeconds = timeoutSeconds
-        self.documentation = documentation
-        self.minimumVersion = minimumVersion
-    }
-
     /// Refuse incompatible or unreadable versions before passing flags the installed CLI may not understand.
     public func versionFailure(program: String, reported: String?) -> String? {
         guard let minimumVersion else { return nil }

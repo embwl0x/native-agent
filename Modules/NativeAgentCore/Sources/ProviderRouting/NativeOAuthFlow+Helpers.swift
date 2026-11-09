@@ -6,7 +6,7 @@ import Darwin
 import PersistenceCore
 import NativeAgentShared
 import TurnTrace
-// Blueprint: | `NativeOAuthFlow+Helpers.swift` | redirect-refusing bounded grants; checked token replies |
+// Blueprint: | `NativeOAuthFlow+Helpers.swift` | redirect-refusing grants; checked token replies and server-paced device authorization |
 
 extension NativeOAuthFlow {
     public struct InlineSetupOutcome: Sendable {
@@ -40,7 +40,7 @@ extension NativeOAuthFlow {
                "unreachable") {
             return "Couldn't reach \(service). Check your internet connection, then try again."
         }
-        // Before the scope check: the format hints name "OAuth & Permissions".
+        // Format hints can contain "OAuth & Permissions", so rejected credentials take precedence.
         if has("401", "reject", "unauthorized", "such as", "botfather", "isn't a setup token",
                "enter a valid", "not a valid", "invalid_auth", "invalid token", "invalid api key",
                "incorrect api key", "didn't accept", "not_authed", "bad credentials") {
@@ -52,46 +52,6 @@ extension NativeOAuthFlow {
         return otherwise ?? "\(service): other error (details in the app log)."
     }
 
-    /// Probe draft keys before saving so rejected keys cannot look connected. Routes without a probe must say their saved key remains unproven.
-    @MainActor
-    public static func saveInlineProviderKey(
-        _ key: String, providerName name: String,
-        testProvider: @MainActor () async throws -> NativeAgentShared.ProviderTestResult,
-        configureProvider: @MainActor () async throws -> Void
-    ) async -> InlineSetupOutcome {
-        // A typed cause decides the sentence; only a peer that sent none is read as prose.
-        func refusal(_ failure: ProviderFailure?, raw: String) -> String {
-            switch failure {
-            case .authExpired?: return "\(name) rejected the key."
-            case .network?: return "Couldn't reach \(name)."
-            case let failure?: return "\(name) could not check the key: \(failure.errorDescription ?? "it did not answer")"
-            case nil: return inlineSetupFailureReason(raw, service: name, secret: "key", typed: [key])
-            }
-        }
-        let probe: NativeAgentShared.ProviderTestResult
-        do {
-            probe = try await testProvider()
-        } catch {
-            return InlineSetupOutcome(error: refusal(ProviderFailure.classify(error), raw: error.localizedDescription))
-        }
-        let failure = probe.cause.flatMap(ProviderFailure.decoded)
-        // A refused check neither rejects nor proves the key: saved, unproven.
-        let unproven = probe.tested && probe.status != "ok" && failure == .refused
-        if probe.tested, probe.status != "ok", !unproven {
-            return InlineSetupOutcome(error: refusal(failure, raw: probe.error ?? ""))
-        }
-        do {
-            // Use the provider sheet's configure owner with no model change; saving a key cannot repoint the route.
-            try await configureProvider()
-        } catch {
-            return InlineSetupOutcome(error: inlineSetupFailureReason(
-                error.localizedDescription, service: name, secret: "key", typed: [key]
-            ))
-        }
-        if unproven { return InlineSetupOutcome(note: "\(name) API key saved; its last check failed: \(probe.error ?? "refused")") }
-        return InlineSetupOutcome(note: probe.tested ? "key checked with \(name)"
-                       : "key saved; \(name) has no check to run")
-    }
 }
 
 // MARK: - PKCE + helpers
@@ -194,53 +154,60 @@ public enum OAuthGrantOperations {
             throw NSError(domain: "NativeOAuthFlow", code: status,
                 userInfo: [NSLocalizedDescriptionKey: "The token endpoint answered HTTP \(status)."])
         }
-        guard let answer else {
-            throw malformedTokenResponse()
-        }
         return answer
     }
 
-    /// Refuse redirects because 307/308 can forward secrets to an unapproved host. HTTP Basic omits the client secret from the body; bound the whole
-    /// exchange, not only idle time.
-    public static func post(_ endpoint: String, _ body: [String: String], json: Bool = false, basic: Bool = false,
-        timeout: TimeInterval = 20) async throws -> (status: Int, answer: [String: Any]?) {
+    /// Refuse redirects because 307/308 can forward secrets to an unapproved host.
+    public static func post(_ endpoint: String, _ body: [String: String], json: Bool = false,
+        basic: Bool = false) async throws -> (status: Int, answer: [String: Any]) {
         guard let url = URL(string: endpoint), url.scheme == "https" else {
             throw NSError(domain: "NativeOAuthFlow", code: -2, userInfo: [NSLocalizedDescriptionKey: "The token endpoint must be an https URL."])
         }
-        let (data, resp) = try await post(url, body, json: json, basic: basic, timeout: min(20, timeout))
-        return ((resp as? HTTPURLResponse)?.statusCode ?? 0,
-                (try? JSONSerialization.jsonObject(with: data)) as? [String: Any])
+        let (data, response) = try await post(url, body, json: json, basic: basic)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        let answer: [String: Any]
+        do {
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw malformedTokenResponse()
+            }
+            answer = object
+        } catch {
+            if http.statusCode >= 400 {
+                throw NSError(domain: "NativeOAuthFlow", code: http.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: "The token endpoint answered HTTP \(http.statusCode) without a JSON object."])
+            }
+            throw malformedTokenResponse()
+        }
+        return (http.statusCode, answer)
     }
 
     /// Shared transport for sign-in and adapter refresh. Adapters keep their session, encoding and error classification; every grant refuses redirects.
     public static func post(
         _ url: URL, _ body: [String: String], json: Bool = false, basic: Bool = false,
-        timeout: TimeInterval = 20, session suppliedSession: URLSession? = nil,
+        session suppliedSession: URLSession? = nil,
         encodeForm: ([String: String]) -> String = formEncode
     ) async throws -> (data: Data, response: URLResponse) {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = timeout
+        req.timeoutInterval = .infinity
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         var body = body
         if basic, let id = body["client_id"], let secret = body.removeValue(forKey: "client_secret") {
-            let encode = { (text: String) in text.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~")))
-                ?? text }
-            req.setValue("Basic " + Data("\(encode(id)):\(encode(secret))".utf8).base64EncodedString(), forHTTPHeaderField: "Authorization")
+            let credential = "\(formComponent(id)):\(formComponent(secret))"
+            req.setValue("Basic " + Data(credential.utf8).base64EncodedString(), forHTTPHeaderField: "Authorization")
         }
         if json {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
         } else {
             req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-            req.httpBody = encodeForm(body).data(using: .utf8)
+            req.httpBody = Data(encodeForm(body).utf8)
         }
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForResource = timeout
-        let session = suppliedSession ?? URLSession(configuration: configuration)
+        let session = suppliedSession ?? ProviderHTTP.makeSession()
         defer { if suppliedSession == nil { session.invalidateAndCancel() } }
         let (data, resp) = try await session.data(for: req, delegate: NoRedirect())
-        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        let status = http.statusCode
         if (300..<400).contains(status) {
             throw NSError(domain: "NativeOAuthFlow", code: status,
                 userInfo: [NSLocalizedDescriptionKey: "The sign-in endpoint answered HTTP \(status), a redirect; sign-in does not follow redirects."])
@@ -248,14 +215,13 @@ public enum OAuthGrantOperations {
         return (data, resp)
     }
 
-    /// Device authorization must retain its code lifetime and polling interval.
+    /// Device authorization retains the server's code and polling interval.
     public struct DeviceCode: Sendable, Equatable {
         public let deviceCode: String
         public let userCode: String
         public let verificationURI: URL
         /// Use the provider's complete verification link only when supplied.
         public let verificationURIComplete: URL?
-        public let expiresAt: Date
         public let interval: TimeInterval
     }
 
@@ -292,11 +258,12 @@ public enum OAuthGrantOperations {
         var form = client
         form["scope"] = scopes
         let (status, answer) = try await post(endpoint, form, basic: basic)
-        if answer?["error"] != nil || status >= 400 { throw DeviceSignInFailure(answer, status: status) }
-        let link = { (key: String) in (answer?[key] as? String).flatMap(URL.init(string:)).flatMap { $0.scheme == "https" ? $0 : nil } }
-        guard let answer, let deviceCode = answer["device_code"] as? String, let userCode = answer["user_code"] as? String,
-              let uri = link("verification_uri") ?? link("verification_url") else { throw DeviceSignInFailure.refused("its answer was incomplete") }
-        let lifetime = try deviceCodeLifetime(answer)
+        if answer["error"] != nil || status >= 400 { throw DeviceSignInFailure(answer, status: status) }
+        let link = { (key: String) in (answer[key] as? String).flatMap(URL.init(string:)).flatMap { $0.scheme == "https" ? $0 : nil } }
+        guard let deviceCode = answer["device_code"] as? String, !deviceCode.isEmpty,
+              let userCode = answer["user_code"] as? String, !userCode.isEmpty,
+              let uri = link("verification_uri") else { throw DeviceSignInFailure.refused("its answer was incomplete") }
+        try validateDeviceCodeLifetime(answer)
         let interval: TimeInterval
         if let raw = answer["interval"] {
             guard let supplied = seconds(raw), supplied > 0 else {
@@ -304,42 +271,46 @@ public enum OAuthGrantOperations {
             }
             interval = supplied
         } else { interval = 5 } // RFC 8628's omitted-interval default.
+        let complete: URL?
+        if answer["verification_uri_complete"] != nil {
+            guard let supplied = link("verification_uri_complete") else {
+                throw DeviceSignInFailure.refused("its complete verification URI was invalid")
+            }
+            complete = supplied
+        } else { complete = nil }
         return DeviceCode(deviceCode: deviceCode, userCode: userCode, verificationURI: uri,
-                          verificationURIComplete: link("verification_uri_complete"),
-                          expiresAt: Date().addingTimeInterval(lifetime), interval: interval)
+                          verificationURIComplete: complete, interval: interval)
     }
 
-    /// Poll at the server interval, adding five seconds on slow_down; never sleep beyond code expiry. Retry connection loss/5xx only within that lifetime,
-    /// and honor cancellation.
+    /// RFC 8628 supplies the polling pace; only a server response or cancellation settles authorization.
     public static func deviceToken(_ code: DeviceCode, endpoint: String, client: [String: String], basic: Bool = false) async throws -> [String: Any] {
-        var interval = max(code.interval, 1)
+        var interval = code.interval
         var form = client
         form["device_code"] = code.deviceCode
         form["grant_type"] = "urn:ietf:params:oauth:grant-type:device_code"
-        while Date() < code.expiresAt {
-            try await Task.sleep(for: .seconds(min(interval, max(code.expiresAt.timeIntervalSinceNow, 0))))
-            let remaining = code.expiresAt.timeIntervalSinceNow
-            guard remaining > 0 else { throw DeviceSignInFailure.expired }
-            let reply: (status: Int, answer: [String: Any]?)
-            do { reply = try await post(endpoint, form, basic: basic, timeout: remaining) }
-            catch is URLError { try Task.checkCancellation(); continue }
-            guard Date() < code.expiresAt else { throw DeviceSignInFailure.expired }
-            guard reply.status < 500, let answer = reply.answer else { continue }
+        while true {
+            try await Task.sleep(for: .seconds(interval))
+            let reply = try await post(endpoint, form, basic: basic)
+            let answer = reply.answer
+            guard reply.status < 500 else { throw DeviceSignInFailure(answer, status: reply.status) }
             switch answer["error"] as? String {
             case nil where reply.status < 400:
                 return answer
             case "authorization_pending"?: continue
             case "slow_down"?:
+                let slower = interval + 5
+                guard slower.isFinite, slower <= Double(Int32.max) else {
+                    throw DeviceSignInFailure.refused("its polling interval exceeded the supported range")
+                }
                 if let raw = answer["interval"] {
                     guard let supplied = seconds(raw), supplied > 0 else {
                         throw DeviceSignInFailure.refused("its polling interval was invalid")
                     }
-                    interval = max(supplied, interval + 5)
-                } else { interval += 5 }
+                    interval = max(supplied, slower)
+                } else { interval = slower }
             default: throw DeviceSignInFailure(answer, status: reply.status)
             }
         }
-        throw DeviceSignInFailure.expired
     }
 
     /// Bound supplied seconds to representable date/sleep values; invalid input stays nil.
@@ -354,8 +325,8 @@ public enum OAuthGrantOperations {
         return seconds
     }
 
-    /// Device codes must expire to bound their polling; token expiry is optional.
-    private static func deviceCodeLifetime(_ response: [String: Any]) throws -> TimeInterval {
+    /// The server must supply code validity; its token endpoint owns the expiry verdict.
+    private static func validateDeviceCodeLifetime(_ response: [String: Any]) throws {
         guard let raw = response["expires_in"] else {
             throw NSError(domain: "NativeOAuthFlow", code: -22,
                 userInfo: [NSLocalizedDescriptionKey: "OAuth response is missing required expires_in; no credential was saved."])
@@ -364,17 +335,19 @@ public enum OAuthGrantOperations {
             throw NSError(domain: "NativeOAuthFlow", code: -22,
                 userInfo: [NSLocalizedDescriptionKey: "OAuth response has invalid expires_in; no credential was saved."])
         }
-        return value
     }
 
     public static func formEncode(_ params: [String: String]) -> String {
-        var allowed = CharacterSet.urlQueryAllowed
-        allowed.remove(charactersIn: "+&=")
-        return params.map { k, v in
-            let ek = k.addingPercentEncoding(withAllowedCharacters: allowed) ?? k
-            let ev = v.addingPercentEncoding(withAllowedCharacters: allowed) ?? v
-            return "\(ek)=\(ev)"
-        }.joined(separator: "&")
+        params.map { "\(formComponent($0.key))=\(formComponent($0.value))" }.joined(separator: "&")
+    }
+
+    private static func formComponent(_ text: String) -> String {
+        text.utf8.map { byte in
+            switch byte {
+            case 65...90, 97...122, 48...57, 45, 46, 95, 126: String(UnicodeScalar(byte))
+            default: String(format: "%%%02X", byte)
+            }
+        }.joined()
     }
 
     static func updateProviderCredential(
@@ -430,10 +403,13 @@ public enum OAuthGrantOperations {
             ("rt_[A-Za-z0-9._-]{16,}",                               "rt_***REDACTED***"),
         ]
         for (pat, repl) in patterns {
-            if let re = try? NSRegularExpression(pattern: pat) {
+            do {
+                let re = try NSRegularExpression(pattern: pat)
                 out = re.stringByReplacingMatches(
                     in: out, range: NSRange(out.startIndex..., in: out),
                     withTemplate: repl)
+            } catch {
+                return "OAuth diagnostic redaction failed: \(error.localizedDescription)"
             }
         }
         return out

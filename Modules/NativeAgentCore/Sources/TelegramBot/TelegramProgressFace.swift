@@ -17,7 +17,11 @@ final class TelegramProgressFace {
     }
 
     func text(input: JSONValue, row: String) async -> String {
-        if source != input { source = input; epoch += 1 }
+        if source != input {
+            guard epoch < UInt64.max else { return "Telegram progress cannot publish: source epoch exhausted." }
+            source = input
+            epoch += 1
+        }
         let snapshot = await faces.sourceChanged(id: "telegram-progress", epoch: epoch, input: input)
         switch snapshot.status {
         case .ready:
@@ -36,11 +40,9 @@ final class TelegramProgressFace {
     nonisolated static func input(_ state: TelegramTurnPresentationState, at now: Date,
         replyTextSettled: Bool) -> JSONValue {
         let sinceMovement = max(0, now.timeIntervalSince(state.lastMovementAt))
-        let phase = TurnPresentationReducer.effectivePhase(state,
-            secondsSinceMovement: sinceMovement, stalledAfter: TurnPresentationReducer.defaultStalledAfter)
         return .object([
-            "kind": .string("progress"), "phase": .string(phase.rawValue),
-            "terminal": .bool(phase.isTerminal), "replyTextSettled": .bool(replyTextSettled),
+            "kind": .string("progress"), "phase": .string(state.phase.rawValue),
+            "terminal": .bool(state.phase.isTerminal), "replyTextSettled": .bool(replyTextSettled),
             "action": (state.writing?.line ?? state.currentAction).map(JSONValue.string) ?? .null,
             "delegate": state.delegateName.map(JSONValue.string) ?? .null,
             "elapsed": .double(max(0, (state.endedAt ?? max(now, state.startedAt)).timeIntervalSince(state.startedAt))),

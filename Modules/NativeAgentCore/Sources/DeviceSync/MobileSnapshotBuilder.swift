@@ -110,12 +110,91 @@ enum MacSyncSnapshotIntegrity {
 actor MobileSnapshotBuilder {
     static let shared = MobileSnapshotBuilder()
 
+    struct CapturedClock: Decodable, Sendable {
+        let capturedAt: String
+    }
+
+    struct GeneratedClock: Decodable, Sendable {
+        let generatedAt: Date
+    }
+
     func build<Value: Sendable>(_ operation: @Sendable () throws -> Value) rethrows -> Value {
         try operation()
     }
 
     func encode<Value: Encodable & Sendable>(_ value: Value) throws -> Data {
         try Self.encoder().encode(value)
+    }
+
+    /// Health contains launch facts. The committed elapsed sample required by installed phones changes only with those facts.
+    func health(_ health: RuntimeHealth, storedAt url: URL, rebuilding: Bool) async throws -> Data {
+        let data = try Self.encoder().encode(health)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let candidate = try decoder.decode(RuntimeHealth.self, from: data)
+        let stored: Data? = try await VolumeIO.run {
+            if rebuilding { return nil }
+            do { return try VolumeIO.contents(of: url) }
+            catch { if MacSyncEngine.isNoSuchFileError(error) { return nil }; throw error }
+        }
+        if let stored {
+            let previous = try decoder.decode(RuntimeHealth.self, from: stored)
+            if candidate == previous, case .object(let fields) = try JSONValue.parse(stored), fields["launchedAt"] != nil {
+                return stored
+            }
+        }
+        return data
+    }
+
+    /// A producer compares with the committed phone copy, including across launches. Only its observation clocks are ignored for equality.
+    func state<Value: Codable & Equatable & Sendable>(
+        _ candidate: Value, storedAt url: URL, rebuilding: Bool = false,
+        retainingClocks: @Sendable (inout Value, Value) -> Void,
+        stamp: @Sendable (inout Value, Value?, Date) throws -> Void
+    ) async throws -> Value {
+        try await state(candidate, storedAt: url, rebuilding: rebuilding, clock: Value.self,
+            retainingClocks: retainingClocks, stamp: stamp)
+    }
+
+    /// Reconstruction reads change clocks independently of the payload; ordinary unreadable copies fail their build.
+    func state<Value: Codable & Equatable & Sendable, Clock: Decodable & Sendable>(
+        _ candidate: Value, storedAt url: URL, rebuilding: Bool = false, clock: Clock.Type,
+        retainingClocks: @Sendable (inout Value, Value) -> Void,
+        stamp: @Sendable (inout Value, Clock?, Date) throws -> Void
+    ) async throws -> Value {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let candidate = try decoder.decode(Value.self, from: Self.encoder().encode(candidate))
+        let stored: (value: Value?, clock: Clock?) = try await VolumeIO.run {
+            let data: Data
+            do { data = try VolumeIO.contents(of: url) }
+            catch {
+                if rebuilding || MacSyncEngine.isNoSuchFileError(error) { return (nil, nil) }
+                throw error
+            }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let storedClock: Clock?
+            do { storedClock = try decoder.decode(clock, from: data) }
+            catch {
+                if !rebuilding { throw error }
+                storedClock = nil
+            }
+            do {
+                return (try decoder.decode(Value.self, from: data), storedClock)
+            } catch {
+                if rebuilding { return (nil, storedClock) }
+                throw error
+            }
+        }
+        if let previous = stored.value {
+            var comparison = candidate
+            retainingClocks(&comparison, previous)
+            if comparison == previous { return previous }
+        }
+        var value = candidate
+        try stamp(&value, stored.clock, Date())
+        return value
     }
 
     nonisolated static func encoder() -> JSONEncoder {
@@ -138,26 +217,45 @@ actor MobileSnapshotBuilder {
         try MobileDeskReadingCopy.data(from: items, encoder: Self.encoder())
     }
 
-    /// Admit whole faces against the actual transport envelope; one page that cannot fit never displaces its siblings.
-    func faces(_ snapshots: [String: PartFaceSnapshot]) throws -> (data: Data, skipped: [String: String]) {
+    /// Whole pages share the phone's file budget; a page that cannot fit carries its own unavailable cause.
+    func faces(_ snapshots: [String: PartFaceSnapshot]) throws -> Data {
         let encoder = Self.encoder()
-        var included: [String: PartFaceSnapshot] = [:]
-        var skipped: [String: String] = [:]
-        var data = try encoder.encode(included)
-        _ = try NAMobileSnapshotStatusCodec.encode(group: .faces, files: ["faces.json": data])
-        for (page, snapshot) in snapshots.sorted(by: { $0.key < $1.key }) {
-            var candidate = included
-            candidate[page] = snapshot
-            let bytes = try encoder.encode(candidate)
-            do {
-                _ = try NAMobileSnapshotStatusCodec.encode(group: .faces, files: ["faces.json": bytes])
-                included = candidate
-                data = bytes
-            } catch DeviceSyncError.payloadTooLarge(let actual, let maximum) {
-                skipped[page] = "Phone snapshot budget exceeded (\(actual) bytes; maximum \(maximum))."
+        var pages = try snapshots.map { id, snapshot in
+            (id: id, key: try encoder.encode(id), snapshot: snapshot, data: try encoder.encode(snapshot))
+        }.sorted { $0.id < $1.id }
+        func file() -> Data {
+            var data = Data("{".utf8)
+            for page in pages {
+                if data.count > 1 { data.append(contentsOf: ",".utf8) }
+                data.append(page.key)
+                data.append(contentsOf: ":".utf8)
+                data.append(page.data)
             }
+            data.append(contentsOf: "}".utf8)
+            return data
         }
-        return (data, skipped)
+        var data = file()
+        let maximumFileBytes = 4 * 1024 * 1024
+        let largest = pages.sorted {
+            $0.data.count == $1.data.count ? $0.id < $1.id : $0.data.count > $1.data.count
+        }
+        for page in largest where data.count > maximumFileBytes {
+            let snapshot = page.snapshot
+            let unavailable = PartFaceSnapshot(part: snapshot.part, version: snapshot.version, sourceEpoch: snapshot.sourceEpoch,
+                status: .unavailable, face: nil, error: PartCallError(code: "face_budget_exceeded",
+                    message: "This page needs \(page.data.count) bytes and doesn't fit with the other pages in the iPhone's 4 MiB page file. "
+                        + "Open it on your Mac or reduce its page content."), owed: snapshot.owed)
+            let replacement = try encoder.encode(unavailable)
+            pages = pages.map { entry in
+                entry.id == page.id ? (entry.id, entry.key, entry.snapshot, replacement) : entry
+            }
+            data = file()
+        }
+        guard data.count <= maximumFileBytes else {
+            throw DeviceSyncError.payloadTooLarge(actualBytes: data.count, maximumBytes: maximumFileBytes)
+        }
+        _ = try NAMobileSnapshotStatusCodec.encode(group: .faces, files: ["faces.json": data])
+        return data
     }
 
     func status(group: NAMobileSnapshotGroup, directory: URL, committed: [String: Data]) async throws -> String? {

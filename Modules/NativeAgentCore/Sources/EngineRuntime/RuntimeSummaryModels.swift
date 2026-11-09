@@ -1,7 +1,7 @@
 import Foundation
 // Blueprint: | `RuntimeSummaryModels.swift` | `KernelGuardrail`, `ApprovalClass`, `AutonomyKernelSummary`; Policy-only summaries |
 
-public struct KernelGuardrail: Identifiable, Codable, Hashable {
+public struct KernelGuardrail: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var title: String
     public var status: String
@@ -12,7 +12,7 @@ public struct KernelGuardrail: Identifiable, Codable, Hashable {
     }
 }
 
-public struct ApprovalClass: Identifiable, Codable, Hashable {
+public struct ApprovalClass: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var title: String
     public var requiresApproval: Bool
@@ -23,7 +23,7 @@ public struct ApprovalClass: Identifiable, Codable, Hashable {
     }
 }
 
-public struct AutonomyKernelSummary: Codable, Hashable {
+public struct AutonomyKernelSummary: Codable, Hashable, Sendable {
     public var status: String
     public var mode: String?
     public var enabled: Bool?

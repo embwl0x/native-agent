@@ -198,11 +198,10 @@ public struct ProposalRecord: Sendable, Codable, Equatable, Identifiable {
 // MARK: - Patch contract
 
 public enum MemoryPatchContract {
-    /// Untyped metadata round-trips pinning, tags, importance, duplicate counts and provenance. Exclude kind: semantic classification and approved backfill own
-    /// its typed writer.
+    /// Untyped metadata round-trips pinning, tags, importance and duplicate counts. Exclude kind: semantic classification and approved backfill own
+    /// its typed writer. Exclude roots: the store alone writes them, from a restatement it turns into roots itself.
     public static let untypedPassthroughKeys: Set<String> = [
-        "pinned", "tags", "importance", "recall_count",
-        "source_history", "duplicate_occurrences", "untrusted_sources", "peer_data_sources", "peer_sources",
+        "pinned", "tags", "importance", "recall_count", "source_history", "duplicate_occurrences",
     ]
 
 }
@@ -213,9 +212,11 @@ public struct SupersedingAcceptance: Sendable, Equatable {
     /// Acceptance requires a target fingerprint; proposals without one stay pending for re-review.
     public let expectedContentHash: String
     public let reason: String
-    public init(targetId: String, expectedContentHash: String, reason: String) {
+    public let restatesOwnPast: Bool
+    public init(targetId: String, expectedContentHash: String, reason: String, restatesOwnPast: Bool = false) {
         self.targetId = targetId
         self.expectedContentHash = expectedContentHash
         self.reason = reason
+        self.restatesOwnPast = restatesOwnPast
     }
 }

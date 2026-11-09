@@ -350,7 +350,7 @@ actor SenseHelperProcess {
         case .page: receipt = .object(["status": .string("ok"), "read": .bool(true)])
         }
         do { try AbilityStore(dataRoot: dataRoot).recordRun(id: record.id, version: record.candidateDigest ?? String(record.version), receipt: receipt,
-            turn: turn) }
+            nativeSense: record.status == .on && record.origin == .builtIn ? JSONValue.fromEncodable(record) : nil, turn: turn) }
         catch {
             // recordRun owns ledger repair; its failure cannot replace the outcome's truth.
             switch outcome {

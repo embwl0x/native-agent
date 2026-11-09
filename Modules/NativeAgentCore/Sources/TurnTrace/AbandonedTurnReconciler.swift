@@ -1,11 +1,33 @@
 import Experiences
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `AbandonedTurnReconciler.swift` | `TurnCheckpoint`: Life-bound checkpoint recovery and guarded retirement |
 
 /// The conversation is rebuilt from the transcript; only in-flight state lives here.
 public struct TurnCheckpoint: Codable, Sendable, Equatable {
+    /// A declared hidden arrival has no user transcript row. Its input stays with this checkpoint alone.
+    public struct HiddenInput: Codable, Sendable, Equatable {
+        public var persona: String?
+        public let origin: JSONValue?
+        public let attachments: [MultimodalAttachment]
+        public let completion: JSONValue?
+        public let queryUserMessage: String?
+        public let threadKind: ChatThreadKind?
+        public let ownedSessionID: String?
+        public let questionRunID: String?
+        public let verifiedSessionID: String?
+
+        public init(origin: JSONValue?, attachments: [MultimodalAttachment], completion: JSONValue?,
+                    queryUserMessage: String?, threadKind: ChatThreadKind?, ownedSessionID: String?,
+                    questionRunID: String?, verifiedSessionID: String?) {
+            self.origin = origin; self.attachments = attachments; self.completion = completion
+            self.queryUserMessage = queryUserMessage; self.threadKind = threadKind; self.ownedSessionID = ownedSessionID
+            self.questionRunID = questionRunID; self.verifiedSessionID = verifiedSessionID
+        }
+    }
+
     public let runId: String
     public var lifeID: String?
     public var stoppedReason: String?
@@ -18,6 +40,7 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public let envelope: [String: JSONValue]
     public let replyRoute: [String: JSONValue]
     public let fileAccess: String
+    public var fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling?
     public let capabilityProfile: String?
     public var peerSources: [String]?
     /// The steering peers the person's card answered in this run: a resume continues under that one card, never a second.
@@ -27,6 +50,7 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public let commandSignatureVerified: Bool?
     public let declaredRemote: Bool?
     public let helperDefinition: JSONValue?
+    public var hiddenInput: HiddenInput?
     public var keptProse = ""
     public var workingCommentaryCharacters = 0
     /// Persisted sentinel: 1 while a call awaits its receipt, nil otherwise; never a step index.

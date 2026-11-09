@@ -22,8 +22,7 @@ enum AgentWorkspaceApps {
     /// Small, explicit controls for common actions. The underlying owner still validates the supplied website and applies the normal conversation gates.
     static func quickAction(tool: String) -> AgentWorkspaceButton? {
         if tool == "browser.chrome_snapshot" {
-            return readButton("Read my current tab", tool: tool,
-                input: ["max_nodes": .int(80), "max_text_chars": .int(10000)])
+            return readButton("Read my current tab", tool: tool, input: [:])
         }
         switch tool {
         case "commit_memory":
@@ -212,7 +211,7 @@ enum AgentWorkspaceApps {
               case .array(let nodes)? = row["nodes"] else {
             // Recovery must retain the selected tab, even when its read is refused or stale.
             let retry: [AgentWorkspaceButton] = integer(input["tab_id"]).map { tab in
-                var arguments: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
+                var arguments: [String: JSONValue] = ["tab_id": .int(tab)]
                 if input["scope"] == .string("main_content") { arguments["scope"] = .string("main_content") }
                 return [readButton("Read this page again", tool: "browser.chrome_snapshot", input: arguments)]
             } ?? []
@@ -249,14 +248,7 @@ enum AgentWorkspaceApps {
             return !projectedIDs.contains(id)
         })
         metadata["workspace_actionable_count"] = .int(Int64(items.count))
-        if object(row["rendering"] ?? .null)["loaded"] == .bool(false) {
-            metadata["workspace_state"] = .string("loading")
-            metadata["workspace_detail"] = .string("""
-                This is the page observed while it is still loading. Read page again for more; opening the tab is not proof that search results or replies \
-                have finished loading.
-                """)
-        }
-        var current: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
+        var current: [String: JSONValue] = ["tab_id": .int(tab)]
         let reading = object(row["reading"] ?? .null)
         let mainContent = reading["scope"] == .string("main_content")
         if mainContent { current["scope"] = .string("main_content") }

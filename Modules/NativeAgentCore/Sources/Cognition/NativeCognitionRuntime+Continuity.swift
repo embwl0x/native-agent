@@ -264,7 +264,7 @@ extension NativeCognitionRuntime {
         return (themes.map { clipped($0, 160) }.filter { $0.count >= 8 }, clipped(text, 2_000))
     }
 
-    /// Report real Desk outcomes in order; name unreadable sources separately from empty ones.
+    /// Return the latest trusted Desk completion and count; name unreadable sources separately.
     nonisolated static func sinceGapItems(
         from: Date,
         to: Date,
@@ -286,7 +286,7 @@ extension NativeCognitionRuntime {
             let done = state.items
                 .filter {
                     $0.status == .done && inGap($0.closedAt.flatMap(DeskClock.parseISO)) && isRealTitle($0.title)
-                        && Reach.deskProvenanceTrusted($0, trusts: { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) })
+                        && Self.deskProvenanceTrusted($0, trusts: { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) })
                 }
                 .sorted { ($0.closedAt ?? "") > ($1.closedAt ?? "") }
             if let first = done.first {
@@ -294,6 +294,14 @@ extension NativeCognitionRuntime {
             }
         }
         return CognitiveCueRead(items, unreadable: unreadable)
+    }
+
+    /// A Desk item speaks for the person only when every step it carries was steered by peers the owner trusts.
+    nonisolated static func deskProvenanceTrusted(_ item: DeskItem, trusts: (String) -> Bool) -> Bool {
+        item.refs.allSatisfy { ref in
+            guard case .step(let step) = ref.kind else { return true }
+            return (step.peers + step.elevated).allSatisfy(trusts)
+        }
     }
 
     nonisolated static func isRealTitle(_ title: String) -> Bool {

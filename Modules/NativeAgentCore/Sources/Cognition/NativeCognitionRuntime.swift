@@ -67,24 +67,20 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     var lastInjectedBodyLine: String?
     var lastInjectedBodyLineAt: Date?
     /// Coalesce sensory bursts into one dirty-settlement pass; quiet time creates no wake.
-    var microcycleTimer = StoreReloadDebouncer.Timer()
+    var microcycleTask: Task<Void, Never>?
+    var microcycleDirty = false
     var microcycleTelemetry: CognitiveMicrocycleTelemetry
-    static let microcycleCoalescingDelay: TimeInterval = 0.25
-    var replayReconciliationPending = false
-    var replayRetryTask: Task<Void, Never>?
-    static let replayFailureRetryDelay: TimeInterval = 30
     /// Use committed dream/REM signals rather than an LLM heartbeat; runReflectionIfDue owns admission and reservation.
     var reflectionEventTask: Task<Void, Never>?
     var studioCanonTask: Task<Void, Never>?
-    /// Retain the hour through admission, terminal settlement and claim release.
-    var studioWanderTask: Task<Void, Never>?
+    /// Retain the horizon's source refresh until its settlement reanchors the residual deadline.
     var horizonRefreshTask: Task<Void, Never>?
-    var reachTask: Task<Void, Never>?
     var sourceWakes = CognitiveSourceWakes()
     var rhythm = RhythmRuntimeState()
+    /// The intake's own state: where thoughts open, sleep, and one batch's admission through landing, recording and ignition.
+    var attention = AttentionState()
     var lastStudioCanonTendingAt: Date?
     var lastStudioRelationAuditVerdict: String?
-    public static let eventDrivenReplayDeadlineSeconds: TimeInterval = 10
     func deadlineLogger(_ message: String) {
         FileHandle.standardError.write(Data("[NativeCognitionRuntime] \(message)\n".utf8))
     }
@@ -92,6 +88,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     var residualDeadline = CoalescingDeadline()
     /// Use real discrete lifecycle boundaries; analytic affect and node decay require no periodic wake.
     var cognitionDeadline = CoalescingDeadline()
+    var maintenanceFailure: String?
     /// Termination latches before cancellation so wake reanchoring cannot resurrect deadline tasks.
     public internal(set) var isFlushedForTermination = false
     /// Publish payload-free invalidations to mounted views instead of polling; canonical runtime state survives coalesced bursts.
@@ -103,7 +100,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     var pursuitCarriedContext: MyQueue.Context?
     let pursuitRead = LatestRead()
     var pursuitReadRevision: UInt64?
-    var pursuitCompletedRefreshRevision = SwiftNativeDeskStore.currentRevision
     var pursuitRefreshInFlight = false
     var pursuitRefreshQueued = false
     var pursuitObservationTask: Task<Void, Never>?
@@ -136,8 +132,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     }
     var organismPersistenceWaiters: [UInt64: [UUID: OrganismPersistenceWait]] = [:]
     var organismPersistenceLastResult = true
-    var organismPersistenceLastWriteAt: ContinuousClock.Instant?
-    var organismPersistenceDebounceTask: Task<Void, Never>?
     /// Carry non-live classification through every event in the same run.
     var nonLiveTurnKindByRunId: [String: CognitiveTurnKind] = [:]
     private var nonLiveTurnKindRunOrder: [String] = []
@@ -326,7 +320,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
         // Completion and live-turn timing are in-memory sources.
         if inherited.event.kind == .userMessageReceived || inherited.event.kind == .assistantTurnCompleted || inherited.event.kind == .providerFailure {
             sourceWakes.horizonDirty = true
-            sourceWakes.reachDirty = true
         }
         if somaticAccepted {
             cachedBodyRead = nil

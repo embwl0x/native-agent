@@ -93,15 +93,19 @@ extension iCloudBridge {
                 guard handled, message.metadata?["kind"] == PhonePlaceEvent.messageKind
                     || message.metadata?["kind"] == PhoneSenseEvent.messageKind
                     || message.metadata?["kind"] == PhoneRequestResult.messageKind else { return handled }
-                guard message.sender == "ios", let encoded = try? PairingSecret.existingSecretBase64(),
-                      let secret = Data(base64Encoded: encoded), message.verifySignature(secret: secret) else { return handled }
+                let secret: Data
+                do { secret = try await self.sync.storage.perform { try PairingSecret.requireExistingSecret() } }
+                catch { return handled }
+                guard await self.acceptsIncomingObserver(generation: observerGeneration),
+                      message.sender == "ios", message.verifySignature(secret: secret) else { return handled }
                 // Deliveries without answers still need durable signed progress so the phone can observe acceptance.
                 return (try? await self.sendChatMessage(text: "Mac received it", sessionID: message.sessionID,
                     correlationID: message.id, metadata: ["kind": "progress", "stage": "received"])) != nil
             }
             guard !Task.isCancelled, self.acceptsIncomingObserver(generation: observerGeneration)
             else { return }
-            if !subscriptionsReady { self.recordCloudKitPushUnavailable() }
+            if !subscriptionsReady { await self.recordCloudKitPushUnavailable() }
+            guard !Task.isCancelled, self.acceptsIncomingObserver(generation: observerGeneration) else { return }
             if self.deviceDrainTask != nil {
                 self.deviceDrainQueued = true
             } else {
@@ -159,10 +163,6 @@ extension iCloudBridge {
         }
         // Authentication suspended; a concurrent cancellation may have completed.
         if seenMessageIDs.contains(msg.id) { return true }
-        if !deviceDrainTriggeredByPush, let proof = cloudKitPushProofAt,
-           msg.timestamp > proof, Date().timeIntervalSince(msg.timestamp) > 16 {
-            recordCloudKitPushEvidence(received: false)
-        }
         switch disposition {
         case .permanentlyRejected(let reason):
             if reason == "stale_timestamp" {
@@ -206,7 +206,9 @@ extension iCloudBridge {
             }
             do {
                 let lastInput = (MacPersonInput.idle()?.seconds).map { Date().addingTimeInterval(-$0) }
-                try PhoneSenseHistory.record(event, dataRoot: PersistenceCore.defaultDataRoot(), afterPersonInput: lastInput)
+                let root = sync.dataRoot
+                try await sync.storage.perform { try PhoneSenseHistory.record(event, dataRoot: root, afterPersonInput: lastInput) }
+                if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
                 recordSeenMessageID(msg.id)
                 persistCKSeenIDs()
                 return true
@@ -222,7 +224,9 @@ extension iCloudBridge {
                 return true
             }
             do {
-                try PhonePlaceHistory.record(event, dataRoot: PersistenceCore.defaultDataRoot())
+                let root = sync.dataRoot
+                try await sync.storage.perform { try PhonePlaceHistory.record(event, dataRoot: root) }
+                if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
                 recordSeenMessageID(msg.id)
                 persistCKSeenIDs()
                 return true
@@ -232,7 +236,11 @@ extension iCloudBridge {
             }
         }
         if msg.metadata?["kind"] == PhoneRequestResult.messageKind {
-            phoneRequests.receive(msg)
+            do { try phoneRequests.receive(msg) }
+            catch {
+                syncStatus = "The phone request result could not be read: \(error.localizedDescription)"
+                return false
+            }
             recordSeenMessageID(msg.id)
             persistCKSeenIDs()
             return true
@@ -337,7 +345,7 @@ extension iCloudBridge {
         switch reservation {
         case .cancelled:
             do {
-                let record = try Self.readChat(message.id, dataRoot: dataRoot)
+                let record = try await sync.storage.perform { try Self.readChat(message.id, dataRoot: dataRoot) }
                 let session = record.assistantSessionId ?? message.sessionID
                 // A Stop arriving after execution cannot replace its saved words or ending.
                 if let session, let answer = try await SwiftNativeChatOrchestrationClient.savedReply(
@@ -345,8 +353,8 @@ extension iCloudBridge {
                     guard try await recoverReply(answer, route: AgentBridgeCompletionRoute(surface: "ios",
                         sessionId: session, sourceKey: route.routeKey, replyTo: route.replyTo,
                         correlationId: message.id)) != "owed" else { return .deferred }
-                } else if let session, try SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(
-                    dataRoot: dataRoot, sessionId: session, runId: message.id) {
+                } else if let session, try await sync.storage.perform({ try SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(
+                    dataRoot: dataRoot, sessionId: session, runId: message.id) }) {
                     try await MacChatTurnRuntime(dataRoot: dataRoot).stop(sessionId: session, runId: message.id)
                     return .deferred
                 } else {
@@ -370,7 +378,7 @@ extension iCloudBridge {
             if let resent = await resendSavedReply(message, route: route, dataRoot: dataRoot) { return resent ? .handled : .deferred }
             // The checkpoint owns unfinished work; the reservation owns its saved answer.
             do {
-                let record = try Self.readChat(message.id, dataRoot: dataRoot)
+                let record = try await sync.storage.perform { try Self.readChat(message.id, dataRoot: dataRoot) }
                 let session = record.assistantSessionId ?? message.sessionID
                 guard let session else { return .deferred }
                 guard let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: session, runId: message.id) else {
@@ -421,14 +429,55 @@ extension iCloudBridge {
         }
         return await startDeviceDrain(ck, trigger: trigger).value
     }
+    /// CloudKit has no stream: this read lifetime never waits on presence publication, push delivery or phone activity.
+    func startDeviceReceiveBeat() {
+        guard deviceReceiveBeatTask == nil, isSetUp, deviceTransport != nil else { return }
+        let generation = setupGeneration
+        deviceReceiveBeatTask = Task {
+            defer {
+                deviceReceiveBeatTask = nil
+                if isSetUp, generation != setupGeneration { startDeviceReceiveBeat() }
+            }
+            while !Task.isCancelled, isSetUp, generation == setupGeneration {
+                guard let ck = deviceTransport else { return }
+                if deviceDrainTask == nil { _ = startDeviceDrain(ck, trigger: .beat) }
+                else {
+                    deviceDrainQueued = true
+                    startDeviceMetadataDrainIfIdle(ck)
+                    _ = await ck.drainIncomingControls()
+                }
+                do { try await Task.sleep(for: .seconds(NAMacPresence.receiveInterval)) }
+                catch { return }
+            }
+        }
+    }
+
+    /// The person is here and pushes may drop: while the phone has spoken within its window, read at the phone's own pace.
+    /// A turn holds the chat drain, so only controls are read meanwhile: Stop still lands.
+    func readWhilePhoneOpen() {
+        guard phoneOpenReadTask == nil, isSetUp, phoneIsOpen else { return }
+        let generation = setupGeneration
+        phoneOpenReadTask = Task {
+            defer { phoneOpenReadTask = nil }
+            while !Task.isCancelled, isSetUp, generation == setupGeneration, speaksToPhone, phoneIsOpen {
+                if let ck = deviceTransport {
+                    if deviceDrainTask == nil { _ = startDeviceDrain(ck, trigger: .phoneOpen) }
+                    else { _ = await ck.drainIncomingControls() }
+                }
+                do { try await Task.sleep(for: .seconds(NAPhoneForegroundPresence.receiveInterval)) }
+                catch { return }
+            }
+        }
+    }
+    private var phoneIsOpen: Bool {
+        lastPhoneContactAt.map { Date().timeIntervalSince($0) < NAPhoneForegroundPresence.window } ?? false
+    }
     /// This handle owns the event-driven drain and awaited human turn, retaining exclusion through teardown.
     private func startDeviceDrain(_ ck: CloudKitDeviceTransport, trigger: DrainTrigger) -> Task<Bool, Never> {
         let generation = setupGeneration
         deviceDrainGeneration = generation
-        deviceDrainTriggeredByPush = trigger == .cloudKitPush
         let task = Task {
             defer {
-                deviceDrainTriggeredByPush = false
                 deviceDrainTask = nil
                 deviceDrainGeneration = nil
                 if isSetUp, deviceDrainQueued, let current = deviceTransport {
@@ -454,7 +503,8 @@ extension iCloudBridge {
         guard isSetUp, generation == setupGeneration else { return false }
         let accountGeneration = accountFailureGeneration
         let doctorGeneration = setupGeneration
-        startDeviceMetadataDrainIfIdle(ck)
+        // Status and pairing keep the independent receive beat's pace; only messages are read this fast.
+        if trigger != .phoneOpen { startDeviceMetadataDrainIfIdle(ck) }
         let result = await ck.drainIncoming()
         guard isSetUp, generation == setupGeneration else { return false }
         // The claim may have found another Mac while this drain was reading.
@@ -465,8 +515,8 @@ extension iCloudBridge {
                 doctorTransportHealth = .available
                 onTransportSucceeded?()
                 let note = ["\(count) drained", deviceReceiveNote].filter { !$0.isEmpty }.joined(separator: "; ")
-                OrganPulse.record("icloud_drain", found: count, note: note, cadence: nil)
-            case .skipped: OrganPulse.record("icloud_drain", .held, note: deviceReceiveNote, cadence: nil)
+                if trigger != .phoneOpen || count > 0 { OrganPulse.record("icloud_drain", found: count, note: note, cadence: nil) }
+            case .skipped: if trigger != .phoneOpen { OrganPulse.record("icloud_drain", .held, note: deviceReceiveNote, cadence: nil) }
             // No pulse: a drain that keeps failing goes overdue.
             case .failure(let error, _): doctorTransportHealth = Self.transportHealth(error)
             }
@@ -482,18 +532,34 @@ extension iCloudBridge {
         return result.dispatchedCount > 0
     }
     /// Separate serialized metadata reads from chat exclusion so slow status cannot hold the inbox.
-    func startDeviceMetadataDrainIfIdle(_ ck: CloudKitDeviceTransport, force: Bool = false) {
-        guard isSetUp, deviceMetadataDrainTask == nil,
-              force || Date() >= nextDeviceMetadataDrainAt else { return }
+    func startDeviceMetadataDrainIfIdle(_ ck: CloudKitDeviceTransport) {
+        guard isSetUp else { return }
+        if deviceMetadataDrainTask != nil {
+            deviceMetadataDrainQueued = true
+            return
+        }
         let generation = setupGeneration
-        nextDeviceMetadataDrainAt = Date().addingTimeInterval(NAPhoneForegroundPresence.beat)
         deviceMetadataDrainTask = Task {
-            defer { deviceMetadataDrainTask = nil }
-            await ck.drainPairing()
-            guard !Task.isCancelled, isSetUp, generation == setupGeneration else { return }
-            await ck.drainStatus()
-            guard !Task.isCancelled, isSetUp, generation == setupGeneration else { return }
-            await retryOwedControlPublication()
+            defer {
+                deviceMetadataDrainTask = nil
+                if isSetUp, deviceMetadataDrainQueued, let current = deviceTransport {
+                    deviceMetadataDrainQueued = false
+                    startDeviceMetadataDrainIfIdle(current)
+                }
+            }
+            repeat {
+                deviceMetadataDrainQueued = false
+                do { try await ck.drainPairing() }
+                catch {
+                    guard isSetUp, generation == setupGeneration else { return }
+                    syncStatus = "The iPhone pairing read failed: \(error.localizedDescription)"
+                    await recordSendResult(operation: "pairing read", error: error)
+                }
+                guard !Task.isCancelled, isSetUp, generation == setupGeneration else { return }
+                await ck.drainStatus()
+                guard !Task.isCancelled, isSetUp, generation == setupGeneration else { return }
+                await publishOwedOutcomes()
+            } while deviceMetadataDrainQueued && !Task.isCancelled
         }
     }
     func recordAccountFailure(_ failure: DeviceSyncAccountFailure) async {
@@ -533,8 +599,15 @@ extension iCloudBridge {
     /// The Mac owns bounded CloudKit retention in a separate single-flight task that never blocks drains.
     private func startDeviceRetentionSweepIfIdle(_ ck: CloudKitDeviceTransport) {
         guard isSetUp, deviceRetentionSweepTask == nil else { return }
+        let generation = setupGeneration
         deviceRetentionSweepTask = Task(priority: .utility) { [weak self] in
-            await ck.sweepExpiredRecords()
+            do { try await ck.sweepExpiredRecords() }
+            catch {
+                if let self, self.isSetUp, self.setupGeneration == generation {
+                    self.syncStatus = "CloudKit retention could not finish: \(error.localizedDescription)"
+                }
+                nativeLog("[iCloudBridge] retention failed: %@", error.localizedDescription)
+            }
             self?.deviceRetentionSweepTask = nil
         }
     }

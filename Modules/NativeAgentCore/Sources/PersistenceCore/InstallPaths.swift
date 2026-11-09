@@ -30,6 +30,8 @@ public struct InstallPaths: Sendable {
     }
     public var bridgeConfigRelativePath: String { usesPrimaryPaths ? ".config" : ".config/" + bundleIdentifier }
     public var bridgeConfigRoot: URL { home.appendingPathComponent(bridgeConfigRelativePath, isDirectory: true) }
+    /// Claude's worklog writer owns this path outside NativeAgent's data root.
+    public var claudeWorklog: URL { home.appendingPathComponent(".claude/state/claude-worklog.jsonl") }
     /// Every bundle owns its Chrome socket; the manifest's owner selects the relay.
     public var chromeSocket: URL {
         home.appendingPathComponent(".config/" + bundleIdentifier + "/chrome.sock")

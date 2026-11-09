@@ -9,7 +9,7 @@ import Browser
 import Dispatcher
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `BrowserWindow.swift` | MainActor WebKit waits; deadlines retire exact views, preserving unknown outcomes |
+// Blueprint: | `BrowserWindow.swift` | MainActor WebKit event waits; interruptions retire exact views, preserving unknown outcomes |
 
 // MARK: - Models
 
@@ -127,7 +127,7 @@ private final class BrowserCallbackWait<Value: Sendable> {
 }
 
 @MainActor
-final class BrowserWindowController: NSObject, ObservableObject {
+final class BrowserWindowController: NSObject, ObservableObject, NSWindowDelegate {
     static let shared = BrowserWindowController()
 
     /// The production controller must use the canonical data root.
@@ -187,6 +187,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
         win.contentView = wv
         win.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         win.isReleasedWhenClosed = false
+        win.delegate = self
         win.center()
         self.window = win
     }
@@ -224,10 +225,9 @@ final class BrowserWindowController: NSObject, ObservableObject {
         if browserOwnerID == runID { browserOwnerID = nil }
     }
 
-    /// A native deadline bounds even a silent renderer; interruption discards the exact view without claiming writes stopped or replaying them.
-    /// Only explicit navigation may establish a new page.
+    /// WebKit completion, process exit, window close or cancellation settles the exact view's wait.
     private func withWebKitCallback<Value: Sendable>(
-        in view: WKWebView, timeout: Duration = .seconds(10),
+        in view: WKWebView,
         start: (@escaping @MainActor (Result<Value, Error>) -> Void) -> Void
     ) async throws -> Value {
         try Task.checkCancellation()
@@ -245,11 +245,6 @@ final class BrowserWindowController: NSObject, ObservableObject {
             finish(.failure(error))
         }
         pendingWebKitWait = (id, interrupt)
-        let deadline = Task { @MainActor in
-            do { try await Task.sleep(for: timeout) } catch { return }
-            interrupt(BrowserError.timeout)
-        }
-        defer { deadline.cancel() }
         return try await withTaskCancellationHandler {
             start(finish)
             let done = wait.done
@@ -291,7 +286,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
 
         activeNavigationID = runID
         defer { activeNavigationID = nil }
-        return try await withWebKitCallback(in: webView, timeout: .seconds(30)) { finish in
+        return try await withWebKitCallback(in: webView) { finish in
             navDelegate.rejectedScheme = nil
             navDelegate.onFinish = finish
             guard let navigation = webView.load(URLRequest(url: url)) else {
@@ -311,6 +306,10 @@ final class BrowserWindowController: NSObject, ObservableObject {
               let pending = pendingWebKitWait else { return false }
         pending.interrupt(error is CancellationError ? BrowserError.outcomeUnknown : error)
         return true
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        pendingWebKitWait?.interrupt(BrowserError.outcomeUnknown)
     }
 
     func screenshot() async throws -> Data {

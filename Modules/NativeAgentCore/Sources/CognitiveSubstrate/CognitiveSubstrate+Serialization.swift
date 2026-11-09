@@ -18,7 +18,7 @@ enum CognitiveArtifactCodec {
         case "emotional_consolidation": required = ["ranAt", "reinforced", "calmed"]
         case "affect": required = ["updatedAt", "arousal", "uncertainty", "taskPressure", "socialWarmth"]
         case "disposition": required = ["updatedAt", "valence"]
-        case "dream_residue": required = ["updatedAt", "claimKeys"]
+        case "dream_residue": required = ["claimKeys"]
         case "mind_ledger": required = ["updatedAt", "suppressions", "undo"]
         case "episode": required = ["evidenceNodeIds", "externalEvidenceIds", "lineageId"]
         case "schema_proposal": required = ["confidence", "evidenceNodeIds", "externalEvidenceIds", "lineageId"]
@@ -61,7 +61,7 @@ enum CognitiveArtifactCodec {
                 }
             }
         }
-        if ["affect", "disposition", "dream_residue", "mind_ledger"].contains(family) {
+        if ["affect", "disposition", "mind_ledger"].contains(family) {
             try field("updatedAt") { $0.numberValue(coercingStrings: false, finiteOnly: true) != nil }
         }
         switch family {
@@ -99,6 +99,7 @@ enum CognitiveArtifactCodec {
                 try field(key) { if case .int(let count) = $0 { return count >= 0 }; return false }
             }
         case "affect":
+            try field("chosenRegister", nullable: true) { CognitiveChosenRegister(payload: $0) != nil }
             for key in ["arousal", "uncertainty", "taskPressure", "socialWarmth"] {
                 guard number(object, key, range: 0...1) else { throw FieldFailure(path: family + "." + key) }
             }
@@ -195,19 +196,6 @@ enum CognitiveArtifactCodec {
                 }
             } catch { throw FieldFailure(path: family + ".judgment: " + String(describing: error)) }
         }
-        if let value = object["careWatchWoke"] {
-            guard case .object(let rests) = value else { throw FieldFailure(path: family + ".careWatchWoke") }
-            for (key, value) in rests {
-                guard key.utf8.count <= 512, UUID(uuidString: String(key.suffix(36))) != nil,
-                      case .object(let rest) = value,
-                      rest["at"]?.numberValue(coercingStrings: false, finiteOnly: true) != nil,
-                      let streak = rest["streak"]?.numberValue(coercingStrings: false, finiteOnly: true),
-                      Int(exactly: streak).map({ $0 >= 0 }) == true,
-                      rest["lived"]?.stringValue.flatMap({ UInt64($0) }) != nil else {
-                    throw FieldFailure(path: family + ".careWatchWoke." + key)
-                }
-            }
-        }
     }
 }
 
@@ -227,6 +215,7 @@ extension CognitiveAffectState {
             // JSONValue's integer is signed; keep the full watermark when it does not fit, rather than trapping or lowering the proof.
             object["lived"] = Int64(exactly: lived).map(JSONValue.int) ?? .string(String(lived))
         }
+        if let chosenRegister { object["chosenRegister"] = chosenRegister.payload }
         // These are temporal anchors for the existing analytic quiet-time projection, not a second affect owner. Optional anchors remain absent when no
         // corresponding presence has been observed.
         if let lastUserPresenceAt {

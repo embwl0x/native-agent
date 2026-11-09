@@ -6,9 +6,11 @@ import PersistenceCore
 import ProviderRouting
 // Blueprint: | `SessionHistoryMessageProjection.swift` | `admission`, `project`. |
 
-/// Replay the retained tail in order without rewriting its words.
+/// Replay the held conversation in order without rewriting its words; a moment's context block stays on its row and never replays.
 /// Prior tool rounds lack provider call IDs, so render text evidence rather than inventing executable tool pairs.
-/// Merge consecutive roles and preserve orphaned assistant/tool history behind a user-side historical header.
+/// Rows that share a role join into one text block, so an exchange is two blocks whatever its tool count and the provider's
+/// lookback from the boundary before the current message always reaches the previous boundary.
+/// Preserve orphaned assistant/tool history behind a user-side historical header.
 package enum SessionHistoryMessages {
     package struct Result: Sendable {
         /// A nonempty prefix must start with a user message.
@@ -20,7 +22,6 @@ package enum SessionHistoryMessages {
         package let replayedRunIds: Set<String>
         package var historyIdentities: Set<String> = []
         package var rowCharacters: [String: Int] = [:]
-        package var replayedContexts: [SentTurnContext] = []
         package var contextWindow: String = "0:"
 
         package static let empty = Result(
@@ -30,10 +31,11 @@ package enum SessionHistoryMessages {
 
     package struct Admission: Sendable {
         let renderables: [(row: SessionHistoryPromptRenderer.Renderable, body: String)]
+        package var heldRows: Int { renderables.count }
     }
 
-    /// Admit exact sent user blocks and whole speech rows; nonpositive history limits disable admission.
-    /// A checked model budget is required even when the range is empty or disabled.
+    /// Admit the whole conversation with exact sent words and whole speech; request fitting owns its input budget.
+    /// Nonpositive history limits disable admission; a checked model budget is required even when the range is empty or disabled.
     package static func admission(
         messages: [ChatMessage],
         historyLimit: Int,
@@ -76,72 +78,63 @@ package enum SessionHistoryMessages {
         return project(admission)
     }
 
-    /// Replay stored context inside its original user block; never rebuild it or promote it to system authority.
+    /// A person's row opens with its own saved time; words and receipts keep their bytes; nothing is promoted to system authority.
     package static func project(
         _ admission: Admission
     ) -> Result {
         let admitted = admission.renderables
         guard !admitted.isEmpty else { return .empty }
 
-        var out: [(role: LLMMessage.Role, content: [LLMContentBlock], identities: Set<String>)] = []
+        var out: [(role: LLMMessage.Role, texts: [String], identities: Set<String>)] = []
         var rowCharacters: [String: Int] = [:]
         var replayedRunIds = Set<String>()
-        var replayedContexts: [SentTurnContext] = []
 
-        func append(_ role: LLMMessage.Role, _ blocks: [LLMContentBlock], identities: Set<String>) {
-            guard !blocks.isEmpty else { return }
+        func append(_ role: LLMMessage.Role, _ text: String, identity: String?) {
+            let identities: Set<String> = identity.map { [$0] } ?? []
             if out.last?.role == role {
-                out[out.count - 1].content.append(contentsOf: blocks)
+                out[out.count - 1].texts.append(text)
                 out[out.count - 1].identities.formUnion(identities)
             } else {
-                out.append((role, blocks, identities))
+                out.append((role, [text], identities))
             }
         }
 
         for (row, body) in admitted {
-            if body.isEmpty && row.sentContext?.block.isEmpty != false { continue }
+            // Nonempty sent words retain exact bytes, including whitespace-only content.
+            if body.isEmpty { continue }
             if out.isEmpty, row.isTool || row.role == "assistant" {
-                append(.user, [.text("[Earlier conversation; retained assistant and tool messages follow.]")], identities: [])
+                append(.user, "[Earlier conversation; retained assistant and tool messages follow.]", identity: nil)
             }
             if row.isTool {
                 rowCharacters[row.historyIdentity] = body.count
-                append(.assistant, [.text(body)], identities: [row.historyIdentity])
+                append(.assistant, body, identity: row.historyIdentity)
                 continue
             }
             switch row.role {
             case "user":
-                var blocks: [LLMContentBlock] = []
-                if let sent = row.sentContext {
-                    replayedContexts.append(sent)
-                    if !sent.block.isEmpty { blocks.append(.text(sent.block)) }
-                }
-                // Replay only text-bearing image blocks; nonempty sent words retain exact bytes, including whitespace-only content.
-                if !body.isEmpty { blocks.append(.text(body)) }
-                rowCharacters[row.historyIdentity] = body.count + (row.sentContext?.block.count ?? 0)
-                append(.user, blocks, identities: [row.historyIdentity])
+                let text = row.stamp.map { $0 + "\n" + body } ?? body
+                rowCharacters[row.historyIdentity] = text.count
+                append(.user, text, identity: row.historyIdentity)
                 if let runId = row.runId {
                     replayedRunIds.insert(runId)
                 }
             case "assistant":
-                let text = body
-                if !text.isEmpty {
-                    rowCharacters[row.historyIdentity] = text.count
-                    append(.assistant, [.text(text)], identities: [row.historyIdentity])
-                }
+                rowCharacters[row.historyIdentity] = body.count
+                append(.assistant, body, identity: row.historyIdentity)
             default:
                 // Fold non-conversation rows into the user side rather than inventing provider roles.
-                rowCharacters[row.historyIdentity] = row.role.count + 3 + body.count
-                append(.user, [.text("[\(row.role)] " + body)], identities: [row.historyIdentity])
+                let text = "[\(row.role)] " + body
+                rowCharacters[row.historyIdentity] = text.count
+                append(.user, text, identity: row.historyIdentity)
             }
         }
 
         let delivered = out.reduce(into: Set<String>()) { $0.formUnion($1.identities) }
         return Result(
-            messages: out.map { LLMMessage(role: $0.role, content: $0.content) },
+            messages: out.map { LLMMessage(role: $0.role, content: [.text($0.texts.joined(separator: "\n\n"))]) },
             replayedRunIds: replayedRunIds,
             historyIdentities: delivered,
             rowCharacters: rowCharacters.filter { delivered.contains($0.key) },
-            replayedContexts: replayedContexts,
             contextWindow: admitted.first?.row.historyIdentity ?? "0:"
         )
     }

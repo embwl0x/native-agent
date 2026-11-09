@@ -33,7 +33,9 @@ public enum NativeScreenCapture {
         // agent's captures.
         let filter = SCContentFilter(
             display: display,
-            excludingWindows: content.windows.filter { PersonOnlyWindows.contains(number: Int($0.windowID)) }
+            excludingWindows: content.windows.filter {
+                PersonOnlyWindows.isOwnProcess($0.owningApplication?.processID) || PersonOnlyWindows.contains(number: Int($0.windowID))
+            }
         )
         let configuration = SCStreamConfiguration()
         // SCDisplay dimensions are points; physical mode dimensions preserve Retina resolution. Transport consumers downscale as needed.

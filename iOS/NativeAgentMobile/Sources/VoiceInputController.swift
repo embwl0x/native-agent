@@ -5,7 +5,7 @@ import Speech
 import AVFoundation
 import os
 import NativeAgentShared
-// Blueprint: | `VoiceInputController.swift` | Session-bound capture and bounded on-device recognition; unsupported devices/locales name blockers |
+// Blueprint: | `VoiceInputController.swift` | Session-bound capture; recognition completion or cancellation settles the draft |
 
 enum VoiceInputAuthorizationPresentation {
     static func speechFailureMessage(
@@ -45,12 +45,11 @@ final class VoiceInputController {
     @ObservationIgnored private var audioToken: UUID?
     @ObservationIgnored private var hasRecognitionTask = false
     @ObservationIgnored private var desiredListening = false
-    @ObservationIgnored private var startGeneration = 0
+    @ObservationIgnored private var startGeneration = UUID()
+    @ObservationIgnored private var finalizingGeneration: UUID?
     private var waitingForFinalAfterStop = false
-    @ObservationIgnored private var finalResultTimeout: Task<Void, Never>?
     @ObservationIgnored private var hasStartedAudioSession = false
     @ObservationIgnored private var utterance: SpeechUtterance?
-    @ObservationIgnored private var captureDeadline: Task<Void, Never>?
     @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private let requestSpeechAuthorization: () async -> SFSpeechRecognizerAuthorizationStatus
     @ObservationIgnored private let requestMicrophoneAuthorization: () async -> Bool
@@ -85,10 +84,9 @@ final class VoiceInputController {
         guard !TalkModeController.shared.isPresented else { return }
         guard !Task.isCancelled, !isStarting, !waitingForFinalAfterStop else { return }
         // Cancel prior capture before starting so rapid presses cannot leak audio engines.
-        finalResultTimeout?.cancel()
-        finalResultTimeout = nil
         if hasRecognitionTask { teardownAudio(cancelTask: true) }
-        startGeneration += 1
+        startGeneration = UUID()
+        finalizingGeneration = nil
         let generation = startGeneration
         isStarting = true
         isVoiceNote = voiceNote
@@ -104,13 +102,6 @@ final class VoiceInputController {
         lastFinalTranscript = ""
         utterance = nil
         hasReceivedAudio = false
-        captureDeadline?.cancel()
-        captureDeadline = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(45))
-            guard !Task.isCancelled, let self, self.startGeneration == generation, self.isStarting else { return }
-            self.cancel()
-            self.error = "Voice input did not become ready within 45 seconds. Try again after speech assets finish downloading."
-        }
         defer {
             if generation == startGeneration, !isListening {
                 isStarting = false
@@ -143,7 +134,7 @@ final class VoiceInputController {
             let preparationError = try await MobileDictation.shared.prepareInput(token: token, names: names, onAudio: { [weak self] in
                 Task { @MainActor in
                     guard let self, self.startGeneration == generation
-                        || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1) else { return }
+                        || (self.waitingForFinalAfterStop && self.finalizingGeneration == generation) else { return }
                     self.hasReceivedAudio = true
                     if self.transcript.isEmpty { self.statusText = "Hearing you..." }
                 }
@@ -155,7 +146,7 @@ final class VoiceInputController {
             }, onResult: { [weak self, generation] utterance in
                 Task { @MainActor in
                     guard let self, self.startGeneration == generation
-                        || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1) else { return }
+                        || (self.waitingForFinalAfterStop && self.finalizingGeneration == generation) else { return }
                     self.utterance = utterance
                     self.transcript = utterance.text
                     if self.waitingForFinalAfterStop && utterance.isFinal { self.publishStoppedTranscript() }
@@ -163,14 +154,17 @@ final class VoiceInputController {
             }, onError: { [weak self, generation] detail in
                 Task { @MainActor in
                     guard let self, self.startGeneration == generation
-                        || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1) else { return }
-                    if let detail { self.error = detail }
-                    if self.waitingForFinalAfterStop { self.publishStoppedTranscript() }
-                    else if detail != nil { self.cancel() }
+                        || (self.waitingForFinalAfterStop && self.finalizingGeneration == generation) else { return }
+                    guard let detail else { return }
+                    self.error = detail
+                    self.waitingForFinalAfterStop = false
+                    self.desiredListening = false
+                    self.teardownAudio(cancelTask: true)
                 }
             })
             guard desiredListening, generation == startGeneration else {
-                try? await MobileDictation.shared.stopInput(token: token, cancelTask: true)
+                do { try await MobileDictation.shared.stopInput(token: token, cancelTask: true) }
+                catch { self.error = "Cancelled voice input could not release audio: \(error.localizedDescription)" }
                 return
             }
             if let preparationError {
@@ -201,7 +195,8 @@ final class VoiceInputController {
             return
         }
         guard desiredListening, generation == startGeneration else {
-            try? await MobileDictation.shared.stopInput(token: token, cancelTask: true)
+            do { try await MobileDictation.shared.stopInput(token: token, cancelTask: true) }
+            catch { self.error = "Cancelled voice input could not release audio: \(error.localizedDescription)" }
             return
         }
 
@@ -209,12 +204,6 @@ final class VoiceInputController {
         isStarting = false
         startedAt = Date()
         if isVoiceNote { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-        captureDeadline?.cancel()
-        captureDeadline = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(180))
-            guard !Task.isCancelled, let self, self.startGeneration == generation else { return }
-            self.stop()
-        }
         error = nil
         statusText = hasReceivedAudio && transcript.isEmpty ? "Hearing you..." : "Listening..."
     }
@@ -226,30 +215,22 @@ final class VoiceInputController {
         if levels.count > 96 { levels.removeFirst(levels.count - 96) }
     }
 
-    /// End audio on touch-up but publish only after bounded recognition finalization.
+    /// End capture on touch-up; only recognition completion publishes the final words.
     func stop() {
         guard !waitingForFinalAfterStop else { return }
         let hadRecordingSession = isListening || hasStartedAudioSession
         if !hadRecordingSession { startTask?.cancel() }
         desiredListening = false
-        captureDeadline?.cancel()
-        startGeneration += 1
+        finalizingGeneration = hadRecordingSession ? startGeneration : nil
+        startGeneration = UUID()
         waitingForFinalAfterStop = hadRecordingSession
         teardownAudio(cancelTask: !hadRecordingSession)
         isListening = false
         isStarting = false
-        statusText = nil
+        statusText = hadRecordingSession ? "Waiting for final recognition · Cancel to discard" : nil
         guard hadRecordingSession else {
             waitingForFinalAfterStop = false
             return
-        }
-        let stopGeneration = startGeneration
-        finalResultTimeout = Task { @MainActor [weak self] in
-            do { try await Task.sleep(for: .seconds(3)) }
-            catch { return }
-            guard let self, self.startGeneration == stopGeneration,
-                  self.waitingForFinalAfterStop else { return }
-            self.publishStoppedTranscript()
         }
     }
 
@@ -261,8 +242,8 @@ final class VoiceInputController {
 
     func cancel() {
         desiredListening = false
-        startGeneration += 1
-        captureDeadline?.cancel(); finalResultTimeout?.cancel()
+        startGeneration = UUID()
+        finalizingGeneration = nil
         startTask?.cancel()
         waitingForFinalAfterStop = false
         isLocked = false
@@ -272,9 +253,8 @@ final class VoiceInputController {
 
     private func publishStoppedTranscript() {
         guard waitingForFinalAfterStop else { return }
-        finalResultTimeout?.cancel()
-        finalResultTimeout = nil
-        startGeneration += 1
+        startGeneration = UUID()
+        finalizingGeneration = nil
         guard let utterance, !utterance.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             waitingForFinalAfterStop = false
             if error == nil {
@@ -296,9 +276,14 @@ final class VoiceInputController {
     private func teardownAudio(cancelTask: Bool) {
         if cancelTask { hasRecognitionTask = false }
         if let token = audioToken {
+            let generation = startGeneration
             Task {
                 do { try await MobileDictation.shared.stopInput(token: token, cancelTask: cancelTask) }
-                catch { NSLog("[VoiceInputController] audio session deactivate failed: %@", error.localizedDescription) }
+                catch {
+                    guard self.startGeneration == generation else { return }
+                    self.error = "Voice input could not finish: \(error.localizedDescription)"
+                    self.waitingForFinalAfterStop = false
+                }
             }
             if cancelTask { audioToken = nil }
         }

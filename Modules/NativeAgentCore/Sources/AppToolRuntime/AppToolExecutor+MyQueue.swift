@@ -14,7 +14,7 @@ extension AppToolExecutor {
     func runHouseFile(input: [String: JSONValue], surface: String, turn: Turn) async -> JSONValue {
         guard let title = input["title"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty,
               let summary = input["summary"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty,
-              let owner = ["me": HarnessFinding.Owner.agent, "builder": .builder, "user": .owner][input["owner"]?.scalarText ?? ""] else {
+              let owner = ["me": BodyFinding.Owner.agent, "builder": .builder, "user": .owner][input["owner"]?.scalarText ?? ""] else {
             return Self.doorRefusal("invalid_input", "Nothing was filed.", remedy: "fix_args",
                                     "Pass title, summary and owner: me, builder or user.")
         }
@@ -42,7 +42,7 @@ extension AppToolExecutor {
             let carried = DeskRef(kind: .step(DeskStep(words: summary, when: "own_turn",
                 peers: steer.sources, elevated: steer.elevated, session: turn.verifiedSessionID,
                 origin: turn.originPrincipal, replyRoute: TurnEnvelope.current(turn: turn, surface: surface).persistedMetadata())))
-            let item = try await HarnessQueue.file(HarnessFinding(key: key, title: title,
+            let item = try await BodyQueue.file(BodyFinding(key: key, title: title,
                 summary: summary, owner: owner,
                 // Carry only agent-owned items; builder and user items stay with their owners.
                 refs: refs.filter { $0.kind.token != "step" } + (owner == .agent ? [carried] : []), source: .agent),
@@ -74,6 +74,40 @@ extension AppToolExecutor {
         func text(_ key: String) -> String? {
             input[key]?.scalarText.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
         }
+        func completion(_ id: String, done: Bool, at: String?, summary: String?, evidence: [String: JSONValue]) -> JSONValue {
+            let change = done ? "done" : "dropped"
+            let when = at.map { " at " + $0 } ?? "; completion time is not recorded"
+            let outcome = summary.map { " Saved outcome: " + $0 + "." } ?? " No outcome summary was recorded."
+            var fields = evidence
+            fields["id"] = .string(id)
+            fields["completed_at"] = at.map(JSONValue.string) ?? .null
+            fields["outcome_summary"] = summary.map(JSONValue.string) ?? .null
+            return Self.doorRefusal(done ? "already_done" : "already_dropped",
+                "\(id) is already \(change)\(when)." + outcome, remedy: "none",
+                "Read the saved completion evidence; this step needs no further closure.", extra: fields)
+        }
+        func terminalStep(_ id: String, alias: String, in state: DeskState) async throws -> JSONValue? {
+            if let item = state.items.first(where: { $0.alias == alias || $0.handle == id }) {
+                guard let step = item.step, item.project == MyQueue.project || !step.promiseCaptures.isEmpty,
+                      item.status.isTerminal else { return nil }
+                return completion("desk." + item.alias, done: item.status == .done, at: item.closedAt, summary: item.summary,
+                    evidence: ["notes": .array(item.notes.map { $0.toJSON() }), "refs": .array(item.refs.map { $0.toJSON() })])
+            }
+            // The archive retains exact handles, not visible numbers or the full live step. Never infer an alias or require discarded refs.
+            guard let archived = try await store.archivedRecords().first(where: { $0.handle == id }),
+                  archived.project == MyQueue.project || archived.refs.contains(where: {
+                      if case .step(let step) = $0.kind { return !step.promiseCaptures.isEmpty }; return false
+                  }), archived.finalStatus != .superseded else { return nil }
+            return completion(archived.handle, done: archived.finalStatus == .done, at: archived.closedAt, summary: archived.summary,
+                evidence: ["refs": .array(archived.refs.map { $0.toJSON() }),
+                           "decisions": .array(archived.decisions.map(JSONValue.string)),
+                           "artifacts": .array(archived.artifacts.map(JSONValue.string))])
+        }
+        func missingStep(_ id: String, alias: String, in state: DeskState) async throws -> JSONValue {
+            if let terminal = try await terminalStep(id, alias: alias, in: state) { return terminal }
+            return Self.doorRefusal("not_found", "\(id) is not an open MY QUEUE step; nothing changed.", remedy: "fix_args",
+                "Read the Desk for its exact desk.N or handle. Missing work is not proof of completion.")
+        }
         func receipt(_ entry: MyQueue.Entry, _ change: String) -> JSONValue {
             var fields: [String: JSONValue] = ["status": .string("ok"), "id": .string(entry.name), "queue": .string(change), "owner": .string("agent"),
                      "peerSteering": .object(["sources": .array(entry.step.peers.map(JSONValue.string)),
@@ -84,7 +118,7 @@ extension AppToolExecutor {
             if entry.step.rhythm != nil, change != "done", change != "dropped" {
                 var times: [JSONValue] = [], cursor = Date()
                 while times.count < 3, let next = IntentionClock.next(entry.step, after: cursor) {
-                    times.append(.string(ResidentWake.shown(next))); cursor = next
+                    times.append(.string(MyQueue.shown(next))); cursor = next
                 }
                 fields["next"] = .array(times)
             }
@@ -92,7 +126,7 @@ extension AppToolExecutor {
             fields["until"] = .string({ switch MyQueue.until(entry) {
                 case .once: return "once"
                 case .standing: return "standing"
-                case .time(let date): return "at " + ResidentWake.shown(date)
+                case .time(let date): return "at " + MyQueue.shown(date)
                 case .words(let words): return words
             } }())
             if let say = entry.step.say { fields["say"] = .string(say) }
@@ -107,12 +141,12 @@ extension AppToolExecutor {
                         return Self.doorRefusal("invalid_input", "Nothing changed.", remedy: "fix_args", "Pass id: the step's desk.N.")
                     }
                     let alias = id.hasPrefix("desk.") ? String(id.dropFirst(5)) : id
-                    guard let entry = MyQueue.entries(try await store.liveState()).first(where: { $0.item.alias == alias || $0.item.handle == id }) else {
-                        return Self.doorRefusal("not_found", "No open step \(id).", remedy: "fix_args", "Read home for its desk.N.")
+                    let state = try await store.liveState()
+                    guard let entry = MyQueue.entries(state).first(where: { $0.item.alias == alias || $0.item.handle == id }) else {
+                        return try await missingStep(id, alias: alias, in: state)
                     }
-                    if let session = turn.verifiedSessionID,
-                       let by = try await store.hold(entry.item.handle, session: session) {
-                        return Self.doorRefusal("held_by", "\(entry.name) is held by \(by).", remedy: "none", "Leave it to that one.")
+                    if let conflict = try await store.runHold(entry.item.handle) {
+                        return conflict.refusal(entry.name)
                     }
                     editing = entry
                     // Parse the requested fields using add's grammar, keeping omitted fields exact below.
@@ -216,27 +250,35 @@ extension AppToolExecutor {
                 return Self.doorRefusal("invalid_input", "Nothing changed.", remedy: "fix_args", "Pass id: the step's desk.N from home.")
             }
             let alias = id.lowercased().hasPrefix("desk.") ? String(id.dropFirst(5)) : id
-            let open = MyQueue.entries(try await store.liveState())
+            let state = try await store.liveState()
+            let open = MyQueue.entries(state)
             guard let entry = open.first(where: { $0.item.alias == alias || $0.item.handle == id }) else {
-                return Self.doorRefusal("not_found", "\(id) is not an open MY QUEUE step; nothing changed.", remedy: "fix_args",
-                                        "\"What I mean to do\" and home's MY QUEUE name each open step by desk.N.")
+                return try await missingStep(id, alias: alias, in: state)
             }
-            if let session = turn.verifiedSessionID,
-               let by = try await store.hold(entry.item.handle, session: session) {
-                return Self.doorRefusal("held_by", "\(entry.name) is held by \(by), which is working it; nothing changed.",
-                                        remedy: "none", "Leave it to that one, or pick it up there.", extra: ["held_by": .string(by)])
+            if let conflict = try await store.runHold(entry.item.handle) {
+                return conflict.refusal(entry.name)
             }
             let dropped = verb == "drop"
             try await MyQueue.finish(entry, dropped: dropped, why: text("reason") ?? (dropped ? "dropped" : "done"), store: store)
-            // Closing a stopped run's queued step also closes the run and releases its holds.
-            if let run = MyQueue.skillRun(in: entry.step.words) {
-                do { try PartRunStore.discard(run, root: store.dataRoot) }
-                catch {
-                    return .object(Self.partSettlementFailure(Self.partFields(receipt(entry, dropped ? "dropped" : "done")),
-                        error: error, operation: "ability.queue_checkpoint_cleanup", id: run, root: store.dataRoot))
-                }
-            }
             return receipt(entry, dropped ? "dropped" : "done")
+        } catch let error as MyQueue.RunCleanupFailure {
+            return .object(Self.partSettlementFailure(Self.partFields(receipt(error.entry, verb == "drop" ? "dropped" : "done")),
+                error: error.underlying, operation: "ability.queue_checkpoint_cleanup",
+                id: error.runID, root: store.dataRoot))
+        } catch is MyQueue.Superseded {
+            do {
+                let state = try await store.liveState()
+                if let id = text("id") {
+                    let alias = id.lowercased().hasPrefix("desk.") ? String(id.dropFirst(5)) : id
+                    if let terminal = try await terminalStep(id, alias: alias, in: state) { return terminal }
+                }
+                return Self.doorRefusal("queue_changed", "The queued step changed before this operation; nothing changed.",
+                    remedy: "fix_args", "Read its current Desk record before changing it.")
+            } catch {
+                return Self.ownedFailure(error, code: "queue_failed", owner: "MY QUEUE",
+                    instruction: "Read the Desk and resolve the reported storage error before another change.",
+                    next: ["page": .string("desk")], effects: .none)
+            }
         } catch {
             return Self.ownedFailure(error, code: "queue_failed", owner: "MY QUEUE",
                 instruction: "Read home to reconcile the queue and resolve the reported cause before another change.",

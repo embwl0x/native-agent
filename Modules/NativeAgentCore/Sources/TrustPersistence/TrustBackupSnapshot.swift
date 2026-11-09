@@ -66,7 +66,7 @@ extension TrustBackupPersistence {
               object["kind"] == .string("backup"),
               object["id"] == .string(id),
               object["integrityVersion"] == .int(2),
-              object["scopeVersion"] == .int(3),
+              object["scopeVersion"] == .int(4),
               case .string(let personaPath)? = object["personaRoot"],
               case .string(let lifeID)? = object["lifeID"],
               UUID(uuidString: lifeID)?.uuidString.lowercased() == lifeID,

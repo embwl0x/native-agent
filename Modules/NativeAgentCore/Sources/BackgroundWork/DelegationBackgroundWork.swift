@@ -29,7 +29,7 @@ public struct DelegationBackgroundWork: Sendable {
 
     fileprivate func reconcileClosedReplyFindings(dataRoot: URL, configRoot: URL) async throws {
         let closed = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items.filter {
-            $0.project == HarnessQueue.project && $0.status.isTerminal && $0.closedAt != nil
+            $0.project == BodyQueue.project && $0.status.isTerminal && $0.closedAt != nil
                 && ($0.findingKey?.hasPrefix("delivery-residue|") == true
                     || $0.findingKey?.hasPrefix("delivery-failed-before-answer|") == true)
         }
@@ -75,7 +75,7 @@ public struct DelegationBackgroundWork: Sendable {
         let key = "delivery-failed-before-answer|" + route
         guard !records.isEmpty else {
             let note = "No replies \(destination) remain failed before an answer."
-            try await HarnessQueue.resolve(key: key, note: note, dataRoot: dataRoot)
+            try await BodyQueue.resolve(key: key, note: note, dataRoot: dataRoot)
             return
         }
         var ordered: [(path: URL, date: Date?)] = records.map { record in
@@ -97,7 +97,7 @@ public struct DelegationBackgroundWork: Sendable {
             DeskRef(refId: $0.path.path, kind: .file(path: $0.path.path, line: nil, label: nil))
         }
         let title = "Replies \(destination) failed before an answer"
-        _ = try await HarnessQueue.file(HarnessFinding(key: key, title: title,
+        _ = try await BodyQueue.file(BodyFinding(key: key, title: title,
             summary: "\(records.count) replies \(destination) failed before an answer\(span)\(missingDates) — inspect or let go",
             owner: .agent, refs: refs, source: .loop), dataRoot: dataRoot, refreshRefs: true)
     }
@@ -146,7 +146,7 @@ public struct DelegationBackgroundWork: Sendable {
                         let owed = read.jobs.filter { $0.agent == peer && $0.replyOwed }
                         let key = "delivery-residue|" + peer
                         if owed.isEmpty {
-                            try? await HarnessQueue.resolve(key: key, note: "No saved answers remain owed.", dataRoot: dataRoot)
+                            try? await BodyQueue.resolve(key: key, note: "No saved answers remain owed.", dataRoot: dataRoot)
                         } else {
                             // Preserve the contact name that agent.contacts exposes.
                             let id = peer.hasPrefix("peer:") ? String(peer.dropFirst(5)) : peer
@@ -154,7 +154,7 @@ public struct DelegationBackgroundWork: Sendable {
                             let name = contacts.first { $0.id == id }?.name
                                 ?? owed.lazy.compactMap(\.contactName).first { !$0.isEmpty }
                                 ?? (peer.hasPrefix("bot-run:") ? "a helper" : DelegationOutcomeCard.displayName(source: peer, agent: peer))
-                            _ = try? await HarnessQueue.file(HarnessFinding(key: key,
+                            _ = try? await BodyQueue.file(BodyFinding(key: key,
                                 title: "Replies owed to " + name,
                                 summary: "\(owed.count) saved replies to \(name) remain owed: the call that asked for each can no longer take it. "
                                     + "Wait on one with desk.wait {handle, on: <its id on this item>}, or let it go with repair.let_go {id, reason}.",
@@ -203,9 +203,7 @@ public struct DelegationBackgroundWork: Sendable {
                     try AgentConversationStore(dataRoot: dataRoot).noteDelegationEvent(
                         agent: job.agent, messageIDs: job.acceptedMessageIDs.sorted()
                     ) { row in
-                        // A terminal outcome may already settle the thread; only an owed answer can stall.
-                        guard row.phase == "waiting" || job.isTerminal else { return nil }
-                        return DelegationOutcomeCard.residentNotice(from: job, conversation: row.label)
+                        DelegationOutcomeCard.residentNotice(from: job, conversation: row.label)
                             .map { AgentConversationNotice(event: $0.event, text: $0.text) }
                     }
                 } catch {
@@ -213,7 +211,7 @@ public struct DelegationBackgroundWork: Sendable {
                         + "for \(job.source):\(job.id): \(error.localizedDescription)\n").utf8))
                     return false
                 }
-                // Failed-channel notices need an arrival inside the runtime to avoid returning down that channel.
+                // A failed channel returns to the agent's own mind stream, never down that channel.
                 if job.terminalOutcome == .failed,
                    !job.reachesAgent || DelegationOutcomeCard.residentNotice(from: job, conversation: "") == nil {
                     let name = job.displayName
@@ -223,9 +221,10 @@ public struct DelegationBackgroundWork: Sendable {
                     let word = job.runStatus ?? job.status ?? "failed"
                     var line = "\(name)'s wake failed" + (word == "failed" ? "" : " (\(word))")
                     if signIn { line += ": its sign-in failed or expired" } else if let head { line += ": \"\(head)\"" }
-                    ResidentWake.shared.request(dataRoot: dataRoot, reason: "what resolved", items: [.init(
-                        id: "wake-failed:\(job.source):\(job.id)", line: line, thread: "wake:" + job.agent,
-                        agent: signIn || head == nil || job.agent.isEmpty ? nil : job.agent, home: true)])
+                    // The line quotes the contact's words only when it carries the head of its reply.
+                    let quoted: [String]? = signIn || head == nil || job.agent.isEmpty ? nil : [job.agent]
+                    Attention.post(Happening(.returned, subject: "wake:" + job.agent, door: "delegation:" + job.source, words: line,
+                        once: "wake-failed:\(job.source):\(job.id)", peers: quoted), dataRoot: dataRoot)
                 }
                 return await recordBoundDelegationSettlement(dataRoot: dataRoot, job: job)
             },
@@ -260,7 +259,6 @@ public struct DelegationBackgroundWork: Sendable {
                 AgentConversationStore(dataRoot: dataRoot).fileURL,
                 dataRoot.appendingPathComponent("bots/run-queue.json"),
                 dataRoot.appendingPathComponent("bots/shelf-index.json"),
-                ResidentWake.url(dataRoot),
                 dataRoot.appendingPathComponent("desk/desk_ops.jsonl"),
                 dataRoot.appendingPathComponent("icloud/chat_delivery_receipts.jsonl"),
                 root.appendingPathComponent("claude-bridge/codex-completion-lifecycle", isDirectory: true),
@@ -342,7 +340,7 @@ public struct DelegationBackgroundWork: Sendable {
     private func fileDelegationRollup(dataRoot: URL, card: DelegationOutcomeCard, jobs: [DelegationReadout], adverse: Bool) async throws -> Bool {
         let members = jobs.filter { job in
             guard job.source == card.source, let outcome = job.terminalOutcome else { return false }
-            if !adverse { return outcome == .succeeded && !job.stalled }
+            if !adverse { return outcome == .succeeded }
             return !["owed", "sent_unconfirmed", "failed_before_answer"].contains(job.deliveryOutcome ?? "")
                 && (outcome == .failed || outcome == .unknown)
         }
@@ -569,10 +567,7 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
                     }
                     group.addTask {
                         guard !Task.isCancelled else { return "reply routes" }
-                        await ResidentWake.shared.routesChanged(dataRoot: dataRoot)
                         for await _ in routes {
-                            guard !Task.isCancelled else { break }
-                            await ResidentWake.shared.routesChanged(dataRoot: dataRoot)
                             guard !Task.isCancelled else { break }
                             await deferral.requestReplyReconciliation()
                             guard !Task.isCancelled else { break }
@@ -594,11 +589,6 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
     }
 
     func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        let stall = DelegationStatusProjector(configRoot: configRoot, dataRoot: dataRoot)
-            .nextStallDeadline(after: now)
-        // Healthy capped outcome batches request coalesced events; deadlines belong to domain work.
-        // Settlement failures do not yet carry their own wake, so this organ retains its six-hour integrity rhythm.
-        let conversation = port.nextConversationDeadline(after: now)
         var quietEnd: Date?
         do {
             if let window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot),
@@ -607,8 +597,13 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
                 await deferral.requestReplyReconciliation()
             }
         } catch {
-            // An unreadable preference cannot authorize release; repair/source events rearm the deadline.
+            await settle {
+                await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId,
+                    outcome: .failed(error: """
+                        Reply quiet-hours preferences unavailable: \(error.localizedDescription). Repair user_prefs.json to rearm release.
+                        """))
+            }
         }
-        return [stall, conversation, quietEnd].compactMap { $0 }.min()
+        return quietEnd
     }
 }

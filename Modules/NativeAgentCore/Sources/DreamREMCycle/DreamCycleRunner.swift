@@ -74,14 +74,16 @@ public actor DreamCycleRunner {
         force: Bool = false,
         trigger: DreamTrigger = .schedule,
         preview: Bool = false,
-        delivery: DreamEffectSink? = nil
+        delivery: DreamEffectSink? = nil,
+        parent: Turn? = nil,
+        beganAt: Date = Date()
     ) async throws -> DreamReport {
         if try !isDreamEnabled() {
             return DreamReport(disabled: true, trigger: trigger)
         }
 
         let diaryDir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
-        let dateKey = entryDateKey(for: trigger)
+        let dateKey = DreamREMSchedule.todayKey(now: beganAt)
         let outPath = diaryDir.appendingPathComponent("\(dateKey).md")
 
         // Hold the reservation from mark reconciliation through diary and mark commit.
@@ -210,7 +212,9 @@ public actor DreamCycleRunner {
         let raw: String
         do {
             try Task.checkCancellation()
-            var call = LLMCall(turn: nil, surface: "dream", purpose: "dream")
+            // Standalone dream work keeps its parent's identity without borrowing the parent's model route.
+            let identity = parent.map { Turn(id: $0.id, run: $0.run, session: $0.session) }
+            var call = LLMCall(turn: identity, surface: "dream", purpose: "dream")
             call.preview = preview
             raw = try await llm.complete(
                 prompt: prompt.text, system: dreamSystem, model: nil,
@@ -316,14 +320,12 @@ public actor DreamCycleRunner {
         _ = try await memory.store(content: lesson.lesson, source: "dream:\(dateKey)", metadata: .object([
             "kind": .string(lesson.kind == "how" ? "skill" : "fact"),
             "lesson_kind": .string(lesson.kind),
-            // Use the recorded surprise as evidence for the agent's inference.
-            "provenance": .string("inferred"),
-            "provenance_by": .string("self"),
             "dream": .string("dream_diary/\(dateKey).md"),
+            // Use the recorded surprise as evidence for the agent's inference.
             "evidence": .object(["speaker": .string("self"), "words": .string(lesson.from)]),
-            // Authorship cannot attest that unknown sources were clean.
-            "peer_sources": .array((sourcePeerIds ?? ["unattributed dream material"]).map(JSONValue.string)),
-        ]), context: MemoryWriteContext(turn: nil, senseReads: nil))
+        ]), context: MemoryWriteContext(
+            // The agent worked it out; its root names the material's principals, and authorship cannot attest that unknown sources were clean.
+            material: sourcePeerIds ?? ["unattributed dream material"], telling: MemoryRoot.Telling(how: .inferred, by: "self")))
     }
 
     private func commitDream(_ captured: DreamPendingWork) -> (written: Bool, errors: [String]) {
@@ -560,17 +562,4 @@ public actor DreamCycleRunner {
         return out
     }
 
-    /// Scheduled dreams target the preceding local day; manual runs target the current day.
-    /// The mark deduplicates material so the next scheduled run can append new writing to that same entry.
-    private func entryDateKey(for trigger: DreamTrigger) -> String {
-        switch trigger {
-        case .schedule:
-            return DreamREMSchedule.dreamEntryDateKey(now: now())
-        case .manual:
-            return DreamREMSchedule.todayKey(
-                now: now(),
-                calendar: DreamREMSchedule.localCalendar()
-            )
-        }
-    }
 }

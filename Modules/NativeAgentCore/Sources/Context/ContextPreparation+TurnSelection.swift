@@ -22,7 +22,7 @@ extension ContextPreparation {
         let allowedPrivacy: [String]
         /// Part of the key because it changes the DERIVED value: it decides whether every persona source is precovered or only the kernel's.
         let stableSegmentCarriesRequiredDocuments: Bool
-        let userMemoryCore: [String]?
+        let userMemoryCore: [String]
         let memoryRecallDisabled: Bool
         let excludedSourceOwners: Set<String>
 
@@ -121,8 +121,8 @@ extension ContextPreparation {
         // Precover persona USER atoms, but suppress canonical memory only for carried USER facts.
         if let user = mirror.documents.first(where: { $0.id.rawValue == "USER.md" }),
            let userSourceID = user.sourceID, precoveredSourceIDs.contains(userSourceID) {
-            let carried = UserMDAutogenMarkers.promptText(user.text, pinnedCore: request.userMemoryCore)
-            let facts = Self.generatedUserFacts(in: carried) ?? Set(carried.split(separator: "\n").compactMap { line in
+            let carried = UserMDAutogenMarkers.promptText(user.text, userMemoryCore: request.userMemoryCore)
+            let facts = Set(carried.split(separator: "\n").compactMap { line in
                 line.hasPrefix("- ") ? MemoryDisplayText.projectionJoinKey(String(line.dropFirst(2))) : nil
             })
             let factsByCore = Dictionary(grouping: facts, by: \.core)
@@ -395,35 +395,6 @@ extension ContextPreparation {
             expandablePointers: packet.expandablePointers.filter { !check.atomIDs.contains($0.atomID) },
             degradedSources: packet.degradedSources + check.unverified,
             budget: packet.budget, receipt: packet.receipt)
-    }
-
-    private static func generatedUserFacts(in text: String) -> Set<MemoryDisplayText.Key>? {
-        let preambleStart = UserMDAutogenMarkers.preambleStart
-        let preambleEnd = UserMDAutogenMarkers.preambleEnd
-        let bodyStart = UserMDAutogenMarkers.bodyStart
-        let bodyEnd = UserMDAutogenMarkers.bodyEnd
-        guard !text.contains(preambleStart),
-              !text.contains(preambleEnd),
-              let start = text.range(of: bodyStart),
-              let end = text.range(of: bodyEnd, range: start.upperBound..<text.endIndex),
-              text[..<start.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              text[end.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return nil }
-
-        var facts = Set<MemoryDisplayText.Key>()
-        for rawLine in text[start.upperBound..<end.lowerBound].split(
-            separator: "\n",
-            omittingEmptySubsequences: false
-        ) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty || line.hasPrefix("#") { continue }
-            guard line.hasPrefix("- ") else { return nil }
-            // Use the same join key as the canonical memory atom body.
-            let fact = MemoryDisplayText.projectionJoinKey(String(line.dropFirst(2)))
-            guard !fact.isEmpty else { return nil }
-            facts.insert(fact)
-        }
-        return facts
     }
 
 }

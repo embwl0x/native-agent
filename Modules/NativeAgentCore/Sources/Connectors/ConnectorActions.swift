@@ -99,34 +99,14 @@ public struct ConnectorActions: Sendable {
                 output = try await self.runCodexWorkJournal(input: input, dataRoot: dataRoot)
             case "codex.handoff":
                 output = try Self.readCodexHandoff(input: input)
-            case "mac.spotlight_search":
-                output = try await runMacSpotlightSearch(input: input, turn: turn)
-            case "mac.calendar_list_upcoming":
-                output = try await platform.macAction(.calendarListUpcoming, input: input, turn: turn)
-            case "mac.reminders_list_due_today":
-                output = try await platform.macAction(.remindersListDueToday, input: input, turn: turn)
-            case "mac.mail_list_recent":
-                output = try await platform.macAction(.mailListRecent, input: input, turn: turn)
-            case "mac.messages_list_recent":
-                output = try await platform.macAction(.messagesRecentThreads, input: input, turn: turn)
-            case "mac.notes_list_recent":
-                output = try await platform.macAction(.notesListRecent, input: input, turn: turn)
-            case "mac.notes_search":
-                output = try await platform.macAction(.notesSearch, input: input, turn: turn)
-            case "mac.contacts_search":
-                output = try await platform.macAction(.contactsSearch, input: input, turn: turn)
-            case "mac.notify":
-                output = try await self.runMacNotify(input: input, turn: turn)
-            case "mobile.notify":
-                output = try await runMobileNotify(input: input, turn: turn)
             case "mac_assistant.watch_templates":
                 output = try await self.runMacAssistantWatchTemplates()
             case "scheduler.schedule_job", "scheduler.create_job":
-                output = try await Self.runSchedulerCreateJob(input: input, dataRoot: dataRoot)
+                output = try await ScheduledReads.create(input, dataRoot: dataRoot)
             case "scheduler.list_jobs":
-                output = try await Self.runSchedulerListJobs(dataRoot: dataRoot)
+                output = try await ScheduledReads.list(dataRoot: dataRoot)
             case "scheduler.cancel_job":
-                output = try await Self.runSchedulerCancelJob(input: input, dataRoot: dataRoot)
+                output = try await ScheduledReads.cancel(input["jobId"]?.scalarText ?? "", dataRoot: dataRoot)
             default:
                 guard descriptor.id.hasSuffix(".status") else {
                     throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
@@ -162,7 +142,7 @@ public struct ConnectorActions: Sendable {
         )
     }
 
-    public func runMacSpotlightSearch(input: [String: JSONValue], toolName: String = "mac.spotlight_search", turn: Turn) async throws -> JSONValue {
+    public func runMacSpotlightSearch(input: [String: JSONValue], toolName: String, turn: Turn) async throws -> JSONValue {
         let query = input["query"]?.scalarText ?? ""
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(domain: "NativeAgentSwiftOnly", code: -400, userInfo: [
@@ -174,24 +154,9 @@ public struct ConnectorActions: Sendable {
         return NativeAppSecretRedactor.redactValue(result.toJSON(readContent: nil))
     }
 
-    public func runMacNotify(input: [String: JSONValue], toolName: String = "mac.notify", turn: Turn) async throws -> JSONValue {
+    public func runMacNotify(input: [String: JSONValue], toolName: String, turn: Turn) async throws -> JSONValue {
         let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: toolName)
         var obj = await platform.postMessage(title: title, body: message, turn: turn)
-        obj.merge([
-            "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
-        ]) { _, new in new }
-        return .object(obj)
-    }
-
-    public func runMobileNotify(input: [String: JSONValue], turn: Turn) async throws -> JSONValue {
-        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mobile.notify")
-        // mobile.notify pins delivery to the phone, with routing and settlement owned by the router.
-        let matter = Matter(id: "mobile_notify:" + UUID().uuidString.lowercased(), form: .words,
-            from: input["source"]?.scalarText ?? "connector_action", title: title, summary: message,
-            open: turn.verifiedSessionID.map { "chat:" + $0 })
-        let receipt = try await platform.attentionRouter().tell(matter, reach: .pinned(.phone, from: nil), turn: turn).requireReceipt()
-        var obj = receipt.deliveryFields()
         obj.merge([
             "title": .string(NativeAppSecretRedactor.redactText(title)),
             "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
@@ -203,40 +168,6 @@ public struct ConnectorActions: Sendable {
         let impl = platform.macAssistantStatusClient()
         let status = try await impl.macAssistantStatus(lightweight: false)
         return status.toJSON()
-    }
-
-    public static func runSchedulerCreateJob(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
-        let writer = makeSchedulerJobWriter(dataRoot: dataRoot)
-        let job = try await writer.createJob(body: .object(input))
-        return .object([
-            "status": .string("completed"),
-            "job": job,
-        ])
-    }
-
-    public static func runSchedulerListJobs(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
-        let writer = makeSchedulerJobWriter(dataRoot: dataRoot)
-        let jobs = try await writer.listJobs()
-        return .object([
-            "status": .string("completed"),
-            "count": .int(Int64(jobs.count)),
-            "jobs": .array(jobs),
-        ])
-    }
-
-    public static func runSchedulerCancelJob(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
-        let jobId = input["jobId"]?.scalarText?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let writer = makeSchedulerJobWriter(dataRoot: dataRoot)
-        let result = try await writer.cancelJob(jobId: jobId)
-        if case .object(var obj) = result {
-            obj["status"] = .string("completed")
-            return .object(obj)
-        }
-        return .object([
-            "status": .string("completed"),
-            "result": result,
-        ])
     }
 
     public static func readCodexHandoff(input: [String: JSONValue]) throws -> JSONValue {

@@ -1,8 +1,8 @@
 /* NativeAgent ability
-{"id":"due-reminders","kind":"ability","version":1,
+{"id":"due-reminders","kind":"ability","version":2,
  "reach":{"capabilities":["reminders"]},
  "face":{"page":"reminders"},
- "record":{"description":"Read reminders in two named parts: today (local day, earliest first) and overdue (before today, oldest first). Each has its full count, capped reminders and has_more; summary names both counts. Includes at most 200 reminders per part from one native query snapshot. Permission and unavailable results retain their native evidence.","actions":["reminders.query"],"inputSchema":{"type":"object","required":["request","now","timeZone"]}}}
+ "record":{"description":"The day split behind reminders.due_today: one native reminders query cut at the local day's start into today and overdue parts.","actions":["reminders.query"],"inputSchema":{"type":"object","required":["request","now","timeZone"]}}}
 */
 function run(input) {
     const request = input.request;

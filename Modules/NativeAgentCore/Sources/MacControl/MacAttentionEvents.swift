@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 #if canImport(AppKit) && os(macOS)
 import AppKit
 #endif
@@ -67,12 +68,16 @@ public struct UnavailableMacAttentionEventSource: MacAttentionEventSource {
 #if canImport(AppKit) && canImport(CoreGraphics) && os(macOS)
 
 private final class SystemMacAttentionObservation: MacAXEffectObservation, @unchecked Sendable {
+    let routingOwner: UUID
+    let routingOpen: Task<Void, Never>
     private let lock = NSLock()
     private var eventMonitors: [Any]
     private var workspaceObserver: NSObjectProtocol?
     private var stopped = false
 
-    init(eventMonitors: [Any], workspaceObserver: NSObjectProtocol?) {
+    init(eventMonitors: [Any], workspaceObserver: NSObjectProtocol?, routingOwner: UUID, routingOpen: Task<Void, Never>) {
+        self.routingOwner = routingOwner
+        self.routingOpen = routingOpen
         self.eventMonitors = eventMonitors
         self.workspaceObserver = workspaceObserver
     }
@@ -90,6 +95,8 @@ private final class SystemMacAttentionObservation: MacAXEffectObservation, @unch
         workspaceObserver = nil
         lock.unlock()
 
+        let opening = routingOpen, owner = routingOwner
+        Task { await opening.value; await MacInputRouting.close(owner) }
         for monitor in monitors { NSEvent.removeMonitor(monitor) }
         if let observer {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
@@ -134,7 +141,12 @@ public struct SystemMacAttentionEventSource: MacAttentionEventSource {
             ]
 
             func activity(from event: NSEvent) -> MacAttentionActivity? {
-                guard let input = event.cgEvent, MacPersonInput.isPerson(input) else { return nil }
+                guard let input = event.cgEvent else { return nil }
+                let token = input.getIntegerValueField(.eventSourceUserData)
+                Task { await MacInputRouting.routed(token) }
+                guard NativePersonInput.isPerson(input) else { return nil }
+                let targetPID = Int32(clamping: input.getIntegerValueField(.eventTargetUnixProcessID))
+                if PersonOnlyWindows.isFaceProcess(targetPID) { return nil }
                 // While the person's own chat is up, only Stop hands back control; otherwise physical input revokes it immediately.
                 if PersonOnlyWindows.isShowing {
                     PersonOnlyWindows.notePersonInput()
@@ -191,9 +203,12 @@ public struct SystemMacAttentionEventSource: MacAttentionEventSource {
             ) { _ in
                 handler(MacAttentionActivity(kind: .appChanged))
             }
+            let routingOwner = UUID()
+            let available = monitors.count == 2
+            let routingOpen = Task { await MacInputRouting.open(routingOwner, available: available) }
             return SystemMacAttentionObservation(
                 eventMonitors: monitors,
-                workspaceObserver: workspace
+                workspaceObserver: workspace, routingOwner: routingOwner, routingOpen: routingOpen
             )
         }
         if Thread.isMainThread { return install() }

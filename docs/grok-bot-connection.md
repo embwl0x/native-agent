@@ -1,6 +1,6 @@
 # Grok Bot connection
 
-The `grok-bot` row in `AgentHostDirectory` uses the installed app with bundle ID
+The `grok-bot` row in `Resources/agent-hosts.json` uses the installed app with bundle ID
 `com.anysphere.sand`. Its route is a webhook routine with a local reply helper.
 
 ## Connect
@@ -10,10 +10,11 @@ Sign in to Grok Bot and grant NativeAgent Accessibility access if required.
 Desktop replies use the Accessibility transcript. If that read is unavailable,
 the reply retains its existing partial text and names the blocker and recipe
 repair; it does not capture a screenshot or use OCR as another reader.
-Every desktop reply observation ends at its existing three-minute reply
-deadline, including when Accessibility notifications are supported. An
-unconfirmed answer remains partial, its receipt names the deadline, and any
-later answer stays in the Grok chat. Nothing is resent. Submission and reply
+Desktop reply observation follows Accessibility and workspace events until the
+correlated nonempty reply with its answering control idle, a concrete failure,
+app closure or cancellation. Without terminal evidence the request remains
+waiting, with any partial text retained and Stop available. Unsupported
+observation is reported directly; no polling reader replaces it. Nothing is resent. Submission and reply
 correlation share whitespace normalization that preserves punctuation and emoji;
 a punctuation-only or emoji-only accepted message retains its identity.
 Foreground setup, desktop sends and foreground restoration use the Mac hands'
@@ -46,12 +47,20 @@ the chat's **Open routine** button and row `AXPress` are not navigation paths.
 The Webhook view is read natively. Readable fields use their AX value directly;
 only a masked field can use its own group's Copy button. Empty or unreadable
 unmasked fields stop without Copy. Native code preserves the clipboard and
-captures Copy's published generation once, including a pending publication
-after physical takeover. It accepts text only while that generation remains
+holds the same cancellable clipboard lease as Grok routine sends and
+DesktopChat sends, from preservation through cleanup. A second operation waits
+for that cleanup; Stop removes its wait without touching the active owner's
+clipboard, and no timer transfers ownership. Native code
+reads the pasteboard's `changeCount` at native Copy completion, without waiting
+on unrelated AX or workspace events. A Copy that completes without publication
+reports that missing evidence. It accepts text only while that generation remains
 current, checking again after the native read; a newer generation is refused
 and never adopted or overwritten. Settlement clears the owned generation and
 restores the previous contents only if that generation is still current,
-after success, failure, Stop or physical takeover alike. Neither field values
+after success, failure, Stop or physical takeover alike. Native Copy returns
+before that settlement starts; adoption, readback and release share one
+uncancelled settlement, so Stop cannot restore the clipboard under that action.
+Neither field values
 nor clipboard values reach the recipe, JavaScript, model, logs or receipts.
 A receipt reports field counts and whether
 each was readable or needed its own Copy control. Field labels, Copy grouping
@@ -94,7 +103,9 @@ precedence through that same generation, including cleanup and foreground restor
 
 Send and read through `app` actions `agent.message` and `agent.read`.
 Before the webhook POST, `GrokRequestStore` binds the message ID to its contact
-and initiating conversation. HTTP 200 means accepted and waiting; a network
+and the asking chat's session (where the answer returns). Receipts and the
+webhook body name the one Grok conversation, `GrokBotRoute.conversation(peer:)`
+(the contact's thread), never the asking chat. HTTP 200 means accepted and waiting; a network
 failure means an unknown outcome. The webhook is not automatically retried.
 A read after ten minutes without an answer reports `no answer in time`;
 silence cannot establish whether Grok is waiting for local approval.
@@ -128,8 +139,8 @@ its pending handover in one durable transition. A failed write leaves it
 claimable; an identical webhook replay keeps the saved handover intact.
 `GrokInboundReply` projects that saved answer onto the exact conversation
 exchange, repeating only this projection after a failed response or restart.
-If Agent's waiting turn already took the answer, it
-does not start a second turn; otherwise the answer is handed into the initiating
+If Agent's waiting turn, a read in the asking chat or the room already took the
+answer, it does not start a second turn; otherwise the answer is handed into the initiating
 chat with peer authorship. A person-initiated quiet send settles without waking
 Agent.
 

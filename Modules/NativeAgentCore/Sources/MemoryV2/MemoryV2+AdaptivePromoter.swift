@@ -32,14 +32,7 @@ public actor AdaptiveMemoryPromoter {
     var inFlightMoments: Set<String> = []
     /// Accepted transcript settlements, including ones still reaching the door. Sleep joins these recordings independently of the interpretation tail.
     private var owedRecordings: [UUID: Task<String?, Never>] = [:]
-    /// The owed-row retry cursor: whether a batch skipped the row, what its failed attempt depended on, when it was last tried (RAM: a relaunch starts
-    /// every row due).
-    var owedRetry: [String: OwedAttempt] = [:]
-    /// Turns this process recorded owed; a row that failed outside the model call is due again once another turn is held.
-    var heldTurns = 0
-    /// Judgment calls the provider answered, by judging route; a row whose call failed is due again once its route answers.
-    var answeredCalls: [String?: Int] = [:]
-    var owedDrainTimer: (id: UUID, deadline: Date, task: Task<Void, Never>)?
+    var recoveries: [String: RecoveryCheckpoint] = [:]
     var pendingLiveObservations = 0
     var observationTail: Task<AdaptiveMemoryObservation, Never>?
     /// Every observation or drain still running (the tail and the ones it waits on), so sleep can stop them all.
@@ -139,7 +132,6 @@ public actor AdaptiveMemoryPromoter {
             turnId: turn.id, runId: turn.run, messageId: origin?.messageId,
             occurredAt: origin?.occurredAt, repliedAt: repliedAt, took: origin?.took, standingAgentName: standingAgentName,
             envelope: TurnEnvelope.current(turn: turn, surface: surface).persistedMetadata(),
-            sourceCheckpoint: MemoryDataProvenance.sources(in: MemoryDataProvenance.stamping(nil, turn: turn)),
             elevatedSources: steer.elevated, originPrincipal: turn.originPrincipal,
             carriedSources: steer.sources, careWakes: origin?.careWakes)
         let recordingID = UUID()
@@ -149,7 +141,6 @@ public actor AdaptiveMemoryPromoter {
             guard !ownWork || momentTurn.isCareWake else { return nil }
             // Everything the door needs is in the captured turn; settlement does not inherit task locals or the caller's cancellation.
             let id = await settle { await door.recordOwed(momentTurn) }
-            if id != nil { heldTurns += 1 }
             if let id, !stopped { inFlightMoments.insert(id) }
             return id
         }
@@ -168,8 +159,6 @@ public actor AdaptiveMemoryPromoter {
     public func sleep() async {
         stopped = true
         heldDrainIsIdle = nil
-        owedDrainTimer?.task.cancel()
-        owedDrainTimer = nil
         for operation in liveOperations.values { operation.cancel() }
         let recordings = Array(owedRecordings.values)
         for recording in recordings { _ = await recording.value }
@@ -196,11 +185,11 @@ public actor AdaptiveMemoryPromoter {
     }
 
     public func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String? = nil,
-        topK: Int? = nil) async throws -> Set<String> {
+        topK: Int? = nil, turn: Turn? = nil) async throws -> Set<String> {
         guard let memoryManager else {
             throw MemoryV2Error.underlying("Recall relevance is unavailable. Configure the selected memory model in Settings, then retry this query.")
         }
-        switch await memoryManager.relevantRecallIDs(query: query, candidates: candidates, generation: generation, topK: topK) {
+        switch await memoryManager.relevantRecallIDs(query: query, candidates: candidates, generation: generation, topK: topK, turn: turn) {
         case .success(let ids): return ids
         case .failure(let failure):
             throw MemoryV2Error.underlying("""
@@ -224,7 +213,6 @@ public actor AdaptiveMemoryPromoter {
         ))
         let momentID = liveMomentID(sessionId: sessionId, origin: origin)
         defer { if let momentID { inFlightMoments.remove(momentID) } }
-        // ResidentWake's dedicated session carries app-authored arrivals.
         guard let momentID,
               !Task.isCancelled, let memory else { return skipped }
         let standingAgent = standingAgentName != nil
@@ -240,8 +228,9 @@ public actor AdaptiveMemoryPromoter {
         return observation
     }
 
-    func unavailablePromotionPolicy(_ error: Error, surface: String) async -> AdaptiveMemoryObservation {
+    func unavailablePromotionPolicy(_ error: Error, surface: String, momentID: String, basis: OwedBasis?) async -> AdaptiveMemoryObservation {
         let cause = error.localizedDescription
+        if !Self.isCancellation(error) { await waitForChange(momentID, since: basis, cause: .trust, words: cause) }
         await RepairOwed.owe(door?.dataRoot ?? PersistenceCore.defaultDataRoot(),
             id: "trust-policy:adaptive-promotion", kind: .run,
             operation: "memory.promotion.authority", owner: "Trust policy", words: cause,

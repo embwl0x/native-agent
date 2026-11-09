@@ -15,7 +15,7 @@ import Network
 
 extension iCloudBridge {
     /// Receive/repair events re-signal one owed outcome; without an event, disk retains it without timers or new identity.
-    func retryOwedControlPublication() async {
+    func publishOwedOutcomes() async {
         let root = sync.dataRoot
         let directory = root.appendingPathComponent("icloud/chat_transactions", isDirectory: true)
         do {
@@ -29,7 +29,7 @@ extension iCloudBridge {
                     do {
                         let row = try JSONDecoder().decode(ChatRecord.self, from: Data(contentsOf: file))
                         guard row.direction == "mac_to_ios", row.state != "completed", let saved = row.outboundMessage,
-                              ["steered", "steer_returned"].contains(saved.metadata?["kind"] ?? "") else { continue }
+                              Self.isOutcomePublication(saved.metadata) else { continue }
                         guard Self.chatURL(saved.id, dataRoot: root) == file, row.msgId == saved.id else { throw CocoaError(.fileReadCorruptFile) }
                         messages.append(saved)
                     } catch { gaps.append("\(file.lastPathComponent): \(error.localizedDescription)") }
@@ -38,15 +38,47 @@ extension iCloudBridge {
             }
             if !pending.1.isEmpty { syncStatus = "Retained phone publications are unreadable: " + pending.1.joined(separator: "; ") }
             // Persisted rows own their bytes; memory holds only not-yet-filed outcomes.
-            let candidates = (pending.0 + Array(pendingControlPublications.values)).sorted { $0.id < $1.id }
-            guard let message = candidates.first(where: { $0.id > controlPublicationCursor }) ?? candidates.first else { return }
-            controlPublicationCursor = message.id
+            let candidates = (pending.0 + Array(pendingOutcomePublications.values)).sorted { $0.id < $1.id }
+            guard let message = candidates.first(where: { $0.id > outcomePublicationCursor }) ?? candidates.first else { return }
+            outcomePublicationCursor = message.id
             _ = try await sendChatMessage(text: message.text, sessionID: message.sessionID,
                 correlationID: message.correlationID, metadata: message.metadata,
                 attachments: message.attachments ?? [], messageID: message.id, timestamp: message.timestamp)
+            if Self.isNoPostPublication(message.metadata) {
+                NotificationCenter.default.post(name: .chatTurnCompleted, object: message.sessionID)
+            }
         } catch {
             syncStatus = "Phone steering outcome delivery remains owed: \(error.localizedDescription)"
         }
+    }
+
+    nonisolated static func isNoPostPublication(_ metadata: [String: String]?) -> Bool {
+        metadata?["kind"] == "final" && metadata?["live"] == "true"
+            && (metadata?["silence"] != nil || metadata?["readBy"] != nil)
+    }
+
+    nonisolated static func isOutcomePublication(_ metadata: [String: String]?) -> Bool {
+        ["steered", "steer_returned"].contains(metadata?["kind"] ?? "")
+            || metadata?["kind"] == "notice" && metadata?["steering"] == "true" || isNoPostPublication(metadata)
+    }
+
+    func retainedNoPostState(id: String, correlationID: String) async throws -> String? {
+        let root = sync.dataRoot
+        return try await sync.storage.perform {
+            let bytes: Data
+            do { bytes = try Data(contentsOf: Self.chatURL(id, dataRoot: root)) }
+            catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+            let row = try JSONDecoder().decode(ChatRecord.self, from: bytes)
+            let secret = try PairingSecret.requireExistingSecret()
+            guard row.msgId == id, row.direction == "mac_to_ios", let message = row.outboundMessage,
+                  message.id == id, message.correlationID == correlationID, message.verifySignature(secret: secret),
+                  Self.isNoPostPublication(message.metadata) else { throw CocoaError(.fileReadCorruptFile) }
+            return row.state
+        }
+    }
+
+    func noteNoPostDeliveryFailure(messageID: String, cause: String) {
+        syncStatus = "The terminal phone reply for \(messageID) is not durably settled: \(cause). Repair its chat transaction; do not replay the turn."
     }
 
     /// Send, receipt and recovery must agree on terminal envelopes, including live failure and Stop.
@@ -92,7 +124,6 @@ extension iCloudBridge {
         let correlation = liveContinuation ? response.runId : route.correlationId ?? response.runId
         let transportID = "reply-" + MacSyncSnapshotIntegrity.digest(Data("\(answerSession)\n\(response.runId)".utf8))
         let root = sync.dataRoot
-        if TurnQuietHoursWindow.holdsResidentWake(session: answerSession, dataRoot: root) { return "owed" }
         let reservation = try Self.replyReservation(correlation, session: session, sourceKey: sourceKey, dataRoot: root)
         let verdict = try await Self.replyVerdict(correlationID: correlation, runID: response.runId, dataRoot: root)
         if verdict != "completed" {
@@ -143,7 +174,6 @@ extension iCloudBridge {
                             metadata: metadata, attachments: attachments, messageID: transportID)
                     }
                 } catch {
-                    if error as? ChatOrchestrationError == .replyHeldForQuietHours { return "owed" }
                     guard try await Self.replyVerdict(correlationID: correlation, runID: response.runId, dataRoot: root) == "completed" else { throw error }
                 }
             }
@@ -249,44 +279,58 @@ extension iCloudBridge {
         let root = sync.dataRoot
         let finalReply = correlationID != nil && Self.isRetainedChatReply(
             kind: metadata?["kind"], canonicalRun: metadata?["canonicalAnswerRunId"])
-        func requireDeliveryAdmission() throws {
+        func requireDeliveryAdmission() async throws {
             guard finalReply || metadata?["kind"] == "text_delta" else { return }
-            guard try CodexCompletionReadout.permitsDelivery(
-                sessionId: metadata?["canonicalAnswerSessionId"] ?? sessionID,
-                runId: metadata?["canonicalAnswerRunId"] ?? metadata?["assistantRunId"] ?? correlationID,
-                configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root), dataRoot: root) else {
-                throw CocoaError(.userCancelled)
+            try await sync.storage.perform {
+                guard try CodexCompletionReadout.permitsDelivery(
+                    sessionId: metadata?["canonicalAnswerSessionId"] ?? sessionID,
+                    runId: metadata?["canonicalAnswerRunId"] ?? metadata?["assistantRunId"] ?? correlationID,
+                    configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root), dataRoot: root) else {
+                    throw CocoaError(.userCancelled)
+                }
             }
         }
-        try requireDeliveryAdmission()
-        if (finalReply || metadata?["kind"] == "text_delta"),
-           TurnQuietHoursWindow.holdsResidentWake(session: metadata?["canonicalAnswerSessionId"] ?? sessionID, dataRoot: root) {
-            throw ChatOrchestrationError.replyHeldForQuietHours
-        }
-        let unsigned = BridgeMessage.make(
-            id: messageID,
-            sender: "mac",
-            text: text,
-            sessionID: sessionID,
-            correlationID: correlationID,
-            metadata: metadata,
-            attachments: attachments.isEmpty ? nil : attachments,
-            timestamp: timestamp ?? Date()
-        )
+        try await requireDeliveryAdmission()
         let (secret, signed) = try await sync.storage.perform {
+            // Attachment names and recognition text are display values too. Keep bytes and identities in their deployed schema.
+            let values = try JSONValue.fromEncodable(attachments).mapStrings(TurnSecretRedactor.redactText)
+            let safeAttachments = try JSONDecoder().decode([NativeAgentShared.MultimodalAttachment].self,
+                from: values.serializedData(pretty: false))
+            let unsigned = BridgeMessage.make(
+                id: messageID,
+                sender: "mac",
+                text: TurnSecretRedactor.redactText(text),
+                sessionID: sessionID,
+                correlationID: correlationID,
+                metadata: metadata?.mapValues(TurnSecretRedactor.redactText),
+                attachments: safeAttachments.isEmpty ? nil : safeAttachments,
+                timestamp: timestamp ?? Date()
+            )
             let secret = try PairingSecret.loadOrGenerateSecret()
             return (secret, try unsigned.signed(with: secret))
         }
         let runID = metadata?["assistantRunId"] ?? correlationID ?? messageID
         if finalReply, !inFlightReplyIDs.insert(runID).inserted { throw BridgeError.containerUnavailable }
         defer { if finalReply { inFlightReplyIDs.remove(runID) } }
-        let retainedPublication = finalReply || ["steered", "steer_returned"].contains(metadata?["kind"] ?? "")
-        let controlPublication = ["steered", "steer_returned"].contains(metadata?["kind"] ?? "")
-        if controlPublication, pendingControlPublications[messageID] == nil { pendingControlPublications[messageID] = signed }
+        let outcomePublication = Self.isOutcomePublication(metadata)
+        let retainedPublication = finalReply || outcomePublication
+        if outcomePublication, pendingOutcomePublications[messageID] == nil { pendingOutcomePublications[messageID] = signed }
         if finalReply, let correlationID {
             let verdict = try await Self.replyVerdict(correlationID: correlationID, runID: runID, dataRoot: root)
-            if verdict == "completed" { return signed }
-            if verdict != nil, !FileManager.default.fileExists(atPath: Self.chatURL(messageID, dataRoot: root).path) {
+            if verdict == "completed" {
+                if outcomePublication {
+                    let saved = try await Self.retainPublication(pendingOutcomePublications[messageID] ?? signed,
+                                                               secret: secret, dataRoot: root)
+                    try await Self.completePublication(saved.id, dataRoot: root)
+                    pendingOutcomePublications[messageID] = nil
+                    return saved
+                }
+                return signed
+            }
+            let hasEnvelope = await sync.storage.perform {
+                FileManager.default.fileExists(atPath: Self.chatURL(messageID, dataRoot: root).path)
+            }
+            if verdict != nil, !hasEnvelope {
                 throw DeviceSyncSendOutcomeUnknown(
                     message: """
                         The retained reply has no original signed envelope; reconcile its server/phone evidence before resubmission. Its checkpoint remains \
@@ -296,8 +340,8 @@ extension iCloudBridge {
         }
         let msg: BridgeMessage
         if retainedPublication {
-            msg = try await Self.retainPublication(pendingControlPublications[messageID] ?? signed, secret: secret, dataRoot: root)
-            if controlPublication { pendingControlPublications[messageID] = nil }
+            msg = try await Self.retainPublication(pendingOutcomePublications[messageID] ?? signed, secret: secret, dataRoot: root)
+            if outcomePublication { pendingOutcomePublications[messageID] = nil }
         }
         else { msg = signed }
         let operation: String
@@ -310,7 +354,7 @@ extension iCloudBridge {
         // Preserve signed payloadJSON verbatim for phone verification; reject oversized records before CloudKit's opaque server failure.
         if let ck = deviceTransport {
             do {
-                try requireDeliveryAdmission()
+                try await requireDeliveryAdmission()
                 try await ck.send(msg) {
                     if finalReply {
                         guard await Self.appendChatDeliveryReceipt(msg, direction: "mac_to_ios", transport: "cloudkit",
@@ -339,7 +383,7 @@ extension iCloudBridge {
                     secret: secret
                 )
                 if retainedPublication { try await Self.completePublication(msg.id, dataRoot: root) }
-                if controlPublication { pendingControlPublications[messageID] = nil }
+                if outcomePublication { pendingOutcomePublications[messageID] = nil }
                 if finalReply, let sessionID, let correlationID,
                    try await Self.replyVerdict(correlationID: correlationID, runID: runID, dataRoot: root) == "completed" {
                     try await SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: root, sessionId: sessionID,
@@ -348,9 +392,8 @@ extension iCloudBridge {
             } catch {
                 throw DeviceSyncSendOutcomeUnknown(message: "CloudKit accepted the message, but local settlement failed: " + error.localizedDescription)
             }
-            // CloudKit acceptance permits an optional wake; conflate nudges without holding the caller.
-            enqueueMessageNudge(msg.id)
-                lastSyncAt = Date()
+            await scheduleDeliveryNudges(for: msg.id)
+            lastSyncAt = Date()
             syncStatus = "CloudKit accepted message — waiting for iOS"
             return msg
         }
@@ -376,7 +419,7 @@ extension iCloudBridge {
             guard await Self.appendChatDeliveryReceipt(msg, direction: "mac_to_ios", transport: "icloud_drive",
                 status: .commitUnverified, secret: secret, dataRoot: root) else { throw CocoaError(.fileWriteUnknown) }
         }
-        try requireDeliveryAdmission()
+        try await requireDeliveryAdmission()
         try await VolumeIO.run { [outboxURL] in
             try FileManager.default.createDirectory(at: outboxURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         }
@@ -406,10 +449,7 @@ extension iCloudBridge {
             throw DeviceSyncSendOutcomeUnknown(message: "The iCloud file was committed, but its local receipt failed: " + error.localizedDescription)
         }
 
-        enqueueMessageNudge(msg.id)
-        if metadata?["kind"] != "text_delta" {
-            await scheduleDeliveryNudges(for: msg.id)
-        }
+        await scheduleDeliveryNudges(for: msg.id)
 
         lastSyncAt = Date()
         syncStatus = "Queued for iCloud sync — waiting for iOS"
@@ -483,45 +523,27 @@ extension iCloudBridge {
         }
     }
 
-    private func enqueueMessageNudge(_ messageID: String) {
-        let sender: ICloudConflatedSender
-        if let messageNudgeSender { sender = messageNudgeSender }
-        else {
-            sender = ICloudConflatedSender()
-            messageNudgeSender = sender
-        }
-        let triggerValue = "\(ISO8601DateFormatter().string(from: Date())):\(messageID)"
-        sender.submit(key: KVSKey.newMessageInDrive) {
-            _ = await withCKTimeout("iCloudBridge.messageNudge", seconds: 3) {
-                let kvs = NSUbiquitousKeyValueStore.default
-                kvs.set(triggerValue, forKey: KVSKey.newMessageInDrive)
-                return kvs.synchronize()
-            }
-        }
-    }
-
     private func scheduleDeliveryNudges(for messageID: String) async {
         let queue: ICloudDeliveryNudgeQueue
         if let deliveryNudgeQueue {
             queue = deliveryNudgeQueue
         } else {
+            let generation = setupGeneration
             queue = ICloudDeliveryNudgeQueue(
                 isAvailable: { [weak self] in
-                    await self?.available ?? false
+                    guard let self else { return false }
+                    return await self.canSendMessageNudge(generation: generation)
                 },
                 sendNudge: { messageID in
                     let triggerValue = "\(ISO8601DateFormatter().string(from: Date())):\(messageID)"
-                    return await withCKTimeout(
-                        "iCloudBridge.deliveryNudge.kvsTrigger",
-                        seconds: 3
-                    ) {
+                    return await Task.detached(priority: .utility) {
                         let kvs = NSUbiquitousKeyValueStore.default
                         kvs.set(triggerValue, forKey: KVSKey.newMessageInDrive)
                         return kvs.synchronize()
-                    } ?? false
+                    }.value
                 },
                 observeOutcome: { [weak self] outcome in
-                    await self?.recordDeliveryNudgeOutcome(outcome)
+                    await self?.recordDeliveryNudgeOutcome(outcome, generation: generation)
                 }
             )
             deliveryNudgeQueue = queue
@@ -529,14 +551,20 @@ extension iCloudBridge {
         await queue.schedule(for: messageID)
     }
 
-    private func recordDeliveryNudgeOutcome(_ outcome: ICloudDeliveryNudgeOutcome) {
+    private func canSendMessageNudge(generation: Int) -> Bool {
+        isSetUp && setupGeneration == generation && available
+    }
+
+    private func recordDeliveryNudgeOutcome(_ outcome: ICloudDeliveryNudgeOutcome, generation: Int) {
+        guard setupGeneration == generation, isSetUp else { return }
         switch outcome.disposition {
         case .synchronized:
             break
         case .unavailable:
             syncStatus = "iCloud delivery nudge skipped: iCloud unavailable"
         case .synchronizeFailed:
-            syncStatus = "iCloud delivery nudge failed: iOS will retry on its next sync"
+            syncStatus = "iCloud wake synchronization failed for \(outcome.messageID); recipient delivery is unknown. Check the iCloud connection."
+            nativeLog("[iCloudBridge] wake synchronization failed msg=%@; recipient delivery is unknown", outcome.messageID)
         }
     }
 }

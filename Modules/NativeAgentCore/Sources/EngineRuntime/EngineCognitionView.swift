@@ -11,8 +11,7 @@ import Cognition
 import CognitiveSubstrate
 import Context
 import ContextFlow
-import TurnTrace
-// Blueprint: | `EngineCognitionView.swift` | `CognitionViewFacade`, `LatestRead`, `DreamDiary`, `FileBackedDreamDiary`; Shared checked cognition projections |
+// Blueprint: | `EngineCognitionView.swift` | Cognition controls, checked diary and observatory reads; living status belongs to LivingStatusOwner |
 
 /// Keep canonical cognition types and executors across page reads and controls.
 @MainActor
@@ -23,10 +22,10 @@ public final class CognitionViewFacade {
 
     public var detail: CognitiveObservatoryDetail?
     public var contextFlowHealth: ContextFlowObservatoryHealthState = .unavailable
+    public private(set) var contextFlowHealthCheckedAt: Date?
     public var lastRefresh: Date?
     public var subconsciousRuntime: NativeSubconsciousRuntimeState?
     public var reflectionRoute: NativeReflectionRouteStatus?
-    public private(set) var modelCalls = ""
     public private(set) var diary: DreamDiary?
     public private(set) var diaryGate: DreamREMGatePolicy?
     public private(set) var diaryError: String?
@@ -36,18 +35,12 @@ public final class CognitionViewFacade {
     @ObservationIgnored private let diaryRead = LatestRead()
     @ObservationIgnored private var diaryWatch: FileChangeWatcher?
 
-    public var livingSnapshot: LivingStatusSnapshot?
-    public var livingRefreshStatus: PanelRefreshStatus?
-    public internal(set) var livingWatchAvailability: LivingStatusFileWatch.Availability?
-    @ObservationIgnored var livingStatusDidChange: (@MainActor () -> Void)?
+    public nonisolated let livingStatus = LivingStatusOwner()
     @ObservationIgnored private let observatoryLatest = LatestRead()
     @ObservationIgnored private let detailRead = LatestRead()
     @ObservationIgnored private let vitalsRead = LatestRead()
-    @ObservationIgnored private let modelCallsRead = LatestRead()
-    @ObservationIgnored private let livingRead = LatestRead()
     private var pendingObservatoryReads = 0
     public var isRefreshing: Bool { pendingObservatoryReads > 0 }
-    public var livingRefreshCoalescer = LivingStatusRefreshCoalescer()
 
     public nonisolated init(dataRoot: URL, runtime: NativeCognitionRuntime? = nil) {
         self.dataRoot = dataRoot
@@ -73,14 +66,6 @@ public final class CognitionViewFacade {
             let route = await runtime?.reflectionRouteStatus()
             return (subconscious, route)
         }, publish: { subconsciousRuntime = $0.0; reflectionRoute = $0.1 })
-    }
-
-    public func refreshModelCalls() async {
-        _ = await modelCallsRead.read({
-            let firstOutputs = await runtime?.providerFirstOutputs() ?? "First outputs: cognition is not running."
-            do { return firstOutputs + "\n\n" + (try await TurnTraceRecentReader(dataRootOverride: dataRoot).modelCalls().serialize(pretty: true)) }
-            catch { return UserFacingError.cause(error, action: "read model calls") }
-        }, publish: { modelCalls = $0 })
     }
 
     public nonisolated func setDreamCycleEnabled(_ enabled: Bool) async throws -> TrustPolicy {
@@ -111,7 +96,6 @@ public final class CognitionViewFacade {
             reflectionBudget: enabled ? max(1, budget) : 0
         )
         subconsciousRuntime = state
-        await NativeCognitionRuntime.reloadStudioWanderInstallation()
         await refreshVitals()
 
         var contextFlowReady = true
@@ -141,11 +125,7 @@ public final class CognitionViewFacade {
     }
 
     public nonisolated func moodWarmth() async -> Double {
-        guard let reading = await runtime?.innerStateReading(
-            windowHours: CognitiveInnerStateReading.defaultWindowHours, detail: .compact
-        ), reading.available, !reading.feltNodes.isEmpty else { return 0 }
-        let sum = reading.feltNodes.reduce(0.0) { $0 + $1.warmth }
-        return min(1, max(0, sum / Double(reading.feltNodes.count)))
+        await runtime?.moodWarmth() ?? 0
     }
 
     /// Read policy from TrustCenter and composite gate arithmetic from DreamREMCycle.
@@ -167,12 +147,13 @@ public final class CognitionViewFacade {
     public func dreamDiary(limit: Int = 30) async throws -> DreamDiary {
         diaryLimit = max(diaryLimit, limit)
         if diaryWatch == nil {
-            diaryWatch = FileChangeWatcher(paths: [
+            let watcher = await FileChangeWatcher.armed(paths: [
                 dataRoot.appendingPathComponent("dream_diary", isDirectory: true),
                 SwiftNativeTrustCenter.policyURL(dataRoot: dataRoot)
             ]) { [weak self] _ in
                 Task { @MainActor [weak self] in await self?.refreshDiary() }
             }
+            if diaryWatch == nil { diaryWatch = watcher } else { watcher.cancel() }
         }
         pendingDiaryReads += 1
         defer { pendingDiaryReads -= 1 }
@@ -202,7 +183,7 @@ public final class CognitionViewFacade {
         do { _ = try await dreamDiary(limit: limit) } catch { /* dreamDiary already published the failure. */ }
     }
 
-    private nonisolated func readDreamDiary(limit: Int, enabled: Bool) async throws -> DreamDiary {
+    @concurrent nonisolated func readDreamDiary(limit: Int, enabled: Bool) async throws -> DreamDiary {
         let diary = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(atPath: diary.path, isDirectory: &isDirectory), !isDirectory.boolValue {
@@ -264,8 +245,6 @@ public enum LivingStatusFileWatch {
             desk.opsPath,
             desk.basePath,
             dataRoot.appendingPathComponent("workflows/approvals/requests.json"),
-            // Include actionable inbox changes because they contribute to Needs you.
-            dataRoot.appendingPathComponent("notifications/inbox.jsonl"),
             // Watch the directory because dream reads select the newest dated entry.
             dataRoot.appendingPathComponent("dream_diary", isDirectory: true),
         ]
@@ -274,107 +253,21 @@ public enum LivingStatusFileWatch {
 }
 
 extension CognitionViewFacade {
-    public func refreshLivingStatus(
-        desk: DeskFacade,
-        agentDisplayName: @MainActor () -> String,
-        dreamErrorDidChange: @MainActor (String?) -> Void
-    ) async {
-        guard livingRefreshCoalescer.requestRefresh() else { return }
-        while true {
-            _ = await livingRead.read({
-                await readLivingStatus(desk: desk,
-                    agentDisplayName: agentDisplayName)
-            }, publish: { outcome in
-            if outcome.checkedDream { dreamErrorDidChange(outcome.dreamError) }
-            livingSnapshot = outcome.snapshot ?? livingSnapshot
-            let now = Date()
-            livingRefreshStatus = PanelRefreshStatus(
-                lastAttemptAt: now,
-                lastSuccessAt: outcome.failedEndpoints.isEmpty ? now : livingRefreshStatus?.lastSuccessAt,
-                failedEndpoints: outcome.failedEndpoints
-            )
-            livingStatusDidChange?()
-            })
-            guard !Task.isCancelled else {
-                livingRefreshCoalescer.cancel()
-                return
-            }
-            guard livingRefreshCoalescer.completePass() else { return }
-            if !livingRefreshCoalescer.trailingPassConsumed {
-                do {
-                    try await Task.sleep(for: .milliseconds(500))
-                } catch {
-                    livingRefreshCoalescer.cancel()
-                    return
-                }
-            }
-        }
-    }
-
-    private func readLivingStatus(
-        desk: DeskFacade,
-        agentDisplayName: @MainActor () -> String
-    ) async -> (snapshot: LivingStatusSnapshot?, failedEndpoints: [String], checkedDream: Bool, dreamError: String?) {
-        guard let organism = await organismSnapshot() else {
-            return (nil, ["Cognition"], false, nil)
-        }
-        var failedEndpoints: [String] = []
-        // Use the Desk overview’s own Needs you value.
-        let board = await desk.loadBoard()
-        guard let overview = board.overview else { return (nil, ["Desk"], false, nil) }
-        if !overview.unavailable.isEmpty { failedEndpoints.append("Desk") }
-        let activeDeskCount = board.items.filter { !$0.status.isTerminal }.count
-        let blockedDeskCount = board.items.filter { $0.status == .blocked }.count
-
-        var dreamError: String?
-        let dreamDiary: DreamDiary?
-        do {
-            dreamDiary = try await self.dreamDiary(limit: 1)
-        } catch {
-            dreamDiary = nil
-            dreamError = UserFacingError.message(error, action: "load the dream diary")
-            failedEndpoints.append("Dream diary")
-        }
-        let latestDream = dreamDiary?.entries.first
-
-        let approvalRows: [ApprovalRecord]
-        do {
-            approvalRows = try board.approvals.get()
-        } catch {
-            approvalRows = []
-            failedEndpoints.append("Approvals")
-        }
-
-        guard failedEndpoints.isEmpty else {
-            return (nil, failedEndpoints, true, dreamError)
-        }
-        return (
-            snapshot: LivingStatusSnapshot.make(
-                organism: organism,
-                activeDeskCount: activeDeskCount,
-                blockedDeskCount: blockedDeskCount,
-                ownerWaiting: overview.needsYouCount,
-                pendingApprovals: approvalRows.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }.count,
-                latestDream: latestDream,
-                agentDisplayName: agentDisplayName()
-            ),
-            failedEndpoints: [], checkedDream: true, dreamError: dreamError
-        )
-    }
-}
-
-extension CognitionViewFacade {
     public func refreshObservatory(
         contextFlowHealthRead: () async -> ContextFlowObservatoryHealthState
     ) async {
         pendingObservatoryReads += 1
         defer { pendingObservatoryReads -= 1 }
-        guard runtime != nil else { return }
         await refreshDetail()
+        await refreshContextFlowHealth(contextFlowHealthRead)
+    }
+
+    public func refreshContextFlowHealth(_ read: () async -> ContextFlowObservatoryHealthState) async {
         _ = await observatoryLatest.read({
-            await contextFlowHealthRead()
+            await read()
         }, publish: { nextContextFlowHealth in
             if contextFlowHealth != nextContextFlowHealth { contextFlowHealth = nextContextFlowHealth }
+            contextFlowHealthCheckedAt = Date()
         })
     }
 }

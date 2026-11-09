@@ -8,6 +8,7 @@ import NativeAgentCore
 @MainActor
 public protocol MacChatSessionStore: AnyObject {
     var sessions: [NativeAgentShared.ChatSession] { get set }
+    var conversationAnchor: ConversationAnchorPin? { get }
     /// Called only inside the index owner's LatestRead publication closure.
     func publishSessionIndexRead(_ sessions: [NativeAgentShared.ChatSession])
     func hasCachedTranscript(for sessionID: String) -> Bool
@@ -122,14 +123,18 @@ public final class MacChatSessionTransactions {
         load: (String) async throws -> Void
     ) async {
         guard !requestedId.isEmpty else { return }
+        let anchorAtChoice = store.conversationAnchor?.sessionId
         // A user-selected session outranks the conversation anchor for the rest of this launch.
-        if userInitiated { MacChatSelectionIntent.noteUserChoice() }
+        if userInitiated {
+            MacChatSelectionIntent.noteUserChoice()
+        }
         port.chatSelectionGeneration += 1
         let generation = port.chatSelectionGeneration
         let hasCachedTranscript = store.hasCachedTranscript(for: requestedId)
 
         if hasCachedTranscript {
             port.commitChatSessionSelection(requestedId)
+            if userInitiated { MacChatSelectionIntent.lastSeenAnchorSessionId = anchorAtChoice }
         }
 
         do {
@@ -140,6 +145,7 @@ public final class MacChatSessionTransactions {
                 guard port.activeChatSessionId == requestedId else { return }
             }
             port.commitChatSessionSelection(requestedId)
+            if userInitiated && !hasCachedTranscript { MacChatSelectionIntent.lastSeenAnchorSessionId = anchorAtChoice }
         } catch {
             if port.chatSelectionGeneration == generation {
                 presentStatus("Chat session load failed: \(error.localizedDescription)")
@@ -226,6 +232,5 @@ public enum MacChatSelectionIntent {
     /// Record explicit user selection, including sidebar picks and newly created sessions.
     public static func noteUserChoice() {
         userChoseThisLaunch = true
-        lastSeenAnchorSessionId = ConversationAnchor.currentSessionId()
     }
 }

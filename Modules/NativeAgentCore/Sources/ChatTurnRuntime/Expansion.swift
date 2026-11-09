@@ -208,7 +208,7 @@ public actor Expansion {
                 } else {
                     let gain = measure.lower * cHit - (1 - measure.lower) * cMiss
                     if best.map({ gain > $0.gain }) ?? true {
-                        best = (Plan(invocation: attempt.invocation, signature: signature, call: call, nature: nature, within: cHit, expected: cMiss,
+                        best = (Plan(invocation: attempt.invocation, signature: signature, call: call, nature: nature,
                                      why: .object(["lane": .string("expansion"), "situation": .string(situation),
                                                    "prediction": .string(template.form), "call": .object(call),
                                                    "nature": .string(nature.rawValue), "tries": .int(Int64(record.tries)),

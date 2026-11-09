@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacAssistantStatus.swift` | `Resources/abilities/mac-watch-catalog.js`: Checked readiness and catalog data; never creates jobs |
+// Blueprint: | `MacAssistantStatus.swift` | `Resources/abilities/mac-watch-catalog.js`: Checked readiness verdicts beside the catalog part's words; never creates jobs |
 
 // Status rendering reads readiness evidence and never creates watch jobs.
 
@@ -70,34 +70,71 @@ public struct MacAssistantWatchRecipe: Codable, Sendable, Equatable, Identifiabl
     public let summary: String
     public let scheduleLabel: String
     public let sources: [String]
-    public let requiredAccess: [String]
     public let actionIds: [String]
     public let jobPayload: JSONValue
     public let displayTitle: String
     public let displaySummary: String
 }
 
+/// The catalog part's words for one access row; the row's status, route and ids stay native.
+public struct MacAssistantAccessWords: Codable, Sendable, Equatable {
+    public let title: String
+    public let detail: String
+    public let nextStep: String?
+}
+
+/// What the catalog part returns: inactive recipes, each access row's words and the status summary.
+public struct MacAssistantWatchCatalog: Codable, Sendable, Equatable {
+    public let recipes: [MacAssistantWatchRecipe]
+    public let access: [String: MacAssistantAccessWords]
+    public let summary: String
+}
+
+/// A row the catalog part gives no words for is a part to repair, never a row drawn without them.
+public struct MacAssistantMissingWords: LocalizedError {
+    public let id: String
+    public var errorDescription: String? {
+        "The mac-watch-catalog part gives no words for access row \(id). Repair its access table; no status was composed."
+    }
+}
+
 public struct MacAssistantWatchTemplate: Sendable, Equatable, Identifiable {
     public let recipe: MacAssistantWatchRecipe
     public let status: String
+    public let requiredAccess: [String]
+    public let readinessIssue: String?
     public var id: String { recipe.id }
     public var title: String { recipe.title }
     public var summary: String { recipe.summary }
     public var scheduleLabel: String { recipe.scheduleLabel }
     public var sources: [String] { recipe.sources }
-    public var requiredAccess: [String] { recipe.requiredAccess }
     public var actionIds: [String] { recipe.actionIds }
     public var jobPayload: JSONValue { recipe.jobPayload }
     public var displayTitle: String { recipe.displayTitle }
     public var displaySummary: String { recipe.displaySummary }
 
-    public init(recipe: MacAssistantWatchRecipe, status: String) {
+    public init(recipe: MacAssistantWatchRecipe, access: [MacAssistantAccessItem]) {
         self.recipe = recipe
-        self.status = status
+        guard case .object(let job) = recipe.jobPayload, job["kind"] == .string("connector_action"),
+              case .object(let payload)? = job["payload"], case .string(let action)? = payload["actionId"], !action.isEmpty else {
+            status = "unavailable"
+            requiredAccess = []
+            readinessIssue = "The watch payload does not name a connector action to read. Repair its catalog recipe."
+            return
+        }
+        guard let source = access.first(where: { $0.actionIds?.contains(action) == true }) else {
+            status = "unavailable"
+            requiredAccess = []
+            readinessIssue = "No access reading owns the watch's action \(action). Its readiness is unavailable."
+            return
+        }
+        status = source.status
+        requiredAccess = [source.id]
+        readinessIssue = source.nextStep
     }
 
     public func toJSON() -> JSONValue {
-        .object([
+        var fields: [String: JSONValue] = [
             "id": .string(id),
             "title": .string(title),
             "status": .string(status),
@@ -109,7 +146,9 @@ public struct MacAssistantWatchTemplate: Sendable, Equatable, Identifiable {
             "jobPayload": jobPayload,
             "displayTitle": .string(displayTitle),
             "displaySummary": .string(displaySummary),
-        ])
+        ]
+        if let readinessIssue, !readinessIssue.isEmpty { fields["readinessIssue"] = .string(readinessIssue) }
+        return .object(fields)
     }
 }
 
@@ -159,6 +198,13 @@ public struct MacAssistantStatusResult: Sendable, Equatable {
              lightweight: lightweight)
     }
 
+    /// Sampling time is not a change in watch content; the caller still receives its own reading's timestamp.
+    public func hasSameContent(as other: Self) -> Bool {
+        status == other.status && summary == other.summary && access == other.access && watchTemplates == other.watchTemplates
+            && blockedAccessCount == other.blockedAccessCount && templateAttentionCount == other.templateAttentionCount
+            && schedulerActions == other.schedulerActions && lazyContract == other.lazyContract && lightweight == other.lightweight
+    }
+
     public func toJSON() -> JSONValue {
         let accessJSON = access.map { $0.toJSON() }
         let templatesJSON = watchTemplates.map { $0.toJSON() }
@@ -174,7 +220,7 @@ public struct MacAssistantStatusResult: Sendable, Equatable {
             "summary": .string(summary),
             "access": .array(project(accessJSON, keys: ["id", "title", "status", "setupRoute", "nextStep"])),
             "watchTemplates": .array(project(templatesJSON, keys: ["id", "title", "status", "summary", "scheduleLabel", "sources", "requiredAccess",
-                "actionIds"])),
+                "actionIds", "readinessIssue"])),
             "blockedAccessCount": .int(Int64(blockedAccessCount)),
             "templateAttentionCount": .int(Int64(templateAttentionCount)),
             "schedulerActions": .array(schedulerActions.map { .string($0) }),
@@ -197,8 +243,17 @@ extension MacAssistantStatusResult {
         pushStatus: [String: JSONValue],
         availableTools: Set<String>, localStatuses: [String: [String: JSONValue]],
         schedulerActions: [String],
-        watchCatalog: @Sendable () async throws -> [MacAssistantWatchRecipe]
+        watchCatalog: @Sendable () async throws -> MacAssistantWatchCatalog
     ) async throws -> MacAssistantStatusResult {
+        let catalog = try await watchCatalog()
+        func words(_ id: String) throws -> MacAssistantAccessWords {
+            guard let words = catalog.access[id] else { throw MacAssistantMissingWords(id: id) }
+            return words
+        }
+        func step(_ words: MacAssistantAccessWords, _ id: String) throws -> String {
+            guard let next = words.nextStep else { throw MacAssistantMissingWords(id: id + ".nextStep") }
+            return next
+        }
         let pushState: String
         switch (pushStatus["status"].flatMap { if case .string(let s) = $0 { s.lowercased() } else { nil } }) {
         case "ok", "ready": pushState = "ready"
@@ -233,7 +288,7 @@ extension MacAssistantStatusResult {
             return (available ? "probe_needed" : "unavailable", detail, nextStep)
         }
 
-        let mailTool = "mail_list_recent"
+        let mailTool = "mail.recent"
         let calendarTool = "mac_calendar_list_upcoming"
         let remindersTool = "mac_reminders_list_due_today"
         let mailAccess = localAccessState(id: "local_mail", toolName: mailTool)
@@ -243,98 +298,76 @@ extension MacAssistantStatusResult {
         let calState = calAccess.status
         let remState = remAccess.status
 
+        let control = try words("mac_control"), notified = try words("mac_notifications"), push = try words("iphone_push")
+        let mail = try words("local_mail"), calendar = try words("local_calendar"), reminders = try words("local_reminders")
         let access: [MacAssistantAccessItem] = [
             MacAssistantAccessItem(
                 id: "mac_control",
-                title: "Mac control",
+                title: control.title,
                 status: macControl.status,
-                detail: "Lets me run shortcuts, post notifications, read files and script apps on this Mac.",
+                detail: control.detail,
                 setupRoute: "sidebar:trust",
-                requiredFor: ["local_mail", "local_calendar", "local_reminders", "mac_notifications"],
+                requiredFor: ["mac_notifications"],
                 nextStep: macControl.nextStep,
                 actionIds: ["mac.self_test"]
             ),
             MacAssistantAccessItem(
                 id: "mac_notifications",
-                title: "Mac notifications",
+                title: notified.title,
                 status: notifications.status,
-                detail: """
-                    I post notifications on this Mac. Readiness uses policy, macOS authorization and a delivered notification retained by Notification Center.
-                    """,
+                detail: notified.detail,
                 setupRoute: "sidebar:trust",
                 requiredFor: ["watch_receipts"],
                 nextStep: notifications.nextStep,
-                actionIds: ["mac.notify"]
+                actionIds: ["notify.mac"]
             ),
             MacAssistantAccessItem(
                 id: "iphone_push",
-                title: "iPhone notifications",
+                title: push.title,
                 status: pushState,
-                detail: "I send what a watch found to your iPhone through APNS, with activity opens on iOS.",
+                detail: push.detail,
                 setupRoute: "sidebar:settings",
                 requiredFor: ["remote_watch_receipts"],
                 nextStep: pushNextStep,
-                actionIds: ["mobile.notify"]
+                actionIds: ["notify.phone"]
             ),
             MacAssistantAccessItem(
                 id: "local_mail",
-                title: "Mac Mail",
+                title: mail.title,
                 status: mailState,
-                detail: """
-                    I read Mail account metadata through Apple Events, mailbox pages through Mail's local Envelope Index, and message bodies from local \
-                    message files. These reads need Automation and Full Disk Access.
-                    """
-                    + (mailAccess.detail.map { " \($0)" } ?? ""),
+                detail: mail.detail + (mailAccess.detail.map { " \($0)" } ?? ""),
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_mail_watch"],
-                nextStep: mailAccess.nextStep ?? (mailState == "ready" ? "" : """
-                    Use Check Mail to check account coverage. If access is missing, follow the returned permission remedy.
-                    """),
+                nextStep: try mailAccess.nextStep ?? (mailState == "ready" ? "" : step(mail, "local_mail")),
                 actionIds: ["mail.recent"],
-                toolNames: [mailTool, "mail_search"]
+                toolNames: [mailTool, "mail.search"]
             ),
             MacAssistantAccessItem(
                 id: "local_calendar",
-                title: "Mac Calendar",
+                title: calendar.title,
                 status: calState,
-                detail: "I read Calendar (read only), through EventKit."
-                    + " Reads check the current grant; missing access returns a permission card for you to allow."
-                    + (calAccess.detail.map { " \($0)" } ?? ""),
+                detail: calendar.detail + (calAccess.detail.map { " \($0)" } ?? ""),
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_calendar_watch"],
-                nextStep: calAccess.nextStep ?? (calState == "ready" ? "" : "Ask me to read Calendar, then allow access on the permission card if requested."),
+                nextStep: try calAccess.nextStep ?? (calState == "ready" ? "" : step(calendar, "local_calendar")),
                 actionIds: ["calendar.upcoming"],
                 toolNames: [calendarTool]
             ),
             MacAssistantAccessItem(
                 id: "local_reminders",
-                title: "Mac Reminders",
+                title: reminders.title,
                 status: remState,
-                detail: "I read Reminders (read only), through EventKit."
-                    + " Reads check the current grant; missing access returns a permission card for you to allow."
-                    + (remAccess.detail.map { " \($0)" } ?? ""),
+                detail: reminders.detail + (remAccess.detail.map { " \($0)" } ?? ""),
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_reminders_watch"],
-                nextStep: remAccess.nextStep ?? (remState == "ready" ? "" : "Ask me to read Reminders, then allow access on the permission card if requested."),
+                nextStep: try remAccess.nextStep ?? (remState == "ready" ? "" : step(reminders, "local_reminders")),
                 actionIds: ["reminders.due_today"],
                 toolNames: [remindersTool]
             ),
         ]
 
-        let statusById: [String: String] = Dictionary(uniqueKeysWithValues: access.map { ($0.id, $0.status) })
-        func templateStatus(_ required: [String]) -> String {
-            let states = required.map { statusById[$0] ?? "unavailable" }
-            if !states.isEmpty && states.allSatisfy({ $0 == "ready" }) { return "ready" }
-            if states.contains("unavailable") { return "unavailable" }
-            if states.contains("failed") { return "failed" }
-            if states.contains("needs_setup") { return "needs_setup" }
-            if states.contains("needs_policy") { return "needs_policy" }
-            if states.contains("needs_permission") { return "needs_permission" }
-            return "probe_needed"
-        }
-
-        let templates = try await watchCatalog().map { recipe in
-            MacAssistantWatchTemplate(recipe: recipe, status: templateStatus(recipe.requiredAccess))
+        let templates = catalog.recipes.map { recipe in
+            MacAssistantWatchTemplate(recipe: recipe, access: access)
         }
 
         let blocked = access.filter { !["ready", "probe_needed"].contains($0.status) }.count
@@ -351,7 +384,7 @@ extension MacAssistantStatusResult {
 
         return MacAssistantStatusResult(
             status: blocked > 0 ? "attention" : (unproven ? "probe_needed" : "ready"),
-            summary: "Watch recipes are inactive here. Reading this status creates no jobs; use an explicit schedule action to create a watch.",
+            summary: catalog.summary,
             access: access,
             watchTemplates: templates,
             blockedAccessCount: blocked,

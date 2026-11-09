@@ -5,6 +5,30 @@ import PersistenceCore
 
 // Blueprint: | `BodyEvidence.swift` | Body evidence classes, secret-free identities and bounded freshness/uncertainty metrics |
 
+/// A projection of the field's failed act, never a claim that every hand is unavailable.
+public struct OrganismHandPain: Sendable, Equatable {
+    public let act: String
+    public let cause: String
+    public init(act: String, cause: String) {
+        func safe(_ text: String, limit: Int) -> String {
+            if JSONValueBounding.containsSecretLikeValue(text) { return "[redacted]" }
+            let quoted = text.replacingOccurrences(of: "<", with: "[").replacingOccurrences(of: ">", with: "]")
+            return String(quoted.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").prefix(limit))
+        }
+        self.act = safe(act, limit: 80)
+        self.cause = safe(cause, limit: 240)
+    }
+}
+
+/// Canonical affect and appraised care history cross together; the body keeps no second care ledger.
+public struct OrganismLifeReading: Sendable {
+    public let affect: CognitiveAffectState
+    public let novelty: Double
+    public let careTension: Double
+    public let careValence: Double
+    public let handPain: [OrganismHandPain]
+}
+
 /// Secret-free evidence classes shared by the narrow body-read projections. These are correlation references only; payloads, credentials, paths, user text, and
 /// provider output never enter the body belief layer.
 public enum BodyEvidenceClass: String, Codable, Sendable, Equatable, CaseIterable {

@@ -19,21 +19,34 @@ extension AppModel {
         }
     }
 
-    func pruneSessionChatState(_ sessionId: String) {
+    func pruneSessionChatState(_ sessionId: String) async {
         engine.transcripts.removeMessages(for: sessionId)
-        detachedChatRefreshStatus.removeValue(forKey: sessionId)
         engine.turns.runtime.pruneSessionState(sessionId)
+        await engine.panelFreshness.removeDetached(sessionId)
     }
 
     /// Pruning must preserve live work and mounted panels.
-    func pruneStaleSessionChatState(knownSessionIds: Set<String>) {
+    func pruneStaleSessionChatState(knownSessionIds: Set<String>) async {
+        let visible: Set<String>
+        do {
+            let face = try BodyFacePresentation.current(model: self)
+            let scope = try await BodyQuietChatCommands(face: face).scope()
+            visible = scope.detachedSessionIDs.union([scope.selectedSessionID])
+        } catch {
+            setFailureStatus(error, action: "read visible conversations before pruning chat state")
+            return
+        }
+        let detachedIDs = await engine.panelFreshness.detachedSessionIDs()
+        guard Set(engine.transcripts.sessions.map(\.id)) == knownSessionIds else { return }
         let cached = engine.transcripts.loadedSessionIDs
-            .union(detachedChatRefreshStatus.keys)
+            .union(detachedIDs)
         for sessionId in engine.turns.runtime.staleSessionIDs(
             cached: cached, known: knownSessionIds,
-            keepVisible: { $0 == activeChatSessionId || DetachedChatWindowController.shared.isDetached($0) }
+            keepVisible: { visible.contains($0) }
         ) {
-            pruneSessionChatState(sessionId)
+            guard !engine.transcripts.sessions.contains(where: { $0.id == sessionId }),
+                  !visible.contains(sessionId) else { continue }
+            await pruneSessionChatState(sessionId)
         }
     }
 
@@ -41,31 +54,41 @@ extension AppModel {
     // Detached windows must stream their fixed session without changing the main window's active session.
 
     func loadDetachedSessionMessages(_ sessionId: String) async {
-        await engine.loadDetachedSessionMessages(sessionId) { failures in
-            detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
-                previous: detachedChatRefreshStatus[sessionId],
-                failedEndpoints: failures, at: Date()
-            )
+        guard !sessionId.isEmpty else { return }
+        await engine.panelFreshness.refreshDetached(session: sessionId) { [self] in
+            await readDetachedSessionMessages(sessionId)
         }
+    }
+
+    private func readDetachedSessionMessages(_ sessionId: String) async -> [String]? {
+        var outcome: [String]?
+        await engine.loadDetachedSessionMessages(sessionId) { outcome = $0 }
+        return outcome
     }
 
     /// Publish pin membership through the transcript owner so detached and main windows agree.
     @MainActor
-    func pinChatSessionForDetachedWindow(_ sessionId: String) {
-        guard !sessionId.isEmpty else { return }
-        _ = try? engine.transcripts.pinSession(sessionId)
+    func pinChatSessionForDetachedWindow(_ sessionId: String) async -> Bool {
+        guard !sessionId.isEmpty else { return false }
+        do {
+            _ = try await engine.transcripts.pinSession(sessionId)
+            return true
+        } catch {
+            statusText = "Pinned tab save is unconfirmed: \(error.localizedDescription)"
+            return false
+        }
     }
 
-    /// Runtime sets retain ownership while a reply settles.
-    var isBusy: Bool { engine.turns.isBusy(activeChatSessionId) }
-    var isChatStreaming: Bool { engine.turns.isStreaming(activeChatSessionId) }
+    /// Turn presentation comes from this conversation's slot; commands keep their operational admission checks.
+    var isBusy: Bool { turnPart("isBusy", for: activeChatSessionId) { $0?.isBusy == true } }
+    var isChatStreaming: Bool { turnPart("isStreaming", for: activeChatSessionId) { $0?.isStreaming == true } }
 
     /// Exclude only the foreground session and retain unknown running IDs so work remains stoppable.
     var otherRunningChatSessionIDs: [String] {
         OtherRunningChats.otherRunning(
-            streamingSessionIDs: engine.turns.liveStreamingSessionIDs,
+            streamingSessionIDs: turnSessionsFace?.streamingSessionIDs ?? [],
             activeSessionID: activeChatSessionId,
-            canonicalSessionIDs: engine.transcripts.sessions.map(\.id)
+            canonicalSessionIDs: face.slot(.sessions).select("allIDs", as: SessionListFace.self) { $0?.allIDs ?? [] }
         )
     }
 
@@ -104,18 +127,20 @@ extension AppModel {
             defaults.string(forKey: key) ?? fallback
         }
 
-        let allowedChats = string("telegramAllowedChats", "")
-        if telegramAllowedChats != allowedChats { telegramAllowedChats = allowedChats }
-
-        let allowedUsers = string("telegramAllowedUsers", "")
-        if telegramAllowedUsers != allowedUsers { telegramAllowedUsers = allowedUsers }
-
-        let requireMention = defaults.object(forKey: "telegramRequireMention") as? Bool ?? true
-        if telegramRequireMention != requireMention { telegramRequireMention = requireMention }
-
         let fileAccess = string("chatFileAccess", "auto")
         if chatFileAccess != fileAccess { chatFileAccess = fileAccess }
 
 
+    }
+}
+
+extension AppModel {
+    /// One part of a conversation's turn face: its reader redraws only when that part changes.
+    func turnPart<Part: Equatable>(_ name: String, for sessionID: String, _ part: @escaping (TurnFace?) -> Part) -> Part {
+        face.slot(.turn(session: sessionID)).select(name, as: TurnFace.self, part)
+    }
+
+    var turnSessionsFace: TurnSessionsFace? {
+        face.slot(.turns).value(as: TurnSessionsFace.self)
     }
 }

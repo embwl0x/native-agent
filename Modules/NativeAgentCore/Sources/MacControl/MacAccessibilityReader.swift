@@ -177,6 +177,7 @@ public enum MacAccessibilityReader {
         deadline: Date? = nil,
         stopAtCut: Bool = false,
         descendInto: ((MacAXElementRef) -> Bool)? = nil,
+        skipping: ((MacAXElementRef, MacOperationContext) -> Bool)? = nil,
         onUnreadable: ((MacAXElementRef, [Int]) -> Void)? = nil,
         context: MacOperationContext, shouldStop: () -> Bool = { Task.isCancelled }) -> MacAXTreeSnapshot {
         let limits = complete ? MacAXLimits.deepPage : limits
@@ -206,6 +207,7 @@ public enum MacAccessibilityReader {
             let hash = source.elementHash(item.ref) ?? item.ref.id
             if seen[hash]?.contains(where: { source.sameElement($0, item.ref) }) == true { continue }
             seen[hash, default: []].append(item.ref)
+            if skipping?(item.ref, context) == true { continue }
             let readAttributes: MacAXAttributes?
             do {
                 if let read { readAttributes = try read(item.ref, context) }
@@ -253,7 +255,8 @@ public enum MacAccessibilityReader {
                 if readFailures.count < 8 { readFailures.append("path \(item.path): \(error.localizedDescription)") }
                 continue
             }
-            if total > children.count {
+            // A read that asked for every child has the app's whole answer: some elements report a count their children do not bear out (Music's text fields).
+            if total > budget, total > children.count {
                 skipped += total - children.count
                 // Fewer than the budget allowed is the copy failing, not the cap.
                 reasons.insert(children.count < min(total, budget) ? "ax_error" : "node_cap")
@@ -376,8 +379,9 @@ public enum MacAccessibilityReader {
             do { children = try node() { context in try source.checkedChildren(of: item.ref, limit: remaining, context: context) } }
             catch { hitAXError = true; continue }
             // Fewer than the budget allowed is the copy failing, not the cap.
-            if children.count < min(total, remaining) { hitAXError = true }
-            else if total > children.count { hitNodeCap = true }
+            if total > remaining {
+                if children.count < remaining { hitAXError = true } else { hitNodeCap = true }
+            }
             for (childIndex, child) in children.enumerated() {
                 queue.append((child, item.path + [childIndex], item.depth + 1))
             }

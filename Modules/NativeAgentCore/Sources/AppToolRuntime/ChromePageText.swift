@@ -24,12 +24,6 @@ enum ChromePageText {
         return VisiblePageText(text: render(snapshot, visible: visible, rows: rows, turn: turn), rows: rows, hasVisibleRows: !visible.isEmpty)
     }
 
-    /// The tab's load deadline may pass before load completes; retain that distinction.
-    static func loadUnfinished(_ snapshot: JSONValue) -> Bool {
-        guard case .object(let page) = snapshot, case .object(let rendering)? = page["rendering"] else { return false }
-        return rendering["loaded"] == .bool(false)
-    }
-
     private static func render(_ snapshot: JSONValue, visible: [Line], rows mirrorRows: [ChromePageMirror.Row], turn: Turn) -> String? {
         guard case .object(let page) = snapshot else { return nil }
         if case .object(let document)? = page["document"], document["kind"] == .string("pdf") {
@@ -62,14 +56,19 @@ enum ChromePageText {
                 : "no main region declared: reading the page without its navigation (scope page adds it)")
         }
         head.append(where_.joined(separator: " · "))
-        if loadUnfinished(snapshot) {
-            head.append("""
-                Still loading: Chrome had not finished loading this page when the read's deadline passed, so this read may be partial. Read it again for the \
-                rest.
-                """)
+        if nodes.contains(where: { $0.objectValue?["states"]?.objectValue?["blockedByModal"] == .bool(true) }) {
+            let names = Set(nodes.flatMap { strings($0.objectValue?["states"]?.objectValue?["blockingDialogs"]) }).sorted()
+            let dialog = names.isEmpty ? "a dialog" : "the dialog " + names.map { "\"" + safe($0) + "\"" }.joined(separator: ", ")
+            head.append("Page content is behind \(dialog); its controls remain blocked. Dialog and overlay rows follow the content.")
         }
         if case .object(let reading)? = page["reading"], reading["pageMoved"] == .bool(true) {
             head.append("The page moved while reading; this is what was read.")
+        }
+        if let find = page["reading"]?.objectValue?["find"]?.objectValue {
+            head.append(find["matched"] == .bool(true)
+                ? "Reading from the first observed match for: " + safe(find["text"]?.stringValue ?? "")
+                : "No match observed in the rendered material walked for: " + safe(find["text"]?.stringValue ?? "")
+                    + ". Unrendered or unwalked content remains unknown.")
         }
 
         var rows = lines(visible)
@@ -107,9 +106,21 @@ enum ChromePageText {
             foot.append("Folded: remaining content of row " + row)
             foot.append("More for row " + row + ": " + address + " · app {page: \"site:\(URL(string: url)?.host ?? "")\", item: \"" + address + "\"}")
         }
-        if case .array(let frames)? = page["frames"] {
-            let closed = frames.filter { if case .object(let f) = $0 { return f["accessible"] == .bool(false) }; return false }.count
-            if closed > 0 { foot.append("\(closed) embedded frame(s) could not be read.") }
+        if case .array(let gaps)? = page["summary"]?.objectValue?["gaps"] {
+            for evidence in gaps {
+                guard case .object(let gap) = evidence, case .int(let frame)? = gap["frameId"], frame >= 0,
+                      let code = gap["code"]?.stringValue, !code.isEmpty, let message = gap["message"]?.stringValue, !message.isEmpty else {
+                    foot.append("Read gap metadata is unreadable; coverage is unknown.")
+                    continue
+                }
+                foot.append("Read gap: Frame \(frame): " + safe(code) + " — " + safe(message))
+            }
+        } else {
+            foot.append("Read gap metadata is unreadable; coverage is unknown.")
+        }
+        if nodes.contains(where: { $0.objectValue?["kind"] == .string("image") }) {
+            let tab = page["tabId"]?.scalarText ?? ""
+            foot.append("Pictures are available through chrome.look{tab_id: " + tab + "}; this text read contains names and sizes, no pixels.")
         }
         foot.append("""
             Act with node_id: a row number as a string or its label, e.g. chrome.click{node_id: \"73\"}. chrome.fill{fields, submit} · chrome.select{node_id, \
@@ -142,20 +153,40 @@ enum ChromePageText {
             "url": page["url"] ?? .null, "title": page["title"] ?? .null,
             "snapshot_id": page["snapshotId"] ?? .null, "captured_at": page["capturedAt"] ?? .null,
             "bytes": .int(Int64(rendered.utf8.count)), "has_more": .bool(next(page, turn: turn) != nil || !elementMore.isEmpty)]
+        if let rendering = page["rendering"] { fields["rendering"] = rendering }
+        if let find = page["reading"]?.objectValue?["find"] { fields["find"] = find }
         if case .array? = page["nodes"] {
-            let summary: [String: JSONValue] = if case .object(let summary)? = page["summary"] { summary } else { [:] }
-            let hasContent = projection.hasVisibleRows || !(summary["text"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            fields["ok"] = .bool(hasContent)
-            fields["status"] = .string(hasContent ? (summary["truncated"] == .bool(true) || loadUnfinished(snapshot) ? "partial" : "completed")
-                : (next(page, turn: turn) != nil ? "partial" : "failed"))
+            let summary = page["summary"]?.objectValue
+            var gapsKnown = false, hasNamedGap = false
+            if case .array(let gaps)? = summary?["gaps"] {
+                gapsKnown = true
+                for gap in gaps {
+                    if case .object(let value) = gap, case .int(let frame)? = value["frameId"], frame >= 0,
+                       let code = value["code"]?.stringValue, !code.isEmpty,
+                       let cause = value["message"]?.stringValue, !cause.isEmpty {
+                        hasNamedGap = true
+                    } else {
+                        gapsKnown = false
+                    }
+                }
+            }
+            fields["node_count"] = summary?["nodeCount"]
+            let hasContent = projection.hasVisibleRows
+                || !(summary?["text"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if !hasContent { fields.removeValue(forKey: "ok") }
+            let finding = page["reading"]?.objectValue?["find"]?.objectValue
+            if hasNamedGap { fields["status"] = .string("partial") }
+            else if !hasContent { fields["status"] = .string("empty_window") }
+            else if gapsKnown { fields["status"] = .string("completed") }
+            fields["gaps"] = summary?["gaps"]
             if !hasContent {
-                fields["reason"] = .string("read_window_empty")
+                fields["reason"] = .string(finding != nil ? "find_not_observed" : "read_window_empty")
                 if case .object(let document)? = page["document"], document["kind"] == .string("image") {
                     fields["next"] = .string("This tab is a picture: chrome.look shows it.")
                 }
             }
-            fields["truncated"] = summary["truncated"] ?? .bool(false)
-            fields["truncation_reasons"] = summary["truncationReasons"] ?? .array([])
+            fields["truncated"] = summary?["truncated"]
+            fields["truncation_reasons"] = summary?["truncationReasons"]
             if case .object(let reading)? = page["reading"] {
                 fields["page_moved"] = reading["pageMoved"] ?? .bool(false)
             }
@@ -201,8 +232,25 @@ enum ChromePageText {
             let (role, label) = roleAndLabel(node)
             let number = id.hasPrefix("n") ? String(id.dropFirst()) : id
             return .init(node: id, role: role, label: safe(label), acts: Set(strings(node["actions"])), options: options,
-                         number: numbers.contains(number) ? number : nil)
+                         number: numbers.contains(number) ? number : nil, actionBlock: actionBlock(node))
         }
+    }
+
+    /// The displayed row and source-grounded site act explain the same captured state.
+    static func actionBlock(_ node: [String: JSONValue]) -> ChromePageMirror.ActionBlock? {
+        let states = node["states"]?.objectValue
+        if states?["blockedByModal"] == .bool(true) {
+            let names = strings(states?["blockingDialogs"]).map { "\"" + safe($0) + "\"" }
+            let dialog = names.isEmpty ? "a modal dialog" : "the modal dialog " + names.joined(separator: ", ")
+            return .init(code: "modal_target_required", reason: "Blocked by \(dialog).")
+        }
+        if node["visible"] == .bool(false) {
+            return .init(code: "node_not_visible", reason: "This row was not visible in the page read.")
+        }
+        if states?["disabled"] == .bool(true) {
+            return .init(code: "node_disabled", reason: "This row is disabled.")
+        }
+        return nil
     }
 
     private static func roleAndLabel(_ node: [String: JSONValue]) -> (String, String) {
@@ -228,11 +276,25 @@ enum ChromePageText {
         var state: [String]; var acts: Bool; var references: Set<String>
         var original: String; var heading: Bool; var level: Int; var section: Int
         var rowPath: String?; var cellPath: String?
+        var repeatedBlock: String? = nil
     }
 
-    /// Drop only empty/exactly repeated read-only rows; join adjacent short text under the first row number.
+    /// Repeat a block by reference while preserving each row's control identity and inline link targets.
     private static func lines(_ visible: [Line]) -> [String] {
-        visible.map { line in
+        var first: [String: String] = [:]
+        return visible.map { original in
+            var line = original
+            let block = line.repeatedBlock ?? line.original
+            if !block.isEmpty {
+                if let number = first[block] {
+                    line.label = "Same text as row " + number + "."
+                    if !line.references.isEmpty {
+                        line.label += " Links: " + line.references.sorted().map { "[link](\($0))" }.joined(separator: " · ")
+                    }
+                    // A reference is prose, even when the first occurrence was a fenced code block.
+                    if line.role == "code" { line.role = "text" }
+                } else { first[block] = line.number }
+            }
             if line.role == "code" {
                 let fence = codeFence(line.label)
                 return line.number + "  code\n" + fence + "\n" + line.label
@@ -364,7 +426,7 @@ enum ChromePageText {
         for item in items {
             if item.acts || !item.state.isEmpty { kept.append(item); continue }
             guard item.role == "code" || item.cellPath != nil || item.label.contains(where: { $0.isLetter || $0.isNumber }) else { continue }
-            var parent = parents[item.id], depth = 0, repeated = kept.last?.original == item.original && kept.last?.section == item.section
+            var parent = parents[item.id], depth = 0, repeated = false
             while !repeated, let id = parent, depth < 4 {
                 repeated = labels[id] == item.original
                 parent = parents[id]; depth += 1
@@ -385,7 +447,8 @@ enum ChromePageText {
         var folded = Set<String>()
         for index in kept.indices where kept[index].heading {
             let headingID = kept[index].id
-            for control in kept where byID[control.id].flatMap({ $0["sectionControlHeadingPath"]?.stringValue }).flatMap({ pathIDs[$0] }) == headingID {
+            for control in kept where byID[control.id].flatMap({ $0["sectionControlHeadingPath"]?.stringValue }).flatMap({ pathIDs[$0] }) == headingID
+                && byID[control.id]?["overlay"] == byID[headingID]?["overlay"] {
                 guard !control.heading else { continue }
                 let label = control.acts ? "[\(control.label)](\(control.number))" : control.label
                 kept[index].label += " · " + label + (control.state.isEmpty ? "" : " [" + control.state.joined(separator: "; ") + "]")
@@ -394,13 +457,18 @@ enum ChromePageText {
                 folded.insert(control.id)
             }
         }
+        // Folded controls carry their states in the heading's label, so the complete presentation is the repeated block.
+        for index in kept.indices where kept[index].heading { kept[index].repeatedBlock = kept[index].label }
         kept.removeAll { folded.contains($0.id) && !headingIDs.contains($0.id) }
+        let repeatedBlocks = Dictionary(grouping: kept, by: \.original).filter { $0.value.count > 1 }.keys
         var links: [Line] = []
         for item in kept {
             if let previous = links.last, item.role == "link", previous.role == "link", item.state == previous.state,
                item.section == previous.section, item.cellPath == previous.cellPath,
+               !repeatedBlocks.contains(item.original), !repeatedBlocks.contains(previous.original),
                let previousPath = byID[item.id]?["adjacentLinkPath"]?.stringValue, pathIDs[previousPath] == previous.id {
                 links[links.count - 1].label += (byID[item.id]?["adjacentLinkGap"]?.stringValue ?? "") + item.label
+                links[links.count - 1].original += (byID[item.id]?["adjacentLinkGap"]?.stringValue ?? "") + item.original
                 links[links.count - 1].references.formUnion(item.references)
                 links[links.count - 1].references.insert(item.number)
                 // Retain the tail identity for a third adjacent link.
@@ -408,11 +476,14 @@ enum ChromePageText {
             } else { links.append(item) }
         }
         kept = tableRows(links, byID: byID, pathIDs: pathIDs)
+        let repeatedProse = Dictionary(grouping: kept, by: \.original).filter { $0.value.count > 1 }.keys
         var joined: [Line] = [], open = false
         for item in kept {
-            let plain = item.role == "text" && !item.heading && item.rowPath == nil && !item.acts && item.state.isEmpty && item.label.count < 120
+            let plain = item.role == "text" && !item.heading && item.rowPath == nil && !item.acts && item.state.isEmpty
+                && item.label.count < 120 && !repeatedProse.contains(item.original)
             if plain, open, joined[joined.count - 1].section == item.section, joined[joined.count - 1].label.count < 240 {
                 joined[joined.count - 1].label += " · " + item.label
+                joined[joined.count - 1].original += " · " + item.original
                 joined[joined.count - 1].references.formUnion(item.references)
                 continue
             }
@@ -535,6 +606,8 @@ enum ChromePageText {
                 }
             }
             line.label = cells.joined(separator: " | ")
+            line.original = items[index..<end].map(\.original).joined(separator: " ")
+            line.repeatedBlock = line.label
             result.append(line); index = end
         }
         return result
@@ -546,6 +619,8 @@ enum ChromePageText {
 
     private static func rowState(_ node: [String: JSONValue]) -> [String] {
         var state: [String] = []
+        if node["overlay"] == .bool(true) { state.append("overlay") }
+        if node["overlayUnknown"] == .bool(true) { state.append("embedding overlay classification unavailable") }
         if case .object(let select)? = node["select"], case .array(let options)? = select["options"] {
             let labels = options.compactMap { value -> String? in
                 guard case .object(let option) = value, let raw = option["value"]?.stringValue else { return nil }
@@ -569,7 +644,6 @@ enum ChromePageText {
             if flags["selected"] == .bool(true) { state.append("selected") }
             if flags["expanded"] == .bool(true) { state.append("expanded") }
             if flags["expanded"] == .bool(false) { state.append("collapsed") }
-            if flags["blockedByModal"] == .bool(true) { state.append("behind dialog") }
         }
         if case .object(let form)? = node["formState"] {
             if form["required"] == .bool(true) { state.append("required") }

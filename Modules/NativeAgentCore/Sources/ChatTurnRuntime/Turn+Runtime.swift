@@ -17,7 +17,6 @@ import TrustCenter
 
 private enum ResumingCheckpointPart: NativeAgentCore.TurnPart { static let unset: TurnCheckpoint? = nil }
 private enum InvocationIDPart: NativeAgentCore.TurnPart { static let unset: String? = nil }
-private enum SpeechInitiativePart: NativeAgentCore.TurnPart { static let unset: ProactiveSpeechInitiative = .scheduled }
 private enum StandingBotPart: NativeAgentCore.TurnPart { static let unset: BotDefinition? = nil }
 private enum BotContractPart: NativeAgentCore.TurnPart { static let unset: BotChatContract? = nil }
 private enum LineInstructionsPart: NativeAgentCore.TurnPart { static let unset: String? = nil }
@@ -132,11 +131,6 @@ extension Turn {
     public var invocationID: String? {
         get { self[InvocationIDPart.self] }
         set { self[InvocationIDPart.self] = newValue }
-    }
-    /// Who asked for proactive speech: the schedule, the person, an intention.
-    public var speechInitiative: ProactiveSpeechInitiative {
-        get { self[SpeechInitiativePart.self] }
-        set { self[SpeechInitiativePart.self] = newValue }
     }
     /// The standing helper this turn runs as.
     public var standingBot: BotDefinition? {

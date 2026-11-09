@@ -8,12 +8,17 @@ import MacControl
 // Blueprint: | `ChromeControlRuntime+Reload.swift` | `ChromeControlRuntime`; Accepted identity alone proves reload. |
 
 extension ChromeControlRuntime {
-    /// Setup, status and settlement share one comparison; unobserved identity proves neither match nor mismatch.
+    /// Compare exactly the two code values status prints; shipped-version policy is separate.
     var acceptedExtensionMatchesFolder: Bool? {
-        guard readyChannel != nil, let files = extensionFiles,
-              let version = facts.extensionVersion,
-              let running = facts.extensionCode, let folder = files.code else { return nil }
-        return version == files.shippedVersion && files.diskVersion == files.shippedVersion && running == folder
+        guard channel != nil, let running = facts.extensionCode, let folder = extensionFiles?.code else { return nil }
+        return running == folder
+    }
+
+    /// Setup and reload must additionally prove the shipped version on a tab-ready connection.
+    var acceptedExtensionMatchesShipped: Bool? {
+        guard readyChannel != nil, let files = extensionFiles, let version = facts.extensionVersion,
+              let matchesFolder = acceptedExtensionMatchesFolder else { return nil }
+        return matchesFolder && version == files.shippedVersion && files.diskVersion == files.shippedVersion
     }
 
     public enum ReloadSource: String, Sendable, Codable { case automatic, manual, verb }
@@ -33,12 +38,14 @@ extension ChromeControlRuntime {
         var afterCode: String?
         var completedAt: Date?
         var reason: String?
+        var attempts: Int?
         var pending: Bool { phase == "sending" || phase == "awaiting_reconnect" }
         var receipt: JSONValue { .object([
             "id": .string(id), "action": .string("chrome.reload_extension"),
             "source": .string(source.rawValue),
             "front_app_changed": .bool(false), "focus_changed": .bool(false),
             "status": .string(phase), "before_version": .string(before),
+            "attempts": attempts.map { JSONValue.int(Int64($0)) } ?? .null,
             "after_version": after.map(JSONValue.string) ?? .null,
             "before_code": beforeCode.map(JSONValue.string) ?? .null,
             "after_code": afterCode.map(JSONValue.string) ?? .null,
@@ -56,7 +63,7 @@ extension ChromeControlRuntime {
     var currentReloadReceipt: JSONValue {
         if extensionReload?.pending == true { return extensionReload!.receipt }
         let latest = reloadPreflightFailure ?? extensionReload?.receipt ?? facts.extensionReload
-        if acceptedExtensionMatchesFolder == true, let files = extensionFiles {
+        if acceptedExtensionMatchesShipped == true, let files = extensionFiles {
             if case .object(let receipt)? = latest, receipt["status"] == .string("succeeded"),
                receipt["after_version"] == .string(files.shippedVersion),
                receipt["after_code"] == facts.extensionCode.map(JSONValue.string),
@@ -274,7 +281,8 @@ extension ChromeControlRuntime {
                     // Lost acknowledgement/cancellation preserves the dispatched reload until reconnect/termination.
                     extensionReload?.phase = "awaiting_reconnect"
                     extensionReload?.reason = """
-                        Reload dispatch is unconfirmed: \(error.localizedDescription). Awaiting an accepted reconnect; no automatic retry.
+                        Reload dispatch is unconfirmed: \(error.localizedDescription). Awaiting an accepted reconnect; the extension can retry a retained \
+                        unaccepted reload once within this bound.
                         """
                     // The pre-dispatch record preserves process and ID across later storage failures.
                     facts.extensionReload = extensionReload?.receipt
@@ -292,7 +300,13 @@ extension ChromeControlRuntime {
         guard extensionReload?.id == id, extensionReload?.phase == "awaiting_reconnect" else { return }
         finishExtensionReload(
             phase: "unconfirmed",
-            reason: "The extension did not reconnect after the reload; its effect is unknown. Check chrome.status; no automatic retry.")
+            reason: """
+                No accepted extension greeting arrived within the reconnect bound. The protocol permits one retained extension retry; without its \
+                greeting, neither that retry nor the after-version is confirmed. Last accepted version: \(facts.extensionVersion ?? "none"); \
+                last accepted at: \(facts.extensionSeenAt.map { $0.description } ?? "never"); \
+                last handshake: \(facts.handshakeReason ?? facts.handshakeResult ?? "none"); \
+                last extension error: \(facts.extensionError ?? "none recorded"). Check chrome.status before relying on the installed version.
+                """)
     }
 
     func reconcileReloadBrowser(_ browsers: [pid_t]) {

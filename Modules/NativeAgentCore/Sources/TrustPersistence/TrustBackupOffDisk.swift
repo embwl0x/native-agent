@@ -176,7 +176,7 @@ extension TrustBackupPersistence {
     private static let offDiskExcludedPaths: Set<String> = [
         "extras", "backups", "production", "chat/index", "activity_watch",
         "logs", "diagnostics", "crash_reports", "ui-frames", "mobile_snapshot_cache",
-        "traces", "turn_traces", "harness", "builder_audit", "memory/backups",
+        "traces", "turn_traces", "body", "builder_audit", "memory/backups",
         "cognition/caring_appraisals.jsonl", "context/feedback.jsonl", "mac_control_audit.jsonl",
         "slack/receipts.jsonl", "scheduler/retired.jsonl", "mobile_push/apns_outcomes.jsonl", "doctor/repair_receipts.jsonl",
         "senses/ledger",

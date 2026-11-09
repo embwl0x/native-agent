@@ -385,8 +385,10 @@ extension SwiftToolDispatcher {
             }
             let session = turn.verifiedSessionID ?? ChatToolSessionInjection.explicitSessionId(in: input)
             guard !session.isEmpty else { throw AgentCommunicationError.invalid("Send from a chat so Grok's reply can return there") }
-            if let requested = try Self.peerString(args, "conversation_id", max: 128, required: false), requested != session {
-                throw AgentCommunicationError.invalid("Grok replies return to the conversation asking")
+            // Grok has one conversation, whichever chat asks; its answer returns to the chat asking.
+            let grokConversation = GrokBotRoute.conversation(peer: peer.id)
+            if let requested = try Self.peerString(args, "conversation_id", max: 128, required: false), requested != grokConversation {
+                throw AgentCommunicationError.invalid("Grok has one conversation, \(grokConversation); its replies return to the chat asking")
             }
             // The exchange's own id, so its answer pairs with exactly that exchange.
             let id = try Self.peerString(args, "message_id", max: 36, required: false)
@@ -394,7 +396,7 @@ extension SwiftToolDispatcher {
             let text = try Self.peerString(args, "text", max: 64000)!
             // App checks running status; no secrets travel in this internal plan.
             return .object(["status": .string("grok_send"), "peer_id": .string(peer.id),
-                "message_id": .string(id), "conversation_id": .string(session), "text": .string(text)])
+                "message_id": .string(id), "asking_session": .string(session), "text": .string(text)])
         }
         if !Set(args.keys).isDisjoint(with: listingFields) {
             guard peer.transport == .a2a, !sending, args["task_id"] == nil else {
@@ -433,11 +435,14 @@ extension SwiftToolDispatcher {
             let row = AgentPeerStore.hostRowID(peer.endpoint).flatMap { id in
                 AgentHostDirectory.rows.first { $0.id == id }
             }
-            // Command hosts run their declared CLI; pull-only hosts must retain the message until their next inbound call.
-            guard let row, row.commandLine != nil else {
+            // A conversation lives on the door it was opened through. Command hosts run their declared CLI; pull-only hosts, and the threads the
+            // contact opened by calling in (its own, or one caller's), retain the message until its next inbound call.
+            let heldThread = ContactCaller.held(args["conversation_id"]?.stringValue, peer: peer.id)
+            guard let row, row.commandLine != nil, heldThread == nil else {
                 let snapshot = try Self.checkedPeerSnapshot(peer.id, store: store)
+                // A held send that names no held thread waits in the contact's own.
                 return try Self.hostPull(invocation: invocation, row: row, contact: snapshot.contact, text: sending ? Self.peerString(args, "text", max: 64000)
-                    : nil,
+                    : nil, conversation: heldThread ?? AgentConversationStore.heldThread(peerID: peer.id),
                                          peers: snapshot.peers)
             }
             // Nothing to page through: the reply came back in the same call as the message that asked for it, and there is no second copy here.

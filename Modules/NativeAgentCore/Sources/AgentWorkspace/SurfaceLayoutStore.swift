@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Darwin
 import Foundation
 import NativeAgentCore
@@ -20,13 +21,17 @@ public enum SurfaceLayoutStore {
                 "required": .array(required.map(JSONValue.string)), "additionalProperties": .bool(false)])
         }
         let text = ToolSchema.strSchema()
+        // A page of the agent's own is a block on the surfaces that take one; whether it is one now is checked at the write.
+        let page = object(["name": .object(["type": .string("string"),
+                "pattern": .string("^" + SurfaceLayout.pagePrefix + "[a-z][a-z0-9-]{1,31}$")]),
+            "hidden": ToolSchema.boolSchema(), "expanded": .object(["type": .string("null")])], required: ["name", "hidden"])
         let surfaces = Dictionary(uniqueKeysWithValues: SurfaceLayout.vocabulary.map { surface, _, blocks in
-            (surface, JSONValue.object(["type": .string("array"), "items": .object(["oneOf": .array(blocks.map { block in
+            (surface, JSONValue.object(["type": .string("array"), "items": .object(["oneOf": .array(blocks.map { block -> JSONValue in
                 let folds = SurfaceLayout.folds.contains(surface + "." + block.name)
                 return object(["name": .object(["const": .string(block.name)]), "hidden": ToolSchema.boolSchema(),
                     "expanded": folds ? ToolSchema.boolSchema() : .object(["type": .string("null")])],
                     required: ["name", "hidden"] + (folds ? ["expanded"] : []))
-            })])]))
+            } + (SurfaceLayout.pageSurfaces.contains(surface) ? [page] : []))])]))
         })
         let profile = object(["hidden": .object(["type": .string("array"), "items": text])], required: ["hidden"])
         let profiles = SurfaceLayout.seed(from: "", at: "").profiles.keys.sorted()
@@ -108,6 +113,23 @@ public enum SurfaceLayoutStore {
                     do { given = try validated(.object(merged)) }
                     catch { return refused("invalid_layout",
                         "layout doesn't match a layout's shape: \(error). Start from layout.read's layout and change only what you mean to.") }
+                    // A page of the agent's own is placed only while it is one: each page block the write adds names an active part's page now.
+                    let placed = SurfaceLayout.pageSurfaces.sorted().flatMap { surface -> [String] in
+                        let before = Set((layout.surfaces[surface] ?? []).map(\.name))
+                        return (given.surfaces[surface] ?? []).filter { !before.contains($0.name) }.compactMap { SurfaceLayout.ownPage(surface, $0.name) }
+                    }
+                    if !placed.isEmpty {
+                        let own = try ownPages(dataRoot: state.root)
+                        if let missing = placed.first(where: { !own.contains($0) }) {
+                            return refused("not_own_page", """
+                                page:\(missing) names no page of the agent's own now: no active part has the face \
+                                {projection:true, page:"\(missing)"}. Nothing was written.
+                                """, instruction: """
+                                    Save and turn on a part whose face is {projection:true, page:"\(missing)"} with ability.save, then place \
+                                    page:\(missing); app {} lists the agent's own pages.
+                                    """, next: .object(["tool": .string("app"), "input": .object([:])]))
+                        }
+                    }
                     // Previous-content recognition only labels the receipt; it never admits a stale write.
                     let givenContent = try content(given)
                     let restored: Int?
@@ -146,22 +168,24 @@ public enum SurfaceLayoutStore {
 
     /// Person fold changes follow the same versioned writer as agent edits.
     @discardableResult
-    public static func setExpanded(_ open: Bool, surface: String, block: String, dataRoot: URL) -> SurfaceLayout? {
+    public static func setExpanded(_ open: Bool, surface: String, block: String, dataRoot: URL) -> Result<SurfaceLayout, SurfaceLayoutFailure> {
         withLoaded(dataRoot) { state in
             let file = file(state.root)
             do {
-                return try CredentialFileLock.withLock(file) {
+                let saved = try CredentialFileLock.withLock(file) {
                     refresh(&state)
                     var next = try state.availability.get()
                     guard var blocks = next.surfaces[surface],
-                          let index = blocks.firstIndex(where: { $0.name == block }), blocks[index].expanded != nil,
-                          blocks[index].expanded != open else { return nil }
+                          let index = blocks.firstIndex(where: { $0.name == block }), blocks[index].expanded != nil else {
+                        throw JSONValue.ShapeError(description: "\(surface).\(block) is not a foldable layout block")
+                    }
+                    guard blocks[index].expanded != open else { return next }
                     blocks[index].expanded = open
                     next.surfaces[surface] = blocks
                     return try commit(next, over: &state, source: "person")
                 }
-            } catch { nativeLog("SurfaceLayoutStore: %@ could not be written: %@", file.path, error.localizedDescription) }
-            return nil
+                return .success(saved)
+            } catch { return .failure(storageFailure(file, error)) }
         }
     }
 
@@ -213,11 +237,22 @@ public enum SurfaceLayoutStore {
         return saved
     }
 
-    private static func refused(_ reason: String, _ detail: String) -> JSONValue {
+    private static func refused(_ reason: String, _ detail: String,
+                                instruction: String = "Read the current layout and its shape; correct the requested change.",
+                                next: JSONValue = .object(["tool": .string("app"), "input": .object(["action": .string("layout.read")])])) -> JSONValue {
         .object(["status": .string("refused"), "reason": .string(reason), "changed": .bool(false), "effects": .string("none"), "detail": .string(detail),
-            "remedy": .object(["kind": .string("correct_arguments"), "instruction": .string(
-                "Read the current layout and its shape; correct the requested change."),
-                "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("layout.read")])])])])
+            "remedy": .object(["kind": .string("correct_arguments"), "instruction": .string(instruction), "next_call": next])])
+    }
+
+    /// The agent's own pages now, read from the abilities as the engine reads them: each active part whose face is
+    /// `{projection:true, page:"<id>"}`. An unreadable store fails the write that asked, with its cause.
+    private static func ownPages(dataRoot: URL) throws -> Set<String> {
+        do { return Set(try AbilityStore(dataRoot: dataRoot).pageParts().map(\.page)) }
+        catch {
+            throw ToolFailureError("The abilities could not be read to check which pages are the agent's own: \(error.localizedDescription). "
+                + "Nothing was written.", effects: .none, nextCall: ToolFailureError.call("app", ["page": .string("tools")]),
+                code: "abilities_unreadable", instruction: "Repair the reported ability-store problem, then place the page again.", recovery: .inspect)
+        }
     }
 
     private static func storageFailure(_ file: URL, _ error: Error) -> SurfaceLayoutFailure {
@@ -236,7 +271,8 @@ public enum SurfaceLayoutStore {
 
     private static var blockVocabulary: JSONValue {
         .object(Dictionary(uniqueKeysWithValues: SurfaceLayout.vocabulary.map { surface, about, blocks in
-            (surface, .string(about + ". Blocks: " + blocks.map { $0.shows.isEmpty ? $0.name : "\($0.name) (\($0.shows))" }.joined(separator: ", ")))
+            (surface, .string(about + ". Blocks: " + blocks.map { $0.shows.isEmpty ? $0.name : "\($0.name) (\($0.shows))" }.joined(separator: ", ")
+                + (SurfaceLayout.pageSurfaces.contains(surface) ? ". " + SurfaceLayout.pageBlockAbout : "")))
         }))
     }
 
@@ -256,8 +292,15 @@ public enum SurfaceLayoutStore {
             var seen = Set<String>()
             for (index, block) in blocks.enumerated() {
                 let at = "surfaces.\(surface)[\(index)]"
-                guard names.contains(block.name) else { throw shape(
-                    "\(at).name \"\(block.name)\" is not a \(surface) block; they are \(names.joined(separator: ", "))") }
+                guard names.contains(block.name) || SurfaceLayout.ownPage(surface, block.name) != nil else {
+                    let takesPages = SurfaceLayout.pageSurfaces.contains(surface)
+                    if takesPages, block.name.hasPrefix(SurfaceLayout.pagePrefix),
+                       let refusal = AppDoorNames.ownPageRefusal(String(block.name.dropFirst(SurfaceLayout.pagePrefix.count))) {
+                        throw shape("\(at).name \"\(block.name)\": \(refusal)")
+                    }
+                    throw shape("\(at).name \"\(block.name)\" is not a \(surface) block; they are \(names.joined(separator: ", "))"
+                        + (takesPages ? ", or page:<id> for a page of the agent's own" : ""))
+                }
                 guard seen.insert(block.name).inserted else { throw shape("\(at).name \"\(block.name)\" is listed twice") }
                 let folds = SurfaceLayout.folds.contains(surface + "." + block.name)
                 guard (block.expanded != nil) == folds else {
@@ -270,7 +313,7 @@ public enum SurfaceLayoutStore {
         let blocks = Set(known.flatMap { surface, names in names.map { surface + "." + $0 } })
         for (name, profile) in layout.profiles.sorted(by: { $0.key < $1.key }) {
             guard profiles.contains(name) else { throw shape("profiles.\(name) is not a profile; they are \(profiles.sorted().joined(separator: ", "))") }
-            for (index, hidden) in profile.hidden.enumerated() where !blocks.contains(hidden) {
+            for (index, hidden) in profile.hidden.enumerated() where !blocks.contains(hidden) && !SurfaceLayout.placesOwnPage(hidden) {
                 throw shape("profiles.\(name).hidden[\(index)] \"\(hidden)\" names no surface.block")
             }
         }
@@ -390,15 +433,18 @@ public final class SurfaceLayoutLive {
         observation = Task { [weak self] in await Self.watch(root: root) { [weak self] in self } }
     }
 
-    public func setExpanded(_ open: Bool, surface: String, block: String) async {
+    @discardableResult
+    public func setExpanded(_ open: Bool, surface: String, block: String) async -> Result<SurfaceLayout, SurfaceLayoutFailure> {
         let root = root
         let saved = await Task.detached { SurfaceLayoutStore.setExpanded(open, surface: surface, block: block, dataRoot: root) }.value
-        if let saved {
+        switch saved {
+        case .success(let value):
             snapshotRead.write {
-                availability = .available(saved)
+                availability = .available(value)
                 NotificationCenter.default.post(name: Self.didChange, object: nil)
             }
-        } else {
+        case .failure(let failure):
+            SystemToastCenter.shared.push(error: failure.localizedDescription, autoDismissAfter: nil)
             await snapshotRead.read {
                 await Task.detached { SurfaceLayoutStore.layout(dataRoot: root) }.value
             } publish: {
@@ -406,6 +452,7 @@ public final class SurfaceLayoutLive {
                 NotificationCenter.default.post(name: Self.didChange, object: nil)
             }
         }
+        return saved
     }
 
     private static func watch(root: URL, projection: @MainActor () -> SurfaceLayoutLive?) async {

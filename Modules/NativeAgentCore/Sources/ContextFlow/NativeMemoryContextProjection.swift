@@ -46,7 +46,7 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
     static let owner = "nativeagent.memory-v2"
 
     var projectionIdentifier: String { Self.owner }
-    var invalidationNamespaces: Set<String> { ["memory-v2"] }
+    var invalidationNamespaces: Set<String> { ["memory-v2", "agent-trust"] }
     let invalidationSourceURL: URL?
     private let dataRoot: URL
 
@@ -65,6 +65,13 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
         self.dataRoot = dataRoot
         self.invalidationSourceURL = dataRoot.appendingPathComponent("memory/memory.sqlite")
             .standardizedFileURL
+    }
+
+    func isInvalidated(by change: DerivedSourceChange) -> Bool {
+        guard change.semantic, invalidationNamespaces.contains(change.namespace) else { return false }
+        let source = change.namespace == "agent-trust" ? dataRoot.appendingPathComponent("agents/peers.json") : invalidationSourceURL
+        guard let source, let locator = change.canonicalLocator else { return true }
+        return source.standardizedFileURL == URL(fileURLWithPath: locator).standardizedFileURL
     }
 
     func compiledProjection(
@@ -107,8 +114,24 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
         do {
             let records = try await memory.memoryRecords(ids: atoms.compactMap(\.1))
             let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            // A queued invalidation may not have published yet. Never deliver an atom whose attribution differs from its roots under live Trust.
+            // One live trust read for this whole pass; every record's roots see the same picture.
+            let trust = MemoryDataProvenance.reading(atoms.compactMap { $0.1.flatMap { byID[$0] }?.extras })
+            let staleProvenance = atoms.filter { atom, id in
+                guard let id, let record = byID[id] else { return false }
+                return !Self.provenanceMatches(record, atom: atom, trust: trust)
+            }
+            if !staleProvenance.isEmpty {
+                // Credential availability can change outside the contact writer. An observed mismatch must request the reading it awaits.
+                await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
+                    namespace: "agent-trust", stableID: "contacts", operation: .reconcile,
+                    canonicalLocator: dataRoot.appendingPathComponent("agents/peers.json").standardizedFileURL.path,
+                    reason: "memory_attribution_changed"))
+            }
+            let staleIDs = Set(staleProvenance.map(\.0.draft.id))
             let dropped = atoms.filter { atom, recordID in
-                !Self.speakable(recordID.flatMap { byID[$0] }, compiledAt: atom.draft.freshness.updatedAt, on: surface)
+                staleIDs.contains(atom.draft.id)
+                    || !Self.speakable(recordID.flatMap { byID[$0] }, compiledAt: atom.draft.freshness.updatedAt, on: surface)
             }
             let invalidDates = dropped.filter { _, id in
                 guard let id, let record = byID[id] else { return false }
@@ -119,12 +142,23 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
                 ContextDegradedSourceNotice(sourceID: $0.0.draft.sourceID, reason: "saved; its check is pending")
             } + invalidDates.map {
                 ContextDegradedSourceNotice(sourceID: $0.0.draft.sourceID, reason: "memory source dates unavailable; repair the canonical record")
+            } + staleProvenance.map {
+                ContextDegradedSourceNotice(sourceID: $0.0.draft.sourceID, reason: "memory attribution changed; waiting for its current projection")
             })
         } catch {
             return ContextTurnExclusion(atomIDs: Set(atoms.map(\.0.draft.id)), unverified: [ContextDegradedSourceNotice(
                 sourceID: ContextStableID.source(owner: Self.owner, locator: "memory-v2"),
                 reason: "memories withheld this turn: the memory store could not confirm them (\(error.localizedDescription))")])
         }
+    }
+
+    private static func provenanceMatches(_ record: MemoryV2.MemoryRecord, atom: ContextStoredAtom,
+                                          trust: MemoryDataProvenance.TrustRead) -> Bool {
+        guard case .held(let roots) = MemoryRoot.reading(record.extras) else { return false }
+        let presented = MemoryRoot.ordered(roots.map { MemoryDataProvenance.presented($0, trust: trust) })
+        let sources = Set(MemoryDataProvenance.sources(in: record.extras, trust: trust))
+        return atom.draft.memoryRoots == presented
+            && Set(atom.draft.entities.filter { $0.kind == "untrusted_source" }.map(\.label)) == sources
     }
 
     static func speakable(_ record: MemoryV2.MemoryRecord?, compiledAt: Date, on surface: ContextSurface) -> Bool {
@@ -157,12 +191,13 @@ private extension MemoryContext {
         dataRoot: URL
     ) throws -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
         let grouped = Dictionary(grouping: records, by: { normalizedID($0.id) })
+        let trust = MemoryDataProvenance.reading(records.map(\.metadata))
         var sources: [ContextCompiledSource] = []
         var failures: [ContextSourceID: String] = [:]
         for key in grouped.keys.sorted() {
             guard !key.isEmpty, let group = grouped[key], group.count == 1 else { continue }
             do {
-                if let source = try prepare(group[0], dataRoot: dataRoot) { sources.append(source) }
+                if let source = try prepare(group[0], dataRoot: dataRoot, trust: trust) { sources.append(source) }
             } catch is CancellationError { throw CancellationError() }
             catch {
                 let id = ContextStableID.source(owner: owner,
@@ -175,7 +210,8 @@ private extension MemoryContext {
 
     static func prepare(
         _ stored: StoredMemory,
-        dataRoot: URL
+        dataRoot: URL,
+        trust: MemoryDataProvenance.TrustRead
     ) throws -> ContextCompiledSource? {
         let record = MemoryV2.MemoryRecord(stored: stored)
         let recordID = normalizedID(record.id)
@@ -201,10 +237,12 @@ private extension MemoryContext {
         }
 
         let updatedAt = try NativeContextProjectionText.requiredDate(record.updatedAt, owner: "memory \(recordID) updatedAt")
-        let createdAt = try NativeContextProjectionText.requiredDate(record.createdAt, owner: "memory \(recordID) createdAt")
+        // Age is when the agent first knew it: the earliest root. Unreadable roots fail this one record.
+        let roots = try MemoryRoot.ordered(MemoryRoot.roots(in: record.extras).map { MemoryDataProvenance.presented($0, trust: trust) })
+        guard let first = roots.first else { throw MemoryRoot.Unreadable("memory \(recordID) has no roots") }
+        let createdAt = try NativeContextProjectionText.requiredDate(first.at, owner: "memory \(recordID) first known")
         let tags = normalizedTags(record.tags)
-        let provenance = try Self.provenance(record)
-        let provenanceJSON = try String(decoding: canonicalEncoder.encode(provenance), as: UTF8.self)
+        let provenanceJSON = try String(decoding: canonicalEncoder.encode(roots), as: UTF8.self)
         let body = presentationBody(
             embeddingText, record: record, maximumUTF8Bytes: NativeMemoryContextProjectionLimits.maximumTextUTF8Bytes
         )
@@ -267,7 +305,7 @@ private extension MemoryContext {
             id: locatorDigest,
             label: record.memoryKind ?? record.layer ?? "memory"
         )]
-        for source in MemoryDataProvenance.sources(in: record.extras, dataRoot: dataRoot) {
+        for source in MemoryDataProvenance.sources(in: record.extras, trust: trust) {
             entities.append(ContextEntity(kind: "untrusted_source", id: ContextStableID.digest(parts: [source]), label: source))
         }
         entities.append(ContextEntity(
@@ -319,7 +357,7 @@ private extension MemoryContext {
             canonicalJSONString(record.evidence) ?? "",
             canonicalJSONString(record.extras?.objectValue?["context_topics"]) ?? "",
             entities.filter { $0.kind == ContextCorrectionScope.entityKind }.map(\.label).joined(separator: "\u{1f}"),
-            canonicalJSONString(.object(MemoryDataProvenance.fields(in: record.extras, dataRoot: dataRoot))) ?? "",
+            canonicalJSONString(.object(MemoryDataProvenance.fields(in: record.extras, trust: trust))) ?? "",
         ] + (body == embeddingText ? [] : [embeddingText]))
 
         // Canonical saves and epoch convergence own the vector; metadata changes can republish an atom without predicting its words again.
@@ -347,7 +385,7 @@ private extension MemoryContext {
             injectionPolicy: .adaptive,
             contentRole: contentRole,
             entities: entities,
-            memoryProvenance: provenance,
+            memoryRoots: roots,
             triggers: tags,
             activation: importance,
             recentUsefulness: 0,
@@ -395,16 +433,6 @@ private extension MemoryContext {
             return value
         }
         return Array(Set(valid).sorted().prefix(NativeMemoryContextProjectionLimits.maximumTagsPerRecord))
-    }
-
-    static func provenance(_ record: MemoryV2.MemoryRecord) throws -> ContextMemoryProvenance? {
-        guard let value = record.extras?.objectValue?["provenance"] else { return nil }
-        guard case .string(let raw) = value,
-              let kind = ContextMemoryProvenance.Kind(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
-            throw ContextFlowStoreError.malformedStoredValue("memory \(record.id) provenance")
-        }
-        let by = record.extras?.objectValue?["provenance_by"]?.stringValue.flatMap(ContextMemoryLead.validDisplayName)
-        return ContextMemoryProvenance(kind: kind, by: by)
     }
 
     /// Dates are presentation evidence, not vector input; valid_to also expires atoms. Prefix dates inside the body cap so bounded expansion retains them

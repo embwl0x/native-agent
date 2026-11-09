@@ -63,11 +63,16 @@ extension AgentConversationStore {
         let matches = rows.filter { $0.scopeSessionID == scope && $0.agent == agent }
         if let label {
             let named = matches.filter { $0.id == label || $0.label.caseInsensitiveCompare(label) == .orderedSame }
-            guard named.count <= 1 else {
+            // A name names one conversation: the rows of one held conversation share its name, and its newest row continues it.
+            guard Set(named.map { $0.conversationID ?? $0.id }).count <= 1 else {
                 throw Failure(message: "Choose a conversation: more than one is named “\(label)”; name it by id: "
                     + named.map(\.id).joined(separator: ", "))
             }
-            return named.first
+            return named.max { $0.updatedAt < $1.updatedAt }
+        }
+        // In the thread a contact opened by calling in, an unnamed message to it goes back on that held thread, never to a carried-in conversation.
+        if let held = Self.ownThread(scope: scope, agent: agent) {
+            return matches.filter { $0.conversationID == held }.max { $0.updatedAt < $1.updatedAt }
         }
         return matches.first(where: { $0.selected }) ?? matches.max { $0.updatedAt < $1.updatedAt }
     }
@@ -78,10 +83,15 @@ extension AgentConversationStore {
         return try CredentialFileLock.withLock(fileURL, work)
     }
     func load() throws -> [AgentConversationRecord] {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
-        let data = try Data(contentsOf: fileURL)
+        try normalizing(loadCommitted())
+    }
+
+    private func loadCommitted() throws -> [AgentConversationRecord] {
+        let data: Data
+        do { data = try Data(contentsOf: fileURL) }
+        catch CocoaError.fileReadNoSuchFile { return [] }
         guard data.count <= 50 * 1024 * 1024 else { throw Failure(message: "Saved conversations are too large to read safely.") }
-        var rows = try JSONDecoder().decode([AgentConversationRecord].self, from: data)
+        let rows = try JSONDecoder().decode([AgentConversationRecord].self, from: data)
         guard rows.count <= 512, Set(rows.map(\.id)).count == rows.count,
               rows.allSatisfy({ UUID(uuidString: $0.id) != nil && UUID(uuidString: $0.operationID) != nil && !$0.scopeSessionID.isEmpty }) else {
             throw Failure(message: "Saved conversations are unavailable; existing records were preserved.")
@@ -95,6 +105,12 @@ extension AgentConversationStore {
             }
             try AgentConversationExchange.validate(row.exchanges, file: fileURL)
         }
+        return rows
+    }
+
+    private func normalizing(_ committed: [AgentConversationRecord]) throws -> [AgentConversationRecord] {
+        guard !committed.isEmpty else { return committed }
+        var rows = committed
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
         let life = try DataRootLife.current(in: root)
         for i in rows.indices {
@@ -122,32 +138,11 @@ extension AgentConversationStore {
             receipt["reason"] = .string(DataRootLife.stoppedReason)
             rows[i].receipt = .object(receipt)
         }
-        return try reconcilingExpiredReplies(rows, peers: try AgentPeerStore(dataRoot: root).list())
-    }
-
-    func reconcilingExpiredReplies(_ records: [AgentConversationRecord], peers: [AgentPeerContact]) throws -> [AgentConversationRecord] {
-        var rows = records
-        let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
-        let requests = GrokRequestStore(dataRoot: root)
-        for i in rows.indices where ["sending", "waiting", "attention"].contains(rows[i].phase) {
-            // Retain the previous receipt until dispatch settles.
-            var receipt = rows[i].phase == "sending" ? .object([:]) : rows[i].receipt ?? .object([:])
-            if peers.contains(where: { "peer:" + $0.id == rows[i].agent && $0.transport == .grokBot }),
-               case .object(let fields) = receipt, fields["reply_deadline"] == nil,
-               let id = rows[i].exchanges?.first(where: { $0.id == rows[i].operationID }).map({ GrokBotRoute.messageID(for: $0) }),
-               FileManager.default.fileExists(atPath: requests.root.appendingPathComponent(id + ".json").path) {
-                receipt = GrokBotRoute.projection(try requests.read(id, peer: String(rows[i].agent.dropFirst(5))))
-            }
-            receipt = AgentConversationView.expiringReply(receipt)
-            if case .object(let fields) = receipt, fields["reply_state"] == .string("no_reply_expired") {
-                AgentConversationSession.absorb(receipt, into: &rows[i])
-                try Self.absorbExchange(into: &rows[i], file: fileURL)
-            }
-        }
         return rows
     }
     func save(_ rows: [AgentConversationRecord]) throws {
-        let previous = try load()
+        let committed = try loadCommitted()
+        let previous = try normalizing(committed)
         var rows = rows
         for index in rows.indices {
             guard let old = previous.first(where: { $0.id == rows[index].id }) else { continue }
@@ -178,20 +173,25 @@ extension AgentConversationStore {
             if !letGo.isEmpty { rows[index].releasing = (rows[index].releasing ?? []) + letGo; released = true }
         }
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
-        let data = try JSONEncoder().encode(rows)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(rows)
         guard data.count <= 50 * 1024 * 1024 else {
             throw Failure(message: "Saved conversations exceed their storage limit; existing records were preserved.")
         }
+        guard data != (try encoder.encode(committed)) else { return }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
         recordExperiences(rows)
-        if rows.contains(where: { row in
-            if row.phase == "attention" { return true }
-            if case .object(let receipt)? = row.receipt { return receipt["reply_state"] == .string("no_reply_expired") }
-            return false
-        }) {
+        if rows.contains(where: { $0.phase == "attention" }) {
             Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
         }
-        try? AgentConversationLiveStore(dataRoot: root).merge([], records: rows)
+        do { try AgentConversationLiveStore(dataRoot: root).merge([], records: rows) }
+        catch {
+            RepairOwed.owe(root, id: "conversation-live", kind: .act,
+                operation: "agent.conversation.live", owner: "agents/conversation-live.json",
+                words: "Conversation was saved, but its live projection did not settle: " + error.localizedDescription,
+                lever: "Repair the named live projection; the saved conversation remains authoritative.")
+        }
         AgentConversationRunning.shared.changed() // wakes queued follow-ups
         if released { Self.release(dataRoot: root) }
     }

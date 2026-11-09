@@ -143,12 +143,17 @@ extension SwiftNativeApprovalInbox {
                 id: id, reason: "decision provenance has no actor"
             )
         }
-        if case .telegram = provenance, record.requiresExecutableReview {
+        if case .personMessage = provenance,
+           try PermissionLaw.humanDecides(action: record.action, payload: record.payload, turn: nil) {
+            throw ApprovalInboxError.resolutionNotAuthorized(id: id, reason: "Permanent deletion requires the person's tap.")
+        }
+        let transport = provenance.transport
+        if case .telegram = transport, record.requiresExecutableReview {
             throw ApprovalInboxError.resolutionNotAuthorized(
                 id: id, reason: "Review and approve the exact code on the Mac or paired phone; Telegram cannot show the whole review."
             )
         }
-        if case .signedIOS(let clientID, _) = provenance {
+        if case .signedIOS(let clientID, _) = transport {
             guard !clientID.isEmpty else {
                 throw ApprovalInboxError.resolutionNotAuthorized(
                     id: id, reason: "signed iOS provenance has no client identity"
@@ -163,7 +168,7 @@ extension SwiftNativeApprovalInbox {
             return
         }
         // A private Telegram chat id identifies its sole user, binding the owner DM to the person's authority.
-        if case .telegram(let chatID, let userID) = provenance, !chatID.isEmpty, chatID == userID,
+        if case .telegram(let chatID, let userID) = transport, !chatID.isEmpty, chatID == userID,
            case .object(let card)? = row["chatCard"], card["telegramChatId"] == .string(chatID) {
             guard !record.isAgentsOwnDecision else {
                 throw ApprovalInboxError.resolutionNotAuthorized(
@@ -179,7 +184,7 @@ extension SwiftNativeApprovalInbox {
                 )
             }
         }
-        guard case .telegram(let chatID, let userID) = provenance else { return }
+        guard case .telegram(let chatID, let userID) = transport else { return }
         guard !chatID.isEmpty, !userID.isEmpty else {
             throw ApprovalInboxError.resolutionNotAuthorized(
                 id: id, reason: "Telegram transport identity is incomplete"

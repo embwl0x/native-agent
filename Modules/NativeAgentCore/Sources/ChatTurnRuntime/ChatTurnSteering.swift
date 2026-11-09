@@ -6,9 +6,9 @@ import AgentWorkspace
 import Desk
 import Transcripts
 import TurnTrace
-// Blueprint: | `ChatTurnSteering.swift` | `ChatTurnSteering`; Canonical open turns, offers from waiting arrivals and atomic resident reservation |
+// Blueprint: | `ChatTurnSteering.swift` | Open turns and waiting arrivals; joined-message evidence prevents guessed approval attribution |
 
-/// Offer new input only at a tool boundary; never cancel or rewind an action already executing.
+/// Offer readable input to the generating round and its next boundary; never cancel or rewind an executing action.
 /// Persist before delivery, then let the next admitted provider round read it.
 /// An offer no turn reads stays with its arrival, which runs as its own door's turn when admission reaches it.
 public actor ChatTurnSteering {
@@ -45,19 +45,91 @@ public actor ChatTurnSteering {
     }
 
     private var pending: [String: [Offer]] = [:]
-    nonisolated private static let pendingSessions = OSAllocatedUnfairLock<Set<String>>(initialState: [])
-    nonisolated public static func hasPending(_ sessionId: String) -> Bool {
-        pendingSessions.withLock { $0.contains(sessionId) }
+    private struct Pending: Sendable {
+        let boundary: Bool
+        let person: Bool
     }
-    /// Only an offer the open turn can read cuts its round; unsettled reservations wait for their round to answer.
+    nonisolated private static let pendingSessions = OSAllocatedUnfairLock<[String: Pending]>(initialState: [:])
+    nonisolated public static func hasPending(_ sessionId: String) -> Bool {
+        pendingSessions.withLock { $0[sessionId]?.boundary == true }
+    }
+    /// Only the person's readable, untainted words withdraw a proposal that has not started.
+    nonisolated public static func hasPersonWaiting(_ sessionId: String) -> Bool {
+        pendingSessions.withLock { $0[sessionId]?.person == true }
+    }
+    /// Async callers read the owner without taking the dispatch snapshot's lock on their actor.
+    public func personWaiting(in sessionId: String) -> Bool {
+        guard let turn = open[sessionId] else { return false }
+        return pending[sessionId]?.contains {
+            turn.takes($0) && $0.turn.originPrincipal == "person" && $0.turn.peerSteering?.isTainted != true
+        } == true
+    }
+    /// Only an offer the open turn can read asks a running ability to hand back at its next step; reserved arrivals await their answer.
     private func syncPendingFlag(_ sessionId: String) {
-        let waiting = reserved[sessionId] == nil
-            && open[sessionId].map { turn in pending[sessionId]?.contains(where: turn.takes) == true } == true
-        Self.pendingSessions.withLock { if waiting { $0.insert(sessionId) } else { $0.remove(sessionId) } }
+        let readable = open[sessionId].map { turn in pending[sessionId]?.filter(turn.takes) ?? [] } ?? []
+        let person = personWaiting(in: sessionId)
+        let boundary = !readable.isEmpty
+        Self.pendingSessions.withLock {
+            if boundary || person { $0[sessionId] = Pending(boundary: boundary, person: person) }
+            else { $0.removeValue(forKey: sessionId) }
+        }
     }
     private var reserved: [String: [Offer]] = [:]
+    /// Replay owns these readings before their doors return to admission.
+    private var replayed: [String: Set<String>] = [:]
+
+    func restoreReadings(_ runs: Set<String>, sessionId: String) {
+        guard !runs.isEmpty else { return }
+        replayed[sessionId] = runs
+        open[sessionId]?.hasJoinedMessage = true
+        let waiting = pending[sessionId] ?? []
+        reserved[sessionId, default: []] += waiting.filter { runs.contains($0.turn.run) }
+        pending[sessionId] = waiting.filter { !runs.contains($0.turn.run) }
+        syncPendingFlag(sessionId)
+    }
+
+    func markReplayedDelivered(_ runs: Set<String>, sessionId: String) -> Bool {
+        guard let turn = open[sessionId] else { return false }
+        for run in runs { answered[run] = turn.steered(sessionId) }
+        for offer in reserved[sessionId] ?? [] where runs.contains(offer.turn.run) { offer.waiter.resume() }
+        reserved[sessionId]?.removeAll { runs.contains($0.turn.run) }
+        if reserved[sessionId]?.isEmpty == true { reserved[sessionId] = nil }
+        syncPendingFlag(sessionId)
+        return true
+    }
+    private struct Listener {
+        let token: UUID
+        let edge: AsyncStream<Offer>.Continuation
+    }
+    private var listeners: [String: [UUID: Listener]] = [:]
+
+    /// Subscribe and inspect waiting offers in the same actor turn, closing the read/subscribe gap.
+    func arrivals(sessionId: String) -> AsyncStream<Offer> {
+        let (stream, edge) = AsyncStream<Offer>.makeStream()
+        guard let turn = open[sessionId] else { edge.finish(); return stream }
+        let id = UUID()
+        listeners[sessionId, default: [:]][id] = Listener(token: turn.token, edge: edge)
+        edge.onTermination = { _ in Task { await self.removeListener(sessionId: sessionId, id: id) } }
+        for offer in pending[sessionId] ?? [] where turn.takes(offer) { edge.yield(offer) }
+        return stream
+    }
+
+    private func removeListener(sessionId: String, id: UUID) {
+        listeners[sessionId]?.removeValue(forKey: id)
+        if listeners[sessionId]?.isEmpty == true { listeners[sessionId] = nil }
+    }
+
+    /// A withdrawn or already-read offer cannot cut a later round from a buffered signal.
+    func canHear(_ offer: Offer, sessionId: String, run: String) -> Bool {
+        guard let turn = open[sessionId], turn.run == run, turn.takes(offer) else { return false }
+        return pending[sessionId]?.contains { $0.turn.run == offer.turn.run } == true
+    }
     /// Arrivals a delivered round answered, until their admission collects the answer.
     private var answered: [String: TurnAdmission.Steered] = [:]
+    func takeAnswer(sessionId: String, run: String) -> TurnAdmission.Steered? {
+        guard answered[run]?.sessionID == sessionId else { return nil }
+        return answered.removeValue(forKey: run)
+    }
     public typealias Persister = @Sendable (String, Offer) async -> Bool
 
     struct OpenTurn {
@@ -72,8 +144,10 @@ public actor ChatTurnSteering {
         /// Who started this turn and the peers already steering it.
         let principal: String
         let sources: Set<String>
-        let fileAccess: String?
-        /// Arrivals whose row this turn could not save run alone, so they never cut its rounds again.
+        let fileAccess: ICloudChatFileAccessPolicy.Ceiling
+        /// A joined arrival keeps its own row and door; the opener cannot stand for its authority.
+        var hasJoinedMessage = false
+        /// Arrivals whose row this turn could not save run alone, so they are not offered to its later rounds.
         var unsaved: Set<String> = []
 
         /// The arrival's answer is this turn's: its run, and the request its door correlates it with.
@@ -86,16 +160,8 @@ public actor ChatTurnSteering {
         func takes(_ offer: Offer) -> Bool {
             guard persist != nil, !helper, !unsaved.contains(offer.turn.run) else { return false }
             let from = offer.turn, carried = Set(from.peerSteering?.checkpointSources ?? [])
-            if from.originPrincipal == "self" {
-                // The agent's line's narrower file ceiling cannot widen by joining a turn already in progress.
-                let current = fileAccess.flatMap { ICloudChatFileAccessPolicy.Mode($0) }
-                switch from.fileAccess.flatMap({ ICloudChatFileAccessPolicy.Mode($0) }) {
-                case .some(.none): guard current == .some(.none) else { return false }
-                case .readOnly?: guard current == .readOnly || current == .some(.none) else { return false }
-                case nil: return false
-                case .auto?, .workspace?, .full?: break
-                }
-            }
+            // Every arrival keeps its file ceiling, regardless of who sent it.
+            guard fileAccess.holds(from.fileAccessCeiling) else { return false }
             if ["person", "self"].contains(from.originPrincipal), from.peerSteering?.isTainted != true { return true }
             return from.originPrincipal == principal && carried.isSubset(of: sources)
         }
@@ -135,9 +201,13 @@ public actor ChatTurnSteering {
         guard !sessionId.isEmpty else { return nil }
         let helper = try SessionConversation.checkedIsHelper(sessionId, dataRoot: dataRoot)
         let token = turn.admissionToken ?? UUID()
-        open[sessionId] = OpenTurn(token: token, turnId: turnId, run: turn.run, dataRoot: dataRoot, door: door, persist: persist,
+        var opened = OpenTurn(token: token, turnId: turnId, run: turn.run, dataRoot: dataRoot, door: door, persist: persist,
                                    helper: helper, principal: turn.originPrincipal, sources: Set(turn.peerSteering?.checkpointSources ?? []),
-                                   fileAccess: turn.fileAccess)
+                                   fileAccess: turn.fileAccessCeiling)
+        if let held = open[sessionId], held.turnId == turnId, held.run == turn.run, Self.rootKey(held.dataRoot) == Self.rootKey(dataRoot) {
+            opened.hasJoinedMessage = held.hasJoinedMessage
+        }
+        open[sessionId] = opened
         Self.openRoots.withLock { $0[sessionId] = OpenRoot(root: Self.rootKey(dataRoot), helper: helper) }
         noteTurnActivity(for: dataRoot, at: Date())
         AgentOpened.shared.began(sessionId)
@@ -150,8 +220,9 @@ public actor ChatTurnSteering {
         guard let token, let turn = open[sessionId], turn.token == token else { return }
         noteTurnActivity(for: turn.dataRoot, at: Date())
         open.removeValue(forKey: sessionId)
+        replayed[sessionId] = nil
+        if let held = listeners.removeValue(forKey: sessionId) { for listener in held.values { listener.edge.finish() } }
         Self.openRoots.withLock { _ = $0.removeValue(forKey: sessionId) }
-        ResidentWake.shared.turnEnded(dataRoot: turn.dataRoot)
         AgentOpened.shared.ended(sessionId, dataRoot: turn.dataRoot)
         if let unanswered = reserved.removeValue(forKey: sessionId)?.filter({ !$0.settled }), !unanswered.isEmpty {
             pending[sessionId] = unanswered + (pending[sessionId] ?? [])
@@ -174,8 +245,14 @@ public actor ChatTurnSteering {
         open[sessionId]?.turnId == turnID
     }
 
-    /// The agent's resident wake and free time wait for an open turn of the agent's;
-    /// helper-owned loops are independent (classified when the turn opens).
+    /// The run identifies the opener only while this exact open turn has read no other arrival.
+    public func canAttributeApprovalToOpeningMessage(sessionId: String, turn: Turn, dataRoot: URL) -> Bool {
+        guard let held = open[sessionId], held.turnId == turn.id, held.run == turn.run,
+              Self.rootKey(held.dataRoot) == Self.rootKey(dataRoot) else { return false }
+        return !held.hasJoinedMessage
+    }
+
+    /// Whether a turn of the agent's is open in this root; helper-owned loops are independent (classified when the turn opens).
     /// `besides`: the session asking — a run started from a turn is not held by that same turn.
     nonisolated public static func hasOpenResidentTurn(dataRoot: URL, besides session: String? = nil) -> Bool {
         let root = rootKey(dataRoot)
@@ -200,54 +277,24 @@ public actor ChatTurnSteering {
         return at
     }
 
-    /// Conversations in other sessions do not hold arrivals; only this wake's own open session does.
-    package func residentWakeIsFree(dataRoot: URL) -> Bool {
-        guard NetworkSense.isUp else { return false }
-        if let turn = open[ResidentWake.session], Self.rootKey(turn.dataRoot) == Self.rootKey(dataRoot) {
-            ResidentWake.shared.wait(dataRoot: dataRoot, until: nil)
-            return false
-        }
-        return true
-    }
-
-    /// Desk revision, freedom, ledger claim and turn reservation share this critical section.
-    package func claimResidentWake(dataRoot: URL, items: [ResidentWake.Item], deskRevision: UInt64,
-                                   quietItems: Set<String>, nextFreeAt: @Sendable (Date, Date) -> Date?, turn: Turn)
-        -> (text: String, items: [ResidentWake.Item])? {
-        guard let token = turn.admissionToken,
-              deskRevision == SwiftNativeDeskStore.currentRevision,
-              residentWakeIsFree(dataRoot: dataRoot) else { return nil }
-        var items = items
-        let now = Date()
-        if items.contains(where: { quietItems.contains($0.id) }) {
-            let due = nextFreeAt(now, turnActivityOrSeed(for: dataRoot, at: now))
-            let busy = Self.hasOpenResidentTurn(dataRoot: dataRoot)
-            if busy || due != nil {
-                items.removeAll { quietItems.contains($0.id) }
-                if items.isEmpty {
-                    if !busy, let due { ResidentWake.shared.wait(dataRoot: dataRoot, until: due, items: quietItems) }
-                    return nil
-                }
-            }
-        }
-        guard !items.isEmpty, let wake = ResidentWake.shared.claim(dataRoot: dataRoot, now: now, prepared: items) else { return nil }
-        open[ResidentWake.session] = OpenTurn(token: token, turnId: turn.id, run: turn.run, dataRoot: dataRoot, door: nil, persist: nil,
-                                            helper: false, principal: turn.originPrincipal, sources: [], fileAccess: turn.fileAccess)
-        Self.openRoots.withLock { $0[ResidentWake.session] = OpenRoot(root: Self.rootKey(dataRoot), helper: false) }
-        noteTurnActivity(for: dataRoot, at: Date())
-        return wake
-    }
-
     /// Admission posts an arrival that waits; a turn of the agent's in its conversation may read it at its next step.
     func post(_ offer: Offer, sessionId: String) {
+        if answered[offer.turn.run] != nil { offer.waiter.resume(); return }
+        if replayed[sessionId]?.contains(offer.turn.run) == true {
+            reserved[sessionId, default: []].append(offer)
+            return
+        }
         pending[sessionId, default: []].append(offer)
         syncPendingFlag(sessionId)
+        if let turn = open[sessionId], turn.takes(offer), let held = listeners[sessionId] {
+            for listener in held.values where listener.token == turn.token { listener.edge.yield(offer) }
+        }
     }
 
     /// The arrival woke (read, its own place, or its own cancellation): taken once a round answered it or carries it now, else withdrawn
     /// for good. Drains run on this same actor, so neither can slip between the other.
     func withdraw(sessionId: String, run: String) -> Withdrawal {
-        if let steered = answered.removeValue(forKey: run) { return .taken(steered) }
+        if let steered = takeAnswer(sessionId: sessionId, run: run) { return .taken(steered) }
         if let turn = open[sessionId], let index = reserved[sessionId]?.firstIndex(where: { $0.turn.run == run }) {
             reserved[sessionId]?[index].settled = true
             if let offer = reserved[sessionId]?[index] { Self.retireCheckpoint(of: offer, sessionId: sessionId, dataRoot: turn.dataRoot) }
@@ -260,19 +307,19 @@ public actor ChatTurnSteering {
     }
 
     /// Reserve what this turn can read and save each row before delivery; Stop or failure leaves them waiting with their saved rows.
-    public func drain(sessionId: String, cancelFlagPath: URL? = nil) async -> [Offer] {
+    public func drain(sessionId: String, cancelFlagPath: URL? = nil) async throws -> [Offer] {
         guard !Task.isCancelled, !ChatCancelFlag.isRaised(cancelFlagPath),
-              reserved[sessionId] == nil,
               let turn = open[sessionId], let persist = turn.persist,
               let waiting = pending[sessionId] else {
             return []
         }
         let taken = waiting.filter(turn.takes)
         guard !taken.isEmpty else { return [] }
+        let requiresPersistence = personWaiting(in: sessionId)
         let runs = Set(taken.map(\.turn.run))
         pending[sessionId] = waiting.filter { !runs.contains($0.turn.run) }
         // Reserve before saving so a withdrawal and the write cannot race.
-        reserved[sessionId] = taken
+        reserved[sessionId, default: []] += taken
         syncPendingFlag(sessionId)
         for offer in taken where !offer.saved {
             if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { return [] }
@@ -281,14 +328,27 @@ public actor ChatTurnSteering {
             guard committed else {
                 // Keep their order, including rows saved before this failure.
                 open[sessionId]?.unsaved.insert(offer.turn.run)
-                pending[sessionId] = (reserved.removeValue(forKey: sessionId) ?? []) + (pending[sessionId] ?? [])
+                let failed = reserved[sessionId]?.filter { runs.contains($0.turn.run) } ?? []
+                reserved[sessionId]?.removeAll { runs.contains($0.turn.run) }
+                if reserved[sessionId]?.isEmpty == true { reserved[sessionId] = nil }
+                pending[sessionId] = failed + (pending[sessionId] ?? [])
                 syncPendingFlag(sessionId)
+                if requiresPersistence {
+                    throw ChatOrchestrationError.underlying("Arrival \(offer.turn.run) could not be saved for this turn; "
+                        + "its door retains it. Proposed calls did not start. Inspect the arrival persistence failure before continuing.")
+                }
                 return []
             }
             if let index = reserved[sessionId]?.firstIndex(where: { $0.turn.run == offer.turn.run }) { reserved[sessionId]?[index].saved = true }
         }
-        guard !Task.isCancelled, !ChatCancelFlag.isRaised(cancelFlagPath) else { return [] }
-        return reserved[sessionId] ?? []
+        guard !Task.isCancelled, !ChatCancelFlag.isRaised(cancelFlagPath),
+              let heldOffers = reserved[sessionId], !heldOffers.isEmpty,
+              var held = open[sessionId], held.token == turn.token else { return [] }
+        if !held.hasJoinedMessage {
+            held.hasJoinedMessage = true
+            open[sessionId] = held
+        }
+        return heldOffers.filter { runs.contains($0.turn.run) }
     }
 
     /// Delivered means a provider round carrying the offers produced output: this turn answers each arrival.

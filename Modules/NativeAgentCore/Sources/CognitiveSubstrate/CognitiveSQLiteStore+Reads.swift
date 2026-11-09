@@ -4,6 +4,19 @@ import PersistenceCore
 // Blueprint: | `CognitiveSQLiteStore+Reads.swift` | `CognitiveSQLiteStore`: `loadRestoreBundle`, `loadReceiptRecords` |
 
 extension CognitiveSQLiteStore {
+    /// Read recorded choices from their existing artifact owner; history has no resident cache or separate store.
+    func loadRegisterChoices(limit: Int) async throws -> [CognitiveChosenRegister] {
+        let payloads = try await dbQueue.read { db in
+            try Self.fetchArtifacts(db, kindPrefix: "register_choice", whole: false, limit: limit)
+        }
+        return try payloads.map { payload in
+            guard let chosen = CognitiveChosenRegister(payload: payload) else {
+                throw CognitiveArtifactCodec.FieldFailure(path: "register_choice")
+            }
+            return chosen
+        }
+    }
+
     func loadRestoreBundle(
         artifactFamilies: [CognitiveArtifactFamilyLoad]
     ) async throws -> CognitiveSQLiteRestoreBundle {
@@ -70,7 +83,7 @@ extension CognitiveSQLiteStore {
                    activation, salience, confidence, source_class,
                    created_at, last_activated_at, decay_half_life,
                    summary, metadata_json, updated_at,
-                   emotional_valence, emotional_arousal, emotional_warmth, lived_seq
+                   emotional_valence, emotional_arousal, emotional_warmth, lived_seq, drive
             FROM cognitive_nodes
             ORDER BY salience DESC, activation DESC, last_activated_at DESC, id ASC
             """
@@ -232,7 +245,19 @@ extension CognitiveSQLiteStore {
             emotionalWarmth: emotionalWarmth
         )
         let lived: Int64? = try row.decode(forColumn: "lived_seq")
-        node.livedSeq = lived.map { UInt64(max(0, $0)) }
+        guard lived.map({ $0 >= 0 }) != false else {
+            throw CognitiveSQLiteReadError.malformedRow(
+                table: "cognitive_nodes", id: rowID, detail: "lived_seq must be nonnegative"
+            )
+        }
+        node.livedSeq = lived.map { UInt64($0) }
+        let drive: Double = try row.decode(forColumn: "drive")
+        guard drive.isFinite, drive >= 0 else {
+            throw CognitiveSQLiteReadError.malformedRow(
+                table: "cognitive_nodes", id: rowID, detail: "drive must be finite and nonnegative"
+            )
+        }
+        node.drive = drive
         return node
     }
 

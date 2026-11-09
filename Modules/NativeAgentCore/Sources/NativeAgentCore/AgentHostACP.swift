@@ -18,22 +18,6 @@ public struct AgentHostACP: Sendable, Equatable, Codable {
     public var supportsLoad: Bool? = nil
     public var supportsResume: Bool? = nil
 
-    package init(executable: String, arguments: [String], documentation: String,
-                 permissionMode: String, referenceVersion: String, environment: [String: String] = [:],
-                 protocolVersion: Int? = nil, modes: [String]? = nil,
-                 supportsLoad: Bool? = nil, supportsResume: Bool? = nil) {
-        self.executable = executable
-        self.arguments = arguments
-        self.documentation = documentation
-        self.permissionMode = permissionMode
-        self.referenceVersion = referenceVersion
-        self.environment = environment
-        self.protocolVersion = protocolVersion
-        self.modes = modes
-        self.supportsLoad = supportsLoad
-        self.supportsResume = supportsResume
-    }
-
     /// Exact installed version whose sandbox launcher was inspected. Do not infer compatibility for neighbouring releases or bypass its sandbox.
     /// https://github.com/google-gemini/gemini-cli/issues/23959
     public func startupBlocker(installedVersion: String?) -> String? {

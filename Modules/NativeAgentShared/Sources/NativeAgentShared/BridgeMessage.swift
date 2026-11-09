@@ -5,7 +5,7 @@ import CryptoKit
 
 // MARK: - Message model (shared wire format for outbox JSON files)
 
-public struct BridgeMessage: Codable, Identifiable, Sendable {
+public struct BridgeMessage: Codable, Identifiable, Sendable, Equatable {
     public let id: String           // UUID string
     public let sender: String       // "mac" | "ios"
     public let timestamp: Date
@@ -33,8 +33,7 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         BridgeMessage(
             id: id,
             sender: sender,
-            // A message's time is whole seconds: the signature and the record carry it in different encoders, and a time in the last
-            // half-millisecond of a second rounds into the next one in one of them, so the receiver would find a valid signature wrong.
+            // Whole seconds keep signature and transport encoders identical.
             timestamp: Date(timeIntervalSinceReferenceDate: timestamp.timeIntervalSinceReferenceDate.rounded(.down)),
             text: text,
             sessionID: sessionID,

@@ -35,7 +35,7 @@ extension AbilityStore {
         let selected = catalog.files.filter { (kind == nil || $0.kind == kind) && (kind == nil || $0.kind == .turn
             || $0.metadata["record"]?.objectValue != nil) }
         return .array(try selected.map { file in
-            var row = try record(file, redactedStatistics: stats[file.id])
+            var row = try record(file, previous: catalog.retained[.previous]?[file.id], redactedStatistics: stats[file.id])
             var versions: [JSONValue] = []
             if let previous = catalog.retained[.previous]?[file.id], let digest = identity(previous) {
                 row["previousVersion"] = .string(digest); versions.append(.string(digest))
@@ -103,11 +103,13 @@ extension AbilityStore {
                 turn: turn); stats
                 .removeValue(forKey: file.id) }
             for (input, id, current, next, promote) in publications {
-                // SenseRecord owns these four fields, not the stem's run evidence.
-                let accounting = kind == .sense ? (stats[id]?.objectValue ?? [:]).filter {
-                    !["uses", "corrections", "lastUsedAt", "unavailableReason"].contains($0.key)
-                } : [:]
-                stats[id] = .object(accounting.merging(input.filter { Self.statistics.contains($0.key) }) { _, new in new })
+                // Lifecycle projections may be redacted. Canonical run/trial evidence never comes back from that presentation.
+                // SenseRecord owns only these four accounting fields; all other accounting stays with catalog.states.
+                if kind == .sense {
+                    var accounting = stats[id]?.objectValue ?? [:]
+                    for key in ["uses", "corrections", "lastUsedAt", "unavailableReason"] { accounting[key] = input[key] }
+                    if stats[id] != nil || !accounting.isEmpty { stats[id] = .object(accounting) }
+                }
                 if input["bundledDefault"] == .bool(true) { continue }
                 var slot: Slot = .current
                 var file: File
@@ -146,7 +148,7 @@ extension AbilityStore {
     }
     static func storedRecord(_ input: [String: JSONValue], kind: Kind) -> [String: JSONValue] {
         var row = input.filter { !statistics.contains($0.key) && !obsolete.contains($0.key)
-            && !partKeys.contains($0.key) && !["kind", "permissions", "bundledDefault", "body"].contains($0.key)
+            && !partKeys.contains($0.key) && !["kind", "permissions", "bundledDefault", "body", "run_counts"].contains($0.key)
             && (kind == .sense || $0.key != "version") }
         if var script = row["script"]?.objectValue { script.removeValue(forKey: "source"); row["script"] = .object(script) }
         return row
@@ -159,22 +161,40 @@ extension AbilityStore {
         }
         return row
     }
+    /// A sense's record: its current version only, so a sense read never depends on its retained previous file.
     public func record(_ file: File, statistics: JSONValue?) throws -> [String: JSONValue] {
-        try record(file, redactedStatistics: Self.redactedEvidence(statistics ?? .null))
+        try record(file, previous: nil, redactedStatistics: Self.redactedEvidence(statistics ?? .null))
     }
-    func record(_ file: File, redactedStatistics: JSONValue?) throws -> [String: JSONValue] {
+    func record(_ file: File, previous: File?, redactedStatistics: JSONValue?) throws -> [String: JSONValue] {
         var row = file.record
         row.merge(redactedStatistics?.objectValue ?? [:]) { _, new in new }
         row["validation_evidence"] = Self.validationEvidence(file.metadata["proof"], fixtures: file.metadata["candidate"]?.objectValue?["fixtures"])
         if let status = Self.validationStatus(file.metadata["proof"]) { row["validationStatus"] = .string(status) }
-        let version = (identity(file) ?? file.bodyDigest) + "@" + String(file.metadata["version"]?.integer ?? 1)
-        let use = row["runs"]?.objectValue?["versions"]?.objectValue?[version]?.objectValue ?? [:]
+        let evidence = row["runs"]?.objectValue?["versions"]?.objectValue ?? [:]
+        let use = evidence[versionKey(file)]?.objectValue ?? [:]
+        let currentRuns = use["count"] ?? .int(0)
+        var runTotals = use.filter { ["count", "ok", "error", "refused", "cut", "network"].contains($0.key) }
+        runTotals["count"] = currentRuns
+        // Lifetime accounting survives retired versions; selected-version evidence belongs only to this exact file identity.
+        row["run_counts"] = .object(["all_versions": row["useCount"] ?? .int(0), "current_version": currentRuns])
+        // Each retained version with a run record, current first; failed is its error and cut runs beside the surprise the stem attributed.
+        var versions: [JSONValue] = []
+        for (retained, slot) in [(file, "current")] + (previous.map { [($0, "previous")] } ?? []) {
+            let key = versionKey(retained)
+            guard let ran = evidence[key]?.objectValue, !versions.contains(where: { $0.objectValue?["version"] == .string(key) }) else { continue }
+            let failed = try Self.outcomeCount(ran, at: "learned.versions.\(key)", names: ["error", "cut"])
+            versions.append(.object(["version": .string(key), "slot": .string(slot), "uses": ran["count"] ?? .int(0), "ok": ran["ok"] ?? .int(0),
+                "surprise": .object((ran["surprise"]?.objectValue ?? [:]).merging(["failed": .int(failed)]) { _, new in new }),
+                "rounds": ran["rounds"] ?? .object([:])]))
+        }
         row["learned"] = .object(["declared": file.metadata["learned"] ?? .null,
-            "use": .object(["version": .string(identity(file) ?? file.bodyDigest), "basis": .string("gated_execution"),
+            "use": .object(["version": .string(identity(file) ?? file.bodyDigest), "scope": .string("current_version"),
+                "basis": .string("gated_execution"),
                 "scope_limit": .int(Int64(CapabilityLifecycle.inputLimit)),
-                "run_totals": .object(use.filter { ["count", "ok", "error", "refused", "cut", "network"].contains($0.key) }),
+                "run_totals": .object(runTotals),
                 "operations": use["operations"] ?? .object([:]),
-                "rounds_per_use": row["runs"]?.objectValue?["rounds"] ?? .array([])])])
+                "rounds_per_use": use["rounds"] ?? .object([:])]),
+            "versions": .array(versions), "trial": row["trial"] ?? .null, "trials": row["trials"] ?? .array([])])
         if file.kind == .sense {
             row["uses"] = row["uses"] ?? .int(0); row["corrections"] = row["corrections"] ?? .int(0)
             if row["status"] == .string("on"), row["unavailableReason"] != nil { row["status"] = .string("unavailable") }

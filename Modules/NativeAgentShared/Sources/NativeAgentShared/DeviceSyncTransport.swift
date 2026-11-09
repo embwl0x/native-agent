@@ -2,24 +2,15 @@ import Foundation
 
 // Blueprint: | `DeviceSyncTransport.swift` | Shared role/message codecs, checked transport and signed phone contact |
 
-/// A background recovery caller can bound reads without changing the transport operations. Foreground callers retain their ordinary per-operation
-/// budgets.
+/// Cancellation and applied-data observations shared by one recovery operation.
 public struct DeviceSyncRecovery: Sendable {
-    public let deadline: Date?
     public let didApplyData: (@Sendable () -> Void)?
 
-    public init(deadline: Date? = nil, didApplyData: (@Sendable () -> Void)? = nil) {
-        self.deadline = deadline
+    public init(didApplyData: (@Sendable () -> Void)? = nil) {
         self.didApplyData = didApplyData
     }
 
-    public var hasTime: Bool {
-        !Task.isCancelled && (deadline.map { $0.timeIntervalSinceNow > 0 } ?? true)
-    }
-
-    public func seconds(upTo maximum: TimeInterval) -> TimeInterval {
-        max(0, min(maximum, deadline?.timeIntervalSinceNow ?? maximum))
-    }
+    public var isActive: Bool { !Task.isCancelled }
 }
 
 // MARK: - Device role + direction
@@ -48,10 +39,11 @@ public enum NADeviceSyncRecordType {
     public static let status = "NAStatus"
 }
 
-/// A quiet Mac still needs a presence beat: unchanged snapshots say nothing about reachability. The phone reads the unpushed record on open and
-/// applies `phoneWindow` to the newest observed Mac record.
+/// Presence renews within the phone's contact window; incoming reads keep their own pace because pushes are hints.
 public enum NAMacPresence {
-    public static let beat: TimeInterval = 120
+    public static let receiveInterval: TimeInterval = 20
+    /// One minute remains for CloudKit acceptance and the foreground phone's next contact read.
+    public static let beat: TimeInterval = 240
     public static let phoneWindow: TimeInterval = 300
 }
 
@@ -59,8 +51,9 @@ public enum NAMacPresence {
 public enum NAPhoneForegroundPresence {
     public static let statusKey = "phone.foreground"
     public static let beat: TimeInterval = 30
-    public static let window: TimeInterval = 120
     public static let receiveInterval: TimeInterval = 0.75
+    /// Recent contact requests fast reads; older contact cannot prove the phone left.
+    public static let window: TimeInterval = 60
 
     public static func signedValue(secret: Data) throws -> String {
         let message = try BridgeMessage.make(sender: "ios", text: "",
@@ -70,16 +63,18 @@ public enum NAPhoneForegroundPresence {
         return String(decoding: try encoder.encode(message), as: UTF8.self)
     }
 
-    /// A missing, unreadable, unsigned or old beat says nothing about contact. Server time limits freshness; the signed envelope binds it to this
-    /// pair.
-    public static func activityDate(value: String, writtenAt: Date?, secret: Data, now: Date) -> Date? {
+    /// Verified contact is a historical fact, dated by CloudKit and bound to this pair.
+    public static func activityDate(value: String, writtenAt: Date?, secret: Data) throws -> Date {
+        guard let writtenAt else {
+            throw DeviceSyncError.underlying(message: "The iPhone contact record has no server date.")
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        guard let writtenAt, writtenAt <= now, now.timeIntervalSince(writtenAt) < window,
-              let message = try? decoder.decode(BridgeMessage.self, from: Data(value.utf8)),
-              message.sender == "ios", message.metadata?["kind"] == statusKey,
-              abs(now.timeIntervalSince(message.timestamp)) < window,
-              message.verifySignature(secret: secret) else { return nil }
+        let message = try decoder.decode(BridgeMessage.self, from: Data(value.utf8))
+        guard message.sender == "ios", message.metadata?["kind"] == statusKey,
+              message.verifySignature(secret: secret) else {
+            throw DeviceSyncError.underlying(message: "The iPhone contact record has no verified signature for this pairing.")
+        }
         return writtenAt
     }
 }
@@ -202,26 +197,6 @@ public enum NAChatMessageCodec {
         return try decoder.decode(BridgeMessage.self, from: data)
     }
 
-    /// Exact replay proof for a stable CloudKit record id. A retry is accepted as success only when the server's authoritative payload and direction
-    /// are equal after JSON key canonicalization; an id collision with different content remains a conflict.
-    public static func isExactIdempotentReplay(
-        existingPayloadJSON: String?,
-        existingDirection: String?,
-        intended: NAChatMessageFields
-    ) -> Bool {
-        // Compare all JSON fields, including signatures and unknown fields, without decoding into BridgeMessage.
-        guard existingDirection == intended.direction,
-              let existingPayloadJSON,
-              let existing = canonicalPayload(existingPayloadJSON),
-              let proposed = canonicalPayload(intended.payloadJSON) else { return false }
-        return existing == proposed
-    }
-
-    private static func canonicalPayload(_ json: String) -> Data? {
-        guard let object = try? JSONSerialization.jsonObject(with: Data(json.utf8)),
-              object is [String: Any] else { return nil }
-        return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
-    }
 
 }
 

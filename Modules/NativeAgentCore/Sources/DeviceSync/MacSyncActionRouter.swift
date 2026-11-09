@@ -1,6 +1,8 @@
 import Foundation
 import ChatTurnRuntime
 import ChatTurnContracts
+import ChatToolParsing
+import Experiences
 import ApprovalInbox
 import Cognition
 import CognitiveSubstrate
@@ -66,32 +68,6 @@ struct MacSyncActionRouter {
             "model": model,
             "reasoning_effort": reasoningEffort,
             "service_tier": serviceTier,
-        ]
-    }
-
-    /// Only canonical routing readback proves a model mutation; inbox acceptance cannot claim success.
-    nonisolated static func canonicalSurfaceModelResponse(
-        surface: String,
-        requestedModel: String,
-        recoveredPreference: SurfacePreference?
-    ) -> [String: String] {
-        guard let recoveredPreference,
-              recoveredPreference.model == requestedModel else {
-            return [
-                "status": "error",
-                "ok": "false",
-                "applied": "false",
-                "message": "Mac could not confirm that the surface model was applied.",
-            ]
-        }
-        return [
-            "status": "ok",
-            "ok": "true",
-            "applied": "true",
-            "surface": surface,
-            "model": recoveredPreference.model,
-            "reasoning_effort": recoveredPreference.reasoningEffort,
-            "service_tier": recoveredPreference.serviceTier,
         ]
     }
 
@@ -206,109 +182,46 @@ struct MacSyncActionRouter {
 
         do {
             switch action.action {
-            case "set_trust_policy": return observed(try await applyTrustAction(payload))
-            case "create_scheduler_job", "pause_scheduler_job", "resume_scheduler_job",
-                "cancel_scheduler_job": return observed(try await schedulerAction(action.action, payload: payload))
-            case "get_helper", "save_helper", "pause_helper", "run_helper", "get_agent_thread",
-                "send_agent_message": return observed(try await helpersAction(action))
-            case "set_connector_enabled", "disconnect_connector": return observed(try await connectorAction(action))
-            case "disconnect_telegram", "set_telegram_settings": return await telegramAction(action)
+            case "get_agent_thread", "send_agent_message": return observed(try await helpersAction(action))
             case "chat_history_page": return observed(try await chatHistoryPage(action))
-            case "set_mac_integration_permission":
-                guard let id = payload["id"], MacIntegrationID.all.contains(id),
-                      let read = payload["read"], ["true", "false"].contains(read),
-                      let write = payload["write"], ["true", "false"].contains(write) else {
-                    return observed(["status": "error", "ok": "false",
-                                     "message": "A known integration id and exact read/write booleans are required."])
+            case "faceRead":
+                guard let raw = payload["request"], let rawCursor = payload["cursor"], let cursor = Int(rawCursor) else {
+                    throw PartCallError(code: "invalid_face_read", message: "faceRead requires a document request and cursor.")
                 }
-                let axes = (read == "true" && MacIntegrationID.supportsRead(id) ? ["read"] : [])
-                    + (write == "true" && MacIntegrationID.supportsWrite(id) ? ["write"] : [])
-                let row = try await api.setAppSetting(id: "trust.mac_integration_\(id)",
-                    value: axes.isEmpty ? "off" : axes.joined(separator: "_"),
-                    actionID: action.msgId, clientID: action.clientId)
-                return observed(["status": "ok", "ok": "true", "id": id,
-                    "read": String(row.value == "read" || row.value == "read_write"),
-                    "write": String(row.value == "write" || row.value == "read_write")])
-            case "app_settings":
-                let rows = try await api.appSettings()
-                return observed(["status": "ok", "ok": "true",
-                                 "settings": String(decoding: try JSONEncoder().encode(rows), as: UTF8.self)])
-            case "app_setting_set":
-                let row = try await api.setAppSetting(id: payload["id"] ?? "", value: payload["value"] ?? "",
-                                                      actionID: action.msgId, clientID: action.clientId)
-                return observed(["status": "ok", "ok": "true",
-                                 "setting": String(decoding: try JSONEncoder().encode(row), as: UTF8.self)])
+                let request = try JSONDecoder().decode(DocumentRequest.self, from: Data(raw.utf8))
+                let page = try await api.faceRead(request, cursor: cursor, revision: payload["revision"], device: action.clientId)
+                let response = ["status": "ok", "ok": "true", "page": String(decoding: try JSONEncoder().encode(page), as: UTF8.self)]
+                let body = try sync.engine.actionResponse(response, for: action)
+                let message = try sync.bridge.cloudKitActionResponseMessage(body, correlationID: action.msgId)
+                let bytes = try NAChatMessageCodec.recordValueBytes(NAChatMessageCodec.encode(message))
+                guard bytes <= Self.historyPageByteBudget else {
+                    throw DeviceSyncError.payloadTooLarge(actualBytes: bytes, maximumBytes: Self.historyPageByteBudget)
+                }
+                return response
             case "pairDevice":
                 return ["status": "ok", "ok": "true", "message": "This phone is paired."]
-            case "createDeskItem":
-                let kindRaw = (payload["kind"] ?? "plan").lowercased()
-                let project = (payload["project"] ?? "General").trimmingCharacters(in: .whitespacesAndNewlines)
-                let title = (payload["title"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                let summary = payload["summary"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard let kind = DeskKind(rawValue: kindRaw), !project.isEmpty, !title.isEmpty,
-                      project.count <= 200, title.count <= 500, (summary?.count ?? 0) <= 2_000 else {
-                    return observed(["status": "error", "code": "invalid_desk_item", "message": "Desk kind, project, title, or summary is invalid."])
-                }
-                let item = try await SwiftNativeDeskStore(dataRoot: PersistenceCore.defaultDataRoot())
-                    .createItem(kind: kind, project: project, title: title, summary: summary)
-                return observed(["status": "ok", "handle": item.handle, "alias": item.alias])
-
-            case "setDeskItemStatus":
-                let handle = (payload["handle"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                let statusRaw = (payload["status"] ?? "").lowercased()
-                guard handle.hasPrefix("desk_"), handle.count <= 64,
-                      let status = DeskStatus(rawValue: statusRaw), status != .blocked else {
-                    return observed(["status": "error", "code": "invalid_desk_status", "message": "Desk handle or status is invalid."])
-                }
-                _ = try await SwiftNativeDeskStore(dataRoot: PersistenceCore.defaultDataRoot())
-                    .setStatus(handle, status: status)
-                return observed(["status": "ok", "handle": handle, "deskStatus": status.rawValue])
-
-            case "appendDeskItemNote":
-                let handle = (payload["handle"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                let note = (payload["text"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                guard handle.hasPrefix("desk_"), handle.count <= 64, !note.isEmpty, note.count <= 2_000 else {
-                    return observed(["status": "error", "code": "invalid_desk_note", "message": "Desk handle or note is invalid."])
-                }
-                _ = try await SwiftNativeDeskStore(dataRoot: PersistenceCore.defaultDataRoot())
-                    .appendNote(handle, text: note)
-                return observed(["status": "ok", "handle": handle])
-
-            // Phone builds in hand still name it submitWorkshopTask.
-            case "submitDeskTask", "submitWorkshopTask":
-                let title = payload["title"] ?? "iOS Desk Task"
-                let objective = payload["objective"] ?? ""
-                let result = try await api.submitDeskTask(title: title, objective: objective)
-                return ["status": "ok", "deskHandle": result.desk_handle, "deskAlias": result.desk_alias, "job": result.job]
-
-            case "approveMemoryProposal":
-                let proposalId = payload["proposalId"] ?? ""
-                let record = try await api.acceptMemoryProposal(proposalID: proposalId)
-                return try await memoryActionResponse(["ok": "true", "status": "ok"],
-                    memoryID: record.id, proposalID: proposalId, api: api)
-
-            case "rejectMemoryProposal":
-                let proposalId = payload["proposalId"] ?? ""
-                try await api.rejectMemoryProposal(proposalID: proposalId, reason: "Rejected via iOS")
-                return observed(try await memoryActionResponse(["ok": "true", "status": "rejected"], proposalID: proposalId, api: api))
-
-            case "deleteMemory":
-                let memoryId = payload["memoryId"] ?? ""
-                guard !memoryId.isEmpty else { return observed(["status": "error", "message": "Missing memoryId"]) }
-                try await api.deleteMemory(id: memoryId)
-                return observed(try await memoryActionResponse(["status": "ok", "ok": "true"], memoryID: memoryId, api: api))
 
             case "approveApproval", "rejectApproval", "cancelApproval":
-                let approvalId = payload["approvalId"] ?? ""
-                let response: [String: String]
-                if approvalId.isEmpty {
-                    response = ["status": "error", "message": "Missing approvalId"]
-                } else {
-                    response = try await approvalActionResponse(approvalId: approvalId,
-                        decision: String(action.action.dropLast("Approval".count)), action: action)
+                guard let id = payload["approvalId"], !id.isEmpty else {
+                    return observed(["status": "error", "ok": "false", "message": "Missing approvalId"])
                 }
-                return action.action == "approveApproval" ? response : observed(response)
+                return observed(try await phoneApprovalResponse(id: id,
+                    decision: String(action.action.dropLast("Approval".count)), device: action.clientId))
+            case "interaction_action":
+                guard payload.count == 1, let sealed = payload[SecretActionEnvelope.field] else {
+                    return ["status": "error", "ok": "false", "message": "The card answer must be sealed by the paired phone."]
+                }
+                let fields = try await sync.storage.perform {
+                    guard let encoded = try PairingSecret.existingSecretBase64(), let secret = Data(base64Encoded: encoded) else {
+                        throw PartCallError(code: "pairing_unavailable", message: "The pairing secret is unavailable; the card was not answered.")
+                    }
+                    return try SecretActionEnvelope.open(sealed, secret: secret, actionID: action.msgId, actionName: action.action)
+                }
+                return try await api.answerPhoneInteraction(fields, device: action.clientId)
+            case "inboxAction":
+                return observed(try await phoneInboxResponse(action))
 
+            // The paired phone's tap answers the row's own action through the person's door.
             case "faceAction":
                 guard let page = payload["page"], !page.isEmpty,
                       let row = payload["row"], !row.isEmpty,
@@ -317,6 +230,38 @@ struct MacSyncActionRouter {
                                      "message": "faceAction requires page, row and action."])
                 }
                 do {
+                    if payload["answers"] == "true" {
+                        guard let encoded = payload["expectedCall"] else {
+                            throw PartCallError(code: "drawn_call_missing", message: "Read the page before acting.")
+                        }
+                        let call = try JSONDecoder().decode(PartFace.Call.self, from: Data(encoded.utf8))
+                        guard let operation = payload["operation"].flatMap(UUID.init(uuidString:)) else {
+                            throw PartCallError(code: "operation_missing", message: "The page act needs its operation identity.")
+                        }
+                        let undoOf = try payload["undoOf"].map { text in
+                            guard let id = UUID(uuidString: text) else {
+                                throw PartCallError(code: "undo_invalid", message: "The inverse needs its original operation identity.")
+                            }
+                            return id
+                        }
+                        let values = try payload["values"].map { encoded in
+                            do { return try JSONDecoder().decode([String: PartFace.Value].self, from: Data(encoded.utf8)) }
+                            catch { throw PartCallError(code: "invalid_form_values", message: "Form values must be a JSON object of named fields.") }
+                        }
+                        let outcome = try await api.faceOutcome(page: page, row: row, action: faceAction,
+                            value: payload["value"], values: values, formRevision: payload["formRevision"],
+                            device: action.clientId, expecting: call, operation: operation,
+                            undoOf: undoOf, checking: payload["checking"] == "true")
+                        var response = ["status": outcome.unresolved ? "outcome_unknown" : (outcome.accepted ? "ok" : "error"),
+                            "effects": outcome.effects.rawValue,
+                            "outcome": String(decoding: try JSONEncoder().encode(outcome), as: UTF8.self)]
+                        if !outcome.unresolved { response["ok"] = outcome.failure == nil && outcome.accepted ? "true" : "false" }
+                        if let words = outcome.failure?.localizedDescription ?? outcome.words { response["message"] = words }
+                        return observed(response)
+                    }
+                    guard payload["values"] == nil, payload["formRevision"] == nil else {
+                        throw PartCallError(code: "drawn_call_missing", message: "Submit forms through their drawn call and retained operation.")
+                    }
                     let words = try await api.faceAction(page: page, row: row, action: faceAction, value: payload["value"], device: action.clientId)
                     var response = ["status": "ok", "ok": "true"]
                     if let words { response["message"] = words }
@@ -325,41 +270,24 @@ struct MacSyncActionRouter {
                     return observed(["status": "error", "ok": "false", "code": error.code, "message": error.message])
                 }
 
-            case "interaction_action":
-                guard action.payload.count == 1,
-                      let sealed = action.payload[SecretActionEnvelope.field],
-                      let encodedSecret = try PairingSecret.existingSecretBase64(),
-                      let secret = Data(base64Encoded: encodedSecret) else {
-                    return ["status": "error", "message": "Could not decrypt the card answer. Check pairing and try again."]
+            case "workActivityState":
+                guard let encoded = payload["workIds"] else {
+                    return ["status": "error", "ok": "false", "message": "Work state needs its exact work identities."]
                 }
-                let fields = try SecretActionEnvelope.open(sealed, secret: secret,
-                    actionID: action.msgId, actionName: action.action)
-                return try await api.interactionAction(payload: fields, actionID: action.msgId, clientID: action.clientId)
-
-            case "inboxAction":
-                let itemId = payload["itemId"] ?? ""
-                let actionId = payload["actionId"]
-                guard !itemId.isEmpty else { return ["status": "error", "message": "Missing inbox item id"] }
-                guard let actionId,
-                      let endpointAction = InboxActionVocabulary.routedAction(actionId, itemID: itemId) else {
-                    return ["status": "error", "code": "invalid_action", "message": "Unknown or missing inbox action"]
-                }
-                if itemId.hasPrefix("interaction:"), actionId == "act" {
-                    let response = try await api.interactionAction(payload: ["action": "open", "itemID": itemId],
-                        actionID: action.msgId, clientID: action.clientId)
-                    return try await inboxActionResponse(response, itemID: itemId, api: api)
-                }
-                if (endpointAction == "approve" || endpointAction == "reject"), !itemId.hasPrefix("interaction:") {
-                    return observed(try await approvalActionResponse(approvalId: itemId,
-                        decision: endpointAction, action: action, inboxItemID: itemId))
-                }
-                try await api.inboxAction(itemId, action: endpointAction)
-                return observed(try await inboxActionResponse([
-                    "status": "ok",
-                    "ok": "true",
-                    "itemId": itemId,
-                    "actionId": actionId,
-                ], itemID: itemId, api: api))
+                let root = sync.dataRoot
+                return try await Task.detached {
+                    let ids = try JSONDecoder().decode([String].self, from: Data(encoded.utf8))
+                    guard !ids.isEmpty, ids.count <= 64, ids.allSatisfy({ $0.hasPrefix("turn:") && $0.count > 5 && $0.count <= 512 }) else {
+                        return ["status": "error", "ok": "false", "message": "Invalid work identities."]
+                    }
+                    var rows: [MobileWorkActivity] = []
+                    for id in Set(ids).sorted() {
+                        rows.append(try await MacSyncEngine.workActivity(id, dataRoot: root))
+                    }
+                    let encoder = JSONEncoder()
+                    encoder.dateEncodingStrategy = .iso8601
+                    return ["status": "ok", "ok": "true", "activities": String(decoding: try encoder.encode(rows), as: UTF8.self)]
+                }.value
 
             case "registerWorkActivity":
                 guard let deviceID = payload["deviceId"], !deviceID.isEmpty,
@@ -506,10 +434,8 @@ struct MacSyncActionRouter {
                         "message": "unpinChatSession requires a valid sessionId.",
                     ])
                 }
-                let current = sync.host.pinnedChatSessionIDs()
-                let next = current.filter { $0 != sessionId }
-                if next != current {
-                    try sync.host.savePinnedChatSessionIDs(next)
+                let changed = try await sync.host.closePinnedChatSession(sessionId)
+                if changed {
                     await MainActor.run {
                         sync.engine.requestChatSnapshotPublication(
                             includeTranscripts: false
@@ -520,82 +446,10 @@ struct MacSyncActionRouter {
                     "status": "ok",
                     "ok": "true",
                     "applied": "true",
-                    "changed": next == current ? "false" : "true",
+                    "changed": changed ? "true" : "false",
                     "sessionId": sessionId,
                     "pinned": "false",
                 ])
-
-            case "configure_provider_secret": return await configureEncryptedProvider(action)
-            case "start_provider_sign_in": return await startProviderSignIn(action)
-            case "configure_provider":
-                let providerId = payload["providerId"] ?? ""
-                guard !providerId.isEmpty else { return observed(["status": "error", "message": "Missing providerId"]) }
-                if let key = payload["api_key"], !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return observed([
-                        "status": "error",
-                        "message": "API keys cannot be sent through iCloud. Open NativeAgent on the Mac to save provider keys locally.",
-                    ])
-                }
-                if payload["auth_mode"] == "oauth",
-                   providerId == "openai_oauth_direct" || providerId == "anthropic_oauth_direct" || providerId == "xai_oauth_direct" {
-                    return observed([
-                        "status": "error",
-                        "ok": "false",
-                        "code": "not_implemented",
-                        "message": "Provider OAuth must be started from the Mac app.",
-                        "provider_id": providerId,
-                    ])
-                }
-                let authMode = payload["auth_mode"] ?? ""
-                _ = try await api.configureProvider(providerId, apiKey: nil, authMode: authMode, defaultModel: nil)
-                return observed(["status": "ok", "provider_id": providerId])
-
-            case "test_provider":
-                let providerId = payload["providerId"] ?? ""
-                guard !providerId.isEmpty else { return observed(["status": "error", "message": "Missing providerId"]) }
-                let result = try await api.testProvider(providerId)
-                var response = ["status": result.status, "detail": result.detail ?? "", "provider_id": providerId]
-                if let error = result.error {
-                    response["error"] = error
-                    response["message"] = error
-                } else if let text = result.response {
-                    response["message"] = text
-                }
-                return observed(response)
-
-            case "clear_provider":
-                let providerId = payload["providerId"] ?? ""
-                guard !providerId.isEmpty else { return ["status": "error", "message": "Missing providerId"] }
-                _ = try await api.clearProvider(providerId)
-                return ["status": "ok", "provider_id": providerId]
-
-            case "set_active_provider":
-                guard let surface = payload["surface"], let providerId = payload["provider_id"],
-                      !surface.isEmpty, !providerId.isEmpty else {
-                    return ["status": "error", "message": "A surface and provider are required."]
-                }
-                _ = try await api.setActiveProvider(surface: surface, providerId: providerId)
-                return ["status": "ok", "ok": "true", "surface": surface, "provider_id": providerId]
-
-            case "set_surface_model":
-                let surface = payload["surface"] ?? "chat"
-                let model = (payload["model"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !model.isEmpty else {
-                    return ["status": "error", "message": "Missing model"]
-                }
-                let reasoning = payload["reasoning_effort"].flatMap { $0.isEmpty ? nil : $0 }
-                let recovered = try await api.saveSurfaceSelection(
-                    surface: surface, model: model, reasoningEffort: reasoning,
-                    serviceTier: reasoning == nil ? nil : payload["service_tier"], providerID: nil
-                )
-                return observed(Self.canonicalSurfaceModelResponse(
-                    surface: surface,
-                    requestedModel: model,
-                    recoveredPreference: ProviderRoutingSurfaceLookup.value(
-                        recovered.preferences,
-                        surface
-                    )
-                ))
 
             case "configure_surface_selection":
                 guard let request = Self.surfaceSelection(from: payload) else {
@@ -647,104 +501,78 @@ struct MacSyncActionRouter {
                 "message": reason,
             ])
         } catch {
+            if action.action == "faceRead" { return ["status": "error", "ok": "false", "message": error.localizedDescription] }
             return observed(["status": "error", "message": error.localizedDescription])
         }
-    }
-
-    private func inboxActionResponse(_ response: [String: String], itemID: String, api: any DeviceSyncHost) async throws -> [String: String] {
-        var response = response
-        response["inboxReadbackRevision"] = String(Date().timeIntervalSince1970)
-        let read = await api.workOverview()
-        response["inboxItemId"] = itemID
-        response["inboxItemJSON"] = String(decoding: try JSONEncoder().encode(read.inbox.get().first { $0.id == itemID }), as: UTF8.self)
-        return response
-    }
-
-    private func memoryActionResponse(_ response: [String: String], memoryID: String? = nil,
-                                      proposalID: String? = nil, api: any DeviceSyncHost) async throws -> [String: String] {
-        var response = response
-        response["memoryReadbackRevision"] = String(Date().timeIntervalSince1970)
-        response["resolvedProposalId"] = proposalID
-        if let memoryID {
-            let row = try await api.activeMemories().first { $0.id == memoryID }.map(MemoryRecord.init(phoneRow:))
-            response["memoryId"] = memoryID
-            response["memoryJSON"] = String(decoding: try JSONEncoder().encode(row), as: UTF8.self)
-        }
-        return response
-    }
-
-    private func approvalActionResponse(approvalId: String, decision: String, action: InboxAction,
-                                        inboxItemID: String? = nil) async throws -> [String: String] {
-        let row = try await sync.host.resolveApproval(id: approvalId, decision: decision,
-            provenance: .signedIOS(clientID: action.clientId, decidedBy: "ios_signed_operator"))
-        let accepted = row.status == "resolved"
-        var out = ["ok": "true", "id": row.id, "status": row.status, "action": row.action,
-            "title": row.title, "risk": row.risk, "decisionAccepted": accepted ? "true" : "false",
-            "decisionStatus": row.status, "createdAt": row.createdAt, "reason": row.reason]
-        out["decision"] = row.decision
-        out["resolvedAt"] = row.resolvedAt
-        if row.decision == "approved" {
-            var status: String?
-            var error: String?
-            var message: String?
-            var ok: Bool?
-            let liveWaiter: Bool
-            if case .object(let fields)? = row.executedAction {
-                func bounded(_ key: String) -> String? {
-                    guard case .string(let value)? = fields[key] else { return nil }
-                    return String(value.unicodeScalars.prefix(512))
-                }
-                status = bounded("status") ?? "recorded"
-                error = bounded("error")
-                message = bounded("message")
-                if case .bool(let value)? = fields["ok"] { ok = value }
-                liveWaiter = false
-            } else if accepted, ["agent.acp.permission", "agent.acp.connect"].contains(row.action),
-                      case .object(let payload) = row.payload,
-                      case .string("agent_acp_live_approval")? = payload["kind"] {
-                liveWaiter = true
-            } else {
-                status = "outcome_unknown"
-                message = "No execution outcome is available."
-                liveWaiter = false
-            }
-            if !liveWaiter {
-                message = message ?? row.detail.map { String($0.unicodeScalars.prefix(512)) }
-                var execution: [String: Any] = [:]
-                if let status { execution["status"] = status }
-                if let error { execution["error"] = error }
-                if let message { execution["message"] = message }
-                if let ok { execution["ok"] = ok }
-                out["executedAction"] = String(describing: execution)
-                let verdict = row.executionResultClass
-                out["executionStatus"] = (status ?? "").lowercased()
-                out["result_class"] = verdict.rawValue
-                out["status"] = verdict.receipt.status
-                out["ok"] = verdict.receipt.ok.map { String($0) }
-                out["message"] = [error, message].compactMap { $0 }.first { !$0.isEmpty }
-                if verdict.isFailure, accepted {
-                    out["message"] = "Decision accepted. " + (out["message"] ?? "Execution did not succeed (\(verdict.rawValue)).")
-                }
-            } else { out["status"] = "pending_approval"; out["result_class"] = "unknown" }
-        }
-        out["approvalReadbackRevision"] = String(Date().timeIntervalSince1970)
-        if inboxItemID != nil { out["inboxReadbackRevision"] = String(Date().timeIntervalSince1970) }
-        let projection = await sync.host.workOverview()
-        let canonical = try projection.approvals.get().first { $0.id == approvalId }
-        out["approvalJSON"] = String(decoding: try JSONEncoder().encode(canonical), as: UTF8.self)
-        out["approvalId"] = approvalId
-        if let inboxItemID {
-            out["inboxItemId"] = inboxItemID
-            out["inboxItemJSON"] = String(decoding: try JSONEncoder().encode(projection.inbox.get().first { $0.id == inboxItemID }), as: UTF8.self)
-        }
-        return out
     }
 
 }
 
 extension MacSyncActionRouter {
-    /// The phone's Steer (builds 49-51): its words are an ios arrival through the one admission. Read by the agent's turn in progress,
-    /// the phone hears "steered"; if its own place comes first, "steer_returned" and the phone sends them through its chat door.
+    /// Signed phone card actions retain the canonical approval and Inbox owners' authority and receipts.
+    func phoneApprovalResponse(id: String, decision: String, device: String, inboxItem: String? = nil) async throws -> [String: String] {
+        let row = try await sync.host.decidePhoneApproval(id: id, decision: decision, device: device)
+        let accepted = row.decision != nil
+        var response: [String: String] = ["status": "ok", "ok": "true", "id": row.id, "approvalId": row.id,
+            "action": row.action, "title": row.title, "risk": row.risk, "createdAt": row.createdAt,
+            "decisionAccepted": accepted ? "true" : "false", "decisionStatus": row.status]
+        response["decision"] = row.decision
+        response["resolvedAt"] = row.resolvedAt
+        response["message"] = row.decisionExperience.face?.words
+        if row.decision == "approved" {
+            let verdict = row.executionResultClass
+            response["result_class"] = verdict.rawValue
+            response["status"] = verdict.receipt.status
+            response["ok"] = verdict.receipt.ok.map { String($0) }
+            response["executionStatus"] = verdict.receipt.status
+            if row.executedAction == nil, ["agent.acp.permission", "agent.acp.connect"].contains(row.action),
+               row.payload.objectValue?["kind"] == .string("agent_acp_live_approval") {
+                response["status"] = "pending_approval"
+            }
+        }
+        // A failed readback cannot undo the completed decision or be serialized as an absent row.
+        let projection = await sync.host.workOverview()
+        do {
+            let canonical = try projection.approvals.get().first { $0.id == id }
+            response["approvalJSON"] = String(decoding: try JSONEncoder().encode(canonical), as: UTF8.self)
+            response["approvalReadbackRevision"] = String(Date().timeIntervalSince1970)
+        } catch { response["approvalReadbackError"] = error.localizedDescription }
+        if let inboxItem {
+            do {
+                let canonical = try projection.inbox.get().first { $0.id == inboxItem }
+                response["inboxItemId"] = inboxItem
+                response["inboxItemJSON"] = String(decoding: try JSONEncoder().encode(canonical), as: UTF8.self)
+                response["inboxReadbackRevision"] = String(Date().timeIntervalSince1970)
+            } catch { response["inboxReadbackError"] = error.localizedDescription }
+        }
+        return response
+    }
+
+    func phoneInboxResponse(_ action: InboxAction) async throws -> [String: String] {
+        guard let id = action.payload["itemId"], !id.isEmpty,
+              let raw = action.payload["actionId"], let answer = InboxActionVocabulary.routedAction(raw, itemID: id) else {
+            throw PartCallError(code: "invalid_action", message: "inboxAction requires an itemId and one of its shown actionId values.")
+        }
+        if !id.hasPrefix("interaction:"), ["approve", "reject"].contains(answer) {
+            return try await phoneApprovalResponse(id: id, decision: answer, device: action.clientId, inboxItem: id)
+        }
+        var response = ["status": "ok", "ok": "true", "itemId": id, "actionId": raw]
+        if id.hasPrefix("interaction:"), answer == "act" {
+            response.merge(try await sync.host.answerPhoneInteraction(["action": "open", "itemID": id], device: action.clientId)) { _, new in new }
+        } else {
+            response["message"] = try await sync.host.faceAction(page: "inbox", row: id, action: answer, value: nil, device: action.clientId)
+        }
+        do {
+            let projection = await sync.host.workOverview()
+            let canonical = try projection.inbox.get().first { $0.id == id }
+            response["inboxItemId"] = id
+            response["inboxItemJSON"] = String(decoding: try JSONEncoder().encode(canonical), as: UTF8.self)
+            response["inboxReadbackRevision"] = String(Date().timeIntervalSince1970)
+        } catch { response["inboxReadbackError"] = error.localizedDescription }
+        return response
+    }
+
+    /// The current turn reads the arrival, or the phone retains ownership of its separate message.
     func steerChat(_ payload: [String: String]) async -> [String: String] {
         guard let sessionId = payload["sessionId"].flatMap(NativeAgentChatSessionID.normalizedPathComponent),
               let runId = payload["runId"], UUID(uuidString: runId) != nil,
@@ -758,12 +586,13 @@ extension MacSyncActionRouter {
         }
         let route = ChatToolSessionContext.ReplyRoute(surface: "ios", sourceKey: routeKey, replyTo: "iphone", correlationId: runId)
         let bridge = sync.bridge
+        let attempt = UUID().uuidString
         func tell(_ kind: String, _ words: String) async -> Bool {
-            let id = "steer-" + MacSyncSnapshotIntegrity.digest(Data("\(runId)\n\(kind)".utf8))
+            let id = "steer-" + MacSyncSnapshotIntegrity.digest(Data("\(runId)\n\(attempt)\n\(kind)".utf8))
             do {
                 _ = try await bridge.sendChatMessage(text: words, sessionID: sessionId, correlationID: runId,
                     metadata: ["kind": kind, "transport": "icloud", "source": "mac", "replyTo": "iphone",
-                               "targetSourceKey": routeKey], messageID: id)
+                               "targetSourceKey": routeKey, "steering": "true"], messageID: id)
                 return true
             } catch {
                 bridge.syncStatus = "Phone steering outcome delivery remains owed: \(error.localizedDescription)"
@@ -788,10 +617,11 @@ extension MacSyncActionRouter {
             engine.waitingSteers[sessionId]?[runId] = nil
             switch result {
             case .success(.steered): _ = await tell("steered", "Read in the reply in progress")
-            // Stopped while it waited: the phone settles it in its own steered shape, and never sends it again.
             case .failure(let error) where error is CancellationError: _ = await tell("steered", "Stopped before it was read")
-            // Its own place came, or admission refused it: the phone's own chat door then owns it.
-            case .success(.ran), .failure: _ = await tell("steer_returned", "Sending it as its own message")
+            case .success(.ran): _ = await tell("steer_returned", "Sending it as its own message")
+            case .failure(let error):
+                _ = await tell("notice", "Steering admission failed: \(error.localizedDescription). "
+                    + "Your message remains queued. Review the cause, then choose Steer or Send from its queue control.")
             }
         }
         return ["status": "ok", "ok": "true", "steered": "true"]

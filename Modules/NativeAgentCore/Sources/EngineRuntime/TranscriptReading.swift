@@ -30,6 +30,16 @@ extension TranscriptsFacade {
         chatRoot.appendingPathComponent("sessions.json")
     }
 
+    /// Selection checks identity without preparing sidebar speech from message files.
+    public nonisolated func readSessionIdentity(_ id: String) async throws -> NativeAgentShared.ChatSession? {
+        let path = sessionsPath
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
+            let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
+            guard let row = rows.first(where: { $0["id"] == .string(id) }) else { return nil }
+            return try NativeAgentShared.ChatSession(row: row)
+        }
+    }
+
     /// Read the session index after retention under the same lock; checked absence is empty.
     private nonisolated func sessionRows() async throws -> [[String: JSONValue]] {
         let dataRoot = self.dataRoot
@@ -57,7 +67,9 @@ extension TranscriptsFacade {
         let projections = try await openingLines.prepareProjections(sessions)
         try Task.checkCancellation()
         let sources = sessions.map { session in
-            (id:session.id,source:ChatShellConversationRow.titleSource(for:session,openingLine:projections[session.id]?.line))
+            // The index title remains known when opening speech could not be read.
+            if projections[session.id]?.issue != nil { return (id: session.id, source: (text: session.title, automated: false)) }
+            return (id:session.id,source:ChatShellConversationRow.titleSource(for:session,openingLine:projections[session.id]?.line))
         }
         let automated = sources.filter { $0.source.automated }
         let face = await presentation.prepareSnapshot("conversations",input:.object(["kind":.string("conversations"),
@@ -105,8 +117,10 @@ extension TranscriptsFacade {
         }
         return try await readPublishedTranscript(safeSessionId: safeSessionId, cached: cached).projection
     }
-    nonisolated internal func readTranscriptProjection(safeSessionId: String, cached: Bool) async throws -> TranscriptReadout {
-        var projection = try await readTranscript(safeSessionId: safeSessionId, cached: cached)
+    @concurrent nonisolated internal func readTranscriptProjection(safeSessionId: String, cached: Bool,
+        limit: Int? = nil) async throws -> TranscriptReadout {
+        _ = await readFirstConversationReceiptTitle()
+        var projection = try await readTranscript(safeSessionId: safeSessionId, cached: cached, limit: limit)
         let cards = try await InlineCards.cardsByRow(
             projection.interactions, messages: projection.messages, sessionID: safeSessionId, dataRoot: dataRoot)
         for index in projection.messages.indices {
@@ -115,9 +129,23 @@ extension TranscriptsFacade {
         projection.cardsHeading = cards.heading
         return await projection.attachmentPreviews()
     }
-    nonisolated func readTranscript(safeSessionId: String, cached: Bool = true) async throws -> TranscriptReadout {
+    @concurrent nonisolated func readTranscript(safeSessionId: String, cached: Bool = true, limit: Int? = nil) async throws -> TranscriptReadout {
         // Use SessionHistoryReader’s resolved fields and retained raw metadata.
-        let history = try await cache.history(at: dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl"), cached: cached)
+        let read = try await cache.history(at: dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl"), cached: cached, limit: limit)
+        let history = read.history
+        if history.stats.mode == "missing" {
+            let index = sessionsPath
+            let declaredEmpty = try await SwiftNativePersistenceCore.withFileLock(index) {
+                try ChatSessionIndexFile.loadObjectRowsForMutation(at: index).contains {
+                    $0["id"] == .string(safeSessionId) && $0["messageCount"] == .int(0)
+                }
+            }
+            guard declaredEmpty else {
+                throw NSError(domain: "NativeAgent.ChatHistory", code: 404, userInfo: [
+                    NSLocalizedDescriptionKey: "The conversation's message file is missing and its index does not declare an empty chat. Restore the file."
+                ])
+            }
+        }
         // UI selection must propagate read failures rather than replace the conversation with prompt history’s tolerated empty subset.
         guard history.stats.mode != "read_failed" else {
             throw NSError(
@@ -136,7 +164,7 @@ extension TranscriptsFacade {
             )
         }
         // New empty sessions are valid; damaged subsets cannot replace a complete published transcript.
-        let coMessages = history.messages
+        let coMessages = try history.checkedMessages()
         let messages = try coMessages.map { co -> ChatMessage in
             guard case .object(let row)? = co.extras else {
                 throw NSError(domain: "NativeAgent.ChatHistory", code: 422, userInfo: [
@@ -152,6 +180,10 @@ extension TranscriptsFacade {
             return message
         }
         var projection = TranscriptReadout(messages: messages)
+        projection.isComplete = !history.stats.truncated
+        ModuleLog.app("[transcript-read] session=%@ scope=%@ cache=%@ bytes=%lld source=%lld rows=%ld", safeSessionId,
+            projection.isComplete ? "complete" : "tail", read.cacheHit ? "hit" : "miss",
+            read.cacheHit ? Int64(0) : history.stats.bytesRead, history.stats.sourceBytes, messages.count)
         projection.interactions = InlineInteractionResolver.interactionsByRow(in: coMessages.compactMap(\.extras),
             lifeID: try DataRootLife.current(in: dataRoot))
         return projection

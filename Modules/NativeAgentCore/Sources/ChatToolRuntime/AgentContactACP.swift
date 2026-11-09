@@ -194,7 +194,7 @@ extension SwiftToolDispatcher {
                     if case .denied = currentPermission { return false }
                     let automaticallyAllowed = kind != "delete" && launchPermission == .fullMac && currentPermission == .fullMac
                     if automaticallyAllowed {
-                        HarnessDecidedRow.post(turn: turn, requester: contact.name, tool: kind,
+                        BodyDecidedRow.post(turn: turn, requester: contact.name, tool: kind,
                                                      sessionID: decidedSessionID, dataRoot: self.dataRoot)
                         allowed = true
                     } else {

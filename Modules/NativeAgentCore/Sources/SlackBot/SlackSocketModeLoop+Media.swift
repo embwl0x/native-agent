@@ -4,15 +4,17 @@ import ChatTurnRuntime
 import PersistenceCore
 import NativeAgentShared
 import BackgroundLoops
-// Blueprint: | `SlackSocketModeLoop+Media.swift` | `SlackSocketModeLoop`: inbound files, bounded image hydration and upload selection |
+// Blueprint: | `SlackSocketModeLoop+Media.swift` | Complete attachment hydration precedes chat; preparation failures retain their own reply |
 
 extension SlackSocketModeLoop {
     enum AttachmentFailure: Error {
-        case unsupported, oversized, empty, limit
+        case missingMetadata, unsupported, oversized, empty, limit
         case permanent(Int), transient(String)
 
         var notice: String {
             switch self {
+            case .missingMetadata:
+                return "attachment_metadata_missing: Slack did not provide a MIME type or download URL. Upload the file again with complete metadata."
             case .unsupported:
                 return "attachment_unsupported: Expected an HTTPS JPEG, PNG, GIF or WebP image. Send a supported image or paste its text."
             case .oversized:
@@ -32,7 +34,6 @@ extension SlackSocketModeLoop {
     struct AttachmentHydration {
         let inbound: SlackInboundMessage
         let failures: [(index: Int, cause: AttachmentFailure)]
-        var hasTransientFailure: Bool { failures.contains { if case .transient = $0.cause { return true }; return false } }
         var notice: String? {
             failures.isEmpty ? nil : failures.map { "Attachment \($0.index + 1): \($0.cause.notice)" }.joined(separator: "\n")
         }
@@ -41,15 +42,16 @@ extension SlackSocketModeLoop {
     func attachmentAwareReply(_ hydration: AttachmentHydration, original: SlackInboundMessage, sessionId: String,
                               handler: SlackHandler) async throws -> SlackSocketModeReply {
         let inbound = hydration.inbound
+        if let notice = hydration.notice { return SlackSocketModeReply(text: notice) }
         if inbound.text.isEmpty && inbound.attachments.isEmpty {
-            return SlackSocketModeReply(text: hydration.notice ?? "No readable message was received.")
+            throw SlackSocketModeError.api("No readable message was received. Send text or a supported attachment.")
         }
         let preview = replyPreview(for: original, sessionId: sessionId)
         let runID = handler.turn.run
         let lease = SessionTurnDelivery.mount(dataRoot: dataRoot, sessionID: sessionId, runID: runID,
             recipient: .init(progress: noticeSink(for: original, preview: preview)))
         defer { SessionTurnDelivery.unmount(dataRoot: dataRoot, sessionID: sessionId, runID: runID, lease: lease) }
-        var reply: SlackSocketModeReply
+        let reply: SlackSocketModeReply
         do {
             reply = try await generateReply(inbound, sessionId: sessionId, handler: handler)
         } catch {
@@ -57,11 +59,6 @@ extension SlackSocketModeLoop {
             throw error
         }
         await settle { await preview.finish() }
-        if reply.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, reply.attachments.isEmpty,
-           try SwiftNativeChatOrchestrationClient.silentTurn(dataRoot: dataRoot, sessionId: sessionId, runId: runID) != nil {
-            return reply
-        }
-        if reply.readBy == nil, let notice = hydration.notice { reply.text = notice + "\n\n" + reply.text }
         return reply
     }
 
@@ -79,23 +76,21 @@ extension SlackSocketModeLoop {
                 remainingBytes -= attachment.byteSize
                 attachments.append(attachment)
             } catch {
+                if Task.isCancelled || error is CancellationError { break }
                 failures.append((index, (error as? AttachmentFailure) ?? .transient(Self.redact(error.localizedDescription))))
                 await writeState([
                     "lastInboundAttachmentErrorAt": .string(Self.nowString()),
-                    "lastInboundAttachmentError": .string(String(describing: error)),
+                    "lastInboundAttachmentError": .string(Self.redact(String(describing: error))),
                 ])
             }
         }
-        let text = !failures.isEmpty && (!inbound.text.isEmpty || !attachments.isEmpty)
-            ? inbound.text + "\n\n[Slack attachment notice: " + failures.map { "Attachment \($0.index + 1): \($0.cause.notice)" }.joined(separator: "\n") + "]"
-            : inbound.text
         let hydrated = SlackInboundMessage(
             eventId: inbound.eventId,
             teamId: inbound.teamId,
             channelId: inbound.channelId,
             userId: inbound.userId,
             eventType: inbound.eventType,
-            text: text,
+            text: inbound.text,
             ts: inbound.ts,
             threadTs: inbound.threadTs,
             channelType: inbound.channelType,
@@ -111,10 +106,12 @@ extension SlackSocketModeLoop {
         _ file: SlackInboundFile,
         maximumBytes: Int
     ) async throws -> ChatTurnRuntime.MultimodalAttachment {
-        let mime = file.mimeType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let mimeType = file.mimeType, !mimeType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let downloadURL = file.downloadURL, !downloadURL.isEmpty else { throw AttachmentFailure.missingMetadata }
+        let mime = mimeType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let supportedMIMEs: Set<String> = ["image/jpeg", "image/png", "image/gif", "image/webp"]
         guard supportedMIMEs.contains(mime),
-              let url = URL(string: file.downloadURL), url.scheme?.lowercased() == "https" else {
+              let url = URL(string: downloadURL), url.scheme?.lowercased() == "https" else {
             throw AttachmentFailure.unsupported
         }
         if let declared = file.byteSize, declared < 0 || declared > maximumBytes {
@@ -156,21 +153,19 @@ extension SlackSocketModeLoop {
 
     static func inboundFiles(_ value: JSONValue?) -> [SlackInboundFile] {
         guard case .array(let rows)? = value else { return [] }
-        return rows.compactMap { value in
-            guard case .object(let file) = value,
-                  let url = file["url_private_download"]?.stringValue ?? file["url_private"]?.stringValue,
-                  let mime = file["mimetype"]?.stringValue else { return nil }
+        return rows.map { value in
+            let file = value.objectValue
             let bytes: Int? = {
-                switch file["size"] {
-                case .int(let value)?: return Int(value)
+                switch file?["size"] {
+                case .int(let value)?: return Int(exactly: value)
                 case .double(let value)?: return Int(exactly: value.rounded(.towardZero))
                 default: return nil
                 }
             }()
             return SlackInboundFile(
-                downloadURL: url,
-                mimeType: mime,
-                name: file["name"]?.stringValue,
+                downloadURL: file?["url_private_download"]?.stringValue ?? file?["url_private"]?.stringValue,
+                mimeType: file?["mimetype"]?.stringValue,
+                name: file?["name"]?.stringValue,
                 byteSize: bytes
             )
         }

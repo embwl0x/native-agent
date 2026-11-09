@@ -15,10 +15,49 @@ The typed browser status projection preserves `recoveryIssue`, `admissionIssues`
 and named `unavailableRuns` through the runtime readout to `browser.status`.
 `ChatTurnRuntime` owns the turn engine. Conversation surfaces share that core
 while retaining their own admission and delivery boundaries.
+
+Cross-conversation continuity belongs to the current turn. The person's local
+chat/iPhone arrival and their own unsteered turn in their direct app/iPhone
+conversation may read other rooms under Remember across conversations. A peer
+origin, bridge door or carried steering peer, including an elevated peer, never
+admits private cross-room words. Remote strangers receive no person's acts.
+The session index's strict `continuityParticipant` still binds implicit previous
+conversation recall; a mixed row does not decide who is speaking on this turn.
+No saved participant rows are rewritten.
+
+The life packet names up to four recorded acts since this conversation's last
+accepted reply. A complete empty selection emits neither heading nor disclaimer;
+real gaps and exhausted read bounds remain visible. Closing dispatch evidence
+attests native acts on the mind stream without requiring a nonexistent heard
+record. Elsewhere carries its recent full-word windows and up to five compact
+conversation lines from the preceding 24 hours, newest first: last message time,
+opening words capped at 120 characters and the exact conversation read. Helpers and their own
+work join the day; a contact send counts with its attested reply or the delivery
+owner's positive acceptance for that exact send, including retained delivered/read
+exchanges after a newer send starts. Delivered one-way notes count without an
+answer; person-authored sends do not. The mind stream is read through its thought
+owner. Own-work words require self-authored, unsteered provenance. Peer turns get day door/time metadata
+without those words. A remote stranger receives no elsewhere feed. Effected
+acts read from their last reply here; exact experience IDs already in the life packet
+are omitted. This read runs ahead of every first word: each recently modified other
+transcript is read back in 64 KiB chunks from captured EOF only until a chunk holds an
+eligible message or lies wholly before the day, because imported replies can be appended
+with older timestamps. It rides the moment block, never a summary cached across turns.
+Later breaths carry only their new step window and recheck turn provenance.
+The [turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled)
+owns the source and disclosure details.
+
 Background notifications call the supplied `AttentionRouter` directly; Trust's
 checked connector statuses use the same supplied connector platform.
 Needs-you counts and kinds derive from `DeskFacade`'s retained overview and are
 unavailable when any overview source is unavailable; AppModel stores no copies.
+The Mac draws attention and status through selections of `CountsFace` at
+`.counts`. Approvals own their checked records and array comparisons on an
+actor; inbox readings and panel freshness also have actor owners. Native
+settings draw selections of `SettingsFace` at `.settings`; provider controls
+and per-conversation context are separate selections. The
+[stage-one feed contract](designs/separate-face.md#stage-one-counts-and-native-settings)
+defines the projection boundary and retained operational ownership.
 Helper schedules and reminder settings retain their source errors on the Desk;
 unreadable settings cannot appear as reminders switched off. Contact snapshots
 require their conversation, helper shelf and active-run sources to read.
@@ -32,7 +71,157 @@ the face's text instead of a separate Trust projection. The privacy inventory
 uses `TrustFacade.privacyMap`, sampled initially and on explicit Refresh, with
 its reading time shown instead of rescanning the data root on every receipt.
 
-The Trust action port receives `PartFaces.Actor`. Person changes use the
+Faced pages own their subtitles, including an absent line. Configured own-page
+rail rows retain an unavailable label when their owner is missing. Door reads
+return a structured unavailable issue when a required face has not published.
+Mac card text separates collection, per-card presentation and structured remedies.
+Provider pickers carry only their used model identity and label fields.
+The Simple shell's offscreen first read awaits contact-owner observation, including
+its read failure, without polling. Browser authentication awaits the system
+session's callback or cancellation and releases its callback registration and
+session together. Sparkle information probes await their update-cycle event;
+caller cancellation releases observation while Sparkle retains execution.
+Delivery launch, network and configuration failures are recorded through the
+experience owner with their cause; they leave the original delivery obligations
+owed. A later owner event can reopen observation.
+The Mac-assistant owner publishes watch content and availability only when
+they change; a new sampling timestamp alone changes neither its retained
+reading nor `watchesDidChange`. Each status caller still receives its own reading.
+
+Page read callbacks are sendable async operations. `PartFaces.readOffMain`
+invokes every registered native and packet reader on the concurrent executor,
+including the agent's own notebook pages. Readers
+copy observable in-memory values in short main-actor hops, then read stores,
+decode, sort, parse times and shape facts, rows, keys and levers off main.
+`LatestRead` admission and retained snapshots remain with their engine owners.
+`PartFaces` is not observable. Accepted page snapshots and the authored-page
+catalog enter its ordered off-main drain, which posts finished `FaceValue`s to
+`engine.face`; the Mac reads only the keys it draws through `appModel.face.slot`.
+Registration, source admission, catalog claims and snapshot comparison belong to
+the `PartFaces` actor. Direct engine page discovery and body lookup await that
+owner; native command ports retain their own isolation. Page construction, store
+reads and feed delivery run off main. Captures await
+the page owner's drain and the feed's applied-frame acknowledgement before
+mounting the page; cancellation ends that frame wait without taking a picture.
+The phone still exports the owner's snapshots through `faces.json`, replacing
+Memories with its separately disclosed projection. Its feed key is
+`phone/memories`, distinct from the Mac's `memories`.
+Row and section transformations copy their value before changing actions, controls
+or rows, retaining fields they do not own. The missing-key-lever section keeps its
+derived `stem:` id, folded presentation and absent footer. Phone file budgeting and
+per-page decoding follow [the companion contract](mobile_companion.md#remote-actions-and-snapshots).
+
+Documents use the same declared demand for every door. A native page keeps its body reader;
+otherwise `PartFaces.body` resolves the item's current packet key, checks the drawn read call,
+runs only a declared read through the app door, and freezes its result as `input.read` for the
+selected pure projection. Pending or unconfirmed reads retain the owner's structured
+continuation and remedy; only complete read evidence permits unwrapping the result.
+Agent calls retain their originating `Turn`; signed phone reads
+carry their verified device and iOS surface. Inline document bodies need no fetch. A failed
+read or projection keeps its cause and runs no alternate reader. The grammar and compatibility
+note are specified in [the face contract](skill_manifest_spec.md#calling-a-part-and-projecting-its-face).
+The page session holds read identity (key, drawn call and native owner revision) and evidence above cells; views draw the answer
+through the shared read-only TextKit component. Quiet capture starts no document demand.
+Native documents use the passive `native-document` seed over title, format and opening/length
+metadata, with the body retained by its native read. Run detail on Mac, phone and the agent's
+door reads the same complete saved ledger record. Helpers' brief sections hold document keys and their definition update stamps;
+their registered body reads the helper owner's checked definitions. Context disclosure reads
+its saved record only while open; the receipt feed contains summary rows and their turn id alone.
+The disclosure's held identity changes with that turn, and Copy uses the document's displayed characters.
+Packet admission begins before reading the source and spans projection, including
+read failures. Only accepted publication replaces the retained source and face;
+equal source epochs may carry changed selection or clock facts. A later-started
+read that publishes prevents an older completion or failure from replacing it.
+The old direct packet invocation on main is removed. Home's owner reads retained
+`AgentWorld` parts and computes Desk parking off main; its source-watch setup
+also leaves main. Desk builds its complete
+revision off main before publication. Today, Inbox, Trust, Memories,
+Settings, Personality, Providers, Connectors (accounts, Telegram, phone and agents),
+Capabilities and Diagnostics follow the same boundary. Capabilities' catalog,
+chat tools, actions and checks are shaped after copying their owners' values.
+Memory owner resolution for the app door's action index, list, rewrite, pin and
+rewrite preview leaves main through concurrent helpers; no synchronous executor
+initialization resolves the memory store. Settings copies registry descriptors,
+in-memory preference values and platform extras into Sendable value snapshots;
+no settings host or registry closure leaves that hop. Its typed stored readers
+read checked Trust, memory policy, dream gates and embeddings through their
+owners with the data root off main. The same readers serve setting.get and
+write readback. Notifications, search, status and platform rows are built off main.
+Memory's facade resolves its embedding source lazily on snapshot reads and writes,
+so initializing that source no longer depends on a settings-host read.
+Memory's embedding snapshot checks saved configuration and installed models off main; Settings
+observes source and runtime changes at those same owners without another cache.
+An unchanged face retains its published snapshot, including its source epoch;
+changing a part invalidates its drawing input without first blanking the page.
+Today registers a pushed page: `PartFaces.refresh` returns its admitted snapshot
+without invoking a packet reader. `TodayReadout` reads independent sources on
+its actor and pushes the assembled packet through `sourceChanged`. Its pending
+set coalesces changes behind the current read, without a timer. Equal source
+readings retain a ready packet without assembly.
+Each intentions reading also replaces one event deadline at its earliest next
+occurrence; expiry invalidates intentions alone, without polling.
+The persona's published display name invalidates trials alone when it changes.
+Per-conversation evidence survives
+unrelated transcript writes, and contact names join that evidence without
+rereading transcripts. The mounted view, text reader and offscreen renderer
+consume the posted face; until its first post they show the reading line.
+Home's projection actor reuses each section's facts and row keys from the exact
+retained source readings it consumed. Thoughts and owed happenings compare their
+content; each open repair row compares its experience before redoing its words.
+An unrelated experience write therefore does not reparse an unchanged thought's
+time or rebuild an unchanged repair. Queue verdicts and trial levers still read
+the current time, and places read current layout, badges and browser connection.
+Source failures and never-read gaps remain explicit. Source reads and Home
+refreshes begin on invalidation; an edge during a read owes one subsequent read
+when it completes. Home's retained-world
+hold and release run with its off-main source-watch lifetime.
+Malformed saved repair calls and transcript tool-input JSON name their read
+failure in the rendered row. Missing input stays absent and cannot supply an
+execution verdict. MY QUEUE reads only `desk/my-queue-carried.json`;
+an absent ledger starts empty without consulting retired arrivals.
+
+`Parts.prepareFace` is the one producer of masked projection input. It retains
+the latest raw/masked content for at most 64 root/part keys, reusing only equal
+content, including unchanged subtrees of a changed packet. `ToolsFacade.face`
+prepares before acquiring the app door; direct `Parts.face` callers enter the
+same producer with their existing invocation. Only that producer constructs
+`NativeAgentSecretRedactor.FaceInput`, after total recursive masking and the
+object/4 MiB check. Projection admission consumes that value without encoding
+and scanning it again; ordinary calls still validate raw input. Eviction only
+costs another mask, never permits unmasked input. ASCII text without any
+credential-pattern introducer skips ICU; non-ASCII text retains full recognition.
+Audit token and JWT expressions are compiled once, and secret detection uses
+match presence rather than generating and comparing digest replacements.
+Authored presentation words read their own `copy/<key>` face slot, including
+its first arrival. Adding another key does not invalidate existing words.
+Make titles use `make-title/<revision>/<file path>` slots, one per preview.
+The engine retains the projection owners; previews carry only their feed key.
+The transcript observes the copy slots its builder uses, including cached
+groups, and an arriving copy invalidates its unchanged-input shortcut.
+Agent and phone textual reads consume the engine owner's result directly.
+Main chat's document reads rows, cards, other-room exchanges, streaming identity
+and clearance in `ChatTranscriptRoom`, separate from the sidebar, header and
+composer. Its streaming identity reads one stable observable slot in `TurnsFacade`;
+the slot directory is unobserved, and empty slots stay attached for the next turn.
+The shared streaming-id dictionary is removed; starting or finishing another
+conversation's stream does not invalidate this read. Sidebar, header and composer
+changes do not become transcript inputs. The session index is operational state,
+without an observable array. Off-main projection posts one finished row at
+`FaceKey.session(id)` and identity-only sections at `.sessions`; only changed
+values reach the feed. First load and failure recovery publish availability
+at `.sessionNavigation`. An unread room observes its own transcript slot's revision,
+so its first read wakes it even when the committed conversation is empty.
+The action-search catalog watches its source files and
+part/helper changes, never general UserDefaults changes: preferences are not
+inputs to its action text.
+
+Mood tint reads the substrate's current felt nodes directly, using the same
+selection, echo collapse and compact cap as the inner-state face. It no longer
+constructs an inner-state capsule, workspace, peer or persona reading for a
+warmth sample, and holds no second history or warmth cache.
+
+The person's Trust rows enter through `PartFaces.act` and `ToolsFacade.personTap`.
+Person changes use the
 existing policy, integration, contact and activity mutation owners; controls
 that can grant more access carry `Control.confirm`. The agent's held Turn goes
 through the existing `setting.set` door checks; it is never turned into a
@@ -40,17 +229,33 @@ person action. Foreground permission acquisition, Chrome setup, the app picker
 and the freeform workbench use the existing Mac adapters. Phone face actions
 cannot open those controls. The existing phone Trust editor and
 `trust_policy.json` publication stay in place until the phone face migration.
-Desk registers once on `engine.pages`. `DeskFace` reads `DeskFacade.loadPage()`;
-its epoch is the Desk store revision captured before that board read. Board
-publication and selected-item changes refresh the face through the page port.
-Selection holds only the handle on `DeskFacade`; details resolve against its
-retained board. Mac navigation, slash previews, offscreen capture and the door
-all read that face, and phone snapshots include it in `faces.json`. Desk's old
-phone snapshot files remain until the companion transition. Face row actions
-use `DeskToolDispatchRouter` and the existing pursuit veto owner. The mounted
-Desk face supplies only editor/navigation/clipboard requests; absent mounted
-faces refuse those requests. Offscreen capture installs no editor port. No
-second board projection or write owner is introduced.
+Desk registers once on `engine.pages` as the agent's part `native-desk` over
+the Desk packet. `deskPacket()` reads `DeskFacade.loadPage()` and gives measured
+facts: board items with what groups them (activity, deferral, done today, the
+`DeskParking` verdict Home shares), live activity, the overview's and work
+lines' rows, timers, the wander hour, the selected item and named source gaps,
+plus a key for every row that leads or acts. Grouping, project rows, titles,
+details, tones and every Desk word are the part's. The packet's epoch is the
+board revision; a selection or a clock edge changes facts at that same revision
+and still draws through the page's read admission. The person's levers are the
+stem's: the Reminders section (Nag me,
+Snooze or Wake up, presets, per-project and per-item switches) is a page lever,
+drawn first; Veto is a key lever on each pursuit's row and on the selected
+item's Veto row. Board publication and selected-item changes refresh the page
+through the page port. A successful in-place Desk open requests a scroll to the
+top so its selected details are shown; ordinary page arrivals keep the reader's
+place. Selection holds only the handle on `DeskFacade`; details resolve against
+its retained board. Mac navigation, slash previews, offscreen capture and the
+door all read that page, and phone snapshots include it in
+`faces.json`. Desk's old phone snapshot files remain until the companion
+transition. Each row action and lever carries its door call (`desk.close`,
+`desk.defer`, `desk.nag`, `desk.remind`, `desk.veto`, `desk.refresh`), and a tap
+runs it through the person's door (`PartFaces.act`); Veto is the person's lever
+verb. Editors, the palette, research, the clipboard, inspecting a run and
+returning to the board are Mac-only links (`page:desk/<place>`, doors `mac`)
+that `FacePageView` hands to the mounted Desk view; absent mounted faces refuse
+those requests. Offscreen capture installs no editor port. No second board
+projection or write owner is introduced.
 
 ## Built-in browser operation ownership
 
@@ -79,13 +284,12 @@ unidentified damaged row. Only a missing run file starts empty. Pre-outbox
 translation, the old terminal spelling and persisted-preview
 cancellation/retention are removed.
 
-The visible WebKit adapter has one native bounded callback owner: navigation
-waits at most 30 seconds; snapshot, JavaScript and DOM callbacks wait at most
-10 seconds, independently of the DOM script's 3750ms readiness deadline; an
-earlier inherited tool-call ceiling ends the same native wait. A parking wake
+The visible WebKit adapter holds navigation, snapshot, JavaScript and DOM
+callbacks until WebKit completes, its content process terminates, the window
+closes or the caller cancels. It imposes no native callback deadline; shared
+route and DOM-script deadlines remain separate contracts. A parking wake
 without a callback result is an interruption, never evidence of completion.
-Cancellation, native deadline expiry or renderer termination ends that wait
-once and retires the affected view. This is not proof that a dispatched effect
+An interruption ends that wait once and retires the affected view. This is not proof that a dispatched effect
 was stopped: its outcome remains unknown. Late callbacks cannot change that
 settlement or release a later owner; there is no automatic replay or page reload.
 A later explicit navigation establishes a new page.
@@ -126,6 +330,38 @@ identity is synthesized. `inbox.json` and
 `approvals.json` publication remains for existing phone builds; `faces.json`
 carries the Inbox face through the existing face publication path.
 
+Diagnostics is the agent's part `native-diagnostics` drawn over
+`diagnosticsPacket()`. The packet reads DoctorFacade, the run ledger, transcripts
+and the actor-owned `LivingStatusOwner` reading: each check with its status, the Doctor's bucket
+for it, whether it is adverse and safely repairable; loop verdicts, the watchdog,
+this Mac, living status, the last 8 loaded activity events and the first 15 runs,
+each status with its bucket. Its keys let the Health checks row run, repair and
+report while no run is in flight, a repairable check offer Repair, a check lead
+to its remedy's page, and a run open its details. The part words, groups and
+orders them; verdicts, thresholds and repair eligibility stay the Doctor's, and
+each action calls its Doctor verb (`doctor.run`, `doctor.repair {check_id}`,
+`doctor.support_report`) through the door. The
+page has no levers. The same part's `run` words the Desk and Activity status checks
+and the Doctor-ask, storage and Speech Recognition cards.
+
+Living-status counting, snapshot construction, refresh coalescing and `LatestRead`
+publication run on `LivingStatusOwner`. Cognition, ForPerson and exact file edges
+refresh it without a debounce clock; its change stream lives within launch work
+and refreshes the Diagnostics packet. Failures retain the last snapshot with
+their named causes. Desk, diary and persona remain the canonical input owners.
+
+Inspector reads `InspectorFace` slots keyed by live cutoff or replay day. It
+selects membership, availability and individual cards separately. `TurnInspectorFeed` is
+the actor owning the trace cursor, grouping, redacted cards, replay and phone
+summary encoding. Clear filters evidence on that owner; replay's requested and
+loaded dates travel with its reading state. Face keys identify the content
+selection, so remounting reuses its slots; mount identities only govern requests.
+Replay state and its `LatestRead` gate belong to the selected persisted day.
+Source edges request one follow-up read while busy, with no debounce sleep.
+Failed reads preserve evidence and their cause; an unfinished read stays
+visibly reading until completion or
+cancellation. Doctor commands read observation state directly from the actor.
+
 Model pickers advertise models and think/fast capabilities only from the selected
 account's checked catalog. A saved unknown model stays visible as unverified,
 with no invented capabilities; a missing catalog does not produce compiled or
@@ -138,17 +374,51 @@ After a turn, an unavailable session index keeps the prior display with its
 refresh error; checked persona-document reads retain their own error independently
 of the reply that already landed.
 
-Personality has one native `PartFace` on `engine.pages`, registered at launch.
-Its read uses PersonaFacade's checked profile/documents, the resident self-reading,
-ProviderRouting's checked catalog, CognitionViewFacade's diary and ApprovalsFacade's
-waiting self-improvement cards. Source-file changes and the account-model refresh
-notification reread it even when no view is mounted. The resident's bootstrap
-and configuration events also refresh self-reading availability. The read-start moment is its
-epoch; PartFaces' LatestRead owns publication. Mac FacePageView and the door's
-generic face text read the same sections. The model choice calls the existing
-Memory and mind group setter. Links retain the document/starter editor, minds
+The Personality page is the agent's part `native-personality`, drawn over the
+packet `personalityPacket` reads: PersonaFacade's checked profile and documents (and
+whether identity is initialized), the resident self-reading and CognitionViewFacade's
+diary, each failed read a named unavailable fact. Its page levers are the stem's:
+My minds (ProviderRouting's checked catalog and the Memory and mind choice) and
+Reset identity when an identity exists. Source-file changes and the account-model refresh notification reread
+it even when no view is mounted. The resident's bootstrap and configuration events also
+refresh self-reading availability. The read-start moment is its epoch; PartFaces'
+LatestRead owns publication. Mac FacePageView and the door's generic face text read the
+same page. The model choice calls the existing Memory and mind group setter. Links retain the document/starter editor, minds
 picker, Dreams and confirmed reset as destinations, and proposal review remains
 in its approval card. No persona write or reset mechanism changes.
+
+Shared `FaceView` draws pages through `FaceDoor.act/open`. Mac `AlivePageKit` supplies
+`FaceStyle` for glass cards and opaque accessibility/capture surfaces. Main windows,
+quiet captures and each transcript attachment host supply it explicitly, including
+attachments in detached conversations in both Mac window implementations. The shared
+default draws no card surface. Phone `AlivePage` supplies list density and native
+inset-grouped sections. `FacePageSession` holds
+non-secret field drafts, folds and selection above recycled rows. `FaceView` owns
+row, control and action-button focus together, so a removed focused row transfers
+keyboard focus to the next surviving row in the old order, or the last row if none
+follows. The shared row owns keyboard navigation, its context menu and accessibility
+actions; the phone adds native swipes to that same row. The fixed shared card
+background and phone's whole-face list
+row are removed. These changes do not add a wire kind or alter page calls.
+
+A page of the agent's own is an active part whose face is `{projection:true,
+page:"<id>"}`; `engine.pages` retains its catalog claim and snapshot from the
+part's notebook. The Mac draws `.page(id)` from the face feed, and `faces.json`
+carries it to the phone. The agent's layout
+places it: `rail` and `more` take a `page:<id>` block, kept on read when the id is
+one `AppDoorNames.ownPageRefusal` allows and written through `layout.write` only
+while an active part has that face page. The Mac rail draws the block as a row
+titled by the face (its id until the face names one) and the selection holds
+`page:<id>` beside `SidebarItem.ownPage`, so the main pane, `page.show` and
+`page.screenshot` draw `FacePageView(page:)`; the iPhone's More draws it as a row
+pushing `MobileFacePage` while `faces.json` holds it. A placed page that is not
+published shows that it is waiting; an inventory failure carries its cause.
+The rail reads the `catalog/own-pages` slot and only the placed pages' title
+slots. A completed inventory removing an authored page publishes an explicit
+unavailable face; clearing a claim conflict refreshes the still-existing stem
+page. Inventory completion also invalidates the engine's action index.
+The door lists the agent's own pages among its pages,
+and `app {page:"<id>"}` reads the snapshot's text, levers first.
 
 Persona reads return authored contents as written, including GROWTH; they never
 filter old-format rows or recreate authored documents. Ordinary persona tool
@@ -190,6 +460,11 @@ preserved bytes;
 persona documents alone supply those instructions. A committed document save
 invalidates context even if readback fails; activity bookkeeping has its own
 owed repair and cannot turn the saved edit into an unsuccessful append.
+Identity form saves carry the field's original document content into the same
+document lock. A changed saved document refuses with `persona_document_conflict`;
+the form retains the draft and reads the saved version for comparison. Later
+keystrokes survive a successful save through field-revision settlement. USER
+remains MemoryV2-owned. Unchanged document and profile writes do not touch disk.
 
 The agent reaches the system through one always-on `app` tool. `app {}` is
 home—where they left off. Pages, home items, discovery, actions and scripts
@@ -230,8 +505,11 @@ status has no effective mode reports that cause through the Settings warning or
 the setting action's unavailable error; it never labels or returns a default mode.
 
 Settings registers one native face on `engine.pages`. It reads
-`QuietSettings.settings(forPage:host:)` through the mounted settings host and
-projects each row's declared kind, value, choices and owner note. The read-start
+`QuietSettings.settings(forPage:host:)` through the mounted settings host in one
+short main-actor snapshot, then projects each row's declared kind, value, choices
+and owner note off main. File-backed rows carry typed owner reads rather than
+host references; a failed row keeps its unavailable detail and readable siblings.
+Platform extras likewise copy plain values before shaping their rows off main. The read-start
 wall-clock milliseconds are its source epoch. A control's `set` calls that
 registry row's existing writer and reads it back; the Mac and authenticated
 phone face gestures enter with owner authority. Agent face actions use
@@ -258,6 +536,10 @@ Committed reconciliation retains each source failure's identity even before its
 first stored row exists. The same checked failure snapshot accompanies selection
 receipts and the turn's ambient reads; an empty ambient result with unavailable
 sources neither reports `no_match` nor settles recollection repair debt.
+
+Unavailable turn recall is withheld and named while the rest of the working set
+is prepared, under the [recall-unavailability law](ANATOMY_OF_A_TURN.md#recall-unavailability).
+This does not change required context publication or configuration failures.
 
 Persona, MemoryV2, Desk and skills retain their own authority. Conversation
 history is read separately from the transcript store. The optional cognitive
@@ -290,10 +572,34 @@ Fetched API-key catalog bytes carry `credential_binding`, checked against the
 current credential on every passive/routing/availability read as well as fetch
 publication. Unbound or mismatched bytes stay historical and unavailable until
 an explicit refresh succeeds. A settings refresh publishes one catalog operation's
-result and cause, without a second cache-mode call after failure.
+result and cause, without a second cache-mode call after failure. Its refresh
+owners run on `ModelCatalogRefreshActor`, away from the main actor: credential
+locks and reads and durable cache commits stay there; asynchronous provider
+fetching and response decoding also remain off the main actor.
+`LatestRead` still orders publication per cache path, and only a committed probe
+write advances its write boundary. Coalescing and credential rechecks share
+that same owner.
 OpenAI public controls use its shipped descriptor; Codex and ChatGPT controls use
 the selected sign-in's matched account catalog. Builder bridge tools use the
 command CLI's sign-in; runtime adapters retain their exact admitted sign-in path.
+Meta (`meta`) is an API-key route with a shipped Standard-mode catalog in
+`FirstPartyModelCatalog`, using the shared `AnthropicTransport` Messages path at
+`https://api.meta.ai/v1/messages` with Bearer auth, as Kimi Code does. Its checked
+key comes only from `providers/meta.json` and that file's Mac Keychain reference. The authenticated
+`GET /v1/models` connection probe shares the API-key receipt owner; its results
+do not import unselected models. No Muse Code credential source is consulted.
+History is client-side: text, native calls and results use the shared Messages
+encoding and SSE decoder. Meta enables the adapter's existing thinking ledger:
+completed thinking and redacted_thinking blocks bind to confirmed tool-call IDs
+and replay before the assistant's text and calls. The ledger holds at most 512
+tool-call IDs in memory; missing or evicted entries add no thinking blocks.
+Kimi Code does not enable replay. No Meta replay store or Responses control
+profile is added.
+The catalog exposes the Messages contract's low/medium/high/xhigh efforts,
+sent as `output_config.effort` with adaptive thinking. First-party strict tools
+and conversation cache markers are omitted, as on Kimi Code. System markers
+use Meta's supported five-minute TTL; automatic prefix caching also works
+without a marker. Receipts read `usage.cache_read_input_tokens` when reported.
 Moonshot rows with no declared adapter reasoning contract keep unknown controls
 and carry `controls_note`; they do not advertise a synthetic `none` effort.
 OpenRouter's current catalog supplies its per-model `reasoning.supported_efforts`
@@ -364,8 +670,10 @@ when none is supplied; undated Anthropic and Keyring access is used until reject
 The network response is validated for the grant's tokens and lifetime, not against
 the saved-file metadata schema (for example, `scope` and `account_id` are not
 required credential fields in a token response).
-Device authorization separately requires a positive code
-lifetime to bound polling. Malformed token data reports `.malformedResponse`
+Device authorization requires a positive code lifetime as protocol metadata;
+the server's `expired_token` response settles expiry. Polls follow the server's
+interval and `slow_down` pacing only while authorization remains pending;
+transport and HTTP failures surface without a retry loop. Malformed token data reports `.malformedResponse`
 with its retry remedy and leaves the saved grant unchanged. This is the token
 response contract in [RFC 6749 §§5.1 and 6](https://www.rfc-editor.org/rfc/rfc6749.html#section-5.1).
 xAI persistence
@@ -382,9 +690,16 @@ from the request and actual tool activity. The prepared Context turn leases
 one generation through the model/action loop; a later source
 change belongs to a later generation.
 
-Stable persona material leads the provider prefix, followed by the verbatim
-conversation tail. At the model-default window bound, a whole oldest block leaves
-replay at stateless half-budget checkpoints; transcript rows remain saved. `ConversationPrefixSeeding.seed` applies the
+Stable persona material leads the provider prefix, followed by the conversation
+verbatim, each exchange with its time; older rows are reached through leads and
+`context.expand`. Quiet never ends what they holds. A conversation is held whole
+until the request reaches the input budget; then the oldest whole turns go in
+half-budget jumps. The input budget is min(model window minus response allowance,
+200,000 tokens). History fitting uses the input budget; refusal and result
+pointers use model window minus response allowance, the physical limit.
+The turn's public context block leads the current user message
+and is sent once. Checkpoints stay anchored to the transcript's start;
+transcript rows remain saved. `ConversationPrefixSeeding.seed` applies the
 [sent-context contract](conversation-context-history.md) before provider dispatch.
 The resident turn's replay metadata write and context/prefix diagnostics run
 beside dispatch and join before tool reads or turn settlement; the in-memory
@@ -429,21 +744,44 @@ After a conversation, the adaptive promoter keeps or stages candidates.
 provenance, kinds, counted reads, trusted acceptance, untrusted review,
 care movements, atomic replacement and rejection protection.
 
-`EngineRuntime/MemoriesFace.swift` reads those owners through `MemoryFacade`
-and watches the canonical SQLite database/WAL and memory profile from launch
-in `EnginePages`, independently of mounted views. Mac `FacePageView`,
-the door's `PartFace.text(door: true)`, and the phone's `faces.json` publication
-consume that face. The read uses its start time as the epoch because the
-facade exposes no store revision; `PartFaces` owns publication through
-`LatestRead`. Failed sections carry their cause while readable siblings remain.
-Reading a face with an active query re-ranks through the same search owner
-without crediting recall hits; **Check again** also retries a failed search.
-Its row actions call the existing pin/delete and proposal accept/reject owners.
-Mac navigation retains native destinations for the graph canvas, full text and
-correction draft, and upkeep. Inline search input and disclosure folds are not
+The Memories page is the agent's part `native-memories`, drawn over the packet
+`EngineRuntime/MemoriesFace.swift` reads through `MemoryFacade` (`memoriesPacket`):
+kept memories with their pin, lifecycle, times and the provenance the memory owners
+derive, the waiting and rejected proposals, the active search, status failures and
+the total, and the Misses (corrections by lesson, this week against last, read from
+`MemoryRecoveryReadout.misses`; an unreadable ledger is a named unavailable fact, never zero),
+each failed read a named unavailable fact, plus the keys its rows may carry.
+The packet is assembled off the main actor; its storage reads suspend main,
+which only reads or publishes facade state. Kept and searched rows share one
+live trust read per packet, including root names, through the
+[memory read contract](MEMORY_SYSTEM_MAP.md). No read clock enters the facts
+or levers: an unchanged packet keeps the existing face and publishes no change.
+`MemoryFacade` resolves its memory owner through one `@concurrent` async boundary:
+symlink identity checks and store opening run off main for its reads and actions,
+including Today's kind-filtered moments read. That read retains the memory owner's
+full list policy; facade snapshot publication stays on main through `LatestRead`.
+`EnginePages` watches the canonical SQLite database/WAL and memory profile from launch,
+independently of mounted views. Wording, ordering (pinned first, newest), provenance
+phrases and sections are the part's. Forget on every `memory:<id>` and Keep / Don't keep
+on every `proposal:<id>` are the person's key levers: the stem composes them, every
+door draws them after the agent's actions on those rows, and they stand as the stem's
+own rows when the face does not draw. Mac `FacePageView`, the door's
+`PartFaceSnapshot.text(door: true)`, and the phone's `faces.json` publication consume
+the page. The read uses its start time as the epoch because the facade exposes no store
+revision; `PartFaces` owns publication through `LatestRead`. Reading with an active
+query re-ranks the search owner's current query without setting it again or
+crediting recall hits; clearing or changing it fences an older refresh. **Check
+again** also retries a failed search. Rows and levers carry their door calls:
+`memory.pin`, `memory.rewrite {pinned:false}`, `memory.forget`, `memory.review`,
+`memories.search` (the search field's value) and `memories.refresh`. Mac navigation
+retains native destinations for the graph canvas, full text and correction draft (whose
+Forget… is the same key lever through `pages.act`), and upkeep. Inline search input and disclosure folds are not
 in the face vocabulary; `/memory` supplies the existing search owner a query.
 The Mac continues writing the existing phone memory snapshots during the
-phone's transition to the shared face.
+phone's transition to the shared face. Before encoding `memories.json`, its
+writer applies canonical `ios` disclosure and temporal eligibility and withholds
+rows with secret-bearing wire fields. The record fields installed phones read
+remain unchanged; see [memory disclosure](MEMORY_SYSTEM_MAP.md#recall-into-a-turn).
 
 The current after-turn path uses one model interpretation for facts, cares
 and semantic appraisal; routing follows [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation).
@@ -590,15 +928,35 @@ each of the person's doors owes `deliver:<door>` (`phone`, `mac`, `telegram:<cha
 `conversation:<session>`), declared at birth (`Matter.born`, the one birth shape). Their reading is the matter's
 progress (`read`) or outcome (archived, dismissed; an owner's `resolved`). `ForPerson` holds every matter addressed to
 them in memory: one record read at launch (`ExperienceStore.addressed(to:)` plus the open ones), then fed by its own
-writes and by `written(addressedTo:)`. The inbox (`ForPerson.inbox()`), held deliveries (`owed()`) and the phone's
+writes and by `written(addressedTo:)`. Both carry the committed `updatedAt` and meet at the owner's equality check;
+identical matters emit no change (the [unchanged experience law](EXPERIENCE.md#delivery-and-face)).
+The inbox (`ForPerson.inbox()`), held deliveries (`owed()`) and the phone's
 `inbox.json` are readings of it; no file holds them and no turn queries the record for them. The inbox is a reading,
 never a copy of a conversation: a matter is a row when it asks them, went wrong, or has no thread.
 
 The person's doors (`Door.person`): their phone always, the Telegram or Slack thread it came from, and the Mac, which is let go at
 send time when their own input does not show them there, so walking up later never alerts again. Two facts replace
-importance: an ask needs their answer, and a matter that went wrong is the only thing that breaks their quiet hours.
+importance: an ask needs their answer, and a matter that went wrong breaks their quiet hours.
+An explicit pinned door also goes now for their own act: positive local Mac provenance
+(no peer origin or agent, explicitly not remote) needs neither a conversation nor request text.
+Otherwise it requires a nonempty current request on a verified direct person conversation,
+with the owner-turn stamp's ingress proof (signed phone or verified Telegram owner).
+Hidden synthetic input, peer, own-work, missing and unreadable provenance keep the
+quiet-hours hold; a pinned door alone proves no request from them.
 Routine success reaches no door (`.inbox`). `AttentionRouter.tell` files a matter through ForPerson and sends what is
 owed; `watch()` sends whatever a change leaves owed, so an owner below the router only tells ForPerson with its doors.
+A quiet-hours hold is accepted, recorded work, not a failed send: the door remains `owed`, and its result projects `deferred`.
+Mac and phone notification calls return `status:held`, `ok:true`, `effects:occurred`, `recorded:true`, no error or failure code,
+and `posted:false` / `delivered:false`. `deferredUntil` and the reply's words name the end read from the same checked
+`TurnQuietHoursWindow` policy that arms release, and warn that sending again would notify twice. Trigger notices, Desk decisions
+and nags, clock deliveries and the lower-level Mac notify adapter retain that meaning; a hold never proves transport acceptance.
+The matter's id is `notificationId`; putting away an inbox matter cancels its owed doors. Absent preferences or
+an unset window means no hold. Unreadable or unresolvable policy never supplies a made-up release time: its named failure
+remains repairable and the saved matter stays owed.
+`desk_notify` observes ForPerson changes and arms its event deadline at quiet end, independently of whether any Desk item is due.
+Its pass releases owed doors before reading the Desk proposal. On relaunch, ForPerson reloads open experiences; the delivery
+watch and startup pass release them outside quiet hours, or the deadline is rearmed inside them. No separate held queue or saved
+release-time copy exists. Rejected doors await launch, network or configuration events; unknown sends await their own receipt.
 Each send reserves the door under an attempt and marks it started before the transport runs, then records accepted,
 rejected (tried again on launch, network return or a door configured) or outcome_unknown (never resent); a
 preference that closes a door lets it go. A door's own receipt (the phone's signed receipt, a Telegram prompt's
@@ -609,12 +967,13 @@ router. Putting a matter away lets go what it still owes; an approval or interac
 resolve first.
 
 Mac fire-and-forget posts retain the OS verdict under the original occurrence.
-The `mac.notify` platform callback requires the calling turn and operation
-deadline: its verified session binds banner replies and resident-wake quiet-hour
-holding, and its deadline bounds the callback wait.
-The native callback wait ends after five seconds or the call's earlier
-deadline; expiry leaves the operation alive to settle its original row, and a
-missing callback remains unknown. Shutdown closes admission without joining it.
+The `mac.notify` platform callback uses the calling turn's verified session to bind banner replies.
+Observation waits for actual OS completion, cancellation or shutdown, with no elapsed-time verdict.
+A missing callback stays waiting and can be cancelled. OS acceptance and durable receipt settlement are separate facts:
+a failed settlement preserves the completed OS effect and reports its cause without inviting another send.
+Shutdown closes admission and cancels observers; eventual OS callbacks retain settlement.
+Every door requires a valid committed person-facing payload. Delivery-watch failures record their actual cause and unknown effects
+through the experience owner; a quiet or empty pass cannot stand in for repair.
 Memory-review crossings retain a source-cycle identity; the same native ledger
 owns acceptance. A below-threshold source supersedes its unsent reminder; no
 producer flag is spent merely because a reminder was offered.

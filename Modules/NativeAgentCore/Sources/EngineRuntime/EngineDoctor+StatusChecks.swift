@@ -110,7 +110,7 @@ extension DoctorFacade {
     private static func diagnosticNarration(root: URL, input: JSONValue, safeDetail: (String) -> String) async -> DiagnosticNarration {
         do {
             return try await NativeAgentEngine.forRoot(root).tools.withPartDoor(envelope: .native("doctor:status-narration")) { door in
-                switch await Parts(root: root).call(id: "diagnostic-narration", input: input, invocation: door.invocation, as: DiagnosticNarration.self) {
+                switch await Parts(root: root).call(id: "native-diagnostics", input: input, invocation: door.invocation, as: DiagnosticNarration.self) {
                 case .success(let narration): return narration
                 case .failure(let error): throw error
                 }

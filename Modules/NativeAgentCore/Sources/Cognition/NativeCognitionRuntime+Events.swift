@@ -26,8 +26,10 @@ enum NativeCognitiveEventFactory {
         let inboxAction = (payload["actionId"] ?? payload["action"] ?? "").lowercased()
         let isCorrection = lowerAction.hasPrefix("reject")
             || lowerAction.hasPrefix("cancel")
-            || lowerAction == "deleteMemory".lowercased()
-            || (lowerAction == "inboxaction" && ["reject", "deny", "dismiss"].contains(inboxAction))
+            // The phone's taps all arrive as faceAction; a row's no (a card's reject, a dismissal, a veto, Forget on a memory) is the person's
+            // correction. Forgetting a kept secret corrects nothing.
+            || (lowerAction == "faceaction" && (["reject", "deny", "dismiss", "veto"].contains(inboxAction)
+                || (inboxAction == "forget" && payload["page"] == "memories")))
         let isProviderFailure = lowerAction.contains("provider") && isError
         guard isCorrection || isProviderFailure else { return nil }
 

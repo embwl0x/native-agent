@@ -24,6 +24,16 @@ public final class PersonaFacade {
     }
     @ObservationIgnored private let profileRead = LatestRead()
     @ObservationIgnored private let documentsRead = LatestRead()
+    @ObservationIgnored private var settingsFeed: SettingsFeedProjection?
+
+    public func bindSettingsFeed(_ feed: SettingsFeedProjection) {
+        settingsFeed = feed
+        publishSettings()
+    }
+
+    private func publishSettings() {
+        settingsFeed?.updatePersona(profile: profile, documents: documents, profileIssue: profileError, documentsIssue: documentsError)
+    }
 
     public nonisolated init(dataRoot: URL, isolated: Bool) {
         self.dataRoot = dataRoot
@@ -41,6 +51,7 @@ public final class PersonaFacade {
             case .success(let next): profile = next; profileError = nil
             case .failure(let error): profileError = error.localizedDescription
             }
+            publishSettings()
         })
         return try result.get()
     }
@@ -55,24 +66,29 @@ public final class PersonaFacade {
             case .success(let next): documents = next; documentsError = nil
             case .failure(let error): documentsError = UserFacingError.cause(error, action: "load the personality docs")
             }
+            publishSettings()
         })
         return try result.get()
     }
 
-    public func saveProfile(_ value: PersonalityProfile) async throws {
+    @discardableResult
+    public func saveProfile(_ value: PersonalityProfile) async throws -> (profile: PersonalityProfile, documentsIssue: String?) {
         let saved = try await owner.savePersonality(value).sharedProfile
-        profileRead.write { profile = saved; profileError = nil }
-        _ = try? await loadDocuments()
+        profileRead.write { profile = saved; profileError = nil; publishSettings() }
+        do {
+            _ = try await loadDocuments()
+            return (saved, nil)
+        } catch { return (saved, error.localizedDescription) }
     }
 
     public func saveName(_ name: String) async throws -> PersonalityProfile {
         let saved = try await owner.saveName(name)
-        profileRead.write { profile = saved; profileError = nil }
+        profileRead.write { profile = saved; profileError = nil; publishSettings() }
         return saved
     }
 
-    public func saveDocument(id: String, content: String, appending: Bool) async throws -> PersonaDocSpec {
-        let saved = try await owner.savePersonalityDoc(id: id, content: content, appending: appending)
+    public func saveDocument(id: String, content: String, appending: Bool, expectedContent: String? = nil) async throws -> PersonaDocSpec {
+        let saved = try await owner.savePersonalityDoc(id: id, content: content, appending: appending, expectedContent: expectedContent)
         documentsRead.write {
             documentsError = nil
             if let index = documents.firstIndex(where: { $0.id == saved.id }) {
@@ -80,8 +96,8 @@ public final class PersonaFacade {
             } else {
                 documents.append(saved)
             }
+            publishSettings()
         }
-        _ = try? await loadDocuments()
         return saved
     }
 }

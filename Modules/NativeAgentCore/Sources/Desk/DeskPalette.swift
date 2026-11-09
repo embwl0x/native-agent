@@ -100,13 +100,12 @@ public struct DeskPaletteQuery: Equatable, Sendable {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return DeskPaletteQuery(verb: nil, query: "") }
         let parts = trimmed.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-        let head = String(parts[0]).lowercased()
+        guard let first = parts.first else { return DeskPaletteQuery(verb: nil, query: "") }
+        let head = String(first).lowercased()
         guard let verb = Verb(rawValue: head) else {
             return DeskPaletteQuery(verb: nil, query: trimmed)
         }
-        let rest = parts.count > 1
-            ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
-            : ""
+        let rest = parts.dropFirst().first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return DeskPaletteQuery(verb: verb, query: rest)
     }
 }

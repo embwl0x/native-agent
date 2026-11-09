@@ -89,9 +89,9 @@ extension iCloudBridge {
         }
     }
 
-    nonisolated static func isTerminalChatTransaction(_ data: Data) -> Bool {
-        guard let row = try? JSONDecoder().decode(ChatRecord.self, from: data),
-              row.direction == "mac_to_ios" || row.hasAdmission else { return false }
+    nonisolated static func isTerminalChatTransaction(_ data: Data) throws -> Bool {
+        let row = try JSONDecoder().decode(ChatRecord.self, from: data)
+        guard row.direction == "mac_to_ios" || row.hasAdmission else { return false }
         return ["completed", "failed_before_answer", "failed"].contains(row.state)
     }
 
@@ -255,6 +255,7 @@ extension iCloudBridge {
         try await SwiftNativePersistenceCore.withFileLock(path) {
             var row = try readChat(id, dataRoot: dataRoot)
             guard row.msgId == id, row.outboundMessage?.id == id else { throw CocoaError(.fileReadCorruptFile) }
+            guard row.state != "completed" else { return }
             row.state = "completed"
             row.updatedAt = NativeTimestampFormat.plainZulu(Date())
             try writeChat(row, to: path)

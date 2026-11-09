@@ -172,18 +172,26 @@ public struct AgentContactRoutes: Sendable {
                 BridgeCore.writeJSON(conn, status: rejection, obj: ["error": "unsupported_mcp_transport_headers"])
                 return
             }
+            // The caller this connector names is the conversation the call is in; a door that names none calls in the contact's own.
+            let caller: ContactCaller?
+            do { caller = try headers[ContactCaller.header].map(ContactCaller.init(header:)) }
+            catch {
+                BridgeCore.writeJSON(conn, status: 400, obj: ["error": "invalid_caller_header", "detail": error.localizedDescription])
+                return
+            }
             // Settle drained pull-host messages only after their response is written; failed responses leave them held.
             let conversations = AgentConversationStore(dataRoot: dataRoot)
             let request = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
             let tool = request?["method"] as? String == "tools/call" ? (request?["params"] as? [String: Any])?["name"] as? String : nil
-            let session = principal.conversationID(protocolName: "mcp") ?? ""
+            let session = principal.peerID.map { peer in caller?.conversation(peer: peer) ?? AgentConversationStore.heldThread(peerID: peer) } ?? ""
             func wire(_ item: AgentConversationStore.Held) -> [String: String] {
-                ["at": NativeTimestampFormat.plainZulu(item.at), "text": item.text, "conversation_id": item.conversation ?? session]
+                ["at": NativeTimestampFormat.plainZulu(item.at), "text": item.text, "conversation_id": item.conversation ?? session,
+                 "conversation_name": item.name]
             }
             let held: AgentConversationStore.HeldDrain
             do {
                 if let tool, let peer = principal.peerID {
-                    held = try conversations.drainHeld(peer: peer, name: principal.displayName ?? principal.id, via: tool) {
+                    held = try conversations.drainHeld(peer: peer, conversation: session, name: principal.displayName ?? principal.id, via: tool) {
                         NativeAgentMCPWire.heldFits($0.map(wire))
                     }
                 } else { held = .nothing }
@@ -195,7 +203,7 @@ public struct AgentContactRoutes: Sendable {
             }
             let taken = held.taken
             let settle = held.settle
-            switch NativeAgentMCPWire.parse(request, byteCount: body.count, defaultSession: principal.conversationID(protocolName: "mcp"),
+            switch NativeAgentMCPWire.parse(request, byteCount: body.count, defaultSession: session,
                                             held: (taken.map(wire), held.remaining)) {
             case .message(let message, let replayBody, let wait, let project):
                 // SSE requires the relay's explicit read capability.
@@ -206,13 +214,15 @@ public struct AgentContactRoutes: Sendable {
                                                     // Digest the message, not its JSON-RPC envelope, because retries may change envelope IDs.
                                                     requestBody: replayBody),
                               responseProjection: project, mcpWait: mcpWait, settle: settle)
-            case .reply(let request, let session, let offset, let waitSeconds, let project):
+            case .reply(let request, let session, let offset, let waitSeconds, let artifactID, let project):
                 Task {
                     let tasks = self.tasks()
                     let reply = await peerReplyReceipt(requestID: request, sessionID: session,
-                        offset: offset, waitSeconds: waitSeconds, principal: principal, tasks: tasks)
-                    let fetched = Self.fetched(reply.receipt, task: reply.task, tasks: tasks)
-                    BridgeCore.writeJSON(conn, status: 200, obj: project(reply.receipt), onSent: { fetched?(); settle(true) },
+                        offset: artifactID == nil ? offset : 0, waitSeconds: waitSeconds, principal: principal, tasks: tasks)
+                    let response = project(reply.receipt)
+                    let fetched = NativeAgentMCPWire.carriesReply(response) ? Self.fetched(reply.receipt, task: reply.task, tasks: tasks) : nil
+                    let carriedHeld = response["error"] == nil
+                    BridgeCore.writeJSON(conn, status: 200, obj: response, onSent: { fetched?(); settle(carriedHeld) },
                                          onFailed: { settle(false) })
                 }
             case .immediate(let status, let response):
@@ -419,9 +429,10 @@ public struct AgentContactRoutes: Sendable {
                                       settle: (@Sendable (Bool) -> Void)? = nil) {
         let settle = held?.settle ?? settle
         func reply(_ status: Int, _ object: [String: Any]) {
+            let response = responseProjection?(status, object) ?? held?.adding(to: object) ?? object
+            let carriedHeld = responseProjection == nil || response["error"] == nil
             BridgeCore.writeJSON(conn, status: responseProjection == nil ? status : 200,
-                      obj: responseProjection?(status, object) ?? held?.adding(to: object) ?? object,
-                      onSent: { settle?(true) }, onFailed: { settle?(false) })
+                      obj: response, onSent: { settle?(carriedHeld) }, onFailed: { settle?(false) })
         }
         guard let json,
               ClaudeBridgeMessageRuntime.validGenericAgentMessage(json), let text = json["text"] as? String else {
@@ -431,7 +442,7 @@ public struct AgentContactRoutes: Sendable {
         let requested = json["sessionId"] as? String
         let protocolSession = peer.protocolName == "mcp"
         let prefix = AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)
-        // MCP session IDs remain transport locators; all contexts run in the contact’s one conversation.
+        // MCP session IDs remain transport locators; a context runs in the conversation it names (AgentBridgePrincipal.storedConversation).
         let stored = protocolSession ? requested.map { prefix + $0 }
             : ClaudeBridgeMessageRuntime.genericAgentSessionID(requested: requested, owner: principal.id)
         guard let stored, stored.hasPrefix(prefix) else {
@@ -466,19 +477,14 @@ public struct AgentContactRoutes: Sendable {
                                          settle: (@Sendable (Bool) -> Void)?) async {
         // Whatever ended the wait, held messages it carried that were not written stay held.
         defer { settle?(false) }
-        guard let ackData = try? JSONSerialization.data(withJSONObject: ack) else { conn.cancel(); return }
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                await writeWaitedReplyBody(conn: conn, ackData: ackData, taskID: taskID, requestID: requestID,
-                    sessionID: sessionID, owner: owner, tasks: tasks, wait: wait, project: project, settle: settle)
-            }
-            group.addTask {
-                // Bound all writes, with one second to send the result after the wait expires.
-                try? await Task.sleep(for: .seconds(wait.seconds + 1))
-            }
-            await group.next()
-            group.cancelAll()
+        let ackData: Data
+        do { ackData = try JSONSerialization.data(withJSONObject: ack) }
+        catch {
+            BridgeCore.writeJSON(conn, status: 500, obj: ["error": "acknowledgment_encoding_failed", "detail": error.localizedDescription])
+            return
         }
+        await writeWaitedReplyBody(conn: conn, ackData: ackData, taskID: taskID, requestID: requestID,
+            sessionID: sessionID, owner: owner, tasks: tasks, wait: wait, project: project, settle: settle)
         conn.cancel()
     }
 
@@ -487,7 +493,16 @@ public struct AgentContactRoutes: Sendable {
                                              wait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?),
                                              project: @escaping @Sendable (Int, [String: Any]) -> [String: Any],
                                              settle: (@Sendable (Bool) -> Void)?) async {
-        guard let ack = try? JSONSerialization.jsonObject(with: ackData) as? [String: Any] else { return }
+        let ack: [String: Any]
+        do {
+            guard let object = try JSONSerialization.jsonObject(with: ackData) as? [String: Any] else {
+                throw AgentContactFailure(code: -32603, message: "The retained acknowledgment is not an object")
+            }
+            ack = object
+        } catch {
+            BridgeCore.writeJSON(conn, status: 500, obj: ["error": "acknowledgment_decoding_failed", "detail": error.localizedDescription])
+            return
+        }
         @Sendable func send(_ data: Data) async -> Bool {
             do { try await AgentContactSSE.send(data, on: conn); return true }
             catch { return false }
@@ -552,8 +567,8 @@ public struct AgentContactRoutes: Sendable {
             data.append(body)
             sent = await send(data)
         }
-        settle?(sent)
-        if sent, let fetchedTask { await tasks.recordReplyFetch(fetchedTask) }
+        settle?(sent && response["error"] == nil)
+        if sent, NativeAgentMCPWire.carriesReply(response), let fetchedTask { await tasks.recordReplyFetch(fetchedTask) }
         } catch { nativeLog("Contact result could not be encoded: %@", error.localizedDescription); conn.cancel() }
     }
 
@@ -653,17 +668,20 @@ struct AgentContactHeldResponse: Sendable {
     private let conversation: String
     var settle: @Sendable (Bool) -> Void { drain.settle }
 
+    /// These doors name no caller: they call in the contact's own conversation.
     init(principal: AgentBridgePrincipal, dataRoot: URL, via door: String) throws {
         let conversation = principal.conversationID(protocolName: "mcp") ?? ""
         self.conversation = conversation
         guard let peer = principal.peerID else { drain = .nothing; return }
-        drain = try AgentConversationStore(dataRoot: dataRoot).drainHeld(peer: peer, name: principal.displayName ?? principal.id, via: door) {
+        drain = try AgentConversationStore(dataRoot: dataRoot).drainHeld(peer: peer, conversation: conversation,
+            name: principal.displayName ?? principal.id, via: door) {
             NativeAgentMCPWire.heldFits(Self.messages($0, conversation: conversation))
         }
     }
 
     private static func messages(_ items: [AgentConversationStore.Held], conversation: String) -> [[String: String]] {
-        items.map { ["at": NativeTimestampFormat.plainZulu($0.at), "text": $0.text, "conversation_id": $0.conversation ?? conversation] }
+        items.map { ["at": NativeTimestampFormat.plainZulu($0.at), "text": $0.text, "conversation_id": $0.conversation ?? conversation,
+                     "conversation_name": $0.name] }
     }
 
     func adding(to object: [String: Any]) -> [String: Any] {

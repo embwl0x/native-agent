@@ -78,24 +78,18 @@ extension NativeAgentEngine {
             cognitionRuntime: runtime, assembly: assembly
         )
     }
-    /// Unattended dreams and REM each have one scheduler owner: `nativeagent-nightly-dream` at 03:30 and `nativeagent-weekly-rem` Sundays at 04:30 Mac-local.
+    /// The night owns dreams and REM; registered loops serve their own evidence.
     public static func assembleAllLoops(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [LoopRegistration] {
         let cognition = cognitionRuntime(for: dataRoot)
-        let llm = makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: cognition, assembly: .compilePersona)
         let runners: [any LoopRunner] = [
             makeAutoDoctorLoop(dataRoot: dataRoot),
             makeOffDiskBackupLoop(dataRoot: dataRoot),
             // Disk hygiene files an oversize notice; it never deletes.
             makeDataRootDiskHygieneLoop(dataRoot: dataRoot),
-            makeWeeklySelfImprovementLoop(dataRoot: dataRoot, llm: llm),
-            // Core owns lifecycle; exact persisted deadlines and activity/config invalidations drive jobs.
-            makeTriggerSchedulerLoop(dataRoot: dataRoot),
             CognitiveMaintenanceLoop(interval: NativeCognitionRuntime.substrateClockCadence, runtime: cognition),
             CognitiveReplayLoop(interval: NativeCognitionRuntime.substrateClockCadence, runtime: cognition),
-            CognitiveReflectionLoop(interval: NativeCognitionRuntime.substrateClockCadence,
-                llm: makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: cognition, assembly: .suppliedPersona), runtime: cognition),
             // Cue authoring requires a live consumer before production scheduling.
             makeHeartbeatLoop(dataRoot: dataRoot),
             // Desk notifications must not touch cognition.
@@ -132,7 +126,7 @@ extension NativeAgentEngine {
 
 extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
     func letGoReplies(deliveryIDs: Set<String>, outcome: String, dataRoot: URL, configRoot: URL) async throws {
-        try await CodexCompletionLifecycle.letGoReplies(deliveryIDs: deliveryIDs, outcome: outcome,
+        _ = try await CodexCompletionLifecycle.letGoReplies(deliveryIDs: deliveryIDs, outcome: outcome,
             dataRoot: dataRoot, configRoot: configRoot)
     }
 
@@ -165,16 +159,18 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
         await NativeAgentEngine.liveCognition.observeMotorActionState(model)
     }
 
+    /// The contact doors' transports (their start, queued sends, reply reads) and the Desk waits that settled. Neither decides that the agent thinks:
+    /// what comes back is a `returned` happening.
     func reconcileAgentConversations() async throws {
-        let agents = NativeAgentEngine.live.agents
+        let engine = NativeAgentEngine.live
         // Reconciliation is the background owner's operation, outside a chat turn.
         let workspace = ChatWorkspaceBinding.operation(turn: nil, invocation: .init())
-        // A contact read failure must not prevent resident due-work consideration.
+        // A contact read failure must not keep a settled Desk wait from returning.
         var firstError: Error?
-        do { try await agents.continuation.tick(workspace: workspace) }
+        do { try await engine.agents.continuation.tick(workspace: workspace) }
         catch is CancellationError { throw CancellationError() }
         catch { firstError = error }
-        do { _ = try await agents.residentWake.tick() }
+        do { try await NativeAgentEngine.makeTurnContinuationRuntime(dataRoot: engine.dataRoot).returnSettledDeskWaits() }
         catch is CancellationError { throw CancellationError() }
         catch { if firstError == nil { firstError = error } }
         if let firstError { throw firstError }
@@ -184,11 +180,8 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
         await NativeAgentEngine.live.agents.continuation.stop()
     }
 
-    func nextConversationDeadline(after now: Date) -> Date? {
-        let agents = NativeAgentEngine.live.agents
-        return [agents.continuation.nextDeadline(after: now), agents.residentWake.nextDeadline(after: now)]
-            .compactMap { $0 }.min()
-    }
+    /// Conversation-owner changes wake reconciliation; no clock declares a reply due.
+    func nextConversationDeadline(after _: Date) -> Date? { nil }
 }
 
 // MARK: - Desk notifications
@@ -241,14 +234,6 @@ extension NativeAgentEngine {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> some LoopRunner {
         MaintenanceBackgroundWork(port: EngineBackgroundWorkPort()).makeOffDiskBackupLoop(dataRoot: dataRoot)
-    }
-
-    public static func makeWeeklySelfImprovementLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        llm: any LLMClient
-    ) -> WeeklySelfImprovementLoop {
-        MaintenanceBackgroundWork(port: EngineBackgroundWorkPort()).makeWeeklySelfImprovementLoop(
-            dataRoot: dataRoot, llm: llm, jobOutcomes: { try AgentJobs.weeklyOutcomes(dataRoot: dataRoot, now: Date()) })
     }
 
     public static func makeDataRootDiskHygieneLoop(

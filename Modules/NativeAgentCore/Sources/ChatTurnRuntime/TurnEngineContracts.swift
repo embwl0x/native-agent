@@ -76,22 +76,21 @@ public struct TurnReach: Sendable, Equatable {
     public internal(set) var expression: JSONValue = .null
     public internal(set) var pins: [String] = []
     public internal(set) var recall = ""
-    public internal(set) var digest = ""
     public internal(set) var packet = ""
     public internal(set) var history = ""
     public internal(set) var facts: [String] = []
     public internal(set) var runtime: JSONValue = .null
 }
 
-/// One line of the agent: when its present was last read (nil: not yet, so the next read starts at the agent's last reply here),
-/// and whether a peer steers it (words from other doors then stay out).
+/// When this line's present was last read; nil starts the next read at the agent's last reply here.
 struct AgentNowCursor: Sendable {
     let at: Date?
-    let peer: Bool
 }
 
 /// The part owns system composition from these gathered inputs.
 public struct TurnContext: Sendable {
+    /// The conversation's held choice travels only in live provider input, outside saved sent-context evidence.
+    var privateWorkingMemory: String = ""
     public let surface: String
     /// Carry the exact persona into dispatch so explicit recall shares automatic recall's disclosure boundary.
     public let personaID: String?
@@ -121,12 +120,11 @@ public struct TurnContext: Sendable {
     public let fluidContextTurn: ContextPreparedTurn?
     /// Replay bounded prior turns oldest first so provider prefixes remain byte-stable.
     public internal(set) var historyMessages: [LLMMessage]
-    /// Hold the complete volatile mass until user-block keyframe/delta seeding; nil means no split has run.
+    /// Hold the complete volatile mass until it leads the current user message; nil means no split has run.
     public internal(set) var turnVolatileBlock: String?
     /// Replay metadata only for user rows actually included in the history projection.
     package var historyReplaySpec: SessionReplaySpec? = nil
     package var historyRowCharacters: [String: Int] = [:]
-    package var replayedTurnContexts: [SentTurnContext] = []
     /// Keep recollection identity independent of turn-varying rendered text.
     package var historyContextWindow = "0:"
     /// Absent measurement stays absent; do not invent a preparation duration.
@@ -139,7 +137,10 @@ public struct TurnContext: Sendable {
     var bodyFelt: BodyFelt.Pending? = nil
     /// Where the agent's present was read for this line; every later step reads only what changed in the agent since.
     var agentNow: AgentNowCursor? = nil
+    /// Act IDs already carried in this turn's life packet, for the moment and later breaths to omit.
+    var recentLifeActs: Set<String> = []
     var cognitiveRuntimeContext: String? = nil
+    var cognitiveFeelingFrame: CognitiveFeelingFrame?
     public internal(set) var turnReach: TurnReach
     /// Keep bounded deduplicated provenance separately from the rendered memory IDs used for delivery credit.
     public var resolvedRecalledIds: [String] {
@@ -206,8 +207,8 @@ public struct TurnContext: Sendable {
         return copy
     }
 
-    /// Move the complete dynamic segment only after all contributors append, preserving order and bytes before delta selection.
-    /// Deliver it after replayed history on the current user row, then store exactly those delivered bytes as metadata.
+    /// Move public dynamic context after its contributors append, preserving order and bytes before delta selection.
+    /// Deliver that block after replayed history and retain its bytes on the user row; private choices remain separate.
     /// Rebuild systemPrompt from emptied segments so it remains equal to their combined value.
     /// Append caller-supplied trailing material after the dynamic block; absent segments or volatile text leave the context unchanged.
     public func splittingVolatileBlock(appending trailingSection: String = "") -> TurnContext {
@@ -321,6 +322,8 @@ public struct TurnEngineResult: Sendable {
     public let completionState: CompletionState?
     public let terminalReason: TerminalReason?
     public let loopCounters: LoopCounters?
+    /// The shared provider loop witnessed acceptance of this turn's exact cognitive context.
+    public let cognitiveContextDelivered: Bool
     /// Memory recording and private work released by the saved answer.
     public internal(set) var afterReply: AfterReply?
     /// Retain working commentary on user-facing surfaces; only explicit answer-only callers trim at this recorded boundary.
@@ -337,7 +340,8 @@ public struct TurnEngineResult: Sendable {
         afterReply: AfterReply? = nil,
         workingCommentaryCharacters: Int? = nil,
         terminalReason: TerminalReason? = nil,
-        loopCounters: LoopCounters? = nil
+        loopCounters: LoopCounters? = nil,
+        cognitiveContextDelivered: Bool = false
     ) {
         self.reply = ChatRichContentParser.visibleText(reply)
         self.modelUsed = modelUsed
@@ -348,6 +352,7 @@ public struct TurnEngineResult: Sendable {
         self.completionState = completionState
         self.terminalReason = terminalReason
         self.loopCounters = loopCounters
+        self.cognitiveContextDelivered = cognitiveContextDelivered
         self.afterReply = afterReply
         self.workingCommentaryCharacters = workingCommentaryCharacters
     }
@@ -379,14 +384,14 @@ public struct TurnEngineResult: Sendable {
         }
     }
 
-    func observingTerminal(reason: TerminalReason, counters: LoopCounters) -> Self {
+    func observingTerminal(reason: TerminalReason, counters: LoopCounters, cognitiveContextDelivered: Bool) -> Self {
         Self(
             reply: reply, modelUsed: modelUsed, recalledIds: recalledIds,
             toolDispatches: toolDispatches, elapsedMs: elapsedMs,
             providerCallCount: providerCallCount,
             completionState: completionState, afterReply: afterReply,
             workingCommentaryCharacters: workingCommentaryCharacters,
-            terminalReason: reason, loopCounters: counters
+            terminalReason: reason, loopCounters: counters, cognitiveContextDelivered: cognitiveContextDelivered
         )
     }
 }

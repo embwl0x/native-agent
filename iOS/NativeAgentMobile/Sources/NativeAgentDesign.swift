@@ -3,11 +3,7 @@ import SwiftUI
 import Foundation
 import UIKit
 import NativeAgentShared
-// Blueprint: | `NativeAgentDesign.swift` | `View`: `appShimmer` |
-
-enum NativeAgentPalette {
-    static let agentAccent = Color(hex: 0x06B6D4)
-}
+// Blueprint: | `NativeAgentDesign.swift` | `NativeAgentAppearance` (the phone's color-scheme control), `AppFont` and `AppMotion` tokens |
 
 // MARK: - Appearance
 
@@ -80,77 +76,4 @@ enum AppMotion {
     static func respecting(_ animation: Animation?, reduceMotion: Bool) -> Animation? {
         reduceMotion ? nil : animation
     }
-}
-
-// MARK: - PulsingDot — live indicator
-
-struct PulsingDot: View {
-    var color: Color = NativeAgentPalette.agentAccent
-    var size: CGFloat = 8
-    var isActive = true
-    @State private var pulse = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.scenePhase) private var scenePhase
-
-    var body: some View {
-        ZStack {
-            if isActive && scenePhase == .active && !reduceMotion {
-                Circle()
-                    .fill(color.opacity(0.35))
-                    .frame(width: size * 2.2, height: size * 2.2)
-                    .scaleEffect(pulse ? 1 : 0.5)
-                    .opacity(pulse ? 0 : 0.6)
-                    .onAppear {
-                        pulse = false
-                        withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) { pulse = true }
-                    }
-            } else {
-                Circle().fill(color.opacity(0.35))
-                    .frame(width: size * 2.2, height: size * 2.2)
-                    .scaleEffect(0.5).opacity(0.6)
-            }
-            Circle()
-                .fill(color)
-                .frame(width: size, height: size)
-                .shadow(color: color.opacity(0.7), radius: 3)
-        }
-        .frame(width: size, height: size)
-    }
-}
-
-// MARK: - Shimmer — loading-state diagonal sweep
-
-struct Shimmer: ViewModifier {
-    @State private var phase: CGFloat = -1
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if reduceMotion {
-            content
-        } else {
-            content.overlay {
-                GeometryReader { geo in
-                    LinearGradient(stops: [
-                        .init(color: .white.opacity(0),   location: 0),
-                        .init(color: .white.opacity(0.35), location: 0.5),
-                        .init(color: .white.opacity(0),   location: 1),
-                    ], startPoint: .topLeading, endPoint: .bottomTrailing)
-                    .frame(width: geo.size.width * 1.6)
-                    .offset(x: geo.size.width * phase)
-                    .blendMode(.plusLighter)
-                    .onAppear {
-                        withAnimation(.linear(duration: 2.2).repeatForever(autoreverses: false)) {
-                            phase = 1.4
-                        }
-                    }
-                }
-                .mask(content)
-            }
-        }
-    }
-}
-
-extension View {
-    func appShimmer() -> some View { modifier(Shimmer()) }
 }

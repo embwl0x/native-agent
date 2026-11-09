@@ -72,9 +72,8 @@ extension ChatStore {
         sendTask = nil
         // Retire old visible correlations, including sessionless replies, while retaining signed handoffs.
         let retiringCorrelations = Set(pendingICloudPlaceholders.keys)
-            .union(timedOutPendingIds.keys)
+            .union(retiredPendingPlaceholders.keys)
             .union(maxDeltaSeqByCorrelation.keys)
-            .union(pendingTimeouts.keys)
         for correlationID in retiringCorrelations {
             markICloudReplyResolved(correlationID, discardRetainedSend: false)
         }
@@ -104,9 +103,8 @@ extension ChatStore {
         sendTask = nil
         // Detachment retires visible callbacks, not the retained transport queue.
         let retiringCorrelations = Set(pendingICloudPlaceholders.keys)
-            .union(timedOutPendingIds.keys)
+            .union(retiredPendingPlaceholders.keys)
             .union(maxDeltaSeqByCorrelation.keys)
-            .union(pendingTimeouts.keys)
         for correlationID in retiringCorrelations {
             markICloudReplyResolved(correlationID, discardRetainedSend: false)
         }

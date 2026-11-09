@@ -163,8 +163,8 @@ extension SwiftNativeMacControl {
                     extra: ["guidance": .string(continuation.modelContext(context: context))])
             }
         }
-        // Refuse self-process frames before any actuator AX call to prevent in-process AppKit re-entry deadlock.
-        if framePid == getpid() {
+        // A recorded frame cannot authorize touching person-only UI.
+        if PersonOnlyWindows.isOwnProcess(framePid) {
             await lookFrameStore.invalidate()
             return injectionRefusal(
                 action: "act",
@@ -180,6 +180,7 @@ extension SwiftNativeMacControl {
                 ]
             )
         }
+        if let refusal = await macAdmissionRefusal(pid: framePid, action: "act", context: context) { return refusal }
         // Match the observed window by persistent identity; missing or ambiguous matches refuse instead of choosing current focus.
         let actWindows: [MacAXWindowRef]
         do { actWindows = try accessibilityActSource(context: context).windows(pid: framePid, context: context) }
@@ -502,7 +503,24 @@ extension SwiftNativeMacControl {
         let textBeforeInput = verb == .type ? accessibilityActSource(context: context).reread(target, context: context)?.value : nil
         let performedAt = now()
         let performed: MacActPerformed?
-        if let placement {
+        let heldEffect: MacActClosedLoop.DeclaredEffect?
+        switch verb {
+        case .focus: heldEffect = .focus
+        case .select: heldEffect = .selected
+        case .type where typeMode == .replace && placement == nil: heldEffect = .text(text)
+        default: heldEffect = nil
+        }
+        let held = heldEffect.map {
+            MacActClosedLoop.verify($0, value: target.value,
+                selected: identityScoped.snapshot.nodes.first { $0.path == live.path }?.attributes.selected,
+                focused: accessibilityActSource(context: context).isFocusedElement(target, pid: framePid, context: context)
+                    && accessibilityActSource(context: context).focusedWindow(pid: framePid, context: context)?.handle == actWindow.handle)
+        }
+        if held?.status == "acted" {
+            performed = MacActPerformed(ok: true, method: "already_held", requestedAction: verb.rawValue,
+                target: target, postState: target, actedHandle: handle,
+                extra: ["already_held": .bool(true), "posted_events": .int(0)], expectedText: verb == .type ? text : nil)
+        } else if let placement {
             performed = await placeInSavePanel(placement, target: target, window: actWindow, pid: framePid,
                                               handle: handle, frontBefore: frontBefore, turn: turn, context: context)
         } else { performed = await performAct(
@@ -545,35 +563,104 @@ extension SwiftNativeMacControl {
         }
 
         // No notification within wait_ms is an unobserved outcome, never proof that the action failed or did nothing.
-        let clock = now
         // Navigation waits for a transition, not a selection reaction; explicit `wait_ms` overrides the bounded default.
         let navigationVerb = MacActClosedLoop.navigationVerbs.contains(verb)
         let effectWaitMs = navigationVerb && body["wait_ms"]?.integerValue.flatMap(Int.init(exactly:)) == nil
             ? MacActClosedLoop.clampedWaitMs(MacActClosedLoop.navigationWaitMs)
             : waitMs
-        let wait = await MacActClosedLoop.waitForEffect(
-            collector: collector,
-            waitMs: effectWaitMs,
-            startedAt: performedAt,
-            clock: { clock() },
-            until: navigationVerb ? MacActClosedLoop.navigationNotificationKinds : []
-        )
-        observation?.stop()
-        // Close a background-opened menu through its owning element and report whether it closed.
+        var read: MacAXRead?
+        var seam: [String: JSONValue] = [:]
+        var postAnchor: MacAnchoredRead?
         var menuLeftOpen: Bool?
-        if background, wait.notifications.contains("AXMenuOpened") {
-            menuLeftOpen = accessibilityActSource(context: context).perform(performed.target, action: "AXCancel", turn: turn, context: context) != .performed
+        let limits = Self.axLimits(from: body)
+        let declaration: MacActClosedLoop.DeclaredEffect
+        switch verb {
+        case .hover: declaration = .pointer
+        case .type: declaration = placement.map { .placement($0, performed.extra["directory_url_after"]?.stringValue) } ?? .text(performed.expectedText)
+        case .focus: declaration = .focus
+        case .select: declaration = .selected
+        case .toggle:
+            declaration = .state(["0": "1", "1": "0", "off": "on", "on": "off",
+                                  "true": "false", "false": "true"][performed.target.value ?? ""])
+        case .dismiss: declaration = .dismissed
+        case .scroll: declaration = .scroll
+        default: declaration = .surface(verb == .open ? entry.label : nil)
+        }
+        let actedEntry = entry
+        // The read is an argument: the settle holds the only reference while it waits.
+        func verdict(_ diff: MacActClosedLoop.EffectDiff?, selected: Bool? = nil, read: MacAXRead?) -> MacActClosedLoop.ActClassification {
+            let entry = actedEntry
+            let windowsAfter: [MacAXWindowRef]
+            do { windowsAfter = try accessibilityActSource(context: context).windows(pid: framePid, context: context) }
+            catch { return MacActClosedLoop.ActClassification(status: "acted_unobserved", reason: "window_readback_unavailable",
+                note: "The action was delivered, but its window readback failed: " + error.localizedDescription + " Inspect this app before another action.") }
+            if verb == .type, performed.method == "ax_set_value",
+               let before = performed.textBeforeWrite, before != performed.expectedText,
+               accessibilityActSource(context: context).reread(performed.target, context: context)?.value == before {
+                return MacActClosedLoop.ActClassification(status: "acted_unobserved",
+                    reason: "text_write_unverified",
+                    note: "AX acknowledged the text write, but the value reads unchanged. Inspect the readback before another write.")
+            }
+            return MacActClosedLoop.verify(declaration,
+                value: accessibilityActSource(context: context).reread(performed.target, context: context)?.value,
+                valueBefore: performed.textBeforeWrite ?? textBeforeInput,
+                selected: selected,
+                focused: accessibilityActSource(context: context).focusedElement(pid: framePid, context: context).flatMap { _ in
+                    accessibilityActSource(context: context).focusedWindow(pid: framePid, context: context).map {
+                        accessibilityActSource(context: context).isFocusedElement(performed.target, pid: framePid, context: context) && $0.handle == actWindow
+                            .handle
+                    }
+                },
+                surfaceChanged: windowsAfter.contains { window in
+                    !actWindows.contains { $0.handle == window.handle }
+                } ? true : nil,
+                dismissed: accessibilityActSource(context: context).windowPresence(actWindow, context: context).map { !$0 },
+                processGone: accessibilitySource(context: context).appInfo(pid: framePid) == nil,
+                diff: diff, notifications: collector.kinds(),
+                pointerOnTarget: accessibilityActSource(context: context).reread(performed.target, context: context)?.frame.flatMap { frame in
+                    self.pointerPositionSource.currentPosition().map { $0.isInside(frame) }
+                },
+                redactingText: entrySecret,
+                // A readout verifies only after an element-by-element stable reread.
+                press: verb == .click ? (effectBefore, entry, { row in
+                    guard let node = read?.snapshot.nodes.first(where: { $0.path == row.path }), let element = node.element,
+                          let fresh = self.accessibilitySource(context: context).attributes(of: element, context: context) else { return false }
+                    return fresh.value == node.attributes.value && fresh.title == node.attributes.title
+                }) : nil,
+                destinationJSON: entry.labelJSON ?? .null,
+                windowTitleJSON: read?.rootTitle.map { MacScreenViewTextRedaction.redactedLegendString($0, valueChars: limits.valueChars) })
         }
 
-        let limits = Self.axLimits(from: body)
-        // Post-action readback stays anchored to the frame's window so its effect and next frame describe the acted-on surface.
-        let (read, seam, postAnchor) = await lookSnapshot(
-            limits: limits,
-            scope: MacLookScope.parse(body["scope"]?.stringValue) ?? .page,
-            anchorPid: framePid,
-            anchorWindow: frame.windowIdentity,
-            completeWindow: frame.completeWindow
-        , context: context)
+        var settledTarget: MacAXActTarget?
+        var settledVerdict = MacActClosedLoop.ActClassification(status: "acted_unobserved", reason: "effect_unreadable")
+        let signals = MacWaitSignals(collector: collector, startedAt: performedAt)
+        defer { signals.stop() }
+        _ = await macSettle("act", signals: signals, patience: Double(effectWaitMs) / 1000,
+            until: navigationVerb ? MacActClosedLoop.navigationNotificationKinds.union(background ? ["AXMenuOpened"] : []) : []) {
+            if background, collector.kinds().contains("AXMenuOpened"), menuLeftOpen == nil {
+                menuLeftOpen = self.accessibilityActSource(context: context).perform(
+                    performed.target, action: "AXCancel", turn: turn, context: context) != .performed
+            }
+            (read, seam, postAnchor) = await self.lookSnapshot(
+                limits: limits, scope: MacLookScope.parse(body["scope"]?.stringValue) ?? .page,
+                anchorPid: framePid, anchorWindow: frame.windowIdentity, completeWindow: frame.completeWindow, context: context)
+            var passDiff: MacActClosedLoop.EffectDiff?
+            if let read, seam["window_minimized"] != .bool(true) {
+                let percept = MacPerceptionCompiler.compile(snapshot: read.snapshot,
+                    secretContext: MacScreenViewTextRedaction.nodeSecretContext(read.snapshot.nodes),
+                    app: read.app, windowTitle: read.rootTitle, focusPath: read.focusPath,
+                    maxAffordances: effectAffordanceCap, uncapped: frame.completeWindow)
+                passDiff = MacActClosedLoop.diff(before: effectBefore, after: percept, afterWindowTitle: read.rootTitle,
+                    afterCaps: MacLookCompileCaps(truncated: percept.truncated,
+                        maxAffordances: frame.completeWindow ? nil : effectAffordanceCap,
+                        maxNodes: frame.completeWindow ? nil : limits.maxNodes, maxDepth: frame.completeWindow ? nil : limits.maxDepth))
+            }
+            settledTarget = self.accessibilityActSource(context: context).reread(performed.target, context: context)
+            settledVerdict = verdict(passDiff, selected: read?.snapshot.nodes.first { $0.path == live.path }?.attributes.selected, read: read)
+            return settledVerdict.status == "acted" || menuLeftOpen != nil
+        }
+        observation?.stop()
+        let wait = MacActClosedLoop.effectWait(collector: collector, startedAt: performedAt)
         let redactValue = verb == .type
         var effect: [String: JSONValue] = [
             "observed": .bool(wait.observed),
@@ -590,7 +677,7 @@ extension SwiftNativeMacControl {
                     valueJSON: entry.valueJSON
                 ),
                 // Post-act reads lack caption context; preserve the frame's secret verdict and expose only a digest for values it withheld.
-                "after": performed.postState.map {
+                "after": settledTarget.map {
                     MacActReceiptRendering.actedElementJSON(
                         $0,
                         redactingValue: redactValue || entrySecret,
@@ -602,7 +689,6 @@ extension SwiftNativeMacControl {
         if let firstMs = wait.firstNotificationMs {
             effect["first_notification_ms"] = .int(Int64(firstMs))
         }
-        if wait.dropped > 0 { effect["notifications_dropped"] = .int(Int64(wait.dropped)) }
         // An unavailable observer refuses before action; an installed observer may honestly report no notifications inside `wait_ms`.
         if !wait.observed {
             effect["reason"] = .string("none_observed")
@@ -642,59 +728,6 @@ extension SwiftNativeMacControl {
             output["menu_left_open"] = .bool(menuLeftOpen)
         }
 
-        let declaration: MacActClosedLoop.DeclaredEffect
-        switch verb {
-        case .hover: declaration = .pointer
-        case .type: declaration = placement.map { .placement($0, performed.extra["directory_url_after"]?.stringValue) } ?? .text(performed.expectedText)
-        case .focus: declaration = .focus
-        case .select: declaration = .selected
-        case .toggle:
-            declaration = .state(["0": "1", "1": "0", "off": "on", "on": "off",
-                                  "true": "false", "false": "true"][performed.target.value ?? ""])
-        case .dismiss: declaration = .dismissed
-        case .scroll: declaration = .scroll
-        default: declaration = .surface(verb == .open ? entry.label : nil)
-        }
-        func verdict(_ diff: MacActClosedLoop.EffectDiff?, selected: Bool? = nil) -> MacActClosedLoop.ActClassification {
-            let windowsAfter: [MacAXWindowRef]
-            do { windowsAfter = try accessibilityActSource(context: context).windows(pid: framePid, context: context) }
-            catch { return MacActClosedLoop.ActClassification(status: "acted_unobserved", reason: "window_readback_unavailable",
-                note: "The action was delivered, but its window readback failed: " + error.localizedDescription + " Inspect this app before another action.") }
-            if verb == .type, performed.method == "ax_set_value",
-               let before = performed.textBeforeWrite, before != performed.expectedText,
-               accessibilityActSource(context: context).reread(performed.target, context: context)?.value == before {
-                return MacActClosedLoop.ActClassification(status: "acted_unobserved",
-                    reason: "text_write_unverified",
-                    note: "AX acknowledged the text write, but the value reads unchanged. Inspect the readback before another write.")
-            }
-            return MacActClosedLoop.verify(declaration,
-                value: accessibilityActSource(context: context).reread(performed.target, context: context)?.value,
-                valueBefore: performed.textBeforeWrite ?? textBeforeInput,
-                selected: selected,
-                focused: accessibilityActSource(context: context).focusedElement(pid: framePid, context: context).flatMap { _ in
-                    accessibilityActSource(context: context).focusedWindow(pid: framePid, context: context).map {
-                        accessibilityActSource(context: context).isFocusedElement(performed.target, pid: framePid, context: context) && $0.handle == actWindow
-                            .handle
-                    }
-                },
-                surfaceChanged: windowsAfter.contains { window in
-                    !actWindows.contains { $0.handle == window.handle }
-                } ? true : nil,
-                dismissed: accessibilityActSource(context: context).windowPresence(actWindow, context: context).map { !$0 },
-                processGone: accessibilitySource(context: context).appInfo(pid: framePid) == nil,
-                diff: diff, notifications: wait.notifications,
-                pointerOnTarget: accessibilityActSource(context: context).reread(performed.target, context: context)?.frame.flatMap { frame in
-                    self.pointerPositionSource.currentPosition().map { $0.isInside(frame) }
-                },
-                redactingText: entrySecret,
-                // A readout verifies only after an element-by-element stable reread.
-                press: verb == .click ? (effectBefore, entry, { row in
-                    guard let node = read?.snapshot.nodes.first(where: { $0.path == row.path }), let element = node.element,
-                          let fresh = self.accessibilitySource(context: context).attributes(of: element, context: context) else { return false }
-                    return fresh.value == node.attributes.value && fresh.title == node.attributes.title
-                }) : nil,
-                destinationJSON: entry.labelJSON ?? .null, windowTitleJSON: effect["window_title"])
-        }
 
         guard let read, seam["window_minimized"] != .bool(true) else {
             // An absent or minimized window cannot supply a fresh frame; invalidate it and name the app/window identity failure.
@@ -747,7 +780,7 @@ extension SwiftNativeMacControl {
             }()
             effect["percept"] = .string(percept)
             if performed.ok {
-                let classification = verdict(nil)
+                let classification = settledVerdict
                 output.merge(classification.receipt) { _, new in new }
                 effect["observed"] = .bool(classification.status != "acted_unobserved")
                 effect["reason"] = classification.reason.map(JSONValue.string)
@@ -794,13 +827,13 @@ extension SwiftNativeMacControl {
             effect[key] = value
         }
         // One verdict from the declared effect and the target's own AX state.
-        let classification = verdict(diff, selected: read.snapshot.nodes.first { $0.path == live.path }?.attributes.selected)
+        let classification = settledVerdict
         if performed.ok { output.merge(classification.receipt) { _, new in new } }
         effect["observed"] = .bool(performed.ok && classification.status != "acted_unobserved")
         if let reason = classification.reason { effect["reason"] = .string(reason) }
         else { effect.removeValue(forKey: "reason") }
-        // Bulk or dropped-event changes include role counts and focus context alongside capped rows.
-        if diff.addedTotal > MacActClosedLoop.maxDiffRows || wait.dropped > 0 {
+        // Bulk changes include role counts and focus context alongside capped rows.
+        if diff.addedTotal > MacActClosedLoop.maxDiffRows {
             effect["summary"] = MacActReceiptRendering.denseEffectSummaryJSON(
                 diff: diff,
                 after: after,

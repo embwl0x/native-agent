@@ -53,9 +53,9 @@ public final class DoctorFacade {
     }
 
     public nonisolated let dataRoot: URL
+    private nonisolated let launchedAt: Date
 
     @ObservationIgnored var diagnosticsDidChange: (@MainActor () -> Void)?
-    @ObservationIgnored var faceAction: (@MainActor (String, String?) async throws -> String?)?
 
     public private(set) var activityEvents: [ActivityEvent] = []
     public private(set) var activityRefresh: PanelRefreshStatus?
@@ -153,44 +153,9 @@ public final class DoctorFacade {
         return read.3
     }
 
-    public private(set) var weeklyDigest: (text: String, date: String)?
-    public private(set) var weeklyDigestError: String?
-    @ObservationIgnored private let weeklyDigestRead = LatestRead()
-
-    public func observeWeeklyDigest() async {
-        await EventDeadlinePhysiology.refreshOnChanges(paths: [
-            dataRoot.appendingPathComponent("self_improvement/digests", isDirectory: true)
-        ]) {
-            _ = await self.weeklyDigestRead.read { () async -> Result<(text: String, date: String)?, Error> in
-            do {
-                let dir = self.dataRoot.appendingPathComponent("self_improvement/digests", isDirectory: true)
-                let digest = try await Task.detached(priority: .utility) { () throws -> (text: String, date: String)? in
-                    let files: [URL]
-                    do { files = try FileManager.default.contentsOfDirectory(
-                        at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) }
-                    catch CocoaError.fileReadNoSuchFile { return nil }
-                    let dated = try files.filter { $0.pathExtension == "md" }.map { url in
-                        (url: url, modified: try url.resourceValues(forKeys: [.contentModificationDateKey])
-                            .contentModificationDate ?? .distantPast)
-                    }
-                    guard let latest = dated.max(by: { $0.modified < $1.modified })?.url else { return nil }
-                    return (try String(contentsOf: latest, encoding: .utf8), latest.deletingPathExtension().lastPathComponent)
-                }.value
-                return Result<(text: String, date: String)?, Error>.success(digest)
-            } catch {
-                return .failure(error)
-            }
-            } publish: { result in
-                switch result {
-                case .success(let digest): self.weeklyDigest = digest; self.weeklyDigestError = nil
-                case .failure(let error): self.weeklyDigestError = UserFacingError.message(error, action: "read latest digest")
-                }
-            }
-        }
-    }
-
-    public nonisolated init(dataRoot: URL) {
+    public nonisolated init(dataRoot: URL, launchedAt: Date) {
         self.dataRoot = dataRoot
+        self.launchedAt = launchedAt
     }
 
     /// All run sources share admission so overlapping runs cannot occur.
@@ -346,17 +311,14 @@ public final class DoctorFacade {
         return String(head) + ellipsis
     }
 
-    /// Begin liveness timing at the first health read, never process launch.
-    private nonisolated static let firstHealthReadAt = Date()
-
-    /// `ok` proves this read answered, not Doctor health; uptime starts at the first health read.
+    /// `ok` proves this read answered, not Doctor health; launch belongs to the engine, never a health read.
     public nonisolated func readHealth() -> RuntimeHealth {
         RuntimeHealth(
             ok: true,
             app: "NativeAgent",
             version: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev",
             dataDir: dataRoot.path,
-            uptimeSeconds: Date().timeIntervalSince(Self.firstHealthReadAt)
+            launchedAt: launchedAt
         )
     }
 
@@ -405,7 +367,6 @@ public final class DoctorFacade {
             runtimeLifecycleDetail: running
                 ? (loopHealth.status == "ok" ? "Swift background loops are running in NativeAgent.app." : loopHealth.detail)
                 : "Swift background loops are not running.",
-            runningImprovements: loopStatuses.filter { $0.executing && $0.name == "self_improvement_sweep" }.count,
             lastActivity: lastActivity,
             repairAvailable: loopStatuses.contains { $0.lastError != nil },
             extras: .object([
@@ -419,7 +380,7 @@ public final class DoctorFacade {
     }
 }
 
-public struct DoctorReport: Equatable, Sendable {
+public struct DoctorReport: Codable, Equatable, Sendable {
     public var status: String
     public var repaired: Bool
     public var checks: [CheckResult]
@@ -439,35 +400,6 @@ extension WatchdogStatus {
         case "off", "not needed": return runtimeLifecycleStatus
         case "unmeasured": return "info"
         default: return "error"
-        }
-    }
-}
-
-extension DoctorFacade {
-    public struct RuntimeStatus: Equatable, Sendable {
-        public enum Tone: Sendable { case neutral, success, warning, failure }
-        public let text: String
-        public let detail: String?
-        public let tone: Tone
-        public let systemImage: String
-    }
-
-    /// Runtime liveness is independent of the most recent operation's feedback.
-    public func runtimeStatus(lastRefreshError: String?) -> RuntimeStatus {
-        let hasError = !(lastRefreshError?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-        let detail = hasError ? "Some sections didn't refresh. The details are in the log." : nil
-        switch health?.ok {
-        case true:
-            return RuntimeStatus(text: hasError ? "App is online; some app data is unavailable" : "App is online",
-                detail: detail, tone: hasError ? .warning : .success,
-                systemImage: hasError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-        case false:
-            return RuntimeStatus(text: "App reported a problem", detail: detail,
-                tone: .failure, systemImage: "xmark.octagon.fill")
-        case nil:
-            return RuntimeStatus(text: hasError ? "App status is unavailable" : "App status has not been checked",
-                detail: detail, tone: hasError ? .failure : .neutral,
-                systemImage: hasError ? "xmark.octagon.fill" : "questionmark.circle")
         }
     }
 }

@@ -34,9 +34,10 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
     public var open: String?
     public var closes: Bool
     public var stance: CognitiveCare.Stance?
+    public var acted: Bool?
 
     public init(target: Target, moved: Double, by: CognitiveCare.Mover, felt: String, note: String,
-                open: String? = nil, closes: Bool = false, stance: CognitiveCare.Stance? = nil) {
+                open: String? = nil, closes: Bool = false, stance: CognitiveCare.Stance? = nil, acted: Bool? = nil) {
         self.target = target
         self.moved = moved.isFinite ? min(1, max(-1, moved)) : 0
         self.by = by
@@ -45,6 +46,7 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
         self.open = open
         self.closes = closes
         self.stance = stance
+        self.acted = acted
     }
 
     /// Missing or malformed care judgments fail interpretation; an unshown key cannot be silently discarded or guessed.
@@ -76,6 +78,13 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
             case let value as Bool: closes = value
             default: return nil
             }
+            let acted: Bool?
+            switch object["acted"] {
+            case nil, is NSNull: acted = nil
+            case let value as NSNumber where CFGetTypeID(value) == CFBooleanGetTypeID(): acted = value.boolValue
+            default: return nil
+            }
+            guard acted != true || by == .her else { return nil }
             var stance: CognitiveCare.Stance?
             if let raw = object["stance"], !(raw is NSNull) {
                 guard let fields = raw as? [String: Any], let said = text(fields["text"]),
@@ -98,7 +107,7 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
                 target = .existing(id)
             }
             out.append(CognitiveCareJudgment(target: target, moved: number.doubleValue, by: by, felt: felt, note: note,
-                                             open: open, closes: closes, stance: stance))
+                                             open: open, closes: closes, stance: stance, acted: acted))
         }
         return out
     }
@@ -554,20 +563,14 @@ extension CognitiveSubstrate {
                 && care.open != nil && judgment.open == nil
             care.record(CognitiveCare.Moment(at: provenance.at, moved: judgment.moved, by: judgment.by, who: who,
                                              felt: judgment.felt, note: birthWords ?? judgment.note, source: provenance.source,
-                                             closedGap: closesGap ? true : nil))
-            if provenance.trusted {
-                if current {
+                                             closedGap: closesGap ? true : nil, answered: judgment.acted == true ? true : nil)) { care in
+                if provenance.trusted, current {
                     if judgment.closes { care.open = nil }
-                    // A root is a value, never a question: a gap belongs to a care of its own.
                     if let open = judgment.open, care.origin != .seed { care.open = String(open.prefix(CognitiveCare.openCharacters)) }
                 }
-                if let stance = judgment.stance, stance != care.stance {
-                    if care.stance != nil {
-                        care.record(CognitiveCare.Moment(
-                            at: provenance.at, moved: 0, by: judgment.by, who: who, felt: "stance pressure",
-                            note: stance.text, source: provenance.source, stancePressure: stance))
-                    } else if current { care.stance = stance }
-                }
+            }
+            if provenance.trusted, current, let stance = judgment.stance {
+                Self.settleCareStance(stance, source: provenance.source, at: provenance.at, care: &care)
             }
             // Touching an ordinarily faded care makes it live again.
             care.fadedAt = nil
@@ -611,6 +614,13 @@ extension CognitiveSubstrate {
         let saving = await saveCares(toSave, at: now)
         await recordReceipt(kind: "cares.applied", payload: payload)
         try saving.get()
+        guard generation == caringAppraisalGeneration else { throw CognitiveWriteDiscarded() }
+        let selfChanges = toSave.filter { id in
+            cares[id]?.story.contains {
+                $0.stanceChange != nil && $0.source == provenance.source && $0.at == provenance.at
+            } == true
+        }
+        try await settleLivedSelf(selfChanges, at: now)
         return touched
     }
 

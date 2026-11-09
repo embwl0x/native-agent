@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import ToolRegistry
+import NativeAgentShared
 // Blueprint: | `MacChatStreamAccumulator.swift` | `ChatStreamAccumulator`; `TurnStreamEvent`; Coalesced deltas; joined final publication |
 
 /// Accumulate deltas off MainActor and publish changed snapshots only.

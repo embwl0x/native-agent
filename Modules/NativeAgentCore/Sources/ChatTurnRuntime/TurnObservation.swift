@@ -5,9 +5,13 @@ import ProviderRouting
 import TurnTrace
 // Blueprint: | `TurnObservation.swift` | `TurnObservation` enum; `text`, `apply`, shared trace emission in `record` |
 
-/// Recovery is input to the next round, never a replacement for the reply.
+/// What changed is input to the next round, never a replacement for the reply.
 enum TurnObservation {
     enum Kind {
+        /// A completed words-only round is followed by saved arrivals, so the turn reads them before ending.
+        case arrival
+        /// Hearing closed a generating round; its arrival may leave before the boundary reads it.
+        case cut(arrivalRead: Bool)
         case lengthLimit(chars: Int)
         case boundary(LLMToolBoundaryReason)
         case malformedCall(why: String)
@@ -20,6 +24,14 @@ enum TurnObservation {
     static func text(_ kind: Kind) -> String {
         let happened: String
         switch kind {
+        case .arrival:
+            happened = "New messages arrived while you were replying. Your completed reply is kept above; read the new messages and answer them next."
+        case .cut(let arrivalRead):
+            happened = """
+                Hearing an arriving message ended that round before it finished. Any words you had said are kept above and none of its calls ran.
+                """ + (arrivalRead
+                    ? " Read the new messages above and answer them next."
+                    : " No new message was read at the boundary; continue from the conversation you have.")
         case .lengthLimit(let chars):
             happened = """
                 Your reply reached the provider's length limit after \(chars) characters; no calls from that reply ran. Continue with a shorter reply \
@@ -53,8 +65,6 @@ enum TurnObservation {
                 happened = "Your reply invented a tool result and was cut before it. Use only returned results; call the action if evidence is still needed."
             case .postCallProse:
                 happened = "Your reply continued after a call without its result and was cut there. Read the result before continuing."
-            case .steered:
-                happened = "The person spoke while you were replying. What you had said stays; their words follow; continue from there."
             case .refusal:
                 happened = """
                     The provider's safety layer refused the reply; complete calls before it were kept and the rest discarded. Offer an allowed \
@@ -77,6 +87,7 @@ enum TurnObservation {
 
     private static func code(_ kind: Kind) -> String {
         switch kind {
+        case .arrival, .cut: "turn_arrival"
         case .lengthLimit: "reply_length_limit"
         case .boundary(let reason):
             switch reason {
@@ -87,7 +98,6 @@ enum TurnObservation {
             case .repeatedAction: "reply_repeated_action"
             case .fabricatedResult: "reply_fabricated_result"
             case .postCallProse: "reply_post_call_prose"
-            case .steered: "reply_steered"
             case .refusal: "reply_safety_refusal"
             }
         case .malformedCall: "malformed_call"

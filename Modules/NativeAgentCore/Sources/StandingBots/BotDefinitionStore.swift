@@ -45,9 +45,13 @@ public struct BotDefinitionStore: Sendable {
         try disk.locked { try listUnlocked(includeDeleted: includeDeleted) }
     }
 
+    public func definitionFiles() throws -> [URL] {
+        try disk.files(at: disk.root.appendingPathComponent("definitions"), extension: "json")
+    }
+
     /// A nonblocking glance may fail on a concurrent write; it never takes the store lock.
     public func listUnlocked(includeDeleted: Bool = false) throws -> [BotDefinition] {
-        let definitions = try disk.files(at: disk.root.appendingPathComponent("definitions"), extension: "json").map { path -> BotDefinition in
+        let definitions = try definitionFiles().map { path -> BotDefinition in
             guard let id = UUID(uuidString: path.deletingPathExtension().lastPathComponent) else {
                 throw StandingBotsError.corruptStore("invalid definition filename")
             }

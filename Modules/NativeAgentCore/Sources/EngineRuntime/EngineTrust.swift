@@ -151,23 +151,30 @@ public final class TrustFacade {
     public var memoryPermissions: TrustMemoryPolicy? { policy?.memoryPolicy }
 
     public private(set) var securityStatus: SecurityCenterStatus?
-    public private(set) var isRefreshingSecurity = false
     public private(set) var securityRefreshError: String?
-    @ObservationIgnored private var securityRefreshTask: Task<Void, Never>?
-    @ObservationIgnored private var securityRefreshRequested = false
     @ObservationIgnored private lazy var policyRead = LatestRead()
+    @ObservationIgnored private var settingsFeed: SettingsFeedProjection?
+
+    public func bindSettingsFeed(_ feed: SettingsFeedProjection) {
+        settingsFeed = feed
+        publishSettings()
+    }
+
+    private func publishSettings() { settingsFeed?.updateTrust(policy: policy, issue: policyReadError) }
 
     public func publishPolicy(_ saved: TrustPolicy?) {
         policyRead.write {
             policy = saved
             policyReadError = nil
             securityStatus = nil
+            publishSettings()
         }
         policyDidChange?()
         Task { await capabilitiesDidChange?() }
     }
 
-    private func readPolicy() async -> Result<[String: JSONValue], Error> {
+    private func readPolicy() async -> (raw: Result<[String: JSONValue], Error>, typed: Result<TrustPolicy, Error>) {
+        var changed = false
         let result = await policyRead.read({
             let checked: Result<[String: JSONValue], Error>
             do { checked = .success(try await center.loadTrustPolicyChecked()) }
@@ -178,56 +185,34 @@ public final class TrustFacade {
             } catch {
                 status = .failure(error)
             }
-            return (checked, status)
-        }, publish: { checked, status in
-            do {
-                policy = try TrustPolicy(policyObject: checked.get())
+            let typed: Result<TrustPolicy, Error> = await Task.detached(priority: .userInitiated) {
+                Result { try TrustPolicy(policyObject: checked.get()) }
+            }.value
+            return (checked, typed, status)
+        }, publish: { _, typed, status in
+            switch typed {
+            case .success(let value):
+                if policy != value { policy = value; changed = true }
+                if policyReadError != nil { changed = true }
                 policyReadError = nil
-            } catch {
+            case .failure(let error):
+                if policy != nil || policyReadError != error.localizedDescription { changed = true }
                 policy = nil
                 policyReadError = error.localizedDescription
             }
             switch status {
             case .success(let value):
-                securityStatus = value
+                if securityStatus != value { securityStatus = value; changed = true }
+                if securityRefreshError != nil { changed = true }
                 securityRefreshError = nil
             case .failure(let error):
-                securityRefreshError = UserFacingError.cause(error, action: "read security status")
+                let issue = UserFacingError.cause(error, action: "read security status")
+                if securityRefreshError != issue { securityRefreshError = issue; changed = true }
             }
+            publishSettings()
         })
-        await capabilitiesDidChange?()
-        return result.0
-    }
-
-    /// Policy, switches and Security Center share one checked generation and invalidation boundary, without view snapshots.
-    public func observeSecurity() async {
-        await EventDeadlinePhysiology.refreshOnChanges(paths:
-            ["trust/policy.json", "telegram/config.json", "paired_phones.json"]
-                .map { dataRoot.appendingPathComponent($0) }
-                + [TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)],
-            notifications: [SwiftNativeSecurityCenter.consentDidWrite]
-        ) { await self.refreshSecurity() }
-    }
-
-    public func refreshSecurity() async {
-        if let securityRefreshTask {
-            securityRefreshRequested = true
-            await securityRefreshTask.value
-            return
-        }
-        isRefreshingSecurity = true
-        let task = Task { @MainActor in
-            defer {
-                isRefreshingSecurity = false
-                securityRefreshTask = nil
-            }
-            repeat {
-                securityRefreshRequested = false
-                _ = await readPolicy()
-            } while securityRefreshRequested
-        }
-        securityRefreshTask = task
-        await task.value
+        if changed { await capabilitiesDidChange?() }
+        return (result.0, result.1)
     }
 
     public var backups: [BackupRecord] = []
@@ -397,8 +382,7 @@ public final class TrustFacade {
 
     /// Damaged policy bytes must throw, never produce a typed default.
     public func load() async throws -> TrustPolicy {
-        let checked = await readPolicy()
-        return try TrustPolicy(policyObject: checked.get())
+        try await readPolicy().typed.get()
     }
 
     public nonisolated func auditLog(limit: Int = 100) async -> MacControlAuditLogRead {
@@ -407,7 +391,7 @@ public final class TrustFacade {
 
     /// Read raw checked policy for fields outside the typed model, including inboxPolicy.
     public nonisolated func rawPolicy() async throws -> [String: JSONValue] {
-        try await readPolicy().get()
+        try await readPolicy().raw.get()
     }
 
     /// Phone fields and Trust interpretation must come from this read’s own checked generation.
@@ -459,44 +443,9 @@ extension TrustFacade {
         }
     }
 
-    public func refreshCatalogSources() async throws {
-        let result: Result<[CapabilityCatalogSource], Error> = await catalogRead.read({
-            do { return .success(try await catalogSources()) }
-            catch { return .failure(error) }
-        }, publish: { result in
-            switch result {
-            case .success(let sources):
-                capabilityCatalogSources = sources
-                catalogRefresh?.failedEndpoints.removeAll { $0 == "catalog sources" }
-            case .failure:
-                catalogRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
-                    lastSuccessAt: catalogRefresh?.lastSuccessAt, failedEndpoints: ["catalog sources"])
-            }
-        })
-        await capabilitiesDidChange?()
-        _ = try result.get()
-    }
-
     /// Missing catalog state has no saved rows; damaged bytes throw and remain unchanged.
     public nonisolated func catalogSources() async throws -> [CapabilityCatalogSource] {
         try CapabilityCatalogStoreReader.catalogSources(dataRoot: dataRoot).map { try CapabilityCatalogSource(row: .object($0)) }
-    }
-
-    /// Mutate catalog sources under their lock with a trace.
-    public func saveCatalogSource(name: String, url: String, kind: String) async throws -> CapabilityCatalogSource {
-        let saved = try CapabilityCatalogSource(row: .object(try await catalogWrites.upsertCatalogSource(
-            name: name, url: url, kind: kind)))
-        catalogRead.write {
-            if let index = capabilityCatalogSources.firstIndex(where: { $0.id == saved.id }) {
-                capabilityCatalogSources[index] = saved
-            } else { capabilityCatalogSources.append(saved) }
-        }
-        await capabilitiesDidChange?()
-        return saved
-    }
-
-    nonisolated private var catalogWrites: SwiftNativeCatalogWrites {
-        SwiftNativeCatalogWrites(dataRoot: dataRoot)
     }
 }
 

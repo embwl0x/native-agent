@@ -183,25 +183,12 @@ extension MemoryStorage {
             at: destination.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        var completed = false
-        defer {
-            if !completed {
-                for candidate in [
-                    destination,
-                    URL(fileURLWithPath: destination.path + "-wal"),
-                    URL(fileURLWithPath: destination.path + "-shm"),
-                ] {
-                    try? FileManager.default.removeItem(at: candidate)
-                }
-            }
-        }
         var destinationConfiguration = Configuration()
-        destinationConfiguration.busyMode = .timeout(5)
-        let destinationQueue = try DatabaseQueue(
-            path: destination.path,
-            configuration: destinationConfiguration
-        )
+        destinationConfiguration.busyMode = .immediateError
+        var openDestination: DatabaseQueue?
         do {
+            let destinationQueue = try DatabaseQueue(path: destination.path, configuration: destinationConfiguration)
+            openDestination = destinationQueue
             try dbPool.backup(to: destinationQueue)
             try destinationQueue.read { db in
                 let quickCheck = try String.fetchAll(db, sql: "PRAGMA quick_check")
@@ -212,19 +199,32 @@ extension MemoryStorage {
                 }
                 try Self.requireSemanticIntegrity(in: db)
             }
+            openDestination = nil
             try destinationQueue.close()
+            for suffix in ["-wal", "-shm"] {
+                try Self.removeBackupArtifact(URL(fileURLWithPath: destination.path + suffix))
+            }
         } catch {
-            try? destinationQueue.close()
+            var cleanupFailures: [String] = []
+            if let openDestination {
+                do { try openDestination.close() }
+                catch { cleanupFailures.append("close: \(error)") }
+            }
+            for candidate in [destination, URL(fileURLWithPath: destination.path + "-wal"), URL(fileURLWithPath: destination.path + "-shm")] {
+                do { try Self.removeBackupArtifact(candidate) }
+                catch { cleanupFailures.append("\(candidate.lastPathComponent): \(error)") }
+            }
+            if !cleanupFailures.isEmpty {
+                throw MemoryStorageError.databaseUnavailable(
+                    "consistent-backup failed: \(error); cleanup failed: \(cleanupFailures.joined(separator: "; "))"
+                )
+            }
             throw error
         }
-        // Close verification before removing transient WAL/SHM sidecars; the coherent backup artifact excludes them.
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = URL(fileURLWithPath: destination.path + suffix)
-            if FileManager.default.fileExists(atPath: sidecar.path) {
-                try FileManager.default.removeItem(at: sidecar)
-            }
-        }
-        completed = true
     }
 
+    private static func removeBackupArtifact(_ url: URL) throws {
+        do { try FileManager.default.removeItem(at: url) }
+        catch let error as CocoaError where error.code == .fileNoSuchFile { return }
+    }
 }

@@ -91,6 +91,8 @@ public struct ProviderInfo: Codable, Hashable, Identifiable, Sendable {
     public var default_model: String?
     /// Explains an unavailable or last-known fetched catalog.
     public var models_note: String? = nil
+    /// Hash of the configuration bytes read under their writer's lock; contains no credential bytes.
+    public var connectionRevision: String? = nil
     public init(
         provider_id: String,
         display_name: String,
@@ -99,7 +101,8 @@ public struct ProviderInfo: Codable, Hashable, Identifiable, Sendable {
         models: [ProviderModelInfo],
         auth_mode: String? = nil,
         default_model: String? = nil,
-        models_note: String? = nil
+        models_note: String? = nil,
+        connectionRevision: String? = nil
     ) {
         self.provider_id = provider_id
         self.display_name = display_name
@@ -109,12 +112,15 @@ public struct ProviderInfo: Codable, Hashable, Identifiable, Sendable {
         self.auth_mode = auth_mode
         self.default_model = default_model
         self.models_note = models_note
+        self.connectionRevision = connectionRevision
     }
 
 }
 
 extension ProviderInfo {
-    private enum CodingKeys: String, CodingKey { case provider_id, display_name, auth_modes, auth_status, models, auth_mode, default_model, models_note }
+    private enum CodingKeys: String, CodingKey {
+        case provider_id, display_name, auth_modes, auth_status, models, auth_mode, default_model, models_note, connectionRevision
+    }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         provider_id = try c.decode(String.self, forKey: .provider_id)
@@ -125,6 +131,7 @@ extension ProviderInfo {
         auth_mode = try c.decodeIfPresent(String.self, forKey: .auth_mode)
         default_model = try c.decodeIfPresent(String.self, forKey: .default_model)
         models_note = try c.decodeIfPresent(String.self, forKey: .models_note)
+        connectionRevision = try c.decodeIfPresent(String.self, forKey: .connectionRevision)
     }
 }
 

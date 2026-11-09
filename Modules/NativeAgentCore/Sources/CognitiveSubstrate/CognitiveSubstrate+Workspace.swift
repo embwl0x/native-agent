@@ -202,7 +202,7 @@ extension CognitiveSubstrate {
         switch node.kind {
         case .conversationFocus, .correction:
             return !isCapsuleMetaOrOperationalTrace(node)
-        case .toolObservation, .providerHealth, .appLifecycle, .feltResolution:
+        case .toolObservation, .providerHealth, .appLifecycle, .feltResolution, .care, .happening:
             return false
         }
     }
@@ -274,7 +274,7 @@ extension CognitiveSubstrate {
         case .correction: kindBoost = 0.15
         case .providerHealth, .toolObservation: kindBoost = 0.08
         case .conversationFocus: kindBoost = 0.05
-        case .appLifecycle: kindBoost = 0
+        case .appLifecycle, .care, .happening: kindBoost = 0
         case .feltResolution: kindBoost = 0.06
         }
         let affectBoost = configuration.enabled

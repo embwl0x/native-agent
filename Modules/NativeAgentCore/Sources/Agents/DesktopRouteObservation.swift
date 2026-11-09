@@ -1,122 +1,88 @@
 import AppKit
-import os
 import ApplicationServices
 import AgentConversations
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-import Senses
-// Blueprint: | `DesktopRouteObservation.swift` | Event wakes retain bounded deadlines. |
-/// Register before the first predicate read; events wake bounded waits and one-shot timers settle quiet intervals. Without AX notifications, sample only inside
-/// the caller’s deadline at 250 ms. Read the condition before surfacing observation failure; every caller must stop its observer.
-@MainActor final class DesktopRouteObservation {
+import Synchronization
+// Blueprint: | `DesktopRouteObservation.swift` | Sendable observation owns locked wake state; AX and workspace events wake cancellable desktop waits. |
+/// Register before the first predicate read. An unavailable source reports its cause; every caller stops its observer.
+final class DesktopRouteObservation: Sendable {
     enum Wake: String, Sendable {
         case initialRead = "initial_read"
         // The AX stream includes its registration-race signal. A wake does not claim that a change notification or content change occurred.
         case accessibility = "accessibility_subscription"
-        case workspace, keyboard
-        case boundary = "time_boundary"
-        case interval = "external_protocol_poll"
+        case workspace
         case unavailable = "observation_unavailable"
     }
     private let stream: AsyncThrowingStream<Wake, Error>
     private let signal: AsyncThrowingStream<Wake, Error>.Continuation
     private let source: MacAppSourceEvents?
-    private var sourceFailure: Error?
-    private let timer: DispatchSourceTimer
-    private(set) var pollingReason: String?
-    private var lastWake: Wake = .initialRead
-    private var stopped = false
-    private var reader: Task<Void, Never>?
-    private var workspace: [NSObjectProtocol] = []
-    private var input: [Any] = []
+    private struct State: Sendable {
+        var sourceFailure: Error?
+        var lastWake: Wake = .initialRead
+        var stopped = false
+        var reader: Task<Void, Never>?
+    }
+    private let state: Mutex<State>
+    private let workspace: Mutex<[NSObjectProtocol]>
 
-    init(bundleID: String, context: MacOperationContext, accessibility: Bool = true, keyboard: Bool = false) throws {
+    init(bundleID: String, context: MacOperationContext, accessibility: Bool = true) async throws {
         try Task.checkCancellation()
-        do { source = accessibility ? try MacAppSourceEvents(bundleID: bundleID, context: context) : nil }
+        var initialFailure: Error?
+        do { source = accessibility ? try await MacAppSourceEvents.open(bundleID: bundleID, context: context) : nil }
         catch is CancellationError { throw CancellationError() }
         catch {
             source = nil
-            pollingReason = Self.unsupportedReason(error)
-            if pollingReason == nil {
-                sourceFailure = GrokRoutineAccessibility.observationFailure(error, operation: "for \(bundleID) could not start")
-            }
+            initialFailure = GrokRoutineAccessibility.observationFailure(error, operation: "for \(bundleID) could not start")
         }
         let pair = AsyncThrowingStream<Wake, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
         stream = pair.stream; signal = pair.continuation
-        timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.resume()
-        workspace = [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didActivateApplicationNotification,
+        workspace = Mutex([NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didActivateApplicationNotification,
                      NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didUnhideApplicationNotification].map { name in
             NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: nil) { _ in
                 pair.continuation.yield(.workspace)
             }
-        }
-        if keyboard {
-            if let monitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { _ in pair.continuation.yield(.keyboard) }) {
-                input.append(monitor)
-            }
-            if let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { event in
-                pair.continuation.yield(.keyboard); return event
-            }) { input.append(monitor) }
-        }
+        })
+        state = Mutex(State(sourceFailure: initialFailure))
         if let source {
-            reader = Task { [weak self] in
+            let reader = Task { [weak self] in
                 do {
                     for try await _ in source.stream {
                         guard !Task.isCancelled else { return }
                         pair.continuation.yield(.accessibility)
                     }
                     guard !Task.isCancelled else { return }
-                    self?.sourceFailure = GrokRoutineAccessibility.Failure(detail: """
-                        Accessibility observation ended before the condition was confirmed. Bring the app forward with its Accessibility tree \
-                        available, then continue.
-                        """)
+                    self?.state.withLock { $0.sourceFailure = GrokRoutineAccessibility.Failure(detail: """
+                            Accessibility observation ended before the condition was confirmed. Bring the app forward with its Accessibility tree \
+                            available, then continue.
+                            """) }
                 } catch {
                     guard !Task.isCancelled else { return }
-                    if let reason = Self.unsupportedReason(error) { self?.pollingReason = reason }
-                    else { self?.sourceFailure = GrokRoutineAccessibility.observationFailure(error, operation: "stopped") }
+                    self?.state.withLock { $0.sourceFailure = GrokRoutineAccessibility.observationFailure(error, operation: "stopped") }
                 }
                 // Let the caller read once before surfacing the lost wake.
                 pair.continuation.yield(.unavailable)
             }
+            state.withLock { $0.reader = reader }
         }
     }
-    private static func unsupportedReason(_ error: Error) -> String? {
-        guard let failure = error as? SenseFailure, failure.code == "source_unsupported" else { return nil }
-        return failure.message
-    }
-    func receipt(readBy: String) -> JSONValue {
+    func receipt(readBy: String, replyComplete: Bool = false) async -> JSONValue {
+        let (sourceFailure, lastWake) = state.withLock { ($0.sourceFailure, $0.lastWake) }
         var fields: [String: JSONValue] = ["read_by": .string(readBy), "wake": .string(lastWake.rawValue),
-            "mode": .string(pollingReason != nil ? "external_protocol_poll" : sourceFailure != nil ? "unavailable" : "source_events")]
-        if let pollingReason { fields["reason"] = .string(pollingReason) }
+            "mode": .string(sourceFailure != nil ? "unavailable" : "source_events")]
         if let sourceFailure { fields["reason"] = .string(sourceFailure.localizedDescription) }
-        if let source { fields["ax_watch_coverage"] = source.coverage }
+        if let source { fields["ax_watch_coverage"] = await source.readCoverage() }
+        if replyComplete { fields["completion_signal"] = .string("correlated_reply_idle") }
         return .object(fields)
     }
-    func next(until deadline: Date? = nil) async throws {
+    func next() async throws {
         try Task.checkCancellation()
-        if let sourceFailure { throw sourceFailure }
-        defer { timer.schedule(deadline: .distantFuture) }
-        if let deadline {
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0 else { lastWake = .boundary; return }
-            let interval = pollingReason != nil && remaining > 0.25
-            let wake: Wake = interval ? .interval : .boundary
-            let signal = self.signal
-            timer.setEventHandler { signal.yield(wake) }
-            timer.schedule(deadline: .now() + (interval ? 0.25 : remaining))
-        } else {
-            timer.schedule(deadline: .distantFuture)
-            guard pollingReason == nil else {
-                throw GrokRoutineAccessibility.Failure(
-                    detail: "Desktop interval observation requires the step's own deadline; no unbounded interval reader was started.")
-            }
-        }
+        if let sourceFailure = state.withLock({ $0.sourceFailure }) { throw sourceFailure }
         var iterator = stream.makeAsyncIterator()
         do {
             guard let wake = try await iterator.next() else { throw CancellationError() }
-            lastWake = wake
+            state.withLock { $0.lastWake = wake }
         } catch is CancellationError { throw CancellationError() }
         catch {
             throw GrokRoutineAccessibility.observationFailure(error, operation: "stopped")
@@ -124,13 +90,20 @@ import Senses
         try Task.checkCancellation()
     }
     func stop() {
-        guard !stopped else { return }
-        stopped = true
-        reader?.cancel(); reader = nil
+        let retirement = state.withLock { state -> (stop: Bool, reader: Task<Void, Never>?) in
+            guard !state.stopped else { return (false, nil) }
+            state.stopped = true
+            let reader = state.reader
+            state.reader = nil
+            return (true, reader)
+        }
+        guard retirement.stop else { return }
+        retirement.reader?.cancel()
         source?.cancel()
-        timer.cancel()
         signal.finish()
-        workspace.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }; workspace.removeAll()
-        input.forEach { NSEvent.removeMonitor($0) }; input.removeAll()
+        workspace.withLock {
+            $0.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+            $0.removeAll()
+        }
     }
 }

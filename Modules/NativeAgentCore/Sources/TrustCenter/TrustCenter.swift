@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -71,6 +72,7 @@ public actor SwiftNativeTrustCenter {
             }
             let merged = Self.deepMerge(current, patch)
             try Self.validateKnownAuthorityPolicyTypes(merged, against: defaults)
+            if merged == current { return current }
             try await SwiftNativePersistenceCore.writeJSON(.object(merged), to: path)
             return merged
         }

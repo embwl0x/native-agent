@@ -3,7 +3,7 @@ import Foundation
 
 public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
     /// Consent is distinct from execution; unreadable decisions never offer consent.
-    public enum Outcome: Sendable, Equatable {
+    public enum Outcome: Sendable, Equatable, Codable {
         case pending, approved, denied, expired, unresolved
 
         public init(status: String, decision: String?) {

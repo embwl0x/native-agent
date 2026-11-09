@@ -15,6 +15,8 @@ public protocol CognitiveRuntimeProviding: Sendable {
         request: CognitiveCapsuleRequest,
         turn: Turn
     ) async
+    /// Publish the feeling reference only from completed-reply settlement.
+    func commitReplyFeeling(_ projection: CognitionAtTurn, request: CognitiveCapsuleRequest) async
     /// A bounded, pure attention read for context selection; nil leaves turn preparation unchanged.
     func attentionSignals(at date: Date) async -> CognitiveAttentionSignals?
 }
@@ -116,6 +118,29 @@ public struct CognitiveWorkspaceSnapshot: Sendable, Equatable {
         self.inhibitedNodeIds = inhibitedNodeIds
     }
 }
+/// Attention's recorded admission and the saved dream owner's completion within it.
+public struct CognitiveSleepDreamReading: Sendable, Equatable {
+    public struct Completion: Sendable, Equatable {
+        public let id: UUID
+        public let occurredAt: Date
+
+        public init(id: UUID, occurredAt: Date) {
+            self.id = id
+            self.occurredAt = occurredAt
+        }
+    }
+
+    public let beganAt: Date?
+    public let completion: Completion?
+    public let failure: String?
+
+    public init(beganAt: Date?, completion: Completion? = nil, failure: String? = nil) {
+        self.beganAt = beganAt
+        self.completion = completion
+        self.failure = failure
+    }
+}
+
 public struct CognitiveCapsuleRequest: Sendable, Equatable {
     public var surface: String
     public var userMessage: String
@@ -136,6 +161,7 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
     public var previousUserTurnAt: Date?
     /// Care speaker identity limits privacy; nil wakes or unidentified senders may press only self-held cares.
     public var speaker: String?
+    public var sleepDream: CognitiveSleepDreamReading?
 
     public var resolvedTurnKind: CognitiveTurnKind {
         turnKind ?? .debug
@@ -152,7 +178,8 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
         turnKind: CognitiveTurnKind? = nil,
         fromUser: Bool = false,
         previousUserTurnAt: Date? = nil,
-        speaker: String? = nil
+        speaker: String? = nil,
+        sleepDream: CognitiveSleepDreamReading? = nil
     ) {
         self.surface = surface
         self.userMessage = userMessage
@@ -167,8 +194,23 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
         self.fromUser = fromUser
         self.previousUserTurnAt = previousUserTurnAt
         self.speaker = speaker
+        self.sleepDream = sleepDream
     }
 }
+/// The full feeling paragraph and the described words that supplied it; subjects and dream prose are not vocabulary.
+public struct CognitiveFeelingFrame: Sendable, Equatable {
+    public static let header = "How you feel:"
+    public let paragraph: String
+    public let words: [String]
+
+    public var promptText: String { Self.header + "\n" + paragraph }
+
+    public init(paragraph: String, words: [String]) {
+        self.paragraph = paragraph
+        self.words = words
+    }
+}
+
 public struct CognitiveCapsule: Sendable, Equatable {
     public var generatedAt: Date
     public var mode: CognitiveCapsuleMode
@@ -177,6 +219,8 @@ public struct CognitiveCapsule: Sendable, Equatable {
     public var provenanceNodeIds: [UUID]
     public var sourcePeerIds: [String]?
     public var truncated: Bool
+    /// Present only when the whole paragraph fits the delivered capsule.
+    public var feelingFrame: CognitiveFeelingFrame?
 
     public var combined: String {
         [stableKernel, dynamicContext]
@@ -191,7 +235,8 @@ public struct CognitiveCapsule: Sendable, Equatable {
         dynamicContext: String,
         provenanceNodeIds: [UUID],
         truncated: Bool,
-        sourcePeerIds: [String]? = nil
+        sourcePeerIds: [String]? = nil,
+        feelingFrame: CognitiveFeelingFrame? = nil
     ) {
         self.generatedAt = generatedAt
         self.mode = mode
@@ -200,26 +245,29 @@ public struct CognitiveCapsule: Sendable, Equatable {
         self.provenanceNodeIds = provenanceNodeIds
         self.sourcePeerIds = sourcePeerIds
         self.truncated = truncated
+        self.feelingFrame = feelingFrame
     }
 }
-/// Pure result of rendering one live injection against a frozen presentation state. The substrate applies it only after the provider accepts that exact turn;
-/// previews, reflections, failures, and retries merely discard it.
+/// Cue presentation commits on context acceptance; the whole feeling frame becomes a reference only at completed-reply settlement.
 public struct CognitiveCapsulePresentationCommit: Sendable, Equatable {
     public let mindEpoch: UInt64
     public let fixedAt: Date
     public let expected: CognitiveCapsulePresentationState
     public let next: CognitiveCapsulePresentationState
+    public let feelingFrameShown: Bool
 
     public init(
         mindEpoch: UInt64,
         fixedAt: Date,
         expected: CognitiveCapsulePresentationState,
-        next: CognitiveCapsulePresentationState
+        next: CognitiveCapsulePresentationState,
+        feelingFrameShown: Bool
     ) {
         self.mindEpoch = mindEpoch
         self.fixedAt = fixedAt
         self.expected = expected
         self.next = next
+        self.feelingFrameShown = feelingFrameShown
     }
 }
 public struct CognitivePreparedCapsule: Sendable, Equatable {
@@ -237,7 +285,7 @@ public struct CognitivePreparedCapsule: Sendable, Equatable {
         self.presentationCommit = presentationCommit
         self.why = why
     }
-    /// The capsule to inject, or nil when this turn's felt answer was "none".
+    /// The capsule to inject; an off or zero-budget projection carries no frame.
     public var nonEmptyCapsule: CognitiveCapsule? {
         capsule.dynamicContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : capsule
     }
@@ -275,6 +323,7 @@ public struct CognitiveAffectState: Codable, Sendable, Equatable {
     public var updatedAt: Date
     /// Save the lived fold seq with affect axes and anchors so every writer retains the mutation's proof; zero carries no watermark.
     public var lived: UInt64
+    public var chosenRegister: CognitiveChosenRegister?
 
     public init(
         arousal: Double = 0,
@@ -282,7 +331,8 @@ public struct CognitiveAffectState: Codable, Sendable, Equatable {
         taskPressure: Double = 0,
         socialWarmth: Double = 0,
         updatedAt: Date = Date(timeIntervalSince1970: 0),
-        lived: UInt64 = 0
+        lived: UInt64 = 0,
+        chosenRegister: CognitiveChosenRegister? = nil
     ) {
         self.arousal = (arousal).clamped01()
         self.uncertainty = (uncertainty).clamped01()
@@ -290,5 +340,6 @@ public struct CognitiveAffectState: Codable, Sendable, Equatable {
         self.socialWarmth = (socialWarmth).clamped01()
         self.updatedAt = updatedAt
         self.lived = lived
+        self.chosenRegister = chosenRegister
     }
 }

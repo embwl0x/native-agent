@@ -1,377 +1,185 @@
 import SwiftUI
+import Foundation
 import NativeAgentShared
-import Combine
-// Blueprint: | `MacToolsView.swift` | Mac controls use PhoneMacControlAction and the shared Trust snapshot; receipts live in MacActionReceipts |
-
-// MARK: - MacToolsView
+// Blueprint: | `MacToolsView.swift` | Shared forms and receipt rows over policy-gated signed Mac controls |
 
 struct MacToolsView: View {
     @EnvironmentObject private var pairingStore: PairingStore
-    private let sync = iCloudSyncEngine.shared
-    private var macPolicy: MacControlPolicyWireSnapshot? { sync.trustPolicy?.macControlPolicy }
+    @StateObject private var ledger = RemoteActionLedger.shared
     @State private var hasLoadedPolicy = false
-    @State private var notifTitle = ""
-    @State private var notifMessage = ""
-    @State private var isSendingNotif = false
-    @State private var notifResult: MacNotificationSendPresentation.Feedback?
-    @State private var volume: Double = MacVolumeControlPresentation.defaultTargetFraction
-    /// Do not show a volume target before selection or imply it is a live gauge.
-    @State private var volumePicked = false
-    @State private var isSettingVolume = false
-    @State private var spotlightQuery = ""
-    @State private var spotlightOutcome: MacToolsSpotlightPresentation.Outcome?
-    @State private var showsAllSpotlightResults = false
-    @State private var isSearching = false
-    @State private var actionStatus: String?
-    @StateObject private var remoteActionLedger = RemoteActionLedger.shared
-
-    private var remoteActions: [RemoteActionCard] {
-        remoteActionLedger.actions
-    }
-
-    private var iosOk: Bool {
-        MacToolsPolicyGatePresentation.state(for: macPolicy) == .enabled
-    }
-
-    private var volumeTargetPercent: Int {
-        MacVolumeControlPresentation.targetPercent(for: volume)
-    }
-
-    private var paired: Bool { pairingStore.isPaired }
-
-    private func allowed(_ privilege: PhoneMacControlAction) -> Bool {
-        paired && MacToolsPrivilegePresentation.isAllowed(privilege, policy: macPolicy)
-    }
-
-    /// Unpaired pages already explain unavailability; avoid per-card Trust hints.
-    private func footer(_ privilege: PhoneMacControlAction, _ text: String?) -> String? {
-        !paired ? nil : allowed(privilege) ? text : lockedText(privilege)
-    }
+    private let sync = iCloudSyncEngine.shared
+    private var session: FacePageSession { sync.pageSessions.page("phone-mac-tools") }
+    private var policy: MacControlPolicyWireSnapshot? { sync.trustPolicy?.macControlPolicy }
 
     var body: some View {
         AlivePage(title: "Mac Tools", line: "Things I can do on your Mac from here.") {
-            if !paired {
-                AliveUnpairedReason()
-                enabledContent
-            } else if !hasLoadedPolicy {
-                ProgressView("Checking Mac Control…")
-                    .foregroundStyle(AlivePalette.secondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 40)
-            } else if !iosOk {
-                disabledEmptyState
-            } else {
-                enabledContent
-            }
+            if !pairingStore.isPaired { AliveUnpairedReason() }
+            if !hasLoadedPolicy && pairingStore.isPaired { ProgressView("Checking Mac Control…") }
+            FaceView(face: face, door: door, session: session)
         }
         .task { await refresh() }
-        .macSyncErrorBanner()
         .refreshable { await refresh() }
+        .macSyncErrorBanner()
     }
 
-    // MARK: - Disabled empty state
-
-    private var disabledEmptyState: some View {
-        AliveCalmState(
-            title: "Mac Tools are off",
-            line: MacToolsPolicyGatePresentation.disabledDescription(for: macPolicy),
-            actionTitle: "Check again",
-            action: { Task { await refresh() } }
-        )
+    private func restriction(_ privilege: PhoneMacControlAction) -> String? {
+        guard pairingStore.isPaired else { return "Pair with your Mac before using Mac Tools." }
+        guard hasLoadedPolicy else { return "Waiting on the Mac's control policy." }
+        guard MacToolsPolicyGatePresentation.state(for: policy) == .enabled else {
+            return MacToolsPolicyGatePresentation.disabledDescription(for: policy)
+        }
+        guard MacToolsPrivilegePresentation.isAllowed(privilege, policy: policy) else {
+            return MacToolsPrivilegePresentation.disabledDescription(for: privilege) + " Enable in the Mac app's Trust tab."
+        }
+        return nil
     }
 
-    // MARK: - Enabled content
+    private func form(_ privilege: PhoneMacControlAction, title: String, fields: [PartFace.FormField], label: String,
+                      footer: String? = nil) -> PartFace.Section {
+        .init(id: privilege.rawValue, title: title, footer: footer, rows: [], block: .init(kind: "form", key: privilege.rawValue,
+            fields: fields, submit: [.init(id: "run", label: label, call: .init(privilege.rawValue), unavailable: restriction(privilege))]))
+    }
 
-    @ViewBuilder
-    private var enabledContent: some View {
-        if let status = actionStatus {
-            AliveFootnote(status, systemImage: "arrow.turn.down.right")
-        }
-
-        AliveSection(
-            "Send a notification",
-            footer: footer(.notification, notifResult?.text)
-        ) {
-            field("Title", text: $notifTitle).aliveRow()
-                .aliveUnavailable(!allowed(.notification))
-            AliveDivider()
-            HStack(spacing: 12) {
-                field("Message", text: $notifMessage)
-                Button {
-                    Task { await sendNotification() }
-                } label: {
-                    if isSendingNotif { ProgressView().controlSize(.small) } else { Text("Send") }
+    private var face: PartFace {
+        var sections = [
+            form(.notification, title: "Send a notification", fields: [
+                .init(id: "title", label: "Title", value: .string(""), placeholder: sync.agentDisplayName),
+                .init(id: "message", label: "Message", kind: "lines", value: .string(""), required: true)
+            ], label: "Send"),
+            form(.volume, title: "The Mac", fields: [
+                .init(id: "percent", label: "Volume target (%)", kind: "number", required: true, min: 0, max: 100, step: 5)
+            ], label: "Set", footer: MacVolumeControlPresentation.currentVolumeDisclosure),
+            form(.spotlight, title: "Search the Mac", fields: [
+                .init(id: "query", label: "Spotlight", value: .string(""), required: true)
+            ], label: "Search")
+        ]
+        if !ledger.actions.isEmpty {
+            sections.append(.init(id: "receipts", title: "Recent on the Mac", footer: "Kept while this app stays open.", rows: ledger.actions.map { card in
+                var actions: [PartFace.Action] = []
+                if card.state == .failed {
+                    actions.append(.init(id: "retry", label: "Retry", call: .init(card.kind.privilege.rawValue,
+                        ["receipt": .string(card.id.uuidString)]), unavailable: restriction(card.kind.privilege)))
                 }
-                .aliveSecondaryButton()
-                .disabled(notifMessage.isEmpty || isSendingNotif || !allowed(.notification))
-                .accessibilityLabel(notifResult.map { "Send. Notification status: \($0.text)" } ?? "Send")
-            }
-            .aliveRow()
-            .aliveUnavailable(!allowed(.notification))
-        }
-
-        AliveSection(
-            "The Mac",
-            footer: footer(.volume, MacVolumeControlPresentation.currentVolumeDisclosure)
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Text("Volume").font(.body).foregroundStyle(AlivePalette.text)
-                    Spacer()
-                    Text(volumePicked ? "\(volumeTargetPercent)%" : "\u{2014}")
-                        .font(.body.monospacedDigit())
-                        .foregroundStyle(AlivePalette.secondary)
-                        .accessibilityLabel(volumePicked ? "Target \(volumeTargetPercent)%" : "No level picked")
+                if card.state == .waitingApproval {
+                    actions.append(.init(id: "approval", label: "Review Approval", call: .init("phone.reviewApproval")))
                 }
-                HStack(spacing: 12) {
-                    Slider(value: $volume, in: 0...1, step: 0.05)
-                        .onChange(of: volume) { volumePicked = true }
-                        .hazeTinted()
-                        .accessibilityLabel("Volume target")
-                    Button {
-                        Task { await setVolume() }
-                    } label: {
-                        if isSettingVolume { ProgressView().controlSize(.small) } else { Text("Set") }
-                    }
-                    .aliveSecondaryButton()
-                    .disabled(!volumePicked)
-                    .accessibilityLabel("Set target \(volumeTargetPercent)%")
-                }
-            }
-            .aliveRow()
-            .disabled(isSettingVolume)
-            .aliveUnavailable(!allowed(.volume))
-        }
-
-        AliveSection("Search the Mac", footer: footer(.spotlight, nil)) {
-            HStack(spacing: 12) {
-                field("Spotlight", text: $spotlightQuery)
-                    .submitLabel(.search)
-                    .onSubmit { Task { await runSpotlight() } }
-                Button {
-                    Task { await runSpotlight() }
-                } label: {
-                    if isSearching { ProgressView().controlSize(.small) } else { Image(systemName: "magnifyingglass") }
-                }
-                .aliveSecondaryButton()
-                .disabled(spotlightQuery.isEmpty || isSearching)
-                .accessibilityLabel("Search")
-            }
-            .aliveRow()
-            .aliveUnavailable(!allowed(.spotlight))
-            if let spotlightOutcome {
-                AliveDivider()
-                spotlightResultPresentation(spotlightOutcome)
-                    .aliveRow()
+                return .init(id: card.id.uuidString, title: card.title,
+                    value: card.subtitle + " · " + card.state.rawValue, at: card.updatedAt.ISO8601Format(), actions: actions)
+            }))
+            sections += ledger.actions.map { card in
+                .init(id: "receipt-body-" + card.id.uuidString, title: card.title, rows: [], block: .init(kind: "document",
+                    key: "receipt-body-" + card.id.uuidString, text: card.detail, format: "plain", copy: true))
             }
         }
+        return PartFace(sections: sections)
+    }
 
-        if !remoteActions.isEmpty {
-            AliveSection("Recent on the Mac", footer: "Kept while this app stays open.") {
-                ForEach(Array(remoteActions.enumerated()), id: \.element.id) { index, action in
-                    if index > 0 { AliveDivider() }
-                    RemoteActionCardView(action: action) {
-                        Task { await retry(action) }
-                    }
-                }
+    private var door: ClosureFaceDoor {
+        ClosureFaceDoor(open: { _ in }, cancellationLabel: "Cancel waiting", waitingOn: "your Mac", perform: perform)
+    }
+
+    private func perform(_ submission: FaceActSubmission) async -> FaceActOutcome {
+        if submission.checking {
+            return await ledger.read(operation: submission.id)
+        }
+        if submission.expectedCall.action == "phone.reviewApproval" {
+            NativeAgentNotificationLaunchIntent.stage(screen: "approvals")
+            NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil, userInfo: ["screen": "approvals"])
+            return .init(effects: .none, accepted: true)
+        }
+        guard let privilege = PhoneMacControlAction(rawValue: submission.expectedCall.action) else {
+            return refused("This Mac control is unavailable.")
+        }
+        if let why = restriction(privilege) { return refused(why) }
+        guard !session.operations.values.contains(where: {
+            $0.submission.id != submission.id && $0.submission.expectedCall.action == privilege.rawValue
+                && ($0.outcome == nil || $0.outcome?.unresolved == true)
+        }) else { return refused("Already waiting on your Mac for this control. Check its outcome before submitting again.") }
+        let kind: RemoteActionKind
+        let cardID: UUID
+        if let receipt = submission.expectedCall.args["receipt"]?.stringValue {
+            guard let card = ledger.actions.first(where: { $0.id.uuidString == receipt }), card.state == .failed else {
+                return refused("Read the receipt again before retrying its original request.")
             }
-        }
-    }
-
-    private func field(_ prompt: String, text: Binding<String>) -> some View {
-        TextField(prompt, text: text, prompt: Text(prompt).foregroundStyle(AlivePalette.secondary))
-            .font(.body)
-            .foregroundStyle(AlivePalette.text)
-            .autocorrectionDisabled()
-            .frame(minHeight: 36)
-    }
-
-    @ViewBuilder
-    private func spotlightResultPresentation(_ outcome: MacToolsSpotlightPresentation.Outcome) -> some View {
-        switch outcome {
-        case .emptyResponse, .invalidResponse, .noResults:
-            Text(outcome.statusText)
-                .font(.subheadline)
-                .foregroundStyle(AlivePalette.secondary)
-        case .results:
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(outcome.visibleRows(showingAll: showsAllSpotlightResults), id: \.self) { result in
-                    Text(result)
-                        .font(.subheadline)
-                        .foregroundStyle(AlivePalette.text)
-                        .lineLimit(showsAllSpotlightResults ? nil : 1)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
+            kind = card.kind; cardID = card.id
+            ledger.bind(cardID, to: submission.id)
+        } else {
+            let values = submission.values ?? [:]
+            switch privilege {
+            case .notification:
+                guard let message = values["message"]?.stringValue, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let title = values["title"]?.stringValue else { return refused("The notification needs its title and message fields.") }
+                kind = .notify(title: title.isEmpty ? sync.agentDisplayName : title, message: message)
+            case .volume:
+                let percent: Double?
+                switch values["percent"] {
+                case .int(let value): percent = Double(value)
+                case .double(let value): percent = value
+                default: percent = nil
                 }
-                if let truncationText = outcome.truncationText(showingAll: showsAllSpotlightResults) {
-                    Text(truncationText)
-                        .font(.footnote)
-                        .foregroundStyle(AlivePalette.secondary)
-                    Button(showsAllSpotlightResults ? "Show fewer Spotlight results" : "Show all Spotlight results") {
-                        showsAllSpotlightResults.toggle()
-                    }
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(AlivePalette.text)
+                guard let percent, percent.isFinite, (0...100).contains(percent), percent.rounded() == percent else {
+                    return refused("Choose a whole volume target between 0% and 100%.")
                 }
+                kind = .volume(Int(percent))
+            case .spotlight:
+                guard let query = values["query"]?.stringValue, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return refused("Enter a Spotlight query.")
+                }
+                kind = .spotlight(query)
+            default: return refused("This page does not offer that Mac control.")
             }
+            let title: String
+            let subtitle: String
+            switch kind {
+            case .notify(let name, _): title = "Send notification"; subtitle = name
+            case .volume(let percent): title = "Set volume"; subtitle = "\(percent)%"
+            case .spotlight(let query): title = "Spotlight search"; subtitle = query
+            }
+            cardID = ledger.start(kind, title: title, subtitle: subtitle, operation: submission.id)
+        }
+        ledger.update(cardID, state: .running, detail: RemoteActionRetryPresentation.dispatchDetail(for: kind,
+            isRetry: submission.expectedCall.args["receipt"] != nil))
+        do {
+            let words: String
+            var committed: [FaceCommittedField] = []
+            switch kind {
+            case .notify(let title, let message):
+                words = try await sync.macNotify(title: title, message: message)
+                committed = [.init(id: "title", value: .string("")), .init(id: "message", value: .string(""))]
+            case .volume(let percent):
+                _ = try await sync.macSetVolume(percent: percent)
+                words = MacVolumeControlPresentation.acknowledgement(percent: percent)
+                committed = [.init(id: "percent", value: .int(Int64(percent)))]
+            case .spotlight(let query):
+                let raw = try await sync.macSpotlight(query: query)
+                let result = try await MacToolsSpotlightPresentation.outcome(from: raw)
+                words = ([result.statusText] + result.rows).joined(separator: "\n")
+                committed = [.init(id: "query", value: .string(query))]
+            }
+            ledger.update(cardID, state: .ranOnMac, detail: words)
+            return .init(words: words, effects: .known, accepted: true, committed: committed)
+        } catch {
+            let cause: any Error = error is CancellationError
+                ? SyncError.responseUnconfirmed("Stopped waiting. Check the action's Mac outcome before submitting new work.") : error
+            let outcome: FaceActOutcome
+            if privilege == .spotlight, cause is DecodingError || cause is PartCallError {
+                outcome = .init(failure: .init(code: "spotlight_response_unreadable", message: cause.localizedDescription,
+                    cause: nil, effects: .none), effects: .none)
+            } else { outcome = .phoneFailure(cause) }
+            let state: RemoteActionState
+            if case SyncError.approvalRequired = cause { state = .waitingApproval }
+            else { state = outcome.effects == .unknown ? .unconfirmed : .failed }
+            ledger.update(cardID, state: state, detail: cause.localizedDescription, approvalID: (cause as? SyncError)?.approvalID)
+            return outcome
         }
     }
 
-    // Include the Trust remedy with each policy refusal so a dimmed control explains why and where to enable it.
-    private func lockedText(_ privilege: PhoneMacControlAction) -> String {
-        "\(MacToolsPrivilegePresentation.disabledDescription(for: privilege)) Enable in the Mac app's Trust tab."
+    private func refused(_ words: String) -> FaceActOutcome {
+        .init(failure: .init(code: "mac_control_unavailable", message: words, cause: nil, effects: .none), effects: .none)
     }
-
-    @discardableResult
-    private func startRemoteAction(_ kind: RemoteActionKind, title: String, subtitle: String) -> UUID {
-        withAnimation(AppMotion.snappy) {
-            remoteActionLedger.start(kind, title: title, subtitle: subtitle)
-        }
-    }
-
-    private func updateRemoteAction(_ id: UUID, state: RemoteActionState, detail: String, approvalID: String? = nil) {
-        withAnimation(AppMotion.snappy) {
-            remoteActionLedger.update(id, state: state, detail: detail, approvalID: approvalID)
-        }
-    }
-
-    private func retry(_ action: RemoteActionCard) async {
-        switch action.kind {
-        case .notify(let title, let message):
-            await sendNotification(titleOverride: title, messageOverride: message, retrying: action.id)
-        case .volume(let percent):
-            await setVolume(percentOverride: percent, retrying: action.id)
-        case .spotlight(let query):
-            await runSpotlight(queryOverride: query, retrying: action.id)
-        }
-    }
-
-    // MARK: - Logic
 
     private func refresh() async {
-        await loadPolicy()
-    }
-
-
-    private func loadPolicy() async {
-        #if DEBUG
-        if MobileDesignSamples.screen != nil {
-            loadDesignSample()
-            return
-        }
-        #endif
         _ = await sync.refreshTrustSnapshot()
         hasLoadedPolicy = true
-    }
-
-    #if DEBUG
-    /// Design fixtures expose policy and receipts without sending anything.
-    private func loadDesignSample() {
-        sync.trustPolicy = TrustPolicy(macControlPolicy: MacControlPolicyWireSnapshot(enabled: true, systemControlAllowed: true, approvalRequiredFor: [],
-            remoteFromIosAllowed: true))
-        hasLoadedPolicy = true
-        guard remoteActionLedger.actions.isEmpty else { return }
-        let volume = remoteActionLedger.start(.volume(40), title: "Set volume", subtitle: "40%")
-        remoteActionLedger.update(volume, state: .failed, detail: "The Mac didn’t answer in time.")
-        let search = remoteActionLedger.start(.spotlight("Meeting notes"), title: "Spotlight search", subtitle: "Meeting notes")
-        remoteActionLedger.update(search, state: .ranOnMac, detail: "2 result(s)")
-    }
-    #endif
-
-    private func sendNotification(titleOverride: String? = nil, messageOverride: String? = nil, retrying cardID: UUID? = nil) async {
-        isSendingNotif = true
-        notifResult = nil
-        let submittedTitle = notifTitle
-        let submittedMessage = notifMessage
-        let title = titleOverride ?? (notifTitle.isEmpty ? iCloudSyncEngine.shared.agentDisplayName : notifTitle)
-        let message = messageOverride ?? notifMessage
-        let actionID = cardID ?? startRemoteAction(.notify(title: title, message: message), title: "Send notification", subtitle: title)
-        updateRemoteAction(
-            actionID,
-            state: .running,
-            detail: RemoteActionRetryPresentation.dispatchDetail(
-                for: .notify(title: title, message: message),
-                isRetry: cardID != nil
-            )
-        )
-        do {
-            _ = try await iCloudSyncEngine.shared.macNotify(title: title, message: message)
-            notifResult = .sent
-            updateRemoteAction(actionID, state: .ranOnMac, detail: "Ran on Mac through iCloud")
-            if cardID == nil, titleOverride == nil, messageOverride == nil,
-               notifTitle == submittedTitle, notifMessage == submittedMessage {
-                notifMessage = ""
-                notifTitle = ""
-            }
-        } catch {
-            if case SyncError.responseUnconfirmed = error {
-                notifResult = .unconfirmed(error.localizedDescription)
-            } else {
-                notifResult = .failed(error.localizedDescription)
-            }
-            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription,
-                               approvalID: (error as? SyncError)?.approvalID)
-        }
-        isSendingNotif = false
-    }
-
-    private func setVolume(percentOverride: Int? = nil, retrying cardID: UUID? = nil) async {
-        isSettingVolume = true
-        actionStatus = nil
-        let percent = percentOverride ?? volumeTargetPercent
-        let actionID = cardID ?? startRemoteAction(.volume(percent), title: "Set volume", subtitle: "\(percent)%")
-        updateRemoteAction(
-            actionID,
-            state: .running,
-            detail: RemoteActionRetryPresentation.dispatchDetail(
-                for: .volume(percent),
-                isRetry: cardID != nil
-            )
-        )
-        do {
-            _ = try await iCloudSyncEngine.shared.macSetVolume(percent: percent)
-            actionStatus = MacVolumeControlPresentation.acknowledgement(percent: percent)
-            updateRemoteAction(actionID, state: .ranOnMac, detail: "Ran on Mac through iCloud")
-        } catch {
-            actionStatus = error.localizedDescription
-            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription,
-                               approvalID: (error as? SyncError)?.approvalID)
-        }
-        isSettingVolume = false
-    }
-
-    private func runSpotlight(queryOverride: String? = nil, retrying cardID: UUID? = nil) async {
-        let query = queryOverride ?? spotlightQuery
-        guard !query.isEmpty else { return }
-        isSearching = true
-        spotlightOutcome = nil
-        showsAllSpotlightResults = false
-        let actionID = cardID ?? startRemoteAction(.spotlight(query), title: "Spotlight search", subtitle: query)
-        updateRemoteAction(
-            actionID,
-            state: .running,
-            detail: RemoteActionRetryPresentation.dispatchDetail(
-                for: .spotlight(query),
-                isRetry: cardID != nil
-            )
-        )
-        do {
-            let raw = try await iCloudSyncEngine.shared.macSpotlight(query: query)
-            let outcome = MacToolsSpotlightPresentation.outcome(from: raw)
-            spotlightOutcome = outcome
-            actionStatus = outcome.statusText
-
-            switch outcome {
-            case .emptyResponse, .invalidResponse:
-                updateRemoteAction(actionID, state: .failed, detail: outcome.statusText)
-            case .noResults, .results:
-                updateRemoteAction(actionID, state: .ranOnMac, detail: "\(outcome.resultCount) result(s)")
-            }
-        } catch {
-            actionStatus = error.localizedDescription
-            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription,
-                               approvalID: (error as? SyncError)?.approvalID)
-        }
-        isSearching = false
     }
 }

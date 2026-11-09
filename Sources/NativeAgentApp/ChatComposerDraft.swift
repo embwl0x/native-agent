@@ -2,11 +2,12 @@ import Foundation
 import SwiftUI
 // Blueprint: | `ChatComposerDraft.swift` | `ChatComposerDraft`: Session-owned draft shared by composers |
 
-/// Share one AppModel-owned draft per session; only text readers observe keystrokes so the registry stays quiet.
+/// Share one AppModel-owned draft per session; Send observes availability rather than every character.
 @MainActor
 @Observable
 final class ChatComposerDraft {
-    var text = ""
+    private(set) var text = ""
+    private(set) var hasVisibleText = false
     let sessionId: String
     var editedAt = Date.distantPast
     private(set) var manualEditRevision: UInt64 = 0
@@ -16,15 +17,22 @@ final class ChatComposerDraft {
     /// Either composer must write the same draft object.
     func edit(_ newText: String) {
         manualEditRevision &+= 1
-        text = newText
+        replaceText(newText)
         editedAt = Date()
     }
 
     /// Dictation must not claim a manual edit; typing invalidates all later updates from that dictation.
     func dictate(_ newText: String, revision: UInt64) {
         guard manualEditRevision == revision else { return }
-        text = newText
+        replaceText(newText)
         editedAt = Date()
+    }
+
+    private func replaceText(_ newText: String) {
+        guard text != newText else { return }
+        text = newText
+        let visible = newText.contains { !$0.isWhitespace }
+        if hasVisibleText != visible { hasVisibleText = visible }
     }
 
     /// Bind directly to the draft child so writes do not invalidate ChatView state.

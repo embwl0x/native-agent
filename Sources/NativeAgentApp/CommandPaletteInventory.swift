@@ -154,7 +154,8 @@ enum CommandPaletteRecentAction: String, CaseIterable, Sendable {
 /// Share the palette's pool and ranking across presentation states.
 enum CommandPalettePresentation {
     /// Index-confirmed chat matches keep their rank without rematching display text.
-    static func filteredItems(pool: [PaletteItem], query: String, confirmed: [PaletteItem], rail: [SidebarItem]) -> [PaletteItem] {
+    static func filteredItems(pool: [PaletteItem], query: String, confirmed: [PaletteItem], rail: [SidebarItem],
+                              sessions: [[String]]) -> [PaletteItem] {
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !cleanQuery.isEmpty else {
             return Array(pool.filter {
@@ -163,16 +164,23 @@ enum CommandPalettePresentation {
             }.prefix(8))
         }
 
-        let scored: [(PaletteItem, Int, Int)] = pool.enumerated().compactMap { index, item in
+        let candidates: [(PaletteItem, Int)] = pool.compactMap { item in
             let title = item.normalizedTitle
             let subtitle = item.normalizedSubtitle
-            if title == cleanQuery { return (item, 0, index) }
-            if title.hasPrefix(cleanQuery) { return (item, 1, index) }
-            if subtitle.hasPrefix(cleanQuery) { return (item, 2, index) }
-            if title.contains(cleanQuery) { return (item, 3, index) }
-            if subtitle.contains(cleanQuery) { return (item, 4, index) }
-            if item.normalizedSearch.contains(cleanQuery) { return (item, 5, index) }
+            if title == cleanQuery { return (item, 0) }
+            if title.hasPrefix(cleanQuery) { return (item, 1) }
+            if subtitle.hasPrefix(cleanQuery) { return (item, 2) }
+            if title.contains(cleanQuery) { return (item, 3) }
+            if subtitle.contains(cleanQuery) { return (item, 4) }
+            if item.normalizedSearch.contains(cleanQuery) { return (item, 5) }
             return nil
+        }
+        var scored = candidates.enumerated().map { ($0.element.0, $0.element.1, $0.offset) }
+        for (rank, ids) in sessions.enumerated() {
+            for id in ids {
+                scored.append((PaletteItem(id: "chat.\(id)", title: "", subtitle: nil,
+                    systemImage: "bubble.left.and.bubble.right", kind: .chatSession(id)), rank, scored.count))
+            }
         }
         // Do not duplicate a chat already matched by title.
         var chats = Set<String>()
@@ -192,7 +200,6 @@ enum CommandPalettePresentation {
     @MainActor
     static func itemPool(
         layout: SurfaceLayoutAvailability,
-        sessions: [ChatSession],
         settings: [PaletteItem] = [],
         saved: [PaletteItem] = []
     ) -> [PaletteItem] {
@@ -209,19 +216,8 @@ enum CommandPalettePresentation {
                             kind: .railTab(page, tab.key), searchText: tab.key)
             }
         }
-        let chats = visibleSessions(sessions).map { session in
-            let title = ChatShellConversationRow.title(for: session)
-            let preview = ChatShellConversationRow.preview(for: session)
-            return PaletteItem(
-                id: "chat.\(session.id)",
-                title: title,
-                subtitle: preview.isEmpty ? "Chat session" : preview,
-                systemImage: "bubble.left.and.bubble.right",
-                kind: .chatSession(session.id)
-            )
-        }
         // Destinations win ties so a page name still opens that page.
-        return pages + tabs + settings + chats + saved + CommandPaletteRecentAction.allCases.map { action in
+        return pages + tabs + settings + saved + CommandPaletteRecentAction.allCases.map { action in
             let presentation = action.presentation
             return PaletteItem(
                 id: "action.\(action.rawValue)",
@@ -231,19 +227,6 @@ enum CommandPalettePresentation {
                 kind: .recentAction(action.rawValue)
             )
         }
-    }
-
-    static func visibleSessions(_ sessions: [ChatSession]) -> [ChatSession] {
-        let ordered = sessions
-            .filter { $0.archived != true }
-            .sorted {
-                let lhsRecency = $0.updatedAt ?? $0.createdAt
-                let rhsRecency = $1.updatedAt ?? $1.createdAt
-                if lhsRecency != rhsRecency { return lhsRecency > rhsRecency }
-                return $0.id < $1.id
-            }
-        var ids = Set<String>()
-        return ordered.filter { ids.insert($0.id).inserted }
     }
 
     @MainActor

@@ -40,7 +40,7 @@ extension AppDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard !Self.launchDidStart else { return }
         Self.launchDidStart = true
-        if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() {
+        if let app = NSWorkspace.shared.frontmostApplication, !PersonOnlyWindows.isOwnProcess(app.processIdentifier) {
             previousWorkApp = app
         }
         NSWorkspace.shared.notificationCenter.addObserver(self,
@@ -59,7 +59,7 @@ extension AppDelegate {
 
     @MainActor @objc func continuationAppActivated(_ notification: Notification) {
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-              app.processIdentifier != getpid() else { return }
+              !PersonOnlyWindows.isOwnProcess(app.processIdentifier) else { return }
         previousWorkApp = app
     }
 
@@ -109,8 +109,8 @@ extension AppDelegate {
         )
         NativeAgentEngine.startContextFlowAtLaunch(dataRoot: PersistenceCore.defaultDataRoot())
 
-        // Regular activation keeps the Dock icon visible while window closure leaves the runtime alive.
-        NSApp.setActivationPolicy(.regular)
+        // The window process owns the Dock icon and menus; her body runs without one.
+        NSApp.setActivationPolicy(.accessory)
 
         // Speech consent belongs to a voice action; launch only reconciles an existing grant.
         NativeAgentEngine.reconcileSpeechPermissionAtLaunch(dataRoot: PersistenceCore.defaultDataRoot())
@@ -131,7 +131,6 @@ extension AppDelegate {
                 alert.addButton(withTitle: "OK")
                 alert.runModal()
             },
-            registerBackgroundTasks: Self.registerBackgroundTaskHandlers,
             resumeMacTurn: { checkpoint, runtime in
                 guard let model = await ApplicationLifetime.shared.appModel else { throw MacChatTurnLifecycleStoreError.invalidRecord }
                 try await model.resumeMacChatTurn(checkpoint) { turn in
@@ -200,7 +199,7 @@ extension AppDelegate {
     ) {
         Task {
             do { try await ApplicationLifetime.shared.prepare() } catch { return }
-            NativeAgentEngine.liveDeviceSync.bridge.cloudKitPushRegistrationFailed(error)
+            await NativeAgentEngine.liveDeviceSync.bridge.cloudKitPushRegistrationFailed(error)
         }
     }
 
@@ -221,7 +220,7 @@ extension AppDelegate {
 
     /// A held quit may block the main queue, so its restart flag must be lock-protected rather than main-actor isolated.
     nonisolated private static let restartQuit = OSAllocatedUnfairLock(initialState: false)
-    @MainActor private static var quitWaitingForTurns = false
+    @MainActor static var quitWaitingForTurns = false
 
     /// Restart has already bounded its origin's settlement; skip the turn wait and release any held quit so the relauncher can reopen.
     @MainActor
@@ -239,9 +238,16 @@ extension AppDelegate {
     /// The async hold and termination drain share one joinable settlement; neither wait bound owns its lifetime.
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard ApplicationLifetime.shared.appModel != nil else { return .terminateNow }
         if Self.quitWaitingForTurns { return .terminateLater }
         closeQuitIngress()
+        guard ApplicationLifetime.shared.appModel != nil else {
+            Self.quitWaitingForTurns = true
+            Task { @MainActor in
+                await Self.closeFaceProcess()
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateLater
+        }
         let producerDrain = NativeAgentEngine.beginQuitProducerSettlement(appLaunch: Self.launchTask,
             appObservers: [approvalNotificationTask].compactMap { $0 })
         let runs = NativeAgentEngine.live.turns.inFlightRunIDs()
@@ -253,6 +259,7 @@ extension AppDelegate {
             ModuleLog.app("[quit] holding quit for %d in-flight turn(s), at most 20s", runs.count)
         }
         Task.detached {
+            await Self.closeFaceProcess()
             if waitsForTurns {
                 await NativeAgentEngine.waitForInFlightTurnsBeforeQuit(runs,
                     isRestarting: { Self.restartQuit.withLock { $0 } })
@@ -283,7 +290,6 @@ extension AppDelegate {
         NativeAgentA2AGRPCListener.shared.stop()
         ClaudeBridgeRuntime.shared.stop()
         MainActor.assumeIsolated {
-            MoodTintWeather.shared.stop()
             // Stop phone ingress and snapshot observations before drains so late actions cannot start snapshot work during termination.
             NativeAgentEngine.liveDeviceSync.bridge.tearDown()
         }

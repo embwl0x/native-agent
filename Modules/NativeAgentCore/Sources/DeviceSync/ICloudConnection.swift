@@ -21,12 +21,6 @@ extension iCloudBridge {
                 Task { @MainActor in self?.refreshPhoneConnection() }
             }
         }
-        do {
-            lastPhoneContactAt = try SignedPeerEvidenceStore.load(dataRoot: sync.dataRoot)?.contactAt
-            phoneContactReadFailure = nil
-        } catch {
-            phoneContactReadFailure = error.localizedDescription
-        }
         doctorTransportHealth = .unmeasured
         doctorSendFailures.removeAll()
         doctorSendMeasured = false
@@ -36,25 +30,43 @@ extension iCloudBridge {
         let generation = setupGeneration
         // Restore the persisted replay window before the first receive event.
         guard loadCKSeenIDs() else { return }
-        recordCloudKitPushEvidence()
-        // CloudKit can be entitled without CloudDocuments; validate its transport independently of the Drive mount.
-        configureDeviceTransportIfAvailable()
-        guard deviceTransport != nil else {
-            available = false
-            syncStatus = transportRefusal?.line ?? "CloudKit transport unavailable — repair this app's iCloud signing and container configuration."
-            doctorTransportHealth = .unavailable(syncStatus)
-            return
-        }
         setupTask = Task {
+            let root = sync.dataRoot
+            await phoneContactRead.read({
+                await sync.storage.perform { Result<Date?, Error> { try SignedPeerEvidenceStore.load(dataRoot: root)?.contactAt } }
+            }, publish: { result in
+                guard generation == setupGeneration, isSetUp else { return }
+                switch result {
+                case .success(let contact):
+                    if let contact, contact > (lastPhoneContactAt ?? .distantPast) { lastPhoneContactAt = contact }
+                    phoneContactReadFailure = nil
+                case .failure(let error): phoneContactReadFailure = error.localizedDescription
+                }
+            })
+            guard generation == setupGeneration, isSetUp, !Task.isCancelled else { return }
+            await recordCloudKitPushEvidence()
+            guard generation == setupGeneration, isSetUp, !Task.isCancelled else { return }
+            // CloudKit can be entitled without CloudDocuments; validate its transport independently of the Drive mount.
+            configureDeviceTransportIfAvailable()
+            guard deviceTransport != nil else {
+                available = false
+                syncStatus = transportRefusal?.line ?? "CloudKit transport unavailable — repair this app's iCloud signing and container configuration."
+                doctorTransportHealth = .unavailable(syncStatus)
+                return
+            }
             let failure = await sync.engine.start()
             guard generation == setupGeneration, isSetUp, !Task.isCancelled else { return }
             if let failure { syncStatus = failure }
             NotificationCenter.default.addObserver(
                 self, selector: #selector(kvsDidChange(_:)),
                 name: NSUbiquitousKeyValueStore.didChangeExternallyNotification, object: nil)
-            Task.detached(priority: .utility) {
-                _ = await withCKTimeout("iCloudBridge.setup.cloudKitKVSNudge") {
+            Task { [weak self] in
+                let synchronized = await Task.detached(priority: .utility) {
                     NSUbiquitousKeyValueStore.default.synchronize()
+                }.value
+                guard let self, generation == self.setupGeneration, self.isSetUp else { return }
+                if !synchronized {
+                    self.syncStatus = "iCloud KVS setup synchronization was not accepted; its remote state is unconfirmed."
                 }
             }
         }
@@ -109,11 +121,12 @@ extension iCloudBridge {
             name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
             object: nil
         )
-        _ = await withCKTimeout("iCloudBridge.setup.kvsSynchronize") {
+        let synchronized = await Task.detached(priority: .utility) {
             NSUbiquitousKeyValueStore.default.synchronize()
-        }
+        }.value
         // Teardown can retire this setup during the final KVS suspension too.
         guard generation == setupGeneration, isSetUp, !Task.isCancelled else { return }
+        if !synchronized { syncStatus = "iCloud KVS setup synchronization was not accepted; its remote state is unconfirmed." }
         startMetadataQuery(docsURL: docsURL)
     }
     /// Publication reports acceptance of the requested groups, not readiness.
@@ -139,6 +152,7 @@ extension iCloudBridge {
         }
         transportRefusal = nil
         deviceTransport = transport
+        startDeviceReceiveBeat()
         OrganPulse.recordStarting("presence_beat", cadence: NAMacPresence.beat)
         transport.useAssetSecret {
             guard let encoded = try? PairingSecret.existingSecretBase64() else { return nil }
@@ -177,6 +191,9 @@ extension iCloudBridge {
         }
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(deviceDidWake),
             name: NSWorkspace.didWakeNotification, object: nil)
+        for name in [NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(deviceActivityChanged), name: name, object: nil)
+        }
         let paths = NetworkSense.changes
         deviceNetworkChanges = Task { [weak self] in
             var receivedState = false
@@ -186,40 +203,89 @@ extension iCloudBridge {
                 // The first value is replay; later up edges count even if a busy drain coalesced the offline edge.
                 let regained = receivedState && up
                 receivedState = true
-                if regained { _ = await self.drainDeviceTransport(trigger: .network) }
+                if regained {
+                    self.sync.engine.requestPresencePublication()
+                    _ = await self.drainDeviceTransport(trigger: .network)
+                }
             }
         }
         NSApplication.shared.registerForRemoteNotifications(matching: [])
     }
     @objc private func deviceDidWake() {
+        sync.engine.requestPresencePublication()
         Task { _ = await self.drainDeviceTransport(trigger: .wake) }
     }
-    private func acceptPhoneForegroundPresence(_ value: String, writtenAt: Date?, originatingPairing: Data, generation: Int) -> Bool {
-        guard isSetUp, generation == setupGeneration, !phonePairedElsewhere,
-              let encoded = try? PairingSecret.existingSecretBase64(),
-              let secret = Data(base64Encoded: encoded),
-              secret == originatingPairing,
-              let contact = NAPhoneForegroundPresence.activityDate(value: value, writtenAt: writtenAt,
-                  secret: secret, now: Date()) else { return false }
+    @objc private func deviceActivityChanged() {
+        sync.engine.requestPresencePublication()
+    }
+    private func acceptPhoneForegroundPresence(_ value: String, writtenAt: Date?, originatingPairing: Data, generation: Int) async -> Bool {
+        guard isSetUp, generation == setupGeneration, !phonePairedElsewhere else { return false }
+        let secret: Data
+        do {
+            secret = try await sync.storage.perform { try PairingSecret.requireExistingSecret() }
+        } catch {
+            guard isSetUp, generation == setupGeneration else { return false }
+            pairingKeyUnreadable = true
+            syncStatus = "Phone contact could not check the Mac pairing key: \(error.localizedDescription). Repair the pairing key."
+            refreshPhoneConnection()
+            return false
+        }
+        guard isSetUp, generation == setupGeneration, !phonePairedElsewhere, secret == originatingPairing else { return false }
+        let contact: Date
+        do {
+            contact = try await sync.storage.perform {
+                try NAPhoneForegroundPresence.activityDate(value: value, writtenAt: writtenAt, secret: secret)
+            }
+        } catch {
+            guard isSetUp, generation == setupGeneration else { return false }
+            syncStatus = "Phone contact could not be read: \(error.localizedDescription). Repair the signed phone contact."
+            return false
+        }
+        guard isSetUp, generation == setupGeneration, !phonePairedElsewhere else { return false }
         notePhoneContact(at: contact)
         return true
     }
     var deviceReceiveNote: String {
-        cloudKitPushUnavailable ? "push unavailable — repair APNs registration; receive resumes on push or an explicit refresh" : ""
+        cloudKitPushUnavailable ? "push unavailable — repair APNs registration; incoming reads continue independently" : ""
     }
-    /// Received push proves wake delivery; missing two eight-second re-signals disproves it, independently of account health.
-    func recordCloudKitPushEvidence(received: Bool? = nil) {
+    /// Actual push receipt or APNs refusal owns wake evidence; silence has no verdict.
+    func recordCloudKitPushEvidence(received: Bool? = nil) async {
         let url = sync.dataRoot.appendingPathComponent("icloud/chat_push_proof.json")
-        do {
+        let generation = setupGeneration
+        let observedAt = Date()
+        let previous = cloudKitPushEvidenceTask
+        let task = Task {
+            await previous?.value
+            guard generation == setupGeneration, isSetUp else { return }
             if let received {
-                cloudKitPushProofAt = received ? Date() : nil
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(cloudKitPushProofAt), to: url)
-            } else if FileManager.default.fileExists(atPath: url.path) {
-                cloudKitPushProofAt = try JSONDecoder().decode(Date?.self, from: Data(contentsOf: url))
+                let proof: Date? = received ? observedAt : nil
+                do {
+                    try await sync.storage.perform {
+                        let data = try JSONEncoder().encode(proof)
+                        do { if try Data(contentsOf: url) == data { return } }
+                        catch CocoaError.fileReadNoSuchFile { /* A first observation needs its own durable record. */ }
+                        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
+                    }
+                    guard generation == setupGeneration, isSetUp else { return }
+                    cloudKitPushProofRead.write { cloudKitPushProofAt = proof }
+                } catch { nativeLog("[iCloudBridge] push evidence unavailable: %@", error.localizedDescription) }
+            } else {
+                await cloudKitPushProofRead.read({
+                    await sync.storage.perform { Result<Date?, Error> {
+                        do { return try JSONDecoder().decode(Date?.self, from: Data(contentsOf: url)) }
+                        catch CocoaError.fileReadNoSuchFile { return nil }
+                    } }
+                }, publish: { outcome in
+                    guard generation == setupGeneration, isSetUp else { return }
+                    switch outcome {
+                    case .success(let proof): cloudKitPushProofAt = proof
+                    case .failure(let error): nativeLog("[iCloudBridge] push evidence unavailable: %@", error.localizedDescription)
+                    }
+                })
             }
-        } catch {
-            nativeLog("[iCloudBridge] push evidence unavailable: %@", error.localizedDescription)
         }
+        cloudKitPushEvidenceTask = task
+        await task.value
     }
     /// Drain and presence are off without a transport, never overdue.
     func recordTransportOrgansOff(_ reason: String) {
@@ -230,19 +296,19 @@ extension iCloudBridge {
         Self.pushLog.notice("APNs registration succeeded")
         // Registration cannot clear subscription failure; only a received chat push proves end-to-end wake.
     }
-    public func cloudKitPushRegistrationFailed(_ error: Error) {
+    public func cloudKitPushRegistrationFailed(_ error: Error) async {
         Self.pushLog.error("APNs registration failed: \(error.localizedDescription, privacy: .private)")
         guard deviceTransport != nil else { return }
         syncStatus = """
             CloudKit receive wake registration failed: \(error.localizedDescription). Repair APNs registration; open Connection to refresh explicitly.
             """
         nativeLog("[iCloudBridge] CloudKit push unavailable; repair APNs registration to restore receive wakes")
-        recordCloudKitPushUnavailable()
+        await recordCloudKitPushUnavailable()
     }
-    func recordCloudKitPushUnavailable() {
+    func recordCloudKitPushUnavailable() async {
         cloudKitPushUnavailable = true
         OrganPulse.record("icloud_drain", .held, note: deviceReceiveNote)
-        recordCloudKitPushEvidence(received: false)
+        await recordCloudKitPushEvidence(received: false)
     }
     public func recognizesCloudKitRemoteNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
         let recognized = CloudKitDeviceTransport.isDeviceSyncNotification(userInfo)
@@ -251,16 +317,18 @@ extension iCloudBridge {
         return recognized
     }
     public func handleCloudKitPushWake(_ userInfo: [AnyHashable: Any]) async {
+        let generation = setupGeneration
         if phonePairingRecheckDue || !phonePairingSettled {
             phonePairingRecheckDue = false
             await claimPhonePairing()
         }
-        guard !phonePairedElsewhere else { return }
+        guard isSetUp, generation == setupGeneration, !phonePairedElsewhere else { return }
         if CloudKitDeviceTransport.isStatusNotification(userInfo), let ck = deviceTransport {
-            startDeviceMetadataDrainIfIdle(ck, force: true)
+            startDeviceMetadataDrainIfIdle(ck)
         }
         if CloudKitDeviceTransport.isChatNotification(userInfo) {
-            recordCloudKitPushEvidence(received: true)
+            await recordCloudKitPushEvidence(received: true)
+            guard isSetUp, generation == setupGeneration else { return }
             cloudKitPushUnavailable = false
         }
         _ = await drainDeviceTransport(trigger: .cloudKitPush)

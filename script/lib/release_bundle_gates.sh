@@ -380,7 +380,11 @@ release_scan_binary_for_local_identity() {
   regex="(^|[^[:alnum:]])($regex)([^[:alnum:]]|$)"
   string_hits="$(release_scan_binary_for_regex "$exe" "$label" ci "$regex")" || return 2
   tmp="$(mktemp "${TMPDIR:-/tmp}/nativeagent-identity-runs.XXXXXX")" || return 2
-  if ! LC_ALL=C tr -c '[:print:]' '\n' < "$exe" > "$tmp"; then
+  # The code signature is hash slots: random bytes that change with every signing and
+  # can spell anything. Its only words are the signer's public subject. Read up to it.
+  local signature_start
+  signature_start="$(otool -l "$exe" | awk '/LC_CODE_SIGNATURE/{found=1} found && /dataoff/{print $2; exit}')"
+  if ! head -c "${signature_start:-$(wc -c < "$exe")}" "$exe" | LC_ALL=C tr -c '[:print:]' '\n' > "$tmp"; then
     rm -f "$tmp"
     echo "ERROR: $label could not extract executable byte runs." >&2
     return 2

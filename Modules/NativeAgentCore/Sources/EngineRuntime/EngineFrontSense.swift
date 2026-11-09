@@ -1,14 +1,15 @@
 import ActivityWatch
 import AgentWorkspace
 import AppKit
+import Experiences
 import Foundation
 import MacControl
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
-import Senses
 import TrustCenter
 
-// Blueprint: | `EngineFrontSense.swift` | Bounded stable-front perception with presence, policy and provenance gates |
+// Blueprint: | `EngineFrontSense.swift` | Front-app perception with presence, policy and provenance gates; once per app per local day as a world happening |
 
 @MainActor
 final class EngineFrontSense {
@@ -18,11 +19,6 @@ final class EngineFrontSense {
     private var pending: UUID?
     private var work: [UUID: Task<Void, Never>] = [:]
     private var drain: Task<Void, Never>?
-
-    private struct Posted: Codable {
-        var day: String
-        var bundles: Set<String>
-    }
 
     func start(dataRoot: URL) {
         guard !stopped, observer == nil else { return }
@@ -44,7 +40,10 @@ final class EngineFrontSense {
               !ActivityPolicy.alwaysExcludedBundleIDs.contains(bundle) else { return false }
         let fullMac = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
             origin: SecurityOriginContext(surface: "native_actions", source: "mac:front"), turn: nil)
-        let policy = try ActivityPolicyStore(dataRoot: dataRoot).loadChecked()
+        let policy = try await Task.detached {
+            try ActivityPolicyStore(dataRoot: dataRoot).loadChecked()
+        }.value
+        try Task.checkCancellation()
         guard !policy.isExcluded(bundleID: bundle), policy.allowModelAccess || fullMac.admitted,
               !NativeAgentMotorEpoch.isAgentDriven(), MacPersonInput.presence()?.here == true else { return false }
         let session = defaultMacSessionStateSource().currentState()
@@ -63,25 +62,16 @@ final class EngineFrontSense {
                 if pending == id { pending = nil }
             }
             do {
-                guard try await admitted(bundle: bundle, dataRoot: dataRoot),
-                      !stopped, pending == id, !Task.isCancelled else { return }
-                try await Task.sleep(for: .seconds(120))
                 guard try await admitted(bundle: bundle, dataRoot: dataRoot) else { return }
+                let person = await Task.detached { AgentScreen.names(dataRoot).person }.value
                 guard !stopped, pending == id, !Task.isCancelled,
+                      !NativeAgentMotorEpoch.isAgentDriven(), MacPersonInput.presence()?.here == true,
                       let front = NSWorkspace.shared.frontmostApplication,
-                      front.processIdentifier == pid, front.bundleIdentifier == bundle,
-                      let crossing = SensesHub.shared.crossing else { return }
-                let day = EngineDaySense.dayKey(Date())
-                let path = dataRoot.appendingPathComponent("mind/front-posted.json")
-                var posted: Posted
-                do { posted = try JSONDecoder().decode(Posted.self, from: Data(contentsOf: path)) }
-                catch CocoaError.fileReadNoSuchFile { posted = Posted(day: day, bundles: []) }
-                if posted.day != day { posted = Posted(day: day, bundles: []) }
-                guard posted.bundles.insert(bundle).inserted else { return }
-                let line = AgentScreen.names(dataRoot).person + " is working in " + name + "."
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(try JSONEncoder().encode(posted), to: path)
-                _ = await crossing.cross(line, watch: "mac:front", reason: "what is in front of the person",
-                                         id: "mac:front:" + bundle + ":" + day, says: line, agent: nil)
+                      front.processIdentifier == pid, front.bundleIdentifier == bundle else { return }
+                // The key is the app and the local day: the first activation of an app each day is the happening, later ones write nothing.
+                Attention.post(Happening(.world, subject: "mac:front:" + bundle, door: "mac:front",
+                    words: person + " is working in " + name + ".",
+                    once: "mac:front:" + bundle + ":" + EngineDaySense.dayKey(Date())), dataRoot: dataRoot)
             } catch is CancellationError {
                 return
             } catch {

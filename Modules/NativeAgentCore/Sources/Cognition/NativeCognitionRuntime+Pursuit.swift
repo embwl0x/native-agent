@@ -15,22 +15,17 @@ import Desk
 import Experiences
 import ProviderRouting
 import Transcripts
+import TriggerScheduler
 
-// Blueprint: | `NativeCognitionRuntime+Pursuit.swift` | NativeCognitionRuntime+Pursuit owner. |
+// Blueprint: | `NativeCognitionRuntime+Pursuit.swift` | Desk moments on the one clock, checked habit receipts and fixed-word delivery |
 
-extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
-    public func queueTurnCandidates() -> (candidates: [DeskItem]?, refreshPendingAfterWrite: Bool) {
-        let revision = SwiftNativeDeskStore.currentRevision
-        return (pursuitReadRevision == revision && !isFlushedForTermination ? pursuitCandidates : nil,
-                !isFlushedForTermination && pursuitCompletedRefreshRevision != revision)
-    }
-
+extension NativeCognitionRuntime {
     private static let maximumPursuitCandidates = 8
 
     /// Keep pursuit reads synchronous so a user turn cannot initiate Desk I/O.
     private func currentPursuitIntent(now: Date) -> (activeTask: String, goal: String)? {
-        guard let candidates = queueTurnCandidates().candidates else { return nil }
-        let best = candidates
+        guard !isFlushedForTermination, pursuitReadRevision == SwiftNativeDeskStore.currentRevision else { return nil }
+        let best = pursuitCandidates
             .filter { $0.isPursuit && !$0.status.isTerminal }
             .prefix(Self.maximumPursuitCandidates)
             .compactMap { item in host.pursuitChoiceTotal(for: item, now: now).map { (item, $0) } }
@@ -45,19 +40,32 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
         guard !isFlushedForTermination, pursuitObservationTask == nil else { return }
         startCognitiveSourceObservations()
         let sourceObservations = sourceWakes
-        let events = EventDeadlinePhysiology.storeAndFileEvents(paths: [
+        let deskEvents = EventDeadlinePhysiology.storeAndFileEvents(paths: [
             dataRoot.appendingPathComponent("desk/desk_ops.jsonl"),
             SwiftNativeDeskStore(dataRoot: dataRoot).basePath,
+            SwiftNativeDeskStore(dataRoot: dataRoot).archivePath
+        ])
+        let events = EventDeadlinePhysiology.storeAndFileEvents(paths: [
             dataRoot.appendingPathComponent("memory/memory.sqlite"),
             dataRoot.appendingPathComponent("memory/memory.sqlite-wal"),
-            dataRoot.appendingPathComponent("workflows/approvals/requests.json"),
-            dataRoot.appendingPathComponent("agents/resident-wake.json")
+            dataRoot.appendingPathComponent("workflows/approvals/requests.json")
         ])
         pursuitObservationTask = Task { [weak self] in
             await withTaskCancellationHandler {
-                for await _ in events {
-                    guard !Task.isCancelled else { return }
-                    await self?.pursuitSourceInvalidated()
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { [weak self] in
+                        for await _ in deskEvents {
+                            guard !Task.isCancelled else { return }
+                            await self?.pursuitSourceInvalidated()
+                            await self?.reofferQueueMoments()
+                        }
+                    }
+                    group.addTask { [weak self] in
+                        for await _ in events {
+                            guard !Task.isCancelled else { return }
+                            await self?.pursuitSourceInvalidated()
+                        }
+                    }
                 }
             } onCancel: {
                 sourceObservations.cancelObservations()
@@ -70,12 +78,16 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
                 await self?.carriedConditionsChanged()
             }
         }
-        // Reconsider waiting work when the live turn's window closes.
+        // A turn window closing can free the agent: the Desk is read again and what is due for when free comes.
         turnIdleObservationTask = Task { [weak self, root = dataRoot] in
             for await _ in ChatTurnSteering.idleEdges(dataRoot: root) {
                 guard !Task.isCancelled else { return }
-                await self?.rescheduleResidualRepairDeadline()
+                await self?.startPursuitRefresh()
             }
+        }
+        // A MY QUEUE time comes back as a fresh read of the Desk; the read posts what is due, once.
+        Task { [root = dataRoot] in
+            await OneClock.at(root).handle(MyQueueReady.owner) { [weak self] _, _ in await self?.startPursuitRefresh() }
         }
     }
 
@@ -116,13 +128,12 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
             return
         }
         pursuitRefreshInFlight = true
-        sourceWakes.pursuitNextAt = nil
         pursuitRefreshTask = Task { [weak self] in
             await self?.finishPursuitRefresh()
         }
     }
 
-    /// Presence edges use the same carried refresh and deadline path as Desk edits without waiting for a turn.
+    /// Presence edges read the Desk again: a step waiting on the person arriving or leaving comes due there.
     public func carriedPresenceChanged() async {
         await startPursuitRefresh()
     }
@@ -141,6 +152,40 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
         } catch {
             ModuleLog(category: "Cognition")("Body signal intention release unavailable: %@", error.localizedDescription)
         }
+    }
+
+    /// A line of news that touches a step waiting on news releases it: the release is the step's own Desk note, and the read that follows posts its
+    /// moment. Each touching line is its own release.
+    func releaseNewsIntentions(touchedBy line: String, watch: String) async {
+        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
+        let entries: [MyQueue.Entry]
+        do {
+            entries = MyQueue.entries(try await store.liveState()).filter {
+                if case .news? = MyQueue.when($0) { return $0.step.status != "stopped" && !MyQueue.isOver($0, at: now()) }
+                return false
+            }
+        } catch {
+            ModuleLog(category: "Cognition")("News intention release unavailable: %@", error.localizedDescription)
+            return
+        }
+        let words = entries.compactMap { entry -> (id: String, words: String)? in
+            guard case .news(let words)? = MyQueue.when(entry) else { return nil }
+            return (entry.item.handle, words)
+        }
+        guard !words.isEmpty, let touched = await substrate.newsIntentionsTouched(by: line, among: words) else { return }
+        var released = false
+        for handle in touched {
+            guard let weighed = entries.first(where: { $0.item.handle == handle }), !isFlushedForTermination, !Task.isCancelled else { continue }
+            do {
+                // Check identity, topic and closure in the release-append transaction.
+                if try await MyQueue.releaseNews(weighed, summary: String(line.prefix(160)) + " (" + watch + ")", store: store, at: now()) {
+                    released = true
+                }
+            } catch {
+                ModuleLog(category: "Cognition")("News release for %@ unavailable: %@", handle, error.localizedDescription)
+            }
+        }
+        if released { await startPursuitRefresh() }
     }
 
     private func finishPursuitRefresh() async {
@@ -176,11 +221,8 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
             pursuitReadRevision = nil
             guard !isFlushedForTermination, snapshot.revision == SwiftNativeDeskStore.currentRevision,
                   let state = snapshot.state else { return }
-            sourceWakes.pursuitNextAt = state.items.filter { !$0.status.isTerminal }
-                .compactMap { $0.deferUntil.flatMap(DeskSequencing.parseDeferStamp) }.filter { $0 > now() }.min()
             let before = Dictionary(pursuitCandidates.filter { !$0.status.isTerminal }.map { ($0.handle, $0) },
                 uniquingKeysWith: { first, _ in first })
-            if pursuitCandidates != state.items { sourceWakes.reachDirty = true }
             pursuitCandidates = state.items
             pursuitCarriedContext = snapshot.context
             pursuitReadRevision = snapshot.revision
@@ -191,7 +233,6 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
                 let wasCarried = before[item.handle].map(Self.carries) == true
                 guard Self.carries(item) || wasCarried else { continue }
                 if item.status.isTerminal || !Self.carries(item) {
-                    ResidentWake.shared.withdraw(dataRoot: dataRoot, key: "carry." + item.handle)
                     if wasCarried && item.status.isTerminal {
                         signals.append((item.handle, item.status == .canceled ? .deskItemCancelled : .deskItemClosed))
                     }
@@ -230,12 +271,11 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
         )
         let needsFollowUp = pursuitRefreshQueued
         pursuitRefreshQueued = false
-        // Failed refresh is unavailable rather than permanently pending.
-        if !needsFollowUp { pursuitCompletedRefreshRevision = snapshot.revision }
         if needsFollowUp {
             await startPursuitRefresh()
+        } else {
+            Task { [weak self] in await self?.considerMoments() }
         }
-        await rescheduleResidualRepairDeadline()
     }
 }
 
@@ -244,128 +284,189 @@ extension NativeCognitionRuntime {
         item.project == MyQueue.project || item.assignee == "agent"
     }
 
-    static func carriedTouch(_ item: DeskItem, at now: Date) -> Date {
-        max(Self.deskDate(item.openedAt) ?? now,
-            item.notes.filter { $0.author == "agent" }.compactMap { Self.deskDate($0.ts) }.max() ?? .distantPast)
+    /// Accept Desk touch stamps with or without fractional seconds.
+    static func deskDate(_ raw: String) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let date = NativeTimestampFormat.parseISO8601FractionalFirst(trimmed) { return date }
+        let day = DateFormatter()
+        day.calendar = Calendar(identifier: .gregorian)
+        day.locale = Locale(identifier: "en_US_POSIX")
+        day.timeZone = .current
+        day.dateFormat = "yyyy-MM-dd"
+        return day.date(from: trimmed)
     }
 
-    /// Share salience, deadline ownership and the existing wake door.
-    func considerCarried(runNow: Bool = false, besides session: String? = nil) async -> (next: Date?, result: MindClockResult) {
-        guard !isFlushedForTermination, !carriedSayInFlight else { return (nil, .waiting("Carried work is running or the runtime is stopping.")) }
+    // MARK: - Moments
+
+    /// MY QUEUE's moments from the Desk as last read. One pass at a time; a read published while a pass runs is taken by the same pass before it ends.
+    func considerMoments() async {
+        guard !carriedSayInFlight else { return }
+        carriedSayInFlight = true
+        defer { carriedSayInFlight = false }
         await finishOwedCarriedSettlements()
-        // A snapshot not yet read, in flight or invalidated waits for the pursuit refresh, whose own beat reports a Desk that would not read.
-        guard !isFlushedForTermination, !carriedSayInFlight, !pursuitRefreshInFlight, !pursuitRefreshQueued,
-              let revision = pursuitReadRevision, let candidates = queueTurnCandidates().candidates,
-              var context = pursuitCarriedContext else { return (nil, .waiting(
-                  "The current Desk readiness snapshot is not available; no work was selected.")) }
-        let at = now(), root = dataRoot
-        let generation = residualDeadline.generation
-        guard candidates.contains(where: { Self.carries($0) && !$0.isPursuit }) else { return (nil, .init("nothing",
-            "The current Desk snapshot contains no carried step.")) }
-        guard !liveTurnInFlight(besides: session) else { return (nil, .waiting("A live turn is in flight.")) }
-        for entry in candidates.compactMap(MyQueue.entry) where MyQueue.isOver(entry, at: at) {
-            do {
-                try await MyQueue.finish(entry, dropped: false, why: "its time ran out (until \(entry.step.until ?? ""))",
-                                         store: SwiftNativeDeskStore(dataRoot: root))
-            } catch {
-                let cause = Self.bodySourceFailure(error, source: "intention expiry " + entry.item.handle, dataRoot: root)
-                if pursuitReadRevision == revision {
-                    pursuitRead.write { pursuitReadRevision = nil }
-                }
-                return (nil, .init("unavailable", cause))
-            }
+        var taken: Date?
+        while !isFlushedForTermination, !Task.isCancelled, let context = pursuitCarriedContext, context.now != taken {
+            taken = context.now
+            await moments(context)
         }
-        let lastTurnActivityAt = await ChatTurnSteering.shared.turnActivityOrSeed(for: root, at: at)
-        let quietAt = runNow ? at : lastTurnActivityAt.addingTimeInterval(StudioWanderLane.quietInterval)
-        guard revision == SwiftNativeDeskStore.currentRevision else { return (nil, .waiting("The Desk changed during the readiness read.")) }
-        guard let opportunities = ResidentWake.carriedOpportunities(dataRoot: root,
-            items: candidates.filter { Self.carries($0) && !$0.isPursuit }, at: at) else {
-            return (nil, .init("unavailable", "The carried wake ledger could not be read and kept; readiness is unknown."))
-        }
-        var next: Date?, best: DeskItem?
-        var readyByTime: [Date: Set<String>] = [:]
-        for item in candidates {
-            let entry = MyQueue.entry(item)
-            // Project next occurrence and end boundaries even while an intention cannot be offered.
-            if let step = entry?.step, let upcoming = IntentionClock.next(step, after: at) { next = min(next ?? upcoming, upcoming) }
-            if let ends = entry.flatMap({ MyQueue.until($0).endsAt }), ends > at { next = min(next ?? ends, ends) }
-            guard let wakeAt = opportunities[item.handle] else { continue }
-            var crossing = wakeAt
-            let moment = entry.flatMap(MyQueue.when)
-            if case .at(let due)? = moment { crossing = max(crossing, due) }
-            if case .every? = moment, let step = entry?.step {
-                guard let due = IntentionClock.occurrence(step, at: at) ?? IntentionClock.next(step, after: at) else { continue }
-                crossing = max(crossing, due)
-            }
-            if let deferred = item.deferUntil.flatMap(DeskSequencing.parseDeferStamp) { crossing = max(crossing, deferred) }
-            // Clock, person, news and body signals arrive promptly; other work waits for free time.
-            if moment?.isPrompt != true { crossing = max(crossing, quietAt) }
-            context.now = max(at, crossing)
-            let ready = readyByTime[context.now] ?? Set(MyQueueReady.ready(items: candidates, context: context).map(\.handle))
-            readyByTime[context.now] = ready
-            guard ready.contains(item.handle) else { continue }
-            if crossing > at { next = min(next ?? crossing, crossing); continue }
-            if let current = best {
-                if Self.carriedTouch(item, at: at) < Self.carriedTouch(current, at: at) { best = item }
-            } else { best = item }
-        }
-        guard let best else { return (next, .waiting(
-            "No carried step is ready at the real time; readiness, occurrence, defer and offer-rest gates still apply.")) }
-        let freedom = StudioWanderLane.decide(now: at, turnInFlight: liveTurnInFlight,
-            lastTurnActivityAt: lastTurnActivityAt, lastWanderAt: nil, satisfyWait: runNow)
-        let prompt = MyQueue.entry(best).flatMap(MyQueue.when)?.isPrompt ?? false
-        guard freedom == .wander || prompt else {
-            guard freedom == .notQuiet else { return (next, .waiting(freedom.rawValue)) }
-            let freeAt = Date(timeIntervalSinceReferenceDate: quietAt.timeIntervalSinceReferenceDate.nextUp)
-            return (min(next ?? freeAt, freeAt), .waiting(freedom.rawValue))
-        }
-        guard revision == SwiftNativeDeskStore.currentRevision else { return (nil, .waiting("The Desk changed before admission.")) }
-        guard !liveTurnInFlight, !carriedSayInFlight,
-              generation == residualDeadline.generation, !isFlushedForTermination, !Task.isCancelled else { return (next, .init("held",
-                  "Carried admission changed before execution.")) }
-        if let entry = MyQueue.entry(best), entry.step.action != nil {
-            carriedSayInFlight = true
-            defer { carriedSayInFlight = false }
-            return (next, await runCarriedHabit(entry, at: at, generation: generation))
-        }
-        // A worded end condition needs the agent's judgment on every occurrence.
-        if let entry = MyQueue.entry(best), let words = entry.step.say,
-           !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           { if case .words = MyQueue.until(entry) { return false }; return true }(),
-           entry.step.origin == "self" || entry.owedToPerson {
-            // Quiet hours hold person-facing notifications, never the agent's work; delivery routing owns the knock.
-            carriedSayInFlight = true
-            defer { carriedSayInFlight = false }
-            return (next, await deliverCarriedSay(entry, words: words, at: at, revision: revision, generation: generation))
-        }
-        var arrival = ResidentWake.carriedArrival(best, crossing: at, dataRoot: dataRoot)
-        arrival.habitSuggestion = await CarriedHabits.shared.suggestion(for: best, dataRoot: root, at: at)
-        guard revision == SwiftNativeDeskStore.currentRevision, !liveTurnInFlight,
-              generation == residualDeadline.generation, !isFlushedForTermination, !Task.isCancelled else {
-            return (next, .init("held", "Carried admission changed while reading its habit suggestion."))
-        }
-        let kept = ResidentWake.shared.request(dataRoot: root, reason: "what you carry", items: [arrival])
-        return (next, .init(kept ? "woke" : "failed", kept ? "A ready step was offered through ResidentWake." : "The carried wake was not kept.",
-                           fields: ["handle": .string(best.handle), "arrival": .string(arrival.id)]))
     }
 
-    private func runCarriedHabit(_ entry: MyQueue.Entry, at: Date, generation: UInt64) async -> MindClockResult {
+    /// One pass over the current read: steps whose time ran out close; what came due is posted as a moment (a habit or fixed words run as reflexes
+    /// first); each open step's next time, and the agent's next free time when work waits for it, are kept on the one clock.
+    private func moments(_ read: MyQueue.Context) async {
+        // A read not yet published, in flight or invalidated is taken when its refresh publishes.
+        guard !isFlushedForTermination, !pursuitRefreshInFlight, !pursuitRefreshQueued, let revision = pursuitReadRevision,
+              revision == SwiftNativeDeskStore.currentRevision else { return }
+        let items = pursuitCandidates
+        let root = dataRoot, at = now()
+        var context = read
+        context.now = at
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        for entry in items.compactMap(MyQueue.entry) where MyQueue.isOver(entry, at: at) {
+            do {
+                try await MyQueue.finish(entry, dropped: false, why: "its time ran out (until \(entry.step.until ?? ""))", store: store)
+            } catch is MyQueue.Superseded {
+                // The step changed or closed first; the Desk read that change triggers takes it.
+            } catch {
+                owe("expiry", entry.item.handle, "Its time ran out, but it could not be closed: " + error.localizedDescription)
+            }
+        }
+        let freeAt = await ChatTurnSteering.shared.turnActivityOrSeed(for: root, at: at).addingTimeInterval(MyQueue.freeAfter)
+        let free = at >= freeAt && ChatTurnSteering.liveSessions(dataRoot: root).isEmpty
+        let due = MyQueueReady.due(items: items, context: context, free: free)
+        for moment in due.moments {
+            let admission = MomentAdmission(moment: moment, revision: revision)
+            // An earlier moment may have suspended while the Desk changed. The fresh read takes the remainder.
+            guard currentMomentRead(admission) else { return }
+            if await admits(admission) { await take(admission, at: now()) }
+        }
+        guard !pursuitRefreshInFlight, !pursuitRefreshQueued,
+              pursuitReadRevision == revision, SwiftNativeDeskStore.currentRevision == revision else { return }
+        // Past the free time with a turn still open, the window's closing reads the Desk again.
+        let current = now()
+        await keepTimes(items, at: current, freeAt: due.waitingForFree && freeAt > current ? freeAt : nil)
+    }
+
+    private struct MomentAdmission {
+        let moment: MyQueueReady.Moment
+        let revision: UInt64
+    }
+
+    private func currentMomentRead(_ admission: MomentAdmission) -> Bool {
+        !isFlushedForTermination && !Task.isCancelled && !pursuitRefreshInFlight && !pursuitRefreshQueued
+            && pursuitReadRevision == admission.revision && SwiftNativeDeskStore.currentRevision == admission.revision
+    }
+
+    /// Reuse the readiness owner at the current time, including until, grace, blockers and presence; never authorize from a frozen due batch.
+    private func admits(_ admission: MomentAdmission) async -> Bool {
+        guard currentMomentRead(admission) else { return false }
+        let freeAt = await ChatTurnSteering.shared.turnActivityOrSeed(for: dataRoot, at: now()).addingTimeInterval(MyQueue.freeAfter)
+        guard currentMomentRead(admission), var context = pursuitCarriedContext else { return false }
+        context.now = now()
+        let free = context.now >= freeAt && ChatTurnSteering.liveSessions(dataRoot: dataRoot).isEmpty
+        let due = MyQueueReady.due(items: pursuitCandidates, context: context, free: free).moments.contains {
+            $0.item.handle == admission.moment.item.handle && $0.occurrence == admission.moment.occurrence
+        }
+        // Time alone may have crossed until/grace or a new free-time boundary; take a fresh pass to close or re-arm it.
+        if !due { await startPursuitRefresh() }
+        return due
+    }
+
+    /// A due step's reflex runs, or its moment is posted: a habit runs on CPU and hands the agent only what needs judgment; fixed words are said as
+    /// they are; everything else opens a thought.
+    private func take(_ admission: MomentAdmission, at: Date) async {
+        let moment = admission.moment
+        let once = MyQueueReady.once(moment.item.handle, moment.occurrence)
+        guard let entry = MyQueue.entry(moment.item) else { await post(moment.item, once: once, at: at, admission: admission); return }
+        if entry.step.action != nil {
+            await runHabit(entry, once: once, at: at, admission: admission)
+        } else if let words = Self.fixedWords(entry), entry.step.origin == "self" || entry.owedToPerson {
+            // Quiet hours hold person-facing notifications, never the agent's work; delivery routing owns the knock.
+            await deliverSay(entry, words: words, once: once, at: at, admission: admission)
+        } else {
+            await post(moment.item, once: once, at: at, admission: admission)
+        }
+    }
+
+    /// Words to say as they are; a worded end condition needs the agent's judgment on every occurrence.
+    private static func fixedWords(_ entry: MyQueue.Entry) -> String? {
+        guard let words = entry.step.say, !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        if case .words = MyQueue.until(entry) { return nil }
+        return words
+    }
+
+    /// A moment owed to the agent: it opens a thought in the agent's mind stream, or, for a promise made to the person, in the conversation it was
+    /// made in, replying by its recorded route. A habit's receipt rides beside the line: handing back a run settles it, without admitting new work.
+    private func post(_ item: DeskItem, once: String, at: Date, receipt: JSONValue? = nil, admission: MomentAdmission) async {
+        if receipt == nil { guard await admits(admission) else { return } }
+        let root = dataRoot, step = item.step
+        let line = MyQueueReady.line(item, at: at)
+        var shows = line.rest
+        let owed = step?.owedToPerson == true
+        var reply: String?
+        do {
+            if owed, let route = step?.replyRoute { reply = try route.serialize(pretty: false) }
+            if let receipt {
+                shows += "\nalready_looked (your habit already ran; start from this receipt, do not blindly repeat the call): "
+                    + (try receipt.serialize(pretty: false))
+            }
+        } catch {
+            owe("moment", item.handle, "Its moment could not be written: " + error.localizedDescription)
+            return
+        }
+        var happening = Happening(.moment, subject: "queue:" + item.handle, door: "queue:" + item.handle, who: "self", words: line.head,
+            once: once, route: owed ? step?.session : nil, reply: reply, peers: step?.peers, elevated: step?.elevated, shows: shows)
+        // A suggestion is offered once a day, so only a moment not yet in the record carries one.
+        if receipt == nil {
+            do {
+                if try await ExperienceStore.at(root).experience(happening.id) == nil,
+                   let suggestion = await CarriedHabits.shared.suggestion(for: item, dataRoot: root, at: at) {
+                    happening.shows = String((shows + " " + suggestion).prefix(Happening.showsLimit))
+                }
+            } catch {
+                owe("moment", item.handle, "Its occurrence record could not be read: " + error.localizedDescription)
+                return
+            }
+        }
+        if receipt == nil { guard await admits(admission) else { return } }
+        // Finish this occurrence's handoff before the carried pass can replace its run with a later occurrence.
+        let accepted = happening
+        await settle { await Attention.post(accepted, dataRoot: root).value }
+    }
+
+    private func runHabit(_ entry: MyQueue.Entry, once: String, at: Date, admission: MomentAdmission) async {
+        let root = dataRoot, handle = entry.item.handle
         do {
             let receipt: JSONValue
-            if let previous = try ResidentWake.carriedRunReceipt(entry.item, dataRoot: dataRoot, at: at) {
-                receipt = previous
+            if let run = try await MyQueueCarried.run(once: once, dataRoot: root) {
+                guard run.done != true else { return }
+                // A run kept before its effects is never repeated: it continues from what it returned, or goes to the agent if it never returned.
+                guard let saved = run.habitReceipt else {
+                    throw PersistenceCoreError.ioFailure("The saved habit run has no receipt: " + once)
+                }
+                receipt = saved
             } else {
-                // Reserve durably before effects; an interrupted write requires reconciliation rather than permission to repeat.
-                let unknown: JSONValue = .object(["status": .string("outcome_unknown"),
+                guard await admits(admission) else { return }
+                let reserved = JSONValue.object(["status": .string("outcome_unknown"),
                     "detail": .string("This habit's attempt was interrupted. Reconcile its effects before repeating it."),
                     "call": entry.step.action ?? .null])
-                try ResidentWake.shared.recordCarriedRun(entry.item, receipt: unknown, dataRoot: dataRoot, at: at)
-                receipt = await host.runCarriedAction(entry.step, handle: entry.item.handle, dataRoot: dataRoot)
-                let root = dataRoot
-                let saved: Result<Void, Error> = await settle {
-                    Result { try ResidentWake.shared.recordCarriedRun(entry.item, receipt: receipt, dataRoot: root, at: at) }
+                try await MyQueueCarried.keep(handle: handle, once: once, receipt: reserved, dataRoot: root)
+                guard await admits(admission) else {
+                    // No call began. Withdraw only this exact reservation, so a fresh pass may admit unchanged work.
+                    let withdrawn: Result<Void, Error> = await settle {
+                        do { try await MyQueueCarried.withdrawUnstarted(once: once, receipt: reserved, dataRoot: root); return .success(()) }
+                        catch { return .failure(error) }
+                    }
+                    try withdrawn.get()
+                    return
                 }
-                try saved.get()
+                let ran = await host.runCarriedAction(entry.step, handle: handle, dataRoot: root)
+                let unsaved: (any Error)? = await settle {
+                    do { try await MyQueueCarried.keep(handle: handle, once: once, receipt: ran, dataRoot: root); return nil } catch { return error }
+                }
+                if let unsaved { throw unsaved }
+                receipt = ran
             }
             let reply = ToolResult(receipt)
             let outcome = reply.payload.objectValue?["result"] ?? reply.payload
@@ -382,38 +483,30 @@ extension NativeCognitionRuntime {
                 && !ChatToolOutcome.isWaitingApproval(returnedReply.payload) && !returnedReply.isWaitingInteraction
                 && result.objectValue?["needs_me"] == nil && outcome.objectValue?["needs_me"] == nil
                 && receipt.objectValue?["needs_me"] == nil
-                && outcome.objectValue?["handed_back"] == nil && outcome.objectValue?["returned_note"] == nil
+                && outcome.objectValue?["handed_back"] == nil
                 && outcome.objectValue?["accounting_error"] == nil
                 && (result.objectValue?["again"] == nil || result.objectValue?["again"] == .null)
             // A completed call cannot decide its own worded end condition.
             let judgedEnd: Bool = { if case .words = MyQueue.until(entry) { return true }; return false }()
             guard finished, !judgedEnd else {
-                var arrival = ResidentWake.carriedArrival(entry.item, crossing: at, dataRoot: dataRoot)
-                arrival.habitReceipt = reply.payload
-                let kept = ResidentWake.shared.request(dataRoot: dataRoot, reason: "what your habit found", items: [arrival])
-                return .init(kept ? "needs_judgment" : "failed", kept ? "The habit's actual receipt was handed to the agent."
-                    : "The habit receipt was kept, but its wake was not.", fields: ["receipt": reply.payload, "handle": .string(entry.item.handle)])
+                await post(entry.item, once: once, at: at, receipt: reply.payload, admission: admission)
+                return
             }
-            guard !liveTurnInFlight, generation == residualDeadline.generation, !isFlushedForTermination, !Task.isCancelled,
-                  let current = try await MyQueue.entry(entry.item.handle, store: SwiftNativeDeskStore(dataRoot: dataRoot)),
-                  current.step == entry.step else { return .init("held", "The habit ran, but live admission or the step changed before settlement.",
-                      fields: ["receipt": reply.payload]) }
+            // A step changed since the habit ran is a new moment; this run stays kept.
+            guard !isFlushedForTermination, !Task.isCancelled,
+                  let current = try await MyQueue.entry(handle, store: SwiftNativeDeskStore(dataRoot: root)), current.step == entry.step else { return }
             if let words = entry.step.say, !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // Only the agent's own steps and promises to the person may say fixed words directly; anything else is the agent's to judge.
                 guard entry.step.origin == "self" || entry.owedToPerson else {
-                    var arrival = ResidentWake.carriedArrival(entry.item, crossing: at, dataRoot: dataRoot)
-                    arrival.habitReceipt = reply.payload
-                    let kept = ResidentWake.shared.request(dataRoot: dataRoot, reason: "what your habit found", items: [arrival])
-                    return .init(kept ? "needs_judgment" : "failed", "The habit has no authority to say these words directly.",
-                        fields: ["receipt": reply.payload])
+                    await post(entry.item, once: once, at: at, receipt: reply.payload, admission: admission)
+                    return
                 }
-                return await deliverCarriedSay(current, words: words, at: at, revision: SwiftNativeDeskStore.currentRevision,
-                    generation: generation, habitResult: returnedReply.payload)
+                await deliverSay(current, words: words, once: once, at: at, habitResult: returnedReply.payload, admission: admission)
             } else {
-                return await settle { await self.settleCarriedDelivery(current, words: nil, habitResult: returnedReply.payload, at: at) }
+                await settle { await self.settleCarriedDelivery(current, once: once, words: nil, habitResult: returnedReply.payload, at: at) }
             }
         } catch {
-            nativeLog("intention habit: %@ needs reconciliation: %@", entry.item.handle, error.localizedDescription)
-            return .init("unavailable", "The habit needs reconciliation: " + error.localizedDescription, fields: ["handle": .string(entry.item.handle)])
+            owe("habit", handle, "Its habit needs reconciliation: " + error.localizedDescription)
         }
     }
 
@@ -428,66 +521,60 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Reconcile uncertain speech at its original destination before permitting a retry.
-    private func deliverCarriedSay(_ entry: MyQueue.Entry, words: String, at: Date,
-                                   revision: UInt64, generation: UInt64, habitResult: JSONValue? = nil) async -> MindClockResult {
-        let occurrence: String
-        guard let condition = MyQueue.when(entry) else { return .init("unavailable",
-            "The carried step's condition is unavailable; repair it before delivery.") }
-        switch condition {
-        case .every:
-            guard let due = IntentionClock.occurrenceID(entry.step, at: at) else { return .init("held", "No rhythm occurrence is due.") }
-            occurrence = due
-        case .at(let due): occurrence = String(due.timeIntervalSince1970)
-        default:
-            // Include presence transitions and new external notes in carry identity; the agent's own note is not a new moment.
-            occurrence = ResidentWake.carriedFingerprint(entry.item, at: at, dataRoot: dataRoot) + "\u{1F}"
-                + (entry.item.notes.filter { $0.author != "agent" }.map(\.ts).max() ?? entry.item.openedAt)
-        }
-        let key = SwiftNativeChatOrchestrationClient.proactiveSpeechIdempotencyKey(
-            scope: "intention.say:" + entry.item.handle, content: occurrence)
-        guard let anchor = ConversationAnchor.currentSessionId(dataRoot: dataRoot) else {
-            nativeLog("intention say: no current conversation for %@", entry.item.handle)
-            return .init("unavailable", "There is no current conversation for the intention's words.")
+    private static let knockLine = "Left you something in chat. No reply needed."
+
+    /// Fixed words land in the current conversation between turns. Speech is keyed by the moment, so an uncertain delivery is reconciled at its original
+    /// destination before any repeat; words that could not be said stay due and are tried again at the next read, never turned into a thought.
+    private func deliverSay(_ entry: MyQueue.Entry, words: String, once: String, at: Date, habitResult: JSONValue? = nil,
+                            admission: MomentAdmission) async {
+        let root = dataRoot, handle = entry.item.handle
+        let key = SwiftNativeChatOrchestrationClient.proactiveSpeechIdempotencyKey(scope: "intention.say:" + handle, content: once)
+        guard let anchor = ConversationAnchor.currentSessionId(dataRoot: root) else {
+            nativeLog("intention say: no current conversation for %@", handle)
+            return
         }
         do {
+            if habitResult == nil, try await MyQueueCarried.run(once: once, dataRoot: root)?.done == true { return }
             // Stamp the destination conversation's route rather than the turn that released the intention.
-            let route = try await HumanConversationReader.read(sessionID: anchor, dataRoot: dataRoot).route
-            guard revision == SwiftNativeDeskStore.currentRevision, !liveTurnInFlight,
-                  generation == residualDeadline.generation, !isFlushedForTermination,
-                  !Task.isCancelled else { return .init("held", "Admission or the Desk changed before speech.") }
-            let engine = host.studioWanderClient(dataRoot: dataRoot, usesLiveAppBody: usesLiveAppBody)
+            let route = try await HumanConversationReader.read(sessionID: anchor, dataRoot: root).route
+            guard ChatTurnSteering.liveSessions(dataRoot: root).isEmpty, await admits(admission) else { return }
+            let engine = host.studioWanderClient(dataRoot: root, usesLiveAppBody: usesLiveAppBody)
             let chat = engine.chatClient(tools: engine.toolDispatchClient())
             let turn = Turn(session: anchor).with(\.envelope, route)
             let outcome = try await chat.speakProactively(content: words, caller: .reachOut,
-                idempotencyKey: key, sessionId: anchor, initiative: .intention, turn: turn)
+                idempotencyKey: key, sessionId: anchor, turn: turn)
             switch outcome {
             case .posted(let session, _):
                 if !Task.isCancelled, !isFlushedForTermination {
                     do {
                         _ = try await host.deliverShoulderTap(
-                            eventId: key, title: PersonaCompiler.agentDisplayName(dataRoot: dataRoot),
-                            body: Reach.knockLine, reason: key,
+                            eventId: key, title: PersonaCompiler.agentDisplayName(dataRoot: root),
+                            body: Self.knockLine, reason: key,
                             userInfo: ["screen": "chat", "source": "intention", "sessionId": session], at: at, turn: turn)
-                    } catch { await recordKnockFailure(error, eventID: key) }
+                    } catch { await knockFailed(error, eventID: key) }
                 }
             case .duplicate:
                 // A duplicate proves the append committed; finish any interrupted Desk settlement.
                 break
-            case .rateLimited:
-                return .init("held", "The speech owner's rate limit held the intention; it stays ready.")
             }
-            return await settle {
-                await self.settleCarriedDelivery(entry, words: words, habitResult: habitResult, at: at)
-            }
+            await settle { await self.settleCarriedDelivery(entry, once: once, words: words, habitResult: habitResult, at: at) }
         } catch {
-            // Keep failed speech ready; never turn it into a model wake.
-            nativeLog("intention say: %@ remains ready: %@", entry.item.handle, error.localizedDescription)
-            return .init("unavailable", "The intention stays ready; speech could not be confirmed: " + error.localizedDescription)
+            nativeLog("intention say: %@ stays due: %@", handle, error.localizedDescription)
         }
     }
 
-    private func settleCarriedDelivery(_ entry: MyQueue.Entry, words: String?, habitResult: JSONValue? = nil, at: Date) async -> MindClockResult {
+    private func knockFailed(_ error: Error, eventID: String) async {
+        RepairOwed.owe(dataRoot, id: "notification:" + eventID, kind: .run,
+            operation: "cognition.notification:" + eventID, owner: "AttentionRouter",
+            words: "The words were posted, but their notification is unavailable: " + error.localizedDescription,
+            tap: "Repair notification delivery in Settings → Doctor. Do not post the words again.")
+        await substrate.recordReceipt(kind: "notification.unavailable", payload: .object([
+            "eventId": .string(eventID), "speech": .string("posted"),
+            "error": .string(error.localizedDescription),
+        ]))
+    }
+
+    private func settleCarriedDelivery(_ entry: MyQueue.Entry, once: String, words: String?, habitResult: JSONValue? = nil, at: Date) async {
         do {
             var notes: [String] = []
             if let result = habitResult {
@@ -498,31 +585,22 @@ extension NativeCognitionRuntime {
                 notes.append("Ran \(clock.string(from: at)): " + String(summary.split(whereSeparator: \.isNewline).joined(separator: " ").prefix(500)))
             }
             if let words {
-                notes.append("Said \(ResidentWake.shown(at)): \"\(words)\"")
+                notes.append("Said \(MyQueue.shown(at)): \"\(words)\"")
             }
-            // Consume and record debt in one write; recovery closes only the unchanged once-step.
-            let debt = try ResidentWake.shared.recordCarriedDelivery(entry.item, dataRoot: dataRoot, at: at,
-                reason: habitResult == nil ? "said" : "habit finished", notes: notes)
+            // Spend the moment and record its Desk debt in one write; recovery closes only the unchanged once-step.
+            let debt = try await MyQueueCarried.delivered(entry.item, once: once, notes: notes,
+                reason: habitResult == nil ? "said" : "habit finished", dataRoot: dataRoot)
             try await finishCarriedSettlement(debt)
-            return .init(words == nil ? "ran" : "said", words == nil ? "The habit completed and its Desk settlement was kept."
-                : "The speech owner confirmed the words; their Desk settlement was kept.", fields: ["handle": .string(entry.item.handle)])
         } catch {
-            nativeLog("intention delivery: %@ settlement not kept: %@", entry.item.handle, error.localizedDescription)
-            return .init(
-                "failed",
-                "Delivery finished but its settlement remains owed: " + error.localizedDescription,
-                fields: ["handle": .string(entry.item.handle)]
-            )
+            owe("settlement", entry.item.handle, "Its delivery finished but its Desk settlement remains owed: " + error.localizedDescription)
         }
     }
 
+    /// Delivered effects whose Desk notes and once-close did not land yet are finished; each debt is its own, and one that fails stays owed.
     func finishOwedCarriedSettlements() async {
-        guard !carriedSayInFlight else { return }
-        carriedSayInFlight = true
-        defer { carriedSayInFlight = false }
         await settle {
             do {
-                for debt in try ResidentWake.owedCarriedSettlements(dataRoot: self.dataRoot) {
+                for debt in try await MyQueueCarried.owedSettlements(dataRoot: self.dataRoot) {
                     do { try await self.finishCarriedSettlement(debt) }
                     catch { nativeLog("intention settlement: %@ remains owed: %@", debt.id, error.localizedDescription) }
                 }
@@ -530,7 +608,7 @@ extension NativeCognitionRuntime {
         }
     }
 
-    private func finishCarriedSettlement(_ debt: ResidentWake.CarriedSettlement) async throws {
+    private func finishCarriedSettlement(_ debt: MyQueueCarried.Settlement) async throws {
         guard let item = DeskItem.fromJSON(debt.item), let entry = MyQueue.entry(item) else {
             throw PersistenceCoreError.ioFailure("The intention's settlement snapshot is unreadable.")
         }
@@ -552,19 +630,36 @@ extension NativeCognitionRuntime {
                 }
             }
         }
-        try ResidentWake.shared.settleCarried(debt, dataRoot: dataRoot)
+        try await MyQueueCarried.settled(debt, dataRoot: dataRoot)
     }
 
-    /// Accept Desk touch stamps with or without fractional seconds.
-    static func deskDate(_ raw: String) -> Date? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        if let date = NativeTimestampFormat.parseISO8601FractionalFirst(trimmed) { return date }
-        let day = DateFormatter()
-        day.calendar = Calendar(identifier: .gregorian)
-        day.locale = Locale(identifier: "en_US_POSIX")
-        day.timeZone = .current
-        day.dateFormat = "yyyy-MM-dd"
-        return day.date(from: trimmed)
+    /// Each open step's next time, and the agent's next free time when work waits for it, are MY QUEUE's times on the one clock; a time whose step
+    /// closed or changed is withdrawn. Each time is kept or reported on its own.
+    private func keepTimes(_ items: [DeskItem], at: Date, freeAt: Date?) async {
+        let clock = OneClock.at(dataRoot)
+        var wanted: [String: OneClock.Time] = [:]
+        for item in items {
+            guard let next = MyQueueReady.next(item, after: at) else { continue }
+            let id = MyQueueReady.time(item.handle)
+            wanted[id] = OneClock.Time(id: id, rhythm: MyQueueReady.rhythm(item), next: next, payload: .object(["handle": .string(item.handle)]))
+        }
+        if let freeAt { wanted[MyQueueReady.freeTime] = OneClock.Time(id: MyQueueReady.freeTime, next: freeAt) }
+        do {
+            for time in try await clock.times(owner: MyQueueReady.owner) where wanted[time.id] == nil {
+                do { try await clock.withdraw(time.id) }
+                catch { owe("clock", time.id, "Its time could not be withdrawn from the clock: " + error.localizedDescription) }
+            }
+        } catch { owe("clock", MyQueueReady.owner, "MY QUEUE's times could not be read from the clock: " + error.localizedDescription) }
+        for time in wanted.values {
+            do { try await clock.declare(time) }
+            catch { owe("clock", time.id, "Its time could not be kept on the clock, so it would not come: " + error.localizedDescription) }
+        }
+    }
+
+    /// A MY QUEUE failure is owed as a repair on what it concerns; a repeat joins the open debt.
+    private func owe(_ operation: String, _ subject: String, _ words: String) {
+        nativeLog("MY QUEUE %@ %@: %@", operation, subject, words)
+        RepairOwed.owe(dataRoot, id: "queue." + operation + ":" + subject, kind: .run, operation: "queue." + operation, owner: subject,
+            words: subject + ": " + words, tap: "Repair the named storage, preserving its records; the Desk's next read takes the step again.")
     }
 }

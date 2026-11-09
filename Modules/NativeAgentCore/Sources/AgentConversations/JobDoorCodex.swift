@@ -1,3 +1,4 @@
+import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -30,9 +31,8 @@ actor JobRPC {
                 if let error = fields["error"]?.objectValue {
                     let code: String = if case .int(let code)? = error["code"] { " (\(code))" } else { "" }
                     waiting.resume(throwing: JobDoorFailure((error["message"]?.stringValue ?? "an error with no message") + code))
-                } else {
-                    waiting.resume(returning: fields["result"] ?? .null)
-                }
+                } else if let result = fields["result"] { waiting.resume(returning: result) }
+                else { waiting.resume(throwing: JobDoorFailure("its app-server response \(id) has neither result nor error")) }
             }
         } catch { ending = error }
         closed = ending
@@ -43,6 +43,7 @@ actor JobRPC {
 
     func request(_ method: String, _ params: [String: JSONValue]) async throws -> JSONValue {
         if let closed { throw closed }
+        guard next < Int64.max else { throw JobDoorFailure("its app-server request identifiers are exhausted") }
         next += 1
         let id = next
         let message = JSONValue.object(["id": .int(id), "method": .string(method), "params": .object(params)])
@@ -55,10 +56,10 @@ actor JobRPC {
     }
 
     /// A request whose answer nobody waits for: a stop on the way out.
-    func fire(_ method: String, _ params: [String: JSONValue]) async {
+    func fire(_ method: String, _ params: [String: JSONValue]) async throws {
+        guard next < Int64.max else { throw JobDoorFailure("its app-server request identifiers are exhausted") }
         next += 1
-        do { try await process.send(.object(["id": .int(next), "method": .string(method), "params": .object(params)])) }
-        catch { nativeLog("Codex job door: %@ was not delivered: %@", method, error.localizedDescription) }
+        try await process.send(.object(["id": .int(next), "method": .string(method), "params": .object(params)]))
     }
 
     func notify(_ method: String) async throws {
@@ -197,19 +198,37 @@ struct CodexJobDoor: JobRunner {
         }
         for ask in asks { ask.cancel() }
         guard !Task.isCancelled else {
-            // The agent's stop: the organ is told on its own terms, then given a moment to settle its thread before its program ends.
-            if let thread, let turn { await rpc.fire("turn/interrupt", ["threadId": .string(thread), "turnId": .string(turn)]) }
-            _ = await Task.detached { await process.stop(grace: .seconds(2)) }.value
+            // Interrupt the turn before closing its program.
+            if let thread, let turn {
+                do { try await rpc.fire("turn/interrupt", ["threadId": .string(thread), "turnId": .string(turn)]) }
+                catch {
+                    RepairOwed.owe(dataRoot, id: job.job + ":interrupt", kind: .message, operation: "agent.job:" + job.job + ":interrupt",
+                        owner: name, words: "Job \(job.job)'s interrupt was not delivered: \(error.localizedDescription)",
+                        lever: "Inspect its remote thread before resuming work.")
+                }
+            }
+            let unconfirmed = await Task.detached { await process.stop() }.value
+            if let unconfirmed {
+                RepairOwed.owe(dataRoot, id: job.job + ":stop", kind: .message, operation: "agent.job:" + job.job + ":stop",
+                    owner: name, words: "Job \(job.job)'s process termination is unconfirmed: \(unconfirmed)",
+                    lever: "Inspect the retained process before starting more work through this contact.")
+            }
             if let thread { await JobDoorLive.shared.release(Self.door + ":" + thread, run) }
             return out.stopped("its job was stopped")
         }
-        let unconfirmed = await process.stop(grace: .seconds(2))
+        let unconfirmed = await process.stop()
         if let thread { await JobDoorLive.shared.release(Self.door + ":" + thread, run) }
-        if let unconfirmed { out.send(.working(note: "Its program did not confirm it stopped: " + unconfirmed)) }
-        let ending = outcome ?? .failed("its app-server ended before its turn did")
+        if let unconfirmed { return out.fail(JobDoorFailure("Its program termination is unconfirmed: " + unconfirmed)) }
+        var ending = outcome ?? .failed("its app-server ended before its turn did")
         if ending == .finished {
-            let made = await JobDoorArtifacts.deliverable(job, since: record.startedAt, report: report, model: model, out: out)
-            out.send(.deliverable(made))
+            do {
+                let made = try await JobDoorArtifacts.deliverable(job, since: record.startedAt, report: report, model: model)
+                out.send(.deliverable(made))
+                if let failure = made.inventoryFailure { ending = .failed(failure) }
+            } catch {
+                out.send(.deliverable(JobDeliverable(artifacts: [], report: report, model: model)))
+                ending = .failed("Its deliverable could not be inventoried: \(error.localizedDescription)")
+            }
         }
         out.send(.ended(ending))
     }
@@ -284,6 +303,6 @@ struct CodexJobDoor: JobRunner {
         }
         guard !Task.isCancelled else { return }
         do { try await rpc.respond(id, reply, code: code) }
-        catch { out.send(.working(note: "Its request \(method) could not be answered: \(error.localizedDescription).")) }
+        catch { out.fail(JobDoorFailure("Its request \(method) could not be answered: \(error.localizedDescription).")) }
     }
 }

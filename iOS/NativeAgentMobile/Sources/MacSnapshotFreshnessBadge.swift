@@ -45,6 +45,8 @@ struct MacSnapshotFreshnessBadge: View {
                                 action: { showsConnection = true })
                     .accessibilityElement(children: staleGroupReason == nil ? .combine : .contain)
                     .accessibilityLabel("Mac snapshot freshness: " + title)
+            } else {
+                AliveFootnote(title)
             }
         }
         .sheet(isPresented: $showsConnection) {
@@ -56,7 +58,6 @@ struct MacSnapshotFreshnessBadge: View {
 struct MacSnapshotFreshnessSchedule: TimelineSchedule {
     let lastSyncedAt: Date?
     var fixed = false
-    var showsFreshAge = false
 
     func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnySequence<Date> {
         AnySequence {
@@ -67,14 +68,10 @@ struct MacSnapshotFreshnessSchedule: TimelineSchedule {
                     if fixed || lastSyncedAt == nil { next = nil }
                     else if let lastSyncedAt {
                         let age = date.timeIntervalSince(lastSyncedAt)
-                        let unit: TimeInterval = showsFreshAge && age < 60 ? 15 : age < 3_600 ? 60 : age < 86_400 ? 3_600 : 86_400
+                        let unit: TimeInterval = age < 3_600 ? 60 : age < 86_400 ? 3_600 : 86_400
                         if age < -60 { next = lastSyncedAt.addingTimeInterval(-60) }
                         else {
-                            let threshold = lastSyncedAt.addingTimeInterval(StatusConnectionPresentation.staleAfter)
-                            let stale = Date(timeIntervalSinceReferenceDate: threshold.timeIntervalSinceReferenceDate.nextUp)
-                            let changedText = lastSyncedAt.addingTimeInterval(max(unit, (floor(age / unit) + 1) * unit))
-                            next = age <= StatusConnectionPresentation.staleAfter
-                                ? (showsFreshAge ? min(changedText, stale) : stale) : changedText
+                            next = lastSyncedAt.addingTimeInterval(max(unit, (floor(age / unit) + 1) * unit))
                         }
                     }
                 }

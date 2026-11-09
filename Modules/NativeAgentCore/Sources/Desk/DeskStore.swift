@@ -4,7 +4,7 @@ import Foundation
 import PersistenceCore
 import NativeAgentCore
 import Synchronization
-// Blueprint: | `DeskStore.swift` | `SwiftNativeDeskStore`, `currentRevision`, `continuation`, `setContinuation`, `heldBy`, `updateTitle` |
+// Blueprint: | `DeskStore.swift` | `SwiftNativeDeskStore`, `currentRevision`, `continuation`, `setContinuation`, `updateTitle` |
 // Flocked base-plus-tail replay prevents compaction from racing committed appends.
 // Snapshot before truncation and prefix-drop on replay prevent loss and duplicate application.
 // Preserve alias high-water, reopening targets and the commit-stamp floor because live rows cannot recover them.

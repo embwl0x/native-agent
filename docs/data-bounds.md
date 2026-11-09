@@ -3,6 +3,12 @@
 Selected live limits enforced by the Swift runtime. These are store-specific
 policies, not a global disk quota. Paths are relative to the app's data root.
 
+Quiet never ends what they holds. A conversation is held whole until the request
+reaches the input budget; then the oldest whole turns go in half-budget jumps.
+The input budget is min(model window minus response allowance, 200,000 tokens).
+History fitting uses the input budget; refusal and result pointers use model
+window minus response allowance, the physical limit.
+
 | Store | Limit | Enforcement / owner |
 |---|---|---|
 | Phone presence evidence | 64 place events and 64 sense/setup events; each organ's latest setup and observation and the first movement since physical Mac input retained within the cap | Atomic histories in `mobile/place-events.json` and `mobile/sense-events.json`; bridge-only writers. Motion, Focus, charging, battery, app audio route, network path, Music metadata, scoped photo count and Places setup use the same sense owner. Current inference requires evidence within 15 minutes; history is not current presence. Each phone owner holds at most 128 pending changes and sends at most 8 per publication. See [mobile presence](mobile_companion.md#where-the-person-is). |
@@ -10,7 +16,7 @@ policies, not a global disk quota. Paths are relative to the app's data root.
 | Approvals | 300 records | On overflow, orphan pending requests unanswered for 24 hours since their last request (creation if never re-asked), then evict oldest eligible terminal records; refuse creation if insufficient space remains. `ApprovalStorage.swift` |
 | Chat hot index | 200 sessions by default, protected sessions excepted | Canonical transcripts and locator rows move to durable `chat/archive/`; no automatic expiry. `ChatSessionRetention.swift` |
 | Chat streaming tail boxes | Cache target 8; active or consumer-held boxes protected regardless of count | On cache demand, `TranscriptsFacade` prunes only unreferenced boxes outside active streaming rows. Mounted bubbles and scroll observers retain the same box through their observation lifetime. `ChatStreamingTail.swift` |
-| Chat context window | Powering model default; at its bound drop oldest whole turns in half-budget jumps | `SessionHistoryTail` derives checkpoints from cumulative replay row sizes in the already-read transcript; no stored cut pointer. Original rows remain on disk. `SessionContextMeasurement` calibrates the composed request from matching provider usage or labels the absent-calibration estimate; unknown window or unreadable evidence fails. Final request admission includes the adapter response allowance. Oldest overflowing tool-result bodies become pointers only after exact retention in `chat/tool_results`; no summary pass or lower-window setting. See [conversation context](conversation-context-history.md). |
+| Held conversation | Input budget above; whole-turn jumps | `ContextBudgetPolicy`, `SessionHistoryTail`; current input may use the physical limit; [contract](conversation-context-history.md). |
 | Cognitive active nodes | 256 by default | Configured by `CognitiveConfiguration.swift` |
 | Cognitive artifacts | Derived from node and reflection budgets; minimum 64. Cares, their migration marker, retired preserved families and reflection receipts still owing effects or dream-journal acknowledgment are excluded. Owed receipts also bypass the settled reflection restore cap. | `CognitiveSubstrate+Persistence.swift` computes the cap; `CognitiveSQLiteStore.swift` prunes by artifact family |
 | Turn evidence and receipts | 14 days | `ExperienceStore` details in `experiences/experiences.sqlite`; forgotten after writes, no retention loop |

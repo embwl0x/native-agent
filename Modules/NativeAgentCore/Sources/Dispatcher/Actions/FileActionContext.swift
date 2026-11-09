@@ -1,3 +1,4 @@
+import NativeAgentShared
 import AuthoredCapabilities
 import Foundation
 import CryptoKit

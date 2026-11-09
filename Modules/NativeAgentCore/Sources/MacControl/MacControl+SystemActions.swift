@@ -362,7 +362,7 @@ extension SwiftNativeMacControl {
               let bundle = player.bundleIdentifier else { return MacAppActGate.unavailable().result(action: "media") }
         try Task.checkCancellation()
         if let refusal = MacAppActGate.refusal(pid: pid, context: context) { return refusal.result(action: "media") }
-        for event in events { CGEventSink().postNative(event, context: context) }
+        for event in events { try await CGEventSink().postNative(event, context: context) }
         return MacControlResult(ok: true, action: "media",
             output: .object(["action": .string(action), "key_sent": .string(key == NX_KEYTYPE_PLAY ? "play_pause" : action == "previous" ? "previous" : "next"),
                 "target_pid": .int(Int64(pid)), "bundle_id": .string(bundle), "playback_state_confirmed": .bool(false),
@@ -519,7 +519,7 @@ extension SwiftNativeMacControl {
         func finish(_ status: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
             let front = accessibilitySource(context: context).frontmostApp()?.processIdentifier == pid
             let ok = status == "focused" && front
-            let reported = ok || status != "focused" ? status : "focus_failed"
+            let reported = ok || status != "focused" ? status : "focus_unverified"
             var output: [String: JSONValue] = [
                 "status": .string(reported),
                 "pid": .int(Int64(pid)),
@@ -537,15 +537,11 @@ extension SwiftNativeMacControl {
         guard pid > 0, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
             return finish("app_gone")
         }
-        if pid == getpid() {
+        if PersonOnlyWindows.isOwnProcess(pid) {
             // Activate our own app without an AX read of ourselves.
-            let binding = context.driver
-            await MainActor.run {
-                if binding?.allowsEmission(context: context) == true { NSApplication.shared.activate() }
-            }
-            if accessibilitySource(context: context).frontmostApp()?.processIdentifier != pid, binding?.allowsEmission(
-                context: context) == true { _ = app.activate() }
-            try? await MacApplications.observeActivation(of: pid, within: 1)
+            guard context.driver?.allowsEmission(context: context) == true else { return finish("yielded_to_user") }
+            do { try await MacApplications.activate(app, context: context) }
+            catch { return finish("activation_unconfirmed", ["message": .string(error.localizedDescription)]) }
             return finish("focused")
         }
         let exact = body["frame_id"]?.stringValue
@@ -591,8 +587,8 @@ extension SwiftNativeMacControl {
             // Putting back an app that had no window (no window asked for): activate that exact pid; `finish` verifies it is frontmost.
             guard identity == nil, exact == nil else { return finish("app_has_no_window") }
             guard context.driver?.allowsEmission(context: context) == true else { return finish("yielded_to_user") }
-            _ = app.activate()
-            try? await MacApplications.observeActivation(of: pid, within: 1)
+            do { try await MacApplications.activate(app, context: context) }
+            catch { return finish("activation_unconfirmed", ["message": .string(error.localizedDescription)]) }
             return finish("focused", ["window_matched": .bool(false)])
         }
         if let continuation, let refusal = continuation.refusal(context: context) {
@@ -600,9 +596,10 @@ extension SwiftNativeMacControl {
         }
         let outcome = accessibilityActSource(context: context).raise(chosen, context: context)
         guard outcome == .performed else {
-            var extra: [String: JSONValue] = ["raise": .string(outcome.rawValue)]
+            var extra = outcome.receipt
+            extra["raise"] = .string(outcome.rawValue)
             if let why = accessibilityActSource(context: context).raiseDiagnostic { extra["diagnostic"] = .string(why) }
-            return finish("focus_failed", extra)
+            return finish(outcome.status == .unverified ? "focus_unverified" : "focus_failed", extra)
         }
         guard let focused = accessibilityActSource(context: context).focusedWindow(pid: pid, context: context),
               case .matched = MacAXWindowIdentity.match(chosen.identity, among: [(focused, focused.identity)]) else {

@@ -16,6 +16,18 @@ public enum ContextBudgetPolicy {
     /// The prompt-budget ratio is a separate safety margin.
     package static let transcriptCharactersPerToken = 3.5
 
+    /// History fitting uses the input budget; current input may use the physical limit.
+    package static func inputTokens(windowTokens: Int, outputTokens: Int) -> Int {
+        min(physicalInputTokens(windowTokens: windowTokens, outputTokens: outputTokens), 200_000)
+    }
+
+    /// Refusal and result pointers use model window minus response allowance, the physical limit.
+    package static func physicalInputTokens(windowTokens: Int, outputTokens: Int) -> Int {
+        let window = max(0, windowTokens)
+        let output = max(0, outputTokens)
+        return window > output ? window - output : 0
+    }
+
     static let combinedUtilizationFraction = 0.25
 
     /// Keep floors through 32,768 tokens because fixed assembled context already occupies a substantial share of small windows.
@@ -52,13 +64,11 @@ public enum ContextBudgetPolicy {
     /// Return the floor table unchanged below the scaling threshold.
     public struct Floors: Sendable {
         public let relevantChars: Int
-        public let relevantItemCap: Int
     }
 
     /// Every door assembles the same model input; delivery owns reply limits.
     static let floors = Floors(
-        relevantChars: 2_400,
-        relevantItemCap: 650
+        relevantChars: 2_400
     )
 
     // Keep this product aligned with UserMDAutogenMarkers.promptByteCap, which cannot read these constants.
@@ -74,7 +84,6 @@ public enum ContextBudgetPolicy {
     /// Share budget fields directly with the history renderer so policy cannot drift.
     public struct Resolved: Sendable {
         public let relevantChars: Int
-        public let relevantItemCap: Int
 
         public let recallRowLimit: Int
         public let memoryRowChars: Int
@@ -158,7 +167,6 @@ public enum ContextBudgetPolicy {
 
         return Resolved(
             relevantChars: min(maximumRelevantCharacters, grow(floors.relevantChars, scale)),
-            relevantItemCap: grow(floors.relevantItemCap, rowScale),
             recallRowLimit: recallRowLimit,
             memoryRowChars: memoryRowChars,
             // Account for rendered row markup so a full final row still fits the aggregate bound.
@@ -199,7 +207,6 @@ public enum ContextBudgetPolicy {
     private static func floorBudget(floors: Floors, windowTokens: Int?) -> Resolved {
         Resolved(
             relevantChars: floors.relevantChars,
-            relevantItemCap: floors.relevantItemCap,
             recallRowLimit: floorRecallRowLimit,
             memoryRowChars: floorMemoryRowChars,
             memoryBlockChars: floorRecallRowLimit * floorMemoryRowChars,

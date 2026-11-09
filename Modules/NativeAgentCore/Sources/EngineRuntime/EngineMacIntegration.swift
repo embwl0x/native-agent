@@ -1,7 +1,9 @@
 import AppToolRuntime
+import AppKit
 import Connectors
 import Combine
 import ChatToolRuntime
+import ChatTurnContracts
 import DeviceSync
 import Foundation
 import MacControl
@@ -39,7 +41,18 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
     @ObservationIgnored private lazy var permissionRead = LatestRead()
     @ObservationIgnored private lazy var watchRead = LatestRead()
     @ObservationIgnored private var permissionObservation: AnyCancellable?
+    @ObservationIgnored private var activationObservation: AnyCancellable?
     @ObservationIgnored private var permissionWatcher: FileChangeWatcher?
+    @ObservationIgnored private var settingsFeed: SettingsFeedProjection?
+
+    public func bindSettingsFeed(_ feed: SettingsFeedProjection) {
+        settingsFeed = feed
+        publishSettings()
+    }
+
+    private func publishSettings() {
+        settingsFeed?.updatePermissions(statuses: systemStatuses, issue: permissionLoadError, isReading: isLoading)
+    }
     private var mailCheck: (status: String, word: String, next: String?)?
 
     public nonisolated init(dataRoot: URL, deviceSync: DeviceSync?, platform: AppConnectorStatusPlatform) {
@@ -48,7 +61,7 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
         self.platform = platform
     }
 
-    /// Release the permission observer with its facade; writes must identify their root.
+    /// Observe saved writes and returns to the body or its window; release both subscriptions with their facade.
     public func observePermissionChanges() {
         // The permission store posts off-main; hop before the main-actor closure to avoid isolation traps.
         permissionObservation = NotificationCenter.default.publisher(for: SystemPermissionPreflight.permissionDidChange)
@@ -61,14 +74,27 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
                     }
                 }
             }
+        activationObservation = NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didActivateApplicationNotification)
+            .receive(on: DispatchQueue.main)
+            .map { notice in
+                let app = notice.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                return PersonOnlyWindows.isOwnProcess(app?.processIdentifier)
+            }
+            .removeDuplicates()
+            .filter { $0 }
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in await self?.refresh(refreshWatches: false) }
+            }
     }
 
     @discardableResult
     public func refresh(refreshWatches: Bool = true, checkMail: Bool = false) async -> Result<MacIntegrationPermissionStore.Snapshot, Error> {
         if permissionWatcher == nil {
-            permissionWatcher = FileChangeWatcher(paths: [dataRoot.appendingPathComponent("security/mac_integration_permissions.json")]) { [weak self] _ in
+            let permissions = dataRoot.appendingPathComponent("security/mac_integration_permissions.json")
+            let watcher = await FileChangeWatcher.armed(paths: [permissions]) { [weak self] _ in
                 Task { @MainActor in await self?.refresh() }
             }
+            if permissionWatcher == nil { permissionWatcher = watcher } else { watcher.cancel() }
         }
         isLoading = true
         let (result, _, _) = await permissionRead.read {
@@ -78,16 +104,15 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
             var mailEvidence: (status: String, word: String, next: String?)?
             if checkMail, case .success(let snapshot) = result, snapshot.permissions["mail"]?.read == true {
                 do {
-                    mailEvidence = MacAssistantStatusResult.mailReadiness(
-                        from: await MacAssistantParts.recover(try await MacAppleScriptBridge.mailListRecent(input: ["limit": .int(1)], context: .init(
-                            dataRoot: dataRoot)), integration:"mail",
-                            dataRoot:dataRoot))
+                    // The person's Check Mail reads mail.recent through the door, as any read of it runs.
+                    mailEvidence = MacAssistantStatusResult.mailReadiness(from: try await MacAssistantParts.verb("mail.recent", input: ["limit": .int(1)],
+                        dataRoot: dataRoot, envelope: .personOnMac("mac_ui:mail.check")))
                 } catch {
                     mailEvidence = (status: "failed", word: "Check failed", next: UserFacingError.cause(error, action: "check Mail"))
                 }
             }
-            let statuses = await Task.detached(priority: .userInitiated) {
-                ["speech_recognition": Self.badgeKey(SystemPermissionPreflight.status(.speechRecognition)),
+            let grants = await Task.detached(priority: .userInitiated) {
+                var statuses = ["speech_recognition": Self.badgeKey(SystemPermissionPreflight.status(.speechRecognition)),
                  "microphone": Self.badgeKey(SystemPermissionPreflight.status(.microphone)),
                  "calendar": LocalPIMConnectorActions.currentCalendarAuthorizationStatus(),
                  "reminders": LocalPIMConnectorActions.currentReminderAuthorizationStatus(),
@@ -95,11 +120,11 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
                  "accessibility": SystemPermissionPreflight.status(.accessibility).rawValue,
                  "screenRecording": SystemPermissionPreflight.status(.screenRecording).rawValue,
                  "fullDiskAccess": SystemPermissionPreflight.status(.fullDiskAccess).rawValue]
+                for app in AppleScriptExecution.automationTargetApps {
+                    statuses[AppleScriptExecution.automationStatusKey(app: app)] = await AppleScriptExecution.automationStatus(app: app, ask: false)
+                }
+                return statuses
             }.value
-            var grants = statuses
-            for app in AppleScriptExecution.automationTargetApps {
-                grants[AppleScriptExecution.automationStatusKey(app: app)] = await AppleScriptExecution.automationStatus(app: app, ask: false)
-            }
             return (result, grants, mailEvidence)
         } publish: { result, grants, mailEvidence in
             switch result {
@@ -122,6 +147,7 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
             // Mail may launch during its read; publish refreshed grants before checked evidence in the same snapshot.
             if let mailEvidence { mailCheck = mailEvidence }
             isLoading = false
+            publishSettings()
             if grantsChanged { NotificationCenter.default.post(name: Self.systemStatusesDidChange, object: dataRoot) }
         }
         if refreshWatches, watchState.response != nil { await self.refreshWatches(refreshPermissions: false) }
@@ -228,12 +254,16 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
                 return .failure(error)
             }
         } publish: { result in
+            let next: MacAssistantWatchSetupLoadState
             switch result {
-            case .success(let response): watchState = .current(response)
-            case .failure(let error): watchState = watchState.afterFailure(UserFacingError.message(error, action: "refresh background watches"))
+            case .success(let response): next = .current(response)
+            case .failure(let error): next = watchState.afterFailure(UserFacingError.message(error, action: "refresh background watches"))
             }
             isLoadingWatches = false
-            NotificationCenter.default.post(name: Self.watchesDidChange, object: nil)
+            if !watchState.hasSameContent(as: next) {
+                watchState = next
+                NotificationCenter.default.post(name: Self.watchesDidChange, object: nil)
+            }
         }
         return try result.get().projected(lightweight: lightweight)
     }
@@ -295,11 +325,11 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
 }
 
 extension MacIntegrationFacade {
-    /// The watch reading was published (current, stale or unavailable); pages that show it read the published state again.
+    /// Watch content or availability changed (current, stale or unavailable), excluding its sampling timestamp.
     public static let watchesDidChange = Notification.Name("MacIntegrationFacade.watchesDidChange")
 }
 
-public enum MacAssistantWatchSetupLoadState: Equatable {
+public enum MacAssistantWatchSetupLoadState: Equatable, Sendable {
     case loading
     case current(MacAssistantStatusResult)
     case stale(MacAssistantStatusResult, message: String)
@@ -331,5 +361,16 @@ public enum MacAssistantWatchSetupLoadState: Equatable {
     func afterFailure(_ message: String) -> Self {
         guard let response else { return .unavailable(message: message) }
         return .stale(response, message: message)
+    }
+
+    func hasSameContent(as other: Self) -> Bool {
+        switch (self, other) {
+        case (.loading, .loading): true
+        case (.current(let left), .current(let right)): left.hasSameContent(as: right)
+        case (.stale(let left, let message), .stale(let right, let otherMessage)):
+            message == otherMessage && left.hasSameContent(as: right)
+        case (.unavailable(let message), .unavailable(let otherMessage)): message == otherMessage
+        default: false
+        }
     }
 }

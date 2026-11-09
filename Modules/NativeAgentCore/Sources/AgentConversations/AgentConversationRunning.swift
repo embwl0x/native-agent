@@ -8,7 +8,7 @@ import PersistenceCore
 public enum AgentConversationWatches {
     public static func begin(row: String, operation: String) { AgentConversationRunning.shared.beginWatch(row + ":" + operation) }
     public static func end(row: String, operation: String) { AgentConversationRunning.shared.endWatch(row + ":" + operation) }
-    /// Reporting expiry leaves the reader running; only settlement retires it.
+    /// Settlement retains the reader until its owner exits.
     public static func retain(_ id: UUID, row: String, operation: String, task: Task<Void, Never>) {
         AgentConversationRunning.shared.retainWatch(id, row: row, operation: operation, task: task)
     }
@@ -61,7 +61,7 @@ final class AgentConversationRunning: @unchecked Sendable {
         lock.withLock { retainedWatches.values.contains { $0.row == row && $0.operation == operation } }
     }
 
-    /// Retirement must also reach watches past their reporting deadline.
+    /// Explicit retirement joins every retained watch for this operation.
     func retireWatches(row: String, operation: String) async -> Bool {
         let tasks = lock.withLock {
             retainedWatches.values.filter { $0.row == row && $0.operation == operation }.map(\.task)
@@ -97,7 +97,7 @@ final class AgentConversationRunning: @unchecked Sendable {
         changed()
     }
 
-    /// The accepted send owns its settlement until actual exit, including after the inline response timeout or a stop request cancels its send.
+    /// Accepted sends retain settlement through actual exit, including after Stop.
     func conclude(row: String, operation: String, work: @escaping @Sendable () async -> Void) {
         let key = row + ":" + operation
         lock.withLock {
@@ -156,7 +156,10 @@ final class AgentConversationRunning: @unchecked Sendable {
 
     func watch(_ row: String) { lock.withLock { watches[row, default: 0] += 1 } }
     func unwatch(_ row: String) {
-        lock.withLock { watches[row] = (watches[row] ?? 1) > 1 ? watches[row]! - 1 : nil }
+        lock.withLock {
+            guard let count = watches[row] else { return }
+            watches[row] = count > 1 ? count - 1 : nil
+        }
         changed() // wakes whoever waits for the watch to end
     }
     func watched(_ row: String) -> Bool { lock.withLock { watches[row] != nil } }
@@ -167,18 +170,22 @@ final class AgentConversationRunning: @unchecked Sendable {
 
     func changed() {
         let woken = lock.withLock {
-            generation += 1
+            generation &+= 1
             defer { changeWaiter = ScopedWaiter() }
             return changeWaiter
         }
         woken.resume()
     }
 
-    func change(after seen: Int, until deadline: Date) async {
+    func change(after seen: Int, until deadline: Date? = nil) async {
         guard let waiter = lock.withLock({ generation == seen ? changeWaiter : nil }) else { return }
+        guard let deadline else { await waiter.park(); return }
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await waiter.park() }
-            group.addTask { try? await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
+            group.addTask {
+                do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
+                catch { return } // Cancellation withdraws this explicitly requested wait.
+            }
             await group.next()
             group.cancelAll()
         }

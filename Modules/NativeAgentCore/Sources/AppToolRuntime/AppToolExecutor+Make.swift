@@ -13,6 +13,27 @@ import MemoryV2
 // Blueprint: | `AppToolExecutor+Make.swift` | `AppToolExecutor`; Studio versions, intake and workspace-fenced reply images |
 
 extension AppToolExecutor {
+    /// A nil ref reads the shelf; an empty ref reads the newest piece, as make.read declares.
+    @MainActor
+    func readMake(ref: String?, offset: Int = 0) async -> JSONValue {
+        let studio = MakeStudio(dataRoot: securityCenter.dataRoot)
+        do {
+            return try await Task.detached(priority: .userInitiated) {
+                guard let ref else { return try studio.shelfPage(offset: offset) }
+                let found = try (ref.isEmpty ? studio.newestMeta() : studio.readMeta(ref))
+                guard let meta = found else {
+                    return Self.doorRefusal("unknown_ref", ref.isEmpty ? "Nothing is in Make yet." : "No Make ref is called \(ref).",
+                        remedy: "correct_route", "Read Make's shelf to choose a retained ref.", next: ["page": .string("make")])
+                }
+                return studio.receipt(meta)
+            }.value
+        } catch {
+            return Self.ownedFailure(error, code: "make_unreadable", owner: studio.root.path,
+                instruction: "Repair the named Make metadata or storage error, then read the shelf again; no empty shelf was established.",
+                next: ["page": .string("make")], effects: .none)
+        }
+    }
+
     @MainActor
     func runStudioIntakeRead(input: [String: JSONValue], surface: String) async -> JSONValue {
         guard MemoryRecordDisclosurePolicy.localPrivateSurfaces.contains(MemoryRecordDisclosurePolicy.canonicalSurface(surface)) else {
@@ -33,35 +54,12 @@ extension AppToolExecutor {
     }
 
     /// Studio reads and writes share the versioned MakeStudio refs shown in the Work pane.
-    @MainActor
     func runMake(verb: String, input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue {
         let root = securityCenter.dataRoot
         let studio = MakeStudio(dataRoot: root)
         let ref = input["ref"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         if verb == "read" {
-            let found: MakeStudio.Meta?
-            do { found = try (ref.isEmpty ? studio.newestMeta() : studio.readMeta(ref)) } catch {
-                return Self.failure("make_unreadable", "Make could not be read: \(error.localizedDescription)", extra: ["effects": .string("none")])
-            }
-            guard let meta = found else {
-                return Self.failure("unknown_ref", ref.isEmpty ? "Nothing is in Make yet." : "No Make ref is called \(ref).")
-            }
-            var receipt: [String: JSONValue] = [
-                "status": .string("ok"), "ref": .string(meta.ref),
-                "versions": .array(meta.versions.map { version in
-                    var row: [String: JSONValue] = [
-                        "n": .int(Int64(version.n)), "path": .string(studio.url(meta.ref, version).path),
-                        "created": .string(version.created),
-                    ]
-                    if let prompt = version.prompt { row["prompt"] = .string(prompt) }
-                    if let model = version.model { row["model"] = .string(model) }
-                    if let madeBy = version.madeBy { row["made_by"] = .string(madeBy) }
-                    return .object(row)
-                }),
-            ]
-            // What the shelf could not read stays on the receipt beside what it could.
-            if let fault = quietHost()?.makeShelfFault { receipt["shelf_fault"] = .string(fault) }
-            return .object(receipt)
+            return await readMake(ref: ref)
         }
         let path = input["path"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !path.isEmpty else { return Self.failure("invalid_input", "Pass path: the file to add to Make.") }
@@ -85,12 +83,12 @@ extension AppToolExecutor {
                             "path": .string(studio.url(added.ref, added.version).path)])
         } catch let refusal as MakeStudio.Refusal {
             return Self.doorRefusal(refusal.reason, refusal.message, remedy: "inspect",
-                "Read Make's latest retained piece before choosing a destination; omit ref only for a new piece.",
-                next: ["action": .string("make.read")])
+                "Read Make's shelf before choosing a destination; omit ref only for a new piece.",
+                next: ["page": .string("make")])
         } catch {
             return Self.ownedFailure(error, code: "make_add_failed", owner: studio.root.path,
                 instruction: "Read Make's retained versions and resolve the reported storage error before adding another copy; this add was not verified.",
-                next: ["action": .string("make.read"), "args": .object(ref.isEmpty ? [:] : ["ref": .string(ref)])], effects: .unknown)
+                next: ref.isEmpty ? ["page": .string("make")] : ["page": .string("make"), "item": .string(ref)], effects: .unknown)
         }
     }
 

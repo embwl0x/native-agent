@@ -76,7 +76,7 @@ extension AgentWorkspaceNavigation {
             case "recall_memory": isSource = input["memory_id"] != nil
             case "desk_read": isSource = input["handle"] != nil
             // Correspondence may be an unrelated interruption. Keep the window for returning, but attach it to the work only on explicit Keep.
-            case "chat_conversations", "mail_list_recent", "messages_recent_threads": isSource = false
+            case "chat_conversations", "mail.recent", "messages.recent": isSource = false
             case "agent_read":
                 if case .string(let agent)? = input["agent"] { isSource = agent.hasPrefix("bot:") || input["conversation"] != nil }
                 else { isSource = false }

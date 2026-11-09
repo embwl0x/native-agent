@@ -30,7 +30,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     /// AX timeouts belong to object instances, not process identities.
     func setMessagingTimeout(pid: Int32, seconds: Float) {
         MacAXExecutionLane.sync {
-            guard pid != getpid() else { return }
+            guard !PersonOnlyWindows.isOwnProcess(pid) else { return }
             lock.lock()
             defer { lock.unlock() }
             messagingTimeouts[pid] = seconds == 0 ? nil : seconds
@@ -59,11 +59,11 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         let window: AXUIElement
         let focus: AXUIElement
     }
-    func captureContinuation(pid: Int32?, taskReference: String, context: MacOperationContext) async -> MacWorkContinuation {
+    @concurrent func captureContinuation(pid: Int32?, taskReference: String, context: MacOperationContext) async -> MacWorkContinuation {
         guard isTrusted() else {
             return .unsupported("accessibility_permission_missing", taskReference: taskReference)
         }
-        guard let pid, pid != getpid() else {
+        guard let pid, !PersonOnlyWindows.isOwnProcess(pid) else {
             return .unsupported("previous_app_unavailable", taskReference: taskReference)
         }
         do {
@@ -105,7 +105,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             .unsupported(reason, taskReference: taskReference)
         }
         guard isTrusted() else { return unsupported("accessibility_permission_missing") }
-        guard pid != getpid(), let app = appInfo(pid: pid) else {
+        guard !PersonOnlyWindows.isOwnProcess(pid), let app = appInfo(pid: pid) else {
             return unsupported("previous_app_unavailable")
         }
         // Saver or lock cover cannot anchor a continuation to an app the user was working in.
@@ -211,7 +211,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         AXIsProcessTrusted()
     }
     package func nativeApplication(pid: Int32, context: MacOperationContext) -> AXUIElement? {
-        guard pid != getpid(), isTrusted() else { return nil }
+        guard !PersonOnlyWindows.isOwnProcess(pid), isTrusted() else { return nil }
         let app = AXUIElementCreateApplication(pid)
         guard (try? Self.ensureRenderer(app, refresh: true, context: context)) != nil else { return nil }
         return app
@@ -237,7 +237,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
               let current = frontmostWindowRoot(context: context), let currentElement = element(current),
               let original = element(window), CFEqual(currentElement, original),
               let target = element(container), attributes(of: container, context: context)?.frame == frame else { return false }
-        // System-wide hits can enter this app’s AX tree and therefore require the main AX lane.
+        // System-wide hits share the AX thread so cross-process reads never occupy the window's thread.
         var hit: AXUIElement? = MacAXExecutionLane.sync {
             var element: AXUIElement?
             guard AXUIElementCopyElementAtPosition(
@@ -262,7 +262,8 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return MacAXAppInfo(
             name: app.localizedName ?? app.bundleIdentifier ?? "unknown",
             bundleIdentifier: app.bundleIdentifier,
-            processIdentifier: app.processIdentifier
+            processIdentifier: app.processIdentifier,
+            isDockApp: app.activationPolicy == .regular
         )
         #else
         return nil
@@ -276,16 +277,17 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return nil
         #endif
     }
-    /// Only regular UI apps can answer window requests.
+    /// Accessory apps remain running after their last window closes; Dock membership is presentation metadata.
     public func runningApps() -> [MacAXAppInfo] {
         #if canImport(AppKit)
         return NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular && !$0.isTerminated }
+            .filter { !$0.isTerminated && ($0.activationPolicy == .regular || $0.activationPolicy == .accessory) }
             .map { app in
                 MacAXAppInfo(
                     name: app.localizedName ?? app.bundleIdentifier ?? "unknown",
                     bundleIdentifier: app.bundleIdentifier,
-                    processIdentifier: app.processIdentifier
+                    processIdentifier: app.processIdentifier,
+                    isDockApp: app.activationPolicy == .regular
                 )
             }
         #else
@@ -295,7 +297,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     /// Read the menu bar root only; MacMenuBar owns bounded descent.
     public func menuBarRoot(pid: Int32, context: MacOperationContext) -> MacAXElementRef? {
         #if canImport(AppKit)
-        guard pid != getpid(), isTrusted() else { return nil }
+        guard !PersonOnlyWindows.isOwnProcess(pid), isTrusted() else { return nil }
         let app = AXUIElementCreateApplication(pid)
         guard let bar = MacAXAttributeRead.copyElement(app, kAXMenuBarAttribute, context: context) else { return nil }
         return mint(bar)
@@ -304,7 +306,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         #endif
     }
     public func transientMenuRoots(pid: Int32, context: MacOperationContext) -> [MacAXElementRef] {
-        guard pid != getpid(), isTrusted(), frontmostApp()?.processIdentifier == pid else { return [] }
+        guard !PersonOnlyWindows.isOwnProcess(pid), isTrusted(), frontmostApp()?.processIdentifier == pid else { return [] }
         let app = AXUIElementCreateApplication(pid)
         var menus: [AXUIElement] = []
         func appendMenu(_ element: AXUIElement) {
@@ -342,8 +344,8 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     }
     public func windowRoot(pid: Int32, context: MacOperationContext) -> MacAXElementRef? {
         #if canImport(AppKit)
-        // Refuse self-process elements even for direct callers: AppKit re-entry can deadlock the main thread.
-        guard pid != getpid() else { return nil }
+        // Direct callers cannot read person-only UI.
+        guard !PersonOnlyWindows.isOwnProcess(pid) else { return nil }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
         let appElement = prepareForRead(AXUIElementCreateApplication(pid))
         // Require a window root; a non-window root can spend the walk budget on the menu bar.
@@ -368,8 +370,8 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     /// Use AXWindows order, then union CF-equal focused/main references so omitted Finder sheets retain their identity without duplicates.
     public func windowRoots(pid: Int32, context: MacOperationContext) -> [MacAXWindowHandle] {
         #if canImport(AppKit)
-        // Apply the same self-process deadlock fence as windowRoot.
-        guard pid != getpid() else { return [] }
+        // Every window shares the process's person-only boundary.
+        guard !PersonOnlyWindows.isOwnProcess(pid) else { return [] }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return [] }
         let appElement = AXUIElementCreateApplication(pid)
         let windows = MacAXWindowInventory.union(
@@ -395,7 +397,8 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return MacAXAppInfo(
             name: app.localizedName ?? app.bundleIdentifier ?? "unknown",
             bundleIdentifier: app.bundleIdentifier,
-            processIdentifier: pid
+            processIdentifier: pid,
+            isDockApp: app.activationPolicy == .regular
         )
         #else
         return nil
@@ -425,7 +428,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         guard let root = element(rootRef) else { return nil }
         var pid: pid_t = 0
         guard AXUIElementGetPid(root, &pid) == .success else { return nil }
-        guard pid != getpid() else { return nil }
+        guard !PersonOnlyWindows.isOwnProcess(pid) else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
         guard let focused = MacAXAttributeRead.copyElement(appElement, kAXFocusedUIElementAttribute, context: context) else { return nil }
         return snapshot.nodes.first { node in
@@ -560,11 +563,12 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return try MacAXAttributeRead.collectingAttributeGaps(context: context) { gaps, context in
             let actions = try MacAXAttributeRead.observationActions(element, context: context)
             let names = MacAXAttributeRead.copyLabel(element, role: role, context: context, prepare: prepareForRead)
+            // The shared value reader suppresses unknown text subroles; every other value failure still makes coverage incomplete.
+            let rawValue = MacAXAttributeRead.copyRaw(element, kAXValueAttribute, context: context)
             // Failed caption or geometry reads leave secrecy unproven and must withhold pixels even when looks can report a gap.
-            if let gap = gaps.values.first {
-                throw MacAccessibilityReader.NativeReadFailure(detail: "Required secret-masking read failed: \(gap)")
+            if let gap = gaps.entries.first(where: { $0.attribute != kAXSubroleAttribute }) {
+                throw MacAccessibilityReader.NativeReadFailure(detail: "Required secret-masking read failed: \(gap.detail)")
             }
-            let rawValue = try MacAXAttributeRead.checkedRaw(element, kAXValueAttribute, context: context)
             return MacAXAttributes(
                 role: role,
                 subrole: names.subrole,
@@ -610,6 +614,24 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             return count
         }
     }
+    public func liesWhollyOutside(_ ref: MacAXElementRef, bounds: MacAXFrame, context: MacOperationContext) -> Bool {
+        guard let element = element(ref) else { return false }
+        // Only a plain container can hold visible children beyond its own frame. An unreadable role or frame is no proof: the ordinary read reports it.
+        return (try? MacAXAttributeRead.node(context: context) { context in
+            let role = try MacAXAttributeRead.checkedText(element, kAXRoleAttribute, context: context)
+            // A table's columns list the same cells its rows do, thousands of them in a long list; its rows already answer for them.
+            if role == "AXColumn", let table = try MacAXAttributeRead.checkedRaw(element, kAXParentAttribute, context: context),
+               CFGetTypeID(table) == AXUIElementGetTypeID() {
+                var rows: CFIndex = 0
+                if AXUIElementGetAttributeValueCount(table as! AXUIElement, kAXRowsAttribute as CFString, &rows) == .success, rows > 0 { return true }
+            }
+            guard !role.isEmpty, !Self.containerRoles.contains(role),
+                  let frame = try MacAXAttributeRead.checkedFrame(element, context: context), frame.w > 0, frame.h > 0 else { return false }
+            return frame.y + frame.h <= bounds.y || frame.y >= bounds.y + bounds.h || frame.x + frame.w <= bounds.x || frame.x >= bounds.x + bounds.w
+        }) ?? false
+    }
+    private static let containerRoles: Set<String> = ["AXWindow", "AXGroup", "AXScrollArea", "AXSplitGroup", "AXTabGroup", "AXLayoutArea", "AXLayoutItem",
+        "AXWebArea", "AXList", "AXTable", "AXOutline", "AXColumn", "AXSheet", "AXDrawer", "AXPopover", "AXUnknown"]
     public func checkedChildren(of ref: MacAXElementRef, limit: Int, context: MacOperationContext) throws -> [MacAXElementRef] {
         try MacAXAttributeRead.checked(context: context) { context in children(of: ref, limit: limit, context: context) }
     }

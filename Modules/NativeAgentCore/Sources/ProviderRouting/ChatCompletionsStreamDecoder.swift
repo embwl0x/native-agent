@@ -3,8 +3,7 @@ import NativeAgentCore
 
 // Blueprint: | `ChatCompletionsStreamDecoder.swift` | `ChatCompletionsStreamDecoder`: checked stream terminals and fragments |
 
-/// Root errors precede choices so the provider's cause survives. Calls retain wire order and require a terminal verdict, complete arguments and nonempty
-/// output.
+/// Root errors precede choices so the provider's cause survives. Calls retain wire order and require a terminal verdict and complete arguments.
 public struct ChatCompletionsStreamDecoder {
     private let providerLabel: String
     private let retainReasoning: Bool
@@ -23,16 +22,15 @@ public struct ChatCompletionsStreamDecoder {
     private var terminalBoundaryReason: LLMToolBoundaryReason?
     private var streamError: Error?
     private var refusalText = ""
+    private var terminalFinishReason: String?
     var errorDetail: String? { streamError.map(ProviderFailure.diagnosticDescription) }
-    private var runaway: RunawayOutputDetector
     public var toolBoundaryReason: LLMToolBoundaryReason? {
-        reachedLengthLimit ? .outputLimit : terminalBoundaryReason ?? runaway.toolBoundaryReason
+        reachedLengthLimit ? .outputLimit : terminalBoundaryReason
     }
 
-    public init(providerLabel: String, retainReasoning: Bool = false, diagnosticDataRoot: URL? = nil, call: LLMCall) {
+    public init(providerLabel: String, retainReasoning: Bool = false) {
         self.providerLabel = providerLabel
         self.retainReasoning = retainReasoning
-        self.runaway = RunawayOutputDetector(diagnosticDataRoot: diagnosticDataRoot, call: call)
     }
 
 
@@ -59,7 +57,7 @@ public struct ChatCompletionsStreamDecoder {
                     : frame.callInput.map(LLMMessageStreamEvent.callInput) ?? .keepAlive
                 if providerID == "xai_oauth_direct", let toolMovement { continuation.yield(toolMovement) }
                 if let content = frame.content {
-                    sawContent = true
+                    sawContent = sawContent || content.contains(where: { !$0.isWhitespace })
                     continuation.yield(.textDelta(content))
                 }
                 if providerID != "xai_oauth_direct" {
@@ -71,17 +69,15 @@ public struct ChatCompletionsStreamDecoder {
             }
         } catch {
             try Task.checkCancellation()
-            guard !(error is any ProviderFailureWrapping),
-                  ProviderFailure.classify(error) == .network else { throw error }
+            let cause = ProviderFailure.classify(error)
+            guard cause == .network || cause == .offline else { throw error }
             streamError = error
             terminalBoundaryReason = .interrupted
         }
         try Task.checkCancellation()
         let terminal = Result {
-            try finalizedToolCalls(idPrefix: idPrefix, providerID: providerID, sawContent: sawContent)
-        }
-        if reachedLengthLimit {
-            RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit", dataRoot: telemetry.diagnosticDataRoot(call: call), call: call)
+            try finalizedToolCalls(idPrefix: idPrefix, providerID: providerID, sawContent: sawContent,
+                                   allowsSilentCompletion: call.allowsSilentCompletion)
         }
         await telemetry.record(call: call,
             requestBody: request.httpBody, provider: providerID, model: model, streaming: true,
@@ -94,6 +90,7 @@ public struct ChatCompletionsStreamDecoder {
         for call in completed { continuation.yield(.toolCall(call)) }
         await onCalls(completed, reasoning)
         if let reason = toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
+        if let streamError { throw streamError }
     }
 
     public struct DecodedFrame: Sendable, Equatable {
@@ -101,7 +98,7 @@ public struct ChatCompletionsStreamDecoder {
         public var content: String?
         /// Reasoning deltas renew liveness without becoming reply text.
         public var reasoning: String?
-        /// Each tool fragment renews Moonshot's idle clock during long argument accumulation.
+        /// Tool fragments report provider movement during argument accumulation.
         public var toolCallDeltaCount = 0
         /// The named call this frame's fragments wrote into, with its input so far.
         public var callInput: LLMStreamCallInput?
@@ -138,6 +135,7 @@ public struct ChatCompletionsStreamDecoder {
         }
         try throwIfChatCompletionsProviderError(choice)
         frame.finishReason = choice["finish_reason"] as? String
+        if let reason = frame.finishReason { terminalFinishReason = reason }
         if frame.finishReason == "length" { reachedLengthLimit = true }
         if frame.finishReason == "content_filter" { terminalBoundaryReason = .refusal }
         guard let delta = choice["delta"] as? [String: Any] else {
@@ -148,9 +146,7 @@ public struct ChatCompletionsStreamDecoder {
             frame.reasoning = thought
         }
         if let content = delta["content"] as? String, !content.isEmpty {
-            _ = runaway.feed(content)
-            let kept = runaway.takeCommittedText()
-            frame.content = kept.isEmpty ? nil : kept
+            frame.content = content
         }
         if let refusal = delta["refusal"] as? String, !refusal.isEmpty {
             refusalText += refusal
@@ -215,7 +211,8 @@ public struct ChatCompletionsStreamDecoder {
     mutating func finalizedToolCalls(
         idPrefix: String,
         providerID: String,
-        sawContent: Bool
+        sawContent: Bool,
+        allowsSilentCompletion: Bool
     ) throws -> [LLMStreamToolCall] {
         if !refusalText.isEmpty { terminalBoundaryReason = .refusal }
         if terminalBoundaryReason == .refusal {
@@ -246,9 +243,10 @@ public struct ChatCompletionsStreamDecoder {
             completed.append(LLMStreamToolCall(id: id, name: call.name, inputJSON: Data(arguments.utf8)))
         }
         if completed.isEmpty, let streamError { throw streamError }
-        if !sawContent && completed.isEmpty && toolBoundaryReason == nil {
-            throw LLMError.streamTruncated(
-                message: "\(providerID) stream produced no content ([DONE], empty)"
+        let silentCompletion = allowsSilentCompletion && sawDone && terminalFinishReason == "stop"
+        if !sawContent && completed.isEmpty && toolBoundaryReason == nil && !silentCompletion {
+            throw ProviderFailure.Diagnostic(cause: .malformedResponse,
+                detail: "\(providerID) stream produced no content ([DONE], empty)"
             )
         }
         return completed
@@ -299,7 +297,7 @@ func applyStreamingLLMHeaders(to request: inout URLRequest) {
 func mapTransportError(_ error: Error, fallback: @autoclosure () -> LLMError) -> Error {
     if error is CancellationError { return CancellationError() }
     let nsError = error as NSError
-    if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled {
+    if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled, Task.isCancelled {
         return CancellationError()
     }
     if error is any ProviderFailureWrapping { return error }
@@ -321,14 +319,15 @@ func throwIfChatCompletionsError(
 ) throws {
     guard !(200..<300).contains(status) else { return }
     let detail = ProviderFailure.wireDetail(data)
+    let retryAfter = parseRetryAfterSeconds(from: response)
     throw ProviderFailure.Diagnostic(cause: .http(
         status: status,
         detail: detail,
-        retryAfter: parseRetryAfterSeconds(from: response)
-    ), detail: "HTTP \(status): \(detail)")
+        retryAfter: retryAfter
+    ), detail: "HTTP \(status): \(detail)", retryAfter: retryAfter)
 }
 
-/// Retry-After admits RFC 7231 seconds/date forms within the shared cap; invalid input stays nil.
+/// Retry-After admits RFC 7231 seconds/date forms; an unknown delay supplies no clock.
 func parseRetryAfterSeconds(from response: URLResponse?, now: Date = Date()) -> Int? {
     guard let http = response as? HTTPURLResponse else { return nil }
     guard
@@ -336,15 +335,17 @@ func parseRetryAfterSeconds(from response: URLResponse?, now: Date = Date()) -> 
             .trimmingCharacters(in: .whitespacesAndNewlines),
         !raw.isEmpty
     else { return nil }
-    if let secs = Int(raw) { return max(0, min(secs, LLMError.retryAfterMaxSeconds)) }
+    if let secs = Int(raw) { return secs >= 0 ? secs : nil }
     // HTTP-date is the alternate RFC 7231 form.
     let fmt = DateFormatter()
     fmt.locale = Locale(identifier: "en_US_POSIX")
     fmt.timeZone = TimeZone(identifier: "GMT")
     fmt.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
     if let date = fmt.date(from: raw) {
-        let delta = Int(date.timeIntervalSince(now).rounded())
-        return max(0, min(delta, LLMError.retryAfterMaxSeconds))
+        let delta = date.timeIntervalSince(now).rounded(.up)
+        guard delta.isFinite, delta < Double(Int.max) else { return nil }
+        if delta <= 0 { return 0 }
+        return Int(delta)
     }
     return nil
 }

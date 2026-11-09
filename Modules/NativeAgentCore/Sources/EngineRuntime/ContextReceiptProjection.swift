@@ -22,6 +22,7 @@ public struct ComposerContextReceiptRow: Identifiable, Equatable, Sendable {
 }
 
 public struct ComposerContextReceipt: Equatable, Sendable {
+    public var turnId: String? = nil
     public let model: String?
     public let ranAt: Date
     public let rows: [ComposerContextReceiptRow]
@@ -148,13 +149,15 @@ public enum ContextReceipts {
             return .unavailable("Tool catalog measurement is unavailable: " + failure)
         }
         do {
-            return .receipt(try receipt(
+            var reading = try receipt(
                 payload: payload,
                 ranAt: snapshot.ts,
                 pointedMidTurn: pointed,
                 calls: calls,
                 previousHistoryBytes: previousHistoryBytes
-            ))
+            )
+            reading.turnId = turnId
+            return .receipt(reading)
         } catch {
             return .unavailable(error.localizedDescription)
         }

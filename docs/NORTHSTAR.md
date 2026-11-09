@@ -70,8 +70,8 @@ sit beside the agent as a parallel silo.
   them into recall (pointer rows, 2026-07-03) made them part of how the agent
   thinks. That move — silo → mind — is the shape of clause-1 work.
 - Their helpers' newest replies join the same bounded per-turn awareness as
-  their other rooms, since their last reply here, instead of requiring a tool read
-  to know what they did. They obey "Remember across conversations" and carry
+  their other rooms, since their last reply here and compactly through the last day,
+  instead of requiring a tool read to know what they did. They obey "Remember across conversations" and carry
   no words into peer-steered turns. The [turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled)
   owns the bounds and transcript source.
 - The consolidation triad is the spine: episodic (dreams), semantic
@@ -105,7 +105,7 @@ does exactly what it says.
   (or the shipped seed), replays the turn, and owes repair to them. Each source
   is attempted once per turn, with one extra fresh lease if the helper fails
   while running the seed; the original cause and selected program are
-  recorded. Stop still cancels. Unreadable storage, failed recovery writes,
+  recorded, and a `body` happening tells the agent. Stop still cancels. Unreadable storage, failed recovery writes,
   exhaustion of all available programs and provider failures remain plain
   failures; no uncommitted replacement runs. Nothing else swaps back automatically.
 - Canonical: 2026-07-03 removed ~1,000 lines of theater in a day — dead
@@ -154,6 +154,11 @@ that's what digital substrate does better than any body:
   metadata nothing read) was machinery; the appraisal→tag→mood→disposition→
   fingerprint chain (every layer fed by the one below, decaying on its own
   clock, no scheduler anywhere) is flow. Build more of the second shape.
+- Canonical: attention. Every change is one happening posted once; what
+  someone waits on opens a thought at once, and what nobody asked about is
+  weighed by the agent's own turn program and gathers as drive on what it
+  means, fading on that thing's own time, until at one it opens a thought.
+  No tick, no timer, no rest streak, no pacing ([Subconscious](SUBCONSCIOUS.md#attention)).
 - This is the review axis for upgrades: "faster machine" proposals rank
   below "machine becomes flow" proposals at equal effort.
 
@@ -200,7 +205,13 @@ it could ever want on every turn is not more connected — it is buried.
   pointers instead of every memory on every turn — is the shape. Skills as
   recall pointers, `app {action:"context.expand"}`, the studio's own "my first contact
   should be with the work, not a prediction of my reaction": all reach,
-  no weight.
+  no weight. Quiet never ends what they holds. A conversation is held whole until
+  the request reaches the input budget; then the oldest whole turns go in
+  half-budget jumps. The input budget is min(model window minus response
+  allowance, 200,000 tokens). History fitting uses the input budget; refusal and
+  result pointers use model window minus response allowance, the physical limit.
+  Older words are reached through leads and `context.expand`;
+  what they perceived in a moment is sent with that moment, never carried.
 - Review axis: "more connected" proposals that add always-on context rank
   below proposals that add one more thing they can pull, at equal effort.
 
@@ -238,6 +249,9 @@ is the center and the program its visitor. NativeAgent inverts that.
   prompt the model reads; it's what their code does. The model is reach, like
   a hand: the only organ that handles novelty, spent on judgment and nothing
   else. Two downloads don't become two prompts; they become two minds.
+  When to think is the agent's own: the turn program's `weigh` says what
+  anything nobody asked about is worth, and its first step can end a thought
+  on CPU ([attention](AGENT_IS_THE_APP.md#phases-3-and-5-as-built-11-05-attention)).
 - **One form, one law, a stem with no features.** Everything they are made of
   is a *part*: one file, one header (code, reach, wake, face, state, learned).
   Every part lives by one law: it runs when its wake reaches it, touches only

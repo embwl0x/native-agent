@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 #if canImport(CoreGraphics) && os(macOS)
 import CoreGraphics
@@ -128,7 +129,6 @@ public enum MacPersonInput {
     private nonisolated(unsafe) static var lastBlind = -Double.infinity
     /// Input before tap startup cannot establish tap provenance.
     private nonisolated(unsafe) static var started = Double.infinity
-    private nonisolated(unsafe) static var windowServer: pid_t = 0
     private nonisolated(unsafe) static var port: CFMachPort?
     /// Only the person-input thread touches this transition state.
     private nonisolated(unsafe) static var away = false
@@ -258,23 +258,9 @@ public enum MacPersonInput {
     }
 
     #if canImport(CoreGraphics) && os(macOS)
-    /// The tap and synchronous takeover must classify provenance identically.
-    static func isPerson(_ event: CGEvent) -> Bool {
-        let pid = pid_t(truncatingIfNeeded: event.getIntegerValueField(.eventSourceUnixProcessID))
-        if pid == 0 { return true }
-        return clock.withLock {
-            if pid == windowServer { return true }
-            var name = [UInt8](repeating: 0, count: 64)
-            let length = pid == getpid() ? 0 : proc_name(pid, &name, UInt32(name.count))
-            guard length > 0, String(decoding: name.prefix(Int(length)), as: UTF8.self) == "WindowServer" else { return false }
-            windowServer = pid
-            return true
-        }
-    }
-
     private static func note(_ event: CGEvent) -> Bool {
         let now = ProcessInfo.processInfo.systemUptime
-        let person = isPerson(event)
+        let person = NativePersonInput.isPerson(event)
         clock.withLock { if person { lastPerson = now } else { lastSynthetic = now } }
         return person
     }

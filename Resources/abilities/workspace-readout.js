@@ -1,6 +1,6 @@
 /* NativeAgent ability
 {
-  "id":"workspace-readout", "kind":"ability", "version":1,
+  "id":"workspace-readout", "kind":"ability", "version":2,
   "reach":{"capabilities":[],"readPaths":[],"hosts":[],"apps":[]},
   "face":{"projection":true},
   "record":{"description":"Compose Today, Music and helper workspace faces from native read facts, selecting only bound item and action keys.","actions":[],"inputSchema":{"type":"object","required":["mode"]}}
@@ -52,7 +52,7 @@ function run(input) {
     if (input.mode === "music") {
         const screen = "screen on music.control means: needs the Music window in front.";
         if (input.state === "unavailable") return {title:"Music",content:{note:screen},items:[],actions:["play","pause","stop","next","previous","playlist","track","find","playlists"].map(action)};
-        const r=input.result, now=input.tool === "music_control" ? r.now_playing : r;
+        const r=input.result, now=input.tool === "music.control" ? r.now_playing : r;
         function playing(row) {
             const state=row.state;
             const since=text(row.since) ? " · observed since "+row.since+" (transition time unknown)" : " · since unknown";
@@ -69,7 +69,7 @@ function run(input) {
         const content={note:screen}, items=[];
         for (const key of ["count","total","has_more","offset","limit","sort","filter"]) if (r[key] !== undefined) content[key]=r[key];
         if (typeof r.count === "number" && typeof r.total === "number") content.message=r.count+" returned of "+r.total+" · has_more: "+r.has_more+(r.has_more ? " · next offset: "+(r.offset+r.count) : "");
-        if (["music_now_playing","music_control"].includes(input.tool) && !input.failed) content.message=playing(now);
+        if (["music.now_playing","music.control"].includes(input.tool) && !input.failed) content.message=playing(now);
         [...(r.results || []),...(r.tracks || [])].forEach((track,index)=>{
             const name=text(track.name); if (!name) return;
             const key="track:"+index;

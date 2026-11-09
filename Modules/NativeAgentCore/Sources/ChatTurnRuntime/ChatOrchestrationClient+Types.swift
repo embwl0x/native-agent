@@ -17,14 +17,12 @@ import CognitiveSubstrate
 // MARK: - Public types
 
 public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
-    case replyHeldForQuietHours
     case emptyMessage
     case underlying(String)
     case helperModelChoice(sessionID: String, reason: String, message: String)
 
     public var errorDescription: String? {
         switch self {
-        case .replyHeldForQuietHours: return "Reply held for quiet hours."
         case .emptyMessage:
             return "chat: message body must contain non-whitespace content"
         case .underlying(let message):

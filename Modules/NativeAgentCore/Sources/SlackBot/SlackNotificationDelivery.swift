@@ -16,15 +16,14 @@ extension SlackWebAPI {
             guard let response = value.objectValue?["response"]?.objectValue else {
                 return .unknown(sent: true, reason: "Slack response envelope is unreadable")
             }
-            if response["ok"] == .bool(true), let ts = response["ts"]?.stringValue, !ts.isEmpty {
+            if response["ok"] == .bool(true), let ts = response["ts"]?.stringValue, !ts.isEmpty,
+               try !hasTruncationWarning(value) {
                 return .delivered
             }
             if let status = response["httpStatus"]?.exactIntegerValue, status >= 500 || status == 408 {
                 return .unknown(sent: true, reason: "Slack returned an inconclusive server failure")
             }
-            // A real Slack ok:false/error reply refuses the send. A parser's synthetic non_json_response/http_N error is not an API refusal.
-            if response["ok"] == .bool(false), let reason = response["error"]?.stringValue,
-               !reason.isEmpty, reason != "non_json_response", !reason.hasPrefix("http_") {
+            if try isProvenMessageRejection(value), let reason = response["error"]?.stringValue {
                 return .notDelivered(reason: reason)
             }
             return .unknown(sent: true, reason: "Slack did not return a checked message acceptance or API rejection")

@@ -7,7 +7,7 @@ extension ChatSessionRetention {
     // same owner through the host. PrivacyMap: chat.
 
     /// A closed-pin result cannot imply that invalid or already-unpinned requests changed storage.
-    public enum CloseResult: Equatable {
+    public enum CloseResult: Equatable, Sendable {
         case closed(encoded: String)
         case refusedInvalidSessionID
         case refusedAlreadyUnpinned
@@ -28,20 +28,20 @@ extension ChatSessionRetention {
 
     /// The durable list is committed before a caller publishes its derived view.
     @discardableResult
-    @MainActor
     public static func save(
         _ ids: [String],
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws -> String {
         let clean = cleanedSessionIds(ids)
         let data = try JSONEncoder().encode(clean)
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: macPinnedSessionIdsPath(dataRoot: dataRoot))
+        if try load(dataRoot: dataRoot) != clean {
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: macPinnedSessionIdsPath(dataRoot: dataRoot))
+        }
         let encoded = String(decoding: data, as: UTF8.self)
         return encoded
     }
 
     /// Close through the durable owner; a failed write leaves the pin visible.
-    @MainActor
     public static func closePinnedTab(
         sessionID: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -63,20 +63,11 @@ extension ChatSessionRetention {
     }
 
     @discardableResult
-    @MainActor
     public static func request(
         encodedPinnedIDs: String,
-        dataRoot: URL = defaultDataRoot(),
-        publish: ([String]) -> Void
-    ) -> Bool {
-        let requested: [String], persisted: [String]
-        do {
-            requested = try decode(encodedPinnedIDs)
-            persisted = try load(dataRoot: dataRoot)
-        } catch { return false }
-        guard requested == persisted else { return false }
-        publish(persisted)
-        return true
+        dataRoot: URL = defaultDataRoot()
+    ) throws -> Bool {
+        try decode(encodedPinnedIDs) == load(dataRoot: dataRoot)
     }
 
     static func macPinnedChatSessionIds(dataRoot: URL) throws -> Set<String> {

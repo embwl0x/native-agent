@@ -49,6 +49,27 @@ from the dream's high-water cutoff through the material read:
   User's words, using the memory's source evidence (older standing corrections
   use their dedicated source). Peer and self writes are not called User's
   corrections.
+- The turn program's own kinds, counted once per settled turn and owned by the
+  version its helper opened: incomplete or failed, stopped, a repeated block
+  or action, a malformed call, and a heal (owned by the version healed away
+  from).
+
+The reading is typed (`SurpriseReading`): each group names its owner, the
+ability whose `authored.<id>` run failed, the turn program by its body digest,
+or none (native hand work, after-turn misses, expansion and organism are the
+dream's only). Each correction in the window, read from the correction ledger
+as session and time only, is owned by the latest turn that settled before it
+in its session: the abilities that turn ran, else the turn program. The dream
+renders the groups' lines; the night (`EngineSleep`, read as `mind.night`)
+counts the owned groups and never their words, and folds each ability's
+timed `corrected` and `slog` surprise (3+ identical top-level calls of it in a
+row within one turn) into the version that ran. Turn-program target and surprise rates count the union of affected settled turns,
+not the sum of kinds: a turn with several kinds is one miss, and a correction to a turn outside the use window stays diagnostic only.
+Heals remain separately diagnostic and adverse verdict evidence, including a version healed away from mid-turn that owns no settled use.
+One reading, two consumers.
+The night freezes attributable window counts with the accounting owner before writing them. Version counts and their completed-through
+watermark commit together; replay writes nothing. The night cursor advances only after every fold settles, and the prepared inputs stay
+durable until its completed row is durable ([manifest](skill_manifest_spec.md)).
 
 This is retained evidence, not an estimate of removed history. Empty kinds
 are omitted. Each present kind gets room in the roughly 2,500-character block;
@@ -71,10 +92,10 @@ After the diary is written, lessons settle through `SwiftNativeMemoryV2.store`,
 the canonical memory commit/admission path: ordinary duplicate matching,
 tombstones, quality and embedding admission still apply. `how` uses the
 existing `skill` memory kind; `fact` uses `fact`, with the original lesson kind
-retained in metadata. The source names the dream, provenance says
-`learned from surprise: <from>`, and `provenance_by` is `self`. The diary also
+retained in metadata. The source names the dream, and its root is `inferred` by
+`self`, with the surprise words as its evidence. The diary also
 keeps their lesson words and the surprise they answer. A self-authored lesson
-retains the dream material's peer boundary, including unknown attribution;
+roots `through` the dream material's peers, or "unattributed dream material";
 authorship does not attest that the source was clean. Save failures remain
 visible in the dream report; returned writing settles even if Stop raced it.
 Their existing recall and came-to-mind paths bring admitted lessons back at a
@@ -97,15 +118,17 @@ Turns nominated by the same precedent now label one claim. Existing frozen
 predictions keep their original keys and labels; they are not rekeyed into
 new claims. Every deferred turn is still batch-judged and labels its claim.
 
-Promises they makes are now an optional section of that same live/batch
-reflection ([Intentions](INTENTIONS.md#promises-they-makes)), with no extra
-call. A reply that promises later work changes a channel even if memories,
-affect, caring and cares are all empty. The complete-no-op label includes
-promises from now on; rows written before promises were asked read as "no
-promise" (ledger version 3 kept: a wrong no-op claim only delays a turn to its
-batch, where its promises are still filed, so a ~4% promise rate does not
-justify discarding ~1,000 labelled turns). Their inferred steps retain the settled turn's
-exact recorded queue steer, origin, session and reply envelope.
+Promises they makes are an optional section of that same live/batch reflection
+([Intentions](INTENTIONS.md#promises-they-makes)). Before filing, the memory model
+judges remaining candidates against their fresh open carried Desk rows: a
+restatement updates its row, one burst is one commitment, and Desk housekeeping
+creates nothing. Canonical step identities retain each original capture across
+closure and archive, so an unfinished reflection cannot recreate it. A reply
+with promise candidates changes a channel even when the filing judgment finds
+they are restatements or housekeeping and memories, affect, caring and cares
+are empty. Retained labels without a measured promise channel stay unknown and
+cannot support complete-no-op standing. Inferred steps retain the settled
+turn's exact recorded queue steer, origin, session and reply envelope.
 
 The comparison bound is now 65,536 chunk pairs, admitting the newest 256
 examples at up to 16 chunks per side. A bounded read of the 10-30 retained
@@ -240,12 +263,13 @@ Before the practice/read-ahead change, their expectation organs were nearly idle
    - Repeated carried-wake handling earns a suggestion through the shared
      `Expectation.stands` cost law; they chooses whether to bind it with
      `queue.update`. Nothing binds automatically.
-   - The bound call runs through their ordinary gated self door at its carried
-     moment. `needs_me` or an unfinished/refused/person-waiting run wakes their
-     with the receipt already in the arrival; a successful routine needs no
-     planning model. The [Habits](HABITS.md) H1/H2 sections own this contract.
-   - Fixed `say` words owed to User or originating from self/person need none;
-     agent-born words still wake their (phase 2 below).
+   - The bound call runs through the agent's ordinary gated self door at its
+     carried moment. `needs_me` or an unfinished/refused/person-waiting run is
+     posted as a `moment` happening with the receipt beside it, which opens a
+     thought; a successful routine needs no planning model. The
+     [Habits](HABITS.md) H1/H2 sections own this contract.
+   - Fixed `say` words owed to User or originating from self need none;
+     any other step's words open a thought (phase 2 below).
 
 ## Their thinking on Today (S5, as built)
 
@@ -326,15 +350,15 @@ nothing today.
      Their turn means no peer `speaker`, not `standingAgent`, and
      `conversationKind(sessionId)?.isPersonConversation == true` (the existing
      row-backed `SessionConversation.kind` lookup, including archives).
-   - Every other recorded turn joins the existing deferred batch (due after
-     45 minutes, up to 4 a call, every usable judgment still labelled).
+   - Every other recorded turn joins the deferred batch when live work releases its owner,
+     up to 4 a call, with every usable judgment labelled and malformed/refused sections left owed.
      Peers, standing agents and helper sessions are not their turns; neither
-     is their `resident-wake` session. Existing own-work exclusions still
+     is the agent's mind stream (`mind`). Existing own-work exclusions still
      apply before a turn becomes a moment.
    - The same owed row and ledger record carry `deferred: true`, reason
-     `not their turn`, and the prediction's actual verdict and claim. Merely
+     `not the person's turn`, and the prediction's actual verdict and claim. Merely
      deferring a peer does not invent a no-op trial. The why-line is
-     `deferred: not their turn; left owed for a batch`.
+     `deferred: not the person's turn; left owed for a batch`.
    - **Provenance verified, already carried:** `judgeOwedBatch` prepares each
      input through `replayRecorded` and the live `interpretMemoryManager`.
      Replay restores speaker/standing-agent identity, envelope, source taint
@@ -350,31 +374,31 @@ nothing today.
    - Expected: about 40% fewer reflection calls.
 2. **Fixed words need no thought (source built; installed proof pending).**
    - A `say` intention whose moment comes delivers its words through the
-     speech path Reach uses, with initiative `.intention`, to User's current
-     conversation. No wake turn and no model call.
-   - It applies to intentions owed to User, or of origin self or person. An
-     agent-born `say` still wakes their.
+     deduplicated speech path (`speakProactively`),
+     to User's current conversation. No thought and no model call.
+   - It applies to intentions owed to User, or of origin self. Any other `say`
+     is posted as a `moment` happening and opens a thought.
    - Its key is the item handle plus the occurrence (`IntentionClock` for a
      rhythm, the due time for `at`), so a retry reconciles the original
      transcript row instead of saying it twice. Other moments use the carry
      fingerprint and latest non-agent note. Its destination carries User's
      own conversation route, as `chat.post` does.
-   - A new post knocks through Reach's informational phone path. The words
+   - A new post knocks through the informational shoulder tap. The words
      land at their time; quiet hours hold only what reaches User, so the
      attention router holds the informational knock until quiet ends
      (User 10-12). An earlier draft held the speech itself, which let a
      rhythm's occurrence age past its two-hour grace and never be said.
-   - Its story gets an agent note, `Said at <ResidentWake.shown(now)>:
-     "<words>"`. A once intention closes with reason `said`; a rhythm goes
-     on, and an until-time ends it as before. Settlement uses `settle` and
-     retains an accepted occurrence fingerprint and its owed Desk settlement
-     atomically in the existing wake ledger. Launch and carried passes finish
-     the idempotent notes and unchanged once-close without speech or another
-     habit run, then clear the debt. This spends no wake or thread hop.
+   - Its story gets an agent note, `Said <MyQueue.shown(now)>: "<words>"`. A
+     once intention closes with reason `said`; a rhythm goes on, and an
+     until-time ends it. Settlement uses `settle` and records the occurrence
+     and its owed Desk settlement in one write in MY QUEUE's carried ledger
+     (`desk/my-queue-carried.json`). Launch and carried passes finish the
+     idempotent notes and unchanged once-close without speech or another
+     habit run, then clear the debt. This opens no thought.
      The old full-turn path for these eligible
      fixed words comes out; no parallel delivery ledger is added.
-   - Failed speech stays ready for the next carried pass and never falls
-     back to a wake. A committed duplicate can establish delivery interrupted
+   - Failed speech stays due for the next carried pass and never becomes a
+     thought. A committed duplicate can establish delivery interrupted
      before its ledger write; saved debts finish without another post or knock.
      The release lead still owes installed proof.
 

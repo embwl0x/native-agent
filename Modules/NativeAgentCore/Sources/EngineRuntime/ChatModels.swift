@@ -106,10 +106,10 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
 }
 
 extension ChatMessage {
-    /// Self-authored wake inputs are never the person’s words, including when the agent also acts on their behalf.
+    /// A thought's opening records in the agent's mind stream are never the person's words, including when the agent also acts on their behalf.
     public var isAgentOwnTurnInput: Bool {
         role == "user" && metadata?.origin?.agent == "self" && metadata?.origin?.authored == "agent"
-            && metadata?.origin?.surface == ResidentWake.session
+            && metadata?.origin?.surface == Happening.stream
     }
 }
 
@@ -150,20 +150,67 @@ extension TranscriptAttachmentPreview {
     }
 }
 
+/// A bounded LRU keeps each attachment path's current inspected identity. Actor isolation shares each decode across transcript readers.
+public actor TranscriptAttachmentPreviews {
+    public static let shared = TranscriptAttachmentPreviews()
+    private struct Entry {
+        let identity: SnapshotTailOpLog.FileStamp
+        let preview: TranscriptAttachmentPreview
+    }
+    private var entries: [String: Entry] = [:]
+    private var oldestFirst: [String] = []
+    private let byteLimit = 16 * 1024 * 1024
+    private let entryLimit = 128
+
+    private func remove(_ path: String) {
+        entries.removeValue(forKey: path)
+        oldestFirst.removeAll { $0 == path }
+    }
+
+    public func read(_ path: String?) -> TranscriptAttachmentPreview {
+        guard let path, !path.isEmpty else { return .init(png: nil) }
+        let url = URL(fileURLWithPath: path)
+        guard let identity = SnapshotTailOpLog.fileStamp(url), identity != .absent else {
+            remove(path)
+            return .init(png: nil)
+        }
+        if let entry = entries[path], entry.identity == identity {
+            oldestFirst.removeAll { $0 == path }
+            oldestFirst.append(path)
+            return entry.preview
+        }
+        remove(path)
+        let preview = TranscriptAttachmentPreview(path: path)
+        // A file replaced during decoding has no certified preview; read its actual identity on the next request.
+        guard SnapshotTailOpLog.fileStamp(url) == identity else { return .init(png: nil) }
+        let cost = preview.png?.count ?? 0
+        // An oversized result can serve this read without being retained by the shared cache.
+        if cost <= byteLimit {
+            while let oldest = oldestFirst.first,
+                  entries.count >= entryLimit || entries.values.reduce(0, { $0 + ($1.preview.png?.count ?? 0) }) + cost > byteLimit {
+                remove(oldest)
+            }
+            entries[path] = Entry(identity: identity, preview: preview)
+            oldestFirst.append(path)
+        }
+        return preview
+    }
+}
+
 extension TranscriptReadout {
     /// Refresh attachments separately: their bytes may change without changing the transcript row or path.
     func attachmentPreviews() async -> Self {
         await Task.detached(priority: .userInitiated) {
-            let rows = self.messages.map { original in
+            var rows: [ChatMessage] = []
+            for original in self.messages {
                 var message = original
-                message.metadata?.attachments = original.metadata?.attachments?.map { original in
-                    var attachment = original
-                    if attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image" {
-                        attachment.preview = TranscriptAttachmentPreview(path: attachment.path)
+                if var attachments = message.metadata?.attachments {
+                    for index in attachments.indices where attachments[index].type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image" {
+                        attachments[index].preview = await TranscriptAttachmentPreviews.shared.read(attachments[index].path)
                     }
-                    return attachment
+                    message.metadata?.attachments = attachments
                 }
-                return message
+                rows.append(message)
             }
             var projection = self
             projection.messages = rows
@@ -207,28 +254,24 @@ extension ChatMessage: MacChatRenderedMessage {
     public var macChatCancelled: Bool { metadata?.cancelled == true }
 }
 
-extension ChatMessage {
-    public init(approval: ApprovalRecord) {
-        var metadata = ChatMessageMetadata()
-        metadata.kind = ChatMessageMetadata.approvalPendingKind
-        metadata.approvalId = approval.id
-        self.init(id: approval.id, role: "tool",
-                  content: "\(approval.title)\n\(approval.reason)\n\(approval.payloadPreview)", metadata: metadata)
-    }
-}
-
 public enum ChatExport {
     public static func export(
         session: ChatSession?,
         sessionId: String,
         messages: [ChatMessage],
-        exportedAt: Date = Date()
+        exportedAt: Date = Date(),
+        destinationDirectory: URL? = nil
     ) async throws -> ChatExportResult {
         try await Task.detached(priority: .userInitiated) {
             guard !sessionId.isEmpty else { throw ChatExportError.noActiveSession }
             guard !messages.isEmpty else { throw ChatExportError.noMessages }
-            guard let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
-                throw ChatExportError.downloadsUnavailable
+            let downloadsDir: URL
+            if let destinationDirectory { downloadsDir = destinationDirectory }
+            else {
+                guard let standard = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
+                    throw ChatExportError.downloadsUnavailable
+                }
+                downloadsDir = standard
             }
 
             let timestamp = fileTimestamp(exportedAt)

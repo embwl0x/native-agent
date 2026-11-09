@@ -53,16 +53,14 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         let held: Bool
         do { held = try await AttentionRouter.hasHeld(dataRoot: dataRoot) }
         catch {
-            nativeLog("desk_notify: held delivery source unavailable: \(error)")
-            return nil // The record's next change rearms the read.
+            await recordDeadlineFailure(error, source: "held notification record")
+            return nil
         }
         let quietEnd: Date?
         do {
-            let window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot)
-            quietEnd = window?.contains(hour: Calendar.current.component(.hour, from: now)) == true
-                ? window?.end(after: now) : nil
+            quietEnd = try AttentionRouter.quietHoursEnd(at: now, dataRoot: dataRoot)
         } catch {
-            // Repair events rearm scheduling; unreadable preferences cannot supply a guessed release deadline.
+            await recordDeadlineFailure(error, source: "quiet-hours preferences")
             return nil
         }
         do {
@@ -79,6 +77,13 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
                         """))
             }
             return held ? quietEnd : nil
+        }
+    }
+
+    private func recordDeadlineFailure(_ error: any Error, source: String) async {
+        await settle {
+            await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId,
+                outcome: .failed(error: "Desk notification \(source) unavailable: \(error.localizedDescription). Repair the source to rearm delivery."))
         }
     }
 
@@ -116,6 +121,8 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         switch prepared {
         case .success(let value): (read, proposal) = value
         case .failure(let error):
+            // The Desk moved under this pass; the change that moved it wakes the next one, so this is no failure.
+            if error is DeskNotificationRead.ChangedRead, released == 0, failures.isEmpty { return .skipped(reason: "the Desk changed during this pass") }
             return .failed(error: "Desk notification proposal/commit: \(error)"
                 + (released > 0 ? "; released \(released) held notification(s)" : "")
                 + (failures.isEmpty ? "" : "; " + failures.joined(separator: "; ")))
@@ -123,7 +130,8 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         let state = read.state
         let decisions = proposal.notifications
         var notified = 0
-        let nagCount = await publishNags(proposal, read: read, failures: &failures)
+        var deferred = Set<String>()
+        let nagCount = await publishNags(proposal, read: read, failures: &failures, deferred: &deferred)
         if decisions.isEmpty && nagCount == 0 && released == 0 && failures.isEmpty {
             return .skipped(reason: "no Desk notification due")
         }
@@ -148,13 +156,14 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
                     reach: .person(from: nil), turn: nil
                 ) } catch { failures.append("\(decision.handle) notification route: \(error.localizedDescription)") }
             }
-            if let outcome, !outcome.deferredForQuietHours {
+            if let outcome {
                 for (destination, verdict) in outcome.destinationOutcomes {
                     if case .notDelivered(let reason) = verdict {
                         failures.append("\(decision.handle) \(destination): \(reason)")
                     }
                 }
             }
+            if let message = outcome?.deferredFields?["message"]?.stringValue { deferred.insert(message) }
             if outcome?.destinationOutcomes.values.contains(.delivered) == true { notified += 1 }
             // The matter keeps its owed doors, even while held or awaiting a receipt.
             guard outcome != nil else { continue }
@@ -176,22 +185,24 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
                 failures.append(stampError)
             }
         }
+        let held = deferred.isEmpty ? "" : "; " + deferred.sorted().joined(separator: "; ")
         if !failures.isEmpty {
             return .failed(error: "Desk notification partial failure: "
-                + failures.prefix(5).joined(separator: "; "))
+                + failures.prefix(5).joined(separator: "; ") + held)
         }
         // Count channel acceptance, not proposed decisions.
         return .completed(result: "notified \(notified) of \(decisions.count) Desk decision(s)"
-            + (nagCount > 0 ? " + \(nagCount) nag(s)" : ""))
+            + (nagCount > 0 ? " + \(nagCount) recorded nag(s)" : "") + held)
     }
 
     /// A digest never travels alone, except for the mute-expiry drift report.
-    private func publishNags(_ proposal: DeskNotificationProposal, read: DeskNotificationRead, failures: inout [String]) async -> Int {
+    private func publishNags(_ proposal: DeskNotificationProposal, read: DeskNotificationRead,
+                             failures: inout [String], deferred: inout Set<String>) async -> Int {
         guard !Task.isCancelled else { return 0 }
         if proposal.openWindow {
             if !proposal.digest.isEmpty {
                 if await deliverNag(title: proposal.digestTitle, body: proposal.digestBody,
-                    label: "unmute digest:\(read.config.windowId)", failures: &failures) {
+                    label: "unmute digest:\(read.config.windowId)", failures: &failures, deferred: &deferred) {
                     let error: String? = await settle {
                         do {
                             _ = try await read.commit(proposal, dataRoot: dataRoot, digestAccepted: true)
@@ -208,7 +219,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         for nag in proposal.nags {
             guard !Task.isCancelled else { break }
             if await deliverNag(title: nag.title, body: nag.body, label: "\(nag.handle):\(read.config.windowId)",
-                deskHandle: nag.handle, failures: &failures) {
+                deskHandle: nag.handle, failures: &failures, deferred: &deferred) {
                 delivered += 1
                 let error: String? = await settle {
                     do { try await read.recordNagDelivery(nag, dataRoot: dataRoot); return nil }
@@ -226,7 +237,8 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         body: String,
         label: String,
         deskHandle: String? = nil,
-        failures: inout [String]
+        failures: inout [String],
+        deferred: inout Set<String>
     ) async -> Bool {
         guard !Task.isCancelled else { return false }
         // Item handles route banner clicks to their item; the unmute digest has no single target.
@@ -238,11 +250,12 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             outcome = nil
             failures.append("\(label) nag route: \(error.localizedDescription)")
         }
-        if let outcome, !outcome.deferredForQuietHours {
+        if let outcome {
             for (destination, verdict) in outcome.destinationOutcomes {
                 if case .notDelivered(let reason) = verdict { failures.append("\(label) nag \(destination): \(reason)") }
             }
         }
+        if let message = outcome?.deferredFields?["message"]?.stringValue { deferred.insert(message) }
         return outcome != nil // The matter owns every destination from here.
     }
 }

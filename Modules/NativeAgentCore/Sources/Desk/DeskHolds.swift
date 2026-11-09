@@ -1,102 +1,100 @@
 import NativeAgentShared
-import Darwin
 import Foundation
 import PersistenceCore
 import NativeAgentCore
-import Synchronization
-// Blueprint: | `DeskHolds.swift` | Durable Desk hold ownership under the existing feed lock |
-/// Flock-protected leases prevent two conversations working one item at once without mutating Desk history.
-/// Stopped runs retain holds only while their resume step is open, bounded by runHoldLimit.
+// Blueprint: | `DeskHolds.swift` | Stopped-run reservations backed by retained checkpoints under the Desk feed lock |
+
 public struct DeskHold: Codable, Sendable, Equatable {
     public var by: String
-    public var session: String
+    public var session: String?
     public var at: Date
 }
+
+/// Only a stopped run with a retained checkpoint can refuse another caller.
+public struct DeskHoldConflict: Sendable {
+    public let holder: DeskHold
+
+    public func refusal(_ subject: String) -> JSONValue {
+        let since = NativeTimestampFormat.fractionalUTCOffset(holder.at)
+        let next: JSONValue = .object(["tool": .string("app"), "input": .object([
+            "action": .string("ability.resume"), "preview": .bool(true),
+            "args": .object(["run_id": .string(String(holder.by.dropFirst(4)))])])])
+        var fields: [String: JSONValue] = [
+            "status": .string("refused"), "reason": .string("held_by"), "effects": .string("none"),
+            "held_by": .string(holder.by), "held_since": .string(since), "held_until": .string("resumed or released"),
+            "detail": .string("\(subject) is held by \(holder.by), since \(since), until resumed or released. This call changed no Desk work."),
+            "remedy": .object(["kind": .string("inspect"), "owner": .string(holder.by), "next_call": next,
+                "instruction": .string("Read the stopped run's question and resume it with your answer, or release its queued step.")]),
+        ]
+        if let session = holder.session { fields["holder_session"] = .string(session) }
+        return .object(fields)
+    }
+}
+
 extension SwiftNativeDeskStore {
-    public static let holdLease: TimeInterval = 30 * 60
-    public static let runHoldLimit: TimeInterval = 7 * 24 * 3600
     var holdsPath: URL { deskDir.appendingPathComponent("holds.json") }
-    /// A run hold requires an open resume step and retained checkpoint, bounded by runHoldLimit.
-    /// holdLease allows time to file the step; a closed or absent step releases its checkpoint too.
-    func isLive(_ hold: DeskHold, now: Date, state: DeskState) throws -> Bool {
-        guard hold.by.hasPrefix("run ") else { return now.timeIntervalSince(hold.at) < Self.holdLease }
-        let run = String(hold.by.dropFirst(4))
-        let age = now.timeIntervalSince(hold.at)
-        // A resumed run keeps its ID, so only steps queued after this hold can sustain it.
-        let steps = state.items.filter { item in
-            item.project == MyQueue.project && (DeskClock.parseISO(item.openedAt).map { $0 >= hold.at.addingTimeInterval(-0.001) } ?? false)
-                && item.refs.contains { if case .step(let step) = $0.kind { MyQueue.skillRun(in: step.words) == run } else { false } }
-        }
-        let bound = steps.isEmpty ? age < Self.holdLease : steps.contains { !$0.status.isTerminal }
-        guard try PartRunStore.exists(run, root: dataRoot), age < Self.runHoldLimit, bound else {
-            try PartRunStore.discard(run, root: dataRoot)
-            return false
-        }
-        return true
+
+    private func retainedRun(_ hold: DeskHold) throws -> Bool {
+        try hold.by.hasPrefix("run ") && PartRunStore.exists(String(hold.by.dropFirst(4)), root: dataRoot)
     }
-    public func hold(_ ref: String, session: String, now: Date = Date()) async throws -> String? {
-        try await hold([ref], session: session, now: now)
+
+    @concurrent public func runHold(_ ref: String) async throws -> DeskHoldConflict? {
+        try await runHold([ref])
     }
-    public func heldBy(_ ref: String, session: String, now: Date = Date()) async throws -> String? {
-        try await editHolds(now: now) { holds, state in
-            guard let item = Self.holdItem(ref, state), let held = holds[item.handle],
-                  try isLive(held, now: now, state: state), held.session != session else { return nil }
-            return held.by
-        }
-    }
-    /// Acquire the group atomically so no partial acquisition strands work.
-    public func hold(_ refs: [String], session: String, now: Date = Date()) async throws -> String? {
-        try await editHolds(now: now) { holds, state in
-            let items = refs.compactMap { Self.holdItem($0, state) }
-            for item in items {
-                if let held = holds[item.handle], try isLive(held, now: now, state: state), held.session != session {
-                    return held.by
-                }
-            }
-            for item in items {
-                if let held = holds[item.handle], try isLive(held, now: now, state: state), held.by.hasPrefix("run ") { continue }
-                holds[item.handle] = DeskHold(by: "conversation " + session, session: session, at: now)
+
+    /// Check reservations without acquiring ownership for the caller.
+    @concurrent public func runHold(_ refs: [String]) async throws -> DeskHoldConflict? {
+        try await editHolds { holds, state in
+            for ref in refs {
+                if let item = Self.holdItem(ref, state), let held = holds[item.handle] { return DeskHoldConflict(holder: held) }
             }
             return nil
         }
     }
-    /// Keep each item’s existing conversation owner when stopped runs overlap.
-    public func hold(_ refs: [String], run: String, session: String, now: Date = Date()) async throws -> [String] {
-        try await editHolds(now: now) { holds, state in
+
+    /// A stopped run reserves its journaled items through its retained checkpoint.
+    @concurrent public func hold(_ refs: [String], run: String, session: String?) async throws -> [String] {
+        try await editHolds { holds, state in
             var names: [String] = []
             for ref in refs {
                 guard let item = Self.holdItem(ref, state), !names.contains("desk." + item.alias) else { continue }
-                if let held = holds[item.handle], try isLive(held, now: now, state: state), held.session != session { continue }
-                holds[item.handle] = DeskHold(by: "run " + run, session: session, at: now)
+                if let held = holds[item.handle], held.by != "run " + run { continue }
+                holds[item.handle] = DeskHold(by: "run " + run, session: session, at: Date())
                 names.append("desk." + item.alias)
             }
             return names
         }
     }
-    @discardableResult
-    public func passHolds(run: String, to session: String, now: Date = Date()) async throws -> [String: DeskHold] {
-        try await editHolds(now: now) { holds, _ in
-            var passed: [String: DeskHold] = [:]
-            for (handle, held) in holds where held.by == "run " + run {
-                passed[handle] = held
-                holds[handle] = DeskHold(by: "conversation " + session, session: session, at: now)
-            }
+
+    /// Taking up a stopped run releases its reservations, without consuming its checkpoint.
+    @concurrent public func passHolds(run: String) async throws -> [String: DeskHold] {
+        try await editHolds { holds, _ in
+            let passed = holds.filter { $0.value.by == "run " + run }
+            for handle in passed.keys { holds.removeValue(forKey: handle) }
             return passed
         }
     }
-    /// Return only unchanged transferred holds so a failed resume cannot steal later ownership.
-    public func returnHolds(_ passed: [String: DeskHold], from session: String, now: Date = Date()) async throws {
-        try await editHolds(now: now) { holds, _ in
-            for (handle, held) in passed where holds[handle]?.by == "conversation " + session { holds[handle] = held }
+
+    /// A refused resume restores its reservations without stealing another stopped run's items.
+    @concurrent public func returnHolds(_ passed: [String: DeskHold]) async throws {
+        guard !passed.isEmpty else { return }
+        try await editHolds { holds, state in
+            let open = Set(state.items.filter { !$0.status.isTerminal }.map(\.handle))
+            for (handle, held) in passed {
+                guard open.contains(handle), holds[handle] == nil, try retainedRun(held) else { continue }
+                holds[handle] = held
+            }
         }
     }
+
     static func holdItem(_ ref: String, _ state: DeskState) -> DeskItem? {
         var key = ref.trimmingCharacters(in: .whitespacesAndNewlines)
         if key.lowercased().hasPrefix("desk.") { key = String(key.dropFirst(5)) }
         return state.items.first { !$0.status.isTerminal && ($0.handle == key || $0.alias == key) }
     }
-    /// Compare-and-set under the ops flock so expired holds cannot compete with a new owner.
-    private func editHolds<T: Sendable>(now: Date, _ edit: @Sendable (inout [String: DeskHold], DeskState) throws -> T) async throws -> T {
+
+    /// The sole editor drops non-run markers and reservations without an open item or retained checkpoint.
+    @concurrent private func editHolds<T: Sendable>(_ edit: @Sendable (inout [String: DeskHold], DeskState) throws -> T) async throws -> T {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
@@ -111,9 +109,9 @@ extension SwiftNativeDeskStore {
                     "Desk holds at \(holdsPath.path) are unavailable: \(error.localizedDescription). Existing bytes were preserved.")
             }
             let before = holds
-            let result = try edit(&holds, state)
             let open = Set(state.items.filter { !$0.status.isTerminal }.map(\.handle))
-            holds = try holds.filter { try open.contains($0.key) && isLive($0.value, now: now, state: state) }
+            holds = try holds.filter { try open.contains($0.key) && retainedRun($0.value) }
+            let result = try edit(&holds, state)
             if holds != before {
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(try JSONEncoder().encode(holds), to: holdsPath)
             }

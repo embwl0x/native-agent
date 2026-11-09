@@ -77,7 +77,7 @@ extension CognitiveSubstrate {
         }
         public init() {}
         enum CodingKeys: String, CodingKey {
-            case valence, warmth, tension, pressure, arousal, affection, warmthBoost, beliefReaction
+            case valence, warmth, tension, pressure, arousal, affection, warmthBoost, beliefReaction, chosenRegister
         }
 
         public init(from decoder: any Decoder) throws {
@@ -98,6 +98,7 @@ extension CognitiveSubstrate {
             warmthBoost = try delta(.warmthBoost, low: 0, high: 0.18)
             // No reaction is optional; a supplied malformed judgment is not.
             beliefReaction = try values.decodeIfPresent(BeliefReaction.self, forKey: .beliefReaction)
+            chosenRegister = try values.decodeIfPresent(CognitiveRegisterChoice.self, forKey: .chosenRegister)
             if valence < 0 { affection = false }
         }
         var valence = 0.0
@@ -110,8 +111,9 @@ extension CognitiveSubstrate {
         /// The affection floor scales by relational source, with the user's weight fixed at 1.0.
         var affectionWeight = 1.0
         public var beliefReaction: BeliefReaction?
+        public var chosenRegister: CognitiveRegisterChoice?
         var isActive: Bool { valence != 0 || warmth != 0 || tension != 0 || pressure != 0 || arousal != 0 }
-        public var isNoOp: Bool { !isActive && !affection && warmthBoost == 0 && beliefReaction == nil }
+        public var isNoOp: Bool { !isActive && !affection && warmthBoost == 0 && beliefReaction == nil && chosenRegister == nil }
     }
 
     nonisolated func studioValence(in text: String) -> Double {

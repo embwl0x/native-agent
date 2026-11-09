@@ -6,6 +6,10 @@ import ChatToolParsing
 // Blueprint: | `AgentWorkspaceMail.swift` | `AgentWorkspaceMail`: retain partial account coverage and continuation |
 
 extension AgentWorkspace {
+    /// Door verbs whose rows the workspace names (mail.N) for later calls, and the verbs that take those names.
+    package static let namesRows: Set<String> = ["mail.recent", "mail.search", "mail.senders"]
+    package static let takesNames: Set<String> = ["mail.read", "mail.triage"]
+
     /// Bind observed workspace names once; caller-supplied locator fields may never override the selected message. Invalid names stay as refused items.
     package static func bindMail(workspace: WorkspaceOperation, _ input: [String: JSONValue], dataRoot: URL) -> [String: JSONValue] {
         let batch = input["items"] != nil
@@ -29,7 +33,7 @@ extension AgentWorkspace {
                 : ["name", "index", "filename", "destination"]
             guard Set(row.keys).isSubset(of: edits), parts.count == 2, parts[0] == "mail", let n = Int(parts[1]),
                   n > 0, case .open(let place)? = action,
-                  case .record("mail_list_recent", let locator, _) = place else {
+                  case .record("mail.recent", let locator, _) = place else {
                 var refused = row
                 refused["binding_error"] = .string(Set(row.keys).isSubset(of: edits)
                     ? "name must be a currently observed mail.N workspace name; refresh page:mail to obtain one."
@@ -54,15 +58,15 @@ enum AgentWorkspaceMail {
     static func itemActions(input: [String: JSONValue], title: String) -> [String: AgentWorkspaceAction] {
         let bound = input.filter { MailReadLocator.fields.union(["mailbox"]).contains($0.key) }
         guard bound["message_id"] != nil, case .string(let id)? = bound["expected_message_id"], !id.isEmpty else { return [:] }
-        var actions: [String: AgentWorkspaceAction] = ["delete": .perform(tool: "mail_delete", input: bound, title: "Delete " + title, textField: nil,
+        var actions: [String: AgentWorkspaceAction] = ["delete": .perform(tool: "mail.delete", input: bound, title: "Delete " + title, textField: nil,
             isEffect: true)]
         if (bound["scope"] ?? bound["mailbox"] ?? .string("inbox")) == .string("inbox") {
-            actions["draft"] = .perform(tool: "mail_draft", input: bound, title: "Draft: " + title, textField: "body", isEffect: true)
-            actions["reply"] = .perform(tool: "mail_reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true)
-            actions["reply-all"] = .perform(tool: "mail_reply", input: bound.merging(["reply_all": .bool(true)]) { _, new in new }, title: "Reply all: "
+            actions["draft"] = .perform(tool: "mail.draft", input: bound, title: "Draft: " + title, textField: "body", isEffect: true)
+            actions["reply"] = .perform(tool: "mail.reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true)
+            actions["reply-all"] = .perform(tool: "mail.reply", input: bound.merging(["reply_all": .bool(true)]) { _, new in new }, title: "Reply all: "
                 + title, textField: "body", isEffect: true)
-            actions["archive"] = .perform(tool: "mail_archive", input: bound, title: "Archive " + title, textField: nil, isEffect: true)
-            actions["mark-read"] = .perform(tool: "mail_mark_read", input: bound, title: "Mark read: " + title, textField: nil, isEffect: true)
+            actions["archive"] = .perform(tool: "mail.archive", input: bound, title: "Archive " + title, textField: nil, isEffect: true)
+            actions["mark-read"] = .perform(tool: "mail.mark_read", input: bound, title: "Mark read: " + title, textField: nil, isEffect: true)
         }
         return actions
     }
@@ -71,8 +75,8 @@ enum AgentWorkspaceMail {
         let open = AgentWorkspaceButton(label: "Open Mail view", action: .perform(tool: "go", input: ["name": .string("Mail")], title: "Mail view",
             textField: nil, isEffect: true))
         var actions: [AgentWorkspaceButton] = [open,
-            .init(label: "Find email", action: .configure(tool: "mail_search", input: [:], title: "Find email")),
-            .init(label: "Compose email", action: .configure(tool: "mail_send", input: [:], title: "Compose email"))]
+            .init(label: "Find email", action: .configure(tool: "mail.search", input: [:], title: "Find email")),
+            .init(label: "Compose email", action: .configure(tool: "mail.send", input: [:], title: "Compose email"))]
         guard case .object(var content) = result, case .array(let rows)? = content["messages"] else {
             return .init(title: "Mail", content: result, items: [], actions: actions)
         }
@@ -82,11 +86,11 @@ enum AgentWorkspaceMail {
            let offset = content["next_offset"] {
             var next = input
             next["offset"] = offset
-            let tool = ["query", "from", "since", "category", "attachment"].contains(where: { input[$0] != nil }) ? "mail_search" : "mail_list_recent"
+            let tool = ["query", "from", "since", "category", "attachment"].contains(where: { input[$0] != nil }) ? "mail.search" : "mail.recent"
             actions.insert(.init(label: "More email", action: .open(.record(tool: tool, input: next, title: "Mail"))), at: 0)
         }
         if input["message_id"] == nil, input["query"] == nil, content["scope"] == .string("inbox"), input["all_categories"] != .bool(true) {
-            actions.append(.init(label: "All categories", action: .open(.record(tool: "mail_list_recent", input: ["all_categories": .bool(true)],
+            actions.append(.init(label: "All categories", action: .open(.record(tool: "mail.recent", input: ["all_categories": .bool(true)],
                 title: "Mail"))))
         }
         content.removeValue(forKey: "messages")
@@ -110,7 +114,7 @@ enum AgentWorkspaceMail {
                 if let position = locator.position { bound["position"] = .int(Int64(position)) }
                 if input["message_id"] == .int(locator.id), input["expected_message_id"] == .string(locator.messageID), content["detail"] == .bool(true) {
                     if object["truncated"] == .bool(true), case .int(let end)? = object["body_end"], end > 0, end <= 2_000_000 {
-                        rowActions.append(.init(label: "Read next part", action: .open(.record(tool: "mail_list_recent", input: bound.merging(["body_offset"
+                        rowActions.append(.init(label: "Read next part", action: .open(.record(tool: "mail.recent", input: bound.merging(["body_offset"
                             : .int(end)]) { _, new in new }, title: title))))
                     }
                     let actions = itemActions(input: bound, title: title)
@@ -119,7 +123,7 @@ enum AgentWorkspaceMail {
                         rowActions.append(.init(label: "Reply to all", action: .configure(tool: tool, input: input, title: title)))
                     }
                 } else if input["message_id"] == nil {
-                    rowActions.append(.init(label: "Read message", action: .open(.record(tool: "mail_list_recent", input: bound, title: title))))
+                    rowActions.append(.init(label: "Read message", action: .open(.record(tool: "mail.recent", input: bound, title: title))))
                 }
             }
             rowActions.append(open)

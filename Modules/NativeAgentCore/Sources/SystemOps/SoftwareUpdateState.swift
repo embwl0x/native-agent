@@ -1,11 +1,11 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `SoftwareUpdateState.swift` | checked update-notice persistence: absent, available, stale or byte-preserved unreadable evidence |
 
 /// Inject Sparkle comparison so persisted notices and host update availability agree.
-@MainActor
 public enum SoftwareUpdateState {
     /// Why a manual update check cannot run. `nil` == updates are really available.
-    public enum Unavailability: Equatable {
+    public enum Unavailability: Equatable, Sendable {
         /// No published appcast means no available update feed.
         case feedNotPublished
         /// The bundle carries no usable Sparkle configuration at all (dev builds).
@@ -17,18 +17,14 @@ public enum SoftwareUpdateState {
         public var detail: String {
             switch self {
             case .feedNotPublished:
-                return "This build has no published update feed, so NativeAgent can’t "
-                    + "check for new versions. Install newer builds by downloading the "
-                    + "latest release disk image and dragging it to Applications."
+                return SoftwareUpdateSettingsFace.Unavailability.feedNotPublished.detail
             case .notConfigured:
-                return "This is a locally-built copy of NativeAgent, which ships without "
-                    + "updater configuration. Rebuild from source to update, or install a "
-                    + "signed release build."
+                return SoftwareUpdateSettingsFace.Unavailability.notConfigured.detail
             }
         }
     }
 
-    private struct PersistedNotice: Codable, Equatable {
+    private struct PersistedNotice: Codable, Equatable, Sendable {
         static let schemaVersion = 1
         var schemaVersion: Int
         var availableVersion: String
@@ -38,7 +34,7 @@ public enum SoftwareUpdateState {
 
     public static let persistedNoticeKey = "NativeAgent.updateNotice.v1"
 
-    public enum NoticeState: Equatable {
+    public enum NoticeState: Equatable, Sendable {
         case absent
         case available(String)
         case stale
@@ -74,23 +70,23 @@ public enum SoftwareUpdateState {
 
     /// Persistence boundary used by launch. A notice survives only for the exact published HTTPS feed/key and only while the offered version is newer than the
     /// currently installed build.
-    private static func persistedNoticeData(
+    @MainActor private static func persistedNotice(
         availableVersion: String,
         info: [String: Any],
         isNewer: @MainActor (String, String) -> Bool
-    ) throws -> Data? {
+    ) -> PersistedNotice? {
         let offered = availableVersion.trimmingCharacters(in: .whitespacesAndNewlines)
         guard resolveUnavailability(info: info) == nil,
               let context = updateContext(info: info),
               !offered.isEmpty,
               isNewer(offered, context.installedVersion)
         else { return nil }
-        return try JSONEncoder().encode(PersistedNotice(
+        return PersistedNotice(
             schemaVersion: PersistedNotice.schemaVersion,
             availableVersion: offered,
             feedURL: context.feedURL,
             publicKey: context.publicKey
-        ))
+        )
     }
 
     private static func updateContext(
@@ -106,10 +102,38 @@ public enum SoftwareUpdateState {
         return (installed, feed, key)
     }
 
-    public static func restoreNotice(
-        info: [String: Any], preferences: UserDefaults,
+    @MainActor public static func restoreNotice(
+        info: [String: Any], preferencesSuiteName: String? = nil,
         isNewer: @MainActor (String, String) -> Bool
-    ) -> NoticeState {
+    ) async -> NoticeState {
+        let reading = await readNotice(suiteName: preferencesSuiteName)
+        let notice: PersistedNotice
+        switch reading {
+        case .absent: return .absent
+        case .unreadable(let issue): return .unreadable(issue)
+        case .notice(let saved): notice = saved
+        }
+        guard resolveUnavailability(info: info) == nil,
+              let context = updateContext(info: info),
+              notice.feedURL == context.feedURL,
+              notice.publicKey == context.publicKey,
+              isNewer(notice.availableVersion, context.installedVersion) else {
+            if let failure = await eraseNotice(suiteName: preferencesSuiteName) { return failure }
+            return .stale
+        }
+        return .available(notice.availableVersion)
+    }
+
+    private enum NoticeReading: Sendable {
+        case absent
+        case notice(PersistedNotice)
+        case unreadable(String)
+    }
+
+    @concurrent private static func readNotice(suiteName: String?) async -> NoticeReading {
+        let preferences: UserDefaults
+        do { preferences = try noticePreferences(suiteName: suiteName) }
+        catch { return .unreadable(error.localizedDescription) }
         guard let value = preferences.object(forKey: persistedNoticeKey) else { return .absent }
         guard let data = value as? Data else {
             return .unreadable("Saved update notice has the wrong preference type; preserved unchanged. Run Check for Updates to obtain fresh evidence.")
@@ -128,35 +152,49 @@ public enum SoftwareUpdateState {
             return .unreadable(
                 "Saved update notice has an unsupported or incomplete shape; preserved unchanged. Run Check for Updates to obtain fresh evidence.")
         }
-        guard resolveUnavailability(info: info) == nil,
-              let context = updateContext(info: info),
-              notice.feedURL == context.feedURL,
-              notice.publicKey == context.publicKey,
-              isNewer(notice.availableVersion, context.installedVersion) else {
-            preferences.removeObject(forKey: persistedNoticeKey)
-            return .stale
-        }
-        return .available(notice.availableVersion)
+        return .notice(notice)
     }
 
-    public static func storeNotice(
-        _ version: String?, info: [String: Any], preferences: UserDefaults,
+    @MainActor public static func storeNotice(
+        _ version: String?, info: [String: Any], preferencesSuiteName: String? = nil,
         isNewer: @MainActor (String, String) -> Bool
-    ) -> NoticeState {
+    ) async -> NoticeState {
         guard let version else {
-            preferences.removeObject(forKey: persistedNoticeKey)
+            if let failure = await eraseNotice(suiteName: preferencesSuiteName) { return failure }
             return .absent
         }
-        do {
-            guard let data = try persistedNoticeData(availableVersion: version, info: info, isNewer: isNewer) else {
-                preferences.removeObject(forKey: persistedNoticeKey)
-                return .stale
-            }
-            preferences.set(data, forKey: persistedNoticeKey)
-            return .available(version)
-        } catch {
-            return .unreadable("Update notice could not be encoded: \(error.localizedDescription) Previous evidence preserved.")
+        guard let notice = persistedNotice(availableVersion: version, info: info, isNewer: isNewer) else {
+            if let failure = await eraseNotice(suiteName: preferencesSuiteName) { return failure }
+            return .stale
         }
+        return await writeNotice(notice, suiteName: preferencesSuiteName)
+    }
+
+    @concurrent private static func writeNotice(_ notice: PersistedNotice, suiteName: String?) async -> NoticeState {
+        do {
+            let preferences = try noticePreferences(suiteName: suiteName)
+            let data = try JSONEncoder().encode(notice)
+            if preferences.data(forKey: persistedNoticeKey) != data { preferences.set(data, forKey: persistedNoticeKey) }
+            return .available(notice.availableVersion)
+        } catch {
+            return .unreadable("Update notice could not be saved: \(error.localizedDescription) Previous evidence preserved.")
+        }
+    }
+
+    @concurrent private static func eraseNotice(suiteName: String?) async -> NoticeState? {
+        do {
+            let preferences = try noticePreferences(suiteName: suiteName)
+            if preferences.object(forKey: persistedNoticeKey) != nil { preferences.removeObject(forKey: persistedNoticeKey) }
+            return nil
+        } catch { return .unreadable(error.localizedDescription) }
+    }
+
+    private static func noticePreferences(suiteName: String?) throws -> UserDefaults {
+        guard let suiteName else { return .standard }
+        guard let preferences = UserDefaults(suiteName: suiteName) else {
+            throw PartCallError(code: "update_preferences_unavailable", message: "The update-notice preference suite could not be opened.")
+        }
+        return preferences
     }
 
     /// Hosts that only ever appear in placeholder/dry-run configuration. A build carrying one of these has no real feed no matter what else it claims.

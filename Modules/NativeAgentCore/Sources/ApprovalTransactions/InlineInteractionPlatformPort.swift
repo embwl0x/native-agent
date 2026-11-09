@@ -16,7 +16,7 @@ public protocol InlineInteractionPlatformPort {
     /// Nil when the paired-phone store can't be read.
     func phoneStanding() async -> NAPhoneStanding?
     func connectorRecords(root: URL) async throws -> [InlineInteractionConnectorStatus]
-    func providers() async throws -> [InlineInteractionProviderStatus]
+    func providers(root: URL) async throws -> [InlineInteractionProviderStatus]
     func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> String?
     func permissionChanges() -> AsyncStream<Void>
     func openInteractionCards() async throws -> [(id: String, sessionID: String)]
@@ -33,13 +33,12 @@ public protocol InlineInteractionControlPort {
     var screenCaptureEnabled: Bool { get }
     var chromeControlEnabled: Bool { get }
     var fullMacGrantIsActive: Bool { get }
-    func enableChromeControl() async
+    func enableChromeControl() async throws
     func setUpChromeControl(turn: Turn) async -> String?
     func saveConnectorCredentials(connector: String, values: [String: String], dataRoot: URL) async -> (error: String?, note: String?)
-    func saveProviderCredential(provider: String, value: String) async -> (error: String?, note: String?)
-    func signInProvider(_ signIn: InlineInteractionRegistry.ProviderSignIn, dataRoot: URL) async -> String?
-    func grantMacControlCategories(_ categories: [String], dataRoot: URL, logTag: String) async
-    func grantCapabilityFlag(policyKey: String, dataRoot: URL, logTag: String) async
+    func openProviderEntry(provider: String, dataRoot: URL) async throws
+    func grantMacControlCategories(_ categories: [String], dataRoot: URL, logTag: String) async throws
+    func grantCapabilityFlag(policyKey: String, dataRoot: URL, logTag: String) async throws
     func saveProviderGroupSelection(group: ProviderSurfaceGroup, providerID: String?, model: String) async throws
 }
 

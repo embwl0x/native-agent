@@ -2,30 +2,7 @@ import AppKit
 import NativeAgentShared
 import SwiftUI
 
-// Blueprint: | `TranscriptStyle.swift` | The document's look: paragraph attribute keys, the app's tokens in AppKit units, one block rendered as one paragraph |
-
-/// What a paragraph carries. Fragments, hit testing, the menu and Copy as Markdown read these; nothing reads a measured height.
-enum TranscriptKey {
-    static let blockID = NSAttributedString.Key("transcript.blockID")
-    static let messageID = NSAttributedString.Key("transcript.messageID")
-    static let role = NSAttributedString.Key("transcript.role")
-    /// `TranscriptParagraph` raw value; picks the layout fragment class.
-    static let kind = NSAttributedString.Key("transcript.kind")
-    /// The block's markdown source, read by Copy as Markdown.
-    static let source = NSAttributedString.Key("transcript.source")
-    /// Space above the paragraph (NSNumber, pt). Spacing lives in fragment margins, never in NSParagraphStyle spacing.
-    static let topGap = NSAttributedString.Key("transcript.topGap")
-    /// On a fold headline: the tool-run group it opens.
-    static let foldOpens = NSAttributedString.Key("transcript.foldOpens")
-    /// On a folded paragraph: the group it hides with while closed.
-    static let foldGroup = NSAttributedString.Key("transcript.foldGroup")
-    /// A user bubble's provenance or bridge line, drawn above the bubble.
-    static let tagSymbol = NSAttributedString.Key("transcript.tagSymbol")
-    static let tagLabel = NSAttributedString.Key("transcript.tagLabel")
-    static let tagAutomated = NSAttributedString.Key("transcript.tagAutomated")
-    /// A code block's language, drawn in its inset's header.
-    static let language = NSAttributedString.Key("transcript.language")
-}
+// Blueprint: | `TranscriptStyle.swift` | AppKit tokens and the press's off-main paragraph renderer |
 
 enum TranscriptParagraph: String {
     case user, reply, heading, quote, listItem, code, foldHeadline, foldDetail, gap, attachment
@@ -52,7 +29,7 @@ enum TranscriptParagraph: String {
     }
 }
 
-/// The app's tokens as the document lays them out (NativeAgentShellLayout, ShellType, ChatPreparedContent, ChatCodeBlockView).
+/// The app's tokens as the document lays them out (NativeAgentShellLayout, ShellType and NativeAgentSpacing).
 enum TranscriptMetrics {
     static let column = NativeAgentShellLayout.roomColumn
     static let gutter = NativeAgentShellLayout.roomGutter
@@ -69,8 +46,7 @@ enum TranscriptMetrics {
     static let quoteIndent: CGFloat = NativeAgentSpacing.md
     /// `ChatActivityRow.indent`: a fold's text sits past its chevron.
     static let foldIndent: CGFloat = 18
-    /// `StreamingParagraphText.paragraphGap`, the gap between a reply's paragraphs.
-    static let paragraphGap: CGFloat = 10
+    static var paragraphGap: CGFloat { StreamingParagraphText.paragraphGap }
     static let codePadH: CGFloat = NativeAgentSpacing.sm
     static let codePadV: CGFloat = NativeAgentSpacing.sm
     /// The strip above the code that holds its language label and copy button.
@@ -103,12 +79,14 @@ enum TranscriptInk {
 }
 
 /// Renders one block as one paragraph. Every paragraph is one NSTextParagraph: newlines inside a block become line separators.
-@MainActor
 struct TranscriptRenderer {
     /// The text container's width: the column, or less in a narrow window.
     let width: CGFloat
     let scale: CGFloat
-    let attachment: (TranscriptBlock, TranscriptAttachmentRef) -> NSTextAttachment
+
+    nonisolated static func prepare(_ block: TranscriptBlock, width: Double, scale: Double) throws -> TranscriptRenderedParagraph {
+        try Self(width: CGFloat(width), scale: CGFloat(scale)).prepared(block)
+    }
 
     func font(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
         .systemFont(ofSize: (size * scale).rounded(), weight: weight)
@@ -118,56 +96,58 @@ struct TranscriptRenderer {
     var label: NSFont { font(ShellType.labelSize) }
     var code: NSFont { .monospacedSystemFont(ofSize: (ShellType.labelSize * scale).rounded(), weight: .regular) }
 
-    /// The paragraph without its source; the controller stamps the source when it installs it, so a growing reply compares by look alone.
-    func paragraph(_ block: TranscriptBlock) -> NSMutableAttributedString {
-        render(block).body
+    func prepared(_ block: TranscriptBlock) throws -> TranscriptRenderedParagraph {
+        let paragraph = try render(block)
+        let hidden = NSMutableAttributedString(string: " ", attributes: paragraph.separator.attributes(at: 0, effectiveRange: nil))
+        hidden.addAttribute(TranscriptKey.liveHidden, value: NSNumber(value: true), range: NSRange(location: 0, length: 1))
+        return try TranscriptRenderedParagraph(block: block,
+            body: AttributedString(paragraph.body, including: TranscriptAttributes.self),
+            separator: AttributedString(paragraph.separator, including: TranscriptAttributes.self),
+            hidden: AttributedString(hidden, including: TranscriptAttributes.self),
+            mapping: TranscriptRevealMapping(block, rendered: paragraph.body.string))
     }
 
     /// The paragraph and the separator that ends it, sharing one set of paragraph attributes (a bubble is measured once).
-    func render(_ block: TranscriptBlock) -> (body: NSMutableAttributedString, separator: NSAttributedString) {
-        let attributes = paragraphAttributes(block)
+    func render(_ block: TranscriptBlock) throws -> (body: NSMutableAttributedString, separator: NSAttributedString) {
+        let attributes = try paragraphAttributes(block)
         let body: NSMutableAttributedString
         switch block.kind {
         case .user(let runs, _):
-            body = inline(runs, font: self.body, color: .labelColor)
+            body = try inline(runs, font: self.body, color: .labelColor)
         case .reply(let runs, let ink):
-            body = ink == .quiet ? inline(runs, font: label, color: .secondaryLabelColor) : inline(runs, font: self.body, color: .labelColor)
+            if ink == .quiet { body = try inline(runs, font: label, color: .secondaryLabelColor) }
+            else { body = try inline(runs, font: self.body, color: .labelColor) }
         case .heading(let runs):
-            body = inline(runs, font: font(ShellType.bodySize, .semibold), color: .labelColor)
+            body = try inline(runs, font: font(ShellType.bodySize, .semibold), color: .labelColor)
         case .quote(let runs):
-            body = inline(runs, font: self.body, color: .secondaryLabelColor)
+            body = try inline(runs, font: self.body, color: .secondaryLabelColor)
         case .listItem(let marker, _, let runs):
             body = NSMutableAttributedString(string: "\t" + marker + "\t", attributes: [.font: self.body, .foregroundColor: NSColor.labelColor])
-            body.append(inline(runs, font: self.body, color: .labelColor))
+            body.append(try inline(runs, font: self.body, color: .labelColor))
         case .code(_, let text):
-            body = NSMutableAttributedString(string: Self.oneParagraph(text), attributes: [.font: code, .foregroundColor: NSColor.labelColor])
+            body = NSMutableAttributedString(string: TranscriptRevealMapping.oneParagraph(text),
+                                             attributes: [.font: code, .foregroundColor: NSColor.labelColor])
         case .foldHeadline(let text, let failed):
             // The headline is a link to its own run, so a keyboard, VoiceOver or accessibility press opens it as a click does.
-            body = NSMutableAttributedString(string: Self.oneParagraph(text), attributes: [
+            body = NSMutableAttributedString(string: TranscriptRevealMapping.oneParagraph(text), attributes: [
                 .font: font(ShellType.labelSize, .medium), .foregroundColor: failed ? TranscriptInk.trouble : NSColor.secondaryLabelColor,
                 .link: TranscriptFoldLink.url(block.messageID),
             ])
         case .foldDetail(let text, let failed):
-            body = NSMutableAttributedString(string: Self.oneParagraph(text), attributes: [
+            body = NSMutableAttributedString(string: TranscriptRevealMapping.oneParagraph(text), attributes: [
                 .font: label, .foregroundColor: failed ? TranscriptInk.trouble : NSColor.secondaryLabelColor,
             ])
         case .gap(let date):
             body = NSMutableAttributedString(string: Self.gapLabel(date), attributes: [
                 .font: font(ShellType.captionSize), .foregroundColor: NSColor.secondaryLabelColor,
             ])
-        case .attachment(let ref):
-            body = NSMutableAttributedString(attachment: attachment(block, ref))
-            body.addAttribute(.font, value: self.body, range: NSRange(location: 0, length: body.length))
+        case .attachment:
+            body = NSMutableAttributedString(string: "\u{FFFC}", attributes: [.font: self.body])
         }
-        // An empty block still draws one line, as an empty bubble drew one blank line.
+        // Empty blocks occupy one line.
         if body.length == 0 { body.append(NSAttributedString(string: " ", attributes: [.font: baseFont(block)])) }
         body.addAttributes(attributes, range: NSRange(location: 0, length: body.length))
         return (body, separator(block, attributes))
-    }
-
-    /// The paragraph separator belongs to the paragraph it ends and carries that paragraph's own attributes, nothing that draws.
-    func separator(_ block: TranscriptBlock) -> NSAttributedString {
-        separator(block, paragraphAttributes(block))
     }
 
     private func separator(_ block: TranscriptBlock, _ paragraph: [NSAttributedString.Key: Any]) -> NSAttributedString {
@@ -186,14 +166,12 @@ struct TranscriptRenderer {
         }
     }
 
-    private func paragraphAttributes(_ block: TranscriptBlock) -> [NSAttributedString.Key: Any] {
+    private func paragraphAttributes(_ block: TranscriptBlock) throws -> [NSAttributedString.Key: Any] {
         var attributes: [NSAttributedString.Key: Any] = [
             TranscriptKey.kind: TranscriptParagraph(block.kind).rawValue,
             TranscriptKey.blockID: block.id,
-            TranscriptKey.messageID: block.messageID,
-            TranscriptKey.role: block.role,
             TranscriptKey.topGap: NSNumber(value: Double(TranscriptMetrics.topGap(block.lead))),
-            .paragraphStyle: style(block),
+            .paragraphStyle: try style(block),
         ]
         if let group = block.foldGroup { attributes[TranscriptKey.foldGroup] = group }
         switch block.kind {
@@ -211,11 +189,11 @@ struct TranscriptRenderer {
         return attributes
     }
 
-    private func style(_ block: TranscriptBlock) -> NSParagraphStyle {
+    private func style(_ block: TranscriptBlock) throws -> NSParagraphStyle {
         let gutter = TranscriptMetrics.gutter
         switch block.kind {
         case .user(let runs, _):
-            return userStyle(runs)
+            return try userStyle(runs)
         case .reply(_, let ink):
             let spacing = ink == .quiet && block.role == "user" ? TranscriptMetrics.userLineSpacing : TranscriptMetrics.replyLineSpacing
             return Self.style(head: gutter, tail: -gutter, lineSpacing: spacing)
@@ -242,8 +220,8 @@ struct TranscriptRenderer {
     }
 
     /// Right-seated and hugging its text: the text box is measured, then indented from the leading edge so it ends at the column's trailing gutter.
-    private func userStyle(_ runs: [TranscriptRun]) -> NSParagraphStyle {
-        let measure = inline(runs, font: body, color: .labelColor)
+    private func userStyle(_ runs: [TranscriptRun]) throws -> NSParagraphStyle {
+        let measure = try inline(runs, font: body, color: .labelColor)
         if measure.length == 0 { measure.append(NSAttributedString(string: " ", attributes: [.font: body])) }
         measure.addAttribute(.paragraphStyle, value: Self.style(head: 0, tail: 0, lineSpacing: TranscriptMetrics.userLineSpacing),
                              range: NSRange(location: 0, length: measure.length))
@@ -270,44 +248,37 @@ struct TranscriptRenderer {
         return style
     }
 
-    func inline(_ runs: [TranscriptRun], font base: NSFont, color: NSColor) -> NSMutableAttributedString {
+    func inline(_ runs: [TranscriptRun], font base: NSFont, color: NSColor) throws -> NSMutableAttributedString {
         let out = NSMutableAttributedString()
         for run in runs where !run.text.isEmpty {
             var attributes: [NSAttributedString.Key: Any] = [
-                .font: styled(base, bold: run.bold, italic: run.italic, code: run.code), .foregroundColor: color,
+                .font: try styled(base, bold: run.bold, italic: run.italic, code: run.code), .foregroundColor: color,
             ]
             if run.strike { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
             if let link = run.link {
                 attributes[.link] = link
                 attributes[.foregroundColor] = NSColor.controlAccentColor
             }
-            out.append(NSAttributedString(string: Self.oneParagraph(run.text), attributes: attributes))
+            out.append(NSAttributedString(string: TranscriptRevealMapping.oneParagraph(run.text), attributes: attributes))
         }
         return out
     }
 
-    private func styled(_ base: NSFont, bold: Bool, italic: Bool, code: Bool) -> NSFont {
+    private func styled(_ base: NSFont, bold: Bool, italic: Bool, code: Bool) throws -> NSFont {
         var font = base
         if code {
             font = .monospacedSystemFont(ofSize: (base.pointSize - 1.5).rounded(), weight: bold ? .semibold : .regular)
         } else if bold {
             font = .systemFont(ofSize: base.pointSize, weight: .semibold)
         }
-        if italic, let slanted = NSFont(descriptor: font.fontDescriptor.withSymbolicTraits(font.fontDescriptor.symbolicTraits.union(.italic)),
-                                        size: font.pointSize) {
-            font = slanted
+        if italic {
+            let descriptor = font.fontDescriptor.withSymbolicTraits(font.fontDescriptor.symbolicTraits.union(.italic))
+            guard let italicFont = NSFont(descriptor: descriptor, size: font.pointSize) else {
+                throw CocoaError(.formatting, userInfo: [NSLocalizedDescriptionKey: "The transcript italic font could not be created."])
+            }
+            font = italicFont
         }
         return font
-    }
-
-    /// Line breaks inside a block become line separators, so the block stays exactly one paragraph.
-    static func oneParagraph(_ text: String) -> String {
-        guard text.contains(where: { $0 == "\n" || $0 == "\r" || $0 == "\r\n" || $0 == "\u{2029}" || $0 == "\u{85}" }) else { return text }
-        return text.replacingOccurrences(of: "\r\n", with: "\u{2028}")
-            .replacingOccurrences(of: "\r", with: "\u{2028}")
-            .replacingOccurrences(of: "\n", with: "\u{2028}")
-            .replacingOccurrences(of: "\u{2029}", with: "\u{2028}")
-            .replacingOccurrences(of: "\u{85}", with: "\u{2028}")
     }
 
     /// "Today 3:04 PM" after an hour of quiet.
@@ -348,12 +319,8 @@ enum TranscriptFoldLink {
     static let scheme = "nativeagent-fold"
 
     /// Hierarchical (`nativeagent-fold:///<group>`): an opaque URL has no path to read the group back from.
-    static func url(_ group: String) -> URL {
-        var parts = URLComponents()
-        parts.scheme = scheme
-        parts.host = ""
-        parts.path = "/" + group
-        return parts.url ?? URL(fileURLWithPath: "/")
+    static func url(_ group: String) -> String {
+        scheme + ":///" + group.utf8.map { String(format: "%%%02X", $0) }.joined()
     }
 
     static func group(_ link: Any) -> String? {

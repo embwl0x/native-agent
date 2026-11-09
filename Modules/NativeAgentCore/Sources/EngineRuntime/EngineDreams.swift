@@ -101,19 +101,24 @@ extension NativeAgentEngine {
     public static func runDream(
         dataRoot root: URL,
         force: Bool = false,
-        trigger: DreamTrigger = .schedule
+        trigger: DreamTrigger = .schedule,
+        parent: Turn? = nil,
+        beganAt: Date = Date()
     ) async throws -> [String: Any] {
+        let cause: Turn
+        if let parent { cause = parent } else { cause = Turn(session: "dream") }
         let cognition = cognitionRuntime(for: root)
         let impl = try await dreamCycle(dataRoot: root)
         let report = try await DreamBackgroundWork.runDream(
             dataRoot: root, cycle: impl, cognitionRuntime: cognition,
-            force: force, trigger: trigger, notifications: EngineREMProposalNotifications()
+            force: force, trigger: trigger, notifications: EngineREMProposalNotifications(), parent: cause, beganAt: beganAt
         )
         var response: [String: Any] = [
             "ok": report.errors.isEmpty, "backend": "swift", "force": force,
             "trigger": report.trigger.rawValue, "sessionsProcessed": report.sessionsProcessed,
             "entriesWritten": report.entriesWritten, "disabled": report.disabled, "errors": report.errors,
         ]
+        response["entryDate"] = DreamREMSchedule.todayKey(now: beganAt)
         if let skipReason = report.skipReason { response["skipReason"] = skipReason }
         if !report.busy.isEmpty { response["busy"] = report.busy }
         if !report.errors.isEmpty {
@@ -123,7 +128,7 @@ extension NativeAgentEngine {
         let output = JSONValue.object(try NativeActionWire.jsonValueBody(response))
         let saved: Result<JSONValue, Error> = await settle {
             do {
-                return .success(try await SchedulerDueJobRunner(root: root).surfaceDreamResult(output))
+                return .success(try await clockWork(dataRoot: root).surfaceDreamResult(output))
             } catch { return .failure(error) }
         }
         if case .object(let receipt) = try saved.get() {
@@ -132,7 +137,7 @@ extension NativeAgentEngine {
         return response
     }
 
-    /// Manual and weekly REM share approval staging; the weekly job passes `force: false` so an earlier manual run cannot distil the same dreams twice.
+    /// Manual and weekly REM share approval staging; the weekly clock time passes `force: false` so an earlier manual run cannot distil the same dreams twice.
     public static func runRem(dataRoot root: URL, force: Bool = true, repair: Bool = false) async throws -> [String: Any] {
         let cognition = cognitionRuntime(for: root)
         let impl = try makeDreamREMCycle(

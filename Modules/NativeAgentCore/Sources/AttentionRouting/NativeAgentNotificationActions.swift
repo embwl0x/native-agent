@@ -14,8 +14,9 @@ public enum NativeAgentNotificationActions {
     public static let newConversationKey = "newNotificationConversation"
 
     public static func messageRoute(turn: Turn?) -> [String: String] {
-        turn?.verifiedSessionID.map { [sessionKey: $0] }
-            ?? [newConversationKey: "true"]
+        var route = turn?.verifiedSessionID.map { [sessionKey: $0] } ?? [newConversationKey: "true"]
+        if let connection = turn?[FacePresentationPart.self] { route["faceRenderer"] = connection.uuidString }
+        return route
     }
 
     public static func category(for userInfo: [String: String]) -> String {
@@ -37,6 +38,8 @@ public enum NativeAgentNotificationActions {
         public let text: String?
         public let title: String
         public let body: String
+        public let renderer: String?
+        public let route: [String: String]
 
         public init(
             action: String, category: String, userInfo: [AnyHashable: Any],
@@ -52,6 +55,10 @@ public enum NativeAgentNotificationActions {
             self.text = text
             self.title = title
             self.body = body
+            renderer = userInfo["faceRenderer"] as? String
+            route = userInfo.reduce(into: [:]) { result, pair in
+                if let key = pair.key as? String, let value = pair.value as? String { result[key] = value }
+            }
         }
     }
 }

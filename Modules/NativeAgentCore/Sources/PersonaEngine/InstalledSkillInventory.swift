@@ -7,8 +7,8 @@ import PersistenceCore
 
 /// Share skill identity and availability across discovery, UI and recall.
 public enum InstalledSkillInventory {
-    /// Exclude IDs now owned by abilities so built-in guidance cannot compete with executable parts.
-    public static func entries(dataRoot: URL, includingSource: Bool = true) throws -> [SkillRecord] {
+    /// Guidance files exclude identities owned by executable parts.
+    public nonisolated static func files(dataRoot: URL) throws -> [URL] {
         let bodies = defaultPersonaRoot(dataRoot: dataRoot).appendingPathComponent("skills/bodies")
         let directory: [URL]
         do {
@@ -16,8 +16,11 @@ public enum InstalledSkillInventory {
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
         let abilityIDs = Set(try AbilityStore(dataRoot: dataRoot).files(kind: .part)
             .map { $0.id.lowercased() })
-        let files = directory.filter { $0.pathExtension == "md" && !abilityIDs.contains($0.deletingPathExtension().lastPathComponent.lowercased()) }
-        return files.map { file in
+        return directory.filter { $0.pathExtension == "md" && !abilityIDs.contains($0.deletingPathExtension().lastPathComponent.lowercased()) }
+    }
+
+    public static func entries(dataRoot: URL, includingSource: Bool = true) throws -> [SkillRecord] {
+        try files(dataRoot: dataRoot).map { file in
             let id = file.deletingPathExtension().lastPathComponent
             do { return try entry(id, file: file, includingSource: includingSource) }
             catch {

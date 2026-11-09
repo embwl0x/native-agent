@@ -13,6 +13,8 @@ import Privacy
 
 extension Parts {
     static let descriptionLimit = 500
+    /// A trial's or setting aside's why: trimmed, then refused past this many characters so the stored words are exactly the agent's.
+    static let whyLimit = 500
     static let parameterNamePattern = "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
     static let parameterTypes = ["string": "string", "int": "int", "integer": "int", "number": "number",
                                  "bool": "bool", "boolean": "bool", "list": "list", "array": "list", "object": "object"]
@@ -30,7 +32,10 @@ extension Parts {
         let spellings = parameterTypes.keys.sorted().flatMap { [$0, $0 + "?"] }.map(JSONValue.string)
         let type: JSONValue = .object(["type": .string("string"), "enum": .array(spellings)])
         let nonempty: JSONValue = .object(["type": .string("string"), "pattern": .string(#"\S"#)])
-        let parameter: JSONValue = .object(["anyOf": .array([type, object(["type": type, "description": nonempty], required: ["type"])])])
+        let declaration: JSONValue = .object(["type": .string("object"),
+            "properties": .object(["type": type, "description": nonempty]), "required": .array([.string("type")]),
+            "additionalProperties": .bool(true), "description": .string("Parameter schema; constraints use the shared JSON Schema validator.")])
+        let parameter: JSONValue = .object(["anyOf": .array([nonempty, declaration])])
         let map: JSONValue = .object(["type": .string("object"),
             "propertyNames": .object(["pattern": .string(parameterNamePattern)]), "additionalProperties": parameter])
         let strings = list(.object(["type": .string("string")]), "A list of strings.")
@@ -68,9 +73,11 @@ extension Parts {
                     "old": .object(["type": .string("string"), "minLength": .int(1)]), "new": .object(["type": .string("string")])]),
                     "required": .array([.string("old"), .string("new")])])]),
             "params": .object(["description": .string("""
-                Input name → type or {type,description?}; integer/boolean/array alias int/bool/list, and ? makes an input optional. Or \
-                {type:\"object\",properties:<same map>,required?:[names],additionalProperties?:false,readOnly?:bool}. Only type and description are \
-                accepted per param; name allowed values in description. Omit to inherit; null or {} clears.
+                Input name → description string or {type,description?}. A leading type word, optionally after optional, sets the type; otherwise string. \
+                Words end at whitespace, commas, colons or parentheses. integer/boolean/array alias int/bool/list; ? on the type or the word optional \
+                makes an input optional. Or \
+                {type:\"object\",properties:<same map>,required?:[names],additionalProperties?:false,readOnly?:bool}. Parameter schemas retain their \
+                constraints, including array items and enum, checked by the shared JSON Schema validator. Omit to inherit; null or {} clears.
                 """),
                 "anyOf": .array([map, schema, .object(["type": .string("null")])])]),
             "actions": list(.object(["type": .string("string")]), """
@@ -83,16 +90,37 @@ extension Parts {
             "triggers": .object(["type": .string("array"), "description": .string("Retained trigger metadata; omit to inherit.")]),
             "converts": list(.object(["type": .string("string"), "pattern": .string("^[0-9a-f]{64}$")]),
                 "Original source SHA-256 digests from the conversion census."),
-            "create_only": .object(["type": .string("boolean"), "description": .string("Refuse an occupied id or name instead of revising it.")])
+            "create_only": .object(["type": .string("boolean"), "description": .string("Refuse an occupied id or name instead of revising it.")]),
+            "trial": .object(["type": .string("boolean"), "description": .string("""
+                Revise a kept ability as a trial: code or edits, and why, are required. The stem records the trial (learned.trial) and judges it \
+                against the kept version from its runs; one open trial per ability. A later save without trial supersedes an open trial. For your \
+                turn program (id: "turn") every revision is a trial and needs why; trial may be omitted, and a revision supersedes its open trial.
+                """)]),
+            "set_aside": .object(["type": .string("boolean"), "description": .string("""
+                Set aside an open trial whose version is current: the kept version's code and declarations are saved forward as a new version, \
+                under the same Trust as any save. Send only id, and why if any. For your turn program (id: "turn"), turn.prev.js is saved forward.
+                """)]),
+            "why": .object(["type": .string("string"), "pattern": .string(#"\S"#), "maxLength": .int(Int64(whyLimit)), "description": .string("""
+                With trial or set_aside: the reason in a sentence, at most \(whyLimit) characters after trimming. Shown, never scored. Required with \
+                every revision of your turn program (id: "turn"), since each one is a trial: what it changes and the surprise it answers.
+                """)])
         ]) { _, value in value }, required: ["id"])
     }()
 
     /// A revision inherits omitted declarations and code; explicit empties clear them. Full Mac may keep the agent's own save immediately; other authority
-    /// remains a draft.
+    /// remains a draft. A part's trial follows what becomes current (AbilityStore.TrialChange), never a save that only waits.
     public func save(_ input: [String: JSONValue], steer: [String], fullMac: Bool, origin given: JSONValue? = nil,
         invocation: Invocation) async throws -> [String: JSONValue] {
+        try await save(input, steer: steer, fullMac: fullMac, origin: given, invocation: invocation, keptSelf: nil)
+    }
+
+    /// `keptSelf` saves the kept self forward: it is the base every omitted field inherits from, and the staged version is marked as the open
+    /// trial's setting aside, with the agent's why.
+    private func save(_ input: [String: JSONValue], steer: [String], fullMac: Bool, origin given: JSONValue?,
+        invocation: Invocation, keptSelf: (kept: OwnedProgramStore.Candidate, why: String?)?) async throws -> [String: JSONValue] {
         let started = ContinuousClock.now
-        var validateMS = 0.0, proofMS = 0.0
+        // A phase this save never ran is absent from its timing, never a zero.
+        var validateMS: Double?, proofMS: Double?
         var descriptionNote: String?
         func milliseconds(since start: ContinuousClock.Instant) -> Double {
             let elapsed = start.duration(to: .now).components
@@ -104,9 +132,10 @@ extension Parts {
                 receipt["description_note"] = .string(descriptionNote)
                 receipt["detail"] = .string((Self.string(receipt, "detail").map { $0 + " " } ?? "") + descriptionNote + ".")
             }
-            return receipt.merging(["timing": .object(["validate_ms": .double(validateMS),
-                "proof_ms": .double(proofMS),
-                "write_ms": .double(max(0, milliseconds(since: started) - validateMS - proofMS))])]) { _, value in value }
+            var timing: [String: JSONValue] = ["write_ms": .double(max(0, milliseconds(since: started) - (validateMS ?? 0) - (proofMS ?? 0)))]
+            timing["validate_ms"] = validateMS.map(JSONValue.double)
+            timing["proof_ms"] = proofMS.map(JSONValue.double)
+            return receipt.merging(["timing": .object(timing)]) { _, value in value }
         }
         func refuse(_ why: String) -> PartError { .invalid(why + " Nothing was saved.") }
         guard case .object(let declaredArguments)? = Self.fields(Self.saveArgumentsSchema)["properties"] else {
@@ -129,16 +158,50 @@ extension Parts {
         guard existing != nil || AbilityStore.isAbilityID(id) else {
             throw refuse("id is 2 to 64 lowercase letters, digits, - and _, a letter first; \(named) reads as \(id).")
         }
-        // A new part never takes a shipped name; revising a part the agent has, shipped ones included, is the agent's call.
+        // A new part never takes a shipped name; revising a part the agent has, shipped ones included, is the agent's call. The turn program is the
+        // agent's own: it is revised, never created.
+        if existing == nil, id == Self.turnID { return timed(try saveTurn(input, steer: steer, fullMac: fullMac, invocation: invocation)) }
         if existing == nil, let shipped = try AbilityStore.reservedPart(id) {
             throw refuse("\(shipped) is reserved for the app's own part. Choose another id.")
+        }
+        if case .object(let learned)? = input["learned"], learned["trial"] != nil {
+            throw refuse("learned.trial is the stem's record of a trial; revise with trial: true and why.")
+        }
+        let trial = input["trial"] == .bool(true), settingAside = input["set_aside"] == .bool(true)
+        guard !(trial && settingAside) else { throw refuse("Send trial or set_aside, not both.") }
+        var why: String?
+        if input["why"] != nil {
+            guard trial || settingAside else { throw refuse("why belongs to a trial or a setting aside; send it with trial: true or set_aside: true.") }
+            let text = (Self.string(input, "why") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { throw refuse("why is nonempty text after trimming.") }
+            guard text.count <= Self.whyLimit else { throw refuse("why is at most \(Self.whyLimit) characters after trimming; this one has \(text.count).") }
+            why = text
+        }
+        // The stem's own record decides whether a trial is open, read unredacted, after any trial whose version left both slots is closed.
+        if trial || settingAside { try abilities.changeTrial(id: id, .reconcile(by: "stem"), turn: invocation.execution.turn) }
+        let accounting = try trial || settingAside ? abilities.states()[id]?.objectValue ?? [:] : [:]
+        var opening: (kept: String, why: String)?
+        if trial {
+            guard existing != nil, let kept = try abilities.read(id: id) else {
+                throw refuse("trial revises a kept ability; \(id) has no kept version. Save it and keep it first.")
+            }
+            guard input["code"] != nil || input["edits"] != nil else { throw refuse("A trial is a revision: send code or edits.") }
+            guard let why else { throw refuse("A trial needs why: what it changes and the surprise it answers, in a sentence.") }
+            guard accounting["trial"] == nil else { throw refuse("One open trial per part: wait for its verdict or set it aside.") }
+            opening = (abilities.versionKey(kept), why)
+        }
+        if settingAside {
+            if let extra = input.keys.sorted().first(where: { !$0.hasPrefix("__") && !["verb", "preview", "id", "set_aside", "why"].contains($0) }) {
+                throw refuse("set_aside saves the kept version forward as it was; send only id and why, not \(extra).")
+            }
+            return try await setAside(id, accounting: accounting, why: why, steer: steer, fullMac: fullMac, origin: given, invocation: invocation)
         }
         if input["create_only"] == .bool(true), try existing != nil || abilities.contains(id: id) {
             validateMS = milliseconds(since: started)
             return timed(["status": .string("failed"), "id": .string(id), "effects": .string("none"), "reason": .string("name_exists"),
                     "detail": .string("That ability name already exists. Choose a fresh name; nothing was replaced.")])
         }
-        let base = try existing.flatMap(latest)
+        let base = try keptSelf?.kept ?? existing.flatMap(latest)
         let was = base.map { Self.fields($0.manifest) } ?? [:]
         var code = Self.string(input, "code")
         if let edits = input["edits"] {
@@ -173,12 +236,17 @@ extension Parts {
                 params = nil; schema = .object(["type": .string("object"), "properties": .object([:])])
             } else {
                 let read = try Self.params(declared)
-                params = .object(read.params); schema = Self.inputSchema(read.params, readOnly: read.readOnly)
+                params = .object(read.params); schema = try Self.inputSchema(read.params, readOnly: read.readOnly)
             }
         }
         var header = input.filter { AbilityStore.partKeys.contains($0.key) }
         for key in AbilityStore.partKeys where header[key] == nil { header[key] = was[key] }
         let part = try AbilityStore.partHeader(header)
+        // A part that answers door verbs takes {verb, ...args}; each verb's args are its declared schema, so params never sits beside answers.
+        if let answered = AbilityStore.answeredInputSchema(part["answers"]) {
+            if let declared = input["params"], declared != .null { throw refuse("answers declares this part's inputs; remove params.") }
+            params = nil; schema = answered
+        }
         let permissions = try Self.declaredStrings(Self.fields(part["reach"] ?? .null)["capabilities"], name: "reach.capabilities")
         // Direct app members, literal door requests and reach derive dependencies; indirect calls declare theirs in actions.
         let reached = AbilityStore.reachActions(permissions)
@@ -196,11 +264,7 @@ extension Parts {
                 return action
             }
         } else {
-            let earlier = Self.strings(was["declaredActions"] ?? was["actions"] ?? Self.fields(was["script"] ?? .null)["actions"])
-            let derived = Set(AbilityStore.reachActions(try Self.declaredStrings(Self.fields(was["reach"] ?? .null)["capabilities"],
-                name: "reach.capabilities"))
-                + OwnedProgram.calledActions(base?.program.source ?? ""))
-            declared = was["declaredActions"] != nil ? earlier : earlier.filter { !derived.contains($0) }
+            declared = try Self.declaredActions(was, source: base?.program.source ?? "")
         }
         var actions: [String] = []
         for id in declared + called + reached where !actions.contains(id) { actions.append(id) }
@@ -229,6 +293,30 @@ extension Parts {
         if let triggers = input["triggers"] ?? was["triggers"] { manifest["triggers"] = triggers }
         if FileManager.default.fileExists(atPath: guidance.path) || was["overrides"] == .string("built_in") { manifest["overrides"] = .string("built_in") }
         manifest.merge(part) { _, value in value }
+        if keptSelf == nil, let base {
+            // Selection/proof are not authored content. Compare before minting an identity that includes the current selection.
+            let authoredKeys = AbilityStore.partKeys.union(["id", "name", "description", "language", "inputSchema", "actions", "declaredActions",
+                "origin", "converts", "params", "compiled", "capabilityPackInstallId", "triggers", "overrides"])
+            var before = was.filter { authoredKeys.contains($0.key) }
+            before.merge(try AbilityStore.partHeader(was.filter { AbilityStore.partKeys.contains($0.key) })) { _, value in value }
+            before["converts"] = try OwnedProgramStore.conversionSources(was["converts"])
+            before["declaredActions"] = .array(try Self.declaredActions(was, source: base.program.source).map(JSONValue.string))
+            before["inputSchema"] = base.program.schema
+            if source == base.program.source, fixtures == base.fixtures, before == manifest {
+                try AbilityStore.withLock {
+                    let live = try row(id)
+                    let selected = try live.flatMap(latest)
+                    guard OwnedProgramStore.selection(live.map(JSONValue.object)) == OwnedProgramStore.selection(existing.map(JSONValue.object)),
+                          selected == base else {
+                        throw refuse("\(id) changed while its content was compared; read its current version.")
+                    }
+                }
+                validateMS = milliseconds(since: started)
+                return timed(["status": .string("ok"), "id": .string(id), "name": .string(name), "effects": .string("none"),
+                    "version": .string(base.digest), "ability_status": existing?["status"] ?? .null,
+                    "detail": .string("\(name) already has this authored content; its versions and trial were left as they are.")])
+            }
+        }
         let candidate = try OwnedProgramStore.Candidate(
             program: OwnedProgram(kind: .part, id: id, version: "candidate", source: source, entry: .run, schema: schema,
                                   dependencies: actions, permissions: permissions, resident: part["resident"] == .bool(true)),
@@ -257,12 +345,28 @@ extension Parts {
             var receipt: [String: JSONValue] = ["status": .string("saved"), "id": .string(id), "name": .string(name),
                 "candidate_digest": .string(candidate.digest), "actions": .array(actions.map(JSONValue.string))]
             if !calls.warnings.isEmpty { receipt["warnings"] = .array(calls.warnings.map(JSONValue.string)) }
-            if manifest["compiled"] == nil, given == nil, fullMac, Self.keepRefusal(origin: origin, name: name, fullMac: true) == nil {
-                // Kept by the agent under Full Mac: a rehearsal proves no live behavior, so its first real run is its proof.
+            // The staged version's trial is written before any keep, so the keep that selects it sees it. The version under trial is this
+            // candidate's identity, which the kept file keeps (identity reads candidate.program.version, which is candidate.digest). Any other
+            // save reconciles: staging over the trial's own waiting draft leaves the trial's version in neither slot.
+            let change = opening.map { AbilityStore.TrialChange.open(version: candidate.digest, kept: $0.kept, why: $0.why) }
+                ?? keptSelf.map { AbilityStore.TrialChange.settingAside(version: candidate.digest, why: $0.why) } ?? .reconcile(by: "agent")
+            do {
+                if let trial = try abilities.changeTrial(id: id, change, turn: invocation.execution.turn) { receipt["trial"] = trial }
+                else if opening != nil || keptSelf != nil {
+                    receipt["accounting_error"] = .string("\(id)'s trial changed meanwhile, so this version was saved without a trial change.")
+                }
+            } catch { receipt["accounting_error"] = .string(error.localizedDescription) }
+            // The person's own decision of this exact call (Home's Set aside) keeps it in one act at any posture, as theirs.
+            let person = invocation.execution.turn?.personAct != nil
+            if manifest["compiled"] == nil, given == nil, person || fullMac && Self.keepRefusal(origin: origin, name: name, fullMac: true) == nil {
+                // Kept by the agent under Full Mac, or by the person: a rehearsal proves no live behavior, so its first real run is its proof.
                 let proving = ContinuousClock.now
                 try store.kept(candidate, key: try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey(), turn: invocation.execution.turn)
                 proofMS = milliseconds(since: proving)
-                try await admit(id: id, digest: candidate.digest, by: "agent", invocation: invocation)
+                if let closed = try await admit(id: id, digest: candidate.digest, by: person ? "user" : "agent", ownerAuthorized: person,
+                    invocation: invocation) {
+                    receipt["trial"] = closed
+                }
                 receipt["status"] = .string("kept"); receipt["ability_status"] = .string("active")
                 receipt["next_call"] = .object(["action": .string("authored." + id), "args": .object([:])])
                 receipt["detail"] = .string("\(name) is kept and on: run it as authored.\(id); its first real run is its proof.")
@@ -280,6 +384,41 @@ extension Parts {
                 throw PartError.stagedButFailed(digest: candidate.digest, committed: staged == .committed, why: error.localizedDescription)
             }
         }
+    }
+
+    /// Setting aside saves the kept self (the retained previous version whose key the trial names) forward through save itself, with the kept self
+    /// as the base every field inherits from, so Trust applies as for any save; the trial closes as set aside when that version becomes current.
+    /// Never a version swap.
+    private func setAside(_ id: String, accounting: [String: JSONValue], why: String?, steer: [String], fullMac: Bool, origin given: JSONValue?,
+        invocation: Invocation) async throws -> [String: JSONValue] {
+        func refuse(_ why: String) -> PartError { .invalid(why + " Nothing was saved.") }
+        guard let open = accounting["trial"] else { throw refuse("\(id) has no open trial to set aside.") }
+        guard case .object(let trial) = open, let version = Self.string(trial, "version"), let keptKey = Self.string(trial, "kept") else {
+            throw refuse("\(id)'s open trial is unreadable in abilities/state.json; repair that record before setting it aside.")
+        }
+        guard let current = try abilities.read(id: id), abilities.identity(current) == version else {
+            let waiting = try abilities.read(id: id, slot: .next).flatMap(abilities.identity) == version
+            throw refuse(waiting
+                ? "\(id)'s trial version \(version.prefix(12)) is a waiting draft, never kept; ability.drop {id:\"\(id)\", pending:true} discards it."
+                : "\(id)'s trial of \(version.prefix(12)) was superseded: the current version is neither it nor its waiting draft.")
+        }
+        guard let keptFile = try abilities.read(id: id, slot: .previous), abilities.versionKey(keptFile) == keptKey,
+              let keptDigest = abilities.identity(keptFile) else {
+            throw refuse("The kept version \(keptKey) is no longer \(id)'s retained previous version, so it cannot be saved forward.")
+        }
+        let kept = try store.load(id: id, digest: keptDigest)
+        var receipt = try await save(["id": .string(id)], steer: steer, fullMac: fullMac, origin: given, invocation: invocation,
+            keptSelf: (kept, why))
+        receipt["detail"] = .string("The earlier version \(keptKey) was saved forward as a new version. " + (Self.string(receipt, "detail") ?? ""))
+        return receipt
+    }
+
+    /// Actions a version declared beyond those its reach and literal calls derive.
+    static func declaredActions(_ manifest: [String: JSONValue], source: String) throws -> [String] {
+        let earlier = Self.strings(manifest["declaredActions"] ?? manifest["actions"] ?? Self.fields(manifest["script"] ?? .null)["actions"])
+        let derived = Set(AbilityStore.reachActions(try Self.declaredStrings(Self.fields(manifest["reach"] ?? .null)["capabilities"],
+            name: "reach.capabilities")) + OwnedProgram.calledActions(source))
+        return manifest["declaredActions"] != nil ? earlier : earlier.filter { !derived.contains($0) }
     }
 
     // MARK: - Rehearsal
@@ -398,11 +537,6 @@ extension Parts {
         return [row["origin"]]
     }
 
-    static func agentMayAdmit(_ origin: JSONValue?) -> Bool {
-        guard let kind = originKind(origin), fields(origin ?? .null)["pack"] == nil else { return false }
-        return kind == "hers" || kind == "peer" && strings(fields(origin ?? .null)["peers"]).allSatisfy(CapabilityLifecycle.ownerTrusts)
-    }
-
     /// Own work needs no untrusted-origin attribution.
     public static func voices(_ row: [String: JSONValue]) -> [String] {
         guard row["origin"] != nil, case .object(let origin) = merged([row["origin"]]) else { return [] }
@@ -411,12 +545,13 @@ extension Parts {
 
     // MARK: - Inputs
 
-    /// Parameter maps and JSON Schema share one input contract; a trailing question mark marks an optional flat parameter.
+    /// Parameter maps and JSON Schema share one input contract; plain strings express optionality with ? on the type or the word optional.
     static func params(_ value: JSONValue) throws -> (params: [String: JSONValue], readOnly: Bool) {
         func refuse(_ why: String) -> PartError { .invalid(why + " Nothing was saved.") }
         let shape = """
-            Each param is its type (string, int or integer, number, bool or boolean, list or array, or object; a trailing ? marks it optional) or {type, \
-            description?}.
+            Each param is a description string (a leading string, int/integer, number, bool/boolean, list/array or object, optionally after optional, \
+            sets its type; otherwise string; ? on the type or the word optional marks it optional; words end at whitespace, commas, colons or \
+            parentheses), or {type, description?, ...schema constraints}.
             """
         guard case .object(let fields) = value else { throw refuse("params maps each input name to its type. " + shape) }
         func read(_ fields: [String: JSONValue]) throws -> [String: JSONValue] {
@@ -431,23 +566,26 @@ extension Parts {
                     throw refuse("params.\(name)'s type is " + (given.isEmpty ? "missing" : "\"\(given)\"") + ". " + shape)
                 }
                 let spelled = type + (optional ? "?" : "")
-                guard case .object(var declaration) = value else { params[name] = .string(spelled); continue }
-                if let key = declaration.keys.sorted().first(where: { !["type", "description"].contains($0) }) {
-                    throw refuse("params.\(name) takes no \(key). " + shape + (key == "enum" ? " Name its allowed values in description." : ""))
-                }
-                guard let description = declaration["description"] else { params[name] = .string(spelled); continue }
-                guard !(string(["d": description], "d") ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    throw refuse("params.\(name).description is nonempty text, or leave description out.")
+                guard var declaration = parameterDeclaration(value) else { throw refuse("params.\(name) has no parameter declaration. " + shape) }
+                if let description = declaration["description"] {
+                    guard case .string(let text) = description, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw refuse("params.\(name).description is nonempty text, or leave description out.")
+                    }
                 }
                 declaration["type"] = .string(spelled)
+                if let problem = JSONValue.null.schemaProblem(schema: try inputProperty(.object(declaration))), problem.keyword == "schema" {
+                    throw refuse("params.\(name): \(problem.words).")
+                }
                 params[name] = .object(declaration)
             }
             return params
         }
-        // Flat maps take precedence; JSON Schema properties are optional only when not required.
-        do { return (try read(fields), false) } catch {
-            guard fields["type"] == .string("object"), case .object(let properties)? = fields["properties"],
-                  fields.keys.allSatisfy(["type", "properties", "required", "additionalProperties", "readOnly"].contains) else { throw error }
+        // A type-bearing value names a parameter, including parameters named type or properties.
+        let namedParameters = fields.values.allSatisfy { parameterType($0) != nil }
+        if !namedParameters, fields["type"] == .string("object"), case .object(let properties)? = fields["properties"] {
+            if let stray = fields.keys.sorted().first(where: { !["type", "properties", "required", "additionalProperties", "readOnly"].contains($0) }) {
+                throw refuse("params takes no \(stray); put each parameter's constraints in properties.")
+            }
             guard fields["additionalProperties"] == nil || fields["additionalProperties"] == .bool(false) else {
                 throw refuse("params.additionalProperties is false or left out: an ability takes only its declared params.")
             }
@@ -464,35 +602,66 @@ extension Parts {
                     throw refuse("params.required names \(stray), which properties does not declare.")
                 }
             }
+            for name in required {
+                if let type = parameterType(properties[name]), type.hasSuffix("?") {
+                    throw refuse("params.\(name) is required and has an optional type; choose one meaning.")
+                }
+            }
             var flat = properties
             for (name, value) in properties where !required.contains(name) {
                 guard let type = parameterType(value), !type.hasSuffix("?") else { continue }
-                if case .object(var declaration) = value { declaration["type"] = .string(type + "?"); flat[name] = .object(declaration) }
-                else { flat[name] = .string(type + "?") }
+                guard var declaration = parameterDeclaration(value) else { continue }
+                declaration["type"] = .string(type + "?"); flat[name] = .object(declaration)
             }
             return (try read(flat), fields["readOnly"] == .bool(true))
         }
+        return (try read(fields), false)
+    }
+
+    /// Plain spellings and schema declarations keep one canonical type without losing the parameter's constraints.
+    private static func inputProperty(_ value: JSONValue) throws -> JSONValue {
+        let types = ["string": "string", "int": "integer", "number": "number", "bool": "boolean", "list": "array", "object": "object"]
+        guard let type = parameterType(value), let jsonType = types[type.hasSuffix("?") ? String(type.dropLast()) : type] else {
+            throw PartError.invalid("A parameter has no canonical type. Nothing was saved.")
+        }
+        guard var property = parameterDeclaration(value) else { throw PartError.invalid("A parameter declaration is missing. Nothing was saved.") }
+        property["type"] = .string(jsonType)
+        return .object(property)
     }
 
     /// Every run must validate against the derived input schema.
-    static func inputSchema(_ params: [String: JSONValue], readOnly: Bool = false) -> JSONValue {
-        let types = ["string": "string", "int": "integer", "number": "number", "bool": "boolean", "list": "array", "object": "object"]
-        let properties = params.mapValues { value -> JSONValue in
-            let type = parameterType(value) ?? ""
-            var property: [String: JSONValue] = ["type": .string(types[type.hasSuffix("?") ? String(type.dropLast()) : type] ?? "")]
-            if case .object(let declaration) = value, let description = declaration["description"] { property["description"] = description }
-            return .object(property)
+    static func inputSchema(_ params: [String: JSONValue], readOnly: Bool = false) throws -> JSONValue {
+        let properties = try params.mapValues(inputProperty)
+        var required: [JSONValue] = []
+        for (name, value) in params.sorted(by: { $0.key < $1.key }) {
+            guard let type = parameterType(value) else { throw PartError.invalid("params.\(name) has no type. Nothing was saved.") }
+            if !type.hasSuffix("?") { required.append(.string(name)) }
         }
         var schema: [String: JSONValue] = ["type": .string("object"), "properties": .object(properties),
-            "required": .array(params.keys.sorted().filter { !(parameterType(params[$0]) ?? "").hasSuffix("?") }.map(JSONValue.string)),
+            "required": .array(required),
             "additionalProperties": .bool(false)]
         if readOnly { schema["readOnly"] = .bool(true) }
         return .object(schema)
     }
 
     static func parameterType(_ value: JSONValue?) -> String? {
-        if case .string(let type)? = value { return type }
-        return string(fields(value ?? .null), "type")
+        parameterDeclaration(value).flatMap { string($0, "type") }
+    }
+
+    /// Strings retain their description. Words end at whitespace, commas, colons or parentheses; the leading type may follow optional.
+    /// A ? on that type or the word optional anywhere marks optionality, even when an untyped description names a string.
+    private static func parameterDeclaration(_ value: JSONValue?) -> [String: JSONValue]? {
+        if case .object(let declaration)? = value { return declaration }
+        guard case .string(let supplied)? = value else { return nil }
+        let description = supplied.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !description.isEmpty else { return nil }
+        let words = description.lowercased().split { $0.isWhitespace || $0 == "," || $0 == ":" || $0 == "(" || $0 == ")" }
+        let word = words.first == "optional" ? words.dropFirst().first : words.first
+        let questioned = word?.hasSuffix("?") == true
+        let base = word.map { questioned ? String($0.dropLast()) : String($0) }
+        let declaredType = base.flatMap { parameterTypes[$0] }
+        let optional = words.contains("optional") || (questioned && declaredType != nil)
+        return ["type": .string((declaredType ?? "string") + (optional ? "?" : "")), "description": .string(description)]
     }
 
     /// Runner verbs and malformed references cannot become action IDs.

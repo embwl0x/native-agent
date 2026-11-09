@@ -10,7 +10,7 @@ import CognitiveSubstrate
 import TurnTrace
 import Desk
 
-// Blueprint: | `MemoryV2+MemoryManager.swift` | `MemoryManagerLane`, `MemoryManagerPromise`: grounded decisions, reviewed targets and promises |
+// Blueprint: | `MemoryV2+MemoryManager.swift` | `MemoryManagerLane`, `MemoryManagerPromise`, `MemoryManagerSettlement`: grounded decisions, reviewed targets, promises and saved person-quoted settlements |
 
 // MARK: - What the manager returns
 
@@ -111,6 +111,9 @@ public struct MemoryManagerRequest: Sendable, Equatable {
     public let took: String?
     /// The exchange's clock, retained when an owed turn is judged later.
     public let occurredAt: Date?
+    /// Only the recorded person's own incoming words can settle the shown moments.
+    public let personWords: String
+    public let openMoments: [DeskItem]
 
     public init(
         userMessage: String,
@@ -122,7 +125,9 @@ public struct MemoryManagerRequest: Sendable, Equatable {
         standingAgent: Bool = false,
         appAuthored: Bool = false,
         took: String? = nil,
-        occurredAt: Date? = nil
+        occurredAt: Date? = nil,
+        personWords: String = "",
+        openMoments: [DeskItem] = []
     ) {
         self.userMessage = userMessage
         self.assistantMessage = assistantMessage
@@ -134,6 +139,8 @@ public struct MemoryManagerRequest: Sendable, Equatable {
         self.appAuthored = appAuthored
         self.took = took
         self.occurredAt = occurredAt
+        self.personWords = personWords
+        self.openMoments = openMoments
     }
 }
 
@@ -142,6 +149,26 @@ public struct MemoryManagerPromise: Codable, Sendable, Equatable {
     public let words: String
     public let when: String
     public let source: String
+
+    public init(words: String, when: String, source: String) {
+        self.words = words; self.when = when; self.source = source
+    }
+
+    /// A saved meaning already holds its semantic judgment; recovery checks its evidence against the recorded reply.
+    public func validate(reply: String) throws {
+        guard !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, reply.contains(source) else {
+            throw FoundationModelsError.decodeFailed("promise requires nonempty words and exact reply source")
+        }
+        switch when {
+        case "next_turn", "own_turn", "when_user_messages": return
+        default:
+            if when.hasPrefix("after_card "), case .afterCard(let id)? = MyQueue.When(when),
+               !id.contains(where: \.isWhitespace), reply.contains(id) { return }
+            if when.hasPrefix("at "), case .at? = MyQueue.When(when) { return }
+            throw FoundationModelsError.decodeFailed("promise has invalid when: \(when)")
+        }
+    }
 
     /// Absence and [] are valid. A malformed present section is never abstention.
     public static func parse(_ value: Any?, reply: String) throws -> [Self] {
@@ -159,18 +186,33 @@ public struct MemoryManagerPromise: Codable, Sendable, Equatable {
                   reply.contains(source) else {
                 throw FoundationModelsError.decodeFailed("promise \(promises.count) requires nonempty words, when and exact reply source")
             }
-            switch when {
-            case "next_turn", "own_turn", "when_user_messages": break
-            default:
-                if when.hasPrefix("after_card "), case .afterCard(let id)? = MyQueue.When(when),
-                   !id.contains(where: \.isWhitespace), reply.contains(id) { break }
-                if when.hasPrefix("at "), case .at? = MyQueue.When(when) { break }
-                throw FoundationModelsError.decodeFailed("promise \(promises.count) has invalid when: \(when)")
+            guard row["committed"] as? Bool == true else {
+                throw FoundationModelsError.decodeFailed("promise \(promises.count) requires committed=true: the reply must undertake the work, "
+                    + "not offer a draft, idea, possibility or an action awaiting someone choosing it")
             }
-            promises.append(Self(words: words.trimmingCharacters(in: .whitespacesAndNewlines),
-                                 when: when, source: source))
+            let promise = Self(words: words.trimmingCharacters(in: .whitespacesAndNewlines), when: when, source: source)
+            try promise.validate(reply: reply)
+            promises.append(promise)
         }
         return promises
+    }
+}
+
+/// Filing decisions retained until their Desk writes land. The settled case also reads older retained judgments.
+public enum MemoryManagerPromiseCapture: Codable, Sendable {
+    case ignore
+    case keep(MemoryManagerPromise, target: String?, candidates: [Int])
+    case settled(id: String, updatedAt: String, source: String)
+}
+
+/// The shared interpretation's person-quoted settlement, with the shown row revision retained for closure.
+public struct MemoryManagerSettlement: Codable, Sendable {
+    public let id: String
+    public let updatedAt: String
+    public let source: String
+
+    public init(id: String, updatedAt: String, source: String) {
+        self.id = id; self.updatedAt = updatedAt; self.source = source
     }
 }
 
@@ -180,6 +222,7 @@ public struct AfterTurnInterpretation: Codable, Sendable {
     public let caring: CaringAppraisalVerdict
     public let cares: [CognitiveCareJudgment]
     public let promises: [MemoryManagerPromise]
+    public let settled: [MemoryManagerSettlement]
     /// The incoming words were the app's, so only the agent's side of the exchange counts.
     public let appAuthored: Bool
     public let model: String?
@@ -193,20 +236,22 @@ public struct AfterTurnInterpretation: Codable, Sendable {
 
     public init(memories: [MemoryManagerDecision],
                 affect: CognitiveSubstrate.AffectAppraisal, caring: CaringAppraisalVerdict,
-                cares: [CognitiveCareJudgment] = [], promises: [MemoryManagerPromise] = [], appAuthored: Bool = false,
+                cares: [CognitiveCareJudgment] = [], promises: [MemoryManagerPromise] = [],
+                settled: [MemoryManagerSettlement] = [], appAuthored: Bool = false,
                 model: String?, surface: String) {
         self.memories = memories
         self.affect = affect
         self.caring = caring
         self.cares = cares
         self.promises = promises
+        self.settled = settled
         self.appAuthored = appAuthored
         self.model = model
         self.surface = surface
     }
 
     private enum CodingKeys: String, CodingKey {
-        case memories, affect, caring, cares, promises, appAuthored, model, surface
+        case memories, affect, caring, cares, promises, settled, appAuthored, model, surface
     }
 
     public init(from decoder: Decoder) throws {
@@ -216,6 +261,8 @@ public struct AfterTurnInterpretation: Codable, Sendable {
         caring = try values.decode(CaringAppraisalVerdict.self, forKey: .caring)
         cares = try values.decode([CognitiveCareJudgment].self, forKey: .cares)
         promises = try values.decode([MemoryManagerPromise].self, forKey: .promises)
+        if values.contains(.settled) { settled = try values.decode([MemoryManagerSettlement].self, forKey: .settled) }
+        else { settled = [] }
         appAuthored = try values.decode(Bool.self, forKey: .appAuthored)
         model = try values.decodeIfPresent(String.self, forKey: .model)
         surface = try values.decode(String.self, forKey: .surface)
@@ -223,7 +270,7 @@ public struct AfterTurnInterpretation: Codable, Sendable {
 }
 
 /// Use the configured Memory model for judgment; rule-based invention cannot establish a memory.
-public struct AfterTurnMemoryFailure: Error, Codable, Sendable, Hashable {
+public struct AfterTurnMemoryFailure: Error, LocalizedError, Codable, Sendable, Hashable {
     public enum Reason: String, Codable, Sendable, Hashable {
         case deadline, cancelled, provider, invalidJSON, missingSections
         case invalidCaring, invalidAffect, invalidMemories, invalidCares
@@ -244,6 +291,8 @@ public struct AfterTurnMemoryFailure: Error, Codable, Sendable, Hashable {
         self.surface = surface
         self.at = at
     }
+
+    public var errorDescription: String? { detail }
 
     public var detail: String {
         "After-turn memory failed: \(reason.rawValue). \(recovery) No new memory was saved from this pass."
@@ -271,10 +320,12 @@ public enum AfterTurnInterpretationFailure: String, Error, Sendable {
 
 /// Each batched exchange retains the request and context it would have received alone.
 public struct MemoryBatchInput: Sendable {
+    public let call: LLMCall
     public let request: MemoryManagerRequest
     public let context: AfterTurnContext?
     public let factsEnabled: Bool
-    public init(request: MemoryManagerRequest, context: AfterTurnContext?, factsEnabled: Bool) {
+    public init(request: MemoryManagerRequest, context: AfterTurnContext?, factsEnabled: Bool, call: LLMCall) {
+        self.call = call
         self.request = request
         self.context = context
         self.factsEnabled = factsEnabled
@@ -292,7 +343,10 @@ public protocol MemoryManaging: Sendable {
     /// Several owed exchanges in one call, one section each, in input order. A nil entry is a section the reply lacked or got wrong: that exchange stays owed.
     /// Throws when the call itself fails.
     func interpretBatch(_ inputs: [MemoryBatchInput]) async throws -> [AfterTurnInterpretation?]
-    func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String?, topK: Int?) async
+    func capturePromises(_ promises: [MemoryManagerPromise], reply: String,
+                         open: [DeskItem], call: LLMCall) async throws
+        -> [MemoryManagerPromiseCapture]
+    func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String?, topK: Int?, turn: Turn?) async
         -> Result<Set<String>, AfterTurnMemoryFailure>
 }
 
@@ -492,6 +546,7 @@ public enum MemoryManagerLane {
         }
         return AfterTurnInterpretation(memories: decisions, affect: interpretation.affect,
             caring: interpretation.caring, cares: interpretation.cares, promises: interpretation.promises,
+            settled: interpretation.settled,
             appAuthored: interpretation.appAuthored,
             model: interpretation.model, surface: interpretation.surface)
     }

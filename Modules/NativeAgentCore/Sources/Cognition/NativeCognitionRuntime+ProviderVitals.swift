@@ -13,32 +13,12 @@ import NativeAgentShared
 
 extension NativeCognitionRuntime {
     /// The sensor validates snapshot age and rows; absent or stale snapshots start cold.
-    /// Load retained first-output traces without blocking launch or turns; streams remain unmeasured until publication.
     func restoreProviderVitalsSnapshot() async {
         do {
             _ = try await providerVitalsSensor.restoreSnapshot(dataRoot: dataRoot, now: now())
         } catch {
             nativeLog("Provider vitals snapshot unavailable: %@", error.localizedDescription)
         }
-        let sensor = providerVitalsSensor, root = dataRoot, cutoff = now()
-        Task.detached(priority: .utility) {
-            do {
-                try await sensor.readFirstOutputs(dataRoot: root, before: cutoff)
-            } catch {
-                nativeLog("Provider first outputs unreadable from retained traces (first-output deadlines learn from this run's calls only): %@",
-                          error.localizedDescription)
-            }
-        }
-    }
-
-    /// The immutable sensor permits actor-free guard reads; evidence stays unmeasured until bootstrap publication.
-    public nonisolated func firstOutputDeadline(provider: String, model: String,
-                                                streamKind: String?, requestBytes: Int) async -> FirstOutputDeadline {
-        await providerVitalsSensor.firstOutputDeadline(provider: provider, model: model, streamKind: streamKind, requestBytes: requestBytes)
-    }
-
-    public nonisolated func providerFirstOutputs() async -> String {
-        await providerVitalsSensor.firstOutputReport()
     }
 
     /// Persist only at termination, never on the observation path.

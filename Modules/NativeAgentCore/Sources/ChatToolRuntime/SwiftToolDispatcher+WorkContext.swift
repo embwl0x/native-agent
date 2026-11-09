@@ -179,25 +179,25 @@ extension SwiftToolDispatcher {
             "sort": .string("newest"), "limit": .int(5), "since": .string(since)]
         let outcome = await raceAgainstTimeout(seconds: 1.5) { [self] in
             let readiness = try await macIntegrationPermissionStore.readinessChecked()
-            let admitted = await fullMacYoloAdmitted(turn: turn, surface: surface)
             guard try await macIntegrationPermissionStore.allows(MacIntegrationID.mail, mode: .read) else {
                 return JSONValue.object(["status": .string("unavailable"), "message": .string(
                     readiness.refusal(integration: MacIntegrationID.mail, mode: .read)
                     ?? "Mail Read is off or unavailable; Mail was not searched.")])
             }
-            guard let bridge = macIntegrationBridge else {
+            guard let door = invocation.appDoor else {
                 return .object(["status": .string("unavailable"),
-                    "message": .string("Mail is not ready: the app's Mail reader is unavailable; Mail was not searched.")])
+                    "message": .string("Mail is not ready: this call has no app door to run mail.search through; Mail was not searched.")])
             }
             try Task.checkCancellation()
-            return try await bridge.serving(turn: turn.with(\.fullMacAdmitted, admitted),
-                context: invocation.macContext(dataRoot: dataRoot)).mailSearch(input: input)
+            // mail.search is the native-mail part's verb: it runs through the door under the same gates as the agent's own call.
+            return CanonicalToolNameDispatcher.actionResult(try await door.perform("app", ["action": .string("mail.search"), "args": .object(input)], turn,
+                invocation), action: "mail.search")
         }
         switch outcome {
         case .value(let result):
             try Task.checkCancellation()
             return AgentWorkspace.attachReadReferences(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
-                tool: "mail_search", input: input, result: result, dataRoot: dataRoot)
+                tool: "mail.search", input: input, result: result, dataRoot: dataRoot)
         case .timedOut:
             return .object(["status": .string("skipped"),
                 "message": .string("Mail search exceeded 1.5 seconds and was skipped; Desk and chat results are retained. No Mail matches were established.")])

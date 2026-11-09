@@ -10,107 +10,18 @@ import ToolRegistry
 import ProviderRouting
 import DoctorChecks
 import Research
-import TelegramBot
 import Connectors
 import ChatTurnRuntime
 import ChatTurnContracts
-// Blueprint: | `AppModel+SkillsIntegrations.swift` | `AppModel`, `refreshTelegramSettingsDraft`, `LatestRead.refreshDraft`, `engine.connectors.update`: UI |
+// Blueprint: | `AppModel+SkillsIntegrations.swift` | `AppModel`: connector updates, Telegram status/test/clear through the Telegram owner, Doctor runs |
 
 enum ConnectorUpdateOutcome: Equatable {
     case verified(ConnectorRecord)
     case failed(String)
 }
 
-struct TelegramSettingsDraftSnapshot: Equatable {
-    var enabled: Bool
-    var chats: String
-    var users: String
-    var requireMention: Bool
-}
-
-extension AppModel {
-    var telegramSettingsDraftSnapshot: TelegramSettingsDraftSnapshot {
-        TelegramSettingsDraftSnapshot(enabled: telegramEnabled, chats: telegramAllowedChats,
-                                      users: telegramAllowedUsers, requireMention: telegramRequireMention)
-    }
-}
-
 @MainActor
 extension AppModel {
-    /// Rebase only untouched clean fields from newest-started reads; user edits remain drafts.
-    func refreshTelegramSettingsDraft<Value>(
-        _ load: () async -> Value,
-        snapshot: (Value) -> TelegramSettingsDraftSnapshot?,
-        publish: (Value) -> Void = { _ in }
-    ) async {
-        let before = telegramSettingsDraftSnapshot
-        let baseline = telegramSettingsDraftBaseline
-        _ = await telegramSettingsRead.refreshDraft(load, apply: { value in
-            if let saved = snapshot(value) {
-                let current = telegramSettingsDraftSnapshot
-                func mayUpdate<T: Equatable>(_ key: KeyPath<TelegramSettingsDraftSnapshot, T>) -> Bool {
-                    current[keyPath: key] == before[keyPath: key]
-                        && (baseline.map { before[keyPath: key] == $0[keyPath: key] } ?? true)
-                }
-                if mayUpdate(\.enabled) { telegramEnabled = saved.enabled }
-                if mayUpdate(\.chats) { telegramAllowedChats = saved.chats }
-                if mayUpdate(\.users) { telegramAllowedUsers = saved.users }
-                if mayUpdate(\.requireMention) { telegramRequireMention = saved.requireMention }
-                telegramSettingsDraftBaseline = saved
-            }
-            publish(value)
-        })
-    }
-
-    func loadSkillManifests() async {
-        isLoadingSkillManifests = true
-        do {
-            try await engine.tools.refreshSkills(includingSource: true)
-            dismissSkillManifestFeedback()
-        } catch {
-            ModuleLog.app("%@", "[skills] learned skills read failed: \(error)")
-            recordSkillManifestFailure("Couldn't read learned skills. Try again; if it keeps happening, the details are in the log.")
-        }
-        isLoadingSkillManifests = false
-    }
-
-    @MainActor
-    func quarantineTool(_ tool: ToolRecord, reason: String = "Owner switched off from NativeAgent UI.") async {
-        do {
-            let updated = try await engine.tools.switchOff(id: tool.id, reason: reason)
-            guard try await engine.tools.refreshAuthored(confirming: updated.id, status: "disabled") else {
-                recordToolOperationStatus("Ability off could not be confirmed after reloading it.", outcome: .failed)
-                return
-            }
-            recordToolOperationStatus("Ability off", outcome: .succeeded)
-        } catch {
-            recordToolOperationStatus(UserFacingError.message(error, action: "turn that ability off"), outcome: .failed, cause: error)
-        }
-    }
-
-    @MainActor
-    func promoteTool(_ tool: ToolRecord) async {
-        if let refusal = engine.tools.keepRefusal(tool, turn: nil) {
-            recordToolOperationStatus("Keeping unavailable: \(refusal)", outcome: .failed)
-            return
-        }
-        do {
-            let version = tool.reviewedKeepDigest
-            guard version != nil || (tool.candidateDigest ?? tool.codeFingerprint) == nil
-                && tool.activePath.map({ URL(fileURLWithPath: $0).pathExtension == "md" }) == true else {
-                throw ToolRegistryError.invalidRequest("Refresh Tools before keeping this ability.")
-            }
-            let updated = try await engine.tools.keep(id: tool.id, version: version)
-            guard try await engine.tools.refreshAuthored(confirming: updated.id, status: "active") else {
-                recordToolOperationStatus("Keeping could not be confirmed after reloading the ability.", outcome: .failed)
-                return
-            }
-            recordToolOperationStatus("Ability kept", outcome: .succeeded)
-        } catch {
-            recordToolOperationStatus(UserFacingError.message(error, action: "keep that ability"), outcome: .failed, cause: error)
-        }
-    }
-
     @MainActor
     func updateConnector(_ connector: ConnectorRecord, enabled: Bool) async -> ConnectorUpdateOutcome {
         do {
@@ -142,94 +53,9 @@ extension AppModel {
 
 
     @MainActor
-    @discardableResult
-    func saveTelegram() async -> TelegramSettingsSaveOutcome {
-        isSavingTelegram = true
-        telegramSettingsSaveOutcome = nil
-        statusText = "Saving Telegram settings..."
-        defer { isSavingTelegram = false }
-
-        if let tokenError = TelegramFacade.tokenValidationMessage(for: telegramToken) {
-            statusText = "Telegram save failed: \(tokenError)"
-            let outcome = TelegramSettingsSaveOutcome.rejected(detail: tokenError)
-            telegramSettingsSaveOutcome = outcome
-            return outcome
-        }
-        guard TelegramBotTokenPresentation.canSave(
-            draft: telegramToken,
-            tokenConfigured: engine.telegram.status?.tokenConfigured == true
-        ) else {
-            let detail = "Add a bot token before saving settings."
-            statusText = "Telegram save failed: \(detail)"
-            let outcome = TelegramSettingsSaveOutcome.rejected(detail: detail)
-            telegramSettingsSaveOutcome = outcome
-            return outcome
-        }
-        let chats = parseTelegramNumericIDs(telegramAllowedChats)
-        let users = parseTelegramNumericIDs(telegramAllowedUsers)
-        let invalid = chats.invalidTokens + users.invalidTokens
-        guard invalid.isEmpty else {
-            let detail = "Invalid numeric ID(s): \(invalid.joined(separator: ", "))."
-            statusText = "Telegram save failed: \(detail)"
-            let outcome = TelegramSettingsSaveOutcome.rejected(detail: detail)
-            telegramSettingsSaveOutcome = outcome
-            return outcome
-        }
-        let normalizedEffort = ProvidersFacade.normalizedReasoningEffort(
-            from: engine.providers.catalog,
-            providers: engine.providers.connections,
-            providerID: engine.providers.selection(for: "telegram").provider,
-            model: telegramModel,
-            selected: telegramReasoningEffort
-        )
-        telegramReasoningEffort = normalizedEffort
-        let submittedEnabled = telegramEnabled
-        let submittedModel = telegramModel
-        let submittedToken = telegramToken
-        do {
-            try await engine.telegram.configureTelegram(
-                token: submittedToken,
-                allowedChatIds: chats.canonicalIDs,
-                allowedUserIds: users.canonicalIDs,
-                requireMention: telegramRequireMention,
-                model: submittedModel,
-                reasoningEffort: normalizedEffort,
-                enabled: submittedEnabled,
-                restartPollLoop: { [backgroundLoopsManager] in
-                    _ = await NativeAgentEngine.restartBackgroundLoop(
-                        id: "telegram_poll",
-                        manager: backgroundLoopsManager
-                    )
-                }
-            )
-            if telegramToken == submittedToken { telegramToken = "" }
-            await refreshAll()
-            if pendingTelegramModel == submittedModel { pendingTelegramModel = nil }
-            if pendingTelegramReasoningEffort == normalizedEffort { pendingTelegramReasoningEffort = nil }
-            statusText = engine.telegram.status?.tokenConfigured == true ? "Telegram settings saved"
-                : "Telegram settings saved. Add a bot token to enable Telegram."
-            let outcome = TelegramSettingsSaveOutcome.saved(
-                tokenConfigured: engine.telegram.status?.tokenConfigured == true,
-                enabled: submittedEnabled,
-                allowlistCount: Set(chats.canonicalIDs + users.canonicalIDs).count
-            )
-            telegramSettingsSaveOutcome = outcome
-            return outcome
-        } catch {
-            let detail = UserFacingError.cause(error, action: "save Telegram settings")
-            setFailureStatus("Couldn't save Telegram settings. " + detail, cause: error)
-            let outcome = TelegramSettingsSaveOutcome.failed(detail: detail)
-            telegramSettingsSaveOutcome = outcome
-            return outcome
-        }
-    }
-
-    @MainActor
     /// Let a Telegram caller defer poll restart because shutdown waits for its own turn too.
     func clearTelegramToken(restartPollLoop: Bool = true) async -> AppMutationResult {
-        isSavingTelegram = true
         statusText = "Clearing Telegram bot token..."
-        defer { isSavingTelegram = false }
         let restart: (@Sendable () async -> Bool)? = restartPollLoop
             ? { @Sendable [backgroundLoopsManager] in
                 await NativeAgentEngine.restartBackgroundLoop(
@@ -238,10 +64,8 @@ extension AppModel {
                 ).didRestart
             }
             : nil
-        let submittedToken = telegramToken
         do {
             try await engine.telegram.disconnectTelegram(restartPollLoop: restart)
-            if telegramToken == submittedToken { telegramToken = "" }
             await refreshAll()
             statusText = "Telegram bot token cleared"
             return .success("Telegram bot token cleared")
@@ -254,40 +78,25 @@ extension AppModel {
     @MainActor
     @discardableResult
     func refreshTelegram() async -> Bool {
-        telegramStatusRefreshError = nil
-        var published = false
-        await refreshTelegramSettingsDraft({ () async -> Result<TelegramPresentationSnapshot, Error> in
         do {
-            return .success(try await engine.telegram.refresh(manager: backgroundLoopsManager))
-        } catch { return .failure(error) }
-        }, snapshot: { result in
-            guard case .success(let status) = result else { return nil }
-            return TelegramSettingsDraftSnapshot(
-                enabled: status.enabled, chats: status.allowedChatIds.joined(separator: ","),
-                users: status.allowedUserIds.joined(separator: ","), requireMention: status.requireMention
-            )
-        }, publish: { result in
-        switch result {
-        case .success(let status):
-            telegramStatusRefreshError = status.credentialIssue ?? status.routingIssue
-            statusText = telegramStatusRefreshError ?? "Telegram status refreshed"
-            published = telegramStatusRefreshError == nil
-        case .failure(let error):
+            let status = try await engine.telegram.refresh(manager: backgroundLoopsManager)
+            let issue = status.credentialIssue ?? status.routingIssue
+            statusText = issue ?? "Telegram status refreshed"
+            return issue == nil
+        } catch {
             setFailureStatus(error, action: "refresh Telegram")
-            telegramStatusRefreshError = UserFacingError.advice(for: error)
+            return false
         }
-        })
-        return published
     }
 
     @MainActor
     func testTelegram() async -> AppMutationResult {
-        isTestingTelegram = true
         statusText = "Sending Telegram test reply..."
-        defer { isTestingTelegram = false }
 
         do {
-            let chatId = splitIDs(telegramAllowedChats).first ?? splitIDs(telegramAllowedUsers).first
+            // The test goes to the first allowed chat, else the first allowed user, as the Telegram owner holds them now.
+            let status = try await engine.telegram.refresh(manager: backgroundLoopsManager)
+            let chatId = (status.allowedChatIds + status.allowedUserIds).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
             let result = try await engine.telegram.sendTelegramTestReply(chatId: chatId, manager: backgroundLoopsManager)
             await refreshAll()
             statusText = TelegramTestReplyPresentation.summary(for: result)
@@ -307,7 +116,6 @@ extension AppModel {
         defer { isClearingTelegramLogs = false }
         do {
             let receipt = try await engine.telegram.clearTelegramDiagnostics(manager: backgroundLoopsManager)
-            telegramStatusRefreshError = nil
             telegramClearLogsOutcome = .completed(receipt)
             statusText = TelegramClearLogsPresentation.summary(for: receipt)
         } catch {
@@ -387,39 +195,9 @@ extension AppModel {
         }, publish: { engine.doctor.report = $0 })
     }
 
-    private func splitIDs(_ value: String) -> [String] {
-        value
-            .split { $0 == "," || $0 == " " || $0 == "\n" || $0 == "\t" }
-            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-    }
-
 }
 
 extension AppModel {
-    @MainActor
-    @discardableResult
-    func refreshToolsFromToolbar() async -> ToolsRefreshPresentation.State {
-        guard !isRefreshingTools else {
-            return .alreadyRefreshing
-        }
-        isRefreshingTools = true
-        toolsRefreshState = .refreshing
-        defer { isRefreshingTools = false }
-
-        await refreshForSidebarItem(.tools)
-        let result = ToolsRefreshPresentation.completion(
-            panelRefresh: panelRefreshStatus[.tools],
-            catalogLoadFailed: engine.tools.catalogLoadError != nil,
-            hasCatalog: engine.tools.catalog != nil
-        )
-        toolsRefreshState = result
-        if let message = ToolsRefreshPresentation.message(for: result) {
-            statusText = message
-        }
-        return result
-    }
-
     // MARK: Integrations / inbox
     func inboxAction(_ id: String, action: String) async throws {
         // A native button starts this act; no running agent turn belongs to the tap.

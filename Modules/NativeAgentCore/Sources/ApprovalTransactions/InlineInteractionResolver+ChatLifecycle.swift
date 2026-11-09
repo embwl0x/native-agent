@@ -93,7 +93,7 @@ extension InlineInteractionResolver {
         _ id: String, sessionID: String, dataRoot: URL
     ) async throws -> (interaction: InlineInteraction, descriptor: InlineInteractionDescriptor)? {
         let current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
-        let control = descriptor(for: current, dataRoot: dataRoot)
+        let control = await descriptor(for: current, dataRoot: dataRoot)
         let running = try await begin(id: id, sessionID: sessionID, expectedRevision: current.revision, dataRoot: dataRoot)
         return (running, control)
     }
@@ -102,12 +102,14 @@ extension InlineInteractionResolver {
         _ interaction: InlineInteraction, descriptor: InlineInteractionDescriptor,
         sessionID: String, value: String?, choice: String?, values: [String: String],
         fullSetup: Bool, turn: Turn, controls: any InlineInteractionControlPort, dataRoot: URL,
-        present: @MainActor (InlineInteractionDescriptor.Control) -> Void,
+        present: @MainActor (InlineInteractionDescriptor.Control) async throws -> Void,
         watch: @MainActor () -> Void, refresh: @MainActor () async -> Void
-    ) async {
+    ) async throws {
         func finish(selection: String?, error: String? = nil, note: String? = nil) async {
+            let secrets = values.values.map { Data($0.utf8) } + (value.map { [Data($0.utf8)] } ?? [])
             await completeControl(interaction.id, sessionID: sessionID, expectedRevision: interaction.revision, selection: selection,
-                scope: nil, setupError: error, note: note, dataRoot: dataRoot)
+                scope: nil, setupError: error.map { FaceSecretRedaction.text($0, secrets: secrets) },
+                note: note.map { FaceSecretRedaction.text($0, secrets: secrets) }, dataRoot: dataRoot)
             await refresh()
         }
         func finishEffect() async {
@@ -133,10 +135,10 @@ extension InlineInteractionResolver {
                 return
             }
             watch()
-            if readiness.status == "needs_setup" { present(.internetAccounts) }
+            if readiness.status == "needs_setup" { try await present(.internetAccounts) }
         case .chromeSetup:
             if !controls.chromeControlEnabled, !controls.fullMacGrantIsActive {
-                await controls.enableChromeControl()
+                try await controls.enableChromeControl()
             }
             if await completeIfVerified(id: interaction.id, sessionID: sessionID, expectedRevision: interaction.revision, dataRoot: dataRoot) {
                 await refresh()
@@ -149,7 +151,13 @@ extension InlineInteractionResolver {
             }
         case .connectorManualToken where !fullSetup && !values.isEmpty:
             await finishEffect()
-        case .macPermissionGrant, .capabilityFlag, .providerAPIKey:
+        case .providerAPIKey:
+            do {
+                try await controls.openProviderEntry(provider: descriptor.target, dataRoot: dataRoot)
+                _ = try await returnToPending(interaction, sessionID: sessionID, dataRoot: dataRoot)
+                await refresh()
+            } catch { await finish(selection: nil, error: error.localizedDescription) }
+        case .macPermissionGrant, .capabilityFlag:
             await finishEffect()
         case .keyring:
             var refused: String? = "This card carries no secret to keep."
@@ -172,40 +180,37 @@ extension InlineInteractionResolver {
             await finish(selection: interaction.target, error: refused)
         case .providerGroupModel:
             if choice == InlineInteractionRegistry.persistentChoiceOptionID {
-                present(.providerGroupModel)
+                try await present(.providerGroupModel)
             } else if let picked = choice, !picked.isEmpty {
                 await completeModelChoice(interaction, picked: picked,
                     sessionID: sessionID, controls: controls, dataRoot: dataRoot)
                 await refresh()
             } else {
-                present(.providerGroupModel)
+                try await present(.providerGroupModel)
             }
         case .inlineChoice:
             await finish(selection: choice)
         case .pairDevice, .connectorManualToken, .trustPostureRequired:
-            present(descriptor.control)
+            try await present(descriptor.control)
         case .unavailable, .unknown:
             break
         }
     }
 
-    /// One effect dispatcher for a local control or an authenticated phone tap. Phone provenance reaches the permission owner; OS prompting stays local.
+    /// Effects run only from the person's local control; phone answers use the canonical Inbox row or non-destructive verification.
     static func applyControlEffect(
         _ interaction: InlineInteraction, descriptor: InlineInteractionDescriptor, value: String?, values: [String: String],
-        controls: any InlineInteractionControlPort, dataRoot: URL, phone: (actionID: String, clientID: String)? = nil
+        controls: any InlineInteractionControlPort, dataRoot: URL
     ) async -> (error: String?, note: String?, watch: Bool) {
         switch descriptor.control {
         case .connectorManualToken:
             let outcome = await controls.saveConnectorCredentials(connector: descriptor.target, values: values, dataRoot: dataRoot)
             return (outcome.error, outcome.note, false)
-        case .providerAPIKey:
-            let outcome = await saveAPIKey(interaction, value: value, controls: controls, dataRoot: dataRoot)
-            return (outcome.error, outcome.note, false)
         case .macPermissionGrant:
-            do { return (nil, nil, try await grantPermissions(interaction, controls: controls, dataRoot: dataRoot, phone: phone)) }
+            do { return (nil, nil, try await grantPermissions(interaction, controls: controls, dataRoot: dataRoot)) }
             catch { return (error.localizedDescription, nil, false) }
         case .capabilityFlag:
-            do { return (nil, nil, try await setCapabilityFlag(interaction, controls: controls, dataRoot: dataRoot, askMacOS: phone == nil)) }
+            do { return (nil, nil, try await setCapabilityFlag(interaction, controls: controls, dataRoot: dataRoot)) }
             catch { return (error.localizedDescription, nil, false) }
         default: return (nil, nil, false)
         }
@@ -250,7 +255,7 @@ extension InlineInteractionResolver {
     public static func grantPermissions(
         _ interaction: InlineInteraction,
         controls: any InlineInteractionControlPort,
-        dataRoot: URL, phone: (actionID: String, clientID: String)? = nil
+        dataRoot: URL
     ) async throws -> Bool {
         // Grant only the requested axis across the whole chain, matching the scope the card showed.
         let mode = interaction.mode
@@ -266,9 +271,9 @@ extension InlineInteractionResolver {
                     integrationId: capability,
                     read: MacIntegrationID.supportsRead(capability) && (mode?.wantsRead ?? true),
                     write: MacIntegrationID.supportsWrite(capability) && (mode?.wantsWrite ?? true),
-                    actionID: "\(phone?.actionID ?? interaction.id)-\(capability)",
-                    surface: phone == nil ? "inline_card" : "ios",
-                    provenance: phone.map { .signedIOS(clientID: $0.clientID) } ?? .local(),
+                    actionID: "\(interaction.id)-\(capability)",
+                    surface: "inline_card",
+                    provenance: .local(),
                     // Merge the requested axis under the store lock so granting it cannot revoke the other axis.
                     onlyAddingAxes: true
                 )
@@ -277,22 +282,25 @@ extension InlineInteractionResolver {
             }
         }
         if !categories.isEmpty {
-            await controls.grantMacControlCategories(categories, dataRoot: dataRoot, logTag: phone == nil ? "interaction" : "signed-phone-card")
+            try await controls.grantMacControlCategories(categories, dataRoot: dataRoot, logTag: "interaction")
         }
-        guard phone == nil else { return false }
         // macOS is asked only for what the app side actually allowed: a Trust write refused outside Full Mac never leads to a macOS prompt.
         let granted: [String: MacIntegrationPermission]
         if interaction.allTargets.contains(where: { MacIntegrationID.all.contains($0) }) {
             granted = try await MacIntegrationPermissionStore(dataRoot: dataRoot).currentChecked()
         } else { granted = [:] } // OS-only/category cards do not read integration authority.
-        let allowed = try interaction.allTargets.filter { capability in
+        var allowed: [String] = []
+        for capability in interaction.allTargets {
             if !MacIntegrationID.all.contains(capability), !InlineInteractionRegistry.isMacControlCategory(capability) {
-                return SystemPermissionPreflight.cardSettingsCapability(capability) != nil
+                if SystemPermissionPreflight.cardSettingsCapability(capability) != nil { allowed.append(capability) }
+            } else if InlineInteractionRegistry.isMacControlCategory(capability) {
+                let permitted = try await Task.detached {
+                    try InlineInteractionRegistry.macControlCategoryAllowed(capability, dataRoot: dataRoot)
+                }.value
+                if permitted { allowed.append(capability) }
+            } else if (granted[capability]?.read ?? false) || (granted[capability]?.write ?? false) {
+                allowed.append(capability)
             }
-            if InlineInteractionRegistry.isMacControlCategory(capability) {
-                return try InlineInteractionRegistry.macControlCategoryAllowed(capability, dataRoot: dataRoot)
-            }
-            return (granted[capability]?.read ?? false) || (granted[capability]?.write ?? false)
         }
         // The card keeps running while macOS leaves anything unresolved, or while a grant waits on the restart only this card's tap performs.
         let unresolved = try await platform.askMacOSForCard(allowed, mode: mode)
@@ -302,33 +310,19 @@ extension InlineInteractionResolver {
     public static func setCapabilityFlag(
         _ interaction: InlineInteraction,
         controls: any InlineInteractionControlPort,
-        dataRoot: URL, askMacOS: Bool = true
+        dataRoot: URL
     ) async throws -> Bool {
         // Patch only the named field under the owner lock so concurrent changes to other switches survive.
         guard let flag = InlineInteractionRegistry.capabilityFlags[interaction.target] else {
             return false
         }
-        await controls.grantCapabilityFlag(policyKey: flag.policyKey, dataRoot: dataRoot, logTag: askMacOS ? "interaction" : "signed-phone-card")
-        if askMacOS, flag.id != "screen_capture" || controls.screenCaptureEnabled,
+        try await controls.grantCapabilityFlag(policyKey: flag.policyKey, dataRoot: dataRoot, logTag: "interaction")
+        if flag.id != "screen_capture" || controls.screenCaptureEnabled,
            !(try await platform.askMacOSForCard([flag.id], mode: nil)).isEmpty {
             return true
         }
         // Trust is re-read by the resolver; the tap is not the authority.
         return false
-    }
-
-    public static func saveAPIKey(
-        _ interaction: InlineInteraction, value: String?, controls: any InlineInteractionControlPort, dataRoot: URL
-    ) async -> (error: String?, note: String?) {
-        let key = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let target = InlineInteractionRegistry.canonicalProviderID(interaction.target)
-        if key.isEmpty, let signIn = InlineInteractionRegistry.providerSignIn(for: target) {
-            return (await controls.signInProvider(signIn, dataRoot: dataRoot), nil)
-        }
-        if target == "anthropic_oauth_direct" || !key.isEmpty {
-            return await controls.saveProviderCredential(provider: target, value: key)
-        }
-        return (nil, nil)
     }
 
     public static func saveModelSelection(target: String, picked: String, controls: any InlineInteractionControlPort) async throws {
@@ -423,7 +417,7 @@ extension InlineInteractionResolver {
             return
         }
         guard current.kind == .permission, case .running = current.state, handed || current.waitingOn != nil,
-              descriptor(for: current, dataRoot: dataRoot).control == .macPermissionGrant else { return }
+              await descriptor(for: current, dataRoot: dataRoot).control == .macPermissionGrant else { return }
         let now = await SystemPermissionPreflight.waitingOn(current.allTargets, mode: current.mode)
         guard now != current.waitingOn, !Task.isCancelled else { return }
         var moved = current

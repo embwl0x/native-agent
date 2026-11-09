@@ -184,6 +184,12 @@ public enum SystemPermissionPreflight {
 
     // MARK: - Non-prompting reads
 
+    /// Keep probe evidence with its status so an unreadable source cannot be presented as a denied grant.
+    public static func snapshot(_ capability: SystemPermissionCapability) -> SystemPermissionSnapshot {
+        if capability == .fullDiskAccess { return fullDiskAccessSnapshot() }
+        return SystemPermissionSnapshot(capability: capability, status: status(capability))
+    }
+
     /// Status reads must never prompt: a background consent request can resolve denied without presenting a usable prompt.
     public static func status(_ capability: SystemPermissionCapability) -> SystemPermissionStatus {
         switch capability {
@@ -240,7 +246,7 @@ public enum SystemPermissionPreflight {
             @unknown default: return .unknown
             }
         case .fullDiskAccess:
-            return MacMessagesHistory.hasAccess ? .granted : .denied
+            return snapshot(capability).status
         case .screenRecording:
             // Preflight screen capture without invoking the prompting request API.
             return CGPreflightScreenCaptureAccess() ? .granted : .denied
@@ -260,10 +266,24 @@ public enum SystemPermissionPreflight {
             @unknown default: return .unknown
             }
         case .automation, .notifications:
-            // Automation needs a running target and may prompt; its per-app probe belongs to MacIntegrationView. Notifications require an async bundled-app
-            // read.
+            // Automation needs a running target and may prompt; its per-app probe belongs to MacIntegrationFacade.refresh, which Trust's macOS grants
+            // rows draw. Notifications require an async bundled-app read.
             return .unknown
         }
+    }
+
+    /// Opening the protected directory reads no messages. Only access errors establish denial.
+    public static func fullDiskAccessSnapshot() -> SystemPermissionSnapshot {
+        let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Messages").path
+        guard let directory = opendir(path) else {
+            let code = errno
+            let denied = code == EACCES || code == EPERM
+            let detail = "Full Disk Access probe at \(path) failed (POSIX \(code)): \(String(cString: strerror(code)))."
+            logger.error("\(detail, privacy: .public)")
+            return SystemPermissionSnapshot(capability: .fullDiskAccess, status: denied ? .denied : .unknown, detail: detail)
+        }
+        closedir(directory)
+        return SystemPermissionSnapshot(capability: .fullDiskAccess, status: .granted)
     }
 
     private static func mapEKStatus(_ status: EKAuthorizationStatus) -> SystemPermissionStatus {
@@ -282,6 +302,7 @@ public enum SystemPermissionPreflight {
     /// The permission card owns acquisition; status reads never prompt.
     public static func warningSummary(for snapshot: SystemPermissionSnapshot) -> String {
         let name = snapshot.capability.displayName
+        if snapshot.status == .unknown, !snapshot.detail.isEmpty { return snapshot.detail }
         switch snapshot.status {
         case .notDetermined, .denied:
             return "NativeAgent needs \(name). Allow it on the permission card."
@@ -357,6 +378,10 @@ extension SystemPermissionPreflight {
                 case .denied: current = .denied
                 default: current = .unknown
                 }
+            } else if gate == .fullDiskAccess {
+                let snapshot = Self.snapshot(gate)
+                if snapshot.status == .unknown { return snapshot.detail }
+                current = snapshot.status
             } else { current = cardStatus(gate, mode: mode) }
             if current == .granted { continue }
             if current == .unknown {

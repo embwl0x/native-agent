@@ -4,6 +4,31 @@ One law for every Stop, cancel, quit and timeout in NativeAgent.
 
 **Stop cancels the work, never its settlement.**
 
+A person's readable, untainted arrival withdraws only calls that have not
+started. This is not Stop: a running call finishes under its existing owner,
+and its receipt stays. Before dispatch, a withdrawn round keeps only its prose
+and names its unstarted calls in `turn.proposalSkipped`. After dispatch pairing,
+unstarted slots retain paired `skipped` / `not_run` results with `effects: none`
+and `reason: person_arrival`; they are neither executions, failures nor
+cancellations. A batch hands back its unstarted entries and earlier receipts.
+An earlier receipt's failure, even nested, keeps its failed batch status,
+remedy and provider error bit; arrival hand-back only adds the unstarted work.
+Admission is checked before publishing a tool start, so a skipped slot leaves
+no started activity or cognitive work charge; its paired receipt still settles.
+The [turn anatomy](ANATOMY_OF_A_TURN.md#1-a-surface-admits-the-turn) owns arrival
+eligibility and the boundary checks.
+
+The turn program's optional `hear` may cut only a generating provider round.
+A cut retains prose, discards every unstarted proposal, saves its checkpoint
+and reads arrivals before asking again. It cancels the round's stream wait,
+never the turn or a running call; it records `provider.roundCut`, not a stopped
+turn. The observation names hearing rather than guessing the sender. If no
+arrival remains for the boundary read, both the turn part and the next request
+are told that no new message was read; the cut still happened.
+HTTP cancellation closes the request. Codex's stdout producer retains
+its existing exit-and-EOF settlement; closing the round stops forwarding its
+words, without claiming that the process or remote generation stopped.
+
 Stop-marker writes merge under the marker's lock using a checked UTF-8 read.
 Only confirmed file absence starts a new marker. Unreadable existing bytes are
 preserved and the Stop request reports the read failure; a named Stop never
@@ -37,19 +62,33 @@ that prose in `TurnEngineError.streamInterrupted` or `streamCancelled`; the
 latter remains distinguishable as Stop. An incomplete engine result keeps its
 existing `EphemeralToolTurnIncomplete` output carrier.
 
-Whole provider replies collect outside the caller's cancellation, with one
-sticky stop handle bound before stream creation. Stop cancels HTTP producers
-or requests process termination for Codex; it leaves collection and pipe
-forwarding alive through actual producer exit and drain. The caller joins that
-work through `settle`, then receives Stop with the drained partial in its
-existing partial-reply sink and `llm.reply.partial` trace. Deadline watches stop
-with the work so they cannot cut off its shutdown drain. A missing exit remains
-pending settlement, never a terminal receipt: the process owner's bounded
-termination and drain mechanisms must finish or report their actual failure.
-Stop also cancels the guard coordinator's network-return and retry-backoff
-waits, including redial admission on an already-online path. Its active wire
-forwarder stays alive while the transport stops, and the coordinator joins it
-before reporting cancellation.
+Buffered whole provider replies collect outside the caller's cancellation, with one
+sticky reply owner bound before stream creation. Stop ends the caller's wait
+at once and cancels HTTP requests; the Codex process runs to its own exit and
+pipe EOF. The owner selects either the reply or cancellation once, including
+Stop before its wait registers. Collection and forwarding settle independently
+through `settle`, joining actual producer exit and drain. A collection failure
+stops its producers without replacing its cause with cancellation. After drain,
+a stopped collection delivers its retained partial to the existing partial-reply
+sink and `llm.reply.partial` trace. A missing exit remains pending settlement,
+never a terminal receipt, and does not hold the cancelled caller. Live chat's
+Stop also ends its stream wait. Codex's plain, structured and streaming calls
+use the same stdout producer, which saves redacted output through
+`ProviderOutputDiagnostics` after exit and EOF, even after the caller or the
+turn's forwarders have ended. `codex.reply.produced` in the experience store's `detail`
+grain points to that file; the trace preview is bounded and the diagnostic file
+keeps the full text under its newest-100 retention. Recording failures retain
+their cause in that trace. Its process error stays beside the
+produced output. A request that declares silence complete accepts empty output
+only after EOF and successful process exit; other empty streams retain their
+malformed-output cause. A process that never exits retains its pending producer,
+and a silent answer's wait stays open with Stop available, without an invented terminal
+record. Read and process failures retain their causes. Stop also cancels a
+pending network-path wait. No provider deadline or retry-backoff worker runs.
+
+Retry classification keeps a failed read-only classification as
+`classificationFailed` with its cause. It cannot label an unreadable call as an
+action that ran, and it still asks the person before repeating unknown effects.
 
 Owned programs stop their helper immediately, cancel the in-flight host call
 and await its actual terminal result before forming the final receipt. A
@@ -65,8 +104,8 @@ inspection; no response means unknown effects, never permission to resend.
 The [authored fetch contract](skill_manifest_spec.md#secret-insertion-and-redaction)
 owns the wait/transport limits and receipt path.
 
-A resident wake waiting for another call's busy slot parks through `ScopedWaiter`.
-Cancelling that wake releases and removes only its own parker, without stopping
+A resident program's call waiting for another call's busy slot parks through
+`ScopedWaiter` (`Senses/OwnedProgramRunner.swift`). Cancelling that call releases and removes only its own parker, without stopping
 the active resident call or waking sibling parkers. Slot release, completed
 retirement and pool closure resolve the remaining waits. Without cancellation
 or an inherited deadline, a still-busy slot remains pending; waking alone is
@@ -86,7 +125,16 @@ runner joins `settle`: cancel/join the deadline, remove the callback, cancel the
 authentication session and release its presentation retention.
 Mac dispatch retains and joins its original execution after cancellation or a
 deadline, then persists its terminal evidence through `settle`. A cancel
-requester's bounded wait does not retire that execution or discard its late result.
+requester with a retained execution awaits that execution's settlement event,
+then checks the durable terminal record, including its `terminalAt`. A failed
+terminal write wakes the requester with its cause; the original response retains
+the produced body result alongside `settlement_failed`. Without a retained
+execution it reports the observed pending state without acknowledgement. A missing
+or uncommitted terminal record reports unconfirmed settlement;
+there is no settlement-grace timer. Cancelling a requester's wait removes only
+that waiter and does not retire the
+execution or discard its late result. Mac dispatch, four-verb actions and watch
+hands add no response deadline; inherited caller deadlines remain in effect.
 The process adapter's typed cancellation carries drained stdout, stderr and
 truncation flags; Mac dispatch returns that material with its stopped receipt.
 
@@ -113,15 +161,13 @@ final flush of affect, consumed residue and nodes, `persistAffectAndNodes`). Its
 final save and the moments left unlived (a `lifecycle.sleep` receipt); a save
 that fails is reported, never swallowed.
 
-Quit has a bounded unfinished outcome: ordinary quit waits at most 20 seconds
-for the turns captured at entry, then at most 30 seconds waiting on the retained
-producer/turn settlement and final mind save. The snapshot still waits for
-tracked turns after the 20-second allowance; neither bound authorizes a
-snapshot ahead of them. If the second bound expires, the result explicitly
-says it did not settle; the settlement keeps running while termination proceeds.
-The last resident drain waits only three seconds. Process exit can therefore
-interrupt unfinished settlement: a completed final save is not guaranteed at
-either bound. The three-second drain joins the very same retained operation;
+Ordinary quit waits for the turns captured at entry and joins the retained
+producer/turn settlement and final mind save from their actual completion.
+Neither join has a clock cutoff. The final synchronous resident drain still
+waits only three seconds at the app termination callback. Process exit can
+therefore interrupt unfinished dependency settlement; removing that remaining
+bound requires the app callback to await the dependency join before termination.
+The three-second drain joins the very same retained operation;
 it cannot start a competing flush or retire Chrome, senses, resident programs,
 ACP, ContextFlow or memory services ahead of producer and turn settlement.
 Browser IPC's full stop likewise follows tracked turns and wake runs, so it
@@ -138,10 +184,10 @@ handoff and five for thread/pump settlement) returns `settled` or
 The controller retains and joins that task even when stopping was already
 underway. A pending outcome reports degraded state without releasing live
 capture ownership or cancelling the pump; a wedged thread can leave this join
-pending until process exit. The quit owner owns the outer wait bound. A
+pending until process exit. A
 policy-disable handoff alone is not the controller's full termination barrier. The quit producer
 settlement joins both the OtherDoorTurns and ActivityWatch handles before the
-final mind save, subject to the bounded-quit/process-exit outcome above.
+final mind save, subject to the final dependency-drain/process-exit limitation above.
 The next launch reconciles retained journal work and committed
 dream cutoffs; the quit result must never claim an unfinished snapshot landed.
 
@@ -164,10 +210,6 @@ restart grace period.
 The shared detached-spawn API reports a missing executable as an argument
 error through its throwing result, so an empty request cannot abort the app.
 
-Scheduled jobs retain their actual body task through cancellation and timeout;
-stopped settlement keeps any returned status, detail and output (including a
-confirmed execution ID), and a watch's returned baseline. A throwing body keeps
-its error and any settled channel receipts, with other effects still unknown.
 Scheduled notifications retain settled channel receipts on their occurrence;
 cancellation joins the body before recording confirmed deliveries and unconfirmed
 channels, and no later channel is sent after Stop.
@@ -222,8 +264,10 @@ saved in its one durable work record through `settle`, even when Stop raced the
 model response. Publication recovers by the section's immutable diary identity.
 Lessons, reflection, care and dated mood delivery checkpoint that record only
 after their checked durable effects land; diary evidence stays byte-stable.
-Refused or failed reflection and care/self persistence remain owed for the next
-real run, including older and archived dates; scheduling alone clears nothing.
+Disabled reflection settles with its off reason;
+reflection that must wait (its daily ceiling, one in flight, a held slot), failed reflection and
+care/self persistence remain owed for the next real run, including older and archived dates;
+scheduling alone clears nothing.
 A returned weekly analysis and its terminal
 outcome are saved in its digest through `settle`; Stop prevents subsequent mood
 changes, proposal staging and practice. Interpretation and reflection follow

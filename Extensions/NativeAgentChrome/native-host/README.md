@@ -37,6 +37,14 @@ authenticated launch-time browser evidence; it has no current browser PID for
 reload proof. The accepted handshake's checked PID is passed to the runtime,
 without a second lossy identity lookup.
 
+When a launching app's socket is missing or refuses the first connection, the
+relay observes its directory for at most twenty seconds and redials once,
+rereading the listener credential before dialing. A changed credential during
+greeting permits that same one redial. Every accepted connection still checks
+both peers; no other transport or credential is tried. The relay also bounds
+its listener-replacement observation after an app exits to twenty seconds.
+No publication or a second refusal remains an explicit connection failure.
+
 The manual [installer](../../../script/install_chrome_native_host.sh) replaces
 the same user-wide Chrome registration shown above; `--uninstall` removes it.
 Its default relay is
@@ -49,11 +57,12 @@ The source template requires both the absolute relay path and this explicit
 bundle identifier to be filled before installation.
 Development verification follows [AGENTS.md](../../../AGENTS.md).
 
-Stop and the app's request deadline send the same request-scoped cancellation
-event for every action. The extension checks it before effects after suspension
-and wakes pending waits. A dispatched request keeps its app waiter for the
-extension's settlement reply, including partial typing evidence; the original
-deadline still reports an unknown outcome if no effect reply arrives. Debugger
+Stop sends request-scoped cancellation; the extension checks it after suspension
+and wakes pending waits. Navigation, snapshots and pictures have no app request
+deadline. Their wait ends through the requested observation, cancellation,
+ownership loss or connection closure. Other actions retain their request
+deadline and cancellation event. A dispatched request retains its waiter for
+the extension's settlement reply, including partial typing evidence. Debugger
 detach and other resource release complete even after cancellation.
 
 Back and Forward use Chrome's debugger to reach the exact neighboring history

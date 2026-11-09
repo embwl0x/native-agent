@@ -16,8 +16,14 @@ cross the ceiling are refused.
 
 Turn traces and standalone receipts are details in `experiences/experiences.sqlite`;
 the record forgets details older than `ExperienceStore.detailHorizon` (14 days) and
-refuses a detail row over 1 MiB. Each persisted turn-trace row is bounded to 12 KiB by
-`TurnTraceEvent.swift`, except `llm.call` rows.
+refuses a detail row over 8 MiB. `TurnTraceEvent.swift` summarizes ordinary
+turn-trace payloads at 12 KiB; `llm.call` receipts use the detail owner's 8 MiB
+row ceiling. A `context.snapshot` retains its complete first-class `feelingFrame`
+alongside that ordinary summary, also within the shared 8 MiB row ceiling.
+The paragraph is redacted before recording and is exempt from per-string,
+preview and 120-byte cue clipping. The retained field is identical on trace
+readback; an oversized detail write fails explicitly. Its measurement contract
+is in [Subconscious](SUBCONSCIOUS.md#what-reaches-the-model).
 
 `Browser/BrowserCaptureCache.swift` owns temporary page text, links and
 screenshots. Captures share 128 MiB, 256 groups and seven days, enforced on
@@ -36,9 +42,14 @@ their own five-per-session policy; see [Data bounds](data-bounds.md).
 
 ## Recovery and cutoff artifacts
 
-| Path | Owner and content | Retention |
-|---|---|---|
-| `diagnostics/cutoffs/<turn-or-time>[-UUID].txt` | `RunawayOutputDetector.writeDiagnostic`: reason, character count and raw output; returns and logs its path | Existing writer keeps the newest 100 text files on write |
+`diagnostics/cutoffs/<turn-or-UUID>[-UUID].txt` belongs to
+`ProviderOutputDiagnostics.writeDiagnostic`: redacted reason and output, with
+the character count. The writer returns and logs its path. It keeps the newest
+100 text files on write and reports retention failures.
+Every Codex call retains its complete produced text here at exit and pipe EOF,
+including after a buffered or streaming caller stops waiting. The
+`codex.reply.produced` detail in `experiences/experiences.sqlite` carries the file path, bounded preview and any
+process or recording cause.
 
 This path is not selected for local backup, production export or a raw phone
 snapshot; PrivacyMap inventories its parent folder. It is a diagnostic review

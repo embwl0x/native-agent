@@ -123,18 +123,16 @@ struct AlivePage<Trailing: View, Content: View>: View {
     var line: String?
     var style: AlivePageStyle
     var freshnessGroup: String?
-    var accessory: AnyView?
     let trailing: Trailing
     let content: Content
 
     init(title: String, line: String? = nil, style: AlivePageStyle = .pushed,
-         freshnessGroup: String? = nil, accessory: AnyView? = nil, @ViewBuilder trailing: () -> Trailing,
+         freshnessGroup: String? = nil, @ViewBuilder trailing: () -> Trailing,
          @ViewBuilder content: () -> Content) {
         self.title = title
         self.line = line
         self.style = style
         self.freshnessGroup = freshnessGroup
-        self.accessory = accessory
         self.trailing = trailing()
         self.content = content()
     }
@@ -146,7 +144,6 @@ struct AlivePage<Trailing: View, Content: View>: View {
                     AlivePageHeader(title: title, line: line, style: style) { trailing }
                         .padding(.horizontal, 4)
                     if let freshnessGroup { AliveFreshnessNote(group: freshnessGroup) }
-                    if let accessory { accessory }
                 }
                 .aliveListRow(top: style == .root ? AliveMetrics.rootTop : 4, bottom: 4)
             }
@@ -156,15 +153,25 @@ struct AlivePage<Trailing: View, Content: View>: View {
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
         .environment(\.aliveInList, true)
+        .environment(\.faceInList, true)
+        .environment(\.faceStyle, .phone)
         .alivePageChrome(title: title, root: style == .root)
     }
 }
 
+extension FaceStyle {
+    static let phone = FaceStyle(
+        insets: EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16), minimumHeight: 44,
+        title: .body.weight(.medium), detail: .subheadline, value: .subheadline.monospacedDigit(),
+        elevation: AlivePalette.fill, actionSurface: AlivePalette.fill,
+        card: { AnyView($0.background(AlivePalette.fill, in: RoundedRectangle(cornerRadius: 12))) })
+}
+
 extension AlivePage where Trailing == EmptyView {
     init(title: String, line: String? = nil, style: AlivePageStyle = .pushed,
-         freshnessGroup: String? = nil, accessory: AnyView? = nil, @ViewBuilder content: () -> Content) {
+         freshnessGroup: String? = nil, @ViewBuilder content: () -> Content) {
         self.init(title: title, line: line, style: style, freshnessGroup: freshnessGroup,
-                  accessory: accessory, trailing: { EmptyView() }, content: content)
+                  trailing: { EmptyView() }, content: content)
     }
 }
 

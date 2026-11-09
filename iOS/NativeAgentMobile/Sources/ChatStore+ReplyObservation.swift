@@ -1,15 +1,11 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `ChatStore+ReplyObservation.swift` | Shared signed reply/rejection/resync receiver; restores bounded delivery observation |
+// Blueprint: | `ChatStore+ReplyObservation.swift` | Shared signed reply, rejection and pairing-resync receiver |
 
 extension ChatStore {
     /// The shared store owns this receiver so presenting Talk cannot remove Chat's observation.
     func attachReplyReceiver(using client: MacBridgeClient) {
         pendingRetryClient = client
-        Task { [weak self] in
-            await self?.restorationTask?.value
-            self?.resumeDeliveryConfirmations()
-        }
         if replyObserverID == nil {
             replyObserverID = client.observeICloudReplies { [weak self] message in
                 Task { @MainActor in await self?.receiveICloudReply(message) }

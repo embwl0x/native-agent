@@ -30,16 +30,6 @@ extension MacFourVerbs {
     public func actSelection(verb: String, handle: String, frameID: String,
                              text: String? = nil, mode: MacTypeMode = .replace, direction: String? = nil,
                              app: String? = nil, turn: Turn, context: MacOperationContext) async -> MacFourVerbsReply {
-        if context.deadline == nil {
-            do {
-                return try await OperationWaitBudget.withDeadline(
-                    seconds: Double(SwiftNativeMacControl.operationTimeoutSeconds(action: "act", body: [:])),
-                  budget: context.waitBudget) { budget in
-                    let context = context.with(\.deadline, budget.deadline)
-                    return await self.actSelection(verb: verb, handle: handle, frameID: frameID,
-                    text: text, mode: mode, direction: direction, app: app, turn: turn, context: context) }
-            } catch { return Self.interruptedActReply(error) }
-        }
         let ownsSerial = !context.holdsActSerial
         if ownsSerial {
             guard await MacActSerial.shared.acquire(context: context) else {

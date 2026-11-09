@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import NativeAgentCore
+import PersistenceCore
 
 // Blueprint: | `ContextFlowModels.swift` | Context identities, policy and immutable generations |
 
@@ -287,7 +288,7 @@ public struct ContextAtomDraft: Codable, Equatable, Sendable {
     public let injectionPolicy: ContextInjectionPolicy
     public let contentRole: ContextContentRole
     public let entities: [ContextEntity]
-    public let memoryProvenance: ContextMemoryProvenance?
+    public let memoryRoots: [MemoryRoot]?
     public let triggers: [String]
     public let activation: Double
     public let recentUsefulness: Double
@@ -311,7 +312,7 @@ public struct ContextAtomDraft: Codable, Equatable, Sendable {
         injectionPolicy: ContextInjectionPolicy,
         contentRole: ContextContentRole,
         entities: [ContextEntity] = [],
-        memoryProvenance: ContextMemoryProvenance? = nil,
+        memoryRoots: [MemoryRoot]? = nil,
         triggers: [String] = [],
         activation: Double = 0,
         recentUsefulness: Double = 0,
@@ -334,7 +335,7 @@ public struct ContextAtomDraft: Codable, Equatable, Sendable {
         self.injectionPolicy = injectionPolicy
         self.contentRole = contentRole
         self.entities = entities
-        self.memoryProvenance = memoryProvenance
+        self.memoryRoots = memoryRoots
         self.triggers = triggers
         self.activation = min(1, max(0, activation))
         self.recentUsefulness = min(1, max(0, recentUsefulness))

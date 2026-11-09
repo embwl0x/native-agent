@@ -1,58 +1,36 @@
 import Foundation
 import Network
+import Synchronization
 
-// Blueprint: | `NetworkSense.swift` | `NetworkSense`, `isUp`, `changes`, `returns(within:)`, `changed`: one path monitor and bounded waits |
+// Blueprint: | `NetworkSense.swift` | One path monitor; network-return waits and body wakes follow path events |
 
-/// The Mac's network path is one body fact, shared by every network consumer. A satisfied path is reachability, not proof that a provider is healthy.
+/// A satisfied path establishes local reachability, never a provider verdict.
 public enum NetworkSense {
     private static let owner = Owner()
     public static let changed = Notification.Name("NativeAgent.network.changed")
-    /// Immediate edge for deadline owners; body signals use `changed` instead.
-    public static let pathChanged = Notification.Name("NativeAgent.network.pathChanged")
-    public static let settlingInterval: TimeInterval = 5
 
-    /// Immediate path state. Until Network delivers its first observation, hold.
+    /// False includes a path that has not yet been observed; callers waiting for reachability keep waiting.
     public static var isUp: Bool { owner.isUp }
-
-    /// Registers before replaying the current state, so a return cannot be lost between a caller's offline read and its subscription. Cancel to retire.
     public static var changes: AsyncStream<Bool> { owner.changes() }
 
-    /// Wait only this long for a path. Stop remains cancellation, never offline.
-    public static func returns(within seconds: TimeInterval) async throws -> Bool {
+    /// Subscribe before replaying the path; an absent return stays waiting until cancellation.
+    public static func returns() async throws {
         try Task.checkCancellation()
-        if isUp { return true }
-        let changes = Self.changes
-        let delay = seconds.isFinite ? min(max(0, seconds), 86_400) : 0
-        let returned = await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                for await up in changes {
-                    if Task.isCancelled { return false }
-                    if up { return true }
-                }
-                return false
-            }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(delay))
-                return false
-            }
-            let result = await group.next() ?? false
-            group.cancelAll()
-            return result
+        for await up in changes {
+            try Task.checkCancellation()
+            if up { return }
         }
-        try Task.checkCancellation()
-        return returned
+        throw CancellationError()
     }
 
-    private final class Owner: @unchecked Sendable {
+    private final class Owner: Sendable {
         private let monitor = NWPathMonitor()
         private let queue = DispatchQueue(label: "NativeAgent.network")
-        private let lock = NSLock()
-        private var up = false
-        private var observers: [UUID: AsyncStream<Bool>.Continuation] = [:]
-        // Only the monitor's serial queue touches the debounced edge.
-        private var observed: Bool?
-        private var posted: Bool?
-        private var settling: DispatchWorkItem?
+        private struct State: Sendable {
+            var up: Bool?
+            var observers: [UUID: AsyncStream<Bool>.Continuation] = [:]
+        }
+        private let state = Mutex(State())
 
         init() {
             monitor.pathUpdateHandler = { [weak self] path in
@@ -61,42 +39,33 @@ public enum NetworkSense {
             monitor.start(queue: queue)
         }
 
-        var isUp: Bool { lock.withLock { up } }
+        var isUp: Bool { state.withLock { $0.up == true } }
 
         func changes() -> AsyncStream<Bool> {
-            let pair = AsyncStream<Bool>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            let pair = AsyncStream<Bool>.makeStream()
             let id = UUID()
-            lock.withLock {
-                observers[id] = pair.continuation
-                pair.continuation.yield(up)
+            state.withLock {
+                $0.observers[id] = pair.continuation
+                if let up = $0.up { pair.continuation.yield(up) }
             }
             pair.continuation.onTermination = { [weak self] _ in
-                guard let self else { return }
-                self.lock.withLock { _ = self.observers.removeValue(forKey: id) }
+                self?.state.withLock { _ = $0.observers.removeValue(forKey: id) }
             }
             return pair.stream
         }
 
         private func receive(_ value: Bool) {
-            guard observed != value else { return }
-            let first = observed == nil
-            observed = value
-            lock.withLock {
-                up = value
-                for observer in observers.values { observer.yield(value) }
+            let edge = state.withLock { state -> (changed: Bool, first: Bool) in
+                guard state.up != value else { return (false, false) }
+                let first = state.up == nil
+                state.up = value
+                for observer in state.observers.values { observer.yield(value) }
+                return (true, first)
             }
-            NotificationCenter.default.post(name: NetworkSense.pathChanged, object: nil)
-            // Observation at launch establishes a baseline, not a new return.
-            if first { posted = value; return }
-            settling?.cancel()
-            let work = DispatchWorkItem { [weak self] in
-                guard let self, self.observed == value, self.posted != value else { return }
-                self.posted = value
-                NotificationCenter.default.post(name: NetworkSense.changed, object: nil,
-                    userInfo: ["is_up": value])
+            guard edge.changed else { return }
+            if !edge.first {
+                NotificationCenter.default.post(name: NetworkSense.changed, object: nil, userInfo: ["is_up": value])
             }
-            settling = work
-            queue.asyncAfter(deadline: .now() + NetworkSense.settlingInterval, execute: work)
         }
     }
 }

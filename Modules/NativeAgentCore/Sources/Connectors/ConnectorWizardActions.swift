@@ -1,23 +1,10 @@
 import Foundation
+import NativeAgentShared
 import ProviderRouting
 import PersistenceCore
 import TrustCenter
 import ChatToolRuntime
-// Blueprint: | `ConnectorWizardActions.swift` | `ConnectorWizardSetupRoute`: wizard and inline cards share the setup registry |
-
-public enum ConnectorWizardSetupRoute: Equatable, Sendable {
-    case manualToken
-    case unavailable
-
-    /// The inline registry also owns wizard routing so both surfaces offer the same way to connect.
-    public static func resolve(provider: String) -> Self {
-        let canonical = InlineInteractionRegistry.canonicalConnectorID(provider)
-        switch InlineInteractionRegistry.connectorSetup(for: canonical) {
-        case .manualToken where canonical == "slack": return .manualToken
-        case .manualToken, .unavailable: return .unavailable
-        }
-    }
-}
+// Blueprint: | `ConnectorWizardActions.swift` | Connector registry entry reads under the persistence lock |
 
 extension ConnectorOAuthRegistry {
     public static func readConnectorRegistryEntry(

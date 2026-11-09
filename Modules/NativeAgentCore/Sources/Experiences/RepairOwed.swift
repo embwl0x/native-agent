@@ -41,7 +41,8 @@ public enum RepairOwed {
     public static func owe(_ store: ExperienceStore, id: String, kind: Experience.Kind, cause: [String] = [],
                            evidence: [Experience.Ref] = [], operation: String, owner: String, words: String,
                            lever: String? = nil, nextCall: String? = nil, tap: String? = nil) async throws {
-        var met = Experience(id: id, kind: kind, cause: cause, evidence: evidence,
+        // The caller's key names the failure source, not an immutable birth that can be reopened after settlement.
+        var met = Experience(id: id + ":" + UUID().uuidString.lowercased(), kind: kind, cause: cause, evidence: evidence,
                              outcome: .init(domain: operation, status: "failed", effects: Experience.Effects.none),
                              face: .init(words: words, artifacts: []),
                              owes: ["repair": .init(to: tap == nil ? "self" : "person")],

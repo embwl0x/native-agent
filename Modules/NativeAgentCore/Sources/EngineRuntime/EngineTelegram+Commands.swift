@@ -263,7 +263,6 @@ extension TelegramFacade {
         let root = dataRoot
         let url = root.appendingPathComponent("telegram/config.json")
         return try await SwiftNativePersistenceCore.withFileLock(url) {
-            let observedAt = Date().timeIntervalSince1970
             // Validate before publishing metadata so malformed settings cannot appear as saved defaults.
             try TelegramConfig.validateMobileConfiguration(at: root)
             let routing = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
@@ -278,7 +277,7 @@ extension TelegramFacade {
             }
             let enabled = status.tokenConfigured && status.enabled
             return MobileTelegramSnapshot(
-                observedAt: observedAt,
+                observedAt: Date().timeIntervalSince1970,
                 tokenConfigured: status.tokenConfigured,
                 enabled: enabled, requireMention: status.requireMention,
                 allowedChatIDs: status.allowedChatIds,

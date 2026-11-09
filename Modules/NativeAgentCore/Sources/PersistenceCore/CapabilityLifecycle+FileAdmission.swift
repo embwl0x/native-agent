@@ -97,8 +97,10 @@ extension CapabilityLifecycle {
                     ?? (!senseRecords || previous.contains { $0.objectValue?["corner"] == row["corner"] && $0.objectValue?["status"] == .string("on") } ? nil
                         : previous.compactMap(\.objectValue).first { $0["corner"] == row["corner"] && requiresOwnerToEnable($0) })
                 if old == row { return value }
+                // A registry-wide keep is authority for its requested transition, not an attempt to enable every off sibling.
+                let statusKey = row["state"] == nil ? "status" : "state"
                 return .object(try preservingOwnerOff(row, before: old, ownerAuthorized: ownerAuthorized,
-                    enabling: enabling, turn: turn))
+                    enabling: enabling && row[statusKey] != old?[statusKey], turn: turn))
             })
         }
         return proposed

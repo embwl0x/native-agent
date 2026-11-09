@@ -8,17 +8,6 @@ import ToolRegistry
 import ChatToolParsing
 // Blueprint: | `MacChatTurnActivity.swift` | `MacChatTurnActivity` struct |
 
-/// Pair session and turn IDs so late activity from a prior stream cannot enter its replacement.
-public struct MacChatTurnIdentity: Sendable, Equatable {
-    public let sessionId: String
-    public let turnId: String
-
-    public init(sessionId: String, turnId: String) {
-        self.sessionId = sessionId
-        self.turnId = turnId
-    }
-}
-
 public enum MacChatTurnActivitySource: Sendable, Equatable {
     case toolUse
     case toolResult
@@ -36,6 +25,7 @@ public struct MacChatTurnActivity: Sendable, Equatable {
     public let delegateDisplayName: String?
     public let outcome: TurnPresentationActivity.Outcome?
     public let occurredAt: Date
+    public let callName: String?
 }
 
 /// Discard raw input and output before constructing activity; retain only bounded plain labels and exact outcome class.
@@ -82,11 +72,12 @@ public enum MacChatTurnActivityBoundary {
             userVisibleNoticeText: boundedNoticeText(text),
             delegateDisplayName: nil,
             outcome: nil,
-            occurredAt: instant
+            occurredAt: instant,
+            callName: nil
         )
     }
 
-    private static func toolUse(
+    public static func toolUse(
         name: String,
         args: [String: String],
         identity: MacChatTurnIdentity,
@@ -101,7 +92,8 @@ public enum MacChatTurnActivityBoundary {
             userVisibleNoticeText: nil,
             delegateDisplayName: delegate,
             outcome: nil,
-            occurredAt: instant
+            occurredAt: instant,
+            callName: name
         )
     }
 
@@ -127,17 +119,18 @@ public enum MacChatTurnActivityBoundary {
             userVisibleNoticeText: nil,
             delegateDisplayName: nil,
             outcome: outcome,
-            occurredAt: instant
+            occurredAt: instant,
+            callName: nil
         )
     }
 
     private static func noticePhase(kind: String) -> TurnPresentationPhase {
+        if kind == "provider.reconnecting" { return .retrying }
         let lower = kind.lowercased()
         if lower.contains("retry") || lower.contains("recovery") { return .retrying }
         if lower.contains("waiting") { return .waiting }
         if lower.contains("blocked") || lower.contains("approval") { return .blocked }
         if lower.contains("timeout") || lower.contains("stall") { return .stalled }
-        if lower.hasPrefix("invoke_") { return .delegation }
         return .working
     }
 

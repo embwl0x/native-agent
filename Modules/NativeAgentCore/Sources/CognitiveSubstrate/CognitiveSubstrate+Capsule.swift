@@ -5,9 +5,6 @@ import TurnTrace
 // Blueprint: | `CognitiveSubstrate+Capsule.swift` | `CognitiveSubstrate`: frozen cues, shared presence and presentation commits |
 
 extension CognitiveSubstrate {
-    /// The care movement this turn's unbidden recall already resolved, if any. It is a parameter rather than a lookup because the render is synchronous — see
-    /// `remindedOfMoment`.
-
     /// Pure frozen render plus the presentation mutation that would become valid only if this exact capsule is accepted into provider context.
     public func compileFrozenCapsulePresentation(
         _ request: CognitiveCapsuleRequest,
@@ -19,7 +16,8 @@ extension CognitiveSubstrate {
     ) -> CognitivePreparedCapsule {
         compileFrozenCapsulePresentation(
             request, from: read, remindedOf: remindedOf, dreamTheme: dreamTheme,
-            gapItems: gapItems, careCue: nil, felt: nil, unreadable: [], turn: turn)
+            gapItems: gapItems, careCue: nil, felt: nil,
+            dreamFeeling: dreamFeelingFrame(at: read.fixedAt, sleep: request.sleepDream), unreadable: [], turn: turn)
     }
 
     private func compileFrozenCapsulePresentation(
@@ -30,6 +28,7 @@ extension CognitiveSubstrate {
         gapItems: [String]?,
         careCue: CognitiveCareCue?,
         felt: (signals: FeltSignals, fingerprint: FeltLineRender?)?,
+        dreamFeeling: String,
         unreadable: [String],
         turn: Turn?
     ) -> CognitivePreparedCapsule {
@@ -66,9 +65,9 @@ extension CognitiveSubstrate {
         let items = read.workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) }
         let expectedPresentationState = read.capsulePresentationState
         var nextPresentationState = expectedPresentationState
-        // Every cue that passed its own gate, best first; only one is shown.
+        // Feeling leads; intentions and voice have their own place beside one continuity cue.
         var cueWhy = CapsuleCueWhy()
-        let candidateLines = innerStateCapsuleLines(
+        let expression = innerStateCapsuleLines(
             from: items,
             request: request,
             at: read.fixedAt,
@@ -78,21 +77,28 @@ extension CognitiveSubstrate {
             gapItems: gapItems,
             careCue: careCue,
             felt: felt,
+            dreamFeeling: dreamFeeling,
             presentationState: &nextPresentationState,
             why: &cueWhy,
             turn: turn
         )
-        // Receipts are not cues: they never compete for the one felt slot.
-        let personLine: String? = request.mode == .inject && request.resolvedTurnKind == .live
-            ? request.speaker.flatMap {
-                read.personLines[CognitiveCareProvenance.personKey($0, aliases: read.carePersonAliases)]
-            }.map { "- With them: " + $0 } : nil
-        let presenceLine = read.personPresenceLine.map { "- Your person: " + $0 }
-        let dynamicLines = [personLine, presenceLine].compactMap { $0 } + (request.surface == Self.cadenceExemptCapsuleSurface
-            ? candidateLines : Self.oneFeltCue(candidateLines))
-            + Array(Set(unreadable)).sorted().map(Self.unreadableCueLine)
+        let candidateLines = expression.lines
+        // Who she is, every live turn: one trait she has shown and who she is with this person, outside the felt-cue competition.
+        let selfReading: CognitiveTurnSelf? = request.mode == .inject && request.resolvedTurnKind == .live
+            ? turnSelf(for: request.speaker, from: read, among: Self.capsuleReachableCares(for: request, from: read)) : nil
+        let selfLines = [selfReading?.trait.map { "- Who you are: " + $0 }, selfReading?.withPerson.map { "- With them: " + $0 }]
+            .compactMap { $0 }
+        // A held self-choice is the frame of expression, so cue cadence cannot make it vanish mid-stretch.
+        let registerLine = read.affect.chosenRegister.flatMap { chosen -> String? in
+            guard chosen.isActive(in: request.sessionId, at: read.fixedAt) else { return nil }
+            return "Your chosen register: " + capsuleLineText(chosen.choice.name, maxCharacters: 80) + "."
+        }
+        let dynamicLines = [registerLine].compactMap { $0 } + Self.capsulePresentationLines(candidateLines, surface: request.surface)
+            + selfLines
+            + Array(Set(unreadable + [selfReading?.unavailable].compactMap { $0 })).sorted().map(Self.unreadableCueLine)
         let capsule = assembledCapsule(
             request, at: read.fixedAt, dynamicLines: dynamicLines,
+            feelingFrame: expression.frame,
             workspaceItems: items,
             maximumCharacters: maximumCharacters)
         let turnKind = request.resolvedTurnKind
@@ -108,7 +114,8 @@ extension CognitiveSubstrate {
                 mindEpoch: read.mindEpoch,
                 fixedAt: read.fixedAt,
                 expected: expectedPresentationState,
-                next: nextPresentationState
+                next: nextPresentationState,
+                feelingFrameShown: capsule.feelingFrame != nil
             )
         } else {
             commit = nil
@@ -125,24 +132,22 @@ extension CognitiveSubstrate {
         _ request: CognitiveCapsuleRequest,
         at now: Date,
         dynamicLines: [String],
+        feelingFrame: CognitiveFeelingFrame,
         workspaceItems: [CognitiveWorkspaceItem],
         maximumCharacters: Int
     ) -> CognitiveCapsule {
-        let stableKernel = Self.capsuleStableKernel("How you feel:", dynamicLines: dynamicLines)
-        let boundedStableKernel = bounded(stableKernel, maxCharacters: maximumCharacters)
-        let separatorCost = dynamicLines.isEmpty || boundedStableKernel.isEmpty ? 0 : 2
-        let remaining = max(0, maximumCharacters - boundedStableKernel.count - separatorCost)
-        let fittedLines = fitCapsuleLines(dynamicLines, maxCharacters: remaining)
+        let fittedLines = fitCapsuleLines(dynamicLines, maxCharacters: maximumCharacters)
         return CognitiveCapsule(
             generatedAt: now,
             mode: request.mode,
-            stableKernel: boundedStableKernel,
+            stableKernel: "",
             dynamicContext: fittedLines.text,
             provenanceNodeIds: unique(workspaceItems.map(\.id)),
-            truncated: fittedLines.truncated || boundedStableKernel.count < stableKernel.count,
+            truncated: fittedLines.truncated,
             sourcePeerIds: CognitiveReflectionCause.unionPeerIds(workspaceItems.map {
                 Self.peerIdentity(metadata: $0.node.metadata, dataRoot: conversationDataRoot).map { [$0] } ?? []
-            })
+            }),
+            feelingFrame: fittedLines.text.contains(feelingFrame.promptText) ? feelingFrame : nil
         )
     }
 
@@ -175,13 +180,10 @@ extension CognitiveSubstrate {
                     expected.soundRutEarlyRepeatSpent
             }
         }
-        // A clipped family change stays new until its felt words are shown.
-        if let words = candidateLines.first(where: { !$0.hasPrefix("- ") }),
-           !shown.contains(words) {
+        // Only a whole delivered frame becomes the reference for the next reply's shift.
+        if let frame = candidateLines.first(where: { $0.hasPrefix(CognitiveFeelingFrame.header) }),
+           !shown.contains(frame) {
             next.fingerprintFamily = expected.fingerprintFamily
-            next.fingerprintCount = expected.fingerprintCount
-            next.fingerprintLastSurfacedAt =
-                expected.fingerprintLastSurfacedAt
             next.ambivalenceCount = expected.ambivalenceCount
             next.lastAmbivalenceAt = expected.lastAmbivalenceAt
         }
@@ -222,11 +224,11 @@ extension CognitiveSubstrate {
         gapItems: [String]? = nil,
         careCue: CognitiveCareCue? = nil,
         felt: (signals: FeltSignals, fingerprint: FeltLineRender?)? = nil,
+        dreamFeeling: String,
         presentationState: inout CognitiveCapsulePresentationState,
         why: inout CapsuleCueWhy,
         turn: Turn?
-    ) -> [String] {
-        var fingerprintSpoken: String?
+    ) -> (lines: [String], frame: CognitiveFeelingFrame) {
         let dyn = frozenRead.personalityDynamics
         let signals = felt?.signals ?? feltSignalsForCapsule(
             from: workspaceItems,
@@ -250,15 +252,14 @@ extension CognitiveSubstrate {
         if let since, let gapOpened {
             why.sources[since] = "gap:\(String(format: "%.0f", (now.timeIntervalSince(gapOpened) / 3_600).rounded()))h"
         }
-        // A touched care or the agent's intention to raise a pressing care leads the felt cues.
+        // The care cue owns intentions; the frame reads charge independently of message matching and cue rest.
         let resting = Self.advanceCareLineRest(&presentationState.careLineRest)
-        let careLines = careCue.map {
+        // The feeling frame already says what is on her mind; the care cue adds only its intentions.
+        let careLines = (careCue.map {
             careCueLines($0, message: request.userMessage, gapOpened: gapOpened, resting: resting, at: now,
                          presentationState: &presentationState, why: &why)
-        } ?? []
-        let reflectionPreview = request.surface == Self.cadenceExemptCapsuleSurface
-        let bodyLine = organismBodyLine(from: request.organismProjection)
-        // The self-exemplar echo goes last so budget truncation cannot displace core cues.
+        } ?? []).filter { !$0.hasPrefix(Self.careMindPrefix) }
+        // Voice selection reads this turn's felt register without deciding whether feeling is present.
         let echo = signals.map { signals in soundEchoSelection(
             from: frozenRead,
             mode: mode,
@@ -278,7 +279,7 @@ extension CognitiveSubstrate {
         )
         let rutLine = rutSpeaks ? echo.rutLine : nil
 
-        // The fingerprint carries feeling and attention as words before the slower anchors.
+        // Association keeps the same felt object and counter-reading as the frame.
         let fingerprint: FeltLineRender?
         if let felt {
             fingerprint = felt.fingerprint
@@ -292,26 +293,14 @@ extension CognitiveSubstrate {
                 affectEnabled: frozenRead.configuration.enabled
             )
         } else { fingerprint = nil }
-        if let fingerprint {
-            // Delivery needs cadence approval and a first-run verdict; reflection omits only the first-run check.
-            let verdict = fingerprintCadenceVerdict(
-                family: fingerprint.family,
-                at: now,
-                dynamics: dyn,
-                presentationState: &presentationState)
-            if verdict.speak, verdict.run == 1 || reflectionPreview {
-                fingerprintSpoken = fingerprint.bareText
-                // Presentation receipts — counters only, no text. A suppressed line was never read, so it records nothing.
-                if fingerprint.carriedAmbivalence {
-                    presentationState.ambivalenceCount = min(presentationState.ambivalenceCount, Int.max - 1) + 1
-                    presentationState.lastAmbivalenceAt = now
-                }
-            } else if request.mode == .inject {
-                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("C09"), "site": .string(
-                    "CognitiveSubstrate+Capsule.swift:innerStateCapsuleLines")]), turn: turn)
-            }
+        let frame = feelingFrame(
+            request: request, read: frozenRead, dreamFeeling: dreamFeeling,
+            leadWord: fingerprint?.leadWord, counterWord: fingerprint?.counterWord,
+            presentationState: &presentationState)
+        if Self.frameCognitionAvailable(frozenRead), fingerprint?.counterWord != nil {
+            presentationState.ambivalenceCount = min(presentationState.ambivalenceCount, Int.max - 1) + 1
+            presentationState.lastAmbivalenceAt = now
         }
-        // Each capsule carries at most one cue.
         var remindedSpoken: String?
         if let remindedOf,
            let line = remindedOfCapsuleLine(for: remindedOf, at: now) {
@@ -332,21 +321,13 @@ extension CognitiveSubstrate {
             presentationState.dreamThemeSurfaced[dreamTheme.id] = now
             Self.boundDateLedger(&presentationState.dreamThemeSurfaced)
         }
-        // Keep one turn-relevant felt cue plus the rut line; clipped cues stay owed, while reflection keeps every line.
-        if reflectionPreview {
-            return dedupedCapsuleLines([fingerprintSpoken, since, bodyLine,
-                                        echo.line, rutLine, remindedSpoken].compactMap { $0 })
-        }
-        let ordered: [String?] = careLines + [
+        let ordered: [String?] = [frame.promptText] + careLines + [
             since, remindedSpoken,
             dreamSpoken,
-            fingerprintSpoken,
-            bodyLine, echo.line, rutLine,
+            echo.line, rutLine,
         ]
-        return dedupedCapsuleLines(ordered.compactMap { $0 })
+        return (dedupedCapsuleLines(ordered.compactMap { $0 }), frame)
     }
-
-    static let soundEchoPrefix = "- Sound: lately you've sounded like"
 
     /// Trace cue selection at production without adding its explanation to the prompt.
     struct CapsuleCueWhy: Sendable {
@@ -355,7 +336,7 @@ extension CognitiveSubstrate {
         var careIntention: String?
     }
 
-    /// `mind.why` retains ranked candidates, scores, sources, winner and signature so the single-cue choice remains explainable.
+    /// Traces retain every candidate and whether its own lane reached the delivered capsule.
     static func cueWhyPayload(
         candidateLines: [String],
         shown: String,
@@ -365,7 +346,7 @@ extension CognitiveSubstrate {
         func kind(_ line: String) -> String {
             for (prefix, name) in [("- Since:", "since"),
                                    ("- Reminded of:", "reminded_of"),
-                                   ("- Body:", "body"), ("- Sound:", "sound"),
+                                   ("- Sound:", "sound"),
                                    ("- Dream:", "dream"), (careMindPrefix, "care"),
                                    (careIntentionPrefix, "care")] where line.hasPrefix(prefix) {
                 return name
@@ -390,45 +371,21 @@ extension CognitiveSubstrate {
             "lane": .string("cue"),
             "signature": .array(signature.map { .string($0) }),
             "candidates": .array(candidateLines.prefix(10).enumerated().map { row($1, rank: $0 + 1) }),
+            "shown": .array(candidateLines.enumerated().filter { shown.contains($0.element) }.map { row($0.element, rank: $0.offset + 1) }),
             "winner": winner.map { row($0, rank: (candidateLines.firstIndex(of: $0) ?? 0) + 1) } ?? .null,
         ])
     }
 
-    /// The rut nudge changes expression, so it does not compete with feeling; a leading care keeps both lines as one thought.
-    static func oneFeltCue(_ ordered: [String]) -> [String] {
-        let isRut: (String) -> Bool = { $0.hasPrefix("- Sound:") && !$0.hasPrefix(soundEchoPrefix) }
-        let cues = ordered.filter { !isRut($0) }
-        let lead = cues.first.map(isCareCueLine) == true ? Array(cues.prefix(while: isCareCueLine)) : Array(cues.prefix(1))
-        return lead + [ordered.first(where: isRut)].compactMap { $0 }
-    }
-
-    /// Show the feeling header only with feeling words; otherwise a following care line would be misread as the stated feeling.
-    static func capsuleStableKernel(_ kernel: String, dynamicLines: [String]) -> String {
-        guard let first = dynamicLines.first else { return kernel }
-        return first.hasPrefix("- ") ? "" : kernel
-    }
-
-    private func organismBodyLine(from projection: OrganismReadout?) -> String? {
-        guard let projection,
-              !projection.isNeutral,
-              let rawLine = projection.bodyLine?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !rawLine.isEmpty else {
-            return nil
+    /// Each lane is selected before fitting; the frame always spends the budget first.
+    static func capsulePresentationLines(_ ordered: [String], surface: String) -> [String] {
+        guard surface != cadenceExemptCapsuleSurface else { return ordered }
+        let frame = ordered.filter { $0.hasPrefix(CognitiveFeelingFrame.header) }
+        let intentions = ordered.filter { $0.hasPrefix(careIntentionPrefix) }
+        let sound = ordered.filter { $0.hasPrefix("- Sound:") }
+        let continuity = ordered.first {
+            !$0.hasPrefix(CognitiveFeelingFrame.header) && !$0.hasPrefix(careIntentionPrefix) && !$0.hasPrefix("- Sound:")
         }
-        let line = rawLine.hasPrefix("- Body:")
-            ? rawLine
-            : "- Body: \(rawLine.replacingOccurrences(of: #"^-?\s*Body:\s*"#, with: "", options: .regularExpression))"
-        let lower = line.lowercased()
-        guard !lower.contains("chemicalstate"),
-              !lower.contains("bodyschema"),
-              !lower.contains("organismkernel"),
-              !lower.contains("organismprojection"),
-              line.rangeOfCharacter(from: .decimalDigits) == nil else {
-            return nil
-        }
-        let boundedLine = capsuleLineText(line, maxCharacters: 180)
-        guard boundedLine.hasPrefix("- Body:") else { return nil }
-        return boundedLine
+        return frame + intentions + sound + [continuity].compactMap { $0 }
     }
 
     /// Preserve the first duplicate only so lossy translation cannot spend the capsule budget on repeated cues.
@@ -450,15 +407,9 @@ extension CognitiveSubstrate {
     ) async -> CognitivePreparedCapsule? {
         let requestTurnKind = request.resolvedTurnKind
         guard requestTurnKind == .live || request.allowNonLiveProjection else { return nil }
-        let read = await frozenRead(at: fixedAt)
-        let speaker = request.speaker.map { CognitiveCareProvenance.personKey($0, aliases: read.carePersonAliases) }
-            .flatMap { read.carePeopleAvailable || CognitiveCareProvenance.independentPersonKey($0) ? $0 : nil }
-        let messageTerms = Self.associationTerms(in: request.userMessage)
-        let reachableCares = read.cares.filter { care in
-            care.fadedAt == nil && !read.associationSuppressions.contains {
-                $0.source == "care:" + care.id.uuidString && Self.suppressionCovers($0.terms, messageTerms: messageTerms)
-            } && (care.with.isEmpty || speaker == CognitiveCare.ownerKey || speaker.map(care.with.contains) == true)
-        }
+        let read = frozenRead(at: fixedAt)
+        let dreamFeeling = dreamFeelingFrame(at: fixedAt, sleep: request.sleepDream)
+        let reachableCares = Self.capsuleReachableCares(for: request, from: read)
         // Embed the felt line once against the frozen read; after suspension, recheck live cadence and ledger to avoid repeating an intervening turn's cue.
         async let recallRead = {
             var felt: (signals: FeltSignals, fingerprint: FeltLineRender?)?
@@ -488,7 +439,8 @@ extension CognitiveSubstrate {
         let prepared = compileFrozenCapsulePresentation(
             request, from: read, remindedOf: remindedOf,
             dreamTheme: dream.0, gapItems: gap.0, careCue: careCue.0,
-            felt: recall.1, unreadable: dream.1 + gap.1 + recall.2 + careCue.1, turn: turn)
+            felt: recall.1, dreamFeeling: dreamFeeling,
+            unreadable: dream.1 + gap.1 + recall.2 + careCue.1, turn: turn)
         // An empty capsule still returns, carrying its commit; callers inject only `nonEmptyCapsule`.
         guard prepared.capsule.mode == .inject else { return nil }
         return prepared
@@ -513,6 +465,8 @@ extension CognitiveSubstrate {
         guard Self.presentationCommitIdentity(capsulePresentationState)
                 == Self.presentationCommitIdentity(commit.expected) else { return false }
         var next = commit.next
+        // Reply settlement owns this reference independently of provider-context acceptance.
+        next.fingerprintFamily = capsulePresentationState.fingerprintFamily
         // Ingest advances these counters independently while a render is frozen.
         if next.soundRutTurnsSinceSurfaced != 0 {
             next.soundRutTurnsSinceSurfaced = capsulePresentationState.soundRutTurnsSinceSurfaced
@@ -522,10 +476,18 @@ extension CognitiveSubstrate {
         } else {
             next.remindedOfTurnsSinceSurfaced = 0
         }
+        guard next != capsulePresentationState else { return true }
+        let before = capsulePresentationArtifactPayload(at: commit.fixedAt)
         capsulePresentationState = next
-        // Persist the accepted cue cadence at the same turn boundary.
-        capsulePresentationDirty = true
+        // A resident-only feeling reference does not rewrite an unchanged durable ledger.
+        if before != capsulePresentationArtifactPayload(at: commit.fixedAt) { capsulePresentationDirty = true }
         return true
+    }
+
+    /// The last completed, saved reply supplies the comparison, even when other turns accepted context while it was running.
+    public func applyReplyFeelingCommit(_ commit: CognitiveCapsulePresentationCommit) {
+        guard !forgettingInFlight, commit.mindEpoch == mindEpoch, commit.feelingFrameShown else { return }
+        capsulePresentationState.fingerprintFamily = commit.next.fingerprintFamily
     }
 
     // MARK: - Durable capsule cadence
@@ -569,12 +531,6 @@ extension CognitiveSubstrate {
         }
         if !capsulePresentationState.careReleased.isEmpty {
             object["careReleased"] = .object(capsulePresentationState.careReleased.mapValues { .double($0.timeIntervalSince1970) })
-        }
-        if !careWatchWoke.isEmpty {
-            object["careWatchWoke"] = .object(careWatchWoke.mapValues {
-                .object(["at": .double($0.at.timeIntervalSince1970), "streak": .int(Int64($0.streak)),
-                         "lived": .string(String($0.lived))])
-            })
         }
         if !capsulePresentationState.careLineRest.isEmpty {
             object["careLineRest"] = .object(capsulePresentationState.careLineRest.mapValues {
@@ -663,20 +619,6 @@ extension CognitiveSubstrate {
             Self.boundDateLedger(&restored)
             capsulePresentationState.careReleased = restored
         }
-        if case .object(let woke)? = object["careWatchWoke"] {
-            var restored: [String: CareWatchRest] = [:]
-            for (key, value) in woke where key.utf8.count <= 512 && UUID(uuidString: String(key.suffix(36))) != nil {
-                if case .object(let row) = value,
-                   let at = row["at"]?.numberValue(coercingStrings: false, finiteOnly: true),
-                   let streak = row["streak"]?.numberValue(coercingStrings: false, finiteOnly: true),
-                   let count = Int(exactly: streak), count >= 0,
-                   let stamp = row["lived"]?.stringValue.flatMap({ UInt64($0) }) {
-                    restored[key] = CareWatchRest(at: Date(timeIntervalSince1970: at), streak: count, lived: stamp)
-                }
-            }
-            careWatchWoke = restored
-            boundCareWatchLedger()
-        }
         if case .object(let rests)? = object["careLineRest"] {
             var restored: [String: CognitiveCapsulePresentationState.CareLineRest] = [:]
             for (key, value) in rests where UUID(uuidString: key) != nil {
@@ -691,14 +633,14 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// The presentation fields a commit is allowed to be stale about. Only the free-running accepted-turn counter is excluded; every other field is rendered
-    /// from the frozen read and must still match exactly.
+    /// Accepted-turn counters and the completed-reply reference have independent write boundaries.
     static func presentationCommitIdentity(
         _ state: CognitiveCapsulePresentationState
     ) -> CognitiveCapsulePresentationState {
         var masked = state
         masked.soundRutTurnsSinceSurfaced = 0
         masked.remindedOfTurnsSinceSurfaced = 0
+        masked.fingerprintFamily = nil
         return masked
     }
 

@@ -9,19 +9,14 @@ import PersistenceCore
 import TrustCenter
 // Blueprint: | `TriggerScheduler.swift` | Trigger config and consent |
 
-/// Owns trigger eligibility, locked durable occurrence claims, job state and inbox acceptance; host delivery follows acceptance. BackgroundLoopLifetimes owns
-/// wake lifecycle; SchedulerDueJobRunner executes jobs. Triggers live at triggers/trigger_config.json; cross-process locks serialize mutations and claims.
+/// Owns inbox trigger configuration and inbox acceptance; each enabled time trigger is a time on the one clock, and host delivery follows acceptance.
+/// Triggers live at triggers/trigger_config.json; a cross-process lock serializes their mutations.
 public actor SwiftNativeTriggerScheduler: Sendable {
-    /// A bounded pass left runnable work. The BackgroundLoops listener coalesces this edge with source changes before admitting the next pass.
-    public static let dueWorkRemaining = Notification.Name("NativeAgent.scheduler.dueWorkRemaining")
-
     let root: URL
     let now: @Sendable () -> Date
     let uuid: @Sendable () -> String
     /// Missing notification transport still accepts the fire but must record warn when the requested push cannot be sent.
     let notifier: TriggerNotifier?
-    /// Explicit optional worklog source for the native brief reader. nil means unconfigured; no personal directory is selected implicitly.
-    let worklogPath: URL?
     /// The originating door runs the agent's part; absent/disabled code stays unavailable.
     let morningBriefPart: MorningBriefPart?
 
@@ -30,14 +25,12 @@ public actor SwiftNativeTriggerScheduler: Sendable {
         now: @escaping @Sendable () -> Date = { Date() },
         uuid: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
         notifier: TriggerNotifier? = nil,
-        worklogPath: URL? = nil,
         morningBriefPart: MorningBriefPart? = nil
     ) {
         self.root = root
         self.now = now
         self.uuid = uuid
         self.notifier = notifier
-        self.worklogPath = worklogPath
         self.morningBriefPart = morningBriefPart
     }
 
@@ -48,20 +41,10 @@ public actor SwiftNativeTriggerScheduler: Sendable {
             .appendingPathComponent("trigger_config.json")
     }
 
-    // MARK: periodic-fire liveness state
-    /// Canonical inbox occurrence state, kept apart from configuration.
-    public nonisolated var inboxStatePath: URL {
-        root
-            .appendingPathComponent("triggers", isDirectory: true)
-            .appendingPathComponent("trigger_state.json")
-    }
     /// The shared activity feed every fire writes its receipt into.
     public nonisolated var activityFeedPath: URL {
         SwiftNativePersistenceCore.activityEventsPath(dataRoot: root)
     }
-
-    /// Bound each pass to protect liveness after mass edits or clock jumps; keep remaining occurrences due and request one coalesced continuation.
-    static let periodicFireCapPerTick = 3
 
     internal static let logger = Logger(subsystem: "com.nativeagent.core", category: "trigger-scheduler")
 
@@ -110,7 +93,10 @@ public actor SwiftNativeTriggerScheduler: Sendable {
                 path: inboxPath, defaultValue: seed
             )
         }
-        return try await SwiftNativePersistenceCore.withFileLock(inboxPath, work)
+        let status = try await SwiftNativePersistenceCore.withFileLock(inboxPath, work)
+        // The clock follows the saved configuration: an enabled trigger holds its daily time, a disabled one none.
+        if status.status == "updated" { try await declareTimes() }
+        return status
     }
 
     /// Update a matching supported inbox trigger; return updated or not_found without dropping saved fields.

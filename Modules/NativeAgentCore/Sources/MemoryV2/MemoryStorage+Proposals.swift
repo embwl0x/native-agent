@@ -145,8 +145,9 @@ extension MemoryStorage {
             ).map(Self.decodeProposal)
             if let existing = pending.first(where: { foldedKey($0.content) == key }) {
                 var merged = try MemorySenseProvenance.preserving(existing: existing.metadata, incoming: merge(existing))
-                merged = MemoryDataProvenance.preserving(existing: existing.metadata, incoming: merged)
-                merged = MemoryDataProvenance.preserving(existing: proposal.metadata, incoming: merged)
+                // The pending proposal keeps every root it held and gains this observation's.
+                let roots = try [MemoryRoot.roots(in: existing.metadata), MemoryRoot.roots(in: proposal.metadata)]
+                merged = MemoryRoot.setting(MemoryRoot.union(roots), in: merged)
                 let provenance = MemorySenseProvenance.merging(existing: merged, incoming: proposal.metadata)
                 if !provenance.isEmpty {
                     var metadata: [String: JSONValue] = [:]
@@ -271,7 +272,16 @@ extension MemoryStorage {
                     }
                 }
             }
-            let mem = StoredMemory(
+            // What lands keeps the roots staged with it (acceptance stamps no turn) and the roots of every row it replaces, as a save does.
+            var replaced = subjectPredecessors
+            if let superseding, !replaced.contains(where: { $0.id == superseding.targetId }),
+               let target = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [superseding.targetId])
+                   .map(Self.decodeMemory) {
+                replaced.append(target)
+            }
+            let roots = try [MemoryRoot.roots(in: proposal.metadata)] + replaced.map { try MemoryRoot.roots(in: $0.metadata) }
+            proposal.metadata = MemoryRoot.setting(MemoryRoot.union(roots), in: proposal.metadata)
+            var mem = StoredMemory(
                 id: proposal.id,
                 content: proposal.content,
                 personaId: proposal.personaId,
@@ -306,13 +316,13 @@ extension MemoryStorage {
             // Insert the replacement and demote its exact target in one transaction; refusal leaves the proposal pending.
             var demoted: [StoredMemory] = []
             if let superseding {
-                demoted.append(try Self.demoteSuperseded(superseding, by: mem, in: db))
+                demoted.append(try Self.demoteSuperseded(superseding, by: &mem, in: db))
             }
             for predecessor in subjectPredecessors where predecessor.id != superseding?.targetId {
                 demoted.append(try Self.demoteSuperseded(SupersedingAcceptance(
                     targetId: predecessor.id, expectedContentHash: Self.contentHash(predecessor.content),
                     reason: "superseded by explicit standing correction on the same subject"
-                ), by: mem, in: db))
+                ), by: &mem, in: db))
             }
             let evicted = try Self.pruneMemoriesToBound(
                 in: db,
@@ -344,7 +354,7 @@ extension MemoryStorage {
     /// acceptance.
     static func demoteSuperseded(
         _ superseding: SupersedingAcceptance,
-        by replacement: StoredMemory,
+        by replacement: inout StoredMemory,
         in db: Database
     ) throws -> StoredMemory {
         guard superseding.targetId != replacement.id else {
@@ -366,9 +376,82 @@ extension MemoryStorage {
                 "memory this update replaces (\(superseding.targetId)) changed since the update was staged"
             )
         }
+        if row.metadata?.objectValue?["pinned"] == .bool(true) {
+            func rulingDate(_ memory: StoredMemory) throws -> Date {
+                let raw: String
+                if let supplied = memory.metadata?.objectValue?["turn_at"] {
+                    guard case .string(let value) = supplied else {
+                        throw MemoryStorageError.invalidTemporalEvidence("Pinned belief turn_at is not a timestamp string")
+                    }
+                    raw = value
+                } else {
+                    // A direct save without a turn has its own admission event.
+                    raw = memory.createdAt
+                }
+                guard var date = MemoryDataProvenance.parseTimestamp(raw) else {
+                    throw MemoryStorageError.invalidTemporalEvidence("Pinned belief ruling time is not ISO-8601")
+                }
+                if let supplied = memory.metadata?.objectValue?["duplicate_occurrences"] {
+                    guard case .array(let occurrences) = supplied else {
+                        throw MemoryStorageError.invalidTemporalEvidence("Pinned belief occurrences are not an array")
+                    }
+                    for occurrence in occurrences {
+                        guard case .object(let fields) = occurrence else {
+                            throw MemoryStorageError.invalidTemporalEvidence("Pinned belief occurrence is not an object")
+                        }
+                        if let supplied = fields["turn_at"] {
+                            guard case .string(let raw) = supplied, let at = MemoryDataProvenance.parseTimestamp(raw) else {
+                                throw MemoryStorageError.invalidTemporalEvidence("Pinned belief occurrence time is not ISO-8601")
+                            }
+                            date = max(date, at)
+                        }
+                    }
+                }
+                if let latest = try Double.fetchOne(db, sql: "SELECT MAX(occurred_at) FROM correction_occurrences WHERE memory_id = ?",
+                                                    arguments: [memory.id]) {
+                    guard latest.isFinite else {
+                        throw MemoryStorageError.invalidTemporalEvidence("Pinned belief correction time is not finite")
+                    }
+                    date = max(date, Date(timeIntervalSince1970: latest))
+                }
+                return date
+            }
+            guard try rulingDate(replacement) >= rulingDate(row) else {
+                throw MemoryV2Error.staleSupersession("A newer ruling owns this pin; the older replacement was not admitted.")
+            }
+        }
         let now = Self.nowISO8601()
+        // The target's roots are read under the same transaction that retires it. A metadata-only change while the writer embedded must reach
+        // the surviving memory too; a pre-insertion read cannot attest the roots present at this landing.
+        let heldRoots = try MemoryRoot.roots(in: replacement.metadata)
+        let roots = MemoryRoot.union([heldRoots, try MemoryRoot.roots(in: row.metadata)])
+        var metadata = MemoryRoot.setting(roots, in: replacement.metadata)
+        let steer = MemoryDataProvenance.sources(in: metadata)
+        if superseding.restatesOwnPast, let teller = steer.first {
+            throw ToolFailureError("These words came through \(steer.joined(separator: ", ")); they cannot become your own past through supersession.",
+                argumentPath: "since / provenance", accepted: "provenance told by \(teller), without since", effects: .none,
+                code: "memory_restatement_steered", status: .refused,
+                instruction: "Save it as told by \(teller) without since, or leave the memory as it is.", recovery: .correctArguments)
+        }
+        if row.metadata?.objectValue?["pinned"] == .bool(true), metadata.objectValue?["pinned"] != .bool(true) {
+            guard case .object(var fields) = metadata else {
+                throw MemoryStorageError.databaseUnavailable("Replacement roots have no metadata object")
+            }
+            if let refusal = UserMDGenerator.pinFailure(kind: fields["kind"]?.stringValue) { throw refusal }
+            fields["pinned"] = .bool(true)
+            fields["pinned_order"] = row.metadata?.objectValue?["pinned_order"]
+            metadata = .object(fields)
+        }
+        if metadata != replacement.metadata {
+            replacement.metadata = metadata
+            replacement.updatedAt = now
+            try db.execute(sql: "UPDATE memories SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                           arguments: [Self.encodeMetadata(replacement.metadata), now, replacement.id])
+        }
         var meta: [String: JSONValue] = [:]
         if case .object(let existing)? = row.metadata { meta = existing }
+        meta.removeValue(forKey: "pinned")
+        meta.removeValue(forKey: "pinned_order")
         meta["corrected_by"] = .string(replacement.id)
         meta["corrected_at"] = .string(now)
         meta["correction_reason"] = .string(superseding.reason)
@@ -384,8 +467,13 @@ extension MemoryStorage {
         row.metadata = .object(meta)
         row.lifecycle = MemoryLifecycle.corrected
         row.updatedAt = now
-        // It was true until its replacement became true; the row stays.
-        row.validTo = replacement.validFrom ?? now
+        // It was true until its replacement became true; the row stays. A replacement known since before this row began ends it where it began.
+        let ends = replacement.validFrom ?? now
+        if let end = MemoryRecallScoring.parseTimestamp(ends), let begun = row.validFrom.flatMap(MemoryRecallScoring.parseTimestamp), end < begun {
+            row.validTo = row.validFrom
+        } else {
+            row.validTo = ends
+        }
         try db.execute(sql: """
             UPDATE memories SET lifecycle = ?, updated_at = ?, metadata_json = ?, valid_to = ?
             WHERE id = ? AND status = 'active'
@@ -433,14 +521,19 @@ extension MemoryStorage {
         }
     }
 
-    /// Only pending or superseded rows permit metadata repair; preserve successor audit links without mutating terminal rows.
+    /// Only pending or superseded rows permit metadata repair; preserve successor audit links without mutating terminal rows. The proposal keeps the
+    /// roots it holds: a repair never writes them.
     @discardableResult
     public func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> StoredProposal? {
         try await dbPool.write { db in
+            guard let current = try Row.fetchOne(db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id]).map(Self.decodeProposal) else {
+                return nil
+            }
+            let repaired = MemoryRoot.setting(try MemoryRoot.roots(in: current.metadata), in: metadata)
             try db.execute(sql: """
                 UPDATE proposals SET metadata_json = ?
                 WHERE id = ? AND status IN ('pending', 'superseded')
-            """, arguments: [Self.encodeMetadata(metadata), id])
+            """, arguments: [Self.encodeMetadata(repaired), id])
             guard db.changesCount > 0 else { return nil }
             return try Row.fetchOne(db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id])
                 .map(Self.decodeProposal)

@@ -49,7 +49,7 @@ import NativeAgentShared
 import Senses
 import ToolExecution
 import Studio
-// Blueprint: | `EngineLaunch.swift` | `NativeAgentEngine`; Ordered bring-up, ingress and bounded retained settlement |
+// Blueprint: | `EngineLaunch.swift` | `NativeAgentEngine`; Ordered bring-up, ingress and retained settlement |
 
 /// Native ports supply effects; existing engine and background owners retain scheduling, admission and reconciliation.
 public protocol EngineBackgroundWorkHost: Sendable {
@@ -78,6 +78,13 @@ private struct EngineDerivedStateInvalidationSink: DerivedStateInvalidationSink 
             $0.namespace == "memory-v2" && $0.canonicalLocator == memoryPath
         }) {
             await writeMemorySnapshot()
+        }
+        let contactsPath = dataRoot.appendingPathComponent("agents/peers.json").standardizedFileURL.path
+        if changes.contains(where: {
+            $0.namespace == "agent-trust" && $0.operation == .reconcile && $0.canonicalLocator == contactsPath
+        }) {
+            // Contact writes already announce this edge; an observed credential-only mismatch reaches both memory projections here too.
+            NotificationCenter.default.post(name: AgentPeerStore.trustDidChange, object: nil)
         }
         await DerivedPersonaPinInvalidationSink(dataRoot: dataRoot).sourceDidChange(changes)
     }
@@ -154,11 +161,15 @@ extension NativeAgentEngine {
                     firstAnchorTask = nil
                     published.continuation.finish()
                 }
-                var session = ConversationAnchor.currentSessionId(dataRoot: dataRoot)
+                var session = await Task.detached(priority: .utility) {
+                    ConversationAnchor.currentSessionId(dataRoot: dataRoot)
+                }.value
                 if session == nil {
                     for await _ in published.stream {
                         guard !Task.isCancelled else { return }
-                        session = ConversationAnchor.currentSessionId(dataRoot: dataRoot)
+                        session = await Task.detached(priority: .utility) {
+                            ConversationAnchor.currentSessionId(dataRoot: dataRoot)
+                        }.value
                         if session != nil { break }
                     }
                 }
@@ -244,10 +255,10 @@ extension NativeAgentEngine {
             let seeds = try AbilityStore.seedCatalog(resources: resources).sorted { $0.path < $1.path }.map { url in (url, Result { try AbilityStore.decode(
                 url) }) }
             // Require a readable whole bundle before disabling untouched seeds.
-            if let shipped = try? seeds.map({ try $0.1.get().id }) {
-                do { try fadeRetiredSeeds(abilities, shipped: Set(shipped), dataRoot: dataRoot) }
-                catch { failures.append("retired seeds: \(error.localizedDescription)") }
-            }
+            do {
+                let shipped = try seeds.map { try $0.1.get().id }
+                try fadeRetiredSeeds(abilities, shipped: Set(shipped), dataRoot: dataRoot)
+            } catch { failures.append("retired seeds: \(error.localizedDescription)") }
             // Bind peer trust before admitting bundled seeds.
             PeerTrust.install(dataRoot: dataRoot)
             // Launch owns no enclosing turn or operation; admission and installation share this explicit operation.
@@ -315,7 +326,8 @@ extension NativeAgentEngine {
             let retired = Set(try abilities.files(kind: .part, includeProposals: false).filter { file in
                 guard AbilityStore.isSeed(file), !shipped.contains(file.id), case .object(let proof)? = file.metadata["proof"],
                       case .string(let digest)? = proof["candidate"] else { return false }
-                return (try? programs.load(id: file.id, digest: digest)) != nil
+                _ = try programs.load(id: file.id, digest: digest)
+                return true
             }.map(\.id))
             guard !retired.isEmpty, case .array(var rows) = try abilities.registry(kind: .part) else { return }
             var faded = false
@@ -376,12 +388,13 @@ extension NativeAgentEngine {
     public static func startResidentWorkAtLaunch(
         dataRoot: URL, embeddingDescriptorURL: URL?,
         storageUnavailable: @escaping @MainActor @Sendable () -> Void,
-        registerBackgroundTasks: @MainActor () -> Void,
         resumeMacTurn: @escaping @Sendable (TurnCheckpoint, TurnContinuationRuntime) async throws -> Void,
         approvals: ApprovalExecution
     ) {
         guard !launchStopped, !residentsStarted, !Task.isCancelled else { return }
         residentsStarted = true
+        // Her body observes every door's turn even when no conversation window is mounted.
+        OtherDoorTurns.shared.start(NativeAgentEngine.live.faceActs.chat)
         retainLaunchWork { await NativeAgentEngine.live.connectors.observe() }
         retainLaunchWork { await NativeAgentEngine.live.observeDiagnosticsLivingStatus() }
         retainLaunchWork {
@@ -391,7 +404,6 @@ extension NativeAgentEngine {
         }
         retainLaunchWork { _ = await reconcileMemoryAtLaunch(dataRoot: dataRoot, storageUnavailable: storageUnavailable) }
         retainLaunchWork { await SwiftNativeMemoryIndexer.reconcileAtLaunch(dataRoot: dataRoot) }
-        registerBackgroundTasks()
         // Bring up owners independently so one blocked store cannot hold siblings or the native launch callback.
         retainLaunchWork {
             do {
@@ -404,7 +416,15 @@ extension NativeAgentEngine {
                     id: "launch.embeddings", title: "Memory model bring-up", status: "fail", detail: detail)], dataRoot: dataRoot)
             }
         }
-        SensesHub.shared.installCrossing(NativeAgentEngine.liveCognition)
+        // One intake: every happening posted from here on is taken by the agent's attention; the stream opens admission once the mind is up.
+        Attention.install(NativeAgentEngine.liveCognition)
+        retainLaunchWork {
+            await NativeAgentEngine.liveCognition.bootstrap()
+            guard !Task.isCancelled else { return }
+            await NativeAgentEngine.live.agents.stream.open(attention: NativeAgentEngine.liveCognition, night: { attended in
+                _ = await NativeAgentEngine.sleep(dataRoot: dataRoot, attended: attended)
+            })
+        }
         EngineFrontSense.shared.start(dataRoot: dataRoot)
         retainLaunchWork { await NativeAgentEngine.liveCognition.bootstrap() }
         // Deliver callbacks owed before relaunch without waiting for a task read.
@@ -423,17 +443,6 @@ extension NativeAgentEngine {
             _ = await AgentDiscoverySession.shared.candidates(refresh: true, probe: false, dataRoot: dataRoot)
         }
         retainLaunchWork {
-            do {
-                try await migrateScheduledIntentionsAtLaunch(dataRoot: dataRoot)
-            } catch is CancellationError {
-                return
-            } catch {
-                let detail = "Scheduled work could not become intentions; resident loops did not start: " + error.localizedDescription
-                ModuleLog.app("[intentions] %@", detail)
-                await DoctorReadout.recordReadings([CheckResult(source: "Launch intention migration",
-                    id: "launch.intentions", title: "Scheduled intentions", status: "fail", detail: detail)], dataRoot: dataRoot)
-                return
-            }
             guard !Task.isCancelled else { return }
             await startBackgroundWorkAtLaunch(
                 dataRoot: dataRoot,
@@ -447,6 +456,8 @@ extension NativeAgentEngine {
                     let loops = assembleAllLoops()
                     await installBotProviderCheck()
                     guard !Task.isCancelled else { return nil }
+                    // The one clock delivers every declared time to its owner from here on; helpers run once their provider check is installed.
+                    await registerClockOwners(dataRoot: dataRoot)
                     return loops
                 },
                 resume: { checkpoint in
@@ -629,15 +640,6 @@ extension NativeAgentEngine {
     }
 
     @discardableResult
-    public static func runBackgroundLoopOnce(loopId: String) async -> LoopTickOutcome {
-        let manager = BackgroundLoopLifetimes.shared
-        if !(await manager.isRunning(loopId: loopId)) {
-            await startBackgroundLoops(loops: assembleAllLoops())
-        }
-        return await manager.runTickOnce(loopId: loopId)
-    }
-
-    @discardableResult
     public static func restartBackgroundLoop(id: String, manager: BackgroundLoopLifetimes = .shared) async -> LoopRestartOutcome {
         await MaintenanceBackgroundWork.restartLoop(id: id, manager: manager, replacementLoop: { id in
             switch id {
@@ -658,21 +660,19 @@ extension NativeAgentEngine {
         // Arm before reading so racing completion or restart stays buffered.
         let events = EventDeadlinePhysiology.storeAndFileEvents(paths: [],
             notifications: [ChatCancelFlag.inFlightDidChange, quitRestartWake])
-        _ = await raceAgainstTimeout(seconds: 20) {
-            var iterator = events.makeAsyncIterator()
-            while !Task.isCancelled,
-                  !NativeAgentEngine.live.turns.inFlightRunIDs().isDisjoint(with: runs), !isRestarting() {
-                guard await iterator.next() != nil else { return }
-            }
+        var iterator = events.makeAsyncIterator()
+        while !Task.isCancelled,
+              !NativeAgentEngine.live.turns.inFlightRunIDs().isDisjoint(with: runs), !isRestarting() {
+            guard await iterator.next() != nil else { return }
         }
         let left = NativeAgentEngine.live.turns.inFlightRunIDs().intersection(runs).count
-        ModuleLog.app("[quit] %@", left == 0 ? "turns finished — quitting" : "\(left) turn(s) still running at the bound — quitting anyway")
+        ModuleLog.app("[quit] %@", left == 0 ? "turns finished" : "\(left) turn(s) remain before settlement")
     }
 
-    // Retain one settlement across close, join and save; caller timeout must not cancel it.
+    // Close, join and save share one retained settlement.
     @MainActor private static var quitSettlement: Task<NativeCognitionSleepOutcome?, Never>?
 
-    /// Both quit bounds join the same retained operation; timeout cancels only the caller’s wait.
+    /// Quit callers join the same retained operation.
     @MainActor
     public static func beginQuitSleep(after producers: Task<Void, Never>, runs: Set<String>,
                                       retireBrowser: @escaping @MainActor @Sendable () -> Void) -> Task<NativeCognitionSleepOutcome?, Never> {
@@ -682,7 +682,7 @@ extension NativeAgentEngine {
             // Arm before the registry read so admitted producers’ final completions cannot race it.
             let events = EventDeadlinePhysiology.storeAndFileEvents(paths: [],
                 notifications: [ChatCancelFlag.inFlightDidChange])
-            // Re-read in-flight turns before the final snapshot, including turns admitted after Stop; retain the bounded wait.
+            // Join every admitted turn before the final snapshot.
             var iterator = events.makeAsyncIterator()
             while !NativeAgentEngine.live.turns.inFlightRunIDs().isEmpty {
                 guard await iterator.next() != nil else {
@@ -700,16 +700,8 @@ extension NativeAgentEngine {
     }
 
     public static func sleepMind(after settlement: Task<NativeCognitionSleepOutcome?, Never>) async -> String {
-        let outcome = await raceAgainstTimeout(seconds: sleepBound) { await settlement.value }
-        switch outcome {
-        case .value(let slept): return slept?.summary ?? "did not settle: admitted-turn observation unavailable"
-        case .timedOut: return "did not settle within \(Int(sleepBound)) s"
-        default: return "did not settle"
-        }
+        await settlement.value?.summary ?? "did not settle: admitted-turn observation unavailable"
     }
-
-    // The relauncher’s exit deadline must include `sleepBound`.
-    static let sleepBound: Double = 30
 
     /// Close producer admission when quit hold begins; keep dependencies alive until admitted runs settle.
     @MainActor
@@ -767,12 +759,12 @@ extension NativeAgentEngine {
             async let promoter: Void = AdaptiveMemoryPromoter.shared.shutdown()
             async let projections: Void = SwiftNativeMemoryV2.shared.shutdownProjections()
             async let notifications: Void = attention.shutdown()
-            _ = await (chrome, senses, programs, acp, context, embeddings, promoter, projections, notifications)
+            async let trace: Void = NativeAgentEngine.live.trace.stop()
+            _ = await (chrome, senses, programs, acp, context, embeddings, promoter, projections, notifications, trace)
             // Retire inventory only after every producer, turn, sense and program has settled.
             await MacAppIndex.shared.shutdown()
             group.leave()
         }
-        NativeAgentEngine.live.trace.stop()
         if group.wait(timeout: .now() + 3.0) == .timedOut {
             ModuleLog.app("[quit] resident settlement unfinished at the 3 s termination bound")
         }

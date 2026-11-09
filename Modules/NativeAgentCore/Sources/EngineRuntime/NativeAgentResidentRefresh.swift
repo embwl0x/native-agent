@@ -14,11 +14,17 @@ public extension NativeAgentEngine {
         policyChanged: @escaping @MainActor () -> Void,
         memoryProposalsChanged: @escaping @MainActor () -> Void
     ) {
-        approvals.recordsDidChange = {
-            Task { await publishWorkStatus() }
+        Task { [approvals] in
+            for await _ in await approvals.changes() {
+                guard !Task.isCancelled else { return }
+                await publishWorkStatus()
+            }
         }
-        inbox.itemsDidChange = {
-            Task { await publishWorkStatus() }
+        Task { [inbox] in
+            for await _ in await inbox.changes() {
+                guard !Task.isCancelled else { return }
+                await publishWorkStatus()
+            }
         }
         turns.activityDidChange = {
             guard #available(macOS 27, *) else { return }

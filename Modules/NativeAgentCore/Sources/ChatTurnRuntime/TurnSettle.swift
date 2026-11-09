@@ -19,7 +19,6 @@ enum TurnSettle {
               turn.execution?.waitingForInteraction != true,
               turn.execution?.transcriptRowKind == nil else { return nil }
         let completion = turn.rows.codexCompletion
-        guard completion?.isTerminalCompletion != false else { return nil }
         let origin = turn.origin
         guard completion != nil || origin?.authored != .agent else { return nil }
         // Discovery and context expansion alone cannot satisfy requested work.

@@ -1,11 +1,10 @@
 import CoreText
+import NativeAgentShared
 import UIKit
 
 // Blueprint: | `MobileTranscriptFragments.swift` | One layout fragment per drawn paragraph kind, and the delegate that picks them and hides closed folds |
 
-/// Every paragraph's look comes from its fragment. Margins are read once from the paragraph's attributes; decoration is placed from the
-/// laid-out lines, never from column constants, because TextKit shifts each fragment by its paragraph indent. Paths are cached per rect
-/// because `draw(at:in:)` runs many times per scroll step; colours resolve at draw time, so light and dark both hold.
+/// Read paragraph geometry once, cache decoration paths and resolve dynamic colors at draw time.
 class TranscriptFragment: NSTextLayoutFragment {
     final lazy var paragraphAttributes: [NSAttributedString.Key: Any] = {
         guard let paragraph = self.textElement as? NSTextParagraph, paragraph.attributedString.length > 0 else { return [:] }
@@ -98,8 +97,8 @@ final class TranscriptUserFragment: TranscriptFragment {
 final class TranscriptCodeFragment: TranscriptFragment {
     private lazy var language: (text: String, font: UIFont)? = {
         guard let text = paragraphAttributes[TranscriptKey.language] as? String,
-              let font = paragraphAttributes[TranscriptKey.languageFont] as? UIFont else { return nil }
-        return (text, font)
+              let size = paragraphAttributes[TranscriptKey.languageFontSize] as? NSNumber else { return nil }
+        return (text, .systemFont(ofSize: CGFloat(size.doubleValue), weight: .medium))
     }()
 
     private var header: CGFloat { language == nil ? 0 : TranscriptMetrics.codeHeader }
@@ -215,9 +214,9 @@ final class TranscriptLayoutDelegate: NSObject, NSTextContentStorageDelegate, NS
 
     func textContentManager(_ textContentManager: NSTextContentManager, shouldEnumerate textElement: NSTextElement,
                             options: NSTextContentManager.EnumerationOptions) -> Bool {
-        guard let paragraph = textElement as? NSTextParagraph, paragraph.attributedString.length > 0,
-              let group = paragraph.attributedString.attribute(TranscriptKey.foldGroup, at: 0, effectiveRange: nil) as? String
-        else { return true }
+        guard let paragraph = textElement as? NSTextParagraph, paragraph.attributedString.length > 0 else { return true }
+        if paragraph.attributedString.attribute(TranscriptKey.liveHidden, at: 0, effectiveRange: nil) as? Bool == true { return false }
+        guard let group = paragraph.attributedString.attribute(TranscriptKey.foldGroup, at: 0, effectiveRange: nil) as? String else { return true }
         return openFolds.contains(group)
     }
 

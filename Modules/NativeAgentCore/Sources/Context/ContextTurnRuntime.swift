@@ -12,9 +12,9 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
 
     public init() {}
 
-    public convenience init(unavailable cause: String) {
+    public convenience init(unavailable cause: String, repairRequired: Bool = true) {
         self.init()
-        fail(cause)
+        fail(cause, repairRequired: repairRequired)
     }
 
     public func value(within nanoseconds: UInt64) async -> ContextQueryEmbeddingValue? {
@@ -39,7 +39,8 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
                 // Snapshot at expiry; joining the cancelled parker cannot admit a late value.
                 return self.lock.withLock {
                     self.result ?? .failure(NativeSemanticQueryError(detail:
-                        "The semantic read is still pending after its bounded wait; no recall selection was made."))
+                        "The semantic read is still pending after its bounded wait; no recall selection was made.",
+                        repairRequired: false))
                 }
             }
             let first = await group.next()!
@@ -57,10 +58,10 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
         }
     }
 
-    public func fail(_ cause: String) {
+    public func fail(_ cause: String, repairRequired: Bool = true) {
         let settled = lock.withLock {
             guard result == nil else { return false }
-            result = .failure(NativeSemanticQueryError(detail: cause))
+            result = .failure(NativeSemanticQueryError(detail: cause, repairRequired: repairRequired))
             return true
         }
         if settled { ready.resume() }
@@ -87,7 +88,12 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
 
 public struct NativeSemanticQueryError: Error, LocalizedError, Sendable {
     public let detail: String
-    public init(detail: String) { self.detail = detail }
+    /// A pending read or cold model is not evidence of a fault. The reader classifies its own cause.
+    public let repairRequired: Bool
+    public init(detail: String, repairRequired: Bool = true) {
+        self.detail = detail
+        self.repairRequired = repairRequired
+    }
     public var errorDescription: String? { "Context semantic read unavailable: " + detail }
 }
 
@@ -151,8 +157,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
     public let postMandatoryCharacterReserve: Int
     /// Every caller declares which persona documents its stable prompt carries verbatim so dynamic context does not duplicate them.
     public let stableSegmentCarriesRequiredDocuments: Bool
-    /// Nil means the USER memory projection is unavailable; [] withholds all generated facts.
-    public let userMemoryCore: [String]?
+    /// The ordered person picture; [] withholds generated facts when recall is disabled or a separately reported read is unavailable.
+    public let userMemoryCore: [String]
     public let memoryRecallEnabled: Bool
     /// Publish expansion pointers for every body the caller truncates; zero means whole-body rendering without truncation pointers.
     public let packetAtomExpandThresholdChars: Int
@@ -181,7 +187,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
         maximumCharacterBudget: Int? = nil,
         postMandatoryCharacterReserve: Int = 0,
         stableSegmentCarriesRequiredDocuments: Bool,
-        userMemoryCore: [String]?,
+        userMemoryCore: [String],
         memoryRecallEnabled: Bool = true,
         packetAtomExpandThresholdChars: Int = 0,
         memoryAtomRowLimit: Int? = nil

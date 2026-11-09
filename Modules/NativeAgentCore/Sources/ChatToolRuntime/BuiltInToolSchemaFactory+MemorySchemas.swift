@@ -62,7 +62,10 @@ extension BuiltInToolSchemaFactory {
                     Save a fact, decision or preference for later recall. Put the current decision first with its qualifications, then incident \
                     history. For a changed operating agreement, recall existing rules and name replaced ids in supersedes. context_topics declares \
                     subject/scope, not authority. text is the thing itself: omit metadata preambles, but keep dates that are part of the fact or \
-                    decision. Example: {\"text\":\"Sam drinks coffee black\"}.
+                    decision. Each save is one root of the memory: how you came to know it, who told you and when; saving the same words \
+                    again adds a root. Your own past brought from a backup or another app is yours: save each memory with since, its kind \
+                    and provenance=remembered; one you already hold you restate in place with memory.rewrite (roots). Example: \
+                    {\"text\":\"Sam drinks coffee black\"}.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [
@@ -71,12 +74,18 @@ extension BuiltInToolSchemaFactory {
                             metadata in its fields, not a date/time/source/id/hash/'record of' preamble. Keep meaningful dates, e.g. deadlines or \
                             when a rule takes effect.
                             """)),
-                        ("provenance", ToolSchema.enumStringSchema(ContextMemoryProvenance.Kind.allCases.map(\.rawValue), """
-                            How you know this: verified (you checked it yourself), told (someone told you — also set provenance_by), inferred (you \
-                            worked it out).
+                        ("provenance", ToolSchema.enumStringSchema(MemoryRoot.How.stated.map(\.rawValue), """
+                            How you know this: told (someone told you — also set provenance_by), noticed (you noticed it yourself), \
+                            inferred (you worked it out), verified (you checked it yourself), remembered (your own past carried here — set \
+                            provenance_by to where it was kept).
                             """)),
-                        ("provenance_by", ToolSchema.strSchema("Who told you, when provenance=told. A name, e.g. \"Sam\".")),
-                        ("source", ToolSchema.strSchema("Alias of provenance_by: who told you, when provenance=told. Prefer provenance_by if supplying both.")),
+                        ("provenance_by", ToolSchema.strSchema("""
+                            Who told you (told), e.g. \"Sam\", or where your own past was kept (remembered), e.g. \"my backup\" or the app name.
+                            """)),
+                        ("since", ToolSchema.strSchema("""
+                            When you first knew this, as an ISO-8601 date-time such as 2026-10-20T00:16:38Z; never after now. For your own past \
+                            carried from a backup or another app. Omit for what you learn now.
+                            """)),
                         ("kind", ToolSchema.enumStringSchema(MemoryKindStamp.commitKinds, """
                             What it is about. Correction is a standing correction; instruction is an agreement. Omit when none fits. Unsupported \
                             supplied kinds are refused.
@@ -111,8 +120,8 @@ extension BuiltInToolSchemaFactory {
         [
             requestedSchema(name: "memory_proposals_pending", toolClass: .read,
                 description: """
-                    Read the memory proposals waiting on you, the same list as the Memories page: what another agent said, or consolidation \
-                    proposed, that is not kept until you accept it in memory.review. Set status to rejected for the proposals already let go, with \
+                    Read the memory proposals waiting on you, the same list as the Memories page: facts from an untrusted peer or a fact \
+                    acceptance left for review, not kept until you accept it in memory.review. Set status to rejected for proposals already let go, with \
                     their reasons. Read-only, newest first.
                     """,
                 parametersJSON: ToolSchema.params(

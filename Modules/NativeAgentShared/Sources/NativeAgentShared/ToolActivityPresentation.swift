@@ -63,10 +63,21 @@ public enum ToolActivityPresentation {
 
     private static let actionLabels = OSAllocatedUnfairLock(initialState: [String: String]())
 
+    /// An `app` action as an act in the app's own words: its label without the model's notes ("personality.mind" → "Choose the Memory and
+    /// mind model"), else its id read as a title.
+    public static func act(_ action: String) -> String {
+        actionLabels.withLock { $0[action] }.map(acting).flatMap { $0.isEmpty ? nil : $0 } ?? title(action)
+    }
+
+    /// Words after a "(", ";", ":" or "," are the model's notes.
+    private static func acting(_ label: String) -> String {
+        label.prefix { !"(;:,".contains($0) }.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// A label as something under way when its first word is a known verb ("Test the connection" → "Testing the connection"), else as it is; words after a
     /// "(", ";", ":" or "," are the model's notes and stay out.
     private static func underway(_ label: String) -> String? {
-        let words = label.prefix { !"(;:,".contains($0) }.trimmingCharacters(in: .whitespaces)
+        let words = acting(label)
         guard let first = words.split(separator: " ").first else { return nil }
         let verb = first.lowercased()
         guard underwayVerbs.contains(verb) else { return words }
@@ -129,11 +140,6 @@ public enum ToolActivityPresentation {
         let words = tool.split(whereSeparator: { $0 == "_" || $0 == "." }).joined(separator: " ")
         if text == "Allow me to use \(words)?" {
             return "Allow me to \(phrase.prefix(1).lowercased())\(phrase.dropFirst())?"
-        }
-        if text == "Approve \(tool)" { return "Approve \(phrase)" }
-        let requesterSuffix = " asked: Approve \(tool)"
-        if text.hasSuffix(requesterSuffix) {
-            return String(text.dropLast(requesterSuffix.count)) + " asked: Approve \(phrase)"
         }
         return text
     }

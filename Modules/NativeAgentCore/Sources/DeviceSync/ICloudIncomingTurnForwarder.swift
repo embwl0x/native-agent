@@ -594,27 +594,40 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         group.addTask { await progress.finish() }
         sync.engine.unregisterActiveChatTask(for: resolvedSessionID, expecting: streamTask)
         func finishWithoutReply(_ evidence: [String: String]) async -> Bool {
-            // A live ending with no words settles the phone's wait and posts nothing.
+            let publicationID = "no-post-" + MacSyncSnapshotIntegrity.digest(Data(msg.id.utf8))
             do {
                 var metadata = replyMetadata
                 metadata["live"] = "true"
                 metadata.merge(evidence, uniquingKeysWith: { _, new in new })
                 _ = try await sync.bridge.sendChatMessage(text: "", sessionID: resolvedSessionID, correlationID: msg.id,
-                    metadata: metadata)
+                    metadata: metadata, messageID: publicationID)
                 await port.completed(sessionID: resolvedSessionID)
                 return true
             } catch {
                 nativeLog("[iCloudBridge] no-post msg %@ settlement not sent: %@", msg.id, "\(error)")
-                await port.completed(sessionID: resolvedSessionID)
-                return ICloudIncomingTurnConsumptionPolicy.shouldConsume(turnReachedTerminalState: true, replyPublished: false)
+                do {
+                    let state = try await sync.bridge.retainedNoPostState(id: publicationID, correlationID: msg.id)
+                    if state == "completed" {
+                        await port.completed(sessionID: resolvedSessionID)
+                        return true
+                    }
+                    if state == "publication_owed" { return true }
+                    await sync.bridge.noteNoPostDeliveryFailure(messageID: msg.id, cause: error.localizedDescription)
+                } catch {
+                    await sync.bridge.noteNoPostDeliveryFailure(messageID: msg.id, cause: error.localizedDescription)
+                }
+                return false
             }
         }
         if let readBy = outcome.readBy { return await finishWithoutReply(["readBy": readBy]) }
         if outcome.error == nil, outcome.cause == nil,
            outcome.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, outcome.attachments.isEmpty {
             do {
-                if let silence = try SwiftNativeChatOrchestrationClient.silentTurn(
-                    dataRoot: PersistenceCore.defaultDataRoot(), sessionId: resolvedSessionID, runId: turn.run, turnId: turn.id) {
+                let silence = try await sync.storage.perform {
+                    try SwiftNativeChatOrchestrationClient.silentTurn(
+                        dataRoot: PersistenceCore.defaultDataRoot(), sessionId: resolvedSessionID, runId: turn.run, turnId: turn.id)
+                }
+                if let silence {
                     return await finishWithoutReply(["silence": silence])
                 }
             } catch {

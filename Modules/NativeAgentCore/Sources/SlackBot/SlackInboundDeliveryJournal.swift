@@ -2,7 +2,9 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SlackInboundDeliveryJournal.swift` | `SlackInboundDeliveryJournal` actor; socket/recovery admission, retains accepted handler tasks until actual exit with one active handler per event in the process (across loop replacements), and terminal delivery truth; `recordPreview` retains live message identity and uncertain creation, `path`, `recoverySummary`, `failedReplyClaims`, `confirmReplyPart` retain confirmed text/image progress across holds; malformed canonical bytes remain in place and throw; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
+import NativeAgentShared
+import os
+// Blueprint: | `SlackInboundDeliveryJournal.swift` | Durable admission and canonical replies; generation uncertainty never authorizes replay |
 
 enum SlackInboundDeliveryPhase: String, Codable, Sendable {
     case claimed
@@ -10,13 +12,16 @@ enum SlackInboundDeliveryPhase: String, Codable, Sendable {
     case prepared
     case dispatching
     case delivered
+    case completedWithoutPost = "completed_without_post"
     case interrupted
     case outcomeUnknown = "outcome_unknown"
     case sentUnconfirmed = "sent_unconfirmed"
     case failedBeforeAnswer = "failed_before_answer"
     case stopped
 
-    var isTerminal: Bool { self == .delivered || self == .interrupted || self == .sentUnconfirmed || self == .failedBeforeAnswer || self == .stopped }
+    var isTerminal: Bool {
+        [.delivered, .completedWithoutPost, .interrupted, .sentUnconfirmed, .failedBeforeAnswer, .stopped].contains(self)
+    }
 }
 
 struct SlackPreparedUpload: Codable, Equatable, Sendable {
@@ -41,6 +46,12 @@ struct SlackPreparedReply: Codable, Equatable, Sendable {
             fingerprint: digest.map { String(format: "%02x", $0) }.joined()
         )
     }
+
+    var textParts: [String] { SlackWebAPI.messageParts(text) }
+    func partFingerprint(_ index: Int) -> String {
+        if textParts.count == 1 { return fingerprint }
+        return SHA256.hash(data: Data("\(fingerprint):\(index)".utf8)).map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 struct SlackInboundDeliveryRecord: Codable, Equatable, Sendable {
@@ -64,12 +75,20 @@ struct SlackInboundDeliveryRecord: Codable, Equatable, Sendable {
     var failedBeforeAnswer: Bool? = nil
     var lastRejection: Rejection? = nil
     var confirmedText: Bool? = nil
+    /// A partial prefix only; `confirmedText` owns complete text acceptance.
+    var confirmedTextPartCount: Int? = nil
     var confirmedUploadCount: Int? = nil
     var previewMessageTs: String? = nil
     var previewCreationUnknown: Bool? = nil
+    var completedWithoutPostTurnID: String? = nil
+    var resolvedRetryInbound: SlackInboundMessage? = nil
+
+    var confirmedTextCount: Int { confirmedText == true ? (prepared?.textParts.count ?? 0) : (confirmedTextPartCount ?? 0) }
 
     var hasValidUploadProgress: Bool {
         (0...(prepared?.uploads.count ?? 0)).contains(confirmedUploadCount ?? 0)
+            && (0...(prepared?.textParts.count ?? 0)).contains(confirmedTextCount)
+            && (confirmedTextPartCount == nil || (confirmedText != true && confirmedTextPartCount == confirmedTextCount))
     }
 }
 
@@ -127,10 +146,12 @@ public actor SlackInboundDeliveryJournal {
     private let terminalCap = 500
     private let pendingCap = 100
     private let encoder: JSONEncoder
-    /// One handler owns each accepted event across loop replacements; recovery must not duplicate its work.
-    nonisolated(unsafe) private static var activeHandlers: Set<String> = []
-    nonisolated(unsafe) private static var handlerTasks: [String: Task<Void, Never>] = [:]
-    private static let handlerLock = NSLock()
+    private struct Handlers: Sendable {
+        var active: Set<String> = []
+        var tasks: [String: Task<Void, Never>] = [:]
+    }
+    /// One handler owns each accepted event across loop replacements.
+    private static let handlers = OSAllocatedUnfairLock(initialState: Handlers())
 
     init(dataRoot: URL) {
         path = Self.path(dataRoot: dataRoot)
@@ -189,17 +210,17 @@ public actor SlackInboundDeliveryJournal {
     }
 
     func acquireHandler(eventId: String) -> Bool {
-        Self.handlerLock.withLock { Self.activeHandlers.insert(path.path + "\u{0}" + eventId).inserted }
+        Self.handlers.withLock { $0.active.insert(path.path + "\u{0}" + eventId).inserted }
     }
 
     /// Accepted human work belongs to the journal, not a socket session. Claim before launching, retain through settlement, and retire at actual exit.
     func startHandler(eventId: String, operation: @escaping @Sendable () async -> Void) {
         let key = path.path + "\u{0}" + eventId
-        Self.handlerLock.withLock {
-            guard Self.activeHandlers.insert(key).inserted else { return }
-            Self.handlerTasks[key] = Task(priority: .userInitiated) {
+        Self.handlers.withLock { handlers in
+            guard handlers.active.insert(key).inserted else { return }
+            handlers.tasks[key] = Task(priority: .userInitiated) {
                 await operation()
-                self.releaseHandler(eventId: eventId)
+                await self.releaseHandler(eventId: eventId)
             }
         }
     }
@@ -250,10 +271,10 @@ public actor SlackInboundDeliveryJournal {
     private static let botEventClaimCap = 1_000
 
     func releaseHandler(eventId: String) {
-        Self.handlerLock.withLock {
+        Self.handlers.withLock { handlers in
             let key = path.path + "\u{0}" + eventId
-            Self.handlerTasks.removeValue(forKey: key)
-            Self.activeHandlers.remove(key)
+            handlers.tasks.removeValue(forKey: key)
+            handlers.active.remove(key)
         }
     }
 
@@ -312,19 +333,11 @@ public actor SlackInboundDeliveryJournal {
         }
     }
 
-    /// An event whose run never reached the agent's turn is claimed again, keeping its run and conversation for the replay.
-    func reclaim(eventId: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
-        try mutate(eventId: eventId) { record in
-            record.phase = .claimed
-            record.updatedAt = now
-            record.outcomeDetail = nil
-        }
-    }
-
     /// Read by the agent's turn in progress: settled with no post of its own.
     func markSteered(eventId: String, turnID: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
         try mutate(eventId: eventId) { record in
-            record.phase = .delivered
+            record.phase = .completedWithoutPost
+            record.completedWithoutPostTurnID = turnID
             record.updatedAt = now
             record.outcomeDetail = "Read by the agent's turn \(turnID); that turn's reply answers it."
         }
@@ -341,7 +354,8 @@ public actor SlackInboundDeliveryJournal {
     /// The agent's completed turn chose silence: the inbound is settled without a Slack post.
     func markSilent(eventId: String, turnID: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
         try mutate(eventId: eventId) { record in
-            record.phase = .delivered
+            record.phase = .completedWithoutPost
+            record.completedWithoutPostTurnID = turnID
             record.updatedAt = now
             record.outcomeDetail = "The agent's turn \(turnID) ended silently."
         }
@@ -349,7 +363,14 @@ public actor SlackInboundDeliveryJournal {
 
     func confirmReplyPart(eventId: String, isText: Bool) throws -> SlackInboundDeliveryRecord {
         try mutate(eventId: eventId) {
-            if isText { $0.confirmedText = true }
+            if isText {
+                let count = $0.confirmedTextCount
+                guard count < ($0.prepared?.textParts.count ?? 0) else { throw SlackInboundJournalError.malformed }
+                let next = count + 1
+                let complete = next == $0.prepared?.textParts.count
+                $0.confirmedText = complete
+                $0.confirmedTextPartCount = complete ? nil : next
+            }
             else {
                 let count = $0.confirmedUploadCount ?? 0
                 guard count < ($0.prepared?.uploads.count ?? 0) else { throw SlackInboundJournalError.malformed }
@@ -366,6 +387,41 @@ public actor SlackInboundDeliveryJournal {
             record.phase = .outcomeUnknown
             record.updatedAt = now
             record.outcomeDetail = detail
+        }
+    }
+
+    func interruptGeneration(eventId: String, detail: String) throws -> SlackInboundDeliveryRecord {
+        try mutate(eventId: eventId) {
+            guard ($0.phase == .generating || $0.phase == .outcomeUnknown), $0.prepared == nil else {
+                throw SlackInboundJournalError.malformed
+            }
+            $0.phase = .interrupted
+            $0.updatedAt = Date()
+            $0.outcomeDetail = detail
+        }
+    }
+
+    /// Explicit retry pins the interrupted input and conversation to the command's own admission.
+    func retryInterruptedGeneration(for inbound: SlackInboundMessage) throws -> SlackInboundDeliveryRecord? {
+        try CredentialFileLock.withLock(path) {
+            var file = try load()
+            guard let command = file.records.firstIndex(where: { $0.inbound.eventId == inbound.eventId && $0.phase == .claimed }),
+                  let index = file.records.indices.filter({ index in
+                      let record = file.records[index]
+                      return record.phase == .interrupted && record.prepared == nil
+                          && record.inbound.teamId == inbound.teamId && record.inbound.channelId == inbound.channelId
+                          && record.inbound.userId == inbound.userId
+                          && (record.inbound.threadTs == inbound.threadTs
+                              || inbound.threadTs != nil && record.inbound.replyThreadTs == inbound.threadTs)
+                  }).max(by: { file.records[$0].updatedAt < file.records[$1].updatedAt }) else { return nil }
+            let interrupted = file.records[index]
+            guard let session = interrupted.assistantSessionId else { throw SlackInboundJournalError.malformed }
+            file.records[command].resolvedRetryInbound = interrupted.resolvedRetryInbound ?? interrupted.inbound
+            file.records[command].assistantSessionId = session
+            file.records[command].updatedAt = Date()
+            let record = file.records[command]
+            try save(file)
+            return record
         }
     }
 
@@ -402,6 +458,19 @@ public actor SlackInboundDeliveryJournal {
         }.max { $0.updatedAt < $1.updatedAt }
     }
 
+    /// Explicit resend consent resumes the same answer; confirmed parts and its run identity remain authoritative.
+    func resumeUnconfirmedReply(eventId: String) throws {
+        _ = try mutate(eventId: eventId) {
+            guard $0.phase == .sentUnconfirmed, $0.prepared != nil else { throw SlackInboundJournalError.malformed }
+            $0.phase = .prepared
+            $0.dispatchStartedAt = nil
+            $0.outcomeDetail = nil
+            $0.updatedAt = Date()
+            // Consent permits another first-part creation only when no confirmed part or known preview can serve it.
+            $0.previewCreationUnknown = nil
+        }
+    }
+
     func retryRejectedReply(for inbound: SlackInboundMessage) throws -> SlackInboundDeliveryRecord? {
         try CredentialFileLock.withLock(path) {
             var file = try load()
@@ -436,6 +505,7 @@ public actor SlackInboundDeliveryJournal {
             $0.assistantRunId = runId; $0.assistantSessionId = sessionId
             $0.prepared = response; $0.phase = .prepared; $0.failedBeforeAnswer = false; $0.dispatchStartedAt = nil; $0.updatedAt = Date()
             $0.confirmedText = nil; $0.confirmedUploadCount = nil
+            $0.confirmedTextPartCount = nil; $0.completedWithoutPostTurnID = nil
             $0.previewMessageTs = nil; $0.previewCreationUnknown = nil
         }
     }
@@ -477,11 +547,14 @@ public actor SlackInboundDeliveryJournal {
                   Set(file.records.map { $0.inbound.eventId }).count == file.records.count,
                   file.records.allSatisfy({
                       !$0.inbound.eventId.isEmpty && $0.hasValidUploadProgress
+                        && ($0.phase == .completedWithoutPost ? $0.completedWithoutPostTurnID?.isEmpty == false : true)
                         && ($0.phase == .claimed || $0.phase == .generating || $0.phase == .interrupted
+                            || $0.phase == .delivered || $0.phase == .completedWithoutPost
                             || $0.phase == .outcomeUnknown || $0.phase == .failedBeforeAnswer || $0.phase == .stopped || $0.prepared != nil)
                   }) else { throw SlackInboundJournalError.malformed }
             let life = try DataRootLife.current(in: path.deletingLastPathComponent().deletingLastPathComponent())
-            for i in file.records.indices where file.records[i].phase != .delivered && DataRootLife.life(of: file.records[i].lifeID) != life {
+            for i in file.records.indices where file.records[i].phase != .delivered && file.records[i].phase != .completedWithoutPost
+                && DataRootLife.life(of: file.records[i].lifeID) != life {
                 file.records[i].phase = .stopped
                 file.records[i].outcomeDetail = DataRootLife.stoppedReason
             }
@@ -498,15 +571,16 @@ public actor SlackInboundDeliveryJournal {
         let terminal = file.records
             .filter { $0.phase.isTerminal }
             .sorted { $0.updatedAt > $1.updatedAt }
-        let unresolved = file.records.filter { !$0.phase.isTerminal }
-        let referenced = try? CodexCompletionReadout.unsettledAnswerRuns(
-            configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
-        let protected = terminal.filter { record in
-            guard let referenced else { return true }
-            return !Set(record.settledAssistantRuns?.keys.map { $0 } ?? [])
-                .union([record.assistantRunId, record.assistantOriginRunId].compactMap { $0 }).isDisjoint(with: referenced)
+        if terminal.count > terminalCap {
+            let referenced = try CodexCompletionReadout.unsettledAnswerRuns(
+                configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
+            let protected = terminal.filter { record in
+                !Set(record.settledAssistantRuns?.keys.map { $0 } ?? [])
+                    .union([record.assistantRunId, record.assistantOriginRunId].compactMap { $0 }).isDisjoint(with: referenced)
+            }
+            let unresolved = file.records.filter { !$0.phase.isTerminal }
+            file.records = unresolved + protected + terminal.filter { !protected.contains($0) }.prefix(terminalCap)
         }
-        file.records = unresolved + protected + terminal.filter { !protected.contains($0) }.prefix(terminalCap)
         file.pendingLimit = pendingCap
         let directory = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

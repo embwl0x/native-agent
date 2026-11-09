@@ -3,7 +3,9 @@ import MemoryV2
 import Context
 import CryptoKit
 import NativeAgentCore
+import NativeAgentShared
 import os
+import Synchronization
 import PersistenceCore
 import Transcripts
 import ProviderRouting
@@ -25,6 +27,9 @@ public enum SessionHistoryPromptRenderer {
         let originLabel: String?
         let incompleteReplyLabel: String?
         let timestamp: String
+        /// The row's absolute local time, which each replayed exchange and each earlier lead opens with.
+        let stamp: String?
+        let messageID: String
         package let isTool: Bool
         package var runId: String? = nil
         /// Wire context belongs only to structured replay and its budget; other prose reads content.
@@ -47,34 +52,33 @@ public enum SessionHistoryPromptRenderer {
         }
     }
 
-    /// Use the caller's checked model budget, shared with structured replay.
+    /// Use the caller's checked model budget, shared with structured replay. Rows the call does not hold are reached as leads.
     package static func renderDetailed(
         renderables: [Renderable],
-        middleCandidates: [Renderable],
         deliveredHistoryIdentities: Set<String>,
         userMessage: String,
         historyLimit: Int,
         budget: ContextBudgetPolicy.Resolved
-    ) -> String? {
+    ) -> (text: String?, leads: Int) {
         let cappedLimit = max(0, historyLimit)
-        guard cappedLimit > 0 else { return nil }
+        guard cappedLimit > 0 else { return (nil, 0) }
 
-        guard !renderables.isEmpty else { return nil }
+        guard !renderables.isEmpty else { return (nil, 0) }
 
         var sections: [String] = [
             "Earlier messages are history, not live readings; recheck anything current before relying on it."
         ]
-        let middleSnippet = relevantEarlierSessionSnippets(
+        let leads = relevantEarlierSessionSnippets(
             userMessage: userMessage,
             promptRenderables: renderables,
-            candidates: middleCandidates,
+            candidates: renderables,
             deliveredHistoryIdentities: deliveredHistoryIdentities,
             budget: budget
         )
-        if let middle = middleSnippet {
-            sections.append(middle)
+        if let leads {
+            sections.append(leads.text)
         }
-        return sections.joined(separator: "\n\n")
+        return (sections.joined(separator: "\n\n"), leads?.count ?? 0)
     }
 
     package static func recallQuery(
@@ -136,7 +140,7 @@ public enum SessionHistoryPromptRenderer {
         var content: String
         var structured = ""
         if isTool {
-            content = ChatTranscriptEvidenceRendering.historicalReceipt(content: message.content, metadata: metadata).text
+            content = ChatTranscriptEvidenceRendering.replayedReceipt(content: message.content, metadata: metadata)
             if let id = extrasObject?["id"]?.stringValue, !id.isEmpty {
                 content += " [context.expand history:\(id)]"
             }
@@ -153,7 +157,9 @@ public enum SessionHistoryPromptRenderer {
                 structured, attachments: metadata?["attachments"])
         }
         guard !content.isEmpty else { return nil }
-        guard let historyIdentity = message.historyIdentity() else { return nil }
+        guard let historyIdentity = message.historyIdentity(),
+              let messageID = extrasObject?["id"]?.stringValue else { return nil }
+        let at = NativeTimestampFormat.parseISO8601FractionalFirst(message.timestamp)
         return Renderable(
             role: role,
             content: content,
@@ -163,6 +169,8 @@ public enum SessionHistoryPromptRenderer {
             incompleteReplyLabel: role == "assistant"
                 ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: extrasObject, metadata: metadata) : nil,
             timestamp: message.timestamp,
+            stamp: at.map { Self.stamp($0) },
+            messageID: messageID,
             isTool: isTool,
             runId: extrasObject?["runId"]?.stringValue ?? metadata?["runId"]?.stringValue,
             sentContext: role == "user" ? SentTurnContext(metadata: metadata) : nil,
@@ -170,13 +178,29 @@ public enum SessionHistoryPromptRenderer {
         )
     }
 
+    private static let stampFormat = Mutex<DateFormatter>({
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.calendar = Calendar(identifier: .gregorian)
+        format.timeZone = .autoupdatingCurrent
+        format.dateFormat = "'['EEEE, MMMM d, yyyy 'at' h:mm a zzz']'"
+        return format
+    }())
+
+    /// Absolute local time spelled like the clock line, so a past exchange reads as when it happened.
+    static func stamp(_ date: Date) -> String {
+        stampFormat.withLock { $0.string(from: date) }
+    }
+
+    /// Words this moment touches in rows the call does not hold come back as leads: time, role, at most a packet atom's
+    /// length, and the pointer that opens the whole row.
     private static func relevantEarlierSessionSnippets(
         userMessage: String,
         promptRenderables: [Renderable],
         candidates: [Renderable],
         deliveredHistoryIdentities: Set<String>,
         budget: Budget
-    ) -> String? {
+    ) -> (text: String, count: Int)? {
         guard budget.relevantChars > 0, !candidates.isEmpty else { return nil }
         let query = middleSearchQuery(userMessage: userMessage, renderables: promptRenderables)
         let queryTerms = Set(searchTokens(query))
@@ -196,7 +220,7 @@ public enum SessionHistoryPromptRenderer {
         guard !docs.isEmpty else { return nil }
 
         let scores = MemoryRecallScoring.bm25Scores(
-            queryTerms: Array(queryTerms),
+            queryTerms: queryTerms.sorted(),
             documents: docs.map { ($0.frequencies, $0.tokens.count) }
         )
         let ranked = zip(docs, scores).compactMap { doc, rawScore -> (index: Int, message: Renderable, score: Double)? in
@@ -217,19 +241,23 @@ public enum SessionHistoryPromptRenderer {
         .sorted { $0.index < $1.index }
 
         guard !ranked.isEmpty else { return nil }
-        var lines = ["Relevant earlier session snippets:"]
+        var lines = ["Earlier in this conversation, beyond what you hold verbatim (open one with its pointer):"]
         var used = lines[0].count
         var added = 0
         for hit in ranked {
-            let capValue = budget.relevantItemCap
-            let line = "[\(hit.message.role)] \(cap(hit.message.displayContent, capValue))"
+            let row = hit.message
+            let pointer = "[context.expand history:\(row.messageID)]"
+            let words = row.isTool && row.content.hasSuffix(" " + pointer)
+                ? String(row.content.dropLast(pointer.count + 1)) : row.displayContent
+            let line = (row.stamp.map { $0 + " " } ?? "") + "[\(row.role)] "
+                + cap(words, ContextBudgetPolicy.packetAtomExpandThresholdChars) + " " + pointer
             let projected = used + line.count + 1
             if added > 0 && projected > budget.relevantChars { break }
             lines.append(line)
             used = projected
             added += 1
         }
-        return added > 0 ? lines.joined(separator: "\n") : nil
+        return added > 0 ? (lines.joined(separator: "\n"), added) : nil
     }
 
     private static func middleSearchQuery(
@@ -278,39 +306,9 @@ public enum SessionHistoryPromptRenderer {
             + lines.joined(separator: "\n")
     }
 
-    static let toolResultHeadChars = 110
-    /// Retain the result tail because errors and exit status often appear at the end.
-    static let toolResultTailChars = 50
-    /// Bound normalization and redaction per end so a short preview cannot scan an entire large receipt.
-    private static let toolResultRedactionWindow = 512
-
-    /// Preserve both result ends and report elided character count so a clipped preview cannot imply completeness.
-    package static func toolEvidenceProjection(_ raw: String) -> String {
-        let keep = toolResultHeadChars + toolResultTailChars
-        if raw.count <= toolResultRedactionWindow {
-            let normalized = normalize(raw)
-            guard normalized.count > keep else { return normalized }
-            return String(normalized.prefix(toolResultHeadChars))
-                + toolResultElisionMarker(normalized.count - keep)
-                + String(normalized.suffix(toolResultTailChars))
-        }
-        // Too large to normalize whole: redact a bounded window at each end.
-        let head = normalize(String(raw.prefix(toolResultRedactionWindow)))
-        let tail = normalize(String(raw.suffix(toolResultRedactionWindow)))
-        guard head.count > keep || !tail.isEmpty else { return head }
-        let kept = min(head.count, toolResultHeadChars) + min(tail.count, toolResultTailChars)
-        return String(head.prefix(toolResultHeadChars))
-            + toolResultElisionMarker(max(0, raw.count - kept))
-            + String(tail.suffix(toolResultTailChars))
-    }
-
-    private static func toolResultElisionMarker(_ elided: Int) -> String {
-        " [… \(elided) chars elided …] "
-    }
-
+    /// Scoring terms never leave the search, so tokenizing reads the words only; what a lead shows is the row as it renders.
     private static func searchTokens(_ text: String) -> [String] {
-        let normalized = normalize(text).lowercased()
-        return normalized
+        String(text.prefix(normalizationInputCharacterCap)).lowercased()
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .map(String.init)
             .filter { token in

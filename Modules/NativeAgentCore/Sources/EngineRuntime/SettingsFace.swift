@@ -4,57 +4,161 @@ import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
+import TriggerScheduler
 import TrustCenter
-// Blueprint: | `SettingsFace.swift` | Settings face reads the registry; person controls use its owner setters, agent controls retain setting.set admission |
+// Blueprint: | `SettingsFace.swift` | Settings rows: registry, notification policy and triggers, search service; every control and action is its setting.set or verb call |
 
 public enum SettingsFaceChange {
     public static let platform = Notification.Name("NativeAgent.settingsFace.platformChanged")
     static let cognition = Notification.Name("NativeAgent.settingsFace.cognitionChanged")
 }
 
-/// Platform-only references and actions stay beside their owners; every door receives the same rows.
+/// Platform-only rows stay beside their owners; every door receives the same rows, each action its own call.
 @MainActor
 public protocol SettingsFaceHost: QuietSettingsHost {
-    func settingsFaceExtras() async throws -> [PartFace.Section]
-    func settingsFaceAction(row: String, action: String) async throws -> String?
+    func settingsFaceExtrasSnapshot() -> any SettingsFaceExtrasSnapshot
+}
+
+/// Platform owners copy plain in-memory values on main; the snapshot shapes its rows off main.
+public protocol SettingsFaceExtrasSnapshot: Sendable {
+    func sections() -> [PartFace.Section]
+}
+
+/// A setting's control or action calls `setting.set` on that setting, the same call the agent makes; the change arrives as `value`.
+func settingSetCall(_ id: String, _ value: PartFace.Value? = nil) -> PartFace.Call {
+    PartFace.Call("setting.set", value.map { ["setting": .string(id), "value": $0] } ?? ["setting": .string(id)])
 }
 
 extension NativeAgentEngine {
+    private struct SettingsSnapshot: Sendable {
+        let settings: [QuietSetting.ReadSnapshot]
+        let search: QuietSetting.Descriptor?
+        let extras: any SettingsFaceExtrasSnapshot
+    }
+
     @MainActor
-    private func settingsFaceHost() throws -> any SettingsFaceHost {
+    private func settingsFaceSnapshot() async throws -> SettingsSnapshot {
         guard hasBody,
               let host = ports.appTools(SwiftNativeSecurityCenter(dataRoot: dataRoot), false).quietHost() as? any SettingsFaceHost,
               host.dataRootOverride == dataRoot else {
             throw PartCallError(code: "settings_unavailable", message: "Settings are not mounted for this agent. Open the Mac app and read Settings again.")
         }
-        return host
+        var settings: [QuietSetting.ReadSnapshot] = []
+        for setting in try QuietSettings.settings(forPage: "settings", host: host) {
+            try Task.checkCancellation()
+            settings.append(try await setting.snapshot(host: host))
+        }
+        let search = try QuietSettings.settings(forPage: "desk", host: host).first { $0.id == Self.searchService }?.descriptor
+        return SettingsSnapshot(settings: settings, search: search, extras: host.settingsFaceExtrasSnapshot())
     }
 
-    @MainActor
+    @concurrent
     func settingsFace() async throws -> (PartFace, UInt64) {
         let epoch = UInt64(Date().timeIntervalSince1970 * 1000)
-        let host = try settingsFaceHost()
-        let settings = try QuietSettings.settings(forPage: "settings", host: host)
+        let snapshot = try await settingsFaceSnapshot()
+        async let notificationRead = settingsFaceNotifications()
+        async let searchRead = settingsFaceSearchService(setting: snapshot.search)
+        async let statusRead = settingsFaceStatus()
         var rows: [PartFace.Row] = []
-        for setting in settings {
+        for setting in snapshot.settings {
             try Task.checkCancellation()
-            rows.append(try await settingsFaceRow(setting, host: host))
+            rows.append(try await settingsFaceRow(setting))
         }
-        let status = try await settingsFaceStatus()
-        let extras = try await host.settingsFaceExtras()
+        let (notifications, search, status) = try await (notificationRead, searchRead, statusRead)
+        let extras = snapshot.extras.sections()
         return (PartFace(title: "Settings", line: "These make up who I am. Everything else I carry is below.", sections: [
             .init(id: "preferences", title: "Preferences", style: .list,
-                  footer: settings.isEmpty ? "The settings registry returned no controls." : nil, rows: rows),
+                  footer: snapshot.settings.isEmpty ? "The settings registry returned no controls." : nil, rows: rows),
+            notifications, search,
         ] + status + extras), epoch)
     }
 
-    @MainActor
-    private func settingsFaceRow(_ setting: QuietSetting, host: any SettingsFaceHost) async throws -> PartFace.Row {
-        let editable = setting.write != nil && !setting.ownerOnly && !setting.fullMacOnly && !setting.readsAnotherDevice
-        var offered: [String]?
+    private static let notificationsMaster = "notifications.raise_unasked"
+    private static let searchService = "research.search_url"
+
+    /// Raising things unasked and its triggers read from the Trust and inbox owners; while the master is off its triggers are not offered.
+    private func settingsFaceNotifications() async throws -> PartFace.Section {
+        let history = PartFace.Row(id: "notifications.history", title: "Notification history",
+                                   detail: "Every note raised, archived and dismissed ones included, under Earlier on Inbox.", open: "page:inbox")
+        let master: Bool
+        do { master = try await trust.inboxEnabled() }
+        catch is CancellationError { throw CancellationError() }
+        catch {
+            return .init(id: "notifications", title: "Notifications", style: .list,
+                         footer: "Notification options are unavailable until this setting can be read.", rows: [
+                .init(id: Self.notificationsMaster, title: "Raise things unasked",
+                      detail: UserFacingError.message(error, action: "read the notification setting"), value: "Unavailable", tone: .failed),
+                history,
+            ])
+        }
+        var rows: [PartFace.Row] = [.init(id: Self.notificationsMaster, title: "Raise things unasked",
+            detail: "When on, observations, file changes, finished Desk tasks and check-ins arrive without being asked.",
+            control: .toggle(master, call: settingSetCall(Self.notificationsMaster)))]
+        var footer: String? = "Nothing is raised unasked while this is off."
+        if master {
+            do {
+                let triggers = try await inbox.triggers()
+                rows += triggers.map {
+                    PartFace.Row(id: QuietSettings.inboxTriggerPrefix + $0.name, title: Self.triggerTitle($0.name), detail: $0.description,
+                          control: .toggle($0.enabled, call: settingSetCall(QuietSettings.inboxTriggerPrefix + $0.name)))
+                }
+                footer = triggers.isEmpty ? "No notification options are configured yet."
+                    : "\(triggers.filter(\.enabled).count) of \(triggers.count) kinds are on."
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                rows.append(.init(id: "notifications.triggers", title: "Notification options unavailable",
+                                  detail: UserFacingError.message(error, action: "load triggers"), tone: .failed))
+                footer = nil
+            }
+        }
+        return .init(id: "notifications", title: "Notifications", style: .list, footer: footer, rows: rows + [history])
+    }
+
+    /// A trigger's name as the person reads it.
+    private static func triggerTitle(_ name: String) -> String {
+        switch name {
+        case "idle_checkin": return "Idle check-in"
+        case "morning_brief": return "Morning brief"
+        default:
+            let words = name.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces)
+            guard let first = words.first else { return name }
+            return String(first).uppercased() + words.dropFirst()
+        }
+    }
+
+    /// The search service is read from its saved configuration; a field sends the address, and Find sends auto, through the registry's write.
+    private func settingsFaceSearchService(setting: QuietSetting.Descriptor?) async throws -> PartFace.Section {
+        let placeholder = "http://localhost:8888, or auto"
+        let row: PartFace.Row
+        if let setting {
+            // Find is the search service's own discovery: the same write as typing auto.
+            let find = [PartFace.Action(id: "find", label: "Find", call: settingSetCall(setting.id, .string("auto")))]
+            do {
+                let url = try await configuration.readSearXNG(dataRoot: dataRoot)
+                row = .init(id: setting.id, title: setting.label, detail: setting.note,
+                            value: url.isEmpty ? "No search service configured." : nil, actions: find,
+                            control: .field(url, placeholder: placeholder, call: settingSetCall(setting.id)))
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                row = .init(id: setting.id, title: setting.label,
+                            detail: UserFacingError.message(error, action: "load the search service"), value: "Unavailable", tone: .failed,
+                            actions: find, control: .field("", placeholder: placeholder, call: settingSetCall(setting.id)))
+            }
+        } else {
+            row = .init(id: Self.searchService, title: "Search service", detail: "The settings registry has no search service setting.",
+                        value: "Unavailable", tone: .failed)
+        }
+        return .init(id: "research", title: "Looking things up", style: .list, rows: [row])
+    }
+
+    private func settingsFaceRow(_ snapshot: QuietSetting.ReadSnapshot) async throws -> PartFace.Row {
+        let setting = snapshot.setting
+        // The face is the person's: every writable setting draws its control, whose call setting.set's one law decides for whoever makes it.
+        let editable = setting.editable
+        let call = settingSetCall(setting.id)
+        let offered = snapshot.choices
         do {
-            if setting.kind == .choice { offered = try await setting.liveChoices?({ host }) ?? setting.choices }
-            let value = try await setting.read(host)
+            let value = try await snapshot.value(dataRoot: dataRoot)
             let control: PartFace.Control?
             if !editable {
                 control = nil
@@ -63,8 +167,8 @@ extension NativeAgentEngine {
                 // Meaning-based memory re-indexes every saved memory when it changes, so it asks first, as the Mac's control always has.
                 case (.boolean, .bool(let on)) where setting.id == "memories.meaning_based":
                     control = .toggle(on, confirm: on ? "Turn off meaning-based memory? Saved memories are re-indexed."
-                        : "Turn on meaning-based memory? Saved memories are re-indexed.")
-                case (.boolean, .bool(let on)): control = .toggle(on)
+                        : "Turn on meaning-based memory? Saved memories are re-indexed.", call: call)
+                case (.boolean, .bool(let on)): control = .toggle(on, call: call)
                 case (.choice, .string(let selected)):
                     guard let offered else {
                         throw QuietSettingError.unavailable("\(setting.label) supplied no choices.")
@@ -72,7 +176,7 @@ extension NativeAgentEngine {
                     guard offered.contains(selected) else {
                         throw QuietSettingError.unavailable("The saved choice \(selected) is not offered by \(setting.label).")
                     }
-                    control = .choice(offered.map { .init(id: $0, label: $0) }, selected: selected)
+                    control = .choice(offered.map { .init(id: $0, label: $0) }, selected: selected, call: call)
                 case (.boolean, _), (.choice, _):
                     throw QuietSettingError.unavailable("\(setting.label) returned a value that does not match its declared type.")
                 default: control = nil
@@ -89,70 +193,9 @@ extension NativeAgentEngine {
                          detail: [setting.note, error.localizedDescription].filter { !$0.isEmpty }.joined(separator: " "),
                          value: "Unavailable", tone: .failed,
                          control: editable ? offered.flatMap { choices in
-                             choices.isEmpty ? nil : .choice(choices.map { .init(id: $0, label: $0) }, selected: nil)
+                             choices.isEmpty ? nil : .choice(choices.map { .init(id: $0, label: $0) }, selected: nil, call: call)
                          } : nil)
         }
-    }
-
-    @MainActor
-    func settingsAct(row: String, action: String, value: String?, by actor: PartFaces.Actor) async throws -> String? {
-        do { return try await applySettingsAct(row: row, action: action, value: value, by: actor) }
-        catch {
-            // A failed registration or readback can follow a committed preference; show what its owner now knows.
-            await settle { _ = await self.pages.refresh(page: "settings") }
-            if error is CancellationError { throw error }
-            if let owned = error as? PartCallError { throw owned }
-            throw PartCallError(code: "setting_failed", message: error.localizedDescription)
-        }
-    }
-
-    @MainActor
-    private func applySettingsAct(row: String, action: String, value: String?, by actor: PartFaces.Actor) async throws -> String? {
-        let host = try settingsFaceHost()
-        // The recovery button is the same setting write, with the same actor, as its switch.
-        if row == "inner-life-status", action == "enable-inner-life" {
-            return try await applySettingsAct(row: "settings.inner_life", action: "set", value: "on", by: actor)
-        }
-        guard action == "set" else {
-            guard case .person = actor else {
-                throw PartCallError(code: "person_only", message: "This action opens a Mac control for the person. Use the app's own actions instead.")
-            }
-            return try await host.settingsFaceAction(row: row, action: action)
-        }
-        guard let setting = try QuietSettings.settings(forPage: "settings", host: host).first(where: { $0.id == row }),
-              !setting.ownerOnly, !setting.fullMacOnly, !setting.readsAnotherDevice, let write = setting.write else {
-            throw PartCallError(code: "setting_not_writable", message: "This row has no editable Settings control. Read Settings again.")
-        }
-        guard let value else { throw PartCallError(code: "missing_value", message: "Pass the control's new value.") }
-        let wanted: JSONValue
-        switch setting.kind {
-        case .boolean:
-            guard value == "on" || value == "off" else {
-                throw PartCallError(code: "bad_value", message: "A Settings switch takes on or off.")
-            }
-            wanted = .bool(value == "on")
-        case .choice: wanted = .string(value)
-        case .text, .number, .list:
-            throw PartCallError(code: "no_field", message: "This face shows the value; use its existing editor or setting.set to change it.")
-        }
-        if case .agent(let turn) = actor {
-            // Keep the agent's actual turn and setting.set's complete admission, lower-only checks and receipts.
-            let result = try await ports.appTools(SwiftNativeSecurityCenter(dataRoot: dataRoot), true).execute(
-                tool: "app", input: ["action": .string("setting.set"),
-                                     "args": .object(["setting": .string(setting.id), "value": wanted])],
-                surface: "app", turn: turn)
-            guard result.objectValue?["status"] == .string("ok") else {
-                throw PartCallError(code: "setting_refused", message: try result.serialize(pretty: false))
-            }
-            return try result.serialize(pretty: false)
-        }
-        // Only the person's Mac or authenticated phone gesture carries owner authority.
-        let turn = Turn().with(\.settingByOwner, true)
-        let detail = QuietWriteDetail()
-        try await write(host, wanted, QuietSettingWrite(turn: turn, detail: detail))
-        let saved = try await setting.read(host)
-        let evidence = try detail.take().sorted { $0.key < $1.key }.map { try "\($0.key): " + settingsFaceText($0.value) }
-        return ([setting.label + ": " + (try settingsFaceText(saved))] + evidence).joined(separator: "\n")
     }
 
     private func settingsFaceText(_ value: JSONValue) throws -> String {

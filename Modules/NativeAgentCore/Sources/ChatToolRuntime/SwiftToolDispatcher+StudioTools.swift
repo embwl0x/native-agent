@@ -30,7 +30,7 @@ extension SwiftToolDispatcher {
                 }
                 if preview {
                     try await shelf.validateReplacement(StudioWorkingShelf.decodeSlots(slots))
-                    return .object(["status": .string("would")])
+                    return .object(["status": .string("would"), "effects": .string("none")])
                 }
                 try await shelf.replace(slots)
                 // Refresh only the existing titles-only Studio pointer.
@@ -39,7 +39,7 @@ extension SwiftToolDispatcher {
                     canonicalLocator: studioStore().journalPath.standardizedFileURL.path,
                     reason: "studio_working_shelf_replaced"
                 ))
-                return .object(["status": .string("ok")])
+                return .object(["status": .string("ok"), "effects": .string("occurred")])
             }
             guard input.isEmpty else { throw StudioWorkingShelf.Refusal(message: "studio_shelf_read accepts no arguments.") }
             let result = try await shelf.read { ref in
@@ -155,6 +155,7 @@ extension SwiftToolDispatcher {
             )
             return .object([
                 "status": .string("ok"),
+                "effects": .string("occurred"),
                 "consult_id": .string(consult.id),
                 "description_only": .bool(consult.descriptionOnly),
                 "artifact_ref_count": .int(Int64(consult.artifactRefs.count)),
@@ -292,6 +293,7 @@ extension SwiftToolDispatcher {
             let graph = await studioJournalDidAppend(entry)
             var result: JSONValue = .object([
                 "status": .string("ok"),
+                "effects": .string("occurred"),
                 "entry_id": .string(entry.id),
                 "recorded_at": .string(entry.recordedAt),
                 "entry": entry.toJSON(),
@@ -356,6 +358,7 @@ extension SwiftToolDispatcher {
             ))
             return .object([
                 "status": .string("ok"),
+                "effects": .string("occurred"),
                 "amendment_id": .string(amendment.id),
                 "entry_id": .string(entry.id),
                 "amended_at": .string(amendment.amendedAt),

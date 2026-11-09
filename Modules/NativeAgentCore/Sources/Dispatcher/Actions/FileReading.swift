@@ -12,7 +12,7 @@ import Darwin
 // Blueprint: | `FileReading.swift` | Descriptor-bound UTF-8 windows and exact bytes; only ENOENT proves absence; metadata-only watches |
 extension FileSystemActions {
     /// Only ENOENT proves absence; permission and I/O errors cannot become missing-file verdicts.
-    private static func readPathIsDirectory(_ path: URL) throws -> Bool? {
+    static func readPathIsDirectory(_ path: URL) throws -> Bool? {
         var info = stat()
         guard lstat(path.path, &info) == 0 else {
             let code = errno
@@ -22,9 +22,10 @@ extension FileSystemActions {
         return info.st_mode & S_IFMT == S_IFDIR
     }
 
-    struct FileReadFailure: Error {
+    struct FileReadFailure: Error, LocalizedError {
         let message: String
         let code: String
+        var errorDescription: String? { message }
     }
     static func openRegularReadHandle(_ path: URL) throws -> FileHandle {
         #if canImport(Darwin)
@@ -199,7 +200,7 @@ extension FileSystemActions {
                 return errResult("File not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing")
             }
             isDirectory = kind
-        } catch let failure as FileReadFailure { return errResult(failure.message, code: failure.code) }
+        } catch let failure as FileReadFailure { return errResult(failure.message, code: failure.code, path: resolved) }
         catch { return errResult(error.localizedDescription, code: "read_failed") }
         if isDirectory {
             if ctx.readOptions.metadataOnly {
@@ -215,7 +216,7 @@ extension FileSystemActions {
         // Nonblocking open and fstat prevent an image-named FIFO from blocking the pixel loader.
         let handle: FileHandle
         do { handle = try openRegularReadHandle(resolved) }
-        catch let error as FileReadFailure { return errResult(error.message, code: error.code) }
+        catch let error as FileReadFailure { return errResult(error.message, code: error.code, path: resolved) }
         catch { return errResult("could not open file", code: "read_failed") }
         defer { try? handle.close() }
         // Decode the verified descriptor's bytes; reopening after validation could render a swapped-in file. Explicit raw reads retain exact bytes regardless
@@ -260,7 +261,7 @@ extension FileSystemActions {
                 offset: offset, expectedVersion: expectedVersion, preserveInvalidUTF8: explicitlyRaw, metadataOnly: ctx.readOptions.metadataOnly
             )
         } catch let error as FileReadFailure {
-            return errResult(error.message, code: error.code)
+            return errResult(error.message, code: error.code, path: resolved)
         } catch {
             return errResult("could not read file: \(error.localizedDescription)", code: "read_failed")
         }
@@ -322,6 +323,8 @@ extension FileSystemActions {
         let entries: [String]
         do {
             entries = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        } catch CocoaError.fileReadNoSuchFile {
+            return errResult("Directory not found: \(folder.path)", code: "file_not_found", path: folder)
         } catch {
             return errResult("Could not list folder: \(error.localizedDescription)", code: "read_failed")
         }
@@ -398,7 +401,7 @@ extension FileSystemActions {
                 return errResult("File not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing")
             }
             if isDirectory { return errResult("Not a file: \(resolved.path)", code: "wrong_path_kind", path: resolved, pathKind: "directory") }
-        } catch let failure as FileReadFailure { return errResult(failure.message, code: failure.code) }
+        } catch let failure as FileReadFailure { return errResult(failure.message, code: failure.code, path: resolved) }
         catch { return errResult(error.localizedDescription, code: "read_failed") }
         let window: (total: Int, lines: [(number: Int, text: String)], bytes: Int, version: String, matches: Int, next: Int?)
         do {
@@ -418,7 +421,7 @@ extension FileSystemActions {
                     search, repeat that search because line positions may have moved.
                     """, code: "file_changed")
             }
-            return errResult(failure.message, code: failure.code)
+            return errResult(failure.message, code: failure.code, path: resolved)
         } catch {
             return errResult("could not read file", code: "read_failed")
         }

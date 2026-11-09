@@ -5,19 +5,18 @@ import MacControl
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `MacPhoneRequestChannel.swift` | `MacPhoneRequestChannel`; Authenticated bounded wait; sends own exclusion. |
+// Blueprint: | `MacPhoneRequestChannel.swift` | Authenticated phone-request results; sends retain exclusion until completion. |
 
-/// One bounded waiter per request; authenticated bridge delivery settles it.
+/// Authenticated results settle requests; shutdown releases observation with the outcome unknown.
 @MainActor
 public final class MacPhoneRequestChannel {
     private weak var bridge: iCloudBridge?
     private final class Pending {
         let done = ScopedWaiter()
-        var deadline: Task<Void, Never>?
         var result: Result<BridgeMessage, Error>?
     }
     private var pending: [String: Pending] = [:]
-    /// Timeout ends waiting, not send exclusion; cancellation cannot prove CloudKit did not deliver.
+    /// A cancelled observation cannot prove CloudKit did not deliver.
     private var sendTask: Task<Void, Never>?
     private var sendFinished: ScopedWaiter?
     var hasPendingRequest: Bool { !pending.isEmpty }
@@ -30,46 +29,19 @@ public final class MacPhoneRequestChannel {
             throw DeviceSyncError.underlying(message: "Another phone request is waiting. Let it finish first.")
         }
         if let finished = sendFinished {
-            let ceiling = ContinuousClock.now.advanced(by: .seconds(min(3, max(0, request.expiresAt.timeIntervalSinceNow))))
-            await finished.park(budget: .init(deadline: deadline.map { min($0, ceiling) } ?? ceiling))
+            await finished.park(budget: .init(deadline: deadline))
         }
         try Task.checkCancellation()
-        guard pending.isEmpty, sendTask == nil, request.expiresAt > Date() else {
+        guard pending.isEmpty, sendTask == nil else {
             throw DeviceSyncError.underlying(
                 message: """
-                    The preceding phone request is still settling, or this request expired while waiting. Its send was not cancelled. Read the setting \
+                    The preceding phone request is still settling. Its send was not cancelled. Read the setting \
                     before another change.
                     """)
         }
-        let seconds = Int(request.expiresAt.timeIntervalSinceNow.rounded())
         try Task.checkCancellation()
         let text = String(decoding: try JSONEncoder().encode(request), as: UTF8.self)
         let response = Pending()
-        let expiryTask = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(max(0, request.expiresAt.timeIntervalSinceNow))) }
-            catch { return }
-            // The Mac knows only when it last heard from the phone, not whether it is listening.
-            let heard: String
-            do {
-                let contact = try SignedPeerEvidenceStore.load(dataRoot: PersistenceCore.defaultDataRoot())?.contactAt
-                heard = contact.map { """
-                    it was last heard from at \(ISO8601DateFormatter().string(from: $0)), \(Int(-$0.timeIntervalSinceNow / 60)) minutes ago
-                    """ }
-                    ?? "it has not been heard from on this Mac"
-            } catch {
-                heard = """
-                    its saved contact evidence is unavailable: \(error.localizedDescription). Repair mobile/signed_peer_evidence.json, preserving its \
-                    contents
-                    """
-            }
-            self?.finish(request.id, result: .failure(DeviceSyncError.underlying(
-                message: "The phone has not answered in \(seconds) s; \(heard). "
-                    + (request.kind.isSettings
-                        ? "The setting's outcome is unconfirmed. Open NativeAgent on the phone and read the setting before another change."
-                        : "If NativeAgent is open on the phone, ask again; or give a place.")
-            )))
-        }
-        response.deadline = expiryTask
         pending[request.id] = response
         let finished = ScopedWaiter()
         sendFinished = finished
@@ -86,7 +58,7 @@ public final class MacPhoneRequestChannel {
                         tap: tap, personDecides: true, code: "operator_permission_off", status: .refused,
                         instruction: "Only the owner can enable this switch.")
                 }
-                guard self?.pending[request.id] != nil, request.expiresAt > Date() else { return }
+                guard self?.pending[request.id] != nil else { return }
                 _ = try await bridge.sendChatMessage(text: text,
                     metadata: ["kind": PhoneRequest.messageKind], messageID: request.id)
             } catch { self?.finish(request.id, result: .failure(error)) }
@@ -95,12 +67,17 @@ public final class MacPhoneRequestChannel {
         if pending[request.id] === response {
             finish(request.id, result: .failure(CancellationError()))
         }
-        return try response.result!.get()
+        guard let result = response.result else {
+            throw DeviceSyncError.underlying(message: "Phone request waiting ended without a result; its outcome is unconfirmed.")
+        }
+        return try result.get()
     }
 
-    func receive(_ message: BridgeMessage) {
-        guard let result = try? JSONDecoder().decode(PhoneRequestResult.self, from: Data(message.text.utf8)),
-              result.requestID == message.correlationID else { return }
+    func receive(_ message: BridgeMessage) throws {
+        let result = try JSONDecoder().decode(PhoneRequestResult.self, from: Data(message.text.utf8))
+        guard result.requestID == message.correlationID else {
+            throw DeviceSyncError.underlying(message: "The phone request result does not match its signed correlation ID.")
+        }
         finish(result.requestID, result: .success(message))
     }
 
@@ -116,7 +93,6 @@ public final class MacPhoneRequestChannel {
 
     private func finish(_ id: String, result: Result<BridgeMessage, Error>) {
         guard let value = pending.removeValue(forKey: id) else { return }
-        value.deadline?.cancel()
         value.result = result
         value.done.resume()
     }

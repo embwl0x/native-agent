@@ -72,20 +72,23 @@ import CoreGraphics
 // Blueprint: | `ConversationAttention.swift` | `MacChatUnreadSessions`; Phone activity remains unread until its chat opens |
 
 /// Phone activity in a background chat stays unread until that chat opens.
-@MainActor @Observable
+@MainActor
 public final class MacChatUnreadSessions {
     public static let shared = MacChatUnreadSessions()
     private static let key = "NativeAgent.unreadPhoneChatSessions"
+    static let didChange = Notification.Name("NativeAgent.unreadPhoneChatSessions.didChange")
     public private(set) var ids = Set(UserDefaults.standard.stringArray(forKey: MacChatUnreadSessions.key) ?? [])
 
     public func received(in sessionID: String) {
         guard sessionID != UserDefaults.standard.string(forKey: "activeChatSessionId") else { return }
-        ids.insert(sessionID)
+        guard ids.insert(sessionID).inserted else { return }
         UserDefaults.standard.set(Array(ids), forKey: Self.key)
+        NotificationCenter.default.post(name: Self.didChange, object: nil)
     }
 
     public func markRead(_ sessionID: String) {
         guard ids.remove(sessionID) != nil else { return }
         UserDefaults.standard.set(Array(ids), forKey: Self.key)
+        NotificationCenter.default.post(name: Self.didChange, object: nil)
     }
 }

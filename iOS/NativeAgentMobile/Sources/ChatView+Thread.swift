@@ -2,7 +2,24 @@ import SwiftUI
 import UIKit
 import NativeAgentShared
 import UniformTypeIdentifiers
-// Blueprint: | `ChatView+Thread.swift` | The conversation's document: its rows, cards and actions, the composer's room and Latest |
+// Blueprint: | `ChatView+Thread.swift` | Conversation document, Inbox cards and actions, composer, Latest and shared options sheet |
+
+/// The approvals this conversation asked for, from the synced approvals.
+enum ConversationApprovals {
+    /// Approvals may outlive their turn linkage, so unresolved decisions remain reachable in this conversation.
+    static func pendingApprovals(sessionId: String?, approvals: [ApprovalRequest]) -> [ApprovalRequest] {
+        guard let sessionId = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines), !sessionId.isEmpty else { return [] }
+        return approvals.filter {
+            $0.chatOriginSessionId == sessionId
+                && ($0.outcome == .pending || $0.outcome == .unresolved || $0.executionFailed || $0.isExpired)
+        }
+    }
+
+    /// Failed and expired outcomes belong beside their turn; they must not appear as decisions still owed.
+    static func waitsOnYou(_ approval: ApprovalRequest) -> Bool {
+        approval.outcome == .pending
+    }
+}
 
 extension ChatView {
     // Process-local visual fixture: no transcript/cache writes and no transport sends.
@@ -140,14 +157,6 @@ extension ChatView {
         )
     }
 
-    /// Mirrored cards answer their original thread through the signed inbox action.
-    private var inlineChatCards: [InboxItemRecord] {
-        guard let session = store.selectedSessionID, !session.isEmpty else { return [] }
-        return sync.inboxItems.filter { item in
-            item.source == "interaction" && item.chat_session_id == session && !["archived", "dismissed"].contains(item.status)
-        }
-    }
-
     /// The Mac's rows for the conversation on screen, in its order (tool runs and asks included).
     private var transcriptRecords: [ChatMessageRecord] {
         #if DEBUG
@@ -157,38 +166,22 @@ extension ChatView {
         return sync.chatTranscripts[session]?.records ?? []
     }
 
-    /// The conversation as the document reads it: the Mac's rows and the phone's own, the streaming reply, approvals where they were
-    /// asked and the decisions still owed after everything, mirrored cards, other-room rows, and each row's buttons.
+    /// The conversation as the document reads it: the Mac's rows and the phone's own, the streaming reply, every card and ask as its
+    /// matter's Inbox row (asks where they were asked, the decisions still owed after everything), other-room rows, and each row's buttons.
     private var transcriptInput: MobileTranscriptInput {
         let messages = visibleMessages
-        let rows = MobileTranscriptRow.rows(records: transcriptRecords, messages: messages)
+        let records = transcriptRecords
         let session = store.selectedSessionID ?? store.mainSessionID
-        let all = inlineChatApprovals
-        var byID: [String: ApprovalRequest] = [:]
-        for approval in all { byID[approval.id] = approval }
-        var approvals: [String: ApprovalRequest] = [:]
-        var asked: Set<String> = []
-        for row in rows {
-            guard row.face?.asks == true, let id = row.metadata?.approvalId else { continue }
-            asked.insert(id)
-            if let approval = byID[id] { approvals[row.id] = approval }
-        }
-        // Only decisions still owed belong at the end; settled outcomes stay with the row that asked.
-        let owed = all.filter { !asked.contains($0.id) && ConversationApprovals.waitsOnYou($0) }
-        for approval in owed { approvals[approval.id] = approval }
-        var cards: [String: InboxItemRecord] = [:]
-        for item in inlineChatCards { cards[item.id] = item }
         let live = messages.last { $0.role == .assistant && ($0.isStreaming || store.liveTurnBubbles.values.contains($0.id)) }
         return MobileTranscriptInput(
-            sessionKey: store.selectedSessionID ?? "",
+            sessionKey: session ?? "",
             messages: messages,
-            rows: rows,
+            records: records,
             liveMessageID: live?.id,
             // The agent's newest movement for this reply: the running tool, or what the agent is writing into a call.
             waitingLine: live.map { store.streamingHint(for: $0) } ?? "",
-            approvals: approvals,
-            tailApprovals: owed,
-            inboxCards: cards,
+            approvals: inlineChatApprovals,
+            inboxFace: sync.faces["inbox"],
             exchanges: session.flatMap { sync.chatTranscripts[$0]?.otherRooms } ?? [],
             cardsAvailable: transcriptReadError == nil,
             canLoadOlder: store.canLoadOlderHistory,
@@ -208,16 +201,6 @@ extension ChatView {
             loadWholeMessage: { id in Task { await store.loadWholeMessage(id) } },
             retrySend: { id in store.sendQueuedNow(id, client: bridgeClient) },
             openExchange: { exchange in openedAgentContactID = exchange.contactID },
-            inboxAction: { itemID, actionID in
-                Task {
-                    do {
-                        _ = try await sync.inboxAction(itemId: itemID, actionId: actionID)
-                    } catch {
-                        store.errorBanner = error.localizedDescription
-                    }
-                }
-            },
-            openInboxItem: { _ in showsInbox = true },
             canRegenerate: store.canRegenerateLast,
             regenerate: { store.regenerateLast(client: bridgeClient, controls: runtimeControls) },
             canReadAloud: voiceOutput.enabled,
@@ -261,33 +244,44 @@ extension ChatView {
                             MobileTranscriptView(input: input, width: geometry.size.width, bottomInset: geometry.safeAreaInsets.bottom,
                                                  actions: transcriptActions, handle: transcript)
                                 .ignoresSafeArea(edges: .bottom)
+                                .overlay(alignment: .top) {
+                                    if let issue = transcript.issue {
+                                        Text(issue).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                                            .padding().background(.regularMaterial)
+                                    } else if transcript.isPreparing {
+                                        Text("Preparing conversation…").font(.caption).foregroundStyle(.secondary)
+                                            .padding().background(.regularMaterial)
+                                    }
+                                }
                         }
                     }
                 }
                 .aliveBottomFade(room: AliveChatRoom(store: store))
-                .safeAreaInset(edge: .bottom, spacing: NativeAgentMobileTheme.Spacing.md) {
-                    VStack(alignment: .trailing, spacing: 8) {
-                        // Keep Latest above the composer and visible only while the reader is away from the end.
-                        if showLatestButton {
-                            Button {
-                                followEnd()
-                            } label: {
-                                Label("Latest", systemImage: "arrow.down")
-                                    .font(.footnote.weight(.semibold))
-                                    .foregroundStyle(AlivePalette.text)
-                                    .padding(.horizontal, 14)
-                                    .frame(minHeight: 44)
-                                    .aliveGlass(in: Capsule(), interactive: true)
-                            }
-                            .buttonStyle(.plain)
-                            .padding(.trailing, NativeAgentMobileTheme.Spacing.lg)
-                            .transition(.opacity)
+                // Latest floats over the document: as part of the composer's inset, showing it would move the end the reader just reached.
+                .overlay(alignment: .bottomTrailing) {
+                    if showLatestButton {
+                        Button {
+                            followEnd()
+                        } label: {
+                            Label("Latest", systemImage: "arrow.down")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(AlivePalette.text)
+                                .padding(.horizontal, 14)
+                                .frame(minHeight: 44)
+                                .aliveGlass(in: Capsule(), interactive: true)
                         }
-                        GlassEffectContainer(spacing: NativeAgentMobileTheme.Spacing.md) { composerBar }
-                            .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
-                            .padding(.bottom, NativeAgentMobileTheme.Spacing.sm)
+                        .buttonStyle(.plain)
+                        .padding(.trailing, NativeAgentMobileTheme.Spacing.lg)
+                        .padding(.bottom, 8)
+                        .transition(.opacity)
                     }
-                    .animation(.easeOut(duration: 0.18), value: showLatestButton)
+                }
+                .animation(.easeOut(duration: 0.18), value: showLatestButton)
+                .safeAreaInset(edge: .bottom, spacing: NativeAgentMobileTheme.Spacing.md) {
+                    otherTurnLine.padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
+                    GlassEffectContainer(spacing: NativeAgentMobileTheme.Spacing.md) { composerBar }
+                        .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
+                        .padding(.bottom, NativeAgentMobileTheme.Spacing.sm)
                 }
                 // Only the reader's own acts move the chat: Latest, sending, the keyboard rising, opening a conversation.
                 .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in followEnd() }
@@ -303,10 +297,6 @@ extension ChatView {
                 if MacSyncErrorBannerPresentation.normalizedMessage(newValue) == nil {
                     dismissedSyncError = nil
                 }
-            }
-            // A note's card opens the Inbox, where the note is read and answered in place.
-            .sheet(isPresented: $showsInbox) {
-                NavigationStack { MobileFacePage(page: "inbox") }
             }
             .sheet(isPresented: $showsChatSetup) {
                 PairingView(onSkip: { showsChatSetup = false }, onPaired: { showsChatSetup = false })
@@ -332,10 +322,7 @@ extension ChatView {
             }
             .sheet(isPresented: $showsConfiguration) {
                 NavigationStack {
-                    ScrollView { configurationControls }
-                        .mobileReadingScreen()
-                        .navigationTitle("Chat options")
-                        .navigationBarTitleDisplayMode(.inline)
+                    AlivePage(title: "Chat options") { configurationControls }
                         .toolbar { Button("Done") { showsConfiguration = false } }
                         .hazeTinted()
                 }
@@ -372,6 +359,26 @@ extension ChatView {
             }
             .onChange(of: selectedPhotoItems, photoSelectionChanged)
         }
+    }
+
+    private var otherTurnLine: some View {
+        TurnElsewhereLine(
+            movements: turnActivity.visibleTurnSessions?.movements(outside: store.selectedSessionID ?? effectiveMainSessionID ?? "") ?? [],
+            agentName: agentDisplayName,
+            open: { session in
+                notifiedSessionID = session
+                consumeNotifiedChatSessionIfNeeded()
+            },
+            stop: { session in
+                let runs = turnActivity.visibleTurnSessions?.movements?.filter { $0.identity.sessionId == session }
+                    .compactMap(\.runID) ?? []
+                guard !runs.isEmpty else { return }
+                Task {
+                    do { try await bridgeClient.cancelChat(sessionID: session, runIDs: runs) }
+                    catch { store.errorBanner = "Stop is unconfirmed: \(error.localizedDescription)" }
+                }
+            }
+        )
     }
 
     private var runtimeControlsBar: some View {

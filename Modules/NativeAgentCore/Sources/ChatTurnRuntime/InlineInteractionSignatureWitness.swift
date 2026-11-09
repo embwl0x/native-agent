@@ -28,6 +28,7 @@ extension InlineInteraction.Continuation {
             resumeText: resumeText, peerSources: steer.sources, elevatedPeerSources: steer.elevated)
         continuation.originTurnId = turn.id
         continuation.lifeID = try DataRootLife.current(in: dataRoot)
+        continuation.fileAccessCeiling = turn.fileAccessCeiling
         continuation.signatureReceipt = InlineInteractionSignatureWitness.receipt(for: .init(
             sessionID: sessionID, interactionID: interaction.id, continuation: continuation,
             originEnvelope: originEnvelope, interaction: interaction),turn: turn)
@@ -101,6 +102,10 @@ public enum InlineInteractionSignatureWitness {
                 let elevated = continuation.elevatedPeerSources ?? []
                 fields.append(String(elevated.count))
                 fields.append(contentsOf: elevated)
+            }
+            if let ceiling = continuation.fileAccessCeiling {
+                fields.append("file-access-ceiling")
+                fields.append(ceiling.signatureMaterial)
             }
             fields.append(Self.digest(interaction.map {
                 "\($0.kind.rawValue)\u{1F}\($0.declineConsequence)"

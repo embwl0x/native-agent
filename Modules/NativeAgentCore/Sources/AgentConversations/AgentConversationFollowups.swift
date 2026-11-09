@@ -38,7 +38,7 @@ extension AgentConversationSession {
         let transport = peer?.transport
         var arguments = args
         arguments["expects_reply"] = expectsReply
-        guard let queued = try store.enqueue(id: row.id, text: text,
+        guard let queued = try store.enqueue(id: row.id, scopeSessionID: scope, text: text,
                 byPerson: turn.personInitiatedSend?.matches(args) == true,
                 arguments: arguments,
                 stillInFlight: { try inFlight($0, transport, dataRoot: dataRoot) }) else { return nil }
@@ -48,8 +48,14 @@ extension AgentConversationSession {
         // Preserve the initiating task context so the queued send clears the same gates later.
         AgentConversationRunning.shared.launch(item.id) {
             await sendWhenSettled(turn: turn, mac: mac, conversation: conversation, workspace: workspace, row: row.id, item: item.id,
-                queuedAt: item.queuedAt, agent: row.agent, label: saved.label, carried: carried,
+                agent: row.agent, carried: carried,
                                   transport: transport, scope: scope, surface: surface, dataRoot: dataRoot, perform: perform)
+        }
+        guard let current = try store.records().first(where: { $0.id == saved.id }) else {
+            throw AgentConversationStore.Failure(message: "The accepted queue's conversation is missing; inspect its saved record before another send.")
+        }
+        if let reason = current.queued?.first(where: { $0.id == item.id })?.notSentReason {
+            return notSent(name, label: current.label, reason, item: item.id)
         }
         let ahead = (saved.queued ?? []).filter { $0.held == nil && $0.id != item.id }.count
         let awaitingCard: Bool = if case .object(let receipt)? = saved.receipt { receipt["status"] == .string("waiting_approval") } else { false }
@@ -70,8 +76,7 @@ extension AgentConversationSession {
                 || row.queueReservation.map { !AgentConversationRunning.shared.waiting($0) } == true
         }
     }
-    /// Restart cannot carry a person’s own send authority; hold those messages and sends older than a day. Resume other sends through their original gated
-    /// chain under the same ordering and reservation.
+    /// Restart cannot carry a person’s own send authority. Other sends retain their original gated chain, order and reservation.
     package static func resumeQueued(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, workspace: WorkspaceOperation,
         _ row: AgentConversationRecord, dataRoot: URL, afterRestart: Bool = true, perform: @escaping Dispatch) {
         let store = AgentConversationStore(dataRoot: dataRoot)
@@ -88,14 +93,14 @@ extension AgentConversationSession {
             _ = try store.releaseReservation(id: row.id, item: reserved)
         }
         for item in row.queued ?? [] where (item.held == nil || item.waitingForMac == true) && AgentConversationRunning.shared.adopt(item.id) {
-            if Date().timeIntervalSince(item.queuedAt) >= 24 * 60 * 60 || afterRestart && item.byPerson == true {
+            if afterRestart && item.byPerson == true {
                 defer { AgentConversationRunning.shared.release(item.id) }
-                try store.holdQueued(id: row.id, item: item, reason: afterRestart && item.byPerson == true
-                    ? "Not sent: the app restarted before the reply ahead of it settled, and the send was yours to make. Send it again if it is still wanted."
-                    : "Not sent: the reply ahead of it did not settle within a day.")
+                try store.refuseQueued(id: row.id, item: item, reason:
+                    "Not sent: the app restarted before this send began. It was yours to make; send it again if it is still wanted.")
                 continue
             }
-            // Keep the asking door recorded on the row, rather than substituting this launch’s identity.
+            // Keep the asking door recorded on the row, rather than substituting this launch’s identity. The send resumes for its own caller;
+            // an item saved without one was queued by the row's caller.
             let route = row.replyRoute.map { saved in
                 ChatToolSessionContext.ReplyRoute(surface: saved["surface"] ?? row.sourceSurface, destinationId: saved["destinationId"],
                     threadId: saved["threadId"], sourceKey: saved["sourceKey"], replyTo: saved["replyTo"],
@@ -104,16 +109,16 @@ extension AgentConversationSession {
             let resumed = turn.with(\.envelope, turn.envelope.map { $0.withDeliveryRoute(route) })
             AgentConversationRunning.shared.launch(item.id) {
                     await sendWhenSettled(turn: resumed, mac: mac, conversation: conversation, workspace: workspace, row: row.id, item: item.id,
-                        queuedAt: item.queuedAt, agent: row.agent, label: row.label, carried: [:],
-                                          transport: transport, scope: row.scopeSessionID, surface: row.sourceSurface,
+                        agent: row.agent, carried: [:],
+                                          transport: transport, scope: item.scopeSessionID ?? row.scopeSessionID, surface: row.sourceSurface,
                                           dataRoot: dataRoot, perform: perform)
             }
         }
         } catch { queueReadFailed(error, row: row.id, dataRoot: dataRoot) }
     }
-    /// A stopped follow-up must retain its reason on the thread.
+    /// Owner changes release the queue; a refusal settles before releasing its place.
     private static func sendWhenSettled(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, workspace: WorkspaceOperation,
-        row id: String, item: String, queuedAt: Date, agent: String, label: String,
+        row id: String, item: String, agent: String,
                                         carried: [String: JSONValue], transport: AgentPeerTransport?,
                                         scope: String, surface: String, dataRoot: URL, perform: @escaping Dispatch) async {
         defer { AgentConversationRunning.shared.release(item) } // adopted by `queue`
@@ -139,7 +144,6 @@ extension AgentConversationSession {
             }
         }
         defer { approvalChanges.cancel() }
-        let giveUp = queuedAt.addingTimeInterval(24 * 60 * 60)
         // Reply handover precedes queued sends; only the queue head may run.
         let ready: (AgentConversationRecord) throws -> Bool = {
             try !replyInFlight($0, transport, dataRoot: dataRoot) && !AgentConversationRunning.shared.watched($0.id) && $0.deliveryState != "delivering"
@@ -147,22 +151,16 @@ extension AgentConversationSession {
         do {
         while !Task.isCancelled {
             let seen = AgentConversationRunning.shared.seen
-            guard let row = try store.records().first(where: { $0.id == id }),
-                  row.queued?.contains(where: { $0.id == item && ($0.held == nil || $0.waitingForMac == true) }) == true else { return }
-            if Date() >= giveUp {
-                if let entry = row.queued?.first(where: { $0.id == item }) {
-                    try store.holdQueued(id: id, item: entry, reason: entry.waitingForMac == true
-                        ? "Not sent: the Mac did not become available within a day. This message stays here; send it again only if still wanted."
-                        : "Not sent: the reply ahead of it did not settle within a day.")
-                }
-                return
+            guard let row = try store.records().first(where: { $0.id == id }) else {
+                throw AgentConversationStore.Failure(message: "The queued message's conversation is missing; its outcome is unproven.")
             }
+            guard row.queued?.contains(where: { $0.id == item && ($0.held == nil || $0.waitingForMac == true) }) == true else { return }
             if let taken = try store.takeQueued(id: id, item: item, ready: ready) {
                 var input = (taken.arguments ?? [:]).merging(carried) { _, current in current }
                 input["agent"] = .string(agent)
                 input["text"] = .string(taken.text)
-                input["conversation"] = .string(label)
-                var why = "the conversation did not take it."
+                input["conversation"] = .string(id)
+                let why: String
                 do {
                     let result = try await withAgentMacDriver(mac, driver: nil) { mac in
                         try await dispatch(turn: turn, mac: mac, conversation: conversation, workspace: workspace, tool: "agent_message", input: input,
@@ -170,19 +168,18 @@ extension AgentConversationSession {
                                            dataRoot: dataRoot, reservation: taken.id, perform: perform)
                     }
                     if case .object(let fields) = result, let detail = string(fields["detail"]) { why = detail }
+                    else { why = "The call returned without a reason; this reservation's send never began." }
                 } catch { why = error.localizedDescription }
-                // Still reserved: it never began (refused before its send), so it stays on the thread, held with the reason, and the queue moves on.
-                if try store.releaseReservation(id: id, item: taken.id) {
-                    try store.holdQueued(id: id, item: taken, reason: "Not sent: " + why)
-                }
-                // A takeover before Return put this exact send back on its queue. Keep its one sender and original one-day boundary.
+                // The reservation proves this send never began; save its terminal reason and release its place together.
+                try store.refuseQueued(id: id, item: taken, reason: "Not sent: " + why, reserved: true)
+                // A takeover before Return returns this exact send to its one sender.
                 if try store.records().first(where: { $0.id == id })?.queued?.contains(where: { $0.id == item && ($0.waitingForMac == true
                     || $0.held == nil) }) == true {
                     continue
                 }
                 return
             }
-            await AgentConversationRunning.shared.change(after: seen, until: giveUp)
+            await AgentConversationRunning.shared.change(after: seen)
         }
         } catch { queueReadFailed(error, row: id, dataRoot: dataRoot) }
     }

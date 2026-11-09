@@ -21,17 +21,24 @@ extension RuntimeReadouts {
         @ObservationIgnored var diagnosticsDidChange: (@MainActor () -> Void)?
         public private(set) var rows: [RunRecord] = []
         public private(set) var readSucceeded: Bool?
+        public private(set) var readIssue: String?
+        public private(set) var observationIssue: String?
+        public func setObservationIssue(_ issue: String?) { observationIssue = issue }
         @ObservationIgnored private let latest = LatestRead()
         public nonisolated init() {}
         @discardableResult
         public func refresh(dataRoot: URL) async throws -> [RunRecord] {
-            let read = await latest.read({ await RuntimeReadouts.runs(dataRoot: dataRoot) }, publish: { next in
-                readSucceeded = next != nil
-                if let next { rows = next }
+            let read: Result<[RunRecord], Error> = await latest.read({
+                do { return .success(try await RuntimeReadouts.readRunHistory(dataRoot: dataRoot)) }
+                catch { return .failure(error) }
+            }, publish: { next in
+                switch next {
+                case .success(let value): rows = value; readSucceeded = true; readIssue = nil
+                case .failure(let error): readSucceeded = false; readIssue = error.localizedDescription
+                }
                 diagnosticsDidChange?()
             })
-            guard let read else { throw RuntimeReadError.unreadableFeed("The run history could not be read. Refresh to try again.") }
-            return read
+            return try read.get()
         }
     }
 }
@@ -43,6 +50,19 @@ private enum StatusFeedAvailability: Equatable {
 }
 
 extension RuntimeReadouts {
+    @concurrent public static func readRunHistory(dataRoot: URL) async throws -> [RunRecord] {
+        Array(try await readRunLedger(dataRoot: dataRoot).sorted { $0.createdAt > $1.createdAt }.prefix(200))
+    }
+
+    /// A detail lookup reads the ledger, without the history list's display limit.
+    @concurrent public static func readRunLedger(dataRoot: URL) async throws -> [RunRecord] {
+        let path = dataRoot.appendingPathComponent("runs/runs.json")
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch CocoaError.fileReadNoSuchFile { return [] }
+        return try RunLedger.records(from: data)
+    }
+
     public static func getNotificationStatus(dataRoot: URL) async throws -> NotificationRuntimeStatus {
         // Read pending counts from the approval owner.
         let approvalsPath = dataRoot

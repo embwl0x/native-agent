@@ -9,9 +9,9 @@ import TelegramBot
 import Transcripts
 import NativeAgentShared
 import Experiences
-// Blueprint: | `ApprovalChatCards.swift` | A conversation delivers its matter's card, then accepts its conversation door with the transcript row |
+// Blueprint: | `ApprovalChatCards.swift` | The one mirror: an ask whose matter owes the person's conversation gets its card row there, then that door is accepted with the row |
 
-/// A conversation named at birth draws the approval's card; every surface resolves the same decision.
+/// The person's conversation named at birth draws the ask's card; every surface resolves the same decision.
 public enum ApprovalChatCards {
     public static func canResolve(_ approval: ApprovalRecord) -> Bool {
         !approval.payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -29,39 +29,43 @@ public enum ApprovalChatCards {
         case failed
     }
 
-    /// The conversation owns only its card; the router owns the other doors.
+    /// An approval the person decides is mirrored into the person's conversation when its matter names that door; the router owns the
+    /// other doors.
     @discardableResult
     public static func post(
         _ record: ApprovalRecord,
         dataRoot: URL
     ) async -> Outcome {
         guard record.status == "pending", !record.isAgentsOwnDecision else { return .skipped }  // the agent's to decide
-        return await postCard(record, dataRoot: dataRoot)
+        return await mirror(record.id, rowID: "approval-card-" + record.id, dataRoot: dataRoot) { sessionID in
+            try cardRow(record, sessionID: sessionID)
+        }
     }
 
-    /// Avoid duplicating a card already shown in the person's active conversation.
-    private static func postCard(_ record: ApprovalRecord, dataRoot: URL) async -> Outcome {
+    /// The one mirror for every ask: a matter that owes the person's conversation door (`Door.personsConversation`) has its card row
+    /// appended there once (the row's run id keeps it to one), and the door is accepted with that row. A failed write leaves the door owed.
+    static func mirror(_ matterID: String, rowID: String, dataRoot: URL,
+                       row: (_ sessionID: String) throws -> JSONValue) async -> Outcome {
         do {
             let forPerson = ForPerson.at(dataRoot)
-            guard let matter = try await forPerson.matter(record.id),
+            guard let matter = try await forPerson.matter(matterID),
                   let owed = matter.owes[Door.conversation("").key], !owed.phase.isSettled,
                   let door = Door(address: owed.to), case .conversation(let sessionID) = door else { return .skipped }
             guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) == sessionID else {
-                throw ApprovalInboxError.malformedResponse("invalid chat-card session")
+                throw ApprovalInboxError.malformedResponse("invalid conversation door \(sessionID)")
             }
+            let card = try row(sessionID)
             let written: Result<Void, Error> = await settle {
                 do {
-                    try await appendCard(record, sessionID: sessionID, dataRoot: dataRoot)
-                    try await forPerson.accepted(record.id, door,
-                        evidence: .init(source: Matter.messages(sessionID), id: "approval-card-" + record.id))
+                    try await appendRow(card, sessionID: sessionID, dataRoot: dataRoot, uniqueRunID: rowID)
+                    try await forPerson.accepted(matter.id, door, evidence: .init(source: Matter.messages(sessionID), id: rowID))
                     return .success(())
                 } catch { return .failure(error) }
             }
             try written.get()
             return .posted(sessionID)
         } catch {
-            // The strip remains visible until delivery is confirmed.
-            nativeLog("[approval-chat-card] delivery failed: %@", error.localizedDescription)
+            nativeLog("[approval-chat-card] mirror into the person's conversation failed: %@", error.localizedDescription)
             return .failed
         }
     }
@@ -72,36 +76,12 @@ public enum ApprovalChatCards {
         await promptPendingInteractions(dataRoot: dataRoot, telegram: telegram)
     }
 
-    /// Exclude the origin conversation because its card already shows there.
-    static func usersConversation(unless origin: String?, dataRoot: URL) throws -> String? {
-        guard let anchor = try ConversationAnchor.checkedCurrent(dataRoot: dataRoot)?.sessionId,
-              NativeAgentChatSessionID.normalizedPathComponent(anchor) == anchor,
-              origin != anchor else { return nil }
-        return anchor
-    }
-
     /// A private chat id is the configured owner's user id.
     static func ownerDM(dataRoot: URL) throws -> Int? {
         guard let config = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false), config.tokenConfigured,
               let owner = config.ownerUserId.flatMap({ Int(exactly: $0) })
         else { return nil }
         return owner
-    }
-
-    /// Nothing leaves for Telegram unredacted: title and reason scrubbed too.
-    private static func redactedForTelegram(_ record: ApprovalRecord) -> ApprovalRecord {
-        var copy = record
-        copy.title = NativeAppSecretRedactor.redactText(record.title)
-        copy.reason = NativeAppSecretRedactor.redactText(record.reason)
-        return copy
-    }
-
-    private static func decisionPayload(_ record: ApprovalRecord) -> JSONValue {
-        guard case .object(let payload) = record.payload,
-              payload["kind"] == .string("chat_tool_approval"), let input = payload["input"] else {
-            return record.payload
-        }
-        return input
     }
 
     /// Attention reuses the prompt transaction, including its in-flight send and receipt-only recovery. It never adds a plain-text approval copy.
@@ -116,8 +96,8 @@ public enum ApprovalChatCards {
             if record.chatCard?.objectValue?[receipt] == .bool(true) { return .delivered }
             guard record.status == "pending" else { return .notDelivered(reason: "The approval is no longer pending") }
             guard let telegram = runningTelegram else { return .notDelivered(reason: "The Telegram approval sender is not running") }
-            try await telegram.promptChatCard(redactedForTelegram(record), chatId: chatId,
-                payload: NativeAppSecretRedactor.redactArguments(decisionPayload(record)))
+            // Nothing leaves for Telegram unredacted: the prompt's words are its matter's, redacted where they are written.
+            try await telegram.promptChatCard(record, chatId: chatId)
             let saved = try await inbox.get(id)
             if saved.chatCard?.objectValue?[receipt] == .bool(true) { return .delivered }
             return .unknown(sent: true, reason: "The approval prompt has no saved delivery receipt; reconcile its prompt transaction")
@@ -129,7 +109,7 @@ public enum ApprovalChatCards {
     }
 
     /// The same `approval_pending` row the tool loop writes, so every surface that draws an approval card from a transcript draws this one.
-    private static func appendCard(_ record: ApprovalRecord, sessionID: String, dataRoot: URL) async throws {
+    private static func cardRow(_ record: ApprovalRecord, sessionID: String) throws -> JSONValue {
         let face = record.matter
         let content = [face.title, face.summary, face.words]
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -139,7 +119,7 @@ public enum ApprovalChatCards {
             "status": .string("waiting_approval"), "approvalId": .string(record.id),
             "tool": .string(record.action), "reason": .string(face.summary),
         ]).serialize(pretty: false)
-        let row: JSONValue = .object([
+        return .object([
             "id": .string("approval-card-\(record.id)"),
             "sessionId": .string(sessionID),
             "role": .string("tool"),
@@ -154,7 +134,6 @@ public enum ApprovalChatCards {
                 "resultSummary": .string(summary),
             ]),
         ])
-        try await appendRow(row, sessionID: sessionID, dataRoot: dataRoot, uniqueRunID: "approval-card-\(record.id)")
     }
 
     static func appendRow(_ row: JSONValue, sessionID: String, dataRoot: URL, uniqueRunID: String? = nil) async throws {

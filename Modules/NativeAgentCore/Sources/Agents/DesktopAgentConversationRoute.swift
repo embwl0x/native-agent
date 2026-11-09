@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import ChatTurnRuntime
 import ChatTurnContracts
+import ChatToolRuntime
 import AgentConversations
 import NativeAgentCore
 import MacControl
@@ -70,8 +71,8 @@ public actor DesktopAgentConversationRoute {
                 try await GrokRoutineAccessibility.send(turn: turn, mac: mac, requested, bot: label, watchReply: true)
                 // Release busy ownership before following replies so other desktop sends can proceed.
                 guard case .object(var fields) = Self.delivered(agent) else { return Self.delivered(agent) }
-                fields["submission_observation"] = await GrokRoutineAccessibility.submissionObservation
-                guard let sent = await GrokRoutineAccessibility.sentLayout else {
+                fields["submission_observation"] = GrokRoutineAccessibility.submissionObservation
+                guard let sent = GrokRoutineAccessibility.sentLayout else {
                     fields["detail"] = .string("""
                         Pasted into chat \u{201C}\(label)\u{201D} in the Grok Bot app and seen there, but that chat's transcript could not be read \
                         to watch for the answer; it stays in that chat.
@@ -84,7 +85,7 @@ public actor DesktopAgentConversationRoute {
                     "watch_id": sent.watchID.map(JSONValue.string) ?? .null])
                 return .object(fields)
             } catch {
-                let reached = await GrokRoutineAccessibility.reached
+                let reached = GrokRoutineAccessibility.reached
                 let why = (error as? MacScreenLock.Covered)?.detail ?? error.localizedDescription
                 let stage = reached == .opening ? "opening Grok Bot" : "opening chat \u{201C}\(label)\u{201D} and checking its message box"
                 return Self.stopped(agent, app: "Grok Bot", stage: stage, typed: reached == .typing || reached == .submitted,
@@ -97,6 +98,12 @@ public actor DesktopAgentConversationRoute {
                 surface: surface, deadlines: work.deadlines)), as: CourierInstructions.self) {
         case .success(let value): instructions = value
         case .failure(let error):
+            await ChatToolDispatchTracer.traceUndispatched(turn: turn, tool: "app", input: ["action": .string("authored.desktop-courier")],
+                surface: surface, result: .object(["status": .string("refused"), "reason": .string(error.code),
+                    "checker": .string("desktop_courier_entry"), "detail": .string(error.message), "effects": .string("none"),
+                    "remedy": Repair.remedy(owner: "desktop courier's originating door", nextCall: nil, tap: nil,
+                        instruction: "Repair the caller's missing originating app door before preparing another desktop send; nothing was sent.")]),
+                dataRoot: dataRoot)
             return Self.stopped(agent, app: "the app", stage: "preparing the courier instructions",
                 typed: false, submitted: false, why: error.localizedDescription)
         }
@@ -316,11 +323,12 @@ package actor DesktopConversationTools: ToolDispatchClient {
         return response
     }
 
-    @MainActor private static func verifiedComposerTarget(mac: MacOperationContext, bundle: String, label: String, content: String) throws -> String? {
+    @concurrent private static func verifiedComposerTarget(mac: MacOperationContext, bundle: String, label: String,
+        content: String) async throws -> String? {
         try MacAccessibilityReader.withReadBudget(context: mac) { mac in try verifiedComposerTargetRead(mac: mac, bundle: bundle, label: label,
             content: content) }
     }
-    @MainActor private static func verifiedComposerTargetRead(mac: MacOperationContext, bundle: String, label: String, content: String) throws -> String? {
+    private static func verifiedComposerTargetRead(mac: MacOperationContext, bundle: String, label: String, content: String) throws -> String? {
         let source = SystemMacAXElementSource()
         guard source.isTrusted(), let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier == bundle else { return nil }

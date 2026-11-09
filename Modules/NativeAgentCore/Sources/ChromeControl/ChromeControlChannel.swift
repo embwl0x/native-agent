@@ -5,7 +5,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import MacControl
-// Blueprint: | `ChromeControlChannel.swift` | `ChromeControlChannel`, `ChromeConversationTab`; Ordered socket effects; tab/document authority. |
+// Blueprint: | `ChromeControlChannel.swift` | `ChromeControlChannel`, `ChromeConversationTab`; ordered socket effects; tab/document authority; local preview responses wait at most two seconds. |
 
 private final class ChromeSocketHandle: @unchecked Sendable {
     private let lock = NSLock()
@@ -220,9 +220,15 @@ actor ChromeControlChannel {
         let dispatch = ChromeRequestDispatch()
         let response = Response()
         return try await withTaskCancellationHandler {
-            let timeout = Task { [weak self, requestTimeout] in
-                try? await Task.sleep(for: requestTimeout)
-                await self?.timeoutRequest(id, context: context)
+            let timeout: Task<Void, Never>?
+            if action == .navigate || action == .snapshot || action == .look {
+                timeout = nil
+            } else {
+                let budget: Duration = action == .preview ? .seconds(2) : requestTimeout
+                timeout = Task { [weak self] in
+                    do { try await Task.sleep(for: budget) } catch { return }
+                    await self?.timeoutRequest(id, context: context)
+                }
             }
             pending[id] = Pending(
                 expectedAction: action,
@@ -287,7 +293,7 @@ actor ChromeControlChannel {
         ]) { _, new in new })])
     }
 
-    func tabs() -> [Int64: ChromeConversationTab] { ownTabs }
+    func tabs() -> [Int64: ChromeConversationTab]? { closed ? nil : ownTabs }
 
     func existingPageAddress(host: String, tabID: Int64?) throws -> [String: JSONValue] {
         // Current ownership supplies addressing; the ensuing read proves document readability.
@@ -394,7 +400,7 @@ actor ChromeControlChannel {
                 yieldInvalidDriver(context: context)
                 return
             }
-            if case .object(let result)? = object["result"] {
+            if row.expectedAction != .preview, case .object(let result)? = object["result"] {
                 if row.expectedAction == .attach {
                     let tabs: [JSONValue] = if case .array(let values)? = result["tabs"] { values } else { [] }
                     guard let rebuilt = ChromeConversationTab.inventory(tabs, previous: ownTabs) else {
@@ -442,8 +448,6 @@ actor ChromeControlChannel {
             if code == "tab_not_owned", let tabID = row.tabID {
                 ownTabs.removeValue(forKey: tabID)
                 endPageObservers(tabID: tabID, error: ChromeControlRuntimeError.extensionRejected(code: code, message: message))
-                NotificationCenter.default.post(name: Notification.Name("NativeAgentChromeTabEnded"), object: nil,
-                    userInfo: ["tabId": tabID, "closed": false])
             }
             if row.expectedAction == .snapshot, case .int(let tabID)? = row.targetReceipt["tabId"] {
                 onCaptureFailure(tabID, "\(code): \(message)", Date())
@@ -470,8 +474,6 @@ actor ChromeControlChannel {
                 endPageObservers(
                     tabID: id,
                     error: ChromeControlRuntimeError.extensionRejected(code: "tab_not_owned", message: "This tab is outside the NativeAgent group."))
-                NotificationCenter.default.post(name: Notification.Name("NativeAgentChromeTabEnded"), object: nil,
-                    userInfo: ["tabId": id, "closed": false])
             }
             replaceTabs(projected)
             return
@@ -481,14 +483,17 @@ actor ChromeControlChannel {
               case .int(let tabID)? = payload["tabId"] else { return }
         if event == "page.invalidated" {
             invalidatePageSnapshot(tabID: tabID)
+        } else if event == "page.frame_invalidated" {
+            // The cached aggregate predates an inner document, but the live
+            // capture retains coherent sibling evidence and removes that
+            // frame's stale routes. Do not fence its pending reply as a new page.
+            pageSnapshots.removeValue(forKey: tabID)
         } else if event == "tab.yielded" || event == "tab.closed" {
             let reason: String = if case .string(let value)? = payload["reason"] { value }
                 else { event == "tab.closed" ? "tab_closed" : "reason_unavailable" }
             let released = JSONValue.object(["tabId": .int(tabID), "reason": .string(reason),
                 "at": object["occurredAt"] ?? .null, "url": payload["url"] ?? ownTabs[tabID]?.url.map(JSONValue.string) ?? .null])
             ownTabs.removeValue(forKey: tabID)
-            NotificationCenter.default.post(name: Notification.Name("NativeAgentChromeTabEnded"), object: nil,
-                userInfo: ["tabId": tabID, "closed": event == "tab.closed"])
             let message = switch reason {
             case "tab_active": "The person selected this tab, so it is theirs now (tab_active)."
             case "tab_missing": "No tab \(tabID) exists any more (tab_missing)."
@@ -593,7 +598,7 @@ actor ChromeControlChannel {
         let started = row.dispatch.cancel()
         if started {
             cancelAction(id, context: context)
-            // Await dispatched work, including partial typing; a missing reply ends as unknown at the request deadline.
+            // Dispatched work settles from its reply or connection loss; other actions also retain their request deadline.
             return
         }
         pending.removeValue(forKey: id)
@@ -622,7 +627,6 @@ struct ChromeConversationTab: Sendable {
     let tabID: Int64
     let userSequence: JSONValue
     let readingView: [String: JSONValue]
-    let hasReadView: Bool
     let title: String?
     let url: String?
     let audible: JSONValue
@@ -649,10 +653,9 @@ struct ChromeConversationTab: Sendable {
         url = string(result["url"]) ?? prior?.url
         audible = result["audible"] ?? prior?.audible ?? .null
         mutedInfo = result["mutedInfo"] ?? prior?.mutedInfo ?? .null
-        hasReadView = result["readingView"] != nil || result["reading"] != nil || prior?.hasReadView == true
         if case .object(let view)? = result["readingView"] { readingView = view }
         else if case .object(let view)? = result["reading"] {
             readingView = view.filter { ["scope", "maxNodes", "maxTextChars"].contains($0.key) }
-        } else { readingView = prior?.readingView ?? ["scope": .string("page"), "maxNodes": .int(80), "maxTextChars": .int(12_000)] }
+        } else { readingView = prior?.readingView ?? ["scope": .string("page")] }
     }
 }

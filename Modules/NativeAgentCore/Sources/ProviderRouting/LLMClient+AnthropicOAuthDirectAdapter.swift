@@ -14,11 +14,11 @@ public final class AnthropicOAuthTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.textMarkers
     public let providerId: String = "anthropic_oauth_direct"
 
-    public static let productionSession: URLSession = makeProductionSession()
+    public static let productionSession: URLSession = ProviderHTTP.makeSession()
 
     private let session: URLSession
-    private let endpoint: URL
-    private let refreshEndpoint: URL
+    private let endpoint: URL?
+    private let refreshEndpoint: URL?
     /// An injected credential path confines alternate runtimes; production resolves the canonical layout.
     private let authPathOverride: URL?
     private let maxTokensOverride: Int?
@@ -27,8 +27,8 @@ public final class AnthropicOAuthTransport: LLMTransport {
 
     public init(
         session: URLSession = AnthropicOAuthTransport.productionSession,
-        endpoint: URL = URL(string: "https://api.anthropic.com/v1/messages")!,
-        refreshEndpoint: URL = URL(string: ProviderOAuthConfig.anthropic.tokenEndpoint)!,
+        endpoint: URL? = URL(string: "https://api.anthropic.com/v1/messages"),
+        refreshEndpoint: URL? = URL(string: ProviderOAuthConfig.anthropic.tokenEndpoint),
         authPathOverride: URL? = nil,
         maxTokens: Int? = nil,
         clientID: String = ProviderOAuthConfig.anthropic.clientId,
@@ -63,15 +63,6 @@ public final class AnthropicOAuthTransport: LLMTransport {
     // Explicit protocol identity for this adapter; never inferred from another application's installed version or a directory read.
     private static let claudeCLIVersion = "2.1.280"
 
-    static func makeProductionSession(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> URLSession {
-        OAuthProductionSession.make(
-            requestTimeout: environment["NATIVE_AGENT_ANTHROPIC_OAUTH_REQUEST_TIMEOUT_SEC"],
-            resourceTimeout: environment["NATIVE_AGENT_ANTHROPIC_OAUTH_RESOURCE_TIMEOUT_SEC"]
-        )
-    }
-
     /// Shared OAuth headers; turn context needs no provider-specific beta.
     static func apiHeaders(accessToken: String) -> [String: String] {
         return [
@@ -88,10 +79,10 @@ public final class AnthropicOAuthTransport: LLMTransport {
 
     /// Every HTTP failure retains bounded body evidence before classification.
     private static func validateStreamResponse(
-        status: Int, bytes: URLSession.AsyncBytes, response: URLResponse
+        status: Int, bytes: ProviderHTTPBytes, response: URLResponse
     ) async throws {
         if !(200..<300).contains(status) {
-            let body = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
+            let body = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096)
             // The person sees one generic line; the provider's own reason stays findable.
             let reason = String(data: body.prefix(600), encoding: .utf8) ?? ""
             ModuleLog(subsystem: "NativeAgent", category: "Anthropic")("oauth HTTP \(status): \(reason)", level: .error)
@@ -224,83 +215,79 @@ public final class AnthropicOAuthTransport: LLMTransport {
         substitutedFrom: String?,
         continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation, call: LLMCall
     ) async throws {
-        // Forced refresh receives the sent token so concurrent rotations reuse the current credential.
-        let requestAccount = OAuthRequestAccount()
-        var lastSentAccessToken: String?
-        for attempt in 0...1 {
-            try Task.checkCancellation()
-            let accessToken = try await ensureFreshAccessToken(
-                forceRefresh: attempt == 1, staleToken: lastSentAccessToken, requestAccount: requestAccount)
-            lastSentAccessToken = accessToken
-
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "POST"
-            for (k, v) in Self.apiHeaders(
-                accessToken: accessToken
-            ) {
-                req.setValue(v, forHTTPHeaderField: k)
-            }
-            req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-
-            let body = try Self.makeMessagesRequestBody(
-                messages: messages,
-                system: system,
-                coercedModel: model,
-                maxTokens: try requestOutputTokens(model: model, call: call),
-                stream: true, call: call
-            )
-            req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-            Self.dumpBodyIfEnabled(body, call: "streamMessages")
-
-            let requestStartNs = DispatchTime.now().uptimeNanoseconds
-            let bytes: URLSession.AsyncBytes
-            let response: URLResponse
-            do {
-                (bytes, response) = try await ProviderWire.open(session, req, call: call)
-            } catch {
-                throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
-            }
-            defer { bytes.task.cancel() }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if status == 401, attempt == 0 { continue }
-            try await Self.validateStreamResponse(status: status, bytes: bytes, response: response)
-
-            let cacheMarkers = Self.cacheMarkers(in: body)
-            var usage = LLMUsage()
-            var ttftMs: Int?
-            var yieldedSemanticOutput = false
-            var lastStopReason: String?
-            var contentBlocks: [Int: String] = [:]
-            var runaway = RunawayOutputDetector(endsAtToolBoundary: body["stop_sequences"] != nil, diagnosticDataRoot: telemetry.diagnosticDataRoot(
-                call: call), call: call)
-            // Connect and mid-stream transport errors share a mapping; parser errors and cancellation pass through.
-            do {
-                // SSEEventStream owns framing; protocol semantics stay here.
-                for try await sse in SSEEventStream(bytes, lifetime: call.lifetime) {
-                    if try await AnthropicTransport.consumeStreamEvent(
-                        sse, usage: &usage, stopReason: &lastStopReason, blocks: &contentBlocks,
-                        ttftMs: &ttftMs, semanticOutput: &yieldedSemanticOutput, runaway: &runaway,
-                        requestStartNs: requestStartNs, requestBody: req.httpBody, provider: providerId,
-                        model: model, telemetry: telemetry,
-                        malformedFrame: "Anthropic OAuth: malformed streamMessages frame",
-                        continuation: continuation, substitutedFrom: substitutedFrom,
-                        cacheMarkers: cacheMarkers, inspectThinking: { text, redacted in
-                            Self.fireThinkingDeltaEvent(text, redacted: redacted, call: call)
-                        },
-                        call: call, payload: { _, _, _ in false }
-                    ) { return }
-                }
-            } catch let err as LLMError {
-                throw err
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
-            }
-            throw LLMError.streamTruncated(
-                message: "Anthropic OAuth streamMessages ended without message_stop"
-            )
+        guard let endpoint else {
+            throw LLMError.providerError(message: "Anthropic response endpoint is invalid; correct its provider configuration.")
         }
+        let requestAccount = OAuthRequestAccount()
+        try Task.checkCancellation()
+        let accessToken = try await ensureFreshAccessToken(
+            requestAccount: requestAccount)
+
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        for (k, v) in Self.apiHeaders(
+            accessToken: accessToken
+        ) {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+
+        let body = try Self.makeMessagesRequestBody(
+            messages: messages,
+            system: system,
+            coercedModel: model,
+            maxTokens: try requestOutputTokens(model: model, call: call),
+            stream: true, call: call
+        )
+        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+        Self.dumpBodyIfEnabled(body, call: "streamMessages")
+
+        let requestStartNs = DispatchTime.now().uptimeNanoseconds
+        let bytes: ProviderHTTPBytes
+        let response: URLResponse
+        do {
+            (bytes, response) = try await ProviderWire.open(session, req, call: call)
+        } catch {
+            throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
+        }
+        defer { bytes.cancel() }
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        let status = http.statusCode
+        try await Self.validateStreamResponse(status: status, bytes: bytes, response: response)
+
+        let cacheMarkers = Self.cacheMarkers(in: body)
+        var usage = LLMUsage()
+        var ttftMs: Int?
+        var yieldedSemanticOutput = false
+        var lastStopReason: String?
+        var contentBlocks: [Int: String] = [:]
+        // Connect and mid-stream transport errors share a mapping; parser errors and cancellation pass through.
+        do {
+            // SSEEventStream owns framing; protocol semantics stay here.
+            for try await sse in SSEEventStream(bytes, lifetime: call.lifetime) {
+                if try await AnthropicTransport.consumeStreamEvent(
+                    sse, usage: &usage, stopReason: &lastStopReason, blocks: &contentBlocks,
+                    ttftMs: &ttftMs, semanticOutput: &yieldedSemanticOutput,
+                    requestStartNs: requestStartNs, requestBody: req.httpBody, provider: providerId,
+                    model: model, telemetry: telemetry,
+                    malformedFrame: "Anthropic OAuth: malformed streamMessages frame",
+                    continuation: continuation, substitutedFrom: substitutedFrom,
+                    cacheMarkers: cacheMarkers, inspectThinking: { text, redacted in
+                        Self.fireThinkingDeltaEvent(text, redacted: redacted, call: call)
+                    },
+                    call: call, payload: { _, _, _ in false }
+                ) { return }
+            }
+        } catch let err as LLMError {
+            throw err
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
+        }
+        throw LLMError.streamTruncated(
+            message: "Anthropic OAuth streamMessages ended without message_stop"
+        )
     }
 
     // MARK: - Auth file resolution + token load
@@ -312,18 +299,15 @@ public final class AnthropicOAuthTransport: LLMTransport {
             .appendingPathComponent("anthropic_oauth_direct.json")
     }
 
-    /// Readiness and execution share the renewal margin and forced-refresh rules.
+    /// Readiness and execution share the renewal margin.
     func ensureFreshAccessToken(
-        forceRefresh: Bool = false,
-        staleToken: String? = nil,
         requestAccount: OAuthRequestAccount = OAuthRequestAccount()
     ) async throws -> String {
-        try OAuthProductionSession.validate(session)
         let path = resolveAuthPath()
         let data = try Data(contentsOf: path)
         let object = try ProviderStateValidation.credential(data: data)
-        try requestAccount.check(object, provider: "anthropic_oauth_direct", rejectedToken: staleToken)
-        if !forceRefresh, let (token, exp) = Self.accessTokenAndExpiry(in: object) {
+        try requestAccount.check(object, provider: "anthropic_oauth_direct")
+        if let (token, exp) = Self.accessTokenAndExpiry(in: object) {
             if let exp = exp {
                 if exp.timeIntervalSinceNow > OAuthGrantOperations.renewalMargin {
                     return token
@@ -338,13 +322,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
             let data = try Data(contentsOf: path)
             let object = try ProviderStateValidation.credential(data: data)
             try requestAccount.check(object, provider: "anthropic_oauth_direct")
-            // A forced refresh reuses the on-disk token when another waiter has already rotated it.
-            if forceRefresh, let staleToken, !staleToken.isEmpty,
-               let (token, _) = Self.accessTokenAndExpiry(in: object),
-               token != staleToken {
-                return token
-            }
-            if !forceRefresh, let (token, exp) = Self.accessTokenAndExpiry(in: object) {
+            if let (token, exp) = Self.accessTokenAndExpiry(in: object) {
                 if let exp = exp, exp.timeIntervalSinceNow > OAuthGrantOperations.renewalMargin {
                     return token
                 }
@@ -393,6 +371,9 @@ public final class AnthropicOAuthTransport: LLMTransport {
     private func refreshTokens(
         at path: URL, baseline: Data, object obj: [String: Any], requestAccount: OAuthRequestAccount
     ) async throws -> String {
+        guard let refreshEndpoint else {
+            throw LLMError.providerError(message: "Anthropic refresh endpoint is invalid; correct its provider configuration.")
+        }
         try ProviderStateValidation.credential(obj)
         let tokenSet = OAuthRefreshBinding.tokenSet(obj, provider: "anthropic_oauth_direct")
         let refresh = tokenSet["refresh_token"] as? String
@@ -408,11 +389,12 @@ public final class AnthropicOAuthTransport: LLMTransport {
         ]
         let (rdata, response): (Data, URLResponse)
         do {
-            (rdata, response) = try await OAuthGrantOperations.post(refreshEndpoint, body, json: true, timeout: 30, session: session)
+            (rdata, response) = try await OAuthGrantOperations.post(refreshEndpoint, body, json: true, session: session)
         } catch {
             throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: refreshEndpoint, operation: "refresh"))
         }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        let status = http.statusCode
         if !(200..<300).contains(status) {
             // Refresh 429 preserves Retry-After; 5xx is transient and neither revokes the credential.
             if status == 429 {
@@ -492,26 +474,5 @@ public final class AnthropicOAuthTransport: LLMTransport {
             options: [.prettyPrinted, .sortedKeys]
         )
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path.resolvingSymlinksInPath())
-    }
-}
-
-extension AnthropicOAuthTransport {
-    /// A text-tool stop without a complete call logs only markup tag names, never chat text.
-    static func logStopWithoutToolCall(_ stopReason: String?, _ text: String) {
-        guard stopReason == "stop_sequence",
-              !text.contains("</invoke>"), !text.contains("</tool_use>") else { return }
-        logCutoffShape(text, event: "stop_sequence without tool call")
-    }
-
-    static func logCutoffShape(_ text: String, event: String = "max_tokens cutoff") {
-        var counts: [String: Int] = [:]
-        let pattern = try? NSRegularExpression(pattern: #"</?[a-z_][a-z0-9_:-]{0,30}(?=[\s>])"#)
-        let range = NSRange(text.startIndex..., in: text)
-        pattern?.enumerateMatches(in: text, range: range) { match, _, _ in
-            if let match, let r = Range(match.range, in: text) { counts[String(text[r]), default: 0] += 1 }
-        }
-        let headerCount = text.components(separatedBy: "NativeAgent tool result").count - 1
-        let shape = counts.sorted { $0.value > $1.value }.prefix(12).map { "\($0.key)x\($0.value)" }.joined(separator: " ")
-        ModuleLog(subsystem: "NativeAgent", category: "Anthropic")("\(event) chars=\(text.count) resultHeaders=\(headerCount) tags=\(shape)", level: .error)
     }
 }

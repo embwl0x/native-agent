@@ -78,12 +78,11 @@ struct JobDoorFailure: Error, LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// One run's outlet: its events in order, `ended` exactly once and last, and the organ's beat on the nerve spine (worked at most once a minute, failed and
-/// stopped as they happen).
+/// One run's outlet: ordered events and exactly one terminal result on the stream and nerve spine.
 final class JobDoorOut: Sendable {
     private let continuation: AsyncThrowingStream<JobEvent, Error>.Continuation
     let organ: String
-    private let state = OSAllocatedUnfairLock<(ended: Bool, beat: Date?)>(initialState: (false, nil))
+    private let ended = OSAllocatedUnfairLock(initialState: false)
 
     init(_ continuation: AsyncThrowingStream<JobEvent, Error>.Continuation, contact: AgentPeerContact) {
         self.continuation = continuation
@@ -92,13 +91,13 @@ final class JobDoorOut: Sendable {
 
     func send(_ event: JobEvent) {
         let ending: Bool = if case .ended = event { true } else { false }
-        guard state.withLock({ state -> Bool in
-            guard !state.ended else { return false }
-            if ending { state.ended = true }
+        guard ended.withLock({ ended -> Bool in
+            guard !ended else { return false }
+            if ending { ended = true }
             return true
         }) else { return }
         switch event {
-        case .working(let note): beat(note)
+        case .working(let note): OrganPulse.record(organ, .worked, note: String(note.prefix(200)))
         case .ended(.finished): OrganPulse.record(organ, .worked, note: "finished its job")
         case .ended(.failed(let why)): OrganPulse.record(organ, .failed, note: String(why.prefix(300)))
         case .ended(.stopped(let why)): OrganPulse.record(organ, .stopped, note: String(why.prefix(300)))
@@ -108,24 +107,25 @@ final class JobDoorOut: Sendable {
         if ending { continuation.finish() }
     }
 
+    func fail(_ failure: JobDoorFailure) {
+        guard ended.withLock({ ended -> Bool in
+            guard !ended else { return false }
+            ended = true
+            return true
+        }) else { return }
+        OrganPulse.record(organ, .failed, note: String(failure.message.prefix(300)))
+        continuation.finish(throwing: failure)
+    }
+
     /// The agent's stop ends the stream before the run does, so its beat is recorded here and nothing more is sent.
     func stopped(_ why: String) {
-        guard state.withLock({ state -> Bool in
-            defer { state.ended = true }
-            return !state.ended
+        guard ended.withLock({ ended -> Bool in
+            defer { ended = true }
+            return !ended
         }) else { return }
         OrganPulse.record(organ, .stopped, note: why)
     }
 
-    private func beat(_ note: String) {
-        let now = Date()
-        guard state.withLock({ state -> Bool in
-            if let last = state.beat, now.timeIntervalSince(last) < 60 { return false }
-            state.beat = now
-            return true
-        }) else { return }
-        OrganPulse.record(organ, .worked, note: String(note.prefix(200)))
-    }
 }
 
 /// One organ's run in this app: the task that drives it, which the agent's stop reaches by the organ's session.
@@ -210,7 +210,7 @@ enum JobDoorBroker {
                                                      commission: record.commission, inbox: SwiftNativeApprovalInbox(root: dataRoot))
         } catch {
             guard !Task.isCancelled else { return false }
-            out.send(.working(note: "A request outside the job's reach was declined: its card could not be filed (\(error.localizedDescription))."))
+            out.fail(JobDoorFailure("Its permission card could not be filed: \(error.localizedDescription)."))
             return false
         }
         out.send(.working(note: (allowed ? "You allowed, once: " : "You declined: ") + String(ask.title.prefix(200))))
@@ -237,27 +237,35 @@ enum JobDoorArtifacts {
         if FileManager.default.fileExists(atPath: folder.appendingPathComponent(".git").path) {
             let ran = try await ProcessExecution().run(executable: "/usr/bin/git",
                 arguments: ["-C", folder.path, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
-                currentDirectory: folder, environment: nil, standardInput: nil, timeoutSeconds: 120, outputByteLimit: 8 * 1_048_576)
+                currentDirectory: folder, environment: nil, standardInput: nil, timeoutSeconds: nil, outputByteLimit: 8 * 1_048_576)
             guard ran.exitCode == 0, !ran.timedOut, !ran.stdoutTruncated else {
                 throw JobDoorFailure("git status in \(folder.path) did not answer (exit \(ran.exitCode)): \(ran.stderr.prefix(300))")
             }
             candidates = ran.stdout.split(separator: "\0").compactMap { entry in
-                entry.count > 3 ? folder.appendingPathComponent(String(entry.dropFirst(3))) : nil
+                guard entry.count > 3 else { gaps.append("git status returned an incomplete entry"); return nil }
+                // A deleted path is work, but only a file that remains (including either side of a delete conflict) is inventoried.
+                let url = folder.appendingPathComponent(String(entry.dropFirst(3)))
+                return FileManager.default.fileExists(atPath: url.path) ? url : nil
             }
         } else {
             let walked = try walk(folder)
             candidates = walked.found
             gaps += walked.gaps
         }
-        var dated: [(URL, Date)] = [], unstated = 0
+        var dated: [(URL, Date)] = []
         for url in candidates {
             let values: URLResourceValues
             do { values = try url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]) }
-            catch { if FileManager.default.fileExists(atPath: url.path) { unstated += 1 }; continue }
-            guard values.isRegularFile == true, let modified = values.contentModificationDate, modified >= since else { continue }
+            catch { gaps.append("\(url.path): \(error.localizedDescription)"); continue }
+            guard let regular = values.isRegularFile else { gaps.append("\(url.path): file kind is unavailable"); continue }
+            guard regular else { continue }
+            guard let modified = values.contentModificationDate else {
+                gaps.append("\(url.path): modification date is unavailable")
+                continue
+            }
+            guard modified >= since else { continue }
             dated.append((url, modified))
         }
-        if unstated > 0 { gaps.append("\(unstated) changed path\(unstated == 1 ? "" : "s") could not be read") }
         dated.sort { $0.1 > $1.1 }
         if dated.count > limit { gaps.append("\(dated.count) files changed; the \(limit) newest came back") }
         return Found(files: dated.prefix(limit).map(\.0), gap: gaps.isEmpty ? nil : gaps.joined(separator: "; "))
@@ -265,9 +273,12 @@ enum JobDoorArtifacts {
 
     /// Every entry under a folder that is not a repo, past nothing but `.git`. Synchronous: the directory enumerator is not for async contexts.
     static func walk(_ folder: URL) throws -> (found: [URL], gaps: [String]) {
-        let unreadable = OSAllocatedUnfairLock(initialState: 0)
+        let unreadable = OSAllocatedUnfairLock<[String]>(initialState: [])
         guard let walk = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
-            options: [], errorHandler: { _, _ in unreadable.withLock { $0 += 1 }; return true }) else {
+            options: [], errorHandler: { url, error in
+                unreadable.withLock { $0.append("\(url.path): \(error.localizedDescription)") }
+                return true
+            }) else {
             throw JobDoorFailure("\(folder.path) could not be read")
         }
         var seen = 0, found: [URL] = [], gaps: [String] = []
@@ -277,22 +288,15 @@ enum JobDoorArtifacts {
             if url.lastPathComponent == ".git" { walk.skipDescendants(); continue }
             found.append(url)
         }
-        let skipped = unreadable.withLock { $0 }
-        if skipped > 0 { gaps.append("\(skipped) entr\(skipped == 1 ? "y" : "ies") of the folder could not be read") }
+        gaps += unreadable.withLock { $0 }
         return (found, gaps)
     }
 
-    /// The deliverable a folder job reports: what changed, the organ's own final words and the model it said it used. A list that cannot be read is said,
-    /// and the job's check still judges the folder.
-    static func deliverable(_ job: JobStart, since: Date, report: String?, model: String?, out: JobDoorOut) async -> JobDeliverable {
+    /// Named inventory failures travel beside successfully read files; they prevent successful settlement.
+    static func deliverable(_ job: JobStart, since: Date, report: String?, model: String?) async throws -> JobDeliverable {
         guard let folder = job.folder else { return JobDeliverable(artifacts: [], report: report, model: model) }
-        do {
-            let found = try await changed(in: folder, since: since)
-            if let gap = found.gap { out.send(.working(note: "What it made, as listed: " + gap + ".")) }
-            return JobDeliverable(artifacts: found.files, report: report, model: model)
-        } catch {
-            out.send(.working(note: "What it changed in \(folder.path) could not be listed (\(error.localizedDescription)); none of it was registered."))
-            return JobDeliverable(artifacts: [], report: report, model: model)
-        }
+        let found = try await changed(in: folder, since: since)
+        let failure = found.gap.map { "Artifact inventory in \(folder.path) is incomplete: \($0)." }
+        return JobDeliverable(artifacts: found.files, report: report, model: model, inventoryFailure: failure)
     }
 }

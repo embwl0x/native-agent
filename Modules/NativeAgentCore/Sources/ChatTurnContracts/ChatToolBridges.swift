@@ -27,22 +27,6 @@ public protocol MacIntegrationToolBridge: Sendable {
     func contactsSearch(input: [String: JSONValue]) async throws -> JSONValue
     func contactsCreateOrUpdate(input: [String: JSONValue]) async throws -> JSONValue
 
-    func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue
-    func mailAttachment(input: [String: JSONValue]) async throws -> (filename: String, data: Data)
-    func mailReadBatch(input: [String: JSONValue]) async throws -> JSONValue
-    func mailTriageBatch(input: [String: JSONValue]) async throws -> JSONValue
-    func mailSearch(input: [String: JSONValue]) async throws -> JSONValue
-    func mailSenders(input: [String: JSONValue]) async throws -> JSONValue
-    func mailSend(input: [String: JSONValue]) async throws -> JSONValue
-
-    func messagesRecentThreads(input: [String: JSONValue]) async throws -> JSONValue
-    func messagesSend(input: [String: JSONValue]) async throws -> JSONValue
-
-    func notesSearch(input: [String: JSONValue]) async throws -> JSONValue
-    func notesCreate(input: [String: JSONValue]) async throws -> JSONValue
-
-    func musicNowPlaying(input: [String: JSONValue]) async throws -> JSONValue
-    func musicControl(input: [String: JSONValue]) async throws -> JSONValue
 
     // Sensitive writes default off in MacIntegrationPermissionStore.
 
@@ -56,24 +40,10 @@ public protocol MacIntegrationToolBridge: Sendable {
     func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue
     func remindersDelete(input: [String: JSONValue]) async throws -> JSONValue
 
-    func mailMarkRead(input: [String: JSONValue]) async throws -> JSONValue
-    func mailArchive(input: [String: JSONValue]) async throws -> JSONValue
-    func mailDelete(input: [String: JSONValue]) async throws -> JSONValue
-    func mailReply(input: [String: JSONValue]) async throws -> JSONValue
-    func mailDraft(input: [String: JSONValue]) async throws -> JSONValue
-
-    func notesModify(input: [String: JSONValue], deleting: Bool) async throws -> JSONValue
-
-    func musicSearchLibrary(input: [String: JSONValue]) async throws -> JSONValue
-    func musicListLibrary(input: [String: JSONValue]) async throws -> JSONValue
-    func musicListPlaylists(input: [String: JSONValue]) async throws -> JSONValue
-
     func contactsDelete(input: [String: JSONValue]) async throws -> JSONValue
 
-    // Scheduler access has no read axis; listing jobs requires write permission.
+    // Scheduled reads have no read axis; listing them requires write permission.
     func schedulerListJobs(input: [String: JSONValue]) async throws -> JSONValue
     func schedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue
     func schedulerCancelJob(input: [String: JSONValue]) async throws -> JSONValue
-    func schedulerSetJobEnabled(input: [String: JSONValue], enabled: Bool) async throws -> JSONValue
-    func schedulerUpdateJob(input: [String: JSONValue]) async throws -> JSONValue
 }

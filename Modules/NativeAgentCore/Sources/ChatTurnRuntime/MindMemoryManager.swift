@@ -8,7 +8,8 @@ import ProviderRouting
 import TurnTrace
 import PersistenceCore
 import DreamREMCycle
-// Blueprint: | `MindMemoryManager.swift` | `MindMemoryJudgment` struct; `predictionModelKey` (the record's key for the model the judgment runs on, read without changing the request; the interpretation reports the same model), `interpret` (with cares when shown and optional reply-grounded promises), `interpretBatch` (owed turns in one call, the same parser and rules once, one section per turn; a missing section stays owed), `appraiseCares`, `relevantRecallIDs`; incremental ranked evidence and catalog-budgeted relevance batches; `AfterTurnMemoryFailure` preserves output limits, request rejections and refusals with distinct recovery |
+import Desk
+// Blueprint: | `MindMemoryManager.swift` | `MindMemoryJudgment` struct; `predictionModelKey` (the record's key for the model the judgment runs on, read without changing the request; the interpretation reports the same model), `interpret` (with cares, optional reply-grounded promises and person-quoted settlements against shown open moments), `interpretBatch` (owed turns in one call, the same parser and rules once, one section per turn; a missing section stays owed), candidate-only `capturePromises`, `appraiseCares`, `relevantRecallIDs`; incremental ranked evidence and catalog-budgeted relevance batches; `AfterTurnMemoryFailure` preserves output limits, request rejections and refusals with distinct recovery |
 
 public struct MindMemoryJudgment: MemoryManaging {
     private let makeLLMClient: @Sendable (PrivateWorkContextAssembly) -> any LLMClient
@@ -68,7 +69,7 @@ public struct MindMemoryJudgment: MemoryManaging {
         case .authExpired: return .authExpired
         case .codexCLISessionExpired: return .codexCLISessionExpired
         case .rateLimited: return .rateLimited
-        case .quotaExceeded: return .provider
+        case .quotaExceeded, .billingNotConfigured: return .provider
         case .overloaded: return .overloaded
         case .contextTooLong: return .contextTooLong
         case .network, .offline: return .network
@@ -144,7 +145,7 @@ public struct MindMemoryJudgment: MemoryManaging {
         return detail.map { $0 + " " + fix } ?? fix
     }
 
-    public func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String? = nil, topK: Int? = nil) async
+    public func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String? = nil, topK: Int? = nil, turn: Turn?) async
         -> Result<Set<String>, AfterTurnMemoryFailure> {
         let started = ProcessInfo.processInfo.systemUptime
         // Judge the embedding's bounded ranking prefix; lower rows already lost relevance.
@@ -339,7 +340,7 @@ public struct MindMemoryJudgment: MemoryManaging {
                     let dispatched = batch
                     group.addTask {
                         let started = ProcessInfo.processInfo.systemUptime
-                        let result = await relevantRecallBatch(prompt: prompt, candidates: dispatched, route: route)
+                        let result = await relevantRecallBatch(prompt: prompt, candidates: dispatched, route: route, turn: turn)
                         return (dispatched, result, (ProcessInfo.processInfo.systemUptime - started) * 1_000)
                     }
                 }
@@ -404,7 +405,7 @@ public struct MindMemoryJudgment: MemoryManaging {
         get throws { try completionPolicy("recall-selection", section: "system") }
     }
 
-    private func relevantRecallBatch(prompt: String, candidates: [RecallPage], route: RecallRoute) async
+    private func relevantRecallBatch(prompt: String, candidates: [RecallPage], route: RecallRoute, turn: Turn?) async
         -> Result<Set<String>, AfterTurnMemoryFailure> {
         let surface = route.surface
         let model = route.model
@@ -416,7 +417,7 @@ public struct MindMemoryJudgment: MemoryManaging {
         guard prompt.utf8.count <= route.payloadByteCap else { return failed(.contextTooLong) }
         let response: String
         do {
-            var call = LLMCall(turn: nil, surface: surface, purpose: "recall_judge")
+            var call = LLMCall(turn: turn, surface: surface, purpose: "recall_judge")
             call.admission = try route.admission.modelAdmission
         response = try await makeLLMClient(.taskOnly).complete(
                 prompt: prompt, system: Self.relevanceSystem, model: model, tools: nil,
@@ -457,7 +458,7 @@ public struct MindMemoryJudgment: MemoryManaging {
     /// The account is the route's provider id, so switching accounts for the same model changes the key.
     public func judgmentRouteKey() async -> String? {
         guard let route = try? await Self.judgmentRoute() else { return nil }
-        return [route.surface, route.admission.providerId ?? "", route.model].joined(separator: "\u{0}")
+        return AfterTurnMemorySurprise.fingerprint([route.surface, route.admission.providerId ?? "", route.model])
     }
 
     private static func judgmentRoute() async throws -> JudgmentRoute {
@@ -515,6 +516,62 @@ public struct MindMemoryJudgment: MemoryManaging {
         }
     }
 
+    /// Match at filing time so deferred exchanges and refolds see work that earlier captures actually landed.
+    public func capturePromises(_ promises: [MemoryManagerPromise], reply: String,
+                                open: [DeskItem], call: LLMCall) async throws
+        -> [MemoryManagerPromiseCapture] {
+        guard !promises.isEmpty else { return [] }
+        let route = try await Self.judgmentRoute()
+        let candidates: [JSONValue] = promises.enumerated().map { index, promise in
+            .object(["id": .int(Int64(index)), "words": .string(promise.words), "when": .string(promise.when), "source": .string(promise.source)])
+        }
+        let input = try JSONValue.object(["candidates": .array(candidates), "open": .array(Self.deskRows(open)),
+            "reply": .string(reply)]).serialize(pretty: false)
+        let text = try await judgedText(prompt: completionPolicy("turn-interpretation", section: "promise-capture", arguments: [input]),
+            system: completionPolicy("turn-interpretation", section: "promise-capture-system"),
+            purpose: "memory_promise", route: route, call: call)
+        return try await Self.settledObject(text: text, route: route) { object in
+            func invalid(_ words: String) -> AfterTurnMemoryFailure {
+                route.failed(.invalidMemories, recovery: "Invalid promise capture: " + words)
+            }
+            guard let groups = object["captures"] as? [[String: Any]] else { throw invalid("captures must be an array of groups.") }
+            var covered: Set<Int> = [], targets: Set<String> = []
+            var captures: [MemoryManagerPromiseCapture] = []
+            for group in groups {
+                guard let ids = group["candidates"] as? [Int], !ids.isEmpty,
+                      Set(ids).count == ids.count, ids.allSatisfy({ promises.indices.contains($0) && !covered.contains($0) }),
+                      let target = group["target"] as? String else { throw invalid("Each candidate must belong to exactly one named group.") }
+                covered.formUnion(ids)
+                if target == "ignore" { captures.append(.ignore); continue }
+                let item = open.first { $0.handle == target }
+                guard target == "new" || item != nil else { throw invalid("The target is not an open Desk id: " + target) }
+                if target != "new", !targets.insert(target).inserted { throw invalid("A restatement must be grouped on its one target: " + target) }
+                let members = ids.compactMap { id in promises.indices.contains(id) ? promises[id] : nil }
+                guard let words = group["words"] as? String, !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let source = group["source"] as? String, members.contains(where: { $0.source == source }), reply.contains(source),
+                      let namedWhen = group["when"] as? String else { throw invalid("Kept groups need words, when and exact candidate evidence.") }
+                let when: String
+                if namedWhen == "keep" {
+                    guard let step = item?.step else { throw invalid("Only an existing step has a condition to keep.") }
+                    if step.when == "after_card" {
+                        guard let card = step.card else { throw invalid("The target's approval condition has no card.") }
+                        when = "after_card " + card
+                    } else { when = step.when }
+                } else {
+                    guard members.contains(where: { $0.when == namedWhen }) else { throw invalid("The group invented a time its candidates never named.") }
+                    when = namedWhen
+                }
+                let evidence = members.map(\.source).reduce(into: [String]()) { result, source in
+                    if !result.contains(source) { result.append(source) }
+                }.joined(separator: "\n")
+                captures.append(.keep(MemoryManagerPromise(words: words.trimmingCharacters(in: .whitespacesAndNewlines), when: when, source: evidence),
+                                      target: target == "new" ? nil : target, candidates: ids))
+            }
+            guard covered == Set(promises.indices) else { throw invalid("The judgment left candidates unclassified.") }
+            return captures
+        }
+    }
+
     /// Required sections form a complete interpretation or name their failure.
     /// Optional promises may be absent/empty; malformed present promises keep the turn owed.
     private static func parseInterpretation(_ object: [String: Any], request: MemoryManagerRequest,
@@ -527,6 +584,9 @@ public struct MindMemoryJudgment: MemoryManaging {
         guard let affectObject = object["affect"] as? [String: Any],
               let affectData = try? JSONSerialization.data(withJSONObject: affectObject),
               let affect = try? JSONDecoder().decode(CognitiveSubstrate.AffectAppraisal.self, from: affectData) else { throw failed(.invalidAffect) }
+        if let choice = affect.chosenRegister {
+            guard request.assistantMessage.contains(choice.source) else { throw failed(.invalidAffect) }
+        }
         let memories: [MemoryManagerDecision]
         do { memories = try MemoryManagerLane.parse(memoriesValue) }
         catch { throw route.failed(.invalidMemories, recovery: String(describing: error)) }
@@ -541,15 +601,30 @@ public struct MindMemoryJudgment: MemoryManaging {
         let promises: [MemoryManagerPromise]
         do { promises = try MemoryManagerPromise.parse(object["promises"], reply: request.assistantMessage) }
         catch { throw route.failed(.invalidMemories, recovery: "Invalid promises section: \(error)") }
+        guard let rows = object["settled"] as? [[String: Any]] else {
+            throw route.failed(.missingSections, recovery: "settled must be an array of person-quoted settlements.")
+        }
+        var settled: [MemoryManagerSettlement] = []
+        var settledIDs: Set<String> = []
+        for row in rows {
+            guard let id = row["id"] as? String, let item = request.openMoments.first(where: { $0.handle == id }),
+                  MyQueue.entry(item) != nil, settledIDs.insert(id).inserted,
+                  let source = row["source"] as? String, !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  request.personWords.contains(source) else {
+                throw route.failed(.invalidMemories,
+                    recovery: "Settlement requires one shown open moment id and an exact quote from this turn's person_words.")
+            }
+            settled.append(MemoryManagerSettlement(id: id, updatedAt: item.updatedAt, source: source))
+        }
         return AfterTurnInterpretation(memories: memories, affect: affect, caring: caring,
                                        cares: cares,
-                                       promises: promises,
+                                       promises: promises, settled: settled,
                                        appAuthored: request.appAuthored, model: route.model, surface: route.surface)
     }
 
     /// Batch exchanges under their exact IDs; missing, malformed or duplicate sections leave only their own rows owed.
     public func interpretBatch(_ inputs: [MemoryBatchInput]) async throws -> [AfterTurnInterpretation?] {
-        guard !inputs.isEmpty, inputs.count <= MemoryManagerLane.batchLimit else { throw AfterTurnInterpretationFailure.envelope }
+        guard let first = inputs.first, inputs.count <= MemoryManagerLane.batchLimit else { throw AfterTurnInterpretationFailure.envelope }
         let route = try await Self.judgmentRoute()
         let prompt = try Self.interpretationRules + "\n"
             + completionPolicy("held-turn-batch", section: "prompt")
@@ -559,7 +634,7 @@ public struct MindMemoryJudgment: MemoryManaging {
             }.joined(separator: "\n\n")
         let text = try await judgedText(prompt: prompt,
             system: try completionPolicy("held-turn-batch", section: "system"),
-            purpose: "memory_held", route: route)
+            purpose: "memory_held", route: route, call: first.call)
         return try await Self.settledObject(text: text, route: route) { object -> [AfterTurnInterpretation?] in
             guard let replies = object["turns"] as? [Any] else { throw route.failed(.missingSections) }
             // Every repeated id is ambiguous, even if one section is malformed.
@@ -628,6 +703,21 @@ public struct MindMemoryJudgment: MemoryManaging {
         get throws { try completionPolicy("turn-interpretation", section: "rules") }
     }
 
+    private static func deskRows(_ open: [DeskItem]) -> [JSONValue] {
+        open.map { item in
+            var row: [String: JSONValue] = ["id": .string(item.handle), "label": .string("desk." + item.alias),
+                "title": .string(item.title), "project": .string(item.project), "status": .string(item.status.rawValue)]
+            if let summary = item.summary { row["summary"] = .string(summary) }
+            if let step = item.step {
+                row["words"] = .string(step.words)
+                row["when"] = .string(step.when)
+                if let card = step.card { row["card"] = .string(card) }
+                if let source = step.source { row["source"] = .string(source) }
+            }
+            return .object(row)
+        }
+    }
+
     static func prompt(_ request: MemoryManagerRequest, context: AfterTurnContext?,
                        factsEnabled: Bool, includeRules: Bool = true) throws -> String {
         let existing = request.existing.map {
@@ -642,6 +732,8 @@ public struct MindMemoryJudgment: MemoryManaging {
         let clock = ISO8601DateFormatter()
         clock.timeZone = .current
         let exchangeTime = request.occurredAt ?? context?.event.occurredAt ?? Date()
+        let settlementInput = try JSONValue.object(["person_words": .string(request.personWords),
+            "open_moments": .array(Self.deskRows(request.openMoments))]).serialize(pretty: false)
         return try completionPolicy("turn-interpretation", section: "prompt", arguments: [
             request.personName ?? "the person",
             request.appAuthored ? completionPolicy("turn-interpretation", section: "app-authored") : request.standingAgent
@@ -662,6 +754,7 @@ public struct MindMemoryJudgment: MemoryManaging {
             request.assistantMessage,
             request.took.map { $0 + "\n" } ?? "",
             Self.caresSection(shown, careWake: context?.careWakes.isEmpty == false),
+            completionPolicy("turn-interpretation", section: "settlement-input", arguments: [settlementInput]),
             MemoryKindStamp.writerKinds.joined(separator: "|"),
             shown.isEmpty ? "" : "," + Self.caresShape
         ])

@@ -5,7 +5,7 @@ import AVFoundation
 import NativeAgentShared
 // Blueprint: | `VoiceInputCapture.swift` | Consent-driven capture with terminal quality and audio attachments |
 
-/// Keep timeout distinct from final recognition so partial text remains recoverable without being submitted as a finished utterance.
+/// Only a final recognition result may be submitted; interrupted capture remains partial.
 public enum VoiceInputStopResult: Equatable, Sendable {
     case final(String)
     case partial(String)
@@ -21,7 +21,7 @@ public enum VoiceInputStopResult: Equatable, Sendable {
         case .final:
             nil
         case .partial:
-            "Voice input timed out before a final transcript was available. Try again."
+            "Voice input ended before a final transcript was available."
         case .failed(let message):
             message
         }
@@ -89,16 +89,12 @@ private func makeSpeechRecognitionHandler(
             }
         }
         if let error {
-            let nsError = error as NSError
-            let ignoredCodes: Set<Int> = [203, 216]
-            if nsError.domain != "kAFAssistantErrorDomain" || !ignoredCodes.contains(nsError.code) {
-                let message = failureMessage(error, "hear that")
-                Task { @MainActor [weak controller] in
-                    controller?.receiveNativeRecognitionFailure(
-                        message: message,
-                        generation: generation
-                    )
-                }
+            let message = failureMessage(error, "hear that")
+            Task { @MainActor [weak controller] in
+                controller?.receiveNativeRecognitionFailure(
+                    message: message,
+                    generation: generation
+                )
             }
         }
     }
@@ -127,26 +123,19 @@ public final class VoiceInputCapture {
     private var stopWaiters: [UUID: ScopedWaiter] = [:]
     private var stopResults: [UUID: VoiceInputStopResult] = [:]
     private var stopInFlight = false
-    // Retain terminal quality until the next capture because a queued UI stop can run after timeout in the same run-loop turn.
+    public var isStopping: Bool { stopInFlight }
+    // A queued UI stop reads the completed capture's terminal quality.
     private var latestStopResult: VoiceInputStopResult?
-    // Cancel the resolved stop's deadline so its stale timer cannot truncate a later capture.
-    private var stopTimeoutTask: Task<Void, Never>?
-    // Match completion to stop generation because an already-scheduled canceled task can still run on MainActor.
-    private var stopGeneration: UInt64 = 0
     private var recognitionGeneration: UInt64 = 0
-
-    private let stopTimeoutNanoseconds: UInt64
 
     public init(
         recognitionContext: @escaping @MainActor () -> [String],
         requestSpeechAuthorization: @escaping @MainActor () async -> SFSpeechRecognizerAuthorizationStatus,
-        failureMessage: @escaping @Sendable (Error, String) -> String,
-        stopTimeoutNanoseconds: UInt64 = 2_000_000_000
+        failureMessage: @escaping @Sendable (Error, String) -> String
     ) {
         self.recognitionContext = recognitionContext
         self.requestSpeechAuthorization = requestSpeechAuthorization
         self.failureMessage = failureMessage
-        self.stopTimeoutNanoseconds = stopTimeoutNanoseconds
     }
 
     private func prepareForCapture() {
@@ -166,34 +155,23 @@ public final class VoiceInputCapture {
     public func stopListeningResult() async -> VoiceInputStopResult {
         guard isListening else { return latestStopResult ?? .final(transcript) }
         let id = UUID(), done = ScopedWaiter()
+        let generation = recognitionGeneration
         stopWaiters[id] = done
         if !stopInFlight {
             stopInFlight = true
-            let generation = nextStopGeneration()
-            armStopTimeout(for: generation)
             finishRecognition()
         }
-        await Task { await done.park() }.value
-        return stopResults.removeValue(forKey: id)!
-    }
-
-    private func nextStopGeneration() -> UInt64 {
-        stopGeneration &+= 1
-        return stopGeneration
-    }
-
-    private func armStopTimeout(for generation: UInt64) {
-        stopTimeoutTask?.cancel()
-        let timeout = stopTimeoutNanoseconds
-        stopTimeoutTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: timeout)
-            guard !Task.isCancelled,
-                  let self,
-                  self.stopGeneration == generation else { return }
-            self.stopTimeoutTask = nil
-            self.errorMessage = "Voice input timed out before a final transcript was available. Try again."
-            self.cleanupRecognition(result: .partial(self.transcript))
+        await done.park()
+        if Task.isCancelled {
+            stopWaiters.removeValue(forKey: id)
+            stopResults.removeValue(forKey: id)
+            if recognitionGeneration == generation { discardListening() }
+            return .partial("")
         }
+        guard let result = stopResults.removeValue(forKey: id) else {
+            return .failed("Voice recognition ended without its terminal capture result.")
+        }
+        return result
     }
 
     private func resolveStopWaiters(with result: VoiceInputStopResult) {
@@ -201,8 +179,6 @@ public final class VoiceInputCapture {
         let waiters = stopWaiters
         stopWaiters.removeAll(keepingCapacity: false)
         stopInFlight = false
-        stopTimeoutTask?.cancel()
-        stopTimeoutTask = nil
         for (id, done) in waiters {
             stopResults[id] = result
             done.resume()
@@ -211,7 +187,6 @@ public final class VoiceInputCapture {
 
     private func cleanupRecognition(result: VoiceInputStopResult? = nil) {
         recognitionGeneration &+= 1
-        stopGeneration &+= 1
         cancelRecognition()
         var result = result
         if case .final? = result, let utterance, let recording {
@@ -224,8 +199,6 @@ public final class VoiceInputCapture {
         }
         recording = nil
         isListening = false
-        stopTimeoutTask?.cancel()
-        stopTimeoutTask = nil
         resolveStopWaiters(with: result ?? .final(transcript))
     }
 
@@ -368,6 +341,8 @@ public final class VoiceInputCapture {
     public func discardListening() {
         cleanupRecognition(result: .partial(""))
         transcript = ""
+        attachment = nil
+        utterance = nil
     }
 
     private func finishRecognition() {

@@ -60,19 +60,24 @@ public struct MacControlResult: Sendable, Equatable {
     }
 
     public func toJSON(readContent: OwnedProgramRunner.ReadContent?) -> JSONValue {
+        let outputFields = output.objectValue ?? [:]
         var fields: [String: JSONValue] = [
-            "status": .string(!ok ? "failed" : output.objectValue?["partial"] == .bool(true) ? "partial" : "completed"),
-            "partial": .bool(output.objectValue?["partial"] == .bool(true)),
+            "status": outputFields["status"] ?? .string(!ok ? "failed" : outputFields["partial"] == .bool(true) ? "partial" : "completed"),
+            "partial": .bool(outputFields["partial"] == .bool(true)),
             "ok": .bool(ok),
             "action": .string(action),
             "output": output,
-            "error": error.map { .string($0) } ?? .null,
             "durationMs": .int(Int64(durationMs)),
             "httpStatus": httpStatus.map { .int(Int64($0)) } ?? .null,
             "operationId": operationId.map { .string($0) } ?? .null,
             "operationState": operationState.map { .string($0.rawValue) } ?? .null,
             "verification": verification.map { .string($0.rawValue) } ?? .null,
         ]
+        fields["error"] = error.map(JSONValue.string)
+        // Owners supply receipt facts through the same projection for every action.
+        for key in ["delivery", "effects", "recorded", "delivered", "posted", "deferredUntil", "message", "notificationId"] {
+            fields[key] = outputFields[key]
+        }
         if !ok, case .object(let output) = output, let remedy = output["remedy"] { fields["remedy"] = remedy }
         let result = JSONValue.object(fields)
         readContent?.record(result,
@@ -160,11 +165,11 @@ public final class MacMotorCount: MacControlClient, @unchecked Sendable {
     public init(_ host: any MacControlClient) { self.host = host }
     public var started: Int { lock.withLock { count } }
 
-    public func dispatch(action: String, body: [String: JSONValue], turn: Turn, context: MacOperationContext) async throws -> MacControlResult {
+    @concurrent public func dispatch(action: String, body: [String: JSONValue], turn: Turn, context: MacOperationContext) async throws -> MacControlResult {
         try await counted(action) { try await self.host.dispatch(action: action, body: body, turn: turn, context: context) }
     }
 
-    public func dispatchApprovedInjection(
+    @concurrent public func dispatchApprovedInjection(
         action: String, body: [String: JSONValue], capability: MacInjectionCapability,
         turn: Turn, context: MacOperationContext
     ) async throws -> MacControlResult {

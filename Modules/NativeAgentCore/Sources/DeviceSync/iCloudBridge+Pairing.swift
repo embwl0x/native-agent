@@ -39,9 +39,10 @@ extension iCloudBridge {
     }
 
     private func pairingSecretForPublication() async throws -> Data {
-        // Callers exclude an in-flight write before entering this read.
-        let secret = try pairingPublicationOwed
-            ? PairingSecret.requireExistingSecret() : PairingSecret.loadOrGenerateSecret()
+        let owed = pairingPublicationOwed
+        let secret = try await sync.storage.perform {
+            try owed ? PairingSecret.requireExistingSecret() : PairingSecret.loadOrGenerateSecret()
+        }
         if sync.engine.pairingSecretRotation == .awaitingVerification {
             await sync.engine.finishPairingSecretRotation(with: secret)
             nativeLog("[PairingBootstrap] Reconciled pairing rotation from the exact existing Keychain item; pairing publication remains owed")
@@ -80,12 +81,13 @@ extension iCloudBridge {
         if pairingPublicationOwed {
             held = await publishPairing(secret) ? true : nil
         } else {
-            held = await transport.claimPairing(secret: secret)
-            if held == nil {
-                await recordSendResult(operation: "pairing", error:
-                    DeviceSyncError.transient(message: "The iPhone pairing record could not be read; retrying at the next sync."))
-            } else {
+            do {
+                held = try await transport.claimPairing(secret: secret)
                 await recordSendResult(operation: "pairing")
+            } catch {
+                await recordSendResult(operation: "pairing", error: error)
+                syncStatus = "The iPhone pairing record could not be read: \(error.localizedDescription)"
+                return
             }
         }
         guard generation == setupGeneration, let held else { return }
@@ -145,15 +147,17 @@ extension iCloudBridge {
 
     func notePhoneContact(at peerTimestamp: Date) {
         let contact = min(peerTimestamp, Date())
-        phoneContactReadFailure = nil
-        if contact > (lastPhoneContactAt ?? .distantPast) { lastPhoneContactAt = contact }
+        phoneContactRead.write {
+            phoneContactReadFailure = nil
+            if contact > (lastPhoneContactAt ?? .distantPast) { lastPhoneContactAt = contact }
+        }
     }
 
     /// Contact is the saved signed evidence; the shared key carries no device identity, so it says that a phone spoke, never which one.
     /// Unreadable evidence is unknown, never silence.
     func standing(of rows: [PairedPhoneStore.Phone]) -> NAPhoneStanding {
         let live = rows.filter { $0.status != .removed }
-        let connected: Bool? = lastPhoneContactAt != nil ? true : phoneContactReadFailure != nil ? nil : false
+        let connected: Bool? = phoneContactReadFailure != nil ? nil : lastPhoneContactAt != nil ? true : nil
         return NAPhoneStanding(connected: connected, waiting: live.filter { $0.status == .pending }.count,
                                approvers: live.filter { $0.status == .paired }.count)
     }
@@ -245,6 +249,10 @@ extension iCloudBridge {
         if let phoneContactReadFailure {
             return .init(.waiting, "Saved phone contact evidence is unavailable: \(phoneContactReadFailure)",
                          owner: .builder, lever: "Repair mobile/signed_peer_evidence.json while preserving its contents, then reconnect.")
+        }
+        if let failure = sync.engine.syncError {
+            return .init(.waiting, "Phone sync needs attention: \(failure)", owner: .builder,
+                         lever: "Repair the named storage or iCloud cause in Diagnostics, then refresh the phone connection.")
         }
         if let rejected = lastPhoneRejectedAt, rejected > (lastPhoneContactAt ?? .distantPast) {
             return .init(.broken,

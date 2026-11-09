@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `Turn.swift` | `Turn`: one identity handed to everything serving it; `TurnPart` keys each owner's state |
 
 /// One turn: which act it is, which run and session are its own, and each
@@ -54,6 +55,11 @@ public protocol TurnPart {
     static var unset: Value { get }
 }
 
+/// The renderer that admitted a presentation; disconnection never retargets its effects.
+public enum FacePresentationPart: TurnPart {
+    public static let unset: UUID? = nil
+}
+
 /// The provider route admitted once for the turn; adapters read it, a later
 /// picker change never splices into it.
 public struct ModelAdmission: Sendable, Equatable {
@@ -77,8 +83,19 @@ private enum PartialReplyPart: TurnPart { static let unset: (@Sendable (String) 
 private enum AdmissionPart: TurnPart { static let unset: ModelAdmission? = nil }
 private enum VerifiedSessionPart: TurnPart { static let unset: String? = nil }
 private enum ToolActPart: TurnPart { static let unset: String? = nil }
+private enum FileAccessPart: TurnPart { static let unset = ICloudChatFileAccessPolicy.Ceiling() }
 
 extension Turn {
+    /// The request's admitted file-access ceiling, shared by Trust, execution and the cards it files.
+    public var fileAccess: String? {
+        get { fileAccessCeiling.mode }
+        set { fileAccessCeiling = .init(newValue) }
+    }
+    /// Re-entry can only intersect authority; neither a wider ID nor an absent one erases a held restriction.
+    public var fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling {
+        get { self[FileAccessPart.self] }
+        set { self[FileAccessPart.self] = self[FileAccessPart.self].intersecting(newValue) }
+    }
     /// The enclosing tool act; nested receipts and terminal accounting retain its exact cause.
     public var act: String? {
         get { self[ToolActPart.self] }

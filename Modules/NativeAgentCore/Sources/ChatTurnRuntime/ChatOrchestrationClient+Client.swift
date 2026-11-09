@@ -1,5 +1,4 @@
 import AuthoredCapabilities
-import ChatToolParsing
 import Foundation
 import CryptoKit
 import NativeAgentCore
@@ -13,6 +12,7 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
+import ChatTurnContracts
 // Blueprint: | `ChatOrchestrationClient+Client.swift` | `SwiftNativeChatOrchestrationClient` actor; `chat`, `chatExecution`; `StructuredChatExecution` carries the response and typed success/failure; `withCurrentChatModel` admits the current Chat pick at a wake's `model.call`, so a run that never thinks needs no model; `withModelContext` binds the same client/provider/model/effort/tier for turns and wakes |
 
 // MARK: - SwiftNative impl
@@ -82,13 +82,6 @@ public actor SwiftNativeChatOrchestrationClient {
         providerLifecycleObserverInstalled: Bool = false,
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
-        // Reuse the executable parser; malformed or unknown calls remain actions.
-        RunawayOutputDetector.registerReadOnlyCalls { block, turn in
-            let calls = ToolCallParser.parse(block, parseInvoke: true, recordShims: false)
-            guard calls.count == 1, let call = calls.first, call.undeclaredKeys.isEmpty else { return false }
-            if call.name == "app" { return RunawayOutputDetector.isAppReadOnly(call.input, turn: turn) }
-            return ParallelToolDispatch.isParallelSafe(internalToolName: call.name, input: call.input, turn: turn)
-        }
         self.engine = engine
         self.tools = tools
         self.llm = llm
@@ -147,6 +140,7 @@ public actor SwiftNativeChatOrchestrationClient {
     ) async throws -> StructuredChatExecution {
         var turn = turn
         turn.peerSteering = turn.peerSteering ?? PeerDataTaint()
+        turn.messageDecisionCalls = turn.messageDecisionCalls ?? MessageDecisionCalls()
         turn.execution = turn.execution ?? ChatTurnExecution()
         if let serviceTier { turn = turn.with(\.requestedServiceTier, serviceTier) }
         turn.fileAccess = fileAccess

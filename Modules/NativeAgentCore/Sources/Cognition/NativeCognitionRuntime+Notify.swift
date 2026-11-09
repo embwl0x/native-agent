@@ -15,6 +15,14 @@ import MemoryV2
 
 extension NativeCognitionRuntime: InnerStateProviding {
 
+    /// Await only the existing bootstrap, then read warmth from the owner of the current felt nodes.
+    public func moodWarmth() async -> Double {
+        guard let bootstrapTask else { return 0 }
+        await bootstrapTask.value
+        guard bootstrapFailure == nil else { return 0 }
+        return await substrate.moodWarmth()
+    }
+
     /// Inner-state reads must not change feelings: peek substrate state and decay only a frozen body copy, never settle the live kernel.
     public func innerStateReading(
         windowHours: Double,

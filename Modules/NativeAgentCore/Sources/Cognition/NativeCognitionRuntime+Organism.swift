@@ -176,8 +176,7 @@ extension NativeCognitionRuntime {
         if let bootstrapFailure { throw PersistenceCoreError.ioFailure(bootstrapFailure) }
         // Dream completion is independent of optional body effects; the journal checkpoint witnesses no-effect settlement.
         if !(await organismKernel.snapshot().enabled) {
-            sourceWakes.reachDirty = true
-            _ = await runEventDrivenReplayWithDeadline(
+            _ = await runEventDrivenReplay(
                 reason: "replay_event:\(SomaticSignalKind.dreamCompleted.rawValue)", material: nil)
             return false
         }
@@ -198,13 +197,12 @@ extension NativeCognitionRuntime {
         }
         await rescheduleResidualRepairDeadline()
         publishRuntimeChange(reason: "somatic:dreamCompleted")
-        _ = await runEventDrivenReplayWithDeadline(reason: "replay_event:dreamCompleted", material: nil)
+        _ = await runEventDrivenReplay(reason: "replay_event:dreamCompleted", material: nil)
         return true
     }
 
     private func settleDreamSignal(_ signal: SomaticSignal) async -> Result<Void, PersistenceCoreError> {
         await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(.dreamCompleted))
-        sourceWakes.reachDirty = true
         await drainFeltResolutionsIntoSubstrate()
         cachedBodyRead = nil
         guard await organismKernel.hasCompletedDream(signal.id),
@@ -267,8 +265,6 @@ extension NativeCognitionRuntime {
     ) async {
         let kind = signal.kind
         await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(kind))
-        // A committed diary invalidates Reach even after a clean scan.
-        if kind == .dreamCompleted { sourceWakes.reachDirty = true }
         await drainFeltResolutionsIntoSubstrate()
         cachedBodyRead = nil
         if persistSynchronously {
@@ -283,7 +279,7 @@ extension NativeCognitionRuntime {
         if kind == .dreamCompleted || kind == .remIntegrated {
             let reason = "replay_event:\(kind.rawValue)"
             // Replay owns flight and terminal accounting; journal acknowledgement prevents duplicate dream reflection.
-            _ = await runEventDrivenReplayWithDeadline(reason: reason,
+            _ = await runEventDrivenReplay(reason: reason,
                 material: reflectAfterReplay ? reflectionMaterial : nil)
         }
     }

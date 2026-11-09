@@ -64,12 +64,9 @@ extension ApprovalExecution {
     /// One domain executor, shared by resolution and crash recovery.
     public struct ApprovalExecutor {
         let action: String
-        let shouldReconcile: (ApprovalRecord) -> Bool
         let execute: (ApprovalRecord) async throws -> Void
-        public init(action: String, shouldReconcile: @escaping (ApprovalRecord) -> Bool = { _ in true },
-                    execute: @escaping (ApprovalRecord) async throws -> Void) {
+        public init(action: String, execute: @escaping (ApprovalRecord) async throws -> Void) {
             self.action = action
-            self.shouldReconcile = shouldReconcile
             self.execute = execute
         }
     }
@@ -146,7 +143,7 @@ extension ApprovalExecution {
             let domains = approvalExecutors(turn: nil)
             let unresolved = refreshed.filter { record in
                 selected.contains(record.id) && ((record.executedAction == nil && (record.decision == "approved"
-                    || domains.contains { executor in ExecutionEventVocabulary.matches(record.action, executor.action) && executor.shouldReconcile(record) }))
+                    || domains.contains { executor in ExecutionEventVocabulary.matches(record.action, executor.action) }))
                     || retry.contains(record.id))
             }.map(\.id)
             let retainedIDs = Set(refreshed.map(\.id))
@@ -178,7 +175,6 @@ extension ApprovalExecution {
         for kind in kinds {
             for rec in records where rec.executedAction == nil
                 && ExecutionEventVocabulary.matches(rec.action, kind.action) {
-                guard kind.shouldReconcile(rec) else { continue }
                 nativeLog("[approvalReconcile] reconciling unexecuted resolved \(kind.action) "
                     + "\(rec.id) (decision: \(rec.decision ?? "?"))")
                 do { try await kind.execute(rec) }
@@ -195,10 +191,6 @@ extension ApprovalExecution {
             ApprovalExecutor(
                 action: "rem.proposal",
                 execute: { await client.applyResolvedREMProposal(from: $0) }),
-            ApprovalExecutor(
-                action: "self_improvement.apply",
-                shouldReconcile: { $0.decision == "approved" },
-                execute: { await client.applyApprovedSelfImprovement(from: $0, turn: turn) }),
             ApprovalExecutor(
                 action: "browser.open_url",
                 execute: { try await self.executeResolvedBrowserRun(from: $0) }),

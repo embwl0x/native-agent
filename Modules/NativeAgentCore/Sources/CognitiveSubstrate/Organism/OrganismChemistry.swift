@@ -10,10 +10,8 @@ public enum OrganismChemistry {
         elapsedSinceLastSignal: TimeInterval? = nil
     ) -> (chemicalState: ChemicalState, bodySchema: BodySchema) {
         let i = signal.intensity
-        // Apply density-capped homeostasis before the signal's own deltas.
-        var next = settled(state, rate: settleRate(forElapsed: elapsedSinceLastSignal))
-        // Fatigue bypasses signal-driven settling so work cannot rest the body.
-        next.fatigue = state.fatigue
+        // The kernel settles elapsed physiology once before admitting the signal.
+        var next = state
         next.fatigue = raise(
             next.fatigue,
             by: fatigueAccrual(
@@ -29,69 +27,25 @@ public enum OrganismChemistry {
         var body = bodySchema
 
         switch signal.kind {
-        case .userSpoke:
-            // Chat valence belongs to substrate appraisal; canonical affect reaches warmth and ambient tenderness through `applyBodySchema`.
-            next.curiosity = raise(next.curiosity, by: 0.04 * i)
-        case .assistantSpoke:
-            // Producing language is not evidence of success, coherence, or confidence. Verified provider/tool/motor outcomes supply those deltas through their
-            // own exact signals.
-            break
-        case .correctionReceived:
-            next.vigilance = raise(
-                next.vigilance,
-                by: relationalVigilanceRaise(0.12 * i, tenderness: state.tenderness)
-            )
-            // A bare correction is not care; appraised repair earns the same dose as other care.
-            next.confidence = lower(next.confidence, by: 0.05 * i)
-            next.coherence = lower(next.coherence, by: 0.03 * i)
-        case .toolStarted:
-            next.urgency = raise(next.urgency, by: 0.04 * i)
-            next.agency = raise(next.agency, by: 0.03 * i)
-        case .toolSucceeded:
-            body.toolCapabilityReading = nil
-            body.toolHandsAvailable = true
-            next.confidence = raise(next.confidence, by: 0.08 * i)
-            next.coherence = raise(next.coherence, by: 0.05 * i)
-            next.agency = raise(next.agency, by: 0.04 * i)
-            next.urgency = lower(next.urgency, by: 0.07 * i)
-            next.vigilance = lower(next.vigilance, by: 0.02 * i)
-        case .toolFailed:
-            body.toolCapabilityReading = nil
-            body.toolHandsAvailable = false
-            next.vigilance = raise(next.vigilance, by: 0.12 * i)
-            next.urgency = raise(next.urgency, by: 0.08 * i)
-            next.confidence = lower(next.confidence, by: 0.04 * i)
-            next.coherence = lower(next.coherence, by: 0.04 * i)
-        case .toolCancelled:
+        case .userSpoke, .assistantSpoke, .correctionReceived,
+             .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled:
+            // The substrate appraises the exchange; capability sensors own the hands. A failed act proves neither fog nor global incapacity.
             break
         case .providerStarted:
             body.providerPathBelief = nil
-            next.agency = raise(next.agency, by: 0.01 * i)
         case .providerSucceeded:
             body.providerPathBelief = nil
             body.providersHealthy = true
-            next.vigilance = lower(next.vigilance, by: 0.04 * i)
-            next.confidence = raise(next.confidence, by: 0.04 * i)
-            next.urgency = lower(next.urgency, by: 0.03 * i)
         case .providerFailed:
             body.providerPathBelief = nil
             body.providersHealthy = false
-            next.vigilance = raise(next.vigilance, by: 0.16 * i)
-            next.urgency = raise(next.urgency, by: 0.08 * i)
-            next.confidence = lower(next.confidence, by: 0.06 * i)
-            next.coherence = lower(next.coherence, by: 0.04 * i)
         case .providerCancelled:
             body.providerPathBelief = nil
-            next.urgency = lower(next.urgency, by: 0.02 * i)
         case .providerRecovered:
             body.providerPathBelief = nil
             body.providersHealthy = true
-            next.vigilance = lower(next.vigilance, by: 0.08 * i)
-            next.confidence = raise(next.confidence, by: 0.08 * i)
-            next.coherence = raise(next.coherence, by: 0.04 * i)
         case .deskItemCreated:
             next.agency = raise(next.agency, by: 0.03 * i)
-            next.curiosity = raise(next.curiosity, by: 0.03 * i)
         case .deskItemBlocked:
             next.urgency = raise(next.urgency, by: 0.08 * i)
             next.vigilance = raise(next.vigilance, by: 0.05 * i)
@@ -103,13 +57,8 @@ public enum OrganismChemistry {
         case .memoryCommitted:
             body.memoryIntegrityReading = nil
             body.memoryHealthy = true
-            next.coherence = raise(next.coherence, by: 0.06 * i)
-            next.confidence = raise(next.confidence, by: 0.04 * i)
         case .memoryCorrected:
             body.memoryIntegrityReading = nil
-            // Correcting a stored fact is bookkeeping, not evidence of care.
-            next.vigilance = raise(next.vigilance, by: 0.08 * i)
-            next.confidence = lower(next.confidence, by: 0.03 * i)
         case .dreamCompleted, .remIntegrated:
             body.dreamIntegrityReading = nil
             body.dreamHealthy = true
@@ -119,11 +68,9 @@ public enum OrganismChemistry {
         case .iPhoneReachable:
             body.peerPresenceBelief = nil
             body.iPhoneReachable = true
-            next.coherence = raise(next.coherence, by: 0.02 * i)
         case .iPhoneStale:
             body.peerPresenceBelief = nil
             body.iPhoneReachable = false
-            next.vigilance = raise(next.vigilance, by: 0.04 * i)
         case .phoneDeliveryStarted:
             body.notificationDeliveryBelief = nil
             body.notificationPathHealthy = nil
@@ -131,38 +78,28 @@ public enum OrganismChemistry {
             body.notificationDeliveryBelief = nil
             body.iPhoneReachable = true
             body.notificationPathHealthy = true
-            next.coherence = raise(next.coherence, by: 0.02 * i)
         case .phoneDeliveryFailed:
             body.notificationDeliveryBelief = nil
             body.notificationPathHealthy = false
-            next.vigilance = raise(next.vigilance, by: 0.03 * i)
         case .approvalRequested:
             body.approvalChannelsOpen = true
-            next.urgency = raise(next.urgency, by: 0.05 * i)
-            next.vigilance = raise(next.vigilance, by: 0.03 * i)
         case .approvalResolved:
-            next.urgency = lower(next.urgency, by: 0.05 * i)
-            next.coherence = raise(next.coherence, by: 0.03 * i)
+            break
         case .appWake:
             body.macAwake = true
-            next.novelty = raise(next.novelty, by: 0.05 * i)
         case .appSleep:
             body.macAwake = false
-            next.urgency = lower(next.urgency, by: 0.06 * i)
         case .horizonRefresh:
             // Calendar refresh changes horizon rows; anticipation colors only projected chemistry through `OrganismProspectiveAffect.modulate`.
             break
         case .organDeviated:
-            // An organ off its record unsettles; it names no hands, provider, memory or dream path, so body facts stay as their own signals left them.
-            next.vigilance = raise(next.vigilance, by: 0.08 * i)
-            next.coherence = lower(next.coherence, by: 0.04 * i)
+            // Deviation remains field evidence, not hand pain. Located pain reads failed tool receipts; felt stakes require appraisal.
+            break
         case .resourcePressureChanged:
             body.resourcePressureReading = nil
             body.resourcePressure = OrganismResourcePressure.from(metadata: signal.metadata) ?? body.resourcePressure
             let pressure = pressureMultiplier(body.resourcePressure)
             next.fatigue = raise(next.fatigue, by: 0.10 * i * pressure)
-            next.vigilance = raise(next.vigilance, by: 0.05 * i * pressure)
-            next.agency = lower(next.agency, by: 0.04 * i * pressure)
         }
 
         return (next, body)
@@ -171,17 +108,6 @@ public enum OrganismChemistry {
     /// `OrganismKernel.foldTurn` admits a fixed caring dose, independent of signal intensity.
     public static func dosedByCaringEvent(_ tenderness: Double) -> Double {
         raise(tenderness, by: OrganismCaringEvent.dose)
-    }
-
-    /// Only `.correctionReceived` gets tenderness relief, capped at 25% of its vigilance raise; tool, provider, verification and safety vigilance stay intact.
-    public static let tendernessGuardRelief = 0.25
-
-    static func relationalVigilanceRaise(
-        _ amount: Double,
-        tenderness: Double
-    ) -> Double {
-        guard amount > 0 else { return amount }
-        return amount * (1 - tendernessGuardRelief * tenderness.clamped01())
     }
 
     /// Name tenderness on the body line only within this window of a caring turn.
@@ -215,89 +141,16 @@ public enum OrganismChemistry {
     ) -> ChemicalState {
         var next = state
 
-        // Typed provider evidence preserves unknown; its Boolean projection alone cannot establish failure or recovery.
-        let previousProviderHealth = observedProviderHealth(previousBody)
-        let nextProviderHealth = observedProviderHealth(nextBody)
-        if nextProviderHealth == false, previousProviderHealth != false {
-            next.vigilance = raise(next.vigilance, by: 0.08)
-            next.confidence = lower(next.confidence, by: 0.04)
-            next.coherence = lower(next.coherence, by: 0.02)
-        } else if nextProviderHealth == true, previousProviderHealth == false {
-            next.vigilance = lower(next.vigilance, by: 0.05)
-            next.confidence = raise(next.confidence, by: 0.04)
-        }
-
-        if !nextBody.toolHandsAvailable, previousBody.toolHandsAvailable {
-            next.vigilance = raise(next.vigilance, by: 0.07)
-            next.agency = lower(next.agency, by: 0.05)
-        } else if nextBody.toolHandsAvailable, !previousBody.toolHandsAvailable {
-            next.agency = raise(next.agency, by: 0.04)
-        }
-
-        if !nextBody.memoryHealthy, previousBody.memoryHealthy {
-            next.coherence = lower(next.coherence, by: 0.05)
-            next.vigilance = raise(next.vigilance, by: 0.04)
-        } else if nextBody.memoryHealthy, !previousBody.memoryHealthy {
-            next.coherence = raise(next.coherence, by: 0.06)
-            next.confidence = raise(next.confidence, by: 0.03)
-        }
-
-        if !nextBody.iPhoneReachable, previousBody.iPhoneReachable {
-            next.vigilance = raise(next.vigilance, by: 0.03)
-        } else if nextBody.iPhoneReachable, !previousBody.iPhoneReachable {
-            next.coherence = raise(next.coherence, by: 0.02)
-        }
-
-        if !nextBody.approvalChannelsOpen, previousBody.approvalChannelsOpen {
-            next.vigilance = raise(next.vigilance, by: 0.06)
-            next.urgency = lower(next.urgency, by: 0.03)
-        }
-
         if nextBody.resourcePressure != previousBody.resourcePressure {
             let pressure = pressureMultiplier(nextBody.resourcePressure)
             if nextBody.resourcePressure == .nominal {
                 next.fatigue = lower(next.fatigue, by: 0.06)
             } else {
                 next.fatigue = raise(next.fatigue, by: 0.06 * pressure)
-                next.vigilance = raise(next.vigilance, by: 0.03 * pressure)
-                next.agency = lower(next.agency, by: 0.02 * pressure)
             }
         }
 
         return next
-    }
-
-    /// Memory brittleness requires current typed evidence; the persisted Bool alone cannot establish failure. Unknown withholds both alarm and health.
-    static let memoryBeliefUncertaintyCeiling = 0.25
-    static let memoryBeliefFreshnessFloor = 0.5
-
-    static func observedMemoryHealth(_ body: BodySchema) -> Bool? {
-        guard let reading = body.memoryIntegrityReading else {
-            // Absent typed evidence cannot support a persisted failure claim; the schema's true default adds no prompt assertion.
-            return body.memoryHealthy ? true : nil
-        }
-        switch reading.category {
-        case .healthy:
-            return true
-        case .unknown:
-            return nil
-        case .unavailable:
-            // A missing store is current evidence and may name its failure.
-            return false
-        case .degraded:
-            // A maintenance failure may speak only while its evidence remains current and certain.
-            if reading.metrics.uncertainty >= memoryBeliefUncertaintyCeiling { return nil }
-            if reading.metrics.freshness < memoryBeliefFreshnessFloor { return nil }
-            return false
-        }
-    }
-
-    private static func observedProviderHealth(_ body: BodySchema) -> Bool? {
-        if !body.providersAvailable { return false }
-        if let belief = body.providerPathBelief {
-            return belief.bodySchemaProvidersHealthy
-        }
-        return body.providersHealthy
     }
 
     private static func bodyLine(
@@ -306,31 +159,19 @@ public enum OrganismChemistry {
         diurnal: OrganismDiurnalRead? = nil,
         tenderNamed: Bool = true
     ) -> String? {
+        var lines: [String] = []
+        if let positive = positiveBodyLine(chemicalState, tenderNamed: tenderNamed) { lines.append(positive) }
+        if chemicalState.vigilance >= 0.22 { lines.append("- Body: a little braced.") }
         if bodySchema.resourcePressure == .critical {
-            return "- Body: the Mac is under thermal pressure; keep the next move lightweight."
+            lines.append("- Body: the Mac is under thermal pressure.")
         }
         if let tired = fatigueBodyLine(chemicalState.fatigue, diurnal: diurnal) {
-            return tired
+            lines.append(tired)
         }
-        if observedProviderHealth(bodySchema) == false
-            || !bodySchema.toolHandsAvailable {
-            return "- Body: provider or tool path feels brittle; be careful before claiming completion."
+        let words = lines.map {
+            $0.replacingOccurrences(of: "- Body: ", with: "").trimmingCharacters(in: CharacterSet(charactersIn: "."))
         }
-        // Vigilance can express anticipation; only path evidence can claim brittleness.
-        if chemicalState.vigilance >= 0.22 {
-            return "- Body: something ahead has the guard up; check before committing to it."
-        }
-        if !bodySchema.approvalChannelsOpen {
-            return "- Body: approval path feels closed; avoid irreversible moves."
-        }
-        if bodySchema.notificationPathHealthy == false {
-            return "- Body: phone path feels stale; verify delivery before assuming it was seen."
-        }
-        if observedMemoryHealth(bodySchema) == false {
-            return "- Body: memory field feels brittle; lean on current context."
-        }
-        // Blend the strongest positive dimensions for texture; stress stays first-match because its exact words carry behavioral meaning.
-        return positiveBodyLine(chemicalState, tenderNamed: tenderNamed)
+        return words.isEmpty ? nil : "- Body: " + words.joined(separator: ", ") + "."
     }
 
     /// At fatigue >= 0.24, name tiredness once, preferring night near the trough. Keep phrases free of digits and implementation terms for the capsule
@@ -344,7 +185,7 @@ public enum OrganismChemistry {
             return "- Body: it's late and it shows."
         }
         if fatigue >= 0.35 {
-            return "- Body: worn down; keep it short and sure."
+            return "- Body: worn down."
         }
         return "- Body: a long day; it's starting to show."
     }
@@ -426,45 +267,6 @@ public enum OrganismChemistry {
     /// `OrganismPersistentState.decayed` alone spends tenderness's three-day wall-clock half-life, shared by live settling and cold-start load regardless of
     /// traffic.
     public static let tendernessHalfLife: TimeInterval = 3 * 24 * 3_600
-
-    /// Per-signal ceiling on the share of the gap to rest that settling may spend.
-    public static let perSignalSettleRate = 0.006
-
-    /// Hourly settling ceiling at any density: alone, ln(2)/0.20 ~= 3.47 h; with persistence's 0.78^h / 0.92^h decay, holds are ~93 / ~147 minutes, both above
-    /// the affect layer's 90-minute socialWarmth hold.
-    public static let maximumSettlePerHour = 0.20
-
-    /// Bound settling by per-signal and hourly shares; without elapsed evidence make no density claim.
-    static func settleRate(forElapsed elapsed: TimeInterval?) -> Double {
-        guard let elapsed else { return perSignalSettleRate }
-        let hours = max(0, elapsed) / 3_600
-        return min(perSignalSettleRate, maximumSettlePerHour * hours)
-    }
-
-    /// Resting values are `ChemicalState.neutral`'s — the same targets the wall-clock decay already relaxes toward (zero for the transient axes, 0.5 for
-    /// coherence and confidence). One law, two clocks.
-    static func settled(
-        _ state: ChemicalState,
-        rate: Double = perSignalSettleRate
-    ) -> ChemicalState {
-        guard rate > 0 else { return state }
-        let neutral = ChemicalState.neutral
-        func toward(_ value: Double, _ target: Double) -> Double {
-            (value + (target - value) * rate).clamped01()
-        }
-        return ChemicalState(
-            warmth: toward(state.warmth, neutral.warmth),
-            vigilance: toward(state.vigilance, neutral.vigilance),
-            curiosity: toward(state.curiosity, neutral.curiosity),
-            fatigue: toward(state.fatigue, neutral.fatigue),
-            coherence: toward(state.coherence, neutral.coherence),
-            agency: toward(state.agency, neutral.agency),
-            tenderness: state.tenderness,
-            confidence: toward(state.confidence, neutral.confidence),
-            novelty: toward(state.novelty, neutral.novelty),
-            urgency: toward(state.urgency, neutral.urgency)
-        )
-    }
 
     // MARK: - Fatigue
 

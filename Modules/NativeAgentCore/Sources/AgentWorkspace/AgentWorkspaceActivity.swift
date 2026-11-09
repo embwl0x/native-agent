@@ -19,17 +19,17 @@ enum AgentWorkspaceActivity {
             tools: ["mac_calendar_create_event"]),
         .init(id: "reminders", title: "Reminders", summary: "Open tasks across all dates, including undated reminders.", tool: "mac_reminders_query",
             input: ["limit": .int(16)], tools: ["mac_reminders_create", "mac_reminders_query"]),
-        .init(id: "mail", title: "Mail", summary: "Recent email, search, and compose.", tool: "mail_list_recent", input: ["limit": .int(16)],
-            tools: ["mail_search", "mail_send"]),
-        .init(id: "messages", title: "Messages", summary: "Recent messages and a new message to a chosen recipient.", tool: "messages_recent_threads",
-            input: ["limit": .int(16)], tools: ["messages_send"]),
+        .init(id: "mail", title: "Mail", summary: "Recent email, search, and compose.", tool: "mail.recent", input: ["limit": .int(16)],
+            tools: ["mail.search", "mail.send"]),
+        .init(id: "messages", title: "Messages", summary: "Recent messages and a new message to a chosen recipient.", tool: "messages.recent",
+            input: ["limit": .int(16)], tools: ["messages.send"]),
         .init(id: "connections", title: "Connections", summary: "Find an agent or set up a connection.", tool: "agent_contacts", tools: ["agent_contacts",
             "agent_connect"])
     ]
 
     static let readTools: Set<String> = ["bot_list", "shelf_read", "shelf_entry", "desk_read", "task_ledger_list", "delegation_status",
-        "mac_calendar_list_upcoming", "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read", "mail_list_recent", "mail_read_batch",
-        "mail_search", "messages_recent_threads", "mac_calendar_calendars", "mac_calendar_free_busy", "mac_reminders_lists"]
+        "mac_calendar_list_upcoming", "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read", "mail.recent", "mail.read",
+        "mail.search", "messages.recent", "mac_calendar_calendars", "mac_calendar_free_busy", "mac_reminders_lists"]
 
     static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> WorkspacePage? {
         switch tool {
@@ -60,8 +60,8 @@ enum AgentWorkspaceActivity {
             }
         case "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read", "mac_reminders_lists":
             return reminders(tool: tool, input: input, result)
-        case "mail_list_recent", "mail_search": return AgentWorkspaceMail.project(input: input, result: result)
-        case "messages_recent_threads": return AgentWorkspaceMessages.project(input: input, result: result)
+        case "mail.recent", "mail.search": return AgentWorkspaceMail.project(input: input, result: result)
+        case "messages.recent": return AgentWorkspaceMessages.project(input: input, result: result)
         default: return nil
         }
     }

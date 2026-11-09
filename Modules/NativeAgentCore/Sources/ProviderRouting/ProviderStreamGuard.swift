@@ -2,15 +2,12 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `ProviderStreamGuard.swift` | `ProviderWire`: bounded pre-answer redelivery; wire-owned clocks |
+import Synchronization
+// Blueprint: | `ProviderStreamGuard.swift` | Provider HTTP session and one stream lifetime; external envelope configuration |
 
 public struct ProviderStreamGuardConfig: Sendable, Equatable {
     public var idleTimeout: TimeInterval
     public var wallTimeout: TimeInterval
-    /// The provider's first-output deadline for this call, asked as the stream starts. It bounds only a wire with nothing on it (a connection that never
-    /// opened or hung before headers); unmeasured leaves the wall.
-    public var firstOutput = FirstOutputDeadline(calls: 0, slowest: nil)
-
     /// Configured timeouts are finite and capped at one day for safe nanosecond conversion.
     public static let maximumTimeout: TimeInterval = 86_400
 
@@ -64,537 +61,427 @@ public struct ProviderStreamGuardConfig: Sendable, Equatable {
     }
 }
 
-/// Every provider HTTP stream opens its wire here; the guard owns redial admission.
-public enum ProviderWire {
-    /// The attempt ceiling includes the initial dial.
-    public static let maxAttempts = 10
-    static let networkReturnWait: TimeInterval = 30
 
-    /// Only HTTP sends establish pre-answer redial admission; silent CLI children do not.
-    public static func open(_ session: URLSession, _ request: URLRequest, call: LLMCall) async throws -> (URLSession.AsyncBytes, URLResponse) {
-        try await networkReturns()
-        var request = request
-        // The guard's idle and wall bound every stream; URLSession's own timeout (60 s by default) would end a model still thinking first.
-        request.timeoutInterval = .infinity
-        call.lifetime.sending?()
-        // Count-only evidence after body assembly and the offline wait, just before URLSession. This is a send attempt, never provider receipt.
-        TurnTraceBus.fireFromContext(kind: "provider.httpRequestStarted", surface: call.surface,
-            payload: .object(["requestBodyBytes": .int(Int64(request.httpBody?.count ?? 0))]), turn: call.turn)
-        call.probeCredential?.sending(request)
-        let opened = try await session.bytes(for: request)
-        if !call.lifetime.stallOnly { call.lifetime.activity?() }
-        return opened
-    }
+/// Request and resource completion belong to URLSession, without an application clock.
+public enum ProviderHTTP {
+    public static let session: URLSession = makeSession()
 
-    /// Bound diagnostic drain before rejecting failed HTTP responses.
-    static func validateChatCompletions(
-        _ bytes: URLSession.AsyncBytes, _ response: URLResponse,
-        rejected: (Int) throws -> Void = { _ in }
-    ) async throws {
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard !(200..<300).contains(status) else { return }
-        let body = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
-        try rejected(status)
-        try throwIfChatCompletionsError(status: status, data: body, response: response)
-    }
-
-    /// Redial only before output for network loss, overload and rate waits up to 30 seconds. Backoff doubles from 0.5 to 8 seconds with jitter;
-    /// attempt/wall limits bound every retry.
-    package static func redialDelay(_ cause: ProviderFailure?, attempt: Int) -> TimeInterval? {
-        guard attempt < maxAttempts else { return nil }
-        let backoff = min(0.5 * pow(2, Double(attempt - 1)), 8) * Double.random(in: 1...1.25)
-        switch cause {
-        case .network?, .overloaded?: return backoff
-        case .rateLimited(let after?)?:
-            return after <= 30 ? max(Double(after), backoff) : nil
-        case .rateLimited(nil)?: return backoff
-        default: return nil
-        }
-    }
-
-    /// A short Wi-Fi blip may heal; an absent path never consumes the wall.
-    static func networkReturns() async throws {
-        try Task.checkCancellation()
-        guard !NetworkSense.isUp else { return }
-        guard try await NetworkSense.returns(within: networkReturnWait) else { throw ProviderFailure.offline }
-    }
-
-    /// Retain final dial count so another owner cannot duplicate redelivery.
-    static func settled(_ error: any Error, tries: Int, seconds: TimeInterval) -> any Error {
-        guard tries > 1, !(error is CancellationError) else { return error }
-        let diagnostic = error as? ProviderFailure.Diagnostic
-        return ProviderFailure.Diagnostic(
-            cause: ProviderFailure.classify(error) ?? .network,
-            detail: ProviderFailure.diagnosticDescription(error) + " (\(tries) tries over \(Int(seconds.rounded())) s)",
-            deadlineExpired: diagnostic?.deadlineExpired ?? false,
-            admitted: diagnostic?.admitted ?? false,
-            repair: diagnostic?.repair,
-            tries: tries)
-    }
-}
-
-public enum ProviderStreamGuard {
-    /// No URLSession request or resource cap: the guard's idle/wall and shared offline bound own the call. Wall-off leaves only the offline bound,
-    /// transport termination, provider completion or cancellation.
-    public static let stallOnlySession: URLSession = {
+    public static func makeSession() -> URLSession {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = .infinity
         config.timeoutIntervalForResource = .infinity
+        // NetworkSense owns reachability waits; URLSession must report a failed connection instead of holding an unsent task.
         config.waitsForConnectivity = false
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.urlCache = nil
         return URLSession(configuration: config)
-    }()
-
-    /// Only provider output establishes first output; synthetic heartbeats cannot.
-    public static func wrap<Element: Sendable>(
-        makeUpstream: @escaping @Sendable (LLMCall) -> AsyncThrowingStream<Element, Error>,
-        config: ProviderStreamGuardConfig,
-        providerLabel: String,
-        isOutput: @escaping @Sendable (Element) -> Bool, call: LLMCall
-    ) -> AsyncThrowingStream<Element, Error> {
-        let activity = call.lifetime.activity
-        return AsyncThrowingStream { continuation in
-            do { try config.validate() }
-            catch { continuation.finish(throwing: error); return }
-            let state = ProviderStreamGuardState(startedAt: monotonicNow())
-            state.observeNetwork()
-            let producer = Task {
-                defer { state.producerDidExit() }
-                do {
-                    try Task.checkCancellation()
-                    var wireCall = call
-                    wireCall.lifetime.stallOnly = config.wallTimeout == 0
-                    wireCall.lifetime.activity = {
-                        if state.markProviderActivity(monotonicNow()) { activity?() }
-                    }
-                    wireCall.lifetime.admitted = { state.markAdmitted() }
-                    wireCall.lifetime.sending = { state.markSent(monotonicNow()) }
-                    let held = wireCall
-                    // Idle time begins only when the producer has actually been admitted. Include upstream creation: even a stream that never opens or
-                    // sends its first event can stall.
-                    guard state.admitProducer(monotonicNow()) else { return }
-                    // Redials stay inside the call's wall and end once answer output begins.
-                    while true {
-                        try await ProviderWire.networkReturns()
-                        guard let attempt = state.beginAttempt(monotonicNow()) else { return }
-                        let wire = Task {
-                            var iterator = makeUpstream(held).makeAsyncIterator()
-                            while let chunk = try await iterator.next() {
-                                try Task.checkCancellation()
-                                guard state.markActivity(monotonicNow(), output: isOutput(chunk)) else { return }
-                                continuation.yield(chunk)
-                            }
-                            // A cancelled upstream may end as if complete.
-                            try Task.checkCancellation()
-                        }
-                        state.own(attempt: wire)
-                        var failure: (any Error)?
-                        do {
-                            // Whole-reply Stop cancels this coordinator's waits, but the transport owns stopping its active work. Await the uncancelled
-                            // forwarder through exit/drain. Iterator termination still cancels it via retire().
-                            try await wire.value
-                        } catch { failure = error }
-                        let (letGo, sent) = state.endAttempt()
-                        try Task.checkCancellation()
-                        // A wire the watchdog let go never completed, however it ended.
-                        guard let reason = letGo ?? failure else { break }
-                        guard sent, !state.snapshot().yieldedAny,
-                              let delay = ProviderWire.redialDelay(
-                                  letGo == nil ? ProviderFailure.classify(reason) : .network, attempt: attempt) else {
-                            throw ProviderWire.settled(reason, tries: attempt, seconds: monotonicNow() - state.snapshot().startedAt)
-                        }
-                        // Bound offline waiting before reporting path absence.
-                        try await ProviderWire.networkReturns()
-                        try await Task.sleep(for: .seconds(delay))
-                    }
-                    try Task.checkCancellation()
-                    state.finish(continuation)
-                } catch {
-                    let snapshot = state.snapshot()
-                    let failure = ProviderFailure.classify(error) == .offline
-                        ? ProviderWire.settled(error, tries: snapshot.attempt, seconds: monotonicNow() - snapshot.startedAt)
-                        : error
-                    state.finish(continuation, throwing: ProviderFailure.normalize(failure, admitted: snapshot.admitted))
-                }
-            }
-
-            let watchdog = Task {
-                defer { state.deadlineDidExit() }
-                while !Task.isCancelled {
-                    // Register under the state lock before reading: an update between the read and park must still wake this wait.
-                    let (snapshot, wake) = state.observe()
-                    if snapshot.finished {
-                        return
-                    }
-
-                    let now = monotonicNow()
-                    let enabled = deadlines(snapshot: snapshot, now: now, config: config)
-                    if let timeout = enabled.first(where: { $0.remaining <= 0 })?.kind {
-                        let error = timeout.error(providerLabel: providerLabel, snapshot: snapshot,
-                                                  waited: now - snapshot.startedAt, config: config)
-                        // A sent wire with no answer activity may redial; recheck progress before releasing it so concurrent activity wins.
-                        if timeout != .wall, timeout != .offline, snapshot.sentAt != nil, !snapshot.yieldedAny,
-                           snapshot.attempt < ProviderWire.maxAttempts {
-                            _ = state.abandon(error, ifUnchanged: snapshot)
-                            continue
-                        }
-                        let ended = state.finish(
-                            continuation,
-                            throwing: error,
-                            ifUnchanged: snapshot
-                        )
-                        if ended {
-                            producer.cancel()
-                            return
-                        }
-                        continue // provider activity won the timeout race
-                    }
-
-                    guard let remaining = enabled.map({ $0.remaining }).min() else {
-                        await wake.park()
-                        continue
-                    }
-                    let delay = max(0.01, remaining)
-                    await withTaskGroup(of: Void.self) { group in
-                        group.addTask { await wake.park() }
-                        group.addTask { try? await Task.sleep(for: .seconds(delay)) }
-                        await group.next()
-                        group.cancelAll()
-                    }
-                }
-            }
-
-            call.replyWork?.own(producer)
-            call.replyWork?.own(watchdog)
-            state.own(producer: producer, deadline: watchdog)
-            continuation.onTermination = { _ in state.retire() }
-        }
-    }
-
-    private static func monotonicNow() -> TimeInterval {
-        ProcessInfo.processInfo.systemUptime
-    }
-
-    private enum TimeoutKind {
-        case idle, wall, firstOutput, offline
-
-        func error(providerLabel p: String, snapshot: ProviderStreamGuardState.Snapshot,
-                   waited: TimeInterval, config: ProviderStreamGuardConfig) -> Error {
-            let waited = Int(waited.rounded()), idle = Int(config.idleTimeout.rounded())
-            let deadline = config.firstOutput
-            let arrived = !snapshot.admitted ? (!snapshot.hasWireActivity ? "nothing arrived" : "headers only")
-                : snapshot.keepAlives == 0 ? "headers only" : "headers and \(snapshot.keepAlives) keep-alives"
-            let evidence = deadline.seconds == nil
-                ? "its first-output deadline is unmeasured (\(deadline.calls) of \(FirstOutputDeadline.callsNeeded) calls)."
-                : "its slowest first output in the last \(deadline.calls) calls was \(String(format: "%.0f", deadline.slowest ?? 0)) s; "
-                    + "for this request's \(deadline.requestBytes / 1024) KB its deadline was \(String(format: "%.0f", deadline.seconds ?? 0)) s."
-            let account: String
-            switch (self, snapshot.yieldedAny) {
-            case (.offline, _):
-                let progress = """
-                    Current dial: \(snapshot.sentAt == nil ? "no HTTP send attempt observed" : "HTTP send attempted"); provider response \
-                    \(snapshot.admitted ? "began" : "not observed"); \(snapshot.eventCount) events received.
-                    """
-                return ProviderFailure.Diagnostic(cause: .offline, detail: ProviderFailure.offline.localizedDescription + " " + progress,
-                    admitted: snapshot.admitted, tries: max(1, snapshot.attempt))
-            case (.firstOutput, _): account = "No first output from \(p) in \(waited) s (\(arrived)); \(evidence)"
-            case (.wall, false): account = "No first output from \(p) by the call's \(waited) s limit (\(arrived)); \(evidence)"
-            case (.idle, false): account = "No first output from \(p), and nothing on the line for \(idle) s (\(arrived) in \(waited) s)."
-            case (.wall, true): account = "\(p) was still replying at the call's \(waited) s limit (\(snapshot.eventCount) events)."
-            case (.idle, true): account = "\(p) went silent for \(idle) s mid-reply (\(snapshot.eventCount) events in \(waited) s)."
-            }
-            let cut = ProviderFailure.noReply(provider: p, seconds: waited, events: snapshot.eventCount, account: account)
-            return ProviderFailure.Diagnostic(cause: cut, detail: account, deadlineExpired: true, admitted: snapshot.admitted,
-                                              tries: max(1, snapshot.attempt))
-        }
-    }
-
-    /// Precedence is wall, offline, idle, first output; the earliest remaining deadline determines the wake.
-    private static func deadlines(
-        snapshot: ProviderStreamGuardState.Snapshot,
-        now: TimeInterval,
-        config: ProviderStreamGuardConfig
-    ) -> [(kind: TimeoutKind, remaining: TimeInterval)] {
-        var enabled: [(kind: TimeoutKind, remaining: TimeInterval)] = []
-        if config.wallTimeout > 0 {
-            enabled.append((.wall, config.wallTimeout - (now - snapshot.startedAt)))
-        }
-        if let down = snapshot.networkDownAt {
-            enabled.append((.offline, ProviderWire.networkReturnWait - (now - down)))
-        }
-        // Between dials only wall/offline deadlines apply; wall-off still honors the shared offline bound.
-        guard config.wallTimeout > 0, let attemptStartedAt = snapshot.attemptStartedAt else { return enabled }
-        if config.idleTimeout > 0, let lastActivityAt = snapshot.lastActivityAt {
-            enabled.append((.idle, config.idleTimeout - (now - lastActivityAt)))
-        }
-        // A live wire is bounded by idle and wall, without a first-output cut.
-        if !snapshot.hasWireActivity, !snapshot.yieldedAny, let deadline = config.firstOutput.seconds {
-            enabled.append((.firstOutput, deadline - (now - attemptStartedAt)))
-        }
-        return enabled
     }
 }
 
-private final class ProviderStreamGuardState: @unchecked Sendable {
-    struct Snapshot: Sendable {
-        var finished: Bool
-        var startedAt: TimeInterval
-        /// The idle clock cannot start before producer admission.
-        var lastActivityAt: TimeInterval?
-        var eventCount: Int
-        var hasWireActivity: Bool
-        var admitted: Bool
-        /// Wire activity includes content-free events but does not prove answer output.
-        var keepAlives: Int
-        /// Only actual text/tool/reasoning output sets first output; pings and synthetic heartbeats do not.
-        var yieldedAny: Bool
-        /// Dial-local clocks reset per attempt; HTTP send time stays nil for non-HTTP wires.
-        var attempt: Int
-        var attemptStartedAt: TimeInterval?
-        var sentAt: TimeInterval?
-        var networkDownAt: TimeInterval?
+/// Headers, body and terminal delivery share the URLSession task's delegate.
+public struct ProviderHTTPBytes: AsyncSequence, Sendable {
+    public typealias Element = UInt8
+    public let task: URLSessionDataTask
+    private let chunks: AsyncThrowingStream<Data, Error>
+    private let cancelTransfer: @Sendable () -> Void
+
+    fileprivate init(task: URLSessionDataTask, chunks: AsyncThrowingStream<Data, Error>, cancel: @escaping @Sendable () -> Void) {
+        self.task = task
+        self.chunks = chunks
+        cancelTransfer = cancel
     }
 
-    private let lock = NSLock()
-    private var finished = false
-    private let startedAt: TimeInterval
-    private var lastActivityAt: TimeInterval?
-    private var providerEvents = 0
-    private var yieldedEvents = 0
-    private var admitted = false
-    private var eventsAtAdmission = 0
-    private var yieldedAny = false
-    private var wake: ScopedWaiter?
-    private var producer: Task<Void, Never>?
-    private var deadline: Task<Void, Never>?
-    private var producerExited = false
-    private var deadlineExited = false
-    private var attempt = 0
-    private var attemptStartedAt: TimeInterval?
-    private var sentAt: TimeInterval?
-    private var attemptTask: Task<Void, Error>?
-    /// Only the producer consumes the watchdog's release reason.
-    private var letGo: (any Error)?
-    private var networkObservation: NSObjectProtocol?
-    private var networkDownAt: TimeInterval?
+    public func cancel() { cancelTransfer() }
 
-    init(startedAt: TimeInterval) {
-        self.startedAt = startedAt
-        self.lastActivityAt = nil
-    }
+    public func makeAsyncIterator() -> AsyncIterator { AsyncIterator(chunks: chunks.makeAsyncIterator()) }
 
-    /// Subscribe before reading; callbacks reread the one owner so even a concurrent return cannot publish an older path over the current one.
-    func observeNetwork() {
-        let observer = NotificationCenter.default.addObserver(forName: NetworkSense.pathChanged,
-            object: nil, queue: nil) { [weak self] _ in self?.networkChanged() }
-        lock.withLock { networkObservation = observer }
-        networkChanged()
-    }
+    public struct AsyncIterator: AsyncIteratorProtocol {
+        fileprivate var chunks: AsyncThrowingStream<Data, Error>.Iterator
+        private var chunk: Data.Iterator?
 
-    private func networkChanged() {
-        lock.lock()
-        guard !finished else { lock.unlock(); return }
-        if NetworkSense.isUp { networkDownAt = nil }
-        else if networkDownAt == nil { networkDownAt = ProcessInfo.processInfo.systemUptime }
-        signalAndUnlock()
-    }
+        fileprivate init(chunks: AsyncThrowingStream<Data, Error>.Iterator) { self.chunks = chunks }
 
-    func admitProducer(_ now: TimeInterval) -> Bool {
-        lock.lock()
-        guard !finished else { lock.unlock(); return false }
-        if lastActivityAt == nil {
-            lastActivityAt = now
-        }
-        signalAndUnlock()
-        return true
-    }
-
-    /// A new dial resets wire clocks without resetting the call's wall.
-    func beginAttempt(_ now: TimeInterval) -> Int? {
-        lock.lock()
-        guard !finished else { lock.unlock(); return nil }
-        attempt += 1
-        attemptStartedAt = now
-        sentAt = nil
-        letGo = nil
-        lastActivityAt = now
-        providerEvents = 0
-        yieldedEvents = 0
-        admitted = false
-        eventsAtAdmission = 0
-        let number = attempt
-        signalAndUnlock()
-        return number
-    }
-
-    func own(attempt task: Task<Void, Error>) {
-        lock.lock()
-        let stop = finished || letGo != nil
-        if !stop { attemptTask = task }
-        lock.unlock()
-        if stop { task.cancel() }
-    }
-
-    /// Only a released HTTP send can authorize another dial.
-    func endAttempt() -> (letGo: (any Error)?, sent: Bool) {
-        lock.withLock {
-            let ended = (letGo, sentAt != nil)
-            letGo = nil
-            attemptTask = nil
-            attemptStartedAt = nil
-            sentAt = nil
-            return ended
+        public mutating func next() async throws -> UInt8? {
+            try Task.checkCancellation()
+            while true {
+                if let byte = chunk?.next() { return byte }
+                guard let data = try await chunks.next() else { return nil }
+                chunk = data.makeIterator()
+            }
         }
     }
+}
 
-    func markSent(_ now: TimeInterval) {
-        lock.lock()
-        guard !finished, attemptStartedAt != nil else { lock.unlock(); return }
-        if sentAt == nil { sentAt = now }
-        signalAndUnlock()
+/// Completion closes the body directly, including when a system cancellation arrives before headers.
+private final class ProviderHTTPTransfer: NSObject, URLSessionDataDelegate, Sendable {
+    private struct State {
+        var header: CheckedContinuation<URLResponse, Error>?
+        var response: Result<URLResponse, Error>?
+        var finished = false
+        var observedFirstBodyBytes = false
+        var task: URLSessionDataTask?
+        var path: Task<Void, Never>?
+    }
+    private let state: Mutex<State>
+    private let body: AsyncThrowingStream<Data, Error>.Continuation
+    private let call: LLMCall
+    private let requestID: String
+
+    init(task: URLSessionDataTask, body: AsyncThrowingStream<Data, Error>.Continuation, call: LLMCall, requestID: String) {
+        state = Mutex(State(task: task))
+        self.body = body
+        self.call = call
+        self.requestID = requestID
     }
 
-    /// Release a dead wire only if progress still matches the observed snapshot.
-    func abandon(_ reason: any Error, ifUnchanged snapshot: Snapshot) -> Bool {
-        lock.lock()
-        guard !finished, attempt == snapshot.attempt, attemptStartedAt != nil, letGo == nil,
-              lastActivityAt == snapshot.lastActivityAt, yieldedAny == snapshot.yieldedAny else {
-            lock.unlock()
+    func open() async throws -> URLResponse {
+        let paths = NetworkSense.changes
+        let observer = Task { [weak self] in
+            for await up in paths {
+                if Task.isCancelled { return }
+                if !up {
+                    self?.finish(error: ProviderFailure.Diagnostic(cause: .offline,
+                        detail: "This Mac's network path became unsatisfied while the model request was open."), cancel: true)
+                    return
+                }
+            }
+        }
+        let ended = state.withLock {
+            if $0.finished { return true }
+            $0.path = observer
             return false
         }
-        letGo = reason
-        attemptStartedAt = nil
-        let task = attemptTask
-        signalAndUnlock()
-        task?.cancel()
-        return true
-    }
-
-    func markActivity(_ now: TimeInterval, output: Bool) -> Bool {
-        lock.lock()
-        guard !finished else { lock.unlock(); return false }
-        yieldedAny = yieldedAny || output
-        // Wire progress comes from received response headers and SSE framing. Adapter presentation yields or synthetic heartbeats cannot hide wire silence
-        // once the transport has begun reporting activity.
-        if providerEvents == 0 {
-            yieldedEvents += 1
-            lastActivityAt = now
+        if ended { observer.cancel() }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let ready = state.withLock { state -> (Result<URLResponse, Error>?, URLSessionDataTask?) in
+                    if let response = state.response { return (response, nil) }
+                    state.header = continuation
+                    return (nil, state.task)
+                }
+                if let response = ready.0 { continuation.resume(with: response) }
+                else { ready.1?.resume() }
+            }
+        } onCancel: {
+            self.finish(error: CancellationError(), cancel: true)
         }
-        signalAndUnlock()
-        return true
     }
 
-    func markAdmitted() {
-        lock.lock()
-        guard !finished else { lock.unlock(); return }
-        admitted = true
-        eventsAtAdmission = providerEvents
-        signalAndUnlock()
-    }
-
-    func markProviderActivity(_ now: TimeInterval) -> Bool {
-        lock.lock()
-        guard !finished else { lock.unlock(); return false }
-        providerEvents += 1
-        lastActivityAt = now
-        signalAndUnlock()
-        return true
-    }
-
-    func snapshot() -> Snapshot {
-        lock.lock()
-        defer { lock.unlock() }
-        return snapshotLocked()
-    }
-
-    func observe() -> (Snapshot, ScopedWaiter) {
-        lock.lock()
-        defer { lock.unlock() }
-        let waiter = wake ?? ScopedWaiter()
-        wake = waiter
-        return (snapshotLocked(), waiter)
-    }
-
-    private func snapshotLocked() -> Snapshot {
-        return Snapshot(
-            finished: finished,
-            startedAt: startedAt,
-            lastActivityAt: lastActivityAt,
-            eventCount: providerEvents > 0 ? providerEvents : yieldedEvents,
-            hasWireActivity: providerEvents > 0,
-            admitted: admitted,
-            keepAlives: admitted ? providerEvents - eventsAtAdmission : 0,
-            yieldedAny: yieldedAny,
-            attempt: attempt,
-            attemptStartedAt: attemptStartedAt,
-            sentAt: sentAt,
-            networkDownAt: networkDownAt
-        )
-    }
-
-    /// Called only with the state lock held; never resume a waiter under it.
-    private func signalAndUnlock() {
-        let waiter = wake
-        wake = nil
-        lock.unlock()
-        waiter?.resume()
-    }
-
-    func retire() {
-        lock.lock()
-        finished = true
-        let producer = self.producer
-        let deadline = self.deadline
-        let wire = attemptTask
-        let observer = networkObservation
-        networkObservation = nil
-        signalAndUnlock()
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        wire?.cancel()
-        producer?.cancel()
-        deadline?.cancel()
-    }
-
-    func own(producer: Task<Void, Never>, deadline: Task<Void, Never>?) {
-        lock.lock()
-        if !producerExited { self.producer = producer }
-        if !deadlineExited { self.deadline = deadline }
-        let stop = finished
-        lock.unlock()
-        // Completion/cancellation can beat handle installation. The terminal latch still cancels them, and each actual exit releases its handle.
-        if stop { producer.cancel(); deadline?.cancel() }
-    }
-
-    func producerDidExit() {
-        lock.withLock { producerExited = true; producer = nil }
-    }
-
-    func deadlineDidExit() {
-        lock.withLock { deadlineExited = true; deadline = nil }
-    }
-
-    @discardableResult
-    func finish<Element: Sendable>(
-        _ continuation: AsyncThrowingStream<Element, Error>.Continuation,
-        throwing error: (any Error)? = nil,
-        ifUnchanged snapshot: Snapshot? = nil
-    ) -> Bool {
-        lock.lock()
-        guard !finished, snapshot == nil
-                || (snapshot?.lastActivityAt == lastActivityAt && snapshot?.yieldedAny == yieldedAny
-                    && snapshot?.networkDownAt == networkDownAt) else {
-            lock.unlock()
-            return false
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
+        let accepted = state.withLock { state -> Bool in
+            guard !state.finished else { return false }
+            state.response = .success(response)
+            var fields: [String: JSONValue] = [:]
+            if let http = response as? HTTPURLResponse { fields["statusCode"] = .int(Int64(http.statusCode)) }
+            trace(kind: "provider.httpHeadersOpened", fields: fields)
+            state.header?.resume(returning: response)
+            state.header = nil
+            return true
         }
-        finished = true
-        signalAndUnlock()
+        completionHandler(accepted ? .allow : .cancel)
+    }
 
-        if let error {
-            continuation.finish(throwing: error)
-        } else {
-            continuation.finish()
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        state.withLock {
+            guard !$0.finished else { return }
+            if !$0.observedFirstBodyBytes, !data.isEmpty {
+                $0.observedFirstBodyBytes = true
+                trace(kind: "provider.httpFirstBodyBytes", fields: ["bodyChunkBytes": .int(Int64(data.count))])
+            }
+            body.yield(data)
         }
-        return true
+    }
+
+    private func trace(kind: String, fields: [String: JSONValue]) {
+        var payload = fields
+        payload["request"] = .string(requestID)
+        payload["conversationRequest"] = .bool(call.conversationRequest)
+        if let admission = call.admission {
+            payload["provider"] = .string(admission.provider)
+            payload["model"] = .string(admission.model)
+            if let effort = admission.reasoningEffort { payload["reasoningEffort"] = .string(effort) }
+        }
+        TurnTraceBus.fireFromContext(kind: kind, surface: call.surface, payload: .object(payload), turn: call.turn)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // A system-cancelled task is a transport failure unless its caller requested Stop.
+        finish(error: error, cancel: false)
+    }
+
+    func finish(error: Error?, cancel: Bool) {
+        let owned = state.withLock { state -> (URLSessionDataTask?, Task<Void, Never>?, Error?)? in
+            guard !state.finished else { return nil }
+            state.finished = true
+            var terminal = error
+            if state.response == nil {
+                let missing = error ?? ProviderFailure.Diagnostic(cause: .malformedResponse,
+                    detail: "The provider's HTTP task completed without response headers.")
+                terminal = missing
+                state.response = .failure(missing)
+                state.header?.resume(throwing: missing)
+                state.header = nil
+            }
+            let owned = (state.task, state.path, terminal)
+            state.task = nil
+            state.path = nil
+            return owned
+        }
+        guard let owned else { return }
+        owned.1?.cancel()
+        if cancel { owned.0?.cancel() }
+        if let error = owned.2 { body.finish(throwing: error) }
+        else { body.finish() }
+        let status = owned.2 == nil ? "completed" : (owned.2 is CancellationError ? "cancelled" : "failed")
+        var payload: [String: JSONValue] = ["request": .string(requestID), "status": .string(status)]
+        if let error = owned.2 { payload["cause"] = .string(ProviderFailure.diagnosticDescription(error)) }
+        TurnTraceBus.fireFromContext(kind: "provider.httpRequestEnded", surface: call.surface, payload: .object(payload), turn: call.turn)
+    }
+}
+
+/// One wire send ends on task completion, network loss or cancellation.
+public enum ProviderWire {
+    public static func open(_ session: URLSession, _ request: URLRequest, call: LLMCall) async throws
+        -> (ProviderHTTPBytes, URLResponse) {
+        await waiting(on: "network path", detail: "Waiting for this Mac's network", call: call)
+        try await NetworkSense.returns()
+        try Task.checkCancellation()
+        var request = request
+        request.timeoutInterval = .infinity
+        let requestID = UUID().uuidString.lowercased()
+        let pair = AsyncThrowingStream<Data, Error>.makeStream()
+        let task = session.dataTask(with: request)
+        let transfer = ProviderHTTPTransfer(task: task, body: pair.continuation, call: call, requestID: requestID)
+        task.delegate = transfer
+        pair.continuation.onTermination = { [weak transfer] ending in
+            if case .cancelled = ending { transfer?.finish(error: CancellationError(), cancel: true) }
+        }
+        call.lifetime.sending?()
+        TurnTraceBus.fireFromContext(kind: "provider.httpRequestStarted", surface: call.surface,
+            payload: .object(["request": .string(requestID), "requestBodyBytes": .int(Int64(request.httpBody?.count ?? 0))]), turn: call.turn)
+        call.probeCredential?.sending(request)
+        let label = call.admission.map { SwiftNativeProviderRouting.displayName(for: $0.provider) } ?? request.url?.host ?? "provider"
+        await waiting(on: "provider response", detail: "Waiting on \(label)", call: call)
+        let response = try await transfer.open()
+        call.lifetime.response?(response)
+        call.lifetime.activity?()
+        return (ProviderHTTPBytes(task: task, chunks: pair.stream, cancel: {
+            transfer.finish(error: CancellationError(), cancel: true)
+        }), response)
+    }
+
+    static func waiting(on reason: String, detail: String, call: LLMCall) async {
+        let since = Date()
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm"
+        await status(kind: "provider.waiting", detail: "\(detail) since \(clock.string(from: since))",
+            facts: ["on": .string(reason), "since": .string(ISO8601DateFormatter().string(from: since))], call: call)
+    }
+
+    static func status(kind: String, detail: String, facts: [String: JSONValue], call: LLMCall) async {
+        var payload = facts
+        payload["detail"] = .string(detail)
+        payload["cancel"] = .string("Stop")
+        TurnTraceBus.fireFromContext(kind: kind, surface: call.surface, payload: .object(payload), turn: call.turn)
+        await call.lifetime.status?(kind, detail)
+    }
+
+    static func validateChatCompletions(
+        _ bytes: ProviderHTTPBytes, _ response: URLResponse,
+        rejected: (Int) throws -> Void = { _ in }
+    ) async throws {
+        guard let response = response as? HTTPURLResponse else {
+            throw ProviderFailure.Diagnostic(cause: .malformedResponse, detail: "Provider response was not HTTP.")
+        }
+        let status = response.statusCode
+        guard !(200..<300).contains(status) else { return }
+        let body = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096)
+        try rejected(status)
+        try throwIfChatCompletionsError(status: status, data: body, response: response)
+    }
+}
+
+/// One turn's reconnect allowance and pending provider-prescribed wait survive every model round.
+public final class ProviderRecovery: Sendable {
+    public struct Stopped: Error, Sendable, LocalizedError, ProviderFailureWrapping {
+        public let providerFailureCause: any Error
+        let reconnectUsed: Bool
+        public var errorDescription: String? {
+            let reason = reconnectUsed ? "The provider request failed again; this turn stopped."
+                : "The provider request cannot reconnect; this turn stopped."
+            return reason + " " + ProviderFailure.diagnosticDescription(providerFailureCause)
+        }
+    }
+
+    private struct Pending: Sendable {
+        let cause: any Error
+        let reconnect: ProviderRecoveryPolicy.Reconnect
+    }
+    private struct State {
+        var reconnectUsed = false
+        var pending: Pending?
+        var waiting: Task<Result<Void, Error>, Never>?
+        var stopped: Stopped?
+    }
+    private let state = Mutex(State())
+    /// The provider whose calls this recovery serves: the first one to use it, the turn's own model.
+    private let owner = Mutex<String?>(nil)
+    public init() {}
+
+    /// Whether a call on `provider` shares this recovery. A nested thought on another provider recovers on its own.
+    fileprivate func serves(_ provider: String?) -> Bool {
+        owner.withLock { owner in
+            if owner == nil { owner = provider }
+            return owner == provider
+        }
+    }
+
+    public var stopped: Stopped? { state.withLock { $0.stopped } }
+
+    fileprivate func completed(reconnecting: Bool) {
+        guard reconnecting else { return }
+        state.withLock {
+            guard $0.reconnectUsed, $0.pending == nil, $0.waiting == nil, $0.stopped == nil else { return }
+            $0.reconnectUsed = false
+        }
+    }
+
+    fileprivate func failed(_ error: Error, admitted: Bool, retryAfter: Int?) -> Error {
+        let normalized = ProviderFailure.normalize(error, admitted: admitted)
+        if normalized is CancellationError || ProviderFailure.classify(normalized) == .outputLimit { return normalized }
+        return state.withLock { state -> Error in
+            if let stopped = state.stopped { return stopped }
+            let failure: Error
+            if let diagnostic = normalized as? ProviderFailure.Diagnostic {
+                failure = ProviderFailure.Diagnostic(cause: diagnostic.cause, detail: diagnostic.detail,
+                    deadlineExpired: diagnostic.deadlineExpired, admitted: diagnostic.admitted, repair: diagnostic.repair,
+                    tries: state.reconnectUsed ? 2 : 1, retryAfter: diagnostic.retryAfter ?? retryAfter)
+            } else { failure = normalized }
+            let reconnect = ProviderRecoveryPolicy.reconnect(failure)
+            if reconnect == nil, !ProviderRecoveryPolicy.isRecoverable(failure) { return failure }
+            guard !state.reconnectUsed, let reconnect else {
+                let stopped = Stopped(providerFailureCause: failure, reconnectUsed: state.reconnectUsed)
+                state.stopped = stopped
+                return stopped
+            }
+            state.pending = Pending(cause: failure, reconnect: reconnect)
+            return failure
+        }
+    }
+
+    fileprivate func beforeRequest(_ call: LLMCall) async throws -> Bool {
+        try Task.checkCancellation()
+        if call.replyWork?.isStopped == true { throw CancellationError() }
+        let gate = state.withLock { state -> Result<Task<Result<Void, Error>, Never>?, Error> in
+            if let stopped = state.stopped { return .failure(stopped) }
+            if let waiting = state.waiting { return .success(waiting) }
+            guard let pending = state.pending else { return .success(nil) }
+            state.pending = nil
+            state.reconnectUsed = true
+            let waiting = Task { await Self.wait(pending, call: call) }
+            state.waiting = waiting
+            return .success(waiting)
+        }
+        let waiting = try gate.get()
+        if let waiting {
+            call.replyWork?.own(waiting)
+            let result = await withTaskCancellationHandler { await waiting.value } onCancel: { waiting.cancel() }
+            try result.get()
+            state.withLock { $0.waiting = nil }
+        }
+        try Task.checkCancellation()
+        if call.replyWork?.isStopped == true { throw CancellationError() }
+        if let stopped { throw stopped }
+        return waiting != nil
+    }
+
+    private static func wait(_ pending: Pending, call: LLMCall) async -> Result<Void, Error> {
+        do {
+            try Task.checkCancellation()
+            let label = call.admission.map { SwiftNativeProviderRouting.displayName(for: $0.provider) } ?? "Provider"
+            let detail: String
+            switch pending.reconnect {
+            case .network: detail = "\(label) dropped the connection; reconnecting when this Mac's network is available"
+            case .provider(let seconds?): detail = "\(label) refused the connection; reconnecting after its requested \(seconds) seconds"
+            case .provider(nil): detail = "\(label) refused the connection; reconnecting"
+            }
+            await ProviderWire.status(kind: "provider.reconnecting", detail: detail,
+                facts: ["cause": .string(ProviderFailure.diagnosticDescription(pending.cause)), "attempt": .int(2)], call: call)
+            switch pending.reconnect {
+            case .network:
+                await ProviderWire.waiting(on: "network path", detail: detail, call: call)
+                try await NetworkSense.returns()
+            case .provider: break
+            }
+            if let seconds = pending.reconnect.retryAfter {
+                await ProviderWire.waiting(on: "provider Retry-After",
+                    detail: "\(label) requested \(seconds) seconds before reconnecting", call: call)
+                try await Task.sleep(for: .seconds(max(0, seconds)))
+            }
+            try Task.checkCancellation()
+            if call.replyWork?.isStopped == true { throw CancellationError() }
+            return .success(())
+        } catch { return .failure(error) }
+    }
+}
+
+/// Failed requests and partial-output continuations pass through the same turn-owned reconnect gate.
+public enum ProviderStreamGuard {
+    public static func wrap(
+        makeUpstream: @escaping @Sendable (LLMCall) -> AsyncThrowingStream<LLMMessageStreamEvent, Error>, call: LLMCall
+    ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let provider = call.admission?.provider
+            let recovery = call.turn?.providerRecovery.flatMap { $0.serves(provider) ? $0 : nil } ?? ProviderRecovery()
+            let producer = Task {
+                do {
+                    while true {
+                        let reconnecting = try await recovery.beforeRequest(call)
+                        let admitted = Mutex(false)
+                        let retryAfter = Mutex<Int?>(nil)
+                        var wireCall = call
+                        let upstreamAdmission = call.lifetime.admitted
+                        wireCall.lifetime.admitted = {
+                            admitted.withLock { $0 = true }
+                            upstreamAdmission?()
+                        }
+                        let upstreamResponse = call.lifetime.response
+                        wireCall.lifetime.response = { response in
+                            retryAfter.withLock { $0 = parseRetryAfterSeconds(from: response) }
+                            upstreamResponse?(response)
+                        }
+                        let held = wireCall
+                        var producedOutput = false
+                        do {
+                            try Task.checkCancellation()
+                            if held.replyWork?.isStopped == true { throw CancellationError() }
+                            for try await event in makeUpstream(held) {
+                                try Task.checkCancellation()
+                                switch event {
+                                case .textDelta(let text): if !text.isEmpty { producedOutput = true }
+                                case .toolCall: producedOutput = true
+                                case .keepAlive, .callInput, .toolBoundary, .replyTextSettled: break
+                                }
+                                continuation.yield(event)
+                            }
+                            try Task.checkCancellation()
+                            if held.replyWork?.isStopped == true { throw CancellationError() }
+                            recovery.completed(reconnecting: reconnecting)
+                            continuation.finish()
+                            return
+                        } catch {
+                            try Task.checkCancellation()
+                            if held.replyWork?.isStopped == true { throw CancellationError() }
+                            let failure = recovery.failed(error, admitted: admitted.withLock { $0 }, retryAfter: retryAfter.withLock { $0 })
+                            if producedOutput || failure is ProviderRecovery.Stopped || failure is CancellationError
+                                || ProviderRecoveryPolicy.reconnect(failure) == nil { throw failure }
+                        }
+                    }
+                } catch { continuation.finish(throwing: error) }
+            }
+            call.replyWork?.own(producer, stop: {})
+            continuation.onTermination = { _ in producer.cancel() }
+        }
     }
 }

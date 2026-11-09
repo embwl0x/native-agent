@@ -6,9 +6,12 @@ import Foundation
 public struct ProviderRequestLifetime: Sendable {
     public var activity: (@Sendable () -> Void)?
     public var admitted: (@Sendable () -> Void)?
-    public var stallOnly = false
     public var sending: (@Sendable () -> Void)?
     public var dispatched: (@Sendable () -> Void)?
+    /// Request-owned wait/reconnect descriptions delivered to the turn's progress sink.
+    public var status: (@Sendable (_ kind: String, _ text: String) async -> Void)?
+    /// Headers supply server pacing before body decoding can fail.
+    public var response: (@Sendable (URLResponse) -> Void)?
     public init() {}
 }
 

@@ -78,7 +78,7 @@ extension AppModel {
     func regenerateChatResponse(_ message: ChatMessage, parent: Turn?) async {
         if message.metadata?.providerRefusal == true {
             if message.metadata?.providerRefusalDraft == true {
-                prepareRejectedTurnDraft(message)
+                await prepareRejectedTurnDraft(message)
             } else {
                 statusText = "outcome unknown — inspect before retry. This rejected turn may have run steps."
             }
@@ -98,13 +98,16 @@ extension AppModel {
     }
 
     @MainActor
-    func prepareRejectedTurnDraft(_ message: ChatMessage) {
+    func prepareRejectedTurnDraft(_ message: ChatMessage) async {
         let sessionId = message.sessionId ?? activeChatSessionId
+        let messages: [ChatMessage]
+        do { messages = try await engine.transcripts.loadMessages(sessionId: sessionId, cached: true) }
+        catch { setFailureStatus(error, action: "read the retry's conversation"); return }
         guard message.metadata?.providerRefusalDraft == true,
               sessionId == activeChatSessionId,
               let snapshot = MacChatRetrySnapshot.capture(
                 target: message,
-                messages: engine.transcripts.messages(for: sessionId),
+                messages: messages,
                 sessionId: sessionId,
                 isSyntheticNotice: false
               ) else {
@@ -173,7 +176,7 @@ extension AppModel {
                 port: self,
                 sessionId: archivingId,
                 prunePresentation: { [self] sessionId in
-                    pruneSessionChatState(sessionId)
+                    await pruneSessionChatState(sessionId)
                 }
             ) else {
                 statusText = "Archive failed: that chat session is no longer available"

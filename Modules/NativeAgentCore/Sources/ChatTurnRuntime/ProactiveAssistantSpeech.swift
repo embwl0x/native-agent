@@ -3,35 +3,21 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ProactiveAssistantSpeech.swift` | `speakProactively`; Locked deduplicated speech; initiative quota |
+// Blueprint: | `ProactiveAssistantSpeech.swift` | `speakProactively`; Locked deduplicated speech and destination reconciliation |
 
 // Every speech entry shares locked claims, destination reconciliation and append so duplicate attempts never write twice.
 // Only a committed transcript row proves posting; only clean absence permits recovery.
-// Scheduled initiative alone spends the hourly quota; explicit requests and intentions keep their own pacing.
 
 /// Keep unprompted speakers exhaustive so widening this boundary requires an explicit caller case.
 public enum ProactiveSpeechCaller: String, Sendable, CaseIterable, Equatable {
     case morningBrief = "morning_brief"
-    /// Scheduled initiative shares the hourly quota; Reach retains its own gates.
     case reachOut = "reach_out"
-}
-
-/// Authorship determines quota admission, independently of deduplication.
-public enum ProactiveSpeechInitiative: String, Sendable, Equatable {
-    case scheduled
-    /// An explicit user request bypasses the proactive quota but remains deduplicated.
-    case userRequested
-    /// An intention's scheduled moment, or a watch's own signal, is its pacing, so it bypasses the hourly quota but remains deduplicated.
-    case intention
-
 }
 
 /// Return a typed outcome so suppression cannot be mistaken for a posted message.
 public enum ProactiveSpeechOutcome: Sendable, Equatable {
     case posted(sessionId: String, messageRunId: String)
     case duplicate(sessionId: String)
-    case rateLimited(secondsRemaining: Int)
-
 }
 
 public enum ProactiveSpeechError: Error, LocalizedError {
@@ -49,8 +35,6 @@ public enum ProactiveSpeechError: Error, LocalizedError {
 }
 
 struct ProactiveSpeechClaim: Sendable, Equatable {
-    /// Only unprompted posts advance quota time; explicit requests leave it unchanged.
-    var lastProactivePostAt: Date?
     /// Bound recent keys while preserving their oldest-first eviction order.
     var recentKeys: [String]
     /// Where each claimed message belongs, including an uncertain append.
@@ -68,18 +52,13 @@ struct ProactiveSpeechClaim: Sendable, Equatable {
     static let recentKeyCap = 16
 
     var jsonValue: JSONValue {
-        var object: [String: JSONValue] = [
+        .object([
             "recentKeys": .array(recentKeys.map { .string($0) }),
             "destinations": .object(destinations.mapValues { $0.jsonValue }),
-        ]
-        if let lastProactivePostAt {
-            object["lastProactivePostAt"] = .string(NativeTimestampFormat.fractionalZulu(lastProactivePostAt))
-        }
-        return .object(object)
+        ])
     }
 
-    init(lastProactivePostAt: Date?, recentKeys: [String], destinations: [String: Destination] = [:]) {
-        self.lastProactivePostAt = lastProactivePostAt
+    init(recentKeys: [String], destinations: [String: Destination] = [:]) {
         self.recentKeys = recentKeys
         self.destinations = destinations
     }
@@ -88,13 +67,6 @@ struct ProactiveSpeechClaim: Sendable, Equatable {
     init(_ value: JSONValue) throws {
         guard case .object(let object) = value,
               case .array(let keys)? = object["recentKeys"] else { throw ProactiveSpeechError.damagedState }
-        if let timestamp = object["lastProactivePostAt"] {
-            guard case .string(let raw) = timestamp,
-                  let date = NativeTimestampFormat.parseISO8601FractionalFirst(raw) else { throw ProactiveSpeechError.damagedState }
-            self.lastProactivePostAt = date
-        } else {
-            self.lastProactivePostAt = nil
-        }
         self.recentKeys = try keys.map {
             guard case .string(let key) = $0, !key.isEmpty else { throw ProactiveSpeechError.damagedState }
             return key
@@ -123,7 +95,7 @@ struct ProactiveSpeechClaim: Sendable, Equatable {
         }
         var destinations = destinations.filter { keys.contains($0.key) }
         destinations[key] = Destination(sessionId: sessionId, runId: runId)
-        return ProactiveSpeechClaim(lastProactivePostAt: lastProactivePostAt, recentKeys: keys, destinations: destinations)
+        return ProactiveSpeechClaim(recentKeys: keys, destinations: destinations)
     }
 }
 
@@ -145,9 +117,6 @@ enum ProactiveSpeechState {
 
 extension SwiftNativeChatOrchestrationClient {
 
-    /// Use one configured gap per caller so all proactive entry points share quota pacing.
-    public static let proactiveSpeechMinimumIntervalSeconds: TimeInterval = 60 * 60
-
     /// Scope plus content digest deduplicates identical messages while permitting genuinely changed content in the same scope.
     public nonisolated static func proactiveSpeechIdempotencyKey(
         scope: String,
@@ -166,17 +135,13 @@ extension SwiftNativeChatOrchestrationClient {
         caller: ProactiveSpeechCaller,
         idempotencyKey: String,
         sessionId: String,
-        initiative: ProactiveSpeechInitiative? = nil,
         persona: String? = nil,
         turn: Turn
     ) async throws -> ProactiveSpeechOutcome {
-        let initiative = initiative ?? turn.speechInitiative
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw ChatOrchestrationError.emptyMessage }
         let resolvedSession = try Self.resolveSessionId(sessionId)
         let statePath = ProactiveSpeechState.path(dataRoot: dataRoot)
-        let now = clock()
-        let interval = Self.proactiveSpeechMinimumIntervalSeconds
 
         // The lock includes append: a clean absent transcript row cannot race
         // another claimant's still-running append. A crash releases the lock,
@@ -203,19 +168,9 @@ extension SwiftNativeChatOrchestrationClient {
                 // ended without this row. Complete that claim at its original destination.
                 destination = recorded
             } else {
-                if initiative == .scheduled, let last = previous?.lastProactivePostAt {
-                    let elapsed = now.timeIntervalSince(last)
-                    if elapsed < interval {
-                        guard let remaining = Int(exactly: (interval - elapsed).rounded(.up)) else {
-                            throw ProactiveSpeechError.damagedState
-                        }
-                        return .rateLimited(secondsRemaining: max(1, remaining))
-                    }
-                }
                 destination = .init(sessionId: resolvedSession, runId: UUID().uuidString)
-                var next = (previous ?? ProactiveSpeechClaim(lastProactivePostAt: nil, recentKeys: []))
+                let next = (previous ?? ProactiveSpeechClaim(recentKeys: []))
                     .appending(key: idempotencyKey, sessionId: destination.sessionId, runId: destination.runId)
-                if initiative == .scheduled { next.lastProactivePostAt = now }
                 rows[caller.rawValue] = next.jsonValue
                 try await SwiftNativePersistenceCore.writeJSON(.object(rows), to: statePath)
             }

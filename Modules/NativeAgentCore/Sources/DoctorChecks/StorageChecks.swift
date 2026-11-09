@@ -162,7 +162,7 @@ public struct RuntimeJSONStoresCheck: DoctorCheck {
     private static let specs: [DoctorJSONStoreSpec] = [
         .init(relativePath: "providers/active.json", shape: .object),
         .init(relativePath: "providers/surfaces.json", shape: .object),
-        .init(relativePath: "scheduler/jobs.json", shape: .array),
+        .init(relativePath: "clock/times.json", shape: .array),
         .init(relativePath: "notifications/push_tokens.json", shape: .object),
         .init(relativePath: "connectors/registry.json", shape: .array),
         .init(relativePath: "connectors/workspaces.json", shape: .array),

@@ -64,6 +64,7 @@ public actor TelegramTurns {
         var continuationID: Int? = nil
         var stopRequested = false
         var stopConfirmed = false
+        var stopSettlement: Task<StopOutcome, Never>?
     }
 
     /// An approval continuation waiting for its destination's turn to end.
@@ -189,7 +190,9 @@ public actor TelegramTurns {
         try Task.checkCancellation()
         guard !isShuttingDown else { throw CancellationError() }
         let updateID = nextInternalUpdateID
-        nextInternalUpdateID &+= 1
+        let (next, overflow) = updateID.addingReportingOverflow(1)
+        guard !overflow else { throw TelegramBotError.underlying("Telegram approval continuation IDs are exhausted") }
+        nextInternalUpdateID = next
         let done = ScopedWaiter()
         approvalWaiters[updateID] = done
         defer { approvalWaiters[updateID] = nil; approvalResults[updateID] = nil }
@@ -210,7 +213,10 @@ public actor TelegramTurns {
             queuedTurns[destination, default: []].append(queued)
             startNextQueuedTurn(destination: destination)
             await Task { await done.park() }.value
-            try approvalResults[updateID]!.get()
+            guard let result = approvalResults[updateID] else {
+                throw TelegramBotError.underlying("Telegram approval continuation ended without a settlement record")
+            }
+            try result.get()
         } onCancel: {
             Task { await self.cancelApprovalContinuation(destination: destination, updateID: updateID) }
         }
@@ -282,6 +288,7 @@ public actor TelegramTurns {
         guard activeTurns[destination]?.id == turnId else { return }
         let card = activeTurns[destination]?.card
         await card?.close()
+        if let settlement = activeTurns[destination]?.stopSettlement { _ = await settlement.value }
         guard activeTurns[destination]?.id == turnId else { return }
         activeTurns[destination] = nil
         startNextQueuedTurn(destination: destination)
@@ -319,7 +326,7 @@ public actor TelegramTurns {
         destination: TelegramDestination,
         turnId: UUID? = nil,
         pauseQueuedTurns: Bool = false
-    ) async -> StopOutcome {
+    ) -> Task<StopOutcome, Never> {
         if pauseQueuedTurns { pausedQueueDestinations.insert(destination) }
         // A turn's own Stop reaches it while it waits in admission; a destination Stop reaches every one.
         let commands = commandDestinations.compactMap {
@@ -328,44 +335,29 @@ public actor TelegramTurns {
         for id in commands { commandTasks[id]?.cancel() }
         guard let active = activeTurns[destination],
               turnId == nil || active.id == turnId else {
-            return commands.isEmpty ? .notRunning : .outcomeUnknown
+            return Task { commands.isEmpty ? .notRunning : .outcomeUnknown }
         }
         activeTurns[destination]?.stopRequested = true
         active.task.cancel()
-        guard let card = active.card else { return .outcomeUnknown }
-        if let phase = await Self.waitForTerminal(card) {
-            guard phase == .canceled else { return .outcomeUnknown }
-            // Stopped presentation does not release ownership. Quit and idle waiters still join this task through its receipt/ingress tail.
-            if activeTurns[destination]?.id == active.id {
-                activeTurns[destination]?.stopConfirmed = true
-            }
-            return commands.contains(where: { commandTasks[$0] != nil }) ? .outcomeUnknown : .confirmed
-        }
-        await card.transition(
-            .outcomeUnknown(reason: "Stop requested, but cancellation was not confirmed")
-        )
-        return .outcomeUnknown
-    }
-
-    private static func waitForTerminal(
-        _ card: TelegramTurnProgressCardDriver
-    ) async -> TelegramTurnPresentationPhase? {
-        await withTaskGroup(of: TelegramTurnPresentationPhase?.self) { group in
-            group.addTask {
-                await card.waitForTerminal()
-            }
-            group.addTask {
-                do {
-                    try await Task.sleep(nanoseconds: 1_500_000_000)
-                } catch {
-                    return nil
+        if let settlement = active.stopSettlement { return settlement }
+        let settlement = Task<StopOutcome, Never> {
+            guard let card = active.card else { return .outcomeUnknown }
+            await card.transition(.blocked(reason: "Stop requested; waiting on turn settlement"))
+            if let phase = await card.waitForTerminal() {
+                guard phase == .canceled else { return .outcomeUnknown }
+                // Stopped presentation does not release ownership. Quit and idle waiters still join the turn's receipt/ingress tail.
+                if activeTurns[destination]?.id == active.id {
+                    activeTurns[destination]?.stopConfirmed = true
                 }
-                return nil
+                return commands.contains(where: { commandTasks[$0] != nil }) ? .outcomeUnknown : .confirmed
             }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
+            await card.transition(
+                .outcomeUnknown(reason: "Stop requested, but cancellation was not confirmed")
+            )
+            return .outcomeUnknown
         }
+        activeTurns[destination]?.stopSettlement = settlement
+        return settlement
     }
 
     public func waitUntilAllIdle() async {

@@ -173,6 +173,10 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     public let moodBasis: Int
     /// Reuse the capsule mood bands to keep vocabulary consistent.
     public let moodWord: String
+    /// The last self-choice stays recallable after its stretch ends.
+    public let chosenRegister: CognitiveChosenRegister?
+    public let registerChoices: [CognitiveChosenRegister]
+    public let registerChoicesIssue: String?
     public let dispositionValence: Double
     public let dispositionWord: String
 
@@ -212,6 +216,9 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         moodValence: Double = 0,
         moodBasis: Int = 0,
         moodWord: String = "even",
+        chosenRegister: CognitiveChosenRegister? = nil,
+        registerChoices: [CognitiveChosenRegister] = [],
+        registerChoicesIssue: String? = nil,
         dispositionValence: Double = 0,
         dispositionWord: String = "even",
         feltNodes: [FeltNode] = [],
@@ -242,6 +249,9 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         self.moodValence = moodValence.clampedSigned()
         self.moodBasis = max(0, moodBasis)
         self.moodWord = moodWord
+        self.chosenRegister = chosenRegister
+        self.registerChoices = detail == .full ? Array(registerChoices.prefix(Self.maximumFeltNodes)) : []
+        self.registerChoicesIssue = registerChoicesIssue
         self.dispositionValence = dispositionValence.clampedSigned()
         self.dispositionWord = dispositionWord
         let feltCap = detail == .full ? Self.maximumFeltNodes : Self.compactFeltNodes
@@ -309,62 +319,24 @@ public struct CognitiveInnerStateOrganismReads: Sendable {
 
 extension CognitiveSubstrate {
 
-    /// Reads never advance decay, move anchors, evict, persist or call a model.
-    public func innerStateReading(
-        windowHours: Double = CognitiveInnerStateReading.defaultWindowHours,
-        detail: CognitiveInnerStateReading.Detail = .compact,
-        organism: CognitiveInnerStateOrganismReads = .none,
-        surface: String? = nil,
-        at explicitNow: Date? = nil
-    ) async -> CognitiveInnerStateReading {
-        let now = explicitNow ?? dependencies.now()
-        let window = min(
-            CognitiveInnerStateReading.maximumWindowHours,
-            max(CognitiveInnerStateReading.minimumWindowHours, windowHours))
-        guard configuration.enabled else {
-            return .unavailable(at: now, windowHours: window, detail: detail)
-        }
 
-        let read = frozenRead(at: now)
-        // All substrate-owned inputs are captured before the growth face suspends.
-        let frozenDisposition = decayedDispositionValence(at: now, dynamics: read.personalityDynamics)
-        let frozenDream = innerStateDreamResidue()
-        let frozenStory = detail == .full ? careStoryLines() : []
-        let frozenSelf = selfKnowledge
-        let frozenSelfIssue = selfKnowledgeReadFailure
-        let frozenPeopleIssue = carePeopleReadFailure
-        let growthInput = detail == .full ? growthWeekInput(at: now) : nil
-        let dyn = read.personalityDynamics
-        let mood = read.mood
-        // The canonical bounded workspace is selected on a copied field.
-        let capsuleItems = read.workspace.items
-            .filter { capsuleEligibleWorkspaceNode($0.node) }
+    /// Tint reads only the substrate's current felt moments. It neither rebuilds the capsule/workspace nor reads persona, peers or history.
+    /// Both tint and the inner-state face use this exact selection and compact cap.
+    public func moodWarmth() -> Double {
+        guard configuration.enabled else { return 0 }
+        let now = dependencies.now()
+        var copied = field
+        let nodes = copied.snapshot(at: now, configuration: configuration)
+        let felt = CognitiveInnerStateReading.trimmedFelt(
+            innerStateFeltNodes(nodes, at: now, window: CognitiveInnerStateReading.defaultWindowHours),
+            cap: CognitiveInnerStateReading.compactFeltNodes)
+        guard !felt.isEmpty else { return 0 }
+        return min(1, max(0, felt.reduce(0.0) { $0 + $1.warmth } / Double(felt.count)))
+    }
 
-        let request = CognitiveCapsuleRequest(
-            surface: "inner_state",
-            userMessage: "",
-            mode: .inspectOnly,
-            organismProjection: organism.projection,
-            allowNonLiveProjection: true,
-            turnKind: .live
-        )
-        let signals = feltSignalsForCapsule(
-            from: capsuleItems, request: request, frozenRead: read)
-        let fingerprintParts = signals.flatMap { Self.feltFingerprintParts(
-            $0, intensityFloor: dyn.feltIntensityFloor) }
-        let fingerprint = fingerprintParts?.text
-
-        let dominant = Self.feltDominantNode(
-            in: feltTintNodes(from: capsuleItems), at: now,
-            halfLife: dyn.fingerprintTintHalfLife)
-        let fingerprintSubject = fingerprintParts.flatMap {
-                Self.feltContributingObject(for: dominant, family: $0.family,
-                    maxCharacters: CognitiveInnerStateReading.subjectLabelCharacters)
-            }
-
-        // Use the felt-day ranking so the two readouts agree on which moments mattered most.
+    private func innerStateFeltNodes(_ nodes: [CognitiveNode], at now: Date, window: Double) -> [CognitiveInnerStateReading.FeltNode] {
         let windowSeconds = window * 3600
-        let feltCandidates = read.snapshot.nodes
+        let feltCandidates = nodes
             .filter { node in
                 // Diagnostic traffic cannot contribute a lived feeling.
                 guard node.turnKind.contributesToLivedState else { return false }
@@ -429,9 +401,77 @@ extension CognitiveSubstrate {
                     arousal: node.arousal, warmth: node.warmth, selection: .recent)
             }
         let felt = Array(strongest) + recent
+        return felt
+    }
+
+    /// Reads never advance decay, move anchors, evict, persist or call a model.
+    public func innerStateReading(
+        windowHours: Double = CognitiveInnerStateReading.defaultWindowHours,
+        detail: CognitiveInnerStateReading.Detail = .compact,
+        organism: CognitiveInnerStateOrganismReads = .none,
+        surface: String? = nil,
+        at explicitNow: Date? = nil
+    ) async -> CognitiveInnerStateReading {
+        let now = explicitNow ?? dependencies.now()
+        let window = min(
+            CognitiveInnerStateReading.maximumWindowHours,
+            max(CognitiveInnerStateReading.minimumWindowHours, windowHours))
+        guard configuration.enabled else {
+            return .unavailable(at: now, windowHours: window, detail: detail)
+        }
+
+        let read = frozenRead(at: now)
+        // All substrate-owned inputs are captured before the growth face suspends.
+        let frozenDisposition = decayedDispositionValence(at: now, dynamics: read.personalityDynamics)
+        let frozenDream = innerStateDreamResidue(at: now)
+        let frozenStory = detail == .full ? careStoryLines() : []
+        let frozenSelf = selfKnowledge
+        let frozenSelfIssue = selfKnowledgeReadFailure
+        let frozenPeopleIssue = carePeopleReadFailure
+        let growthInput = detail == .full ? growthWeekInput(at: now) : nil
+        let dyn = read.personalityDynamics
+        let mood = read.mood
+        // The canonical bounded workspace is selected on a copied field.
+        let capsuleItems = read.workspace.items
+            .filter { capsuleEligibleWorkspaceNode($0.node) }
+
+        let request = CognitiveCapsuleRequest(
+            surface: "inner_state",
+            userMessage: "",
+            mode: .inspectOnly,
+            organismProjection: organism.projection,
+            allowNonLiveProjection: true,
+            turnKind: .live
+        )
+        let signals = feltSignalsForCapsule(
+            from: capsuleItems, request: request, frozenRead: read)
+        let fingerprintParts = signals.flatMap { Self.feltFingerprintParts(
+            $0, intensityFloor: dyn.feltIntensityFloor) }
+        let fingerprint = fingerprintParts?.text
+
+        let dominant = Self.feltDominantNode(
+            in: feltTintNodes(from: capsuleItems), at: now,
+            halfLife: dyn.fingerprintTintHalfLife)
+        let fingerprintSubject = fingerprintParts.flatMap {
+                Self.feltContributingObject(for: dominant, family: $0.family,
+                    maxCharacters: CognitiveInnerStateReading.subjectLabelCharacters)
+            }
+
+        let felt = innerStateFeltNodes(read.snapshot.nodes, at: now, window: window)
         let growthLines: [String]
         if let growthInput { growthLines = await growthWeek(input: growthInput).lines }
         else { growthLines = [] }
+
+        var registerChoices: [CognitiveChosenRegister] = []
+        var registerChoicesIssue: String?
+        if detail == .full {
+            if let store, configuration.persistenceEnabled {
+                do {
+                    registerChoices = try await store.loadRegisterChoices(limit: CognitiveInnerStateReading.maximumFeltNodes)
+                        .filter { $0.at <= now && now.timeIntervalSince($0.at) <= window * 3_600 }
+                } catch { registerChoicesIssue = "Register choice history could not be read: \(error)" }
+            } else { registerChoicesIssue = "Register choice history storage is unavailable." }
+        }
 
         return CognitiveInnerStateReading(
             generatedAt: now,
@@ -443,6 +483,9 @@ extension CognitiveSubstrate {
             moodValence: mood.valence,
             moodBasis: mood.basis,
             moodWord: Self.innerStateMoodWord(mood.valence),
+            chosenRegister: read.affect.chosenRegister,
+            registerChoices: registerChoices,
+            registerChoicesIssue: registerChoicesIssue,
             dispositionValence: frozenDisposition,
             dispositionWord: Self.innerStateDispositionWord(frozenDisposition),
             feltNodes: Array(felt),
@@ -528,12 +571,21 @@ extension CognitiveSubstrate {
         return "ordinary hours"
     }
 
-    /// Project the existing dream contribution, never classify an episode's prose.
-    func innerStateDreamResidue() -> CognitiveInnerStateReading.DreamResidue? {
-        guard let transition = dispositionTransitions.last(where: { $0.source.hasPrefix("dream ") }) else { return nil }
-        let tone = transition.afterContribution - transition.afterDecay
+    /// The frame and introspection share the recorded tone, never classify an episode's prose.
+    func innerStateDreamResidue(at now: Date) -> CognitiveInnerStateReading.DreamResidue? {
+        let tone: Double
+        let at: Date
+        if let residue = dreamResidue, residue.mintedAt <= now {
+            tone = residue.valence
+            at = residue.mintedAt
+        } else if let transition = dispositionTransitions.last(where: { $0.source.hasPrefix("dream ") && $0.at <= now }) {
+            tone = transition.afterContribution - transition.afterDecay
+            at = transition.at
+        } else {
+            return nil
+        }
         let word = tone > 0 ? "settled" : tone < 0 ? "heavy" : "even"
         return CognitiveInnerStateReading.DreamResidue(
-            moodWord: word, date: String(transition.source.dropFirst("dream ".count)))
+            moodWord: word, date: at.formatted(.dateTime.month(.abbreviated).day().hour().minute()))
     }
 }

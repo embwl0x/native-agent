@@ -4,6 +4,7 @@ import Studio
 import ApprovalTransactions
 import AppToolRuntime
 import Foundation
+import NativeAgentShared
 import Experiences
 import NotificationInbox
 import AttentionRouting
@@ -89,6 +90,14 @@ public final class NativeAgentEngine: Sendable {
         }
     }
     public let dataRoot: URL
+    /// What her faces draw: her owners post finished values here, and each face (the Mac window, the phone) applies them per frame.
+    public let face = FaceFeedSource()
+    @MainActor public lazy var faceActs = EngineFaceActs(engine: self)
+    public let countsFeed: CountsFeedProjection
+    public let settingsFeed: SettingsFeedProjection
+    public let panelFreshness: PanelFreshnessOwner
+    public let countsStatus: CountsStatusProjection
+    @MainActor var countSources: CountSources?
     public let layout: SurfaceLayoutLive
     public let ports: NativeAgentEnginePorts
     private let clients: EngineAgentContactClients
@@ -104,6 +113,7 @@ public final class NativeAgentEngine: Sendable {
     /// Settings projects the same canonical sync owner.
     public let sync: SyncFacade
     public let memory: MemoryFacade
+    public let graphUpkeep: GraphUpkeepOwner
     /// Share one saved persona presentation between Mac and phone.
     public let persona: PersonaFacade
     /// Every approval and inbox surface observes the same root-specific owners.
@@ -116,7 +126,7 @@ public final class NativeAgentEngine: Sendable {
     public let configuration = RuntimeReadouts.Configuration()
     public let runs = RuntimeReadouts.Runs()
     public let connectors: ConnectorReadiness
-    public func setSurfaceExpanded(_ open: Bool, surface: String, block: String) async {
+    @discardableResult public func setSurfaceExpanded(_ open: Bool, surface: String, block: String) async -> Result<SurfaceLayout, SurfaceLayoutFailure> {
         await layout.setExpanded(open, surface: surface, block: block)
     }
     public let telegram: TelegramFacade
@@ -127,6 +137,8 @@ public final class NativeAgentEngine: Sendable {
     public let today: TodayReadout
     /// Every page's face (the agent's JS pages and the native ones) and the one port what a row does returns through, for every door.
     public let pages: PartFaces
+    /// The same Memories part over the memory owner's ios-disclosed packet; never a copy of the unrestricted Mac face.
+    let phoneMemoryPages: PartFaces
     public let desk: DeskFacade
     public let bots: BotRunnerScheduler
     /// Every chat surface observes the root’s same transcript and turn owners.
@@ -147,11 +159,17 @@ public final class NativeAgentEngine: Sendable {
     }
 
     private init(dataRoot: URL, ports: NativeAgentEnginePorts, body: Body?) {
+        let launchedAt = Date()
         let hasBody = body != nil
         self.dataRoot = dataRoot
         self.layout = SurfaceLayoutLive(dataRoot: dataRoot)
         self.ports = ports
         self.hasBody = hasBody
+        let counts = CountsFeedProjection(feed: face)
+        self.countsFeed = counts
+        self.settingsFeed = SettingsFeedProjection(feed: face)
+        self.panelFreshness = PanelFreshnessOwner(counts: counts)
+        self.countsStatus = CountsStatusProjection(countsFeed: counts)
         let contextFlow = body?.contextFlow ?? NativeContextFlowRuntime(dataRoot: dataRoot)
         let clients = EngineAgentContactClients(dataRoot: dataRoot, ports: ports, hasBody: hasBody,
             cognition: body?.cognition, contextFlow: contextFlow)
@@ -168,9 +186,10 @@ public final class NativeAgentEngine: Sendable {
             catch { return false }
         }
         self.memory = MemoryFacade(dataRoot: dataRoot)
+        self.graphUpkeep = GraphUpkeepOwner(dataRoot: dataRoot)
         self.persona = PersonaFacade(dataRoot: dataRoot, isolated: !hasBody)
-        self.approvals = ApprovalsFacade(dataRoot: dataRoot)
-        self.inbox = InboxFacade(dataRoot: dataRoot)
+        self.approvals = ApprovalsFacade(dataRoot: dataRoot, counts: counts)
+        self.inbox = InboxFacade(dataRoot: dataRoot, counts: counts)
         self.chrome = ChromeControlRuntime(dataRoot: dataRoot, signatureFailureNote: { id, message in
             try await ForPerson.at(dataRoot).tell(Matter(id: id, form: .wentWrong, from: "chrome",
                 title: "Chrome link blocked by browser signature validation", summary: message), doors: Door.person(thread: nil))
@@ -178,7 +197,7 @@ public final class NativeAgentEngine: Sendable {
         self.trust = TrustFacade(dataRoot: dataRoot, connectorActionStatuses: {
             try await ConnectorActionRecord.checkedStatuses(root: dataRoot, platform: ports.connectorStatus)
         })
-        self.providers = ProvidersFacade(dataRoot: dataRoot)
+        self.providers = ProvidersFacade(dataRoot: dataRoot, settingsFeed: settingsFeed)
         self.connectors = ConnectorReadiness(root: dataRoot, platform: ports.connectorStatus)
         self.telegram = TelegramFacade(dataRoot: dataRoot)
         self.tools = ToolsFacade(dataRoot: dataRoot) { detail, turn in
@@ -189,7 +208,7 @@ public final class NativeAgentEngine: Sendable {
         self.contactThreads = ContactThreadReadouts(dataRoot: dataRoot, contacts: self.contacts)
         self.senses = SensesFacade()
         let makeTools = self.tools
-        self.make = MakeStudio.Shelf(dataRoot: dataRoot) { id, input, version in
+        self.make = MakeStudio.Shelf(dataRoot: dataRoot, feed: face) { id, input, version in
             do {
                 return try await makeTools.withPartDoor(envelope: .personOnMac("mac_ui:make.preview")) { door in
                     await Parts(root: dataRoot).face(id: id, input: input, version: version, invocation: door.invocation)
@@ -197,17 +216,20 @@ public final class NativeAgentEngine: Sendable {
             } catch { return .failure(.init(code: "door_unavailable", message: error.localizedDescription)) }
         }
         self.today = TodayReadout()
-        let readoutRoot = dataRoot
-        self.pages = PartFaces(dataRoot: dataRoot) { [ports] id, input, version in
-            await ports.cognitionHost.readoutFace(id: id, input: input, version: version, dataRoot: readoutRoot)
+        let faceTools = self.tools
+        self.pages = PartFaces(dataRoot: dataRoot, feed: face) { id, input, version in
+            await faceTools.face(id: id, input: input, version: version)
+        }
+        self.phoneMemoryPages = PartFaces(dataRoot: dataRoot, feed: face, key: { PageFaceKey.phone($0) }) { id, input, version in
+            await faceTools.face(id: id, input: input, version: version)
         }
         let turns = TurnsFacade(dataRoot: dataRoot)
         self.turns = turns
-        self.transcripts = TranscriptsFacade(turns: turns)
-        self.doctor = DoctorFacade(dataRoot: dataRoot)
-        let trace = TurnInspectorFeed(dataRootOverride: dataRoot)
+        self.transcripts = TranscriptsFacade(turns: turns, feed: face)
+        self.doctor = DoctorFacade(dataRoot: dataRoot, launchedAt: launchedAt)
+        let trace = TurnInspectorFeed(dataRootOverride: dataRoot, feed: face)
         self.trace = trace
-        if hasBody { Task { @MainActor in trace.start() } }
+        if hasBody { Task { await trace.start() } }
         self.contextFlow = contextFlow
         let cognition = body?.cognition
         self.cognition = cognition
@@ -222,8 +244,24 @@ public final class NativeAgentEngine: Sendable {
                                     completionSender: ports.completionSender(dataRoot))
         clients.attach(self.agents)
         installSessionDelivery()
+        Task { @MainActor [turns, face, approvals, persona, transcripts] in
+            turns.bindTurnFaces(source: face, approvals: approvals, persona: persona, transcripts: transcripts)
+        }
         Task { @MainActor [layout] in layout.start() }
-        Task { @MainActor [weak self] in self?.registerPages() }
+        Task { @MainActor [weak self, pages] in
+            await self?.registerPages()
+            await pages.finishRegistration()
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            countSources = CountSources(engine: self)
+            bindCountStatusSources()
+            await trust.bindSettingsFeed(settingsFeed)
+            await persona.bindSettingsFeed(settingsFeed)
+            await connectors.bindSettingsFeed(settingsFeed)
+            await macIntegration.bindSettingsFeed(settingsFeed)
+            await configuration.bindSettingsFeed(settingsFeed)
+        }
     }
 
     public func toolDispatchClient(
@@ -296,13 +334,6 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
         bridgeToolDispatchClient(fileAccess: fileAccess, approvalFiler: nil,
             approvalTimeoutSeconds: 30, verifiedSessionId: verifiedSessionId, conversation: conversation)
     }
-    func deliverReach(reply: String, itemID: String, turnID: String, turn: Turn) async {
-        await cognition?.deliverReach(reply: reply, itemID: itemID, turnID: turnID, chat: bridgeChatClient(), turn: turn)
-    }
-    func cognitionChanges() async -> AsyncStream<NativeCognitionRuntimeChange>? {
-        await cognition?.changes()
-    }
-
     func toolDispatchClient(
         enforceAppAutonomy: Bool = true,
         actionExecution suppliedExecution: AppActionExecution? = nil

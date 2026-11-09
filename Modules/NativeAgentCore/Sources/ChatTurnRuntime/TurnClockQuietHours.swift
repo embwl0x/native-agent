@@ -8,21 +8,6 @@ import Experiences
 
 /// Share local quiet-hour interpretation between context and delivery; start after end denotes a midnight-spanning window.
 public struct TurnQuietHoursWindow: Sendable, Equatable {
-    public static func holdsResidentWake(session: String?, dataRoot: URL, at date: Date = Date()) -> Bool {
-        do {
-            guard try SessionConversation.checkedKind(session, dataRoot: dataRoot)?.isOwnWork == true else { return false }
-        } catch {
-            reportUnavailable(error, dataRoot: dataRoot)
-            return true
-        }
-        do {
-            return try checkedRead(dataRoot: dataRoot)?.contains(hour: Calendar.current.component(.hour, from: date)) == true
-        } catch {
-            // checkedRead owns its repair receipt. The dependent wake stays held.
-            return true
-        }
-    }
-
     public let startHour: Int
     public let endHour: Int
 
@@ -80,7 +65,7 @@ public struct TurnQuietHoursWindow: Sendable, Equatable {
     }
 
     private static func unavailable(_ reason: String) -> ToolFailureError {
-        ToolFailureError("Quiet hours are unavailable: \(reason) Repair user_prefs.json before releasing resident wake delivery.",
+        ToolFailureError("Quiet hours are unavailable: \(reason) Repair user_prefs.json so held deliveries can be decided.",
             effects: .none, owner: "user_prefs.json", code: "quiet_hours_unavailable", recovery: .repair)
     }
 

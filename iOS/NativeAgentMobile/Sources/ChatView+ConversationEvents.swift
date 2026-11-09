@@ -10,7 +10,7 @@ extension ChatView {
     func restoreConversation() async {
         await store.restorationTask?.value
         guard !Task.isCancelled else { return }
-        store.resumeObservingPendingExchanges(using: bridgeClient)
+        store.resumeObservingPendingExchanges()
         #if DEBUG
         if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleModel") {
             showsConfiguration = true
@@ -53,7 +53,7 @@ extension ChatView {
         }
         store.attachReplyReceiver(using: bridgeClient)
         // Resume observing accepted exchanges without sending them again.
-        store.resumeObservingPendingExchanges(using: bridgeClient)
+        store.resumeObservingPendingExchanges()
         NativeAgentDeepLinkSendHook.deliverPending(
             to: store,
             client: bridgeClient,
@@ -62,7 +62,6 @@ extension ChatView {
         Task {
             await store.restorationTask?.value
             await iCloudBridge.shared.deviceIncomingSetupTask?.value
-            await iCloudBridge.shared.setupTask?.value
             await bridgeClient.pollICloudRepliesNow()
             if !sync.refreshInFlight {
                 await sync.refreshProviderControlsSnapshot()
@@ -80,7 +79,7 @@ extension ChatView {
         if newPhase == .active {
             if MobileQuickAskRoute.consume() { composerIsFocused = true }
             importSharedItems()
-            store.resumeObservingPendingExchanges(using: bridgeClient)
+            store.resumeObservingPendingExchanges()
             Task {
                 await bridgeClient.pollICloudRepliesNow()
                 await sync.refreshChatSessionListSnapshot()
@@ -119,7 +118,7 @@ extension ChatView {
         } else {
             draft.text += " " + newValue
         }
-        if sendNow && !voiceInput.isVoiceNote { DispatchQueue.main.async { submitMessage() } }
+        if sendNow && !voiceInput.isVoiceNote { submitMessage() }
     }
 
     func photoSelectionChanged(_ previousItems: [PhotosPickerItem], _ items: [PhotosPickerItem]) {

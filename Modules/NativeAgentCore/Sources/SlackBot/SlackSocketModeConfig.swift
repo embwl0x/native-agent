@@ -5,13 +5,6 @@ import TrustCenter
 // Blueprint: | `SlackSocketModeConfig.swift` | TransportAllowlist's canonical Slack policy; throwing ingress and toggle readers retain unavailable authority |
 
 public struct SlackSocketModeConfig: Sendable, Equatable {
-    public static func parseIDs(_ raw: String) -> Set<String> {
-        Set(raw.split { $0 == "," || $0 == ";" || $0.isWhitespace }
-            .map(String.init)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty })
-    }
-
     let botToken: String
     let appToken: String
     let botUserId: String?

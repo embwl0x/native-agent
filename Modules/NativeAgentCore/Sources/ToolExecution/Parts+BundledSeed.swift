@@ -20,7 +20,7 @@ extension Parts {
         }
         let actions = try Self.declaredStrings(record["actions"], name: "actions")
         let permissions = try Self.declaredStrings(Self.fields(seed.part["reach"] ?? .null)["capabilities"], name: "reach.capabilities")
-        let schema = record["inputSchema"] ?? .object(["type": .string("object")])
+        let schema = AbilityStore.answeredInputSchema(seed.part["answers"]) ?? record["inputSchema"] ?? .object(["type": .string("object")])
         let manifest = record.merging([
             "id": .string(seed.id), "name": record["name"] ?? .string(seed.id), "origin": .object(["by": .string("hers")]),
             "language": .string("javascript"), "inputSchema": schema, "actions": .array(actions.map(JSONValue.string)),
@@ -31,7 +31,7 @@ extension Parts {
             manifest: .object(manifest), fixtures: .array([]), dependencyShapes: try dependencyShapes(actions, invocation: invocation), prior: .null)
         let version: Int64 = if case .int(let value)? = seed.metadata["version"] { value } else { 1 }
         guard try !store.isCurrentSeed(candidate, version: version) else { return nil }
-        try checkDependencies(candidate, invocation: invocation)
+        try await checkDependencies(candidate, invocation: invocation)
         let signer = SwiftNativeManifestSigner(dataRoot: root)
         let key = try await signer.loadOrCreateSigningKey()
         var file = try store.bundledSeed(candidate, version: version, key: key)

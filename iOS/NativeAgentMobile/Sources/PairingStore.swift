@@ -175,8 +175,6 @@ final class PairingStore: ObservableObject {
                 case .installed(let secret):
                     if !iCloudBridge.shared.deliveryPairingMatches(secret) {
                         iCloudBridge.shared.deliveryPairingDidChange()
-                    } else {
-                        iCloudBridge.shared.resumeDeliveryNudges()
                     }
                 }
             }
@@ -338,11 +336,11 @@ final class PairingStore: ObservableObject {
         }
     }
 
-    /// Bound the synchronize wait so a wedged KVS service cannot freeze its caller.
-    nonisolated static func synchronizeKVSWithTimeout() async {
-        _ = await withCKTimeout("PairingStore.KVS.synchronize", seconds: 2) {
+    nonisolated static func synchronizeKVS() async throws {
+        let synchronized = await Task.detached(priority: .utility) {
             NSUbiquitousKeyValueStore.default.synchronize()
-        }
+        }.value
+        guard synchronized else { throw SyncError.persistence("iCloud key-value synchronization was not accepted.") }
     }
 
     /// Validate exact length before PairingStore commits; transport must not become another persistence owner.

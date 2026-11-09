@@ -1,3 +1,4 @@
+import NativeAgentShared
 // Reread saved authority at each use so settings take effect on the next turn. Missing keys share TrustCenter defaults; saved damage stays unavailable. Keep
 // the reader in MemoryV2 so every consuming module shares it.
 

@@ -3,7 +3,7 @@ import Foundation
 // Blueprint: | `PhonePlaceEvent.swift` | `PhonePlaceEvent`: authenticated cross-device place observations |
 
 /// Source observations, carried only inside an authenticated BridgeMessage.
-public struct PhonePlaceEvent: Codable, Sendable, Identifiable {
+public struct PhonePlaceEvent: Codable, Sendable, Identifiable, Equatable {
     public enum Transition: String, Codable, Sendable { case arrived, left, at }
     public static let messageKind = "phone_place_event"
     public let id: String

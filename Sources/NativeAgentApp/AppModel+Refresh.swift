@@ -1,6 +1,7 @@
+import NativeAgentShared
 import Foundation
 import EngineRuntime
-// Blueprint: | `AppModel+Refresh.swift` | `AppModel`, `setIfChanged`, `refreshAll`, `refreshTelegramSettingsDraft`: Shared refresh and Telegram draft reads |
+// Blueprint: | `AppModel+Refresh.swift` | `AppModel`, `setIfChanged`, `refreshAll`: Shared refresh reads |
 
 @MainActor
 extension AppModel {
@@ -67,23 +68,10 @@ extension AppModel {
         _ = await decodeLogged("getConnectors") { try await engine.connectors.refresh().get() }
         _ = await decodeLogged("getWorkspaces") { try await engine.connectors.refreshWorkspaces() }
         _ = await decodeLogged("getWatchdog") { await engine.doctor.refreshWatchdog(manager: backgroundLoopsManager) }
-        _ = await engine.desk.refreshJobs()
-        if let detail = engine.desk.jobsFeedState?.failureDetail {
-            recordRefreshFailure("getJobs", error: RuntimeReadError.unreadableFeed(detail))
+        if let detail = await engine.desk.timesFeed().failureDetail {
+            recordRefreshFailure("getClockTimes", error: RuntimeReadError.unreadableFeed(detail))
         }
-        await refreshTelegramSettingsDraft({
-        await decodeLogged("getTelegramStatus") { try await engine.telegram.refresh(manager: backgroundLoopsManager) }
-        }, snapshot: { status in
-            guard let st = status else { return nil }
-            return TelegramSettingsDraftSnapshot(
-                enabled: st.enabled, chats: st.allowedChatIds.joined(separator: ","),
-                users: st.allowedUserIds.joined(separator: ","), requireMention: st.requireMention
-            )
-        }, publish: { fetchedTelegramStatus in
-        if fetchedTelegramStatus != nil {
-            telegramStatusRefreshError = nil
-        }
-        })
+        _ = await decodeLogged("getTelegramStatus") { try await engine.telegram.refresh(manager: backgroundLoopsManager) }
         // Load providers at startup so the composer can populate its provider menu.
         await loadProvidersForChat()
         if let detail = engine.providers.settings?.catalogError {
@@ -91,7 +79,13 @@ extension AppModel {
         }
         await reloadChatState()
         _ = await decodeLogged("getConfig", { try await RuntimeReadouts.configuration(engine: engine) })
-        setIfChanged(\.statusText, engine.doctor.health?.ok == true ? "I'm online" : "I'm unavailable")
+        let healthStatus: String
+        switch engine.doctor.health?.ok {
+        case true?: healthStatus = "I'm online"
+        case false?: healthStatus = "I'm unavailable"
+        case nil: healthStatus = "My connection status is unknown"
+        }
+        setIfChanged(\.statusText, healthStatus)
         await publishWorkStatus()
     }
 }

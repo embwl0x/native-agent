@@ -16,8 +16,8 @@ func readDreamPersonaDocs(
         engine: SwiftNativePersonaEngine(root: personaRoot, dataRoot: dataRoot)
     )
     let snapshot = try await compiler.contextSourceSnapshot(surface: surface)
-    // USER supplies pinned core; new memories arrive separately.
-    let userCore: [String]?
+    // USER carries the bounded person picture; new memories arrive separately.
+    let userCore: [String]
     if try !MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) {
         userCore = []
     } else if preview {
@@ -30,7 +30,7 @@ func readDreamPersonaDocs(
     for id in ["SOUL", "VOICE", "GROWTH", "USER", "AGENTS"] {
         let raw = snapshot.packet.activeDocs[id] ?? ""
         switch id {
-        case "USER": docs["\(id).md"] = UserMDAutogenMarkers.promptText(raw, pinnedCore: userCore)
+        case "USER": docs["\(id).md"] = UserMDAutogenMarkers.promptText(raw, userMemoryCore: userCore)
         default: docs["\(id).md"] = raw
         }
     }
@@ -97,7 +97,7 @@ public actor REMTombstoneStore {
     private let fm = FileManager.default
 
     public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
-        let dir = dataRoot.appendingPathComponent("harness", isDirectory: true)
+        let dir = dataRoot.appendingPathComponent("body", isDirectory: true)
         self.path = dir.appendingPathComponent(".rem_tombstones.json")
     }
 

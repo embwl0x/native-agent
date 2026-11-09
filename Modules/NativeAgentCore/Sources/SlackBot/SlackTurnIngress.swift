@@ -16,7 +16,7 @@ extension SlackSocketModeLoop {
     /// Build the Slack-profiled client only after configuration admits Socket Mode. Transcript completion must signal once on both settled and throwing turns.
     public static func ifConfigured(
         dataRoot: URL,
-        chatClient makeChatClient: @escaping @Sendable (SlackAfterHandling?) -> SwiftNativeChatOrchestrationClient,
+        chatClient makeChatClient: @escaping @Sendable () -> SwiftNativeChatOrchestrationClient,
         turnCompleted: @escaping @Sendable (_ sessionID: String) -> Void,
         botEventIntake: @escaping SlackBotEventIntake
     ) throws -> SlackSocketModeLoop? {
@@ -24,7 +24,7 @@ extension SlackSocketModeLoop {
             return nil
         }
         let handler: SlackProgressChat = { inbound, sessionId, handler in
-            let client = makeChatClient(handler.deferAfterHandling)
+            let client = makeChatClient()
             let takeover = await MacWorkContinuation.admit(inbound.text)
             let prompt = """
             [from: slack, user: \(inbound.userId), channel: \(inbound.channelId)]

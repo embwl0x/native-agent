@@ -76,7 +76,8 @@ let products: [Product] =
 // Every target needs runtime support; disk owners need PersistenceCore. Keep edges required for transitive extension visibility.
 let extraDeps: [String: [String]] = [
     "AgentConversations": ["PersonaEngine", "Experiences", "AuthoredCapabilities", "AgentWorkspace", "MacControl", "Privacy", "PersistenceCore",
-        "ApprovalInbox", "StandingBots", "AgentLinkTransport", "ProviderRouting", "TurnTrace", "ChatTurnContracts", "ChatToolParsing", "Desk", "TrustCenter"],
+        "ApprovalInbox", "StandingBots", "AgentLinkTransport", "ProviderRouting", "TurnTrace", "ChatTurnContracts", "ChatToolParsing", "Desk", "TrustCenter",
+        "Transcripts"],
     "ChatTurnContracts": ["PersistenceCore", "ProviderRouting", "TurnTrace", "ApprovalInbox", "ChatToolParsing", "CognitiveSubstrate", "MacControl"],
     "ChatToolRuntime": ["Experiences", "AuthoredCapabilities", "Senses", "ChatTurnContracts", "AgentConversations", "AgentWorkspace", "ChatSessionWork",
         "ChatToolParsing", "Research", "StandingBots", "PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle",
@@ -87,7 +88,7 @@ let extraDeps: [String: [String]] = [
         "MemoryV2", "ChromeControl", "Desk", "StandingBots", "MacIntegration", "Transcripts", "NotificationInbox", "Senses", "SwarmRuns",
         "Dispatcher", "TriggerScheduler", "PersonaEngine"],
     "ChatSessionWork": ["Experiences", "MemoryV2", "MacControl", "Context", "PersistenceCore", "Transcripts", "TurnTrace", "ProviderRouting", "ChatToolParsing",
-        "PersonaEngine"],
+        "PersonaEngine", "CognitiveSubstrate"],
     "ChatToolParsing": ["MacControl", "PersistenceCore", "TurnTrace"],
     "AgentLinkTransport": ["Experiences", "PersistenceCore", "ProviderRouting"],
     "EngineRuntime": ["ActivityWatch", "Experiences", "AuthoredCapabilities", "AgentWorkspace", "ChatSessionWork", "TurnTrace", "Privacy", "Senses", "Agents",
@@ -108,7 +109,7 @@ let extraDeps: [String: [String]] = [
         "Context", "MacControl", "Research", "PersistenceCore", "TrustCenter", "StandingBots", "ToolRegistry", "ToolExecution", "Privacy",
         "AttentionRouting", "MacIntegration", "PersonaEngine", "ProviderRouting", "DeviceSync", "Dispatcher", "Studio", "DoctorChecks", "TrustPersistence",
         "MemoryV2", "AgentConversations", "ChatSessionWork", "ChatToolParsing", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "NotificationInbox",
-        "TelegramBot"],
+        "TelegramBot", "DreamREMCycle"],
 
     // Experiences sits below domain owners so each can record its own events in the shared GRDB store.
     "Experiences": [],
@@ -116,7 +117,7 @@ let extraDeps: [String: [String]] = [
     "Privacy": ["PersistenceCore"],
     "Desk": ["PersistenceCore", "TrustCenter", "Transcripts"],
     "Studio": ["Experiences", "AuthoredCapabilities", "PersistenceCore"],
-    "Senses": ["AuthoredCapabilities", "PersistenceCore"],
+    "Senses": ["Experiences", "AuthoredCapabilities", "PersistenceCore"],
     "TurnTrace": ["Experiences", "AuthoredCapabilities", "PersistenceCore"],
     "Transcripts": ["PersistenceCore"],
     "StandingBots": ["Experiences", "PersistenceCore", "TriggerScheduler", "ApprovalInbox", "Dispatcher"],
@@ -160,7 +161,8 @@ let extraDeps: [String: [String]] = [
     // The engine owns cognition and injects ContextFlow; platform effects arrive through CognitionHost to avoid reverse imports.
     "Cognition": ["Experiences", "AuthoredCapabilities", "PersistenceCore", "CognitiveSubstrate", "Context", "ContextFlow", "MemoryV2", "PersonaEngine",
         "ProviderRouting", "BackgroundLoops", "ApprovalInbox", "TriggerScheduler", "NotificationInbox", "DreamREMCycle", "TurnTrace", "Studio", "Desk",
-        "Privacy", "AgentConversations", "AgentWorkspace", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "Transcripts", "Senses"],
+        "Privacy", "AgentConversations", "AgentWorkspace", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "Transcripts", "Senses",
+        "MacControl"],
     // The engine owns device sync and injects its mind; app mirrors arrive through DeviceSyncHost to avoid reverse imports.
     "DeviceSync": ["MultimodalTTS", "Experiences", "MacControl", "PersistenceCore", "CognitiveSubstrate", "Cognition", "MemoryV2", "ApprovalInbox",
         "NotificationInbox", "ProviderRouting", "MacIntegration", "TrustCenter", "PersonaEngine", "Transcripts", "Desk", "Privacy",
@@ -176,7 +178,7 @@ let extraDeps: [String: [String]] = [
         "PersistenceCore", "PersonaEngine", "Privacy", "ProviderRouting", "StandingBots", "TelegramBot", "ToolRegistry", "TriggerScheduler", "TrustCenter",
         "TurnTrace", "ChatSessionWork", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "Transcripts"],
     "ToolExecution": ["Experiences", "AuthoredCapabilities", "Senses", "PersonaEngine", "PersistenceCore", "TrustCenter", "ToolRegistry", "Desk", "MacControl",
-        "ProviderRouting", "Privacy"],
+        "ProviderRouting", "Privacy", "TriggerScheduler"],
     "Research": ["PersistenceCore", "Privacy", "MacControl", "ProviderRouting", "TurnTrace"],
     "TriggerScheduler": ["Experiences", "PersistenceCore", "Desk", "ActivityWatch", "Privacy", "NotificationInbox", "TrustCenter", "ChatTurnContracts"],
     // Due-job execution composes owners that already depend on TriggerScheduler.
@@ -186,7 +188,7 @@ let extraDeps: [String: [String]] = [
     "Dispatcher": ["ChatToolParsing", "PersonaEngine", "Experiences", "AuthoredCapabilities", "Senses", "PersistenceCore", "MacControl", "TrustCenter",
         "TurnTrace"],
     // TrustCenter owns the Mac Control gate and injection vocabulary; MacControl reads them.
-    "MacControl": ["Experiences", "Senses", "PersistenceCore", "TrustCenter"],
+    "MacControl": ["Experiences", "Senses", "PersistenceCore", "TrustCenter", "TurnTrace"],
     "Onboarding": ["PersistenceCore", "PersonaEngine", "MemoryV2"],
 
 
@@ -198,7 +200,7 @@ let extraDeps: [String: [String]] = [
     "Browser": ["PersistenceCore", "Privacy", "ApprovalInbox", "TurnTrace", "Dispatcher"],
     "Context": ["PersistenceCore", "TrustCenter", "PersonaEngine"],
     // The engine owns ContextFlow and its projections; reverse imports would create a cycle.
-    "ContextFlow": ["PersistenceCore", "Context", "MemoryV2", "PersonaEngine", "DreamREMCycle", "TurnTrace", "Studio", "Desk", "Senses"],
+    "ContextFlow": ["PersistenceCore", "Context", "MemoryV2", "PersonaEngine", "DreamREMCycle", "TurnTrace", "Studio", "Desk", "Senses", "Experiences"],
     // ProviderRouting supplies credentials, PersistenceCore supplies data paths, and TrustCenter checks saved multimodal authority (default off).
     "MultimodalTTS": ["ProviderRouting", "PersistenceCore", "TrustCenter"],
     // MacIntegration gates each surface's reads and writes; PersistenceCore provides locked atomic permission storage.
@@ -210,6 +212,7 @@ let extraDeps: [String: [String]] = [
 ]
 
 let externalDeps: [String: [Target.Dependency]] = [
+    "SystemOps": [.product(name: "NativeAgentShared", package: "NativeAgentShared")],
     "PersistenceCore": [.product(name: "NativeAgentShared", package: "NativeAgentShared")],
     "AgentConversations": [.product(name: "Yams", package: "Yams"), .product(name: "NativeAgentShared", package: "NativeAgentShared")],
     "AgentLinkTransport": [
@@ -268,7 +271,8 @@ let subsystemTargets: [Target] = subsystems.flatMap { name -> [Target] in
         (extraDeps[name] ?? []).map { .target(name: $0) } +
         (externalDeps[name] ?? []) +
         (name == "DoctorChecks" ? [.product(name: "NativeAgentShared", package: "NativeAgentShared")] : [])
-    let targetResources: [Resource]? = (name == "AgentConversations") ? [.copy("Resources/grok-routine.json")] : nil
+    let targetResources: [Resource]? = (name == "AgentConversations")
+        ? [.copy("Resources/grok-routine.json"), .copy("Resources/agent-hosts.json")] : nil
     return [.target(
         name: name,
         dependencies: deps,

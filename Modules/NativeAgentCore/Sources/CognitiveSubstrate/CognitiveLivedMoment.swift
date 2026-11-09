@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import PersistenceCore
 
 // Blueprint: | `CognitiveLivedMoment.swift` | `CognitiveLivedMoment` journal; `LivedMomentDoor` records before folding |
@@ -17,7 +18,7 @@ public enum CognitiveMomentState: String, Codable, Sendable, Equatable {
     case refused
 }
 
-/// A claimed care arrival, carried through the reply into its journal record.
+/// The care a thought of the agent's attends, carried through the reply into its journal record.
 public struct CognitiveCareWake: Codable, Sendable, Equatable {
     public var careID: UUID
     public var watch: String
@@ -48,25 +49,24 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
     public var repliedAt: Date?
     public var took: String?
     public var standingAgentName: String?
-    /// Provenance, kept exactly as the held queue keeps it: the turn's envelope, its source checkpoint and its elevated sources.
+    /// The recorded envelope and answered source decisions accompany the complete carried sources.
     public var envelope: JSONValue?
-    public var sourceCheckpoint: [String]?
     public var elevatedSources: [String]?
     /// Retain the same principal and carried steer as queue.add; missing provenance stays absent.
     public var originPrincipal: String?
     public var carriedSources: [String]?
-    /// Only care-bearing resident wakes enter the journal from the agent's own work.
+    /// Only the agent's thoughts about a care enter the journal from the agent's own work.
     public var careWakes: [CognitiveCareWake]?
 
     public var isCareWake: Bool {
-        sessionId == "resident-wake" && careWakes?.isEmpty == false
+        sessionId == Happening.stream && careWakes?.isEmpty == false
             && !assistant.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     public init(sessionId: String, surface: String, user: String, asked: String, assistant: String,
                 turnId: String? = nil, runId: String? = nil, messageId: String? = nil,
                 occurredAt: Date? = nil, repliedAt: Date? = nil, took: String? = nil, standingAgentName: String? = nil,
-                envelope: JSONValue? = nil, sourceCheckpoint: [String]? = nil,
+                envelope: JSONValue? = nil,
                 elevatedSources: [String]? = nil, originPrincipal: String? = nil,
                 carriedSources: [String]? = nil, careWakes: [CognitiveCareWake]? = nil) {
         self.sessionId = sessionId
@@ -82,7 +82,6 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
         self.took = took
         self.standingAgentName = standingAgentName
         self.envelope = envelope
-        self.sourceCheckpoint = sourceCheckpoint
         self.elevatedSources = elevatedSources
         self.originPrincipal = originPrincipal
         self.carriedSources = carriedSources
@@ -158,6 +157,8 @@ public struct CognitiveLivedMoment: Codable, Sendable {
     public var mindEpoch: UInt64
     public var bodyEpoch: UInt64
     public var input: CognitiveMomentInput?
+    /// The interpretation owner's checkpoint in parts_json, read from the same journal row.
+    public var recovery: JSONValue?
     /// The interpretation, as the interpretation owner encoded it (`AfterTurnInterpretation` lives in MemoryV2, above this module).
     public var meaning: JSONValue?
 
@@ -184,14 +185,28 @@ public struct CognitiveLivedMoment: Codable, Sendable {
     }
 }
 
+/// Preparation distinguishes a broken input from its embedding owner and a local journal operation.
+public enum LivedMomentPreparationFailure: Error, LocalizedError, Sendable {
+    case record(String), embedding(String), local(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .record(let words), .embedding(let words), .local(let words): return words
+        }
+    }
+}
+
 /// Only recorded turns may fold through the interpretation owner's installed door.
 public struct LivedMomentDoor: Sendable {
     /// The data root whose journal this door keeps (never a global default).
+    public var saveRecovery: @Sendable (String, JSONValue) async throws -> Void
+    public var routeAnswer: @Sendable (String) async throws -> String?
+    public var recordAnswer: @Sendable (String, String) async throws -> Void
     public var dataRoot: URL
     /// Record the settled turn as owed. Returns its identity, or nil when the journal cannot record it (the turn cannot fold).
     public var recordOwed: @Sendable (CognitiveMomentTurn) async -> String?
     /// The interpretation context for a recorded moment (rebuilt from the record after a relaunch); its caring request is saved with the input.
-    public var prepare: @Sendable (_ moment: String, _ origin: AfterTurnOrigin, _ reply: String) async -> AfterTurnContext?
+    public var prepare: @Sendable (_ moment: String, _ origin: AfterTurnOrigin, _ reply: String) async throws -> AfterTurnContext
     /// The interpretation came back: written onto the row (`meant`) before any part applies it. True only when the write is durable.
     public var meant: @Sendable (_ moment: String, _ meaning: JSONValue) async -> Bool
     /// The moment's attempt reached its end (its fold landed and its facts are settled): `lived`, payloads dropped.
@@ -205,14 +220,20 @@ public struct LivedMomentDoor: Sendable {
 
     public init(
         dataRoot: URL,
+        saveRecovery: @escaping @Sendable (String, JSONValue) async throws -> Void,
+        routeAnswer: @escaping @Sendable (String) async throws -> String?,
+        recordAnswer: @escaping @Sendable (String, String) async throws -> Void,
         recordOwed: @escaping @Sendable (CognitiveMomentTurn) async -> String?,
-        prepare: @escaping @Sendable (String, AfterTurnOrigin, String) async -> AfterTurnContext?,
+        prepare: @escaping @Sendable (String, AfterTurnOrigin, String) async throws -> AfterTurnContext,
         meant: @escaping @Sendable (String, JSONValue) async -> Bool,
         lived: @escaping @Sendable (String) async -> Void,
         refuse: @escaping @Sendable (String, String) async -> Void,
         unlived: @escaping @Sendable () async -> [CognitiveLivedMoment]?,
         moment: @escaping @Sendable (String) async -> CognitiveLivedMoment?
     ) {
+        self.saveRecovery = saveRecovery
+        self.routeAnswer = routeAnswer
+        self.recordAnswer = recordAnswer
         self.dataRoot = dataRoot
         self.recordOwed = recordOwed
         self.prepare = prepare

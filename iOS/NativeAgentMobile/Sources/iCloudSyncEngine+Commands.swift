@@ -2,101 +2,50 @@ import Darwin
 import Foundation
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `iCloudSyncEngine+Commands.swift` | Subject commands and receipt adoption through the signed action transaction |
+// Blueprint: | `iCloudSyncEngine+Commands.swift` | Signed subject commands, drawn-call page outcomes and read-only reconciliation |
 
 extension iCloudSyncEngine {
+    func faceOutcome(page: String, submission: FaceActSubmission) async -> FaceActOutcome {
+        do {
+            var payload = ["page": page, "row": submission.row, "action": submission.action, "answers": "true",
+                "operation": submission.id.uuidString, "expectedCall": String(decoding: try JSONEncoder().encode(submission.expectedCall), as: UTF8.self)]
+            if let value = submission.value { payload["value"] = value }
+            if let values = submission.values {
+                payload["values"] = String(decoding: try JSONEncoder().encode(values), as: UTF8.self)
+            }
+            if let revision = submission.formRevision { payload["formRevision"] = revision }
+            if let undoOf = submission.undoOf { payload["undoOf"] = undoOf.uuidString }
+            if submission.checking { payload["checking"] = "true" }
+            let response = try await sendActionAndWait(InboxAction.make(action: "faceAction", payload: payload))
+            guard let encoded = response["outcome"] else {
+                throw WireFailure(code: "page_reply_unconfirmed", message: "The Mac did not return this page action's outcome.",
+                                  cause: response["message"], effects: .unknown)
+            }
+            return try JSONDecoder().decode(FaceActOutcome.self, from: Data(encoded.utf8))
+        } catch { return .interrupted(error) }
+    }
+
     // MARK: - Higher-level mutation helpers
 
     // A Desk task waits on its original identity; a refusal never submits another task.
 
-    @discardableResult
-    func approveApproval(id: String) async throws -> [String: String] {
-        let action = InboxAction.make(action: "approveApproval", payload: ["approvalId": id])
-        return try adoptApprovalResponse(await sendDecisionActionAndWait(action))
-    }
-
-    @discardableResult
-    func rejectApproval(id: String) async throws -> [String: String] {
-        let action = InboxAction.make(action: "rejectApproval", payload: ["approvalId": id])
-        return try adoptApprovalResponse(await sendDecisionActionAndWait(action))
-    }
-
-    @discardableResult
-    func cancelApproval(id: String) async throws -> [String: String] {
-        let action = InboxAction.make(action: "cancelApproval", payload: ["approvalId": id])
-        return try adoptApprovalResponse(await sendDecisionActionAndWait(action))
-    }
-
-    private func adoptApprovalResponse(_ response: [String: String]) throws -> [String: String] {
-        // Approval decision settlement is independent of execution success.
-        if let json = response["approvalJSON"], let id = response["approvalId"],
-           let revision = response["approvalReadbackRevision"].flatMap(Double.init) {
-            let row = try JSONDecoder().decode(ApprovalRequest?.self, from: Data(json.utf8))
-            if installReadback(revision: revision, file: "approvals.json", id: id) {
-                if let index = approvals.firstIndex(where: { $0.id == id }) {
-                    if let row { approvals[index] = row } else { approvals.remove(at: index) }
-                } else if let row { approvals.append(row) }
-            }
-        }
-        return try requireSuccessfulActionResponse(response)
-    }
-
-    @discardableResult
-    func approveMemoryProposal(proposalId: String) async throws -> [String: String] {
-        let action = InboxAction.make(action: "approveMemoryProposal", payload: ["proposalId": proposalId])
-        return try adoptMemoryResponse(await sendDecisionActionAndWait(action))
-    }
-
-    @discardableResult
-    func rejectMemoryProposal(proposalId: String) async throws -> [String: String] {
-        let action = InboxAction.make(action: "rejectMemoryProposal", payload: ["proposalId": proposalId])
-        return try adoptMemoryResponse(await sendDecisionActionAndWait(action))
-    }
-
-    private func adoptMemoryResponse(_ response: [String: String]) throws -> [String: String] {
-        if let id = response["resolvedProposalId"],
-           let revision = response["memoryReadbackRevision"].flatMap(Double.init),
-           installReadback(revision: revision, file: "memory_proposals.json", id: id) {
-            memoryProposals.removeAll { $0.id == id }
-            memoryProposalsSnapshotLoaded = true
-        }
-        if let id = response["memoryId"], let json = response["memoryJSON"],
-           let revision = response["memoryReadbackRevision"].flatMap(Double.init) {
-            let row = try JSONDecoder().decode(MemoryRecord?.self, from: Data(json.utf8))
-            if installReadback(revision: revision, file: "memories.json", id: id) {
-                memories.removeAll { $0.id == id }
-                if let row { memories.insert(row, at: 0) }
-            }
-        }
-        return try requireSuccessfulActionResponse(response)
-    }
-
-    @discardableResult
-    func inboxAction(itemId: String, actionId: String) async throws -> [String: String] {
-        let action = InboxAction.make(action: "inboxAction", payload: [
-            "itemId": itemId,
-            "actionId": actionId,
-        ])
-        let response = try await sendActionAndWait(action)
-        if let id = response["inboxItemId"], let json = response["inboxItemJSON"],
-           let revision = response["inboxReadbackRevision"].flatMap(Double.init) {
-            let row = try JSONDecoder().decode(InboxItemRecord?.self, from: Data(json.utf8))
-            if installReadback(revision: revision, file: "inbox.json", id: id) {
-                if let index = inboxItems.firstIndex(where: { $0.id == id }) {
-                    if let row { inboxItems[index] = row } else { inboxItems.remove(at: index) }
-                } else if let row { inboxItems.insert(row, at: 0) }
-                inboxSnapshotLoaded = true
-            }
-        }
-        return try adoptApprovalResponse(response)
-    }
-
-    /// A face row's action, answered by the page's owner on the Mac: its words, or its refusal thrown.
+    /// Run the row's call through the person's signed phone door; await its owned decision result.
     func faceAction(page: String, row: String, action: String, value: String?) async throws -> String? {
-        var payload = ["page": page, "row": row, "action": action]
-        if let value { payload["value"] = value }
-        let response = try await sendActionAndWait(InboxAction.make(action: "faceAction", payload: payload))
-        return try requireSuccessfulActionResponse(response)["message"]
+        guard await refreshFacesSnapshot() else {
+            throw SyncError.unsupported("The page's actions have not synced from the Mac yet.")
+        }
+        let snapshot = faces[page]
+        let sections = (snapshot?.levers ?? []) + (snapshot?.keyLevers ?? []) + (snapshot?.drawnFace?.sections ?? [])
+        let rows = sections.flatMap(\.rows).filter { $0.id == row }
+        let call: PartFace.Call?
+        if action == "set", let value { call = rows.compactMap(\.control).first?.settingCall(value) }
+        else { call = rows.flatMap { $0.actions ?? [] }.first { $0.id == action }?.call }
+        guard let call else { throw SyncError.unsupported("Read this page on the phone before acting on its row.") }
+        let outcome = await faceOutcome(page: page, submission: .init(id: UUID(), row: row, action: action,
+                                                                    value: value, expectedCall: call))
+        if let failure = outcome.failure { throw failure }
+        if outcome.unresolved { throw SyncError.responseUnconfirmed(outcome.words ?? "Read the action's current state before repeating it.") }
+        return outcome.words
     }
 
     @discardableResult
@@ -112,20 +61,31 @@ extension iCloudSyncEngine {
             "bundleId": bundleId,
             "deviceId": deviceId,
         ])
-        return try requireSuccessfulActionResponse(await sendActionAndWait(action, pollTimeoutSeconds: 45))
+        return try requireSuccessfulActionResponse(await sendActionAndWait(action))
     }
 
     // MARK: - Mac Control (iOS → Mac remote actions)
     // Mac authority checks own control admission; all actions retain signed retry identity.
-    private func macControlResult(_ action: InboxAction, pollTimeoutSeconds: Double = 120) async throws -> String {
-        let raw = try await sendActionAndWait(action, pollTimeoutSeconds: pollTimeoutSeconds)
-        let result = try requireSuccessfulActionResponse(
-            raw
-        )
-        if result["blocked"] == "true" {
-            throw SyncError.unsupported(result["message"] ?? result["error"] ?? result["code"] ?? "Mac control denied.")
+    private func macControlResult(_ action: InboxAction) async throws -> String {
+        let raw = try await sendActionAndWait(action)
+        let result: [String: String]
+        do { result = try requireSuccessfulActionResponse(raw) }
+        catch {
+            if case SyncError.approvalRequired = error { throw error }
+            if raw["effects"] == "none" {
+                throw WireFailure(code: raw["code"] ?? "mac_control_refused", message: error.localizedDescription,
+                    cause: nil, effects: .none)
+            }
+            throw error
         }
-        return result["result"] ?? result["message"] ?? result["status"] ?? "ok"
+        if result["blocked"] == "true" {
+            throw WireFailure(code: result["code"] ?? "mac_control_blocked",
+                message: result["message"] ?? result["error"] ?? "Mac control denied.", cause: nil, effects: .none)
+        }
+        guard let text = result["result"] else {
+            throw SyncError.responseUnconfirmed("The Mac's signed control reply omitted its result. Read the Mac outcome before submitting again.")
+        }
+        return text
     }
 
     private func sendMacControl(_ action: PhoneMacControlAction, arguments: [String: String]) async throws -> String {
@@ -153,35 +113,7 @@ extension iCloudSyncEngine {
     }
 
     // MARK: - Telegram control
-    func disconnectTelegram() async throws -> MobileTelegramSnapshot {
-        let lifecycle = lifecycleGeneration
-        let action = InboxAction.make(action: "disconnect_telegram", payload: ["confirmed": "true"])
-        let response = try requireSuccessfulActionResponse(await sendActionAndWait(action))
-        guard let json = response["telegram"],
-              let recovered = try? JSONDecoder().decode(MobileTelegramSnapshot.self, from: Data(json.utf8)) else {
-            throw SyncError.unsupported("The Mac did not return readable Telegram settings. Refresh before trying again.")
-        }
-        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
-        applyTelegramSnapshot(recovered)
-        return recovered
-    }
-
-    // MARK: - Provider control (signed actions; credential bodies are encrypted)
-
-    func answerInteraction(_ card: InlineInteraction, sessionID: String, actionName: String,
-                           values: [String: String] = [:]) async throws -> [String: String] {
-        guard let secret = pairingStore?.iCloudPairingSecret else { throw SyncError.notSigned }
-        var action = InboxAction.make(action: "interaction_action", payload: [:])
-        var fields = values
-        fields["sessionID"] = sessionID
-        fields["interactionID"] = card.id
-        fields["revision"] = String(card.revision)
-        fields["action"] = actionName
-        action.payload = [SecretActionEnvelope.field: try SecretActionEnvelope.seal(fields, secret: secret,
-            actionID: action.msgId, actionName: action.action)]
-        return try requireSuccessfulActionResponse(await sendActionAndWait(action,
-            intentionalNewRequest: true, pollTimeoutSeconds: 90))
-    }
+    // MARK: - Provider control
 
     /// Commit the full tuple atomically through ProviderRouting; Chat metadata is not routing authority.
     func configureSurfaceSelection(
@@ -228,40 +160,6 @@ extension iCloudSyncEngine {
         }
     }
 
-    func refreshAppSettings() async {
-        guard !appSettingsLoading, appSettingsSaving.isEmpty else { return }
-        appSettingsLoading = true
-        defer { appSettingsLoading = false }
-        let lifecycle = lifecycleGeneration
-        do {
-            _ = try await appSettingsRead.read({
-                let result = try requireSuccessfulActionResponse(await sendActionAndWait(
-                    .make(action: "app_settings", payload: [:])))
-                guard let raw = result["settings"] else { throw SyncError.persistence("The Mac did not return its settings.") }
-                guard lifecycle == lifecycleGeneration else { throw CancellationError() }
-                return try JSONDecoder().decode([MobileAppSetting].self, from: Data(raw.utf8))
-            }, publish: { appSettingRows = $0; appSettingsFailure = nil })
-        } catch { if lifecycle == lifecycleGeneration { appSettingsFailure = "The Mac's settings could not be read: \(error.localizedDescription)" } }
-    }
-
-    /// Adopt settings only through the owning Mac control's readback.
-    func setAppSetting(_ setting: MobileAppSetting, to value: String) async {
-        guard setting.writable, setting.unavailableReason == nil, let currentValue = setting.value,
-              !appSettingsSaving.contains(setting.id), value != currentValue else { return }
-        appSettingsRead.write { appSettingsSaving.insert(setting.id) }
-        defer { appSettingsSaving.remove(setting.id) }
-        let lifecycle = lifecycleGeneration
-        do {
-            let result = try requireSuccessfulActionResponse(await sendActionAndWait(
-                .make(action: "app_setting_set", payload: ["id": setting.id, "value": value])))
-            guard let raw = result["setting"] else { throw SyncError.persistence("The Mac did not return the saved setting.") }
-            guard lifecycle == lifecycleGeneration else { throw CancellationError() }
-            let row = try JSONDecoder().decode(MobileAppSetting.self, from: Data(raw.utf8))
-            if let index = appSettingRows.firstIndex(where: { $0.id == row.id }) { appSettingsRead.write { appSettingRows[index] = row } }
-            appSettingsFailure = nil
-        } catch { if lifecycle == lifecycleGeneration { appSettingsFailure = "\(setting.label) could not be confirmed: \(error.localizedDescription)" } }
-    }
-
     func agentThreadAction(id: String, text: String? = nil, sessionID: String? = nil) async throws -> MobileAgentThread {
         let lifecycle = lifecycleGeneration
         var payload = ["id": id]
@@ -272,7 +170,7 @@ extension iCloudSyncEngine {
             payload["text"] = text; payload["session_id"] = session
         }
         let result = try requireSuccessfulActionResponse(await sendActionAndWait(
-            .make(action: text == nil ? "get_agent_thread" : "send_agent_message", payload: payload), pollTimeoutSeconds: text == nil ? 30 : 120))
+            .make(action: text == nil ? "get_agent_thread" : "send_agent_message", payload: payload)))
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
         guard let raw = result["thread"] else { throw SyncError.persistence("The Mac did not return the agent thread.") }
         let thread = try await Task.detached(priority: .userInitiated) {
@@ -287,43 +185,4 @@ extension iCloudSyncEngine {
         }
         return thread
     }
-
-    @discardableResult
-    func changeSchedulerJob(action: String, payload: [String: String]) async throws -> MobileSchedulerJob {
-        let lifecycle = lifecycleGeneration
-        let result = try requireSuccessfulActionResponse(await sendActionAndWait(
-            InboxAction.make(action: action, payload: payload)
-        ))
-        guard lifecycle == lifecycleGeneration,
-              let data = result["scheduler_job"]?.data(using: .utf8),
-              let snapshot = try? JSONDecoder().decode(MobileSchedulerSnapshot.self, from: data),
-              snapshot.jobs.count == 1,
-              let id = result["id"],
-              payload["id"] == nil || payload["id"] == id,
-              let job = snapshot.jobs.first(where: { $0.id == id }) else {
-            throw SyncError.persistence("The Mac did not return the saved scheduler job. Refresh before trying again.")
-        }
-        // This receipt proves one job, not a successful full-list refresh.
-        var merged = schedulerSnapshot ?? MobileSchedulerSnapshot(capturedAt: 0, jobs: [])
-        if snapshot.capturedAt >= max(merged.capturedAt, schedulerJobReceiptTimes[id] ?? 0) {
-            if let index = merged.jobs.firstIndex(where: { $0.id == id }) {
-                merged.jobs[index] = job
-            } else {
-                merged.jobs.append(job)
-            }
-            if snapshot.capturedAt >= (schedulerJobReceiptTimes.values.max() ?? 0) {
-                merged.mac_time_zone = snapshot.mac_time_zone
-            }
-            schedulerJobReceiptTimes[id] = snapshot.capturedAt
-            schedulerSnapshot = merged
-        }
-        return job
-    }
-}
-
-/// The Mac's reply to a Desk task: the item it opened and the agent's line that carries it.
-struct MobileDeskTaskStart: Sendable, Equatable {
-    let deskHandle: String
-    let deskAlias: String
-    let job: String
 }

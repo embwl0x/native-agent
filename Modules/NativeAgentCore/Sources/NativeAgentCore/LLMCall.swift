@@ -22,6 +22,8 @@ public struct LLMCall: Sendable {
     public var session: String?
     /// Only the conversation's own requests calibrate its context; secondary calls stay unmeasured.
     public var conversationRequest = false
+    /// A clean provider terminal may complete this request without answer text or calls.
+    public var allowsSilentCompletion = false
     /// Payload-free replay recipe from the request builder.
     public var requestPlan: Data?
     /// Stable/dynamic split of the system prompt; a caching layout, never content.
@@ -30,8 +32,6 @@ public struct LLMCall: Sendable {
     public var currentUserIndex: Int?
     /// A real generation for an explicit preview: nothing learns from it.
     public var preview = false
-    /// The shared router owns this call's wall and cancels its process.
-    public var wallOwned = false
     /// Trace root for this call; nil resolves the default data root.
     public var traceDataRoot: URL?
 

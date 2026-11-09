@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Synchronization
 @preconcurrency import Dispatch
 import NativeAgentCore
@@ -6,7 +7,7 @@ import PersistenceCore
 import TurnTrace
 // Blueprint: | `LLMClient+CodexAdapter.swift` | `CodexProcess`: one process lifecycle; strict UTF-8 pipes |
 
-/// One strict decoder for each Codex pipe, shared by both runners. Only an incomplete scalar waits for another read. Invalid bytes and their entire suffix
+/// One strict decoder for each Codex pipe. Only an incomplete scalar waits for another read. Invalid bytes and their entire suffix
 /// stay owned as raw evidence; valid text before them remains available.
 final class CodexUTF8Output: @unchecked Sendable {
     struct Snapshot: Sendable {
@@ -63,7 +64,7 @@ final class CodexUTF8Output: @unchecked Sendable {
     }
 }
 
-/// The process has settled; valid prefixes and exact undecodable pipe bytes stay on this error. Neither diagnostic prose nor logs publish raw bytes.
+/// Valid prefixes and exact undecodable pipe bytes stay on this error. Neither diagnostic prose nor logs publish raw bytes.
 struct CodexOutputEncodingFailure: Error, Sendable, LocalizedError, ProviderFailureWrapping {
     let stdout: CodexUTF8Output.Snapshot
     let stderr: CodexUTF8Output.Snapshot
@@ -79,85 +80,72 @@ struct CodexOutputEncodingFailure: Error, Sendable, LocalizedError, ProviderFail
     }
 }
 
-private final class CodexProcessShutdown: @unchecked Sendable {
-    private let process: ManagedProcess
-    private let launchTree: ProcessTreeSnapshot
-    private let lock = NSLock()
-    private var requested = false
-    private let stopped = DispatchGroup()
-
-    init(_ process: ManagedProcess) {
-        self.process = process
-        launchTree = ProcessTreeReaper.snapshot(rootPID: process.processIdentifier)
+/// Dispatch owns a cancellable stdin write; a full pipe never blocks process settlement.
+private final class CodexProcessInput: Sendable {
+    private struct State {
+        var channel: DispatchIO?
+        var cancelled = false
+        var failure: String?
     }
+    private let state = Mutex(State())
+    private let finished = DispatchGroup()
 
-    func requestStop() {
-        let admitted = lock.withLock {
-            guard !requested, process.isRunning else { return false }
-            requested = true
-            stopped.enter()
-            return true
+    init(handle: FileHandle, data: Data, onFailure: @escaping @Sendable () -> Void) throws {
+        let descriptor = fcntl(handle.fileDescriptor, F_DUPFD_CLOEXEC, 0)
+        guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard fcntl(descriptor, F_SETNOSIGPIPE, 1) == 0 else {
+            let error = NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            Darwin.close(descriptor)
+            throw error
         }
-        guard admitted else { return }
-        let tree = ProcessTreeReaper.snapshot(
-            rootPID: process.processIdentifier, retaining: launchTree
-        )
-        ProcessTreeReaper.signal(tree, signal: SIGTERM)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { [stopped] in
-            defer { stopped.leave() }
-            ProcessTreeReaper.quiesceAndKill(tree)
-            // The runner's termination handler owns root exit observation and joins this escalation before draining and returning the result.
+        do { try handle.close() }
+        catch { Darwin.close(descriptor); throw error }
+        let queue = DispatchQueue(label: "NativeAgent.codex.stdin")
+        finished.enter()
+        let channel = DispatchIO(type: .stream, fileDescriptor: descriptor, queue: queue) { [self] error in
+            let closed = Darwin.close(descriptor)
+            let closeError = errno
+            state.withLock {
+                if error != 0, !$0.cancelled {
+                    $0.failure = "Codex stdin cleanup failed: \(NSError(domain: NSPOSIXErrorDomain, code: Int(error)).localizedDescription)"
+                }
+                if closed != 0 {
+                    $0.failure = "Codex stdin close failed: \(NSError(domain: NSPOSIXErrorDomain, code: Int(closeError)).localizedDescription)"
+                }
+                $0.channel = nil
+            }
+            finished.leave()
+        }
+        state.withLock { $0.channel = channel }
+        let bytes = data.withUnsafeBytes { DispatchData(bytes: $0) }
+        channel.write(offset: 0, data: bytes, queue: queue) { [self] done, _, error in
+            if error != 0 {
+                let failed = state.withLock {
+                    guard !$0.cancelled else { return false }
+                    $0.failure = "Could not deliver Codex stdin: \(NSError(domain: NSPOSIXErrorDomain, code: Int(error)).localizedDescription)"
+                    return true
+                }
+                if failed { onFailure() }
+            }
+            if done { channel.close() }
         }
     }
 
-    /// Called on the process exit queue, never the cooperative executor.
-    func waitForStop() { stopped.wait() }
-}
-
-public struct CodexProcessResult: Sendable {
-    public var exitCode: Int32
-    public var stdout: String
-    public var stderr: String
-    public var timedOut: Bool
-    public init(exitCode: Int32, stdout: String, stderr: String, timedOut: Bool = false) {
-        self.exitCode = exitCode
-        self.stdout = stdout
-        self.stderr = stderr
-        self.timedOut = timedOut
+    var captureFailure: String? { state.withLock { $0.failure } }
+    func wait() { finished.wait() }
+    func stop() {
+        let channel = state.withLock { $0.cancelled = true; return $0.channel }
+        channel?.close(flags: .stop)
     }
 }
 
-/// Cancellation is sticky: a fire before registration must terminate the child as soon as its handle arrives.
-public final class CodexTerminator: @unchecked Sendable {
-    private let lock = NSLock()
-    private var handler: (@Sendable () -> Void)?
-    private var fired: Bool = false
-    public init() {}
-    public func register(_ h: @escaping @Sendable () -> Void) {
-        lock.lock()
-        let shouldFireImmediately = fired
-        handler = h
-        lock.unlock()
-        // Honor cancellation that arrived before the process registered its terminator.
-        if shouldFireImmediately { h() }
-    }
-    public func fire() {
-        lock.lock()
-        fired = true
-        let h = handler
-        lock.unlock()
-        h?()
-    }
-}
-
-/// Register termination immediately after spawn so consumer cancellation cannot leave an unowned process running.
+/// One invocation retains its process and pipes through exit and drain, independently of the caller's wait.
 public struct CodexProcessInvocation: Sendable {
     public var executable: String
     public var arguments: [String]
     public var stdin: String
-    public var timeout: TimeInterval
-    public var terminator: CodexTerminator
     public var lifetime: ProviderRequestLifetime
+    public var call: LLMCall?
     /// Optional full child-process environment. Rooted secondary runtimes use this to bind CODEX_HOME/NATIVE_AGENT_DATA_ROOT instead of silently reading
     /// the operator's personal Codex home.
     public var environment: [String: String]?
@@ -165,25 +153,24 @@ public struct CodexProcessInvocation: Sendable {
         executable: String,
         arguments: [String],
         stdin: String,
-        timeout: TimeInterval,
-        terminator: CodexTerminator = CodexTerminator(),
         environment: [String: String]? = nil,
-        lifetime: ProviderRequestLifetime = ProviderRequestLifetime()
+        lifetime: ProviderRequestLifetime = ProviderRequestLifetime(),
+        call: LLMCall? = nil
     ) {
         self.executable = executable
         self.arguments = arguments
         self.stdin = stdin
-        self.timeout = timeout
-        self.terminator = terminator
         self.environment = environment
         self.lifetime = lifetime
+        self.call = call
     }
 
     /// Spawn once, drain both pipes, and join shutdown before reporting exit.
     fileprivate func run(
         stdout: @escaping @Sendable (Data) -> Void,
+        stdoutClosed: @escaping @Sendable (ProcessPipeDrain.End) -> Void,
         stderr: @escaping @Sendable (Data) -> Void,
-        exited: @escaping @Sendable (Int32, Bool, Bool) -> Void
+        exited: @escaping @Sendable (Int32, String?) -> Void
     ) throws {
         let proc = ManagedProcess()
         var environment = environment ?? ProcessInfo.processInfo.environment
@@ -199,7 +186,7 @@ public struct CodexProcessInvocation: Sendable {
         let stdoutReader: ProcessPipeDrain
         let stderrReader: ProcessPipeDrain
         do {
-            stdoutReader = try ProcessPipeDrain(handle: outPipe.fileHandleForReading, onData: stdout)
+            stdoutReader = try ProcessPipeDrain(handle: outPipe.fileHandleForReading, onData: stdout, onEnd: stdoutClosed)
             do {
                 stderrReader = try ProcessPipeDrain(handle: errPipe.fileHandleForReading, onData: stderr)
             } catch {
@@ -213,27 +200,36 @@ public struct CodexProcessInvocation: Sendable {
             }
             throw error
         }
-        let terminating = Mutex(false)
-        let timedOut = Mutex(false)
-        let cancelled = Mutex(false)
-        let timeoutSlot = Mutex<DispatchWorkItem?>(nil)
-        let shutdownSlot = Mutex<CodexProcessShutdown?>(nil)
-        // Install before run so even an immediately exiting child settles.
-        proc.terminationHandler = { p in
-            terminating.withLock { $0 = true }
-            timeoutSlot.withLock { $0 }?.cancel()
-            shutdownSlot.withLock { $0 }?.waitForStop()
+        let input: CodexProcessInput
+        do {
+            input = try CodexProcessInput(handle: inPipe.fileHandleForWriting, data: Data(stdin.utf8)) {
+                if proc.isRunning { ProcessTreeReaper.quiesceAndKill(proc.groupSnapshot) }
+            }
+        } catch {
             stdoutReader.stopAndWait()
             stderrReader.stopAndWait()
-            try? outPipe.fileHandleForReading.close()
-            try? errPipe.fileHandleForReading.close()
-            if let failure = p.terminationError { stderr(Data(("\n" + failure).utf8)) }
-            exited(p.terminationStatus, timedOut.withLock { $0 }, cancelled.withLock { $0 } && p.terminationError == nil)
-            timeoutSlot.withLock { slot in defer { slot = nil }; return slot }?.cancel()
+            throw error
+        }
+        // Install before run so even an immediately exiting child settles.
+        proc.terminationHandler = { p in
+            if p.terminationError != nil {
+                input.stop()
+                stdoutReader.stop()
+                stderrReader.stop()
+            }
+            input.wait()
+            stdoutReader.waitForEOF()
+            stderrReader.waitForEOF()
+            let failures = [p.terminationError, input.captureFailure, stdoutReader.captureFailure,
+                            stderrReader.captureFailure].compactMap { $0 }
+            let failure = failures.isEmpty ? nil : failures.joined(separator: "; ")
+            exited(p.terminationStatus, failure)
         }
         do {
             try proc.run()
         } catch {
+            input.stop()
+            input.wait()
             stdoutReader.stopAndWait()
             stderrReader.stopAndWait()
             for pipe in [outPipe, errPipe, inPipe] {
@@ -242,43 +238,11 @@ public struct CodexProcessInvocation: Sendable {
             }
             throw error
         }
-        try? inPipe.fileHandleForReading.close()
-        try? outPipe.fileHandleForWriting.close()
-        try? errPipe.fileHandleForWriting.close()
-        let shutdown = CodexProcessShutdown(proc)
-        shutdownSlot.withLock { $0 = shutdown }
-        terminator.register {
-            cancelled.withLock { $0 = true }
-            shutdown.requestStop()
-            timeoutSlot.withLock { $0 }?.cancel()
-        }
-        guard !terminating.withLock({ $0 }) else { return }
-        if timeout > 0 {
-            let work = DispatchWorkItem {
-                if proc.isRunning {
-                    timedOut.withLock { $0 = true }
-                    shutdown.requestStop()
-                }
-            }
-            timeoutSlot.withLock { $0 = work }
-            if terminating.withLock({ $0 }) {
-                timeoutSlot.withLock { slot in defer { slot = nil }; return slot }?.cancel()
-                return
-            }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: work)
-        }
-        // Arm stop and deadline before a full stdin pipe can block its writer.
-        let input = Data(stdin.utf8)
-        DispatchQueue.global(qos: .userInitiated).async {
-            try? inPipe.fileHandleForWriting.write(contentsOf: input)
-            try? inPipe.fileHandleForWriting.close()
-        }
+        if input.captureFailure != nil, proc.isRunning { ProcessTreeReaper.quiesceAndKill(proc.groupSnapshot) }
     }
 }
 
-public typealias CodexProcessRunner = @Sendable (CodexProcessInvocation) async throws -> CodexProcessResult
-
-/// Yield stdout in order, finish after exit/drain, and propagate failures. Consumer termination must stop the child and detach its read handler.
+/// Yield stdout in order; a silent answer requires EOF and successful process exit.
 public typealias CodexStreamingProcessRunner = @Sendable (CodexProcessInvocation) -> AsyncThrowingStream<String, Error>
 
 /// Buffered and incremental callers share one process lifecycle; delivery follows the CLI's stdout flushing.
@@ -291,23 +255,17 @@ public final class CodexProcess: LLMTransport {
 
     public let providerId: String = "codex"
     private let codexBin: String?
-    private let timeout: TimeInterval
-    private let runner: CodexProcessRunner
     private let streamingRunner: CodexStreamingProcessRunner
     private let processEnvironment: [String: String]
     private let dataRootOverride: URL?
 
     public init(
         codexBin: String? = nil,
-        timeout: TimeInterval = 180,
-        runner: @escaping CodexProcessRunner = CodexProcess.defaultRunner,
         streamingRunner: @escaping CodexStreamingProcessRunner = CodexProcess.defaultStreamingRunner,
         processEnvironmentOverride: [String: String]? = nil,
         dataRootOverride: URL? = nil
     ) {
         self.codexBin = codexBin
-        self.timeout = timeout
-        self.runner = runner
         self.streamingRunner = streamingRunner
         self.processEnvironment = processEnvironmentOverride ?? ProcessInfo.processInfo.environment
         self.dataRootOverride = dataRootOverride
@@ -315,57 +273,7 @@ public final class CodexProcess: LLMTransport {
 
     /// NativeAgent tools never reach the CLI; its tool wire is unsupported.
     public func complete(prompt: String, system: String?, model: String, tools: [LLMToolSchema]?, call: LLMCall) async throws -> String {
-        let authPath = resolvedAuthPath()
-        let args = try arguments(model: model, authPath: authPath, call: call)
-        let terminator = CodexTerminator()
-        let invocation = CodexProcessInvocation(
-            executable: try codexBin ?? CodexExecutable.resolveCodexExecutable(environment: processEnvironment).path,
-            arguments: args,
-            stdin: Self.composedPrompt(system: system, prompt: prompt),
-            timeout: call.wallOwned || call.lifetime.stallOnly ? 0 : timeout,
-            terminator: terminator,
-            environment: childEnvironment(authPath: authPath), lifetime: call.lifetime
-        )
-        try await Self.prepareCodexHome(authPath)
-        let result: CodexProcessResult
-        do {
-            // Consumer cancellation must stop the spawned process rather than leave it running after its owner exits.
-            result = try await withTaskCancellationHandler(
-                operation: { [runner] in
-                    let outcome: Result<CodexProcessResult, Error> = await settle {
-                        do { return .success(try await runner(invocation)) }
-                        catch { return .failure(error) }
-                    }
-                    return try outcome.get()
-                },
-                onCancel: { terminator.fire() }
-            )
-        } catch is CancellationError {
-            // Keep cancellation typed so structured callers cannot mistake it for process failure.
-            throw CancellationError()
-        } catch {
-            throw mapTransportError(error, fallback: .underlying(message: "codex: \(error)"))
-        }
-        // Cancellation can cause a nonzero exit without the runner throwing; check it before classifying a process failure.
-        if Task.isCancelled {
-            // The runner has joined exit and both drains. Produced text is returned to the cancelled owner for its stopped settlement.
-            if !result.stdout.isEmpty { return result.stdout }
-            throw CancellationError()
-        }
-        if result.timedOut {
-            throw LLMError.underlying(message: "codex: timed out after \(Int(timeout))s")
-        }
-        if result.exitCode != 0 {
-            // Keep bounded CLI failure evidence for diagnosis.
-            throw Self.classifyCodexFailure(
-                exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr)
-        }
-        // Empty stdout is streamTruncated even when the CLI exits successfully.
-        if result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw LLMError.streamTruncated(
-                message: "codex produced no output (exit 0, empty stdout)")
-        }
-        return result.stdout
+        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: call)
     }
 
     private func resolvedAuthPath() -> URL {
@@ -442,77 +350,106 @@ public final class CodexProcess: LLMTransport {
         return "…" + String(t.suffix(max))
     }
 
-    /// Streaming shares the complete invocation's cancellation owner.
+    /// Words settle at stdout EOF; a silent answer also waits for successful process exit.
     public func stream(
         prompt: String,
         system: String?,
         model: String, call: LLMCall
     ) -> AsyncThrowingStream<String, Error> {
+        guard !Task.isCancelled, call.replyWork?.isStopped != true else {
+            return AsyncThrowingStream { $0.finish(throwing: CancellationError()) }
+        }
         let authPath = resolvedAuthPath()
-        let terminator = CodexTerminator()
+        let work = call.replyWork ?? ProviderReplyWork()
         return AsyncThrowingStream { continuation in
             let task = Task {
-                await withTaskCancellationHandler {
-                    var sawContent = false
-                    do {
-                        try Task.checkCancellation()
-                        let args = try arguments(model: model, authPath: authPath, call: call)
-                        let invocation = CodexProcessInvocation(
-                            executable: try codexBin ?? CodexExecutable.resolveCodexExecutable(environment: processEnvironment).path,
-                            arguments: args,
-                            stdin: Self.composedPrompt(system: system, prompt: prompt),
-                            timeout: call.wallOwned || call.lifetime.stallOnly ? 0 : timeout,
-                            terminator: terminator,
-                            environment: childEnvironment(authPath: authPath), lifetime: call.lifetime
-                        )
-                        try await Self.prepareCodexHome(authPath)
-                        let upstream = streamingRunner(invocation)
-                        for try await chunk in upstream {
-                            try Task.checkCancellation()
-                            if !chunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                sawContent = true
-                            }
-                            continuation.yield(chunk)
+                var sawContent = false
+                var output = ""
+                do {
+                    try Task.checkCancellation()
+                    if work.isStopped { throw CancellationError() }
+                    let args = try arguments(model: model, authPath: authPath, call: call)
+                    let invocation = CodexProcessInvocation(
+                        executable: try codexBin ?? CodexExecutable.resolveCodexExecutable(environment: processEnvironment).path,
+                        arguments: args,
+                        stdin: Self.composedPrompt(system: system, prompt: prompt),
+                        environment: childEnvironment(authPath: authPath), lifetime: call.lifetime, call: call
+                    )
+                    try await Self.prepareCodexHome(authPath)
+                    if work.isStopped { throw CancellationError() }
+                    let upstream = streamingRunner(invocation)
+                    for try await chunk in upstream {
+                        output += chunk
+                        if !chunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            sawContent = true
                         }
-                        // A clean exit without content is still an empty turn.
-                        if sawContent {
-                            continuation.finish()
-                        } else {
-                            continuation.finish(throwing: LLMError.streamTruncated(
-                                message: "codex produced no output (clean exit, empty stream)"))
-                        }
-                    } catch is CancellationError {
-                        continuation.finish()
-                    } catch let err as any ProviderFailureWrapping {
-                        continuation.finish(throwing: err)
-                    } catch let err as LLMError {
-                        continuation.finish(throwing: err)
-                    } catch {
-                        continuation.finish(throwing: LLMError.underlying(message: "codex: \(error)"))
+                        continuation.yield(chunk)
                     }
-                } onCancel: {
-                    terminator.fire()
+                    guard sawContent || call.allowsSilentCompletion else {
+                        throw ProviderFailure.Diagnostic(cause: .malformedResponse,
+                            detail: "codex closed stdout without reply text")
+                    }
+                    await retainProducedReply(output, error: nil, call: call)
+                    continuation.finish()
+                } catch is CancellationError {
+                    await retainProducedReply(output, error: CancellationError(), call: call)
+                    continuation.finish(throwing: CancellationError())
+                } catch let err as any ProviderFailureWrapping {
+                    await retainProducedReply(output, error: err, call: call)
+                    continuation.finish(throwing: err)
+                } catch let err as LLMError {
+                    await retainProducedReply(output, error: err, call: call)
+                    continuation.finish(throwing: err)
+                } catch {
+                    await retainProducedReply(output, error: error, call: call)
+                    continuation.finish(throwing: LLMError.underlying(message: "codex: \(error)"))
                 }
             }
-            call.replyWork?.own(task, stop: { terminator.fire() })
-            continuation.onTermination = { _ in
-                terminator.fire()
-                task.cancel()
+            work.own(task, stop: {})
+            continuation.onTermination = { ending in
+                if case .cancelled = ending { work.stop() }
             }
         }
     }
 
-    // MARK: - Buffered text-only messages contract
+    /// The producer owns its output even after its caller stops waiting.
+    @concurrent nonisolated private func retainProducedReply(_ output: String, error: Error?, call: LLMCall) async {
+        guard !call.preview else { return }
+        var payload: [String: JSONValue] = [
+            "outputPreview": .string(TurnTraceRedactor.redactText(String(output.prefix(2_000)))),
+            "outputBytes": .int(Int64(output.utf8.count)),
+        ]
+        if let error { payload["error"] = .string(ProviderFailure.diagnosticDescription(error)) }
+        var retentionFailed = false
+        if !output.isEmpty {
+            switch ProviderOutputDiagnostics.writeDiagnostic(output, reason: "Codex output at stdout settlement", dataRoot: dataRootOverride, call: call) {
+            case .success(let path):
+                if let path { payload["outputPath"] = .string(path.path) }
+                else { retentionFailed = true; payload["retentionError"] = .string("Codex output retention returned no path.") }
+            case .failure(let cause):
+                retentionFailed = true
+                payload["retentionError"] = .string(ProviderFailure.diagnosticDescription(cause))
+            }
+        }
+        let row = TurnTraceEvent(kind: "codex.reply.produced", title: "Codex produced reply",
+            status: error == nil && !retentionFailed ? "ok" : "failed",
+            payload: .object(payload), createdAt: ISO8601DateFormatter().string(from: Date()),
+            turnId: call.turn?.id, sessionId: call.session, surface: call.surface, turn: call.turn)
+        let root = call.traceDataRoot ?? dataRootOverride
+        await settle { await TurnTracePersistLane(dataRootOverride: root).append(row) }
+    }
 
-    /// The CLI cannot see images; tell the model and record the drop while flattening tool blocks into the text prompt.
+    // MARK: - Text-only messages contract
+
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
         tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
-        let combined = try await messagesPrompt(messages, model: model, call: call)
-        return try await complete(prompt: combined, system: system, model: model, tools: tools, call: call)
+        try await LLMMessageStreamEvent.reply(collecting: { held in
+            self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held)
+        }, using: LLMCallTraceRecorder(dataRootOverride: dataRootOverride), call: call)
     }
 
     private func messagesPrompt(_ messages: [LLMMessage], model: String, call: LLMCall) async throws -> String {
@@ -525,7 +462,7 @@ public final class CodexProcess: LLMTransport {
         return flattened.text
     }
 
-    /// Delivery follows actual stdout for every deadline policy.
+    /// Delivery follows stdout; silence also requires the process's successful exit.
     public func streamMessages(
         messages: [LLMMessage],
         system: String?,
@@ -536,6 +473,7 @@ public final class CodexProcess: LLMTransport {
             let task = Task {
                 do {
                     let prompt = try await messagesPrompt(messages, model: model, call: call)
+                    try Task.checkCancellation()
                     for try await chunk in stream(prompt: prompt, system: system, model: model, call: call) {
                         try Task.checkCancellation()
                         continuation.yield(.textDelta(chunk))
@@ -547,7 +485,9 @@ public final class CodexProcess: LLMTransport {
                 }
             }
             call.replyWork?.own(task, stop: {})
-            continuation.onTermination = { _ in task.cancel() }
+            continuation.onTermination = { ending in
+                if case .cancelled = ending { task.cancel() }
+            }
         }
     }
 
@@ -587,9 +527,6 @@ public final class CodexProcess: LLMTransport {
         ] {
             args.append(contentsOf: ["--disable", feature])
         }
-        if call.lifetime.stallOnly {
-            args.append(contentsOf: ["-c", "model_reasoning_summary=\"auto\""])
-        }
         if let effort = try OpenAIExecutionControls.reasoningEffort(
             model: model,
             requested: call.admission?.reasoningEffort,
@@ -625,54 +562,46 @@ public final class CodexProcess: LLMTransport {
             let activity = inv.lifetime.activity
             let admitted = inv.lifetime.admitted
             let stdout = CodexUTF8Output(), stderr = CodexUTF8Output()
-            continuation.onTermination = { _ in inv.terminator.fire() }
             do {
                 try inv.run(stdout: { data in
                     if !data.isEmpty { activity?(); admitted?() }
                     if let text = stdout.append(data) { continuation.yield(text) }
+                }, stdoutClosed: { ending in
+                    let out = stdout.finish()
+                    switch ending {
+                    case .stopped: break
+                    case .failed(let detail):
+                        continuation.finish(throwing: LLMError.underlying(message: "Codex stdout capture failed: \(detail)"))
+                    case .eof:
+                        // An allowed silent answer needs the process's successful exit as well as EOF.
+                        if !out.undecodable.isEmpty {
+                            continuation.finish(throwing: CodexOutputEncodingFailure(stdout: out, stderr: stderr.finish()))
+                        } else if out.text.contains(where: { !$0.isWhitespace }) || inv.call?.allowsSilentCompletion != true {
+                            continuation.finish()
+                        }
+                    }
                 }, stderr: { data in
                     if !data.isEmpty { activity?() }
                     _ = stderr.append(data)
-                }, exited: { status, timedOut, cancelled in
+                }, exited: { status, failure in
                     let out = stdout.finish(), err = stderr.finish()
-                    if !out.undecodable.isEmpty || !err.undecodable.isEmpty {
-                        continuation.finish(throwing: CodexOutputEncodingFailure(stdout: out, stderr: err))
-                    } else if cancelled {
-                        continuation.finish(throwing: CancellationError())
-                    } else if timedOut {
-                        continuation.finish(throwing: LLMError.underlying(message: "codex: timed out after \(inv.timeout)s"))
-                    } else if status == 0 {
-                        continuation.finish()
-                    } else {
-                        continuation.finish(throwing: CodexProcess.classifyCodexFailure(
-                            exitCode: status, stdout: out.text, stderr: err.text))
-                    }
+                    let cause: Error?
+                    if let failure {
+                        cause = LLMError.underlying(message: "Codex process capture failed: \(failure)")
+                    } else if !out.undecodable.isEmpty || !err.undecodable.isEmpty {
+                        cause = CodexOutputEncodingFailure(stdout: out, stderr: err)
+                    } else if status != 0 {
+                        cause = CodexProcess.classifyCodexFailure(exitCode: status, stdout: out.text, stderr: err.text)
+                    } else { cause = nil }
+                    var payload: [String: JSONValue] = ["exitCode": .int(Int64(status)), "status": .string(cause == nil ? "completed" : "failed")]
+                    if let cause { payload["cause"] = .string(ProviderFailure.diagnosticDescription(cause)) }
+                    TurnTraceBus.fireFromContext(kind: "codex.process.exited", surface: inv.call?.surface,
+                        payload: .object(payload), turn: inv.call?.turn)
+                    if let cause { continuation.finish(throwing: cause) }
+                    else { continuation.finish() }
                 })
             } catch {
                 continuation.finish(throwing: LLMError.underlying(message: "codex: \(error)"))
-            }
-        }
-    }
-
-    public static let defaultRunner: CodexProcessRunner = { inv in
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CodexProcessResult, Error>) in
-            let stdout = CodexUTF8Output(), stderr = CodexUTF8Output()
-            do {
-                try inv.run(stdout: { data in _ = stdout.append(data) },
-                            stderr: { data in _ = stderr.append(data) },
-                            exited: { status, timedOut, cancelled in
-                    let out = stdout.finish(), err = stderr.finish()
-                    if !out.undecodable.isEmpty || !err.undecodable.isEmpty {
-                        continuation.resume(throwing: CodexOutputEncodingFailure(stdout: out, stderr: err))
-                    } else if cancelled, out.text.isEmpty {
-                        continuation.resume(throwing: CancellationError())
-                    } else {
-                        continuation.resume(returning: CodexProcessResult(
-                            exitCode: status, stdout: out.text, stderr: err.text, timedOut: timedOut))
-                    }
-                })
-            } catch {
-                continuation.resume(throwing: error)
             }
         }
     }

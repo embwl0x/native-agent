@@ -269,8 +269,7 @@ extension TrustBackupPersistence {
         }
         notes += try SwiftNativeApprovalInbox.mergeRestoreFences(
             safetyRoot: kept.dataDirectory, destinationRoot: destinationRoot)
-        notes += try SwiftNativeTriggerScheduler.mergeRestoreFences(
-            safetyRoot: kept.dataDirectory, destinationRoot: destinationRoot)
+        notes += try ClockRestoreFence.merge(safetyRoot: kept.dataDirectory, destinationRoot: destinationRoot)
         try DataRootLife.begin(in: destinationRoot, id: intent.transactionID)
         try Self.rollTranscriptGenerationsForward(
             in: destinationRoot,

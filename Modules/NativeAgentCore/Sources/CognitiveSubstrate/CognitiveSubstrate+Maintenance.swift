@@ -54,7 +54,7 @@ extension CognitiveSubstrate {
             if configuration.persistenceEnabled {
                 // Resident sensory admission defers its per-event affect and node writes here. Affect, consumed residue, nodes, pruning and the receipt settle
                 // in one canonical SQLite transaction.
-                var artifacts = affectCheckpoint(at: settledAt)
+                var artifacts = affectCheckpoint()
                 // The resident ingest's accepted-turn tick (and any unflushed cadence move) rides the same transaction.
                 if capsulePresentationDirty {
                     capsulePresentationDirty = false
@@ -127,7 +127,7 @@ extension CognitiveSubstrate {
         // One checkpoint operation materializes the same full affect projection that live reads use (base decay + quiet calming + warm-presence floor).
         _ = decayAffectInMemory(to: now)
 
-        var artifacts = affectCheckpoint(at: now)
+        var artifacts = affectCheckpoint()
         var receipts: [CognitiveReceiptWrite] = []
         var stagedTimelineEvents: [CognitiveDevelopmentalTimelineEvent] = []
         if let consolidation = consolidateEmotionalArousalIfDueInMemory(reason: reason, at: now, satisfyWait: satisfyWait) {

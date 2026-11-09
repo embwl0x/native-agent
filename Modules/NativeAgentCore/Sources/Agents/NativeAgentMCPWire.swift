@@ -1,6 +1,8 @@
 import Foundation
 import ChatToolParsing
 import CoreFoundation
+import CryptoKit
+import NativeAgentCore
 // Blueprint: | `NativeAgentMCPWire.swift` | MCP negotiation, parsing, caller-supplied request identity and reply projection |
 
 /// Stateless MCP transport projection only. Chat admission, context and receipts stay with the canonical bridge and chat owners.
@@ -8,15 +10,15 @@ enum NativeAgentMCPWire {
     enum Action {
         case message(body: [String: Any], replayBody: Data, wait: (seconds: Int, progressToken: ID?),
                      project: @Sendable (Int, [String: Any]) -> [String: Any])
-        case reply(requestID: String, sessionID: String, offset: Int, waitSeconds: Int,
+        case reply(requestID: String, sessionID: String, offset: Int, waitSeconds: Int, artifactID: String?,
                    project: @Sendable ([String: Any]) -> [String: Any])
         case immediate(status: Int, body: [String: Any])
         case acceptedNotification
     }
 
     static let versions = ["2025-11-25", "2025-06-18", "2025-03-26"]
-    /// Keep the default reply wait below clients’ usual 60-second deadline to leave time for transport settlement.
-    static let defaultWaitSeconds = 25
+    /// Retrieval waits only for a duration the caller explicitly requests.
+    static let defaultWaitSeconds = 0
     static let maximumWaitSeconds = 300
 
     enum ID: Sendable {
@@ -90,7 +92,8 @@ enum NativeAgentMCPWire {
                       text.utf8.count <= 64000 else {
                     return failure(id, code: -32602, message: "Provide nonempty text up to 64000 UTF-8 bytes and optional session/request IDs.")
                 }
-                // The id is the transport's replay locator; every id runs in the contact's one conversation.
+                // The id is the transport's replay locator. Omitted, it is the caller's own conversation; one naming another of this contact's
+                // conversations runs there (AgentBridgePrincipal.storedConversation).
                 let session: String
                 if let supplied = args["session_id"] {
                     guard let value = supplied as? String, validSession(value) else {
@@ -181,15 +184,23 @@ enum NativeAgentMCPWire {
                 })
             }
             if name == "agent_reply" {
-                guard Set(args.keys).isSubset(of: ["session_id", "request_id", "offset", "wait_seconds"]),
+                guard Set(args.keys).isSubset(of: ["session_id", "request_id", "offset", "wait_seconds", "artifact_id"]),
                       let session = args["session_id"] as? String, validSession(session),
                       let request = args["request_id"] as? String, exactUUID(request) else {
                     return failure(id, code: -32602, message: "Use the exact returned MCP session and request IDs.")
                 }
+                let artifactID: String?
+                if let raw = args["artifact_id"] {
+                    guard let value = raw as? String, value.utf8.count == 64,
+                          value.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                        return failure(id, code: -32602, message: "artifact_id must be the exact returned reply_artifact id.")
+                    }
+                    artifactID = value
+                } else { artifactID = nil }
                 var offset = 0
                 if let raw = args["offset"] {
-                    guard let value = wholeNumber(raw, in: 0...1_048_576) else {
-                        return failure(id, code: -32602, message: "offset must be an integer from 0 through 1048576.")
+                    guard let value = wholeNumber(raw, in: 0...(artifactID == nil ? 1_048_576 : Int.max)) else {
+                        return failure(id, code: -32602, message: "offset must be a nonnegative integer; prose offsets are at most 1048576.")
                     }
                     offset = value
                 }
@@ -200,7 +211,13 @@ enum NativeAgentMCPWire {
                     }
                     waitSeconds = value
                 }
-                return .reply(requestID: request, sessionID: session, offset: offset, waitSeconds: waitSeconds, project: { receipt in
+                let readOffset = offset
+                return .reply(requestID: request, sessionID: session, offset: readOffset, waitSeconds: waitSeconds, artifactID: artifactID,
+                              project: { receipt in
+                    if let artifactID {
+                        let chunk = artifactChunk(receipt, id: artifactID, offset: readOffset, session: session, request: request)
+                        return toolResult(id, fields: chunk, failed: chunk["retrieval_result_class"] as? String == "failed", held: held)
+                    }
                     let allowed: Set<String> = ["status", "reply", "attachments", "completionDelivery", "deliveryId", "request_id", "session_id",
                         "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail",
                             "provider_failure", "work", "delegated_completions", "wait_ignored", "retrieval_result_class", "execution_result_class",
@@ -255,35 +272,100 @@ enum NativeAgentMCPWire {
         return inner.count + outer.count <= heldBudget
     }
 
-    private static func toolResult(_ id: ID, fields: [String: Any], failed: Bool, held: Held = ([], 0)) -> [String: Any] {
+    /// A deterministic projection of the canonical task's file payload, never another retained store.
+    private static func artifactBytes(_ fields: [String: Any]) throws -> Data {
+        try JSONSerialization.data(withJSONObject: fields.filter { ["attachments", "delegated_completions"].contains($0.key) },
+            options: [.sortedKeys])
+    }
+
+    private static func artifactID(_ bytes: Data) -> String {
+        SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func artifactChunk(_ receipt: [String: Any], id: String, offset: Int, session: String, request: String) -> [String: Any] {
+        do {
+            if receipt["retrieval_result_class"] as? String == "failed" { return receipt }
+            let bytes = try artifactBytes(receipt)
+            guard artifactID(bytes) == id else {
+                return ["status": "unavailable", "retrieval_result_class": "failed", "detail":
+                    "This retained file payload no longer matches artifact_id. Read the reply's current evidence; no message was repeated."]
+            }
+            guard offset <= bytes.count else {
+                return ["status": "invalid_request", "retrieval_result_class": "failed", "detail": "Artifact offset exceeds its byte size."]
+            }
+            let end = offset + min(BridgeCore.mcpArtifactChunkByteCap, bytes.count - offset)
+            return ["status": "ok", "retrieval_result_class": "succeeded", "session_id": session, "request_id": request,
+                "artifact_id": id, "mime": "application/json", "byte_size": bytes.count,
+                "offset": offset, "next_offset": end, "has_more": end < bytes.count,
+                "base64": bytes.subdata(in: offset..<end).base64EncodedString()]
+        } catch {
+            return ["status": "unavailable", "retrieval_result_class": "failed",
+                "detail": "The retained file payload could not be encoded. Repair its projection; do not resend the message."]
+        }
+    }
+
+    /// A reference alone does not acknowledge withheld files. The last artifact chunk acknowledges their retrieval.
+    static func carriesReply(_ response: [String: Any]) -> Bool {
+        guard let result = response["result"] as? [String: Any], let fields = result["structuredContent"] as? [String: Any] else { return false }
+        return (fields["reply"] as? String)?.isEmpty == false || (fields["attachments"] as? [[String: Any]])?.isEmpty == false
+            || (fields["artifact_id"] != nil && fields["has_more"] as? Bool == false && fields["base64"] != nil)
+    }
+
+    private static func envelope(_ id: ID, fields: [String: Any], failed: Bool, held: Held) throws -> [String: Any] {
         var fields = fields
         // Include actual messages in both structured and text content because hosts may expose only one to their model.
         if !held.messages.isEmpty || held.remaining > 0 {
             fields["held_messages"] = held.messages
             fields["held_remaining"] = held.remaining
         }
-        let data: Data
-        do { data = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]) }
-        catch {
-            return ["jsonrpc": "2.0", "id": id.value, "error": ["code": -32603,
-                "message": """
-                    The retained tool result could not be encoded: \(error.localizedDescription). Repair the result projection; do not repeat the \
-                    action.
-                    """]]
-        }
+        let data = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
         return ["jsonrpc": "2.0", "id": id.value, "result": [
             "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]],
             "structuredContent": fields, "isError": failed
         ]]
     }
 
+    private static func toolResult(_ id: ID, fields: [String: Any], failed: Bool, held: Held = ([], 0)) -> [String: Any] {
+        do {
+            let full = try envelope(id, fields: fields, failed: failed, held: held)
+            if try JSONSerialization.data(withJSONObject: full).count <= BridgeCore.mcpResponseByteCap { return full }
+            var bounded = fields.filter { !["attachments", "delegated_completions"].contains($0.key) }
+            if fields["attachments"] != nil || fields["delegated_completions"] != nil {
+                guard let session = fields["session_id"] as? String, let request = fields["request_id"] as? String else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                let bytes = try artifactBytes(fields), digest = artifactID(bytes)
+                bounded["reply_artifact"] = ["id": digest, "mime": "application/json", "byte_size": bytes.count,
+                    "contains": fields.keys.filter { ["attachments", "delegated_completions"].contains($0) }.sorted(),
+                    "read_with": ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": request,
+                        "artifact_id": digest, "offset": 0]]]
+            }
+            let reference = try envelope(id, fields: bounded, failed: failed, held: held)
+            if try JSONSerialization.data(withJSONObject: reference).count <= BridgeCore.mcpResponseByteCap { return reference }
+            // An oversized non-file field is a named projection failure, independent of execution and held-message delivery.
+            bounded = bounded.filter { ["status", "session_id", "request_id", "original_status", "execution_result_class", "execution_terminal",
+                "reply_artifact"].contains($0.key) }
+            bounded["retrieval_result_class"] = "failed"
+            bounded["detail"] = "The retained reply projection exceeds the MCP response bound. Repair its projection; do not resend the message."
+            let unavailable = try envelope(id, fields: bounded, failed: true, held: held)
+            guard try JSONSerialization.data(withJSONObject: unavailable).count <= BridgeCore.mcpResponseByteCap else {
+                throw CocoaError(.fileReadTooLarge)
+            }
+            return unavailable
+        } catch {
+            return ["jsonrpc": "2.0", "id": id.value, "error": ["code": -32603,
+                "message": "The retained tool result could not be encoded within the MCP response bound. Repair its projection; do not repeat the action."]]
+        }
+    }
+
     /// Pull hosts have no push command; queued messages leave through their next call’s result.
     static var heldNote: String {
         """
             Every agent_message and agent_reply result may also carry held_messages: what \(PeerFacingIdentity.agentName) wrote to you since your \
-            last call, oldest first, each {at, text, conversation_id}, with held_remaining saying how many more wait for your next call. They are \
-            delivered by being returned there and nowhere else, so read them every time; answer one with agent_message, session_id set to its \
-            conversation_id.
+            last call, oldest first, each {at, text, conversation_id, conversation_name}, with held_remaining saying how many more wait for your \
+            next call. Messages in your own conversation come only to you; one from a conversation whose caller has ended comes to whoever calls \
+            next, named by its conversation_name. They are delivered by being returned there and nowhere else, so read them every time; answer one \
+            with agent_message, session_id set to its conversation_id.
             """
     }
 
@@ -291,14 +373,17 @@ enum NativeAgentMCPWire {
         let agent = PeerFacingIdentity.agentName
         return [
             ["name": "agent_message", "description": """
-                Talk with \(agent). You and \(agent) have one conversation: every message goes on in it, and its mcp- session_id comes back with \
-                each result. The call waits up to wait_seconds and returns the reply (status answered). If it is still in progress the status is \
-                enqueued: keep the returned IDs and read the reply with agent_reply. \(heldNote)
+                Talk with \(agent). This session of yours has its own conversation with \(agent): every message goes on in it, and its mcp- \
+                session_id comes back with each result. The call waits up to wait_seconds and returns the reply (status answered). If it is still \
+                in progress the status is enqueued: keep the returned IDs and read the reply with agent_reply. \(heldNote)
                 """,
              "inputSchema": ["type": "object", "properties": [
                 "text": ["type": "string", "maxLength": 64000],
                 "session_id": ["type": "string",
-                    "description": "Optional. Your one conversation with \(agent) continues either way; a returned ID is accepted."],
+                    "description": """
+                        Optional. Omit it to go on in your own conversation with \(agent); set it to a held message's conversation_id to answer \
+                        in that conversation.
+                        """],
                 "request_id": ["type": "string", "description": """
                     Required canonical UUID you generate. It is this message's replay key: a retry of the SAME message must carry the same \
                     request_id, and new content needs a new one. Never resend solely because a reply is missing.
@@ -313,11 +398,14 @@ enum NativeAgentMCPWire {
             ["name": "agent_reply", "description": """
                 Read the retained reply to an exact \(agent) message. It only reads: nothing is sent, resent or started. wait_seconds holds the \
                 call until the reply settles, as agent_message's wait does, so one call replaces polling. Missing evidence does not prove failure \
-                or authorize replay. Follow next_offset when has_more is true. \(heldNote)
+                or authorize replay. Follow next_offset when has_more is true. A reply_artifact holds file payload too large for one response: \
+                use its read_with, then pass artifact_id with each byte offset until has_more is false; concatenate decoded base64 chunks \
+                and decode the resulting JSON for attachments and delegated completions. \(heldNote)
                 """,
              "inputSchema": ["type": "object", "properties": [
                 "session_id": ["type": "string"], "request_id": ["type": "string"],
-                "offset": ["type": "integer", "minimum": 0, "maximum": 1048576],
+                "offset": ["type": "integer", "minimum": 0, "description": "Prose character offset (at most 1048576), or byte offset with artifact_id."],
+                "artifact_id": ["type": "string", "description": "Optional exact reply_artifact id; reads bounded file-payload chunks instead of prose."],
                 "wait_seconds": ["type": "integer", "minimum": 0, "maximum": maximumWaitSeconds, "default": 0,
                                  "description": "How long this call waits for a reply still in progress; back the moment it settles. 0 reads it as it is now."]
              ], "required": ["session_id", "request_id"], "additionalProperties": false],

@@ -70,7 +70,7 @@ extension SwiftToolDispatcher {
         value["restart_required"] = nil
     }
     /// Pull-only hosts receive held messages on their next inbound call; retained messages are not evidence of sending.
-    static func hostPull(invocation: ChatToolInvocation, row: AgentHostRow?, contact: AgentPeerContact, text: String?,
+    static func hostPull(invocation: ChatToolInvocation, row: AgentHostRow?, contact: AgentPeerContact, text: String?, conversation: String,
         peers: [AgentPeerContact] = []) throws -> JSONValue {
         let name = row?.displayName ?? contact.name
         var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("mcpHost"),
@@ -116,7 +116,7 @@ extension SwiftToolDispatcher {
         }
         result["status"] = .string("held"); result["delivered"] = .bool(false)
         result["delivery"] = .string("held")
-        result["conversation_id"] = .string("mcp-" + contact.id)
+        result["conversation_id"] = .string(conversation)
         result["detail"] = .string("""
             Held, not sent: it waits for \(name)'s next check-in and goes out in the result of that call; nothing is lost. Do not resend.\u{20}
             """ + presence)

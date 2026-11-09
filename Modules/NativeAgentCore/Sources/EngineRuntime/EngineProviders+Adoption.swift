@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import DeviceSync
 import PersistenceCore
@@ -20,7 +21,7 @@ extension ProvidersFacade {
             let providers = try await list().providers
             guard providers.contains(where: { $0.provider_id == providerId && $0.auth_status.eligible }) else { return false }
             let result = try await routing.adoptConnectedProvider(providerId)
-            try publishCommittedRouting(result.snapshot)
+            await publishCommittedRouting(result.snapshot)
             await refreshSessionsAfterRoutingWrite()
             if result.surfacesChanged.contains("cognition_reflection") {
                 await NativeAgentEngine.liveCognition.refreshConfiguration()
@@ -139,7 +140,7 @@ extension ProvidersFacade {
     public func acceptCodexCLISession(
         failure: (Error, String) -> Void
     ) async -> Bool {
-        guard NativeOAuthFlow.recordCodexCLISessionDecision(
+        guard await NativeOAuthFlow.recordCodexCLISessionDecision(
             allow: true, source: "providers_offer", dataRoot: dataRoot
         ) else { return false }
         _ = await adoptProviderForBlankSurfaces(
@@ -159,6 +160,15 @@ extension ProvidersFacade {
         _ = await adoptProviderForBlankSurfaces(
             providerID, dataRoot: dataRoot, failure: failure
         )
+        // A save can be ineligible for adoption; it still owes its open editor a checked current baseline.
+        if case .failed(let detail) = await refreshSettings(refreshCatalog: false, cause: { error, _ in error.localizedDescription }) {
+            throw ProviderRoutingError.underlying("The account was saved, but its current settings could not be read: \(detail)")
+        }
+        // LatestRead returns this read even if a newer failure won publication and retained the old account baseline.
+        try Task.checkCancellation()
+        if let settingsError {
+            throw ProviderRoutingError.underlying("The account was saved, but its current settings are unavailable: \(settingsError)")
+        }
         didSave()
     }
 }

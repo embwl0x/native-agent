@@ -102,12 +102,12 @@ extension NativeCognitionRuntime {
         // Restore may finish during sleep but cannot open new producers.
         await bootstrapTask?.value
         sourceWakes.cancelObservations()
-        let producers = [rhythm.observation, rhythm.refresh, bootstrapChoresTask, studioWanderTask,
-            reflectionEventTask, studioCanonTask, horizonRefreshTask, reachTask,
+        let producers = [rhythm.observation, rhythm.refresh, bootstrapChoresTask,
+            reflectionEventTask, studioCanonTask, horizonRefreshTask,
             pursuitRefreshTask, pursuitObservationTask, carriedExperienceObservationTask, turnIdleObservationTask,
-            approvalLifecycleObservationTask, replayRetryTask,
+            approvalLifecycleObservationTask,
             sourceWakes.canonObservation, sourceWakes.horizonObservation,
-            sourceWakes.reachObservation, sourceWakes.clockObservation, sourceWakes.careObservation]
+            sourceWakes.peopleObservation, sourceWakes.clockObservation, sourceWakes.careObservation]
         for producer in producers { producer?.cancel() }
         for producer in producers { await producer?.value }
         // Join durable replay without cancelling its commit.
@@ -117,8 +117,6 @@ extension NativeCognitionRuntime {
         bootstrapChoresTask = nil
         studioCanonTask = nil
         horizonRefreshTask = nil
-        reachTask = nil
-        studioWanderTask = nil
         approvalLifecycleObservationTask = nil
         // Reject late advisory publication as well as draining its body.
         pursuitRead.write { pursuitReadRevision = nil }
@@ -129,10 +127,8 @@ extension NativeCognitionRuntime {
         pursuitRefreshTask = nil
         residualDeadline.invalidate()
         cognitionDeadline.invalidate()
-        // Quiesce dirty microcycles and replay retries before the terminal snapshot so they cannot commit or rearm afterward.
-        // Reschedule paths must also honor termination.
-        microcycleTimer.cancel()
-        replayRetryTask = nil
+        await microcycleTask?.value
+        microcycleTask = nil
         reflectionEventTask = nil
         let sleepAt = now()
         let sleepStamp = String(format: "%.0f", sleepAt.timeIntervalSince1970.rounded(.towardZero) + 0)
@@ -184,9 +180,28 @@ extension NativeCognitionRuntime {
     func livedMomentDoor() -> LivedMomentDoor {
         LivedMomentDoor(
             dataRoot: dataRoot,
+            saveRecovery: { [weak self] id, value in
+                guard let store = await self?.cognitiveStore else {
+                    throw CocoaError(.fileReadUnknown, userInfo: [NSLocalizedDescriptionKey: "The cognition store is unavailable."])
+                }
+                try await store.saveMomentRecovery(id, recovery: value)
+            },
+            routeAnswer: { [weak self] route in
+                guard let store = await self?.cognitiveStore else {
+                    throw CocoaError(.fileReadUnknown, userInfo: [NSLocalizedDescriptionKey: "The cognition store is unavailable."])
+                }
+                return try await store.momentRouteAnswer(route)
+            },
+            recordAnswer: { [weak self] id, route in
+                guard let store = await self?.cognitiveStore else {
+                    throw CocoaError(.fileReadUnknown, userInfo: [NSLocalizedDescriptionKey: "The cognition store is unavailable."])
+                }
+                try await store.recordMomentAnswer(id, route: route)
+            },
             recordOwed: { [weak self] turn in await self?.recordOwedMoment(turn) },
             prepare: { [weak self] id, origin, reply in
-                await self?.prepareMoment(id, origin: origin, reply: reply)
+                guard let self else { throw LivedMomentPreparationFailure.local("The cognition runtime is unavailable.") }
+                return try await self.prepareMoment(id, origin: origin, reply: reply)
             },
             meant: { [weak self] id, meaning in await self?.markMomentMeant(id, meaning: meaning) ?? false },
             lived: { [weak self] id in await self?.settleMoment(id, as: .lived) },
@@ -245,14 +260,18 @@ extension NativeCognitionRuntime {
     }
 
     /// Keep the judgment's caring evidence on its journal entry so the fold needs no second sealed-request store.
-    func prepareMoment(_ id: String, origin: AfterTurnOrigin, reply: String) async -> AfterTurnContext? {
+    func prepareMoment(_ id: String, origin: AfterTurnOrigin, reply: String) async throws -> AfterTurnContext {
         await bootstrap()
         guard let cognitiveStore, var row = await readMoment(id),
-              row.state == .owed || row.state == .meant else { return nil }
-        if row.input?.factsOnly == true { return nil }
+              row.state == .owed || row.state == .meant else {
+            throw LivedMomentPreparationFailure.local("The recorded moment is unavailable for context preparation.")
+        }
+        if row.input?.factsOnly == true {
+            throw LivedMomentPreparationFailure.record("A facts-only moment has no cognition context to prepare.")
+        }
         guard let record = row.input?.deferred else {
             await noteMomentReadFailed(id, why: "ordinary turn context is unavailable")
-            return nil
+            throw LivedMomentPreparationFailure.record("The recorded turn context is unavailable; repair its input.")
         }
         let context: AfterTurnContext
         do {
@@ -260,17 +279,18 @@ extension NativeCognitionRuntime {
                 exchange: row.state == .owed ? origin.userMessage + "\n" + reply : nil,
                 careWakes: row.input?.turn?.isCareWake == true ? row.input?.turn?.careWakes ?? [] : [])
         } catch {
+            if Task.isCancelled || error is CancellationError { throw CancellationError() }
             RepairOwed.owe(dataRoot, id: "moment-context:" + id, kind: .run,
                 operation: "cognition.moment.context:" + id, owner: "memory/embedding",
                 words: "This moment's care context is unavailable: \(error.localizedDescription)",
                 tap: "Repair the embedding owner in Settings → Memory. The moment remains owed.")
-            return nil
+            throw LivedMomentPreparationFailure.embedding(error.localizedDescription)
         }
         if row.state == .owed {
             row.input?.deferred?.caring = context.caring
             do { try await cognitiveStore.saveMoment(row) } catch {
                 await noteMomentReadFailed(id, why: "caring request not saved: \(error)")
-                return nil
+                throw LivedMomentPreparationFailure.local("The caring request could not be saved: \(error.localizedDescription)")
             }
         }
         return context
@@ -358,6 +378,10 @@ extension NativeCognitionRuntime {
               var row = await readMoment(momentID), row.meaning != nil, row.state == .meant,
               let record = row.input?.deferred else { return false }
         let seq: UInt64
+        if row.foldSeq == nil, context.caring != nil, row.input?.turn?.turnId?.isEmpty != false {
+            await noteMomentReadFailed(momentID, why: "The caring appraisal has no heard turn identity.")
+            return false
+        }
         do {
             guard let assigned = try await cognitiveStore.beginFold(momentID) else { return false }
             seq = assigned
@@ -367,8 +391,8 @@ extension NativeCognitionRuntime {
             return false
         }
         // A caring receipt reflects the first fold; refolds cannot rewrite or relabel it.
-        if row.foldSeq == nil, let request = context.caring {
-            await caringReceiptLog.record(request, heard: row.input?.turn?.turnId ?? "", model: interpretation.model,
+        if row.foldSeq == nil, let request = context.caring, let heard = row.input?.turn?.turnId {
+            await caringReceiptLog.record(request, heard: heard, model: interpretation.model,
                 surface: interpretation.surface, verdict: interpretation.caring)
         }
         let mind = await substrate.foldTurn(

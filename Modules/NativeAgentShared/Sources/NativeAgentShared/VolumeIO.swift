@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-// Blueprint: | `VolumeIO.swift` | Serial off-pool filesystem work; bounded waits never cancel issued writes |
+// Blueprint: | `VolumeIO.swift` | Serial off-pool filesystem work; issued writes own physical completion |
 
 public enum VolumeIO {
     private static let queue = DispatchQueue(label: "NativeAgent.volume-io", qos: .utility)
@@ -11,7 +11,6 @@ public enum VolumeIO {
         onFinish: @escaping @Sendable () -> Void = {},
         _ body: @escaping @Sendable () throws -> T
     ) async throws -> T {
-        let budget = budget.deadline == nil ? budget.capped(seconds: 30) : budget
         let result = ContinuationOnce<Result<T, Error>>()
         if Task.isCancelled || budget.expired {
             result.resume(.failure(budget.cancellationError))

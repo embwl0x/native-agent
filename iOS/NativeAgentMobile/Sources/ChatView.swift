@@ -22,6 +22,7 @@ struct ChatView: View {
     @Environment(\.accessibilityReduceMotion) var reduceMotion
     @Environment(ChatStore.self) var store
     let sync = iCloudSyncEngine.shared
+    @ObservedObject var turnActivity = PhoneTurnActivity.shared
     @AppStorage(HazeColor.key) var hazeColorRaw = HazeColor.defaultValue.rawValue
     @AppStorage("chatFileAccess") var selectedFileAccess = "auto"
     @State var draft = MobileChatDraft()
@@ -30,11 +31,10 @@ struct ChatView: View {
     @State var showsChatSetup = false
     @State private var historyLimit = ChatView.historyPage
     @State var showsConfiguration = false
-    @State var showsInbox = false
     @State var openedAgentContactID: String?
     @Environment(\.dynamicTypeSize) var dynamicTypeSize
     @ScaledMetric(relativeTo: .footnote) private var sessionTabWidth: CGFloat = 156
-    @FocusState var composerIsFocused: Bool
+    @State var composerIsFocused = false
     @State var transcript = MobileTranscriptHandle()
     var showLatestButton: Bool { !transcript.isAtEnd }
     @State var dismissedSyncError: String?

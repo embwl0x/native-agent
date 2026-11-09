@@ -7,40 +7,35 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Desk
-import Senses
-// Blueprint: | `NativeCognitionRuntime+SourceWakes.swift` | `SenseCrossing`. |
+// Blueprint: | `NativeCognitionRuntime+SourceWakes.swift` | Source observations and checked care-movement consumption |
 
 /// Use source invalidations and actual time boundaries on the existing residual deadline; quiet sources need no interval polling.
 struct CognitiveSourceWakes: Sendable {
     var canonObservation: Task<Void, Never>?
     var horizonObservation: Task<Void, Never>?
-    var reachObservation: Task<Void, Never>?
+    var peopleObservation: Task<Void, Never>?
     var clockObservation: Task<Void, Never>?
+    /// Serializes opportunity admission across the presence source's suspensions.
+    var hourReading: ScopedWaiter?
     var careObservation: Task<Void, Never>?
-    var lastCares: [CognitiveCare]?
+    /// The care movements already read (their `once` keys), so each is posted once per reading.
+    var careMoments: Set<String> = []
     var canonReady = false
     var canonInputs: [URL: SnapshotTailOpLog.FileStamp]?
     var horizonReady = false
-    var reachReady = false
-    var reachInputs: [URL: SnapshotTailOpLog.FileStamp]?
     var canonDirty = true
     var canonNextAt: Date?
     var horizonDirty = true
     var horizonNextAt: Date?
     var horizonRunning = false
-    var reachDirty = true
-    var reachNextAt: Date?
-    var reachLastScanAt: Date?
     var clockDirty = true
-    var pursuitNextAt: Date?
-    var wanderNextAt: Date?
     /// Keep only concurrent writes here; item notes own news rest.
     var newsReleasesInFlight: Set<String> = []
 
     func cancelObservations() {
         canonObservation?.cancel()
         horizonObservation?.cancel()
-        reachObservation?.cancel()
+        peopleObservation?.cancel()
         clockObservation?.cancel()
         careObservation?.cancel()
     }
@@ -101,29 +96,9 @@ extension NativeCognitionRuntime {
         return pair.stream
     }
 
-    private nonisolated static func reachInputPaths(at root: URL) -> [URL] {
-        [SwiftNativeDeskStore(dataRoot: root).opsPath, SwiftNativeDeskStore(dataRoot: root).basePath]
-            + ["user_prefs.json", "agents/peers.json", "cognition/user_turn.json", "cognition/reach.json", "memory/profile.json"]
-                .map { root.appendingPathComponent($0) }
-    }
-
-    private nonisolated static func reachSourceEvents(at root: URL) -> AsyncStream<Void> {
-        let pair = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        let files = EventDeadlinePhysiology.storeAndFileEvents(paths: reachInputPaths(at: root))
-        let relay = Task { [continuation = pair.continuation] in
-            for await _ in files {
-                guard !Task.isCancelled else { return }
-                continuation.yield(())
-            }
-        }
-        pair.continuation.onTermination = { _ in
-            relay.cancel()
-        }
-        return pair.stream
-    }
-
     func startCognitiveSourceObservations() {
         guard !isFlushedForTermination, sourceWakes.clockObservation == nil else { return }
+        OrganJudge.beat(Self.reflectionOrgan, .held, note: "waiting for dream or replay evidence")
         startRhythmObservation()
         let root = dataRoot
         let memory = ["memory/memory.sqlite", "memory/memory.sqlite-wal"].map { root.appendingPathComponent($0) }
@@ -137,9 +112,6 @@ extension NativeCognitionRuntime {
             let peer = DelegationStatusProjector(configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root), dataRoot: root)
             return EventDeadlinePhysiology.storeAndFileEvents(paths: memory + desk + peer.watchedPaths
                 + [approvals])
-        }
-        let reachEvents: @Sendable () -> AsyncStream<Void> = {
-            Self.reachSourceEvents(at: root)
         }
         // Mark readiness only after registration; rearm before reads so new children also receive watches.
         let clock = EventDeadlinePhysiology.storeAndFileEvents(paths: [preferences], notifications: [
@@ -170,16 +142,13 @@ extension NativeCognitionRuntime {
                 }
             }
         }
-        sourceWakes.reachObservation = Task { [weak self] in
-            guard var events = await self?.admittedSourceEvents(reachEvents) else { return }
-            await self?.reachSourceChanged()
-            while !Task.isCancelled {
-                for await _ in events {
-                    guard let next = await self?.admittedSourceEvents(reachEvents) else { return }
-                    events = next
-                    await self?.reachSourceChanged()
-                    break
-                }
+        // The address book names who each care is held with.
+        let people = EventDeadlinePhysiology.storeAndFileEvents(paths: [root.appendingPathComponent("agents/peers.json")])
+        sourceWakes.peopleObservation = Task { [weak self] in
+            await self?.substrate.refreshCarePeople()
+            for await _ in people {
+                guard !Task.isCancelled else { return }
+                await self?.substrate.refreshCarePeople()
             }
         }
         sourceWakes.clockObservation = Task { [weak self] in
@@ -225,32 +194,11 @@ extension NativeCognitionRuntime {
         await rescheduleResidualRepairDeadline()
     }
 
-    private func reachSourceChanged() async {
-        guard !isFlushedForTermination else { return }
-        sourceWakes.reachReady = true
-        var inputs: [URL: SnapshotTailOpLog.FileStamp] = [:]
-        var complete = true
-        for path in Self.reachInputPaths(at: dataRoot) {
-            if let stamp = SnapshotTailOpLog.fileStamp(path) { inputs[path] = stamp }
-            else { complete = false }
-        }
-        let changed = !complete || inputs != sourceWakes.reachInputs
-        let peersPath = dataRoot.appendingPathComponent("agents/peers.json")
-        let peopleChanged = sourceWakes.reachInputs == nil || inputs[peersPath] != sourceWakes.reachInputs?[peersPath]
-        sourceWakes.reachInputs = complete ? inputs : nil
-        if peopleChanged { await substrate.refreshCarePeople() }
-        if changed {
-            sourceWakes.reachDirty = true
-            await rescheduleResidualRepairDeadline()
-        }
-    }
-
     private func clockSourceChanged() async {
         guard !isFlushedForTermination else { return }
         rhythm.dirty = true
         sourceWakes.clockDirty = true
         sourceWakes.canonDirty = true
-        sourceWakes.reachDirty = true
         sourceWakes.horizonDirty = true
         cachedBodyRead = nil
         await rescheduleCognitionMaintenanceDeadline(force: true)
@@ -259,82 +207,80 @@ extension NativeCognitionRuntime {
         await host.perceiveDay(dataRoot: dataRoot)
     }
 
+    /// Every new judged movement of a care (a story entry, by whoever judged it: after-turn, reflection, the night, the hour) amends the agent's
+    /// thoughts about that care since its previous movement. A movement that lifts the care's pressure up through its bar is a `self` happening,
+    /// unless a thought of the agent's own made it (a thought's own acts are attended inside it): a care speaks once per rise, not once per turn.
     func caresSourceChanged() async {
-        guard !isFlushedForTermination, !Task.isCancelled else { return }
-        let cares = await substrate.caresPressing(for: CognitiveCare.ownerKey, at: Date())
-            .map(\.care).sorted { $0.id.uuidString < $1.id.uuidString }
-        guard !isFlushedForTermination, !Task.isCancelled, sourceWakes.lastCares != cares else { return }
-        sourceWakes.lastCares = cares
-        sourceWakes.reachDirty = true
-        await rescheduleResidualRepairDeadline()
+        guard !isFlushedForTermination, !Task.isCancelled, let cares = await substrate.careStories() else { return }
+        var seen: Set<String> = []
+        var moved: [(care: CognitiveCare, index: Int, once: String)] = []
+        for care in cares {
+            for (index, moment) in care.story.enumerated() {
+                let milliseconds = (moment.at.timeIntervalSince1970 * 1_000).rounded()
+                guard milliseconds.isFinite, milliseconds >= Double(Int64.min), milliseconds < Double(Int64.max) else {
+                    RepairOwed.owe(dataRoot, id: "attention.care-time:" + care.id.uuidString, kind: .act,
+                        operation: "attention.care-time", owner: care.id.uuidString, words: "A care movement has an invalid timestamp.",
+                        lever: "Repair this care's recorded timestamp before reading its movement.")
+                    continue
+                }
+                let once = "care:\(care.id.uuidString):\(Int64(milliseconds))"
+                guard seen.insert(once).inserted, !sourceWakes.careMoments.contains(once), care.fadedAt == nil,
+                      !Task.isCancelled else { continue }
+                moved.append((care, index, once))
+            }
+        }
+        sourceWakes.careMoments.formIntersection(seen)
+        for (care, index, once) in moved {
+            do {
+                try await careMoved(care, at: index, once: once)
+                sourceWakes.careMoments.insert(once)
+                RepairOwed.settle(dataRoot, operation: "attention.amend:" + once, evidence: .init(source: "care", id: once))
+            } catch {
+                RepairOwed.owe(dataRoot, id: "attention.amend:" + once, kind: .act,
+                    operation: "attention.amend:" + once, owner: care.id.uuidString, words: error.localizedDescription,
+                    lever: "Repair the named care or thought record; this care movement remains unread.")
+            }
+        }
+    }
+
+    private func careMoved(_ care: CognitiveCare, at index: Int, once: String) async throws {
+        guard let moment = care.story.dropFirst(index).first else {
+            throw PersistenceCoreError.ioFailure("The care movement is missing: " + once)
+        }
+        let subject = "care:" + care.id.uuidString
+        let words = care.about + ": " + moment.felt + " — " + moment.note
+        let bar = CognitiveSubstrate.careReleasePressure
+        if let pressure = moment.pressure, pressure.before < bar, pressure.after >= bar,
+           !moment.source.hasPrefix("exchange:" + Attention.stream + "/") {
+            let happening = Happening(.`self`, subject: subject, door: "care", who: "self", words: words, once: once,
+                care: care.id.uuidString, moved: moment.moved, open: pressure.open)
+            await Attention.post(happening, dataRoot: dataRoot).value
+            guard try await ExperienceStore.at(dataRoot).experience(happening.id) != nil else {
+                throw PersistenceCoreError.ioFailure("The care movement happening has not been committed: " + happening.id)
+            }
+        }
+        guard moment.moved != 0 else { return }
+        let previous = care.story.prefix(index).last?.at
+        let node = try await substrate.attentionNode(care: care.id, subject: subject, words: words).key
+        for thought in try await Attention.thoughts(dataRoot: dataRoot, now: now()) where thought.thought?.node == node
+            && !thought.claims.contains(where: { $0.claim == Thought.careMoved }) {
+            guard let settled = NativeTimestampFormat.parseISO8601FractionalFirst(thought.at) else {
+                throw PersistenceCoreError.ioFailure("The thought has an invalid settlement timestamp: " + thought.id)
+            }
+            guard settled <= moment.at, previous.map({ settled > $0 }) ?? true else { continue }
+            try await Attention.amend(thought: thought.id, dataRoot: dataRoot)
+        }
     }
 
     func nextCognitiveSourceWake(at: Date) -> Date? {
-        let canon = reachEnabled && sourceWakes.canonReady && studioCanonTask == nil ? (sourceWakes.canonDirty
+        let canon = backgroundThinkingEnabled && sourceWakes.canonReady && studioCanonTask == nil ? (sourceWakes.canonDirty
             ? lastStudioCanonTendingAt?.addingTimeInterval(Self.studioCanonTendingMinimumInterval) ?? at
             : sourceWakes.canonNextAt) : nil
         let horizon = sourceWakes.horizonReady && horizonRefreshTask == nil ? (sourceWakes.horizonDirty
             ? at
             : sourceWakes.horizonNextAt) : nil
-        let reach = sourceWakes.reachReady && reachTask == nil && reachEnabled ? (sourceWakes.reachDirty
-            ? sourceWakes.reachNextAt ?? at : sourceWakes.reachNextAt) : nil
-        let rhythmAt = rhythm.refresh == nil ? (rhythm.dirty ? at : rhythm.due) : nil
-        let wander = studioWanderTask == nil ? sourceWakes.wanderNextAt : nil
-        return [canon, horizon, reach, sourceWakes.pursuitNextAt, rhythmAt, wander].compactMap { $0 }.min()
-    }
-}
-
-// Release care-relevant news through carried work; other owed work files its own arrivals.
-extension NativeCognitionRuntime: SenseCrossing {
-    public func cross(_ line: String, watch: String, reason: String, id: String, says: String,
-                      agent: String?) async -> SenseCrossed {
-        guard !isFlushedForTermination else { return .unweighed }
-        // Keep the moment primed for the next turn regardless of its weight.
-        PrimedMoments.prime(dataRoot: dataRoot, line: says.isEmpty ? line : says, source: watch)
-        await releaseNewsIntentions(touchedBy: line, watch: watch)
-        guard !isFlushedForTermination else { return .unweighed }
-        switch await substrate.careTouched(by: line, watch: watch) {
-        case .unweighed: return .unweighed
-        case .untouched: return .untouched
-        case .touches(let care, resting: true): return .resting(care: care.about)
-        case .touches(let care, resting: false):
-            // Carry the hop rule on the watch thread so its own releases cannot wake it repeatedly.
-            let wokeAt = now()
-            guard ResidentWake.shared.request(dataRoot: dataRoot, reason: reason + " about " + care.about, items: [
-                .init(id: id, line: says, thread: watch, agent: agent, home: true, at: wokeAt, careID: care.id)
-            ]) else { return .notKept(care: care.about) }
-            await substrate.watchWoke(watch, about: care, at: wokeAt)
-            return .woke(care: care.about)
-        }
+        let rhythmAt = rhythm.refresh == nil ? (rhythm.dirty ? at : [rhythm.due, rhythm.nightDue].compactMap { $0 }.min()) : nil
+        return [canon, horizon, rhythmAt].compactMap { $0 }.min()
     }
 
-    /// Keep release and rest in the Desk story; the next note consumes a release even if another watch produced it.
-    private func releaseNewsIntentions(touchedBy line: String, watch: String) async {
-        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        do {
-            let entries = MyQueue.entries(try await store.liveState()).filter {
-                if case .news? = MyQueue.when($0) { return $0.step.status != "stopped" && !MyQueue.isOver($0, at: now()) }
-                return false
-            }
-            let words = entries.compactMap { entry -> (id: String, words: String)? in
-                guard case .news(let words)? = MyQueue.when(entry) else { return nil }
-                return (entry.item.handle, words)
-            }
-            guard let touched = await substrate.newsIntentionsTouched(by: line, among: words) else { return }
-            var released = false
-            for handle in touched {
-                let key = handle
-                guard sourceWakes.newsReleasesInFlight.insert(key).inserted else { continue }
-                defer { sourceWakes.newsReleasesInFlight.remove(key) }
-                guard let weighed = entries.first(where: { $0.item.handle == handle }),
-                      !isFlushedForTermination, !Task.isCancelled else { continue }
-                // Check identity, topic, closure and 12-hour rest in the release-append transaction.
-                if try await MyQueue.releaseNews(weighed, summary: String(line.prefix(160)) + " (" + watch + ")",
-                    store: store, at: now(), rest: CognitiveSubstrate.careReleaseRest) { released = true }
-            }
-            if released { await startPursuitRefresh() }
-        } catch {
-            ModuleLog(category: "Cognition")("News intention release unavailable: %@", error.localizedDescription)
-        }
-    }
 }

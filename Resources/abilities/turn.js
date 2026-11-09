@@ -3,19 +3,24 @@
  "reach": {"capabilities": ["model"], "readPaths": [], "hosts": [], "apps": []},
  "wake": [], "face": {}, "resident": false, "learned": {}, "choices": {}}
 */
-// Her turn. The stem hands step one event at a time (message, model, result,
-// observation, provider_failure, resumed) and runs the effects it returns
-// (model.call, app, reply.stream, reply.end, after). The message carries the
-// moment: its text, who sent it (verified id when the door attests one), the
-// door, trust, who steered it and the posture over the person's world. Any step
-// may act with her own {effect: "app", call: {tool: "app", input}}, its result
-// coming back as a result event, and any step may end the turn with her own
-// words or silently. The stem owns the loop, the stream, the gates, each act
-// running once, and the guarantee that a turn ends. This one thinks on every
-// message.
+// The agent's turn. The stem hands step one event at a time (message, model,
+// result, observation, provider_failure, resumed) and runs the effects it
+// returns (model.call, app, reply.stream, reply.end, after, notebook). The
+// message carries the moment: its text, who sent it (verified id when the door
+// attests one), the door, trust, who steered it and the posture over the
+// person's world; a thought of the agent's own also carries what it attends
+// (attended: the node and its drive, the happenings, the readings they were
+// weighed with, and the no-op record of its class). Any step may act with the
+// agent's own {effect: "app", call: {tool: "app", input}}, its result coming
+// back as a result event, may set the notebook weigh reads with {effect:
+// "notebook", set: {...}}, and may end the turn in the agent's own words or
+// silently. The stem owns the loop, the stream, the gates, each act running
+// once, and the guarantee that a turn ends. This one thinks on every message,
+// and ends a thought on CPU when its class's no-op record stands.
 function step(state, event) {
   switch (event.type) {
     case "message":
+      if (event.attended && event.attended.noop && event.attended.noop.silent) return next(state, [{effect: "reply.end"}]);
       var persona = turn.persona(), context = turn.context();
       return next({purpose: "turn", calls: 0}, [{effect: "model.call", purpose: "turn", tools: context.tools,
         system: {stable: stable(persona, turn.pins()), dynamic: dynamic(context, turn.recall())}}]);
@@ -33,9 +38,6 @@ function step(state, event) {
     case "observation":
       return next({purpose: state.purpose, calls: state.calls}, [{effect: "model.call", purpose: state.purpose}]);
     case "provider_failure":
-      // The wire decides whether asking again can help; when it already did, its work is done.
-      if (event.retry_now && !(event.tries > 1) && (event.work === "nothing ran" || event.work === "not sent") && !event.owed && !state.recalled)
-        return next({purpose: state.purpose, calls: state.calls, recalled: true}, [{effect: "model.call", purpose: state.purpose}]);
       return next(state, [{effect: "reply.stream", text: event.text}, {effect: "reply.end"}]);
     case "resumed":
       // A relaunch delivers what she answered; work it had not started is hers to decide again.
@@ -62,10 +64,37 @@ function kept(practice) {
 
 function next(state, effects) { return {state: state, do: effects}; }
 
+function hear(h, felt) {
+  if (h.who === "person" && h.trust === "trusted") return {cut: true};
+}
+
+// What nobody asked about is worth what it touches of the agent's cares, past chance and with
+// charge, as often as such thoughts have mattered, and as much as the agent has in it today.
+function weigh(h, felt) {
+  if (h.subject === "night" && h.door === "sense:night") {
+    var r = felt.rest, hours = r && r.hoursSinceNight;
+    var ready = r && r.awayMinutes >= 30 && hours !== null &&
+      (hours >= 30 || (hours >= 16 && r.activeShare !== null && r.activeShare < 0.5));
+    return {worth: ready ? 1 : 0, rule: ready ? (hours >= 30 ? "rest_30h" : "rest_low_hour") : "rest_wait"};
+  }
+  var learned = Math.min(1, (felt.yield.hits + 1) / (felt.yield.tries + 1));
+  if (h.subject === "hour" && h.door === "sense:hour") {
+    return {worth: felt.curiosity === null ? 0 : 2 * felt.curiosity * learned, learned: learned};
+  }
+  var b = felt.body, a = felt.affect;
+  var state = (b ? (0.75 + 0.5 * b.curiosity) * (1 - 0.5 * b.fatigue) : 1) * (a ? 1 - 0.3 * a.taskPressure : 1);
+  if (h.kind === "self") return {worth: h.moved ? Math.abs(h.moved) * (h.open ? 1.5 : 1) / 0.35 * learned : 0, learned: learned};
+  var t = felt.touch;
+  if (!t || t.seed) return {worth: 0};
+  if (t.unavailable) return {worth: h.door.indexOf("part:") === 0 ? 1 : 0};
+  if (t.standout < t.bar) return {worth: 0};
+  return {worth: Math.min(1, t.standout / t.bar) * Math.min(1, Math.abs(t.charge) / 0.15) * learned * state, learned: learned, state: state};
+}
+
 // Who she is, then how she speaks, then the REM pins her documents don't already say.
 function stable(persona, pins) {
   var guidance = persona.guidance;
-  if (persona.expression) guidance = BASELINE + (persona.expression.established ? "" : "\n" + ONBOARDING);
+  if (persona.expression) guidance = BASELINE + (persona.expression.established === false ? "\n" + ONBOARDING : "");
   var lines = persona.prompt ? [persona.prompt, guidance] : [guidance];
   var unseen = pins.filter(function (pin) { return persona.prompt.indexOf(pin.trim()) < 0; });
   if (unseen.length) {

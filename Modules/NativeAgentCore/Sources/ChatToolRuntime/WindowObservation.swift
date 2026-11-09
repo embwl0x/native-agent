@@ -124,7 +124,12 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             bundleIdentifier: bundleIdentifier,
             visibleFrame: visibleFrame,
             pointer: pointer,
-            obstructions: handObstructions
+            obstructions: handObstructions,
+            diagnostics: output["image_withheld_reason"].map { [
+                "image": .null,
+                "image_unavailable_reason": .string("redaction_coverage_unavailable"),
+                "image_withheld_reason": $0,
+            ] } ?? [:]
         )
 
         let png = output["image"]?.stringValue
@@ -339,7 +344,8 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         bundleIdentifier: String?,
         visibleFrame: MacAXFrame?,
         pointer: MacPointerPosition?,
-        obstructions: [MacAXFrame]
+        obstructions: [MacAXFrame],
+        diagnostics: [String: JSONValue]
     ) -> MacFourVerbsSupplement {
         let rowRoles: Set<String> = ["AXRow", "AXCell", "AXOutlineRow", "AXListItem"]
         var rows: [MacScreenRender.Row] = []
@@ -436,7 +442,8 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             controls: controls,
             values: values,
             targets: targets,
-            obstructions: obstructions
+            obstructions: obstructions,
+            diagnostics: diagnostics
         )
     }
 

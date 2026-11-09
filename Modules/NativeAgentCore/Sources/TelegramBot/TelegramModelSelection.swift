@@ -7,43 +7,44 @@ import MemoryV2
 import DeviceSync
 import NotificationInbox
 import PersistenceCore
+import ChatTurnContracts
 
-// Blueprint: | `TelegramModelSelection.swift` | Use checked account-scoped catalogs; retain each provider's cause and declared capabilities |
+// Blueprint: | `TelegramModelSelection.swift` | Checked account-scoped catalogs; `TelegramCommandSender` attests command provenance and the single owner; model controls invoke the person's canonical Providers call |
 
 public struct TelegramProviderRoutingBridge: Sendable {
     let routing: SwiftNativeProviderRouting
+    let dataRoot: URL
+    let choose: @Sendable (_ setting: String, _ value: JSONValue, _ turn: Turn) async throws -> Void
 
-    public init(routing: SwiftNativeProviderRouting) {
+    public init(routing: SwiftNativeProviderRouting, dataRoot: URL,
+                choose: @escaping @Sendable (String, JSONValue, Turn) async throws -> Void) {
         self.routing = routing
+        self.dataRoot = dataRoot
+        self.choose = choose
     }
 
     public func saveModelConfig(surface: String, key: String, value: String, turn: Turn) async throws {
-        var body: [String: JSONValue] = ["surface": .string(surface)]
+        let sender = try TelegramCommandSender(turn: turn, dataRoot: dataRoot)
+        try sender.requireOwner()
+        guard surface == "telegram" else { throw TelegramBotError.invalidRequest }
         switch key {
-        case "reasoning_effort", "reasoningEffort":
-            body["reasoningEffort"] = .string(value)
-        case "service_tier", "serviceTier":
-            body["serviceTier"] = .string(value)
-        case "model":
-            // The model changes; the surface keeps its chosen route.
-            body["model"] = .string(value)
+        case "reasoning_effort":
+            try await choose("thinking", .string(value), sender.turn)
+        case "service_tier":
+            guard ["priority", "default"].contains(value) else { throw TelegramBotError.invalidRequest }
+            try await choose("fast", .bool(value == "priority"), sender.turn)
         default:
-            body[key] = .string(value)
+            throw TelegramBotError.invalidRequest
         }
-        _ = try await routing.saveModelConfig(.object(body))
     }
 
     public func saveModelSelection(surface: String, provider: String?, model: String, turn: Turn) async throws {
-        // Keep the surface's explicit account rather than guessing from the model name.
-        let explicitProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let admittedProvider = explicitProvider?.isEmpty == false ? explicitProvider : nil
-        try await routing.saveSurfaceConfiguration(
-            surface: surface,
-            model: model,
-            reasoningEffort: nil,
-            serviceTier: nil,
-            providerId: admittedProvider
-        )
+        let sender = try TelegramCommandSender(turn: turn, dataRoot: dataRoot)
+        try sender.requireOwner()
+        guard surface == "telegram" else { throw TelegramBotError.invalidRequest }
+        let menu = try await modelMenuForSurface(surface)
+        let selected = provider ?? menu.currentProvider
+        try await choose("model", .string(InlineInteractionRegistry.modelOptionID(providerID: selected, modelID: model)), sender.turn)
     }
 
     public func modelMenuForSurface(_ surface: String) async throws -> TelegramModelMenu {
@@ -95,6 +96,40 @@ public struct TelegramProviderRoutingBridge: Sendable {
     }
 
 
+}
+
+/// The configuration owner identifies the person; a chat allowlist never identifies its other members as that person.
+public struct TelegramCommandSender: Sendable {
+    public let turn: Turn
+    public let sender: String
+    public let isOwner: Bool
+
+    public init(turn: Turn, dataRoot: URL) throws {
+        guard turn.fileAccess != "read_only" else {
+            throw TelegramBotError.underlying("This Telegram request is read-only; nothing changed.")
+        }
+        guard let envelope = turn.envelope, envelope.surface == "telegram", envelope.workIdentity != nil,
+              let chat = envelope.verifiedChatId, Int64(chat) != nil,
+              let sender = envelope.verifiedUserId, let id = Int64(sender), id > 0 else {
+            throw TelegramBotError.underlying("Telegram command has no verified sender; nothing changed.")
+        }
+        guard let config = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false) else {
+            throw TelegramBotError.notConfigured
+        }
+        self.sender = sender
+        isOwner = config.ownerUserId == id
+        if isOwner { self.turn = turn }
+        else {
+            let steering = PeerDataTaint(restoring: (turn.peerSteering?.checkpointSources ?? []) + ["telegram:" + sender])
+            self.turn = turn.with(\.peerSteering, steering)
+        }
+    }
+
+    public func requireOwner() throws {
+        guard isOwner else {
+            throw TelegramBotError.underlying("Only Telegram's single verified owner can change the Chat model, Think or Fast. Nothing changed. Review allowed user IDs on the Mac if no single owner is configured.")
+        }
+    }
 }
 
 public struct TelegramModelMenu: Sendable, Equatable {

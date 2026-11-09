@@ -186,7 +186,7 @@ extension ActivityWatcher {
             detachObserver()
             idleResumeWatch = true
             // Observe without opening; later AX input outside the motor epoch can resume capture without an app switch.
-            if let bundleId, let pid, pid != ownProcessID,
+            if let bundleId, let pid, !PersonOnlyWindows.isOwnProcess(pid),
                engine.shouldCapture(bundleID: bundleId) {
                 _ = attachCheckedObserver(pid: pid)
             }
@@ -194,7 +194,7 @@ extension ActivityWatcher {
         }
 
         // Refuse unknown, self and excluded identities before AX; close the prior span and preserve the gap.
-        guard let bundleId, let pid, pid != ownProcessID,
+        guard let bundleId, let pid, !PersonOnlyWindows.isOwnProcess(pid),
               engine.shouldCapture(bundleID: bundleId) else {
             feed(.activate(
                 bundleId: ActivityPolicy.selfProcessBundleID, appName: "excluded", at: safeNow()

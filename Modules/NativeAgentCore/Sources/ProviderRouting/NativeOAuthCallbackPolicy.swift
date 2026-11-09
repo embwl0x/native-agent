@@ -2,16 +2,6 @@ import Foundation
 // Blueprint: | `NativeOAuthCallbackPolicy.swift` | exact callback state |
 
 extension NativeOAuthFlow {
-    /// Direct custom-scheme URLs must resolve the same pending state as the authentication session callback.
-    public static func handleCallbackURL(_ url: URL) -> Bool {
-        guard url.scheme == callbackURLScheme, url.host == "oauth" else {
-            return false
-        }
-        let (_, returnedState, _) = parseCallback(url)
-        guard let s = returnedState else { return false }
-        return PendingCallbacks.shared.resolve(state: s, with: url)
-    }
-
     public enum CallbackValidation {
         case code(String)
         case failure(String)

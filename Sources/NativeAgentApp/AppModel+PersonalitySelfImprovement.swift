@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import NativeAgentShared
+import NativeAgentCore
 import EngineRuntime
 import PersonaEngine
 import DoctorChecks
@@ -23,6 +24,24 @@ enum PersonalityDocumentsReloadOutcome: Equatable {
 
 @MainActor
 extension AppModel {
+    func readPersonaFormState(documents: Bool) async throws -> PersonaSettingsFace {
+        var state = PersonaSettingsFace()
+        if documents { state.documents = try await engine.persona.loadDocuments() }
+        else { state.profile = try await engine.persona.loadProfile() }
+        return state
+    }
+
+    func savePersonaFormName(_ name: String) async throws -> PersonalityProfile {
+        let previousName = engine.persona.profile?.name
+        let saved = try await engine.persona.saveName(name)
+        teachMemoryHygieneName(previousName: previousName)
+        return saved
+    }
+
+    func savePersonaFormDocument(id: String, content: String, expectedContent: String) async throws -> PersonaDocSpec {
+        try await engine.persona.saveDocument(id: id, content: content, appending: false, expectedContent: expectedContent)
+    }
+
     /// Preserve persistence errors in the save result.
     @MainActor
     func savePersonalityChecked(_ profile: PersonalityProfile) async throws {
@@ -118,12 +137,12 @@ extension AppModel {
         }
     }
 
-    // MemoryFacade owns pending rows and failures; the Mac supplies only the decision animation.
+    // MemoryFacade owns pending rows and their publication.
     @MainActor
-    func loadMemoryProposals(animateDecision: Bool = false) async {
+    func loadMemoryProposals() async {
         _ = await decodeLogged("getMemoryProposals") {
             try await engine.memory.proposals(status: "pending", publish: { change in
-                withAnimation(animateDecision ? NativeAgentMotion.arrive : nil, change)
+                change()
             })
         }
     }
@@ -131,18 +150,18 @@ extension AppModel {
     @MainActor
     func approveMemoryProposal(id: String) async throws {
         _ = try await engine.memory.accept(proposalID: id, publish: { change in
-            withAnimation(NativeAgentMotion.arrive, change)
+            change()
         })
-        await loadMemoryProposals(animateDecision: true)
+        await loadMemoryProposals()
         await engine.approvals.refresh()
     }
 
     @MainActor
     func rejectMemoryProposal(id: String, reason: String = "") async throws {
         try await engine.memory.reject(proposalID: id, reason: reason, publish: { change in
-            withAnimation(NativeAgentMotion.arrive, change)
+            change()
         })
-        await loadMemoryProposals(animateDecision: true)
+        await loadMemoryProposals()
         await engine.approvals.refresh()
     }
 
@@ -159,22 +178,26 @@ extension AppModel {
 
     /// Use the native completion record so zero proposals cannot conceal an incomplete or failed REM run.
     @MainActor
-    func runRemPass() async -> DreamsREMActionFeedback {
+    func runRemPass() async -> (isSuccess: Bool, message: String) {
         dreamError = nil
         do {
-            let feedback = DreamsREMActionFeedback.resolve(response: try await NativeAgentEngine.runRem(dataRoot: engine.dataRoot))
-            if feedback.isSuccess {
-                statusText = feedback.message
+            let response = try await NativeAgentEngine.runRem(dataRoot: engine.dataRoot)
+            let completion = try REMRunReportPayload.validatedManualCompletion(response: response).get()
+            let message: String
+            if completion.nothingToConsolidate {
+                message = "REM consolidation completed — nothing to consolidate yet."
             } else {
-                dreamError = "REM cycle failed: \(feedback.message)"
-                statusText = "REM cycle failed"
+                let proposals = completion.proposals == 1 ? "1 proposal" : "\(completion.proposals) proposals"
+                let archived = completion.archivedEntries == 1 ? "1 diary entry archived" : "\(completion.archivedEntries) diary entries archived"
+                message = "REM consolidation completed — \(proposals), \(archived)."
             }
-            return feedback
+            statusText = message
+            return (true, message)
         } catch {
-            let feedback = DreamsREMActionFeedback.failed(UserFacingError.message(error, action: "run the REM cycle"))
-            dreamError = feedback.message
+            let message = UserFacingError.message(error, action: "run the REM cycle")
+            dreamError = message
             statusText = "REM cycle failed"
-            return feedback
+            return (false, message)
         }
     }
 
@@ -233,10 +256,10 @@ extension AppModel {
     /// Keep dream-run errors on the Dreams tab and reload only after success so failures remain visible. busy names effects kept owed
     /// because a shared slot was held: the run succeeded, and those wait for the next one.
     @MainActor
-    func runDreamPassForDreams() async -> (ok: Bool, busy: [String]) {
+    func runDreamPassForDreams(parent: Turn? = nil) async -> (ok: Bool, busy: [String]) {
         dreamError = nil
         do {
-            let result = try await NativeAgentEngine.runDream(dataRoot: engine.dataRoot, trigger: .manual)
+            let result = try await NativeAgentEngine.runDream(dataRoot: engine.dataRoot, trigger: .manual, parent: parent)
             if let detail = DreamReport.completionFailure(result) {
                 dreamError = "Dream cycle failed: \(detail)"
                 statusText = "Dream cycle failed"

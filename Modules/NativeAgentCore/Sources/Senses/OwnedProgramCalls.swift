@@ -185,6 +185,9 @@ extension OwnedProgram {
         func dynamic(_ name: String, _ line: Int) {
             result.warnings.append("\(name) at line \(line) computes a name; it remains checked at run time against declared actions and reach.")
         }
+        func unknownShape(_ name: String, _ line: Int) {
+            result.warnings.append("\(name) at line \(line) has unknown shape; its actual value remains checked at the app door at run time.")
+        }
         func add(_ id: String, primitive: Bool = false, inferred: Bool = false, line: Int, given: [Calls.Argument]? = nil) {
             result.literal.append(.init(id: id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), spelling: id,
                                         primitive: primitive, inferred: inferred, line: line, given: given))
@@ -198,7 +201,46 @@ extension OwnedProgram {
             if first < end { ranges.append(first..<end) }
             return ranges
         }
-        func argumentShape(_ range: Range<Int>) -> Calls.Argument {
+        // Resolve lexical initializers, never execute JavaScript. Parameters, reassignment and mutation leave an unknown shape.
+        var values: [(name: String, scope: Range<Int>, at: Int, expression: Range<Int>?)] = []
+        for open in pairs.keys.sorted() where text(open) == "(" {
+            guard let close = pairs[open], text(close + 1) == "{", let end = pairs[close + 1],
+                  !["if", "while", "for", "with", "switch"].contains(text(open - 1)) else { continue }
+            for parameter in segments(open + 1, close) {
+                // Destructured/default parameters are opaque bindings too; never resolve an outer value through them.
+                for at in parameter where literal(at) == nil && word(Array(text(at).utf16).first ?? 0) {
+                    values.append((text(at), (close + 1)..<(end + 1), open, nil))
+                }
+            }
+        }
+        for i in tokens.indices where text(i) == "=" && text(i + 1) == ">" {
+            let parameters = text(i - 1) == ")" ? pairs[i - 1].map { ($0 + 1)..<(i - 1) } : (i - 1)..<i
+            guard let parameters, let body = functions.filter({ $0.lowerBound == i + 2 }).first else { continue }
+            for at in parameters where literal(at) == nil && word(Array(text(at).utf16).first ?? 0) {
+                values.append((text(at), body, i, nil))
+            }
+        }
+        for i in tokens.indices where ["const", "let", "var"].contains(text(i)) {
+            var end = i + 1
+            while end < tokens.count, ![";", ")", "in", "of"].contains(text(end)) {
+                if end > i + 1, tokens[end].line > tokens[end - 1].line,
+                   !["=", ",", ".", ":", "?", "+", "-", "&&", "||"].contains(text(end - 1)),
+                   ![".", "[", "(", ","].contains(text(end)) { break }
+                end = pairs[end].flatMap { $0 > end ? $0 + 1 : nil } ?? end + 1
+            }
+            for declaration in segments(i + 1, end) {
+                guard let name = declaration.first else { continue }
+                if ["{", "["].contains(text(name)), let close = pairs[name] {
+                    for at in (name + 1)..<close where literal(at) == nil && word(Array(text(at).utf16).first ?? 0) {
+                        values.append((text(at), scope(i, function: text(i) == "var"), at, nil))
+                    }
+                    continue
+                }
+                values.append((text(name), scope(i, function: text(i) == "var"), name,
+                    text(name + 1) == "=" ? (name + 2)..<declaration.upperBound : nil))
+            }
+        }
+        func argumentShape(_ range: Range<Int>, reading: Set<Int> = []) -> Calls.Argument {
             guard let first = range.first else { return .unknown }
             if range.count == 1 {
                 if let value = literal(first) { return .value(.string(value)) }
@@ -207,6 +249,42 @@ extension OwnedProgram {
                 case "false": return .value(.bool(false));
                 case "null": return .value(.null);
                 default: break
+                }
+                if let binding = values.filter({ $0.name == text(first) && $0.scope.contains(first) })
+                    .sorted(by: { $0.scope.count < $1.scope.count }).first,
+                   binding.at < first, let expression = binding.expression, !reading.contains(binding.at) {
+                    let initial = argumentShape(expression, reading: reading.union([binding.at]))
+                    let reference: Bool
+                    switch initial { case .object, .array: reference = true; default: reference = false }
+                    let changed = binding.scope.contains { at in
+                        guard at != binding.at, text(at) == binding.name,
+                              ![".", "?"].contains(text(at - 1)) else { return false }
+                        // Keys are not reads of the binding. An object/array that escapes to an alias or unknown call may have changed.
+                        if text(at + 1) == ":" { return false }
+                        if reference {
+                            let opens = pairs.keys.filter { text($0) == "(" && $0 < at && pairs[$0]! > at }
+                            guard let open = opens.max() else { return true }
+                            var root = open - 1
+                            while root > 0 {
+                                if text(root - 1) == "." { root -= 2 }
+                                else if text(root) == "]", let start = pairs[root] { root = start - 1 }
+                                else { break }
+                            }
+                            // Prelude calls consume their arguments without mutating the caller's object; anything else is unknown.
+                            if text(root) != "app" || bindings.contains(where: { $0.name == "app" && $0.scope.contains(root) }) {
+                                return true
+                            }
+                        }
+                        var next = at + 1
+                        while text(next) == "." || text(next) == "[" {
+                            next = text(next) == "." ? next + 2 : (pairs[next].map { $0 + 1 } ?? tokens.count)
+                        }
+                        return text(next) == "=" && !["=", ">"].contains(text(next + 1))
+                            || ["+", "-"].contains(text(next)) && text(next + 1) == text(next)
+                            || ["+", "-"].contains(text(at - 1)) && text(at - 2) == text(at - 1)
+                            || ["+", "-", "*", "/", "?", "|", "&"].contains(text(next)) && text(next + 1) == "="
+                    }
+                    if !changed { return initial }
                 }
             }
             let number = range.map { text($0) }.joined()
@@ -217,8 +295,9 @@ extension OwnedProgram {
                 for field in segments(first + 1, range.upperBound - 1) {
                     guard let keyAt = field.first, text(keyAt) != ".", text(keyAt) != "[" else { return .unknown }
                     let key = literal(keyAt) ?? text(keyAt)
-                    if field.count == 1 { fields[key] = .unknown }
-                    else if text(keyAt + 1) == ":" { fields[key] = argumentShape((keyAt + 2)..<field.upperBound) }
+                    if key == "__proto__", text(keyAt + 1) == ":" { return .unknown }
+                    if field.count == 1 { fields[key] = argumentShape(field, reading: reading) }
+                    else if text(keyAt + 1) == ":" { fields[key] = argumentShape((keyAt + 2)..<field.upperBound, reading: reading) }
                     else { return .unknown }
                 }
                 return .object(fields)
@@ -226,7 +305,10 @@ extension OwnedProgram {
             if text(first) == "[", pairs[first] == range.upperBound - 1 {
                 let elements = segments(first + 1, range.upperBound - 1)
                 if elements.contains(where: { $0.first.map { text($0) == "." } ?? false }) { return .unknown }
-                return .array(elements.map(argumentShape))
+                return .array(elements.map { argumentShape($0, reading: reading) })
+            }
+            if text(first) == "(", pairs[first] == range.upperBound - 1 {
+                return argumentShape((first + 1)..<(range.upperBound - 1), reading: reading)
             }
             return .unknown
         }
@@ -234,50 +316,25 @@ extension OwnedProgram {
             guard let end = pairs[open] else { return nil }
             let ranges = segments(open + 1, end)
             guard !ranges.contains(where: { $0.first.map { text($0) == "." } ?? false }) else { return nil }
-            return ranges.dropFirst(dropping).map(argumentShape)
+            return ranges.dropFirst(dropping).map { argumentShape($0) }
         }
-        // Inspect only a request's own fields; action-looking nested data is not a call.
-        func property(_ name: String, in object: Int) -> Int? {
-            guard text(object) == "{", let end = pairs[object] else { return nil }
-            var cursor = object + 1, found: Int?
-            while cursor < end {
-                if (text(cursor) == name || literal(cursor) == name), text(cursor + 1) == ":" { found = cursor + 2 }
-                cursor = pairs[cursor].flatMap { $0 > cursor ? $0 + 1 : nil } ?? cursor + 1
+        func doorAction(_ request: Calls.Argument, line: Int) {
+            guard case .object(let fields) = request,
+                  case .string(let id)? = fields["action"]?.value else {
+                unknownShape("app(request)", line); return
             }
-            return found
+            let args = fields["args"] ?? .object([:])
+            if case .unknown = args { unknownShape("app args", line) }
+            add(id, inferred: true, line: line, given: [args])
         }
-        func doorAction(_ object: Int, line: Int) {
-            if let value = property("action", in: object), let id = literal(value), [",", "}"].contains(text(value + 1)) {
-                let args: Calls.Argument
-                if let start = property("args", in: object), let end = pairs[object] {
-                    let stop = segments(object + 1, end).first { $0.contains(start) }?.upperBound ?? start
-                    args = argumentShape(start..<stop)
-                } else { args = .object([:]) }
-                // Spreads and computed requests can replace action/args, so their shape is unknown.
-                let opaque = pairs[object].map { end in
-                    segments(object + 1, end).contains { $0.first.map { text($0) == "." || text($0) == "[" } ?? false }
-                } ?? true
-                add(id, inferred: true, line: tokens[value].line, given: opaque ? nil : [args])
-            } else { dynamic("app({action:…})", line) }
-        }
-        func doorRequest(_ object: Int, line: Int) {
-            guard text(object) == "{", let requestEnd = pairs[object], [",", ")"].contains(text(requestEnd + 1)) else {
-                dynamic("app(request)", line); return
-            }
-            if property("action", in: object) != nil { doorAction(object, line: line); return }
-            guard let batch = property("actions", in: object) else { return }
-            guard text(batch) == "[", let end = pairs[batch], [",", "}"].contains(text(end + 1)) else {
-                dynamic("app({actions:…})", line); return
-            }
-            var cursor = batch + 1
-            while cursor < end {
-                if text(cursor) == "," { cursor += 1; continue }
-                guard text(cursor) == "{", let close = pairs[cursor], [",", "]"].contains(text(close + 1)) else {
-                    dynamic("app({actions:…})", line); return
-                }
-                doorAction(cursor, line: tokens[cursor].line)
-                cursor = close + 1
-            }
+        func doorRequest(_ open: Int, line: Int) {
+            guard let end = pairs[open], let first = segments(open + 1, end).first else { return }
+            let request = argumentShape(first)
+            guard case .object(let fields) = request else { unknownShape("app(request)", line); return }
+            if fields["action"] != nil { doorAction(request, line: line); return }
+            guard let batch = fields["actions"] else { return }
+            guard case .array(let requests) = batch else { unknownShape("app actions", line); return }
+            for request in requests { doorAction(request, line: line) }
         }
         for start in tokens.indices where roots.contains(text(start)) {
             // A property named app is not the bound app object.
@@ -311,7 +368,7 @@ extension OwnedProgram {
             let spelling = ([root] + members).joined(separator: ".")
             if computed { dynamic(spelling, line); continue }
             if members.isEmpty {
-                if root == "app" { doorRequest(cursor + 1, line: line); continue }
+                if root == "app" { doorRequest(cursor, line: line); continue }
                 result.refusals.append("\(root) is an object, so \(root)(…) at line \(line) cannot run. Use "
                     + "\(root).<method>(args), as exposed by the program prelude.")
                 continue
@@ -355,13 +412,14 @@ extension OwnedProgram {
                 if let operation {
                     var arguments = given(cursor, dropping: members == ["call"] ? 1 : 0)
                     // The host prelude consumes root before files.* dispatch, so root is not a door field.
-                    if operation.hasPrefix("files."), var list = arguments,
+                    let filePrimitive = OwnedProgramRunner.hostFilePrimitives.contains(operation)
+                    if operation.hasPrefix("files."), !filePrimitive, var list = arguments,
                        case .object(var fields)? = list.first, fields["root"] != nil {
                         fields.removeValue(forKey: "root")
                         fields["path"] = .unknown
                         list[0] = .object(fields); arguments = list
                     }
-                    add(operation, primitive: !operation.hasPrefix("files."), line: line, given: arguments)
+                    add(operation, primitive: !operation.hasPrefix("files.") || filePrimitive, line: line, given: arguments)
                     if operation == "part.call" {
                         if case .object(let request)? = arguments?.first,
                            case .value(.string(let id))? = request["id"] {

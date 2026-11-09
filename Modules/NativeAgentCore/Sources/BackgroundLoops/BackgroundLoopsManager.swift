@@ -326,29 +326,6 @@ public actor BackgroundLoopLifetimes {
         }
     }
 
-    /// OS wakes use the canonical durable cadence; manual force-runs remain explicit.
-    /// Recheck eligibility inside the shared gate so a periodic tick settling after the cheap read prevents duplicate work.
-    @discardableResult
-    public func runTickIfDue(loopId: String) async -> LoopTickOutcome {
-        let lifecycle = lifecycleGeneration
-        if starting { await startTransition.park() }
-        guard automaticLifecycleIsCurrent(lifecycle) else {
-            return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
-        }
-        guard let runner = managedRunner(loopId: loopId) else {
-            if case .disabled(_, let reason) = registrations[loopId] { return .off(reason) }
-            if case .unreadable(_, let error) = registrations[loopId] { return .failed(error: error) }
-            return .failed(error: "loop not registered: \(loopId)")
-        }
-        // This early rejection saves gate work; the authoritative durable predicate runs again after admission.
-        guard await scheduler.isDue(loopId: loopId) == true else {
-            return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
-        }
-        return await executeRegisteredTick(
-            loopId: loopId, runner: runner, lifecycle: lifecycle, requiresDue: true
-        )
-    }
-
     /// Revalidate registration after suspension and gate admission; automatic wakes also retain their admitting lifecycle.
     internal func executeRegisteredTick(
         loopId: String,

@@ -6,17 +6,6 @@ import ProviderRouting
 import CloudKit
 // Blueprint: | `EngineRouteError.swift` | Plain failure remedies and full-width POSIX error interpretation |
 #endif
-public enum DaemonError: Error, LocalizedError, Sendable {
-    case notFound(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .notFound(let path): return "Not found: \(path)"
-        }
-    }
-}
-
-
 /// Keep raw errors in logs; user-facing failures need a plain cause and remedy.
 public enum UserFacingError {
     private static let logger = ModuleLog(subsystem: "com.nativeagent.app", category: "user-facing-error")

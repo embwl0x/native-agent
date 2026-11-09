@@ -8,7 +8,6 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
     public var uptimeSeconds: Double
     public var runtimeLifecycleStatus: String
     public var runtimeLifecycleDetail: String
-    public var runningImprovements: Int
     public var lastActivity: JSONValue?
     public var repairAvailable: Bool
     public var extras: JSONValue?
@@ -17,7 +16,6 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
         uptimeSeconds: Double,
         runtimeLifecycleStatus: String,
         runtimeLifecycleDetail: String,
-        runningImprovements: Int,
         lastActivity: JSONValue? = nil,
         repairAvailable: Bool,
         extras: JSONValue? = nil
@@ -25,7 +23,6 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
         self.uptimeSeconds = uptimeSeconds
         self.runtimeLifecycleStatus = runtimeLifecycleStatus
         self.runtimeLifecycleDetail = runtimeLifecycleDetail
-        self.runningImprovements = runningImprovements
         self.lastActivity = lastActivity
         self.repairAvailable = repairAvailable
         self.extras = extras
@@ -34,7 +31,6 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
     private static let knownKeys: Set<String> = [
         "uptimeSeconds",
         "runtimeLifecycleStatus", "runtimeLifecycleDetail",
-        "runningImprovements",
         "lastActivity",
         "repairAvailable",
         "extras",
@@ -45,7 +41,6 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
         try c.encode(uptimeSeconds, forKey: JSONKey("uptimeSeconds"))
         try c.encode(runtimeLifecycleStatus, forKey: JSONKey("runtimeLifecycleStatus"))
         try c.encode(runtimeLifecycleDetail, forKey: JSONKey("runtimeLifecycleDetail"))
-        try c.encode(runningImprovements, forKey: JSONKey("runningImprovements"))
         try c.encodeIfPresent(lastActivity, forKey: JSONKey("lastActivity"))
         try c.encode(repairAvailable, forKey: JSONKey("repairAvailable"))
         try c.encodeUnknownFields(extras, excluding: Self.knownKeys)

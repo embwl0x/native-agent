@@ -18,10 +18,10 @@ extension DoctorFacade {
         await capabilitiesDidChange?()
         do {
             let run = try await ImprovementGauntletRun.run(dataRoot: dataRoot,
-                runProcess: { @Sendable executable, arguments, directory, timeout in
-                    let result = try await ProcessExecution.runBounded(executable: executable, arguments: arguments,
-                        currentDirectory: directory, timeout: timeout)
-                    return (result.status, SystemGitActions.processDetail(result))
+                runProcess: { @Sendable executable, arguments, directory in
+                    let result = try await ProcessExecution().run(executable: executable, arguments: arguments,
+                        currentDirectory: directory, environment: nil, standardInput: nil, timeoutSeconds: nil)
+                    return (result.exitCode, SystemGitActions.processDetail((result.exitCode, result.stdout, result.stderr)))
                 }, appendBoundedRun: { @Sendable in try await NativeRegistryEvaluation.appendBoundedRun($0, to: $1) })
             _ = await refreshHardening()
             await settle { await self.finishImprovementChecks() }
@@ -46,12 +46,18 @@ extension DoctorFacade {
         productionExportFailure = nil
         await capabilitiesDidChange?()
         let root = dataRoot
+        let health = readHealth()
+        let runProcess: ProductionExport.ArtifactProcessRunner = { executable, arguments, directory in
+            let result = try await ProcessExecution().run(executable: executable, arguments: arguments,
+                currentDirectory: directory, environment: nil, standardInput: nil, timeoutSeconds: nil)
+            return (result.exitCode, result.stdout, result.stderr)
+        }
         do {
             let export = support
-                ? try await ProductionExport.createSupportBundle(dataRoot: root, runProcess: ProcessExecution.runBounded,
+                ? try await ProductionExport.createSupportBundle(dataRoot: root, runProcess: runProcess,
                     diagnostics: { @Sendable in await SupportDiagnostics.read(reusingChecks: nil) },
-                    health: { @Sendable in DoctorFacade(dataRoot: root).readHealth() })
-                : try await ProductionExport.createArchive(dataRoot: root, runProcess: ProcessExecution.runBounded) {
+                    health: { @Sendable in health })
+                : try await ProductionExport.createArchive(dataRoot: root, runProcess: runProcess) {
                     @Sendable in try await DoctorReadout.getProductionHardening(dataRoot: root)
                 }
             let verification = try await export.verifyRegistry(dataRoot: root)

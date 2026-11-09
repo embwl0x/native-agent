@@ -19,8 +19,8 @@ settings:
   SWIFT_STRICT_CONCURRENCY: complete
   TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
   SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
-  MARKETING_VERSION: "0.6.15"
-  CURRENT_PROJECT_VERSION: "61"
+  MARKETING_VERSION: "0.6.16"
+  CURRENT_PROJECT_VERSION: "72"
   # Set DEVELOPMENT_TEAM locally in Xcode or on the xcodebuild command line
   # for device builds. Do not commit a personal Apple Developer Team ID.
   CODE_SIGN_STYLE: "Automatic"
@@ -65,7 +65,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_BUNDLE_ID)
         INFOPLIST_FILE: Sources/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # iOS remote control uses signed iCloud KVS/Drive messages only.
+        # Signed CloudKit messages/actions; KVS carries progress and delivery nudges.
       configs:
         Debug:
           NATIVEAGENT_APS_ENVIRONMENT: development
@@ -73,7 +73,7 @@ targets:
         Release:
           NATIVEAGENT_APS_ENVIRONMENT: production
           NATIVEAGENT_ICLOUD_ENVIRONMENT: Production
-    # PATCH-2026-05-07: icloud-bridge iOS entitlements for iCloud Drive + KVS
+    # iCloud transport entitlements.
     entitlements:
       path: Sources/NativeAgentMobile.entitlements
       properties:
@@ -95,8 +95,7 @@ targets:
         com.apple.developer.icloud-container-identifiers:
           - $(NATIVEAGENT_ICLOUD_CONTAINER_ID)
         com.apple.developer.icloud-services:
-          # CK-1 (2026-07-05): additive. CloudDocuments keeps live KVS/Drive
-          # sync; CloudKit is the device-sync foundation. Keep both.
+          # Preserve the container's declared services; phone transport uses CloudKit.
           - CloudDocuments
           - CloudKit
         com.apple.developer.ubiquity-container-identifiers:

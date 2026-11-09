@@ -35,7 +35,7 @@ extension MacSyncEngine {
         switch presence {
         case .published: presenceSummary = "CloudKit accepted Mac presence."
         case .ineligible: presenceSummary = "Mac presence is not eligible for this phone."
-        case .failed: presenceSummary = "CloudKit has not accepted Mac presence."
+        case .failed: presenceSummary = "Mac presence publication is incomplete."
         }
         return ([presenceSummary]
             + (syncError.map { [$0] } ?? [])
@@ -124,10 +124,12 @@ extension MacSyncEngine {
                 name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
                 object: nil
             )
-            Task.detached(priority: .utility) {
-                _ = await withCKTimeout("MacSyncEngine.start.kvsSynchronize") {
+            Task { [weak self] in
+                let synchronized = await Task.detached(priority: .utility) {
                     NSUbiquitousKeyValueStore.default.synchronize()
-                }
+                }.value
+                guard let self, generation == self.snapshotLifecycleGeneration, self.isActive else { return }
+                if !synchronized { self.syncError = "iCloud KVS setup synchronization was not accepted; its remote state is unconfirmed." }
             }
         } else {
             await startArchiveRetentionWatcher()
@@ -140,7 +142,6 @@ extension MacSyncEngine {
         guard generation == snapshotLifecycleGeneration, isActive else { return nil }
         startPresenceBeat()
         startCognitionSnapshotObservation()
-        await startSchedulerSnapshotObservation()
         await startHelpersSnapshotObservation()
         await startConnectorsSnapshotObservation()
         guard generation == snapshotLifecycleGeneration, isActive else { return nil }
@@ -204,8 +205,6 @@ extension MacSyncEngine {
         configurePresenceBeat(enabled: false)
         cognitionSnapshotObservationTask?.cancel()
         cognitionSnapshotObservationTask = nil
-        schedulerSnapshotWatcher?.cancel()
-        schedulerSnapshotWatcher = nil
         helpersSnapshotWatcher?.cancel()
         helpersSnapshotWatcher = nil
         connectorsSnapshotWatcher?.cancel()
@@ -222,13 +221,15 @@ extension MacSyncEngine {
             NotificationCenter.default.removeObserver(pageFacePublishedObserver)
             self.pageFacePublishedObserver = nil
         }
-        chatTranscriptSnapshotPublicationTask?.cancel()
-        chatTranscriptSnapshotPublicationTask = nil
-        chatSnapshotCoalescer.reset()
+        if let turnSessionsFacePublishedObserver {
+            NotificationCenter.default.removeObserver(turnSessionsFacePublishedObserver)
+            self.turnSessionsFacePublishedObserver = nil
+        }
         // The retiring pass owns admission until its physical write returns.
         snapshotWriteQueuedScope = nil
         snapshotWriteQueuedNeedsHeavy = false
         snapshotWriteQueuedNeedsRepublish = false
+        snapshotWriteQueuedRepairs = []
         snapshotWriteQueuedNeedsMemories = false
         snapshotWriteQueuedNeedsChatTranscripts = false
         // Clear retired roots so post-stop calls cannot write to a superseded container, even beyond generation fences.
@@ -238,9 +239,9 @@ extension MacSyncEngine {
         transactionDir = nil
         pruneDeadlineTask?.cancel()
         pruneDeadlineTask = nil
-        archiveRetentionRetryAfter = nil
-        archiveRetentionWatcher?.cancel()
+        let archiveWatcher = archiveRetentionWatcher
         archiveRetentionWatcher = nil
+        if let archiveWatcher { Task.detached(priority: .utility) { archiveWatcher.cancel() } }
         inboxQuery?.stop()
         inboxQuery = nil
         NotificationCenter.default.removeObserver(self)
@@ -291,12 +292,18 @@ extension MacSyncEngine {
         configurePresenceBeat(enabled: true)
     }
 
+    /// Activity attests liveness without republishing unchanged state.
+    func requestPresencePublication() {
+        guard isActive else { return }
+        presenceBeatDue = Date()
+        presenceBeatEvents?.yield(())
+    }
+
     private func configurePresenceBeat(enabled: Bool) {
         guard enabled || presenceBeatEvents != nil || presenceBeatRegistrationTask != nil else { return }
         presenceBeatEvents?.finish()
         presenceBeatEvents = nil
         presenceBeatDue = enabled ? Date() : nil
-        presenceBeatDelay = NAMacPresence.beat
         let generation = snapshotLifecycleGeneration
         let registration: LoopRegistration?
         if enabled {
@@ -337,17 +344,15 @@ extension MacSyncEngine {
         guard !Task.isCancelled, isActive, generation == snapshotLifecycleGeneration else {
             return .skipped(reason: "Phone sync is not active.", healthNeutral: true)
         }
-        defer { self.presenceBeatDue = Date().addingTimeInterval(presenceBeatDelay) }
+        defer { self.presenceBeatDue = Date().addingTimeInterval(NAMacPresence.beat) }
         switch publication {
         case .ineligible:
             return .skipped(reason: "Mac presence is not eligible for this phone.", healthNeutral: true)
         case .published:
             OrganPulse.record("presence_beat", .worked, cadence: NAMacPresence.beat)
-            presenceBeatDelay = NAMacPresence.beat
             return .completed(result: nil)
         case .failed:
-            presenceBeatDelay = min(NAMacPresence.phoneWindow, presenceBeatDelay * 2)
-            return .failed(error: "CloudKit has not accepted Mac presence.")
+            return .failed(error: "Mac presence publication is incomplete.")
         }
     }
 
@@ -404,10 +409,13 @@ extension MacSyncEngine {
                 iPhone snapshot integrity check found \(report.integrityFailures.joined(separator: "; ")). Rebuilding the affected mobile snapshot groups.
                 """
             // Force heavy projections too; a light pass cannot repair their mismatched files.
-            await writeSnapshots(forceHeavy: true)
+            await writeSnapshots(forceHeavy: true,
+                repairFiles: Set(report.missingManagedFiles + report.mismatchedManagedFiles + report.unreadableManagedFiles))
         } else if retryChangedSkips {
             // Failed publications may have no cached digest left to reconcile.
-            await writeSnapshots(forceHeavy: true)
+            let managed = Set(NAMobileSnapshotGroup.allCases.flatMap(\.filenames))
+            let repairFiles = Set((skippedGroups ?? [:]).keys.map { $0 + ".json" }).intersection(managed)
+            await writeSnapshots(forceHeavy: true, repairFiles: repairFiles)
         } else if retrySkipped {
             await writeSnapshots()
         }
@@ -470,6 +478,7 @@ extension MacSyncEngine {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
+                self?.requestPresencePublication()
                 self?.requestChatSnapshotPublication(includeTranscripts: true)
             }
         }
@@ -486,16 +495,22 @@ extension MacSyncEngine {
                 self?.requestChatSnapshotPublication(includeTranscripts: true)
             }
         }
-        // A changed face rides the light work-activity pass, which carries faces like every pass. A pass refreshes every page itself, so a
-        // face that changes during one is already in it and asks for no other.
+        // A changed face rides the light work-activity pass. Changes after a writer captures faces queue a trailing pass through its coalescer.
         if let pageFacePublishedObserver {
             NotificationCenter.default.removeObserver(pageFacePublishedObserver)
         }
         pageFacePublishedObserver = NotificationCenter.default.addObserver(forName: .pageFacePublished, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, !self.snapshotWriteInFlight else { return }
-                self.requestWorkActivityPublication()
+                self?.requestWorkActivityPublication()
             }
+        }
+        if let turnSessionsFacePublishedObserver {
+            NotificationCenter.default.removeObserver(turnSessionsFacePublishedObserver)
+        }
+        turnSessionsFacePublishedObserver = NotificationCenter.default.addObserver(
+            forName: .turnSessionsFacePublished, object: nil, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.requestWorkActivityPublication() }
         }
     }
 
@@ -504,27 +519,12 @@ extension MacSyncEngine {
         requestChatSnapshotPublication(includeTranscripts: true)
     }
 
-    /// One coalescer upgrades pending session-only work when transcript demand arrives, avoiding a second timer.
+    /// The snapshot writer merges demand until capture, then retains one follow-up through physical completion.
     public func requestChatSnapshotPublication(includeTranscripts: Bool) {
         guard isActive else { return }
         let generation = snapshotLifecycleGeneration
-        guard chatSnapshotCoalescer.enqueue(
-            includeTranscripts: includeTranscripts,
-            generation: generation
-        ) else { return }
-        chatTranscriptSnapshotPublicationTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: .milliseconds(180))
-            } catch {
-                return
-            }
-            guard let self else { return }
-            guard let includeTranscripts = self.chatSnapshotCoalescer.resolve(
-                generation: generation,
-                currentGeneration: self.snapshotLifecycleGeneration,
-                isActive: self.isActive
-            ) else { return }
-            self.chatTranscriptSnapshotPublicationTask = nil
+        Task { @MainActor [weak self] in
+            guard let self, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
             await self.writeSnapshots(
                 includeChatTranscripts: includeTranscripts,
                 scope: .chatSessions
@@ -546,18 +546,21 @@ extension MacSyncEngine {
     @discardableResult
     func startArchiveRetentionWatcher(transactionDirectories: [URL] = []) async -> Bool {
         let generation = snapshotLifecycleGeneration
-        let paths = MacSyncArchiveRetentionWatchPaths.resolve(
-            inboxDirectory: inboxDir,
-            responsesDirectory: responsesDir,
-            transactionDirectory: transactionDir,
-            dataRoot: PersistenceCore.defaultDataRoot()
-        )
-        guard paths.count == (inboxDir == nil ? 5 : 7) else {
-            syncError = "Archive retention unavailable: sync directories could not be opened."
-            return false
-        }
+        let dataRoot = sync.dataRoot
+        let inboxDirectory = inboxDir
+        let responsesDirectory = responsesDir
+        let transactionDirectory = transactionDir
+        let paths: [URL]
         let transactionFiles: [URL]
         do {
+            paths = try await sync.storage.perform {
+                try MacSyncArchiveRetentionWatchPaths.resolve(
+                    inboxDirectory: inboxDirectory,
+                    responsesDirectory: responsesDirectory,
+                    transactionDirectory: transactionDirectory,
+                    dataRoot: dataRoot
+                )
+            }
             transactionFiles = try await sync.storage.perform {
                 try transactionDirectories.flatMap { directory in
                     try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
@@ -565,7 +568,7 @@ extension MacSyncEngine {
             }
         } catch {
             if !Task.isCancelled, isActive, generation == snapshotLifecycleGeneration {
-                syncError = "Archive retention unavailable: sync directories could not be opened."
+                syncError = "Archive retention unavailable: \(error.localizedDescription). Restore access to the named sync directory."
             }
             return false
         }
@@ -575,14 +578,18 @@ extension MacSyncEngine {
                 self.reconcileArchiveRetention(pruneFirst: true)
             }
         }
-        guard !Task.isCancelled, isActive, generation == snapshotLifecycleGeneration else { watcher.cancel(); return false }
-        archiveRetentionWatcher?.cancel()
+        guard !Task.isCancelled, isActive, generation == snapshotLifecycleGeneration else {
+            await Task.detached(priority: .utility) { watcher.cancel() }.value
+            return false
+        }
+        let previous = archiveRetentionWatcher
         archiveRetentionWatcher = watcher
-        return true
+        if let previous { await Task.detached(priority: .utility) { previous.cancel() }.value }
+        return !Task.isCancelled && isActive && generation == snapshotLifecycleGeneration
     }
 }
 
-/// Presence has no change event: BackgroundLoops owns beat, backoff and phone-window deadlines; transport owns publication.
+/// Activity edges and the renewal deadline share one publication owner; incoming reads have a separate lifetime.
 private struct MacSyncPresenceBeat: EventDeadlineLoopRunner {
     weak var engine: MacSyncEngine?
     let generation: UInt64

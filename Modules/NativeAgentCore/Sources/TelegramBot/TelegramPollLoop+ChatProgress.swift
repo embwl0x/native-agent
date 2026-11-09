@@ -47,6 +47,7 @@ extension TelegramPollLoop {
                     FileHandle.standardError.write(
                         Data("TelegramPollLoop: sendChatAction failed: \(TurnSecretRedactor.redactText(String(describing: error)))\n".utf8)
                     )
+                    break
                 }
                 do { try await Task.sleep(nanoseconds: 4_000_000_000) }
                 catch { break }
@@ -141,7 +142,6 @@ extension TelegramPollLoop {
                 } else { throw TelegramBotError.underlying("Assistant answer has no durable delivery owner.") }
                 return try !CodexCompletionReadout.permitsDelivery(sessionId: session, runId: run,
                     configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
-                    || TurnQuietHoursWindow.holdsResidentWake(session: session, dataRoot: dataRoot)
             },
             sendGeneratedImage: { path, bytes in
                 do { try await Self.defaultSendChatAction(token, destination, "upload_photo") }

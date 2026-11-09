@@ -57,9 +57,9 @@ package enum ChatWorkspaceBinding {
     }
 
     package static func elsewhere(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String, surface: String, peer: Bool, at: Date?,
-                                  reading: AgentScreen.ElsewhereReading?) async -> String? {
+                                  reading: AgentScreen.ElsewhereReading?, shown: Set<String>) async -> String? {
         await AgentScreen.elsewhere(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, surface: surface, peer: peer,
-                                  turn: at, reading: reading)
+                                  turn: at, reading: reading, shown: shown)
     }
 
     private struct Conversations: AgentWorkspaceConversationPort {
@@ -70,6 +70,17 @@ package enum ChatWorkspaceBinding {
         func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord] {
             let store = AgentConversationStore(dataRoot: dataRoot)
             return try locked ? store.records() : store.recordsUnlocked()
+        }
+        func acceptedSends(dataRoot: URL) throws -> Set<String> {
+            var accepted: Set<String> = []
+            for row in try AgentConversationStore(dataRoot: dataRoot).recordsUnlocked() {
+                if row.phase != "sending", AgentConversationDelivery.accepted(row) { accepted.insert(row.operationID) }
+                // Earlier sends keep their own positive evidence after the current operation advances.
+                for exchange in (row.exchanges ?? []) + (row.releasing ?? []) where exchange.id != row.operationID {
+                    if exchange.reply != nil || ["delivered", "read"].contains(exchange.status) { accepted.insert(exchange.id) }
+                }
+            }
+            return accepted
         }
         func find(dataRoot: URL, scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord? {
             try AgentConversationStore(dataRoot: dataRoot).find(scopeSessionID: scopeSessionID, agent: agent, label: label)
@@ -167,7 +178,8 @@ package enum ChatWorkspaceBinding {
         }
         func appAction(_ tool: String) -> String? { ToolNameAliases.appAction(tool) }
         func macIntegrationAccess(_ name: String) -> MacIntegrationAccess? {
-            SwiftToolDispatcher.macIntegrationAccess(forTool: name)
+            // Readiness only shapes which buttons a room shows; an unreadable catalog shows the button and the run's own switch gate refuses.
+            do { return try SwiftToolDispatcher.integrationGate(tool: name, input: [:], turn: nil) } catch { return nil }
         }
         func withWebScheme(_ value: String) -> String { SwiftToolDispatcher.withWebScheme(value) }
         func markConsumed(peer: String) { PeerDataTaint.markConsumed(peer: peer) }

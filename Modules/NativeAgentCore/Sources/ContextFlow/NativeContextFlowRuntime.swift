@@ -8,7 +8,7 @@ import PersonaEngine
 import PersistenceCore
 import TurnTrace
 import NativeAgentShared
-// Blueprint: | `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime`: checked admission; joined lifecycle; drain and provenance |
+// Blueprint: | `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime`: checked admission, joined lifecycle, health events, drain and provenance |
 
 private struct NativeContextEmbeddingProvider: ContextMarkdownEmbeddingProvider {
     let memory: SwiftNativeMemoryV2
@@ -47,7 +47,8 @@ private struct NativeContextMarkdownCompiler: ContextMarkdownCompiling {
 
 public actor NativeContextFlowRuntime: ContextTurnPreparing {
     let dataRoot: URL
-    var coordinator: ContextPreparation?
+    private let healthEvents = ContextHealthEvents()
+    var coordinator: ContextPreparation? { didSet { healthEvents.signal() } }
     var memoryRuntime: SwiftNativeMemoryV2?
     private let memoryPressureObserver: DispatchContextMemoryPressureObserver?
     /// Payload-free Desk invalidations make the coordinator reread canonical stores.
@@ -57,7 +58,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     var lifecycle: (
         id: UUID, operation: LifecycleOperation,
         configuration: Result<NativeContextFlowConfiguration, NativeContextFlowStartupError>?, task: Task<Void, Never>
-    )?
+    )? { didSet { healthEvents.signal() } }
     private var personaPickerReconcile: (id: UUID, task: Task<Void, Never>)?
     private var personaPickerRequestRevision: UInt64 = 0
     var semanticQueryCache: [String: ContextQueryEmbeddingValue] = [:]
@@ -126,8 +127,8 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                 throw MemoryV2Error.storageUnavailable
             }
             let store = try ContextSQLiteStore(dataRoot: dataRoot)
-            let arena = try ContextArena(budget: configuration.budget)
-            let registry = try ContextSourceRegistry()
+            let arena = try ContextArena(budget: configuration.budget, healthEvents: healthEvents)
+            let registry = try ContextSourceRegistry(healthEvents: healthEvents)
             let provider = PersonaContextFlowProvider(dataRoot: dataRoot)
             let coordinator = ContextPreparation(
                 mode: configuration.mode,
@@ -192,7 +193,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         observation?.cancel()
         let queries = Array(semanticQueryTasks.values)
         queries.forEach { $0.cancel() }
-        semanticQueryTickets.values.forEach { $0.fail(Self.retiredSemanticQueryCause) }
+        semanticQueryTickets.values.forEach { $0.fail(Self.retiredSemanticQueryCause, repairRequired: false) }
         semanticQueryTickets.removeAll()
         semanticQueryCache.removeAll()
         semanticQueryCacheOrder.removeAll()
@@ -319,6 +320,9 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         if startupFailedClosed { return .unavailable }
         return configuration.mode == .off ? .off : .unavailable
     }
+
+    /// One root's lifecycle, source, feedback, publication, pressure and lease edges survive coordinator replacement.
+    public nonisolated func healthChanges() -> AsyncStream<Void> { healthEvents.changes() }
 
     /// During a lifecycle transition, report the configured mode without waiting.
     public func contextFlowMode() async throws -> ContextFlowMode {

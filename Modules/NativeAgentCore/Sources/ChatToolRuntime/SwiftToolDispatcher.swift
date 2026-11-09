@@ -204,7 +204,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             .filter { seen.insert($0).inserted })
         var schemas: [LLMToolSchema] = []
         if includeSchemas {
-            let registry = try Self.authoredTools(records: records, named: schemaNames).map(\.schema)
+            let registry = try Self.authoredTools(records: records, named: schemaNames).filter { $0.answer == nil }.map(\.schema)
             let combined = builtIn.map { executorDescriptors[$0.name]?.schema ?? $0 } + registry
             schemas = withContributedSchemas(usesCanonicalBody
                 ? combined
@@ -279,7 +279,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
 
     /// The same, for the `app` door's generated `authored.<id>` actions, with the primitive permissions and app dependencies each declares. The store's lock
     /// and canonical revision cover local and external changes. A failed read is not memoized; the key is read before the catalog walk.
-    package static func authoredTools(dataRoot: URL) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
+    package static func authoredTools(dataRoot: URL) -> [AuthoredTool] {
         switch checkedAuthoredTools(dataRoot: dataRoot) {
         case .success(let tools): return tools
         case .failure: return [] // Unreadable authority offers no executable actions.
@@ -287,14 +287,13 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     }
 
     /// Inventory readers retain the fault; execution discovery stays fail-closed.
-    package static func checkedAuthoredTools(dataRoot: URL) -> Result<[(schema: LLMToolSchema, permissions: [String], actions: [String],
-        page: String?, action: String?)], any Error> {
+    package static func checkedAuthoredTools(dataRoot: URL) -> Result<[AuthoredTool], any Error> {
         checkedAuthoredCatalog(dataRoot: dataRoot).map(\.tools)
     }
 
     /// One checked source snapshot supplies callable contracts and exact stable IDs.
     package struct AuthoredCatalog: Sendable {
-        package let tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)]
+        package let tools: [AuthoredTool]
         package let aliases: [String: String]
     }
 
@@ -325,11 +324,23 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     nonisolated(unsafe) private static var authoredToolsMemo: (key: (String, [String], Int),
         catalog: AuthoredCatalog)?
 
-    static func authoredTools(records: [ToolRecord], named names: Set<String>? = nil) throws -> [(schema: LLMToolSchema, permissions: [String],
-        actions: [String], page: String?, action: String?)] {
+    /// One callable entry of the agent's parts: a part's own run, or a door verb its header answers.
+    package struct AuthoredTool: Sendable {
+        package let schema: LLMToolSchema
+        package let permissions: [String]
+        package let actions: [String]
+        package let page: String?
+        package let action: String?
+        /// The verb's declaration when this entry is a verb the part answers.
+        package let answer: [String: JSONValue]?
+        /// A part that answers verbs runs only through them; its own entry is the run target and admission schema, never an action of its own.
+        package let answering: Bool
+    }
+
+    static func authoredTools(records: [ToolRecord], named names: Set<String>? = nil) throws -> [AuthoredTool] {
         let active = records
             .filter { $0.fields["status"] == .string("active") && $0.fields["disabledBy"] != .string("owner") }
-        var tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] = []
+        var tools: [AuthoredTool] = []
         for row in active {
             let id = row.id
             guard names?.contains(id) != false, isAuthorableToolName(id) else { continue }
@@ -346,11 +357,87 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             let permissions = row.permissions ?? []
             let reach = PermissionLaw.reach(ofPermissions: permissions)
             let toolClass = permissions.map(PermissionLaw.permissionClass).max() ?? (schemaObject["readOnly"] == .bool(true) ? .read : .write)
-            tools.append((LLMToolSchema(name: id, toolClass: toolClass, reach: reach,
-                                       capabilities: ["tool_call", "safe_read"], description: row.description, parametersJSON: schemaData),
-                          permissions, row.actions ?? [],
-                          page, action))
+            let answers: [String: JSONValue] = if case .object(let verbs)? = row.fields["answers"] { verbs } else { [:] }
+            tools.append(AuthoredTool(schema: LLMToolSchema(name: id, toolClass: toolClass, reach: reach,
+                                                            capabilities: ["tool_call", "safe_read"], description: row.description,
+                                                            parametersJSON: schemaData),
+                                      permissions: permissions, actions: row.actions ?? [], page: page, action: action, answer: nil,
+                                      answering: !answers.isEmpty))
+            for (verb, entry) in answers.sorted(by: { $0.key < $1.key }) {
+                tools.append(try answeredTool(part: id, verb: verb, entry: entry, permissions: permissions, actions: row.actions ?? [], page: page,
+                                              reach: reach))
+            }
         }
-        return tools.sorted { $0.schema.name < $1.schema.name }
+        return tools.sorted { ($0.schema.name, $0.action ?? "") < ($1.schema.name, $1.action ?? "") }
+    }
+
+    /// A verb runs as its part, judged by its declared class; its Mac integration switch is the one owning the part's app reach.
+    static func answeredTool(part: String, verb: String, entry: JSONValue, permissions: [String], actions: [String], page: String?,
+                             reach: ToolReach) throws -> AuthoredTool {
+        guard case .object(let declared) = entry, case .string(let effect)? = declared["class"], case .string(let description)? = declared["description"],
+              case .object(var args)? = declared["args"] else {
+            throw ToolFailureError("The admitted ability \(part) declares \(verb) without description, class and args.", effects: .none,
+                owner: "abilities/\(part).js", instruction: "Repair this ability's answers header before offering its verbs.")
+        }
+        // A door verb's arguments are closed unless its schema declares them open, as for every native door verb.
+        if args["additionalProperties"] == nil { args["additionalProperties"] = .bool(false) }
+        let floor = try shippedAnswerFloor.get()[verb]
+        let toolClass = max(try answerClass(effect, part: part, verb: verb), floor?.toolClass ?? .read)
+        var answer = declared
+        if floor?.irreversible == true { answer["irreversible"] = .bool(true) }
+        // A shipped seed's verb keeps the seed's app switch whatever reach a revision declares.
+        let gate = (floor?.integration ?? integration(of: permissions)).map { MacIntegrationAccess($0, toolClass == .read ? .read : .write) }
+        // A verb's capabilities say what its class does where its part reaches: a person-side write changes data outside the app's own.
+        let effects: Set<String> = switch toolClass {
+        case .read: []
+        case .write: reach == .person ? ["outside_app_data_write"] : ["app_data_write"]
+        case .send: ["external_send"]
+        case .destructive: ["destructive"]
+        }
+        let capabilities = toolClass.baseCapabilities.union(effects)
+        return AuthoredTool(schema: LLMToolSchema(name: part, toolClass: toolClass, reach: reach, capabilities: capabilities, macIntegration: gate,
+                                                  description: description, parametersJSON: try JSONValue.object(args).serializedData(pretty: false)),
+                            permissions: permissions, actions: actions, page: page, action: verb, answer: answer, answering: true)
+    }
+
+    /// Admission accepts only these four; a header damaged after admission is refused, never read as a write.
+    static func answerClass(_ name: String, part: String, verb: String) throws -> ToolClass {
+        switch name {
+        case "read": return .read
+        case "write": return .write
+        case "send": return .send
+        case "destructive": return .destructive
+        default:
+            throw ToolFailureError("\(part) declares \(verb) with class \(name); a verb's class is read, write, send or destructive.", effects: .none,
+                owner: "abilities/\(part).js", instruction: "Repair this ability's answers header before offering its verbs.")
+        }
+    }
+
+    /// The one Mac integration a part's app reach names; none when it names no integration app or more than one.
+    static func integration(of permissions: [String]) -> String? {
+        let apps = Set(permissions.compactMap { permission -> String? in
+            let pieces = permission.split(separator: ":", maxSplits: 1).map(String.init)
+            return pieces.count == 2 && ["app_read", "app_write"].contains(pieces[0]) ? MacIntegrationID.owning(appBundleID: pieces[1]) : nil
+        })
+        return apps.count == 1 ? apps.first : nil
+    }
+
+    /// A verb the app ships a part for keeps that seed's class, irreversibility and app switch as its floor: a revision may raise them, never lower
+    /// them below what the native verb was. Read once from the bundled seeds; an unreadable bundle fails the whole authored catalog, so none of the
+    /// agent's parts are offered until the app's own resources read.
+    static let shippedAnswerFloor = Result<[String: (toolClass: ToolClass, irreversible: Bool, integration: String?)], any Error> {
+        var floor: [String: (toolClass: ToolClass, irreversible: Bool, integration: String?)] = [:]
+        for url in try AbilityStore.seedCatalog() {
+            let seed = try AbilityStore.decode(url)
+            guard case .object(let verbs)? = seed.part["answers"] else { continue }
+            let reach: [String] = if case .object(let scope)? = seed.part["reach"], case .array(let names)? = scope["capabilities"] {
+                names.compactMap(\.stringValue)
+            } else { [] }
+            for (verb, entry) in verbs {
+                guard case .object(let declared) = entry, case .string(let name)? = declared["class"] else { continue }
+                floor[verb] = (try answerClass(name, part: seed.id, verb: verb), declared["irreversible"] == .bool(true), integration(of: reach))
+            }
+        }
+        return floor
     }
 }

@@ -4,7 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 
-// Blueprint: | `TurnContextSnapshotTrace.swift` | Exact opening-request snapshots and ordered fed-context writes |
+// Blueprint: | `TurnContextSnapshotTrace.swift` | Opening-request sizes, public context snapshots and ordered fed-context writes |
 import ProviderRouting
 // Packet turns retain their own memory provenance for recall-outcome reporting.
 import Context
@@ -49,8 +49,11 @@ extension SwiftNativeTurnEngine {
         let wireSchemas = request.tools ?? []
         // Per-turn material may travel in the user block instead of system segments.
         let volatileBlock = context.turnVolatileBlock ?? ""
-        let ridesVolatileBlock = !volatileBlock.isEmpty
+        let ridesVolatileBlock = !volatileBlock.isEmpty || !context.privateWorkingMemory.isEmpty
         let dynamic = ridesVolatileBlock ? volatileBlock : (segments?.dynamic ?? "")
+        // Private words count in the request but never enter its retained previews.
+        let countedDynamic = [context.privateWorkingMemory, dynamic].joined()
+        let countedVolatile = [context.privateWorkingMemory, volatileBlock].joined()
         let cognitive = context.cognitiveRuntimeContext.flatMap { fragment in
             Self.deliveredInput(context).contains(fragment) ? fragment : nil
         }
@@ -83,7 +86,7 @@ extension SwiftNativeTurnEngine {
         }
         let systemBytes = systemPrompt.utf8.count
         let stableBytes = stable.utf8.count
-        let dynamicBytes = dynamic.utf8.count
+        let dynamicBytes = countedDynamic.utf8.count
         let userMessageBytes = context.userMessage.utf8.count
         let cognitiveBytes = cognitive?.utf8.count ?? 0
         let imagePayloadBytes = context.imageBlocks.reduce(0) { partial, block in
@@ -114,7 +117,9 @@ extension SwiftNativeTurnEngine {
             "reasoningEffort": .string(context.reasoningEffort),
             "systemTotalChars": .int(Int64(systemPrompt.count)),
             "stableChars": .int(Int64(stable.count)),
-            "dynamicChars": .int(Int64(dynamic.count)),
+            "dynamicChars": .int(Int64(countedDynamic.count)),
+            "privateWorkingMemoryChars": .int(Int64(context.privateWorkingMemory.count)),
+            "privateWorkingMemoryBytes": .int(Int64(context.privateWorkingMemory.utf8.count)),
             "userMessageChars": .int(Int64(context.userMessage.count)),
             "toolSchemaCount": .int(Int64(wireSchemas.count)),
             "toolsAvailableCount": .int(Int64(context.toolsAvailable.count)),
@@ -182,7 +187,7 @@ extension SwiftNativeTurnEngine {
                     }
                 }
             ))
-            payload["volatileBlockChars"] = .int(Int64(context.turnVolatileBlock?.count ?? 0))
+            payload["volatileBlockChars"] = .int(Int64(countedVolatile.count))
             // Measure UTF-8 bytes beside other byte totals; mixing character counts into a byte denominator would fabricate a percentage.
             payload["historyMessageBytes"] = .int(Int64(
                 context.historyMessages.reduce(0) { total, message in
@@ -192,7 +197,7 @@ extension SwiftNativeTurnEngine {
                     }
                 }
             ))
-            payload["volatileBlockBytes"] = .int(Int64(volatileBlock.utf8.count))
+            payload["volatileBlockBytes"] = .int(Int64(countedVolatile.utf8.count))
         }
         // Text-tool requests send catalog prose, not schema JSON; measure rows at their actual stable or volatile placement.
         if systemPrompt.contains(AnthropicOAuthTransport.textToolProtocolHeader) {
@@ -241,6 +246,16 @@ extension SwiftNativeTurnEngine {
         }
 
         if let cognitive {
+            if let frame = context.cognitiveFeelingFrame, cognitive.contains(frame.promptText) {
+                let paragraph = ChatSecretRedactor.redactText(frame.paragraph)
+                payload["feelingFrame"] = .object([
+                    "paragraph": .string(paragraph), "bytes": .int(Int64(paragraph.utf8.count)),
+                    "complete": .bool(true),
+                    "words": .array(frame.words.map { .string(ChatSecretRedactor.redactText($0)) }),
+                ])
+            } else {
+                payload["feelingFrame"] = .object(["complete": .bool(false)])
+            }
             payload["cognitiveCue"] = cognitiveCue(cognitive)
             let cognitivePreview = snapshotPreview(
                 cognitive,
@@ -370,22 +385,17 @@ extension SwiftNativeTurnEngine {
 
     private nonisolated static func cognitiveCue(_ cognitive: String) -> JSONValue? {
         let text = ChatSecretRedactor.redactText(cognitive)
-            .components(separatedBy: "[OrganismBehavior]")[0]
+            .components(separatedBy: "[OrganismBehavior]").prefix(1).joined()
         let lines = text.split(separator: "\n").map {
             $0.trimmingCharacters(in: .whitespaces)
         }
-        var felt = false
         for (index, line) in lines.enumerated() {
-            if line == "How you feel:" { felt = true; continue }
             let kind: String
             let wording: String
             if line.hasPrefix("- "), let colon = line.firstIndex(of: ":") {
                 kind = line.dropFirst(2)[..<colon].lowercased()
                     .replacingOccurrences(of: " ", with: "_")
                 wording = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-            } else if felt {
-                kind = "felt"
-                wording = line
             } else { continue }
             let measured = kind == "sound"
                 ? ([wording] + lines.dropFirst(index + 1).filter { $0.hasPrefix("- Sound:") })
@@ -431,7 +441,7 @@ extension SwiftNativeTurnEngine {
     }
 }
 
-/// Retain the latest dynamic context and turn brief in one overwritten session file so the composer can show the actual feed.
+/// Retain public dynamic context and the turn brief for the composer; private held choices remain with scratch.
 /// The trace keeps only its bounded preview.
 public enum ContextFedRecord {
     /// Reserved synchronously at dispatch admission, before bookkeeping escapes.
@@ -474,7 +484,7 @@ public enum ContextFedRecord {
         public let brief: String
     }
 
-    static func url(sessionId: String, dataRoot: URL) -> URL? {
+    public static func url(sessionId: String, dataRoot: URL) -> URL? {
         guard let safe = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return nil }
         return dataRoot.appendingPathComponent("diagnostics/fed", isDirectory: true)
             .appendingPathComponent(safe + ".json")

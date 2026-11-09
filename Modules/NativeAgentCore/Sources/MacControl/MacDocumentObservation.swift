@@ -85,10 +85,14 @@ extension SwiftNativeMacControl {
                 Self.attachRedaction(redaction, to: &output)
                 return result(ok: true, output)
             case .failure(let failure):
+                var evidence: [String: JSONValue] = ["path": .string(path)]
+                if failure == .fileNotFound {
+                    evidence.merge(VerifiedPath.missingReadEvidence(URL(fileURLWithPath: path))) { _, owned in owned }
+                }
                 return refuse(
                     failure.rawValue,
                     MacDocumentRead.words(for: failure, path: path),
-                    ["path": .string(path)]
+                    evidence
                 )
             }
             } catch {
@@ -346,7 +350,8 @@ extension SwiftNativeMacControl {
                 }
             }
             if truncationReason == nil && !reachedEnd {
-                eventSink.post(mouse: MacMouseEvent(phase: .move, button: .left, x: centreX, y: centreY), turn: turn, context: context)
+                do { try await eventSink.send(mouse: MacMouseEvent(phase: .move, button: .left, x: centreX, y: centreY), turn: turn, context: context) }
+                catch { return refuse("window_motor_unconfirmed", error.localizedDescription) }
             }
             while framesRead < MacDocumentRead.maxFrames {
                 if truncationReason != nil || reachedEnd { break }
@@ -357,7 +362,8 @@ extension SwiftNativeMacControl {
                     break
                 }
                 // Scrolling down moves content up; retain the same direction convention as act.
-                eventSink.post(scroll: MacScrollEvent(deltaX: 0, deltaY: -delta, unit: .pixel), turn: turn, context: context)
+                do { try await eventSink.send(scroll: MacScrollEvent(deltaX: 0, deltaY: -delta, unit: .pixel), turn: turn, context: context) }
+                catch { truncationReason = "window_motor_unconfirmed: " + error.localizedDescription; break }
                 steps += 1
                 await Self.settleForDocumentRead()
                 if let reason = await stopReason() { truncationReason = reason; break }

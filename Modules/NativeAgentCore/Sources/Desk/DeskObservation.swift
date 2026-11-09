@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `DeskObservation.swift` | `DeskObservationEvaluator`: note-free material fingerprints for HarnessQueue |
+// Blueprint: | `DeskObservation.swift` | `DeskObservationEvaluator`: note-free material fingerprints for BodyQueue |
 
 public enum DeskObservationEvaluator {
     /// Keep fingerprints order-stable and note-free so retained evidence preserves its identity.

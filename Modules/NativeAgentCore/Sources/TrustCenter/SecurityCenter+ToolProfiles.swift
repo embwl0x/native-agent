@@ -81,6 +81,8 @@ public enum AuthoredToolEffects {
         "network.accept": ["network_write"], "network.close": ["network_write"],
         "network.send": ["network_write", "external_send"],
         "apps.call": ["applescript", "system_control"],
+        // The stem's file readers open a snapshot copy read-only; reach to the path is the part's declared readPaths.
+        "files.query": ["safe_read"], "files.mime": ["safe_read"],
         "screen.watch": ["safe_read"], "screen.next": ["safe_read"], "frame.read": ["safe_read"],
         // Program start owns shell admission; later talk stays within it.
         "program.start": ["process_spawn", "shell"], "program.send": ["process_spawn"],

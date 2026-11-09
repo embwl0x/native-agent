@@ -33,7 +33,8 @@ public extension MacChatTurnPresentationPort {
         requireActiveSession: Bool,
         requireIdleAndEmpty: Bool = false,
         origin: ChatMessageOrigin? = nil,
-        parent: Turn? = nil
+        parent: Turn? = nil,
+        renderer: UUID? = nil
     ) async -> MacChatStartedTurn {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else {
@@ -70,6 +71,11 @@ public extension MacChatTurnPresentationPort {
             }
             return MacChatStartedTurn(acceptance: .accepted(sessionId: targetSessionId), task: task)
         }
+        do { try await prepareMacChatTranscript(sessionId: targetSessionId) }
+        catch {
+            return MacChatStartedTurn(acceptance: rejectMacChatTurn("The conversation could not be read; your draft is preserved: "
+                + error.localizedDescription), task: nil)
+        }
         let reservation = macChatTurns.reserveTurn(sessionId: targetSessionId)
         var transferredReservation = false
         defer {
@@ -93,10 +99,11 @@ public extension MacChatTurnPresentationPort {
         // A shown send under a parent owns its run, so its row never collides with that turn's own user row.
         let ownRun: String?? = parent != nil && !hideUserBubble ? .some(UUID().uuidString) : nil
         // One id for the shown bubble, the row a steering persister writes and the row the turn writes.
-        let turn = TurnRequest(message: text, sessionID: targetSessionId, surface: "chat",
+        var turn = TurnRequest(message: text, sessionID: targetSessionId, surface: "chat",
             envelope: .some(envelope), origin: .some(origin ?? parent?.origin), pinnedRunID: ownRun)
             .turn(id: requestTurnID, parent: parent)
             .with(\.rows.pinnedUserMessageID, hideUserBubble ? nil : UUID().uuidString)
+        if let renderer { turn[FacePresentationPart.self] = renderer }
         // The words exactly as the turn writes its row, so the saved row, a steered row and the turn's own are one row.
         let words = trimmed.isEmpty ? "(see attachments)" : trimmed
         let arrival = TurnArrival(words: words, attachments: attachments, surface: "chat", row: hideUserBubble ? .hidden : .saved)
@@ -129,11 +136,15 @@ public extension MacChatTurnPresentationPort {
             return MacChatStartedTurn(acceptance: .rejected(message: "Chat admission was superseded"), task: nil)
         }
         // Recheck welcome eligibility after suspension so the greeting never rides a turn already running.
-        if requireIdleAndEmpty && (reservation == nil || chatHasConversationRows(sessionId: targetSessionId)) {
-            return MacChatStartedTurn(
-                acceptance: .rejected(message: "The greeting's conversation is no longer idle and empty"),
-                task: nil
-            )
+        if requireIdleAndEmpty {
+            do {
+                let hasRows = try chatHasConversationRows(sessionId: targetSessionId)
+                if reservation == nil || hasRows {
+                    return MacChatStartedTurn(acceptance: .rejected(message: "The greeting's conversation is no longer idle and empty"), task: nil)
+                }
+            } catch {
+                return MacChatStartedTurn(acceptance: rejectMacChatTurn(error.localizedDescription), task: nil)
+            }
         }
         let identity = MacChatTurnIdentity(sessionId: targetSessionId, turnId: requestTurnID)
         // A shown send is saved before it is accepted, so a relaunch before it is answered resumes it; a hidden card keeps its own claim.
@@ -256,10 +267,15 @@ public extension MacChatTurnPresentationPort {
     /// A replacement generation must survive that cleanup; admission without a task is revoked by requestStop.
     @MainActor
     func stopChatStream(sessionId: String? = nil,
-                        revokeDriverControl: (@MainActor @Sendable () async -> Void)? = nil) {
+                        revokeDriverControl: (@MainActor @Sendable () async -> Void)? = nil,
+                        didWrite: (@MainActor @Sendable (Result<Void, Error>) -> Void)? = nil) {
         // Main-window Stop targets only its active session; choosing an arbitrary background stream could cancel unrelated work.
         let sid = sessionId ?? activeChatSessionId
-        guard !sid.isEmpty else { return }
+        guard !sid.isEmpty else {
+            didWrite?(.failure(NSError(domain: "NativeAgentChatSession", code: 400,
+                userInfo: [NSLocalizedDescriptionKey: "Stop requires a conversation id."])))
+            return
+        }
         if let turnId = macChatTurns.activeTurnIDsBySession[sid],
            let requested = requestChatTurnCancellation(
                sessionId: sid,
@@ -271,7 +287,7 @@ public extension MacChatTurnPresentationPort {
             }
         }
         macChatTurns.requestStop(sessionId: sid,
-                                 revokeDriverControl: revokeDriverControl)
+                                 revokeDriverControl: revokeDriverControl, didWrite: didWrite)
         // Let the in-flight task clean its own busy state and buffers to avoid racing settlement.
     }
 

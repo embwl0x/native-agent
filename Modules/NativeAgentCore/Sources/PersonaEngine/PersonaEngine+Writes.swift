@@ -151,6 +151,7 @@ extension SwiftNativePersonaEngine {
             for (key, value) in body {
                 merged[key] = value.foundationObject
             }
+            if try PersonaCompiler.decodeProfile(raw: merged) == existing { return existing }
             merged["updatedAt"] = NativeTimestampFormat.fractionalZulu(Date())
 
             let normalized = try PersonaCompiler.decodeProfile(raw: merged)
@@ -226,7 +227,8 @@ extension SwiftNativePersonaEngine {
     /// Require checked existing documents for edits and keep USER under MemoryV2.
     /// Hold the document lock across prior read, bounded mutation, backup and durable write.
     /// Return saved content and its modification time.
-    public func savePersonalityDoc(id: String, content: String, appending: Bool = false) async throws -> PersonaDocSpec {
+    public func savePersonalityDoc(id: String, content: String, appending: Bool = false,
+                                   expectedContent: String? = nil) async throws -> PersonaDocSpec {
         let docId = id.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
 
         if docId == "USER" {
@@ -244,6 +246,11 @@ extension SwiftNativePersonaEngine {
         let result: PersonaDocSpec = try await SwiftNativePersistenceCore.withFileLock(path) { [self] in
             // Setup supplies only its section; both replacement and append require actual prior content.
             let existing = try Self.readPersonaDocumentForMutation(at: path)
+            if let expectedContent, existing.text != expectedContent {
+                throw WireFailure(code: "persona_document_conflict",
+                    message: "This document changed after editing began. Compare your draft with the saved version before saving again.",
+                    cause: "The saved \(docId).md differs from the editor's baseline.", effects: .none)
+            }
             let nextContent = appending ? existing.text + content : content
             guard !appending || nextContent.unicodeScalars.count <= 30_000 else {
                 throw PersonaWriteError.invalidInput(
@@ -251,6 +258,11 @@ extension SwiftNativePersonaEngine {
             }
             // Enforce the editor's 30,000-scalar bound on the combined document.
             let cappedContent = Self.capByCodePoints(nextContent, cap: 30000)
+            if cappedContent == existing.text {
+                let values = try path.resourceValues(forKeys: [.contentModificationDateKey])
+                return PersonaDocSpec(id: spec.id, title: spec.title, filename: spec.filename, path: path.path,
+                    content: existing.text, updatedAt: values.contentModificationDate.map { NativeTimestampFormat.fractionalZulu($0) })
+            }
             // Replace one pre-edit recovery copy per document so the immediately prior version remains reachable.
             try SwiftNativePersistenceCore.writeDataAtomicDurable(
                 existing.data,
@@ -415,7 +427,6 @@ extension CompiledPersonalityProfile {
     }
 }
 
-extension PersonaDocSpec: Identifiable {}
 
 extension SwiftNativePersonaEngine {
     public func saveName(_ rawName: String) async throws -> PersonalityProfile {

@@ -50,7 +50,7 @@ public actor MemoryStorage {
         self.path = path
         var config = Configuration()
         config.foreignKeysEnabled = true
-        config.busyMode = .timeout(2)
+        config.busyMode = .immediateError
         // Bound retained WAL to 4 MB on every connection.
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_size_limit = 4194304")
@@ -162,15 +162,13 @@ public actor MemoryStorage {
 
     // MARK: - Memory CRUD
 
-    /// Duplicate matching and evidence accumulation share the insertion write transaction, so simultaneous stores cannot lose counts or provenance.
+    /// Duplicate matching and evidence accumulation share the insertion write transaction, so simultaneous stores cannot lose counts or roots. The
+    /// memory arrives stamped with its roots by `SwiftNativeMemoryV2.store`.
     public func admitMemory(
         _ memory: StoredMemory, insertIfMissing: Bool, preserveID: Bool,
-        superseding: [SupersedingAcceptance] = [],
-        context: MemoryWriteContext
+        superseding: [SupersedingAcceptance] = []
     ) async throws -> StoredMemory? {
-        var stamped = memory
-        stamped.metadata = try context.stamping(stamped.metadata)
-        let memory = stamped
+        _ = try MemoryRoot.roots(in: memory.metadata)
         let result = try await dbPool.write { db -> (StoredMemory?, [StoredMemory], [StoredMemory]) in
             try Self.requireWritableEpoch(in: db, vector: memory.embedding, epoch: memory.embeddingEpoch)
             try Self.requireNotTombstoned(memory, in: db)
@@ -181,15 +179,16 @@ public actor MemoryStorage {
                 ORDER BY rowid
             """, arguments: [preserveID, memory.id]).map(Self.decodeMemory)
             if let row = try Self.admissionDuplicate(of: memory, among: rows, in: db) {
-                let saved = try Self.foldDuplicate(memory, into: row, in: db)
+                var saved = try Self.foldDuplicate(memory, into: row, in: db)
                 let demoted = try superseding.filter { $0.targetId != saved.id }
-                    .map { try Self.demoteSuperseded($0, by: saved, in: db) }
+                    .map { try Self.demoteSuperseded($0, by: &saved, in: db) }
                 return (saved, [], demoted)
             }
             guard insertIfMissing else { return (nil, [], []) }
             try Self.validateTemporalEvidence(memory)
             try Self.executeMemoryInsert(memory, in: db)
-            let demoted = try superseding.map { try Self.demoteSuperseded($0, by: memory, in: db) }
+            var replacement = memory
+            let demoted = try superseding.map { try Self.demoteSuperseded($0, by: &replacement, in: db) }
             let evicted = try Self.pruneMemoriesToBound(in: db, limit: memoryLimit, preservingIDs: [memory.id])
             guard let saved = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [memory.id]).map(Self.decodeMemory) else {
                 throw MemoryStorageError.databaseUnavailable("committed memory is missing")
@@ -254,18 +253,24 @@ public actor MemoryStorage {
         if preservingID { object[preservesIDKey] = .bool(true) }
         if !superseding.isEmpty {
             object[pendingSupersedesKey] = .array(superseding.map {
-                .object(["id": .string($0.targetId), "hash": .string($0.expectedContentHash), "reason": .string($0.reason)])
+                .object(["id": .string($0.targetId), "hash": .string($0.expectedContentHash), "reason": .string($0.reason),
+                         "restatesOwnPast": .bool($0.restatesOwnPast)])
             })
         }
         return .object(object)
     }
 
-    public static func owedSupersessions(_ metadata: JSONValue?) -> [SupersedingAcceptance] {
-        guard case .object(let object)? = metadata, case .array(let rows)? = object[pendingSupersedesKey] else { return [] }
-        return rows.compactMap { row in
+    public static func owedSupersessions(_ metadata: JSONValue?) throws -> [SupersedingAcceptance] {
+        guard case .object(let object)? = metadata, let pending = object[pendingSupersedesKey] else { return [] }
+        guard case .array(let rows) = pending else { throw MemoryV2Error.staleSupersession("Unreadable owed supersession intent.") }
+        return try rows.map { row in
             guard case .object(let fields) = row, case .string(let id)? = fields["id"],
-                  case .string(let hash)? = fields["hash"], case .string(let reason)? = fields["reason"] else { return nil }
-            return SupersedingAcceptance(targetId: id, expectedContentHash: hash, reason: reason)
+                  case .string(let hash)? = fields["hash"], case .string(let reason)? = fields["reason"],
+                  case .bool(let restatesOwnPast)? = fields["restatesOwnPast"] else {
+                throw MemoryV2Error.staleSupersession("Owed supersession lacks readable restatement intent; review it before admission.")
+            }
+            return SupersedingAcceptance(targetId: id, expectedContentHash: hash, reason: reason,
+                                         restatesOwnPast: restatesOwnPast)
         }
     }
 
@@ -321,8 +326,27 @@ public actor MemoryStorage {
                 metadata[key] = .array(Array(merged.suffix(SwiftNativeMemoryV2.duplicateProvenanceCap)))
             }
         }
-        row.metadata = MemoryDataProvenance.preserving(
-            existing: memory.metadata, incoming: .object(metadata))
+        // A duplicate must retain the complete incoming provenance or refuse the write.
+        let held = try MemoryRoot.roots(in: existing.metadata)
+        let incoming = try MemoryRoot.roots(in: memory.metadata)
+        let principals = (held + incoming).flatMap(\.through)
+        let trust = MemoryDataProvenance.reading([], principals: principals)
+        if !MemoryDataProvenance.steering(principals, trust: trust).isEmpty {
+            guard let first = MemoryRoot.firstKnown(held.map { MemoryDataProvenance.presented($0, trust: trust) })?.date else {
+                throw MemoryStorageError.databaseUnavailable("duplicate write: the held roots have no readable first-known time")
+            }
+            for root in incoming {
+                guard let at = root.date else {
+                    throw MemoryStorageError.databaseUnavailable("duplicate write: an incoming root has no readable time")
+                }
+                guard root.how != .remembered, at >= first else {
+                    throw MemoryStorageError.databaseUnavailable(
+                        "duplicate write: incoming provenance restates the agent's past across an untrusted source boundary"
+                    )
+                }
+            }
+        }
+        row.metadata = MemoryRoot.setting(MemoryRoot.union([held, incoming]), in: .object(metadata))
         row.updatedAt = Self.nowISO8601()
         try Self.validateTemporalEvidence(row)
         try db.execute(sql: """
@@ -354,15 +378,13 @@ public actor MemoryStorage {
         return saved
     }
 
+    /// The memory arrives stamped with its roots by `SwiftNativeMemoryV2.store`.
     @discardableResult
     public func insertMemory(
         _ memory: StoredMemory,
-        superseding: [SupersedingAcceptance] = [],
-        context: MemoryWriteContext
+        superseding: [SupersedingAcceptance] = []
     ) async throws -> StoredMemory {
-        var stamped = memory
-        stamped.metadata = try context.stamping(stamped.metadata)
-        let memory = stamped
+        _ = try MemoryRoot.roots(in: memory.metadata)
         let (saved, demoted, evicted) = try await dbPool.write { db -> (StoredMemory, [StoredMemory], [StoredMemory]) in
             try Self.requireNotTombstoned(memory, in: db)
             try Self.validateTemporalEvidence(memory)
@@ -372,7 +394,8 @@ public actor MemoryStorage {
                 epoch: memory.embeddingEpoch
             )
             try Self.executeMemoryInsert(memory, in: db)
-            let demoted = try superseding.map { try Self.demoteSuperseded($0, by: memory, in: db) }
+            var replacement = memory
+            let demoted = try superseding.map { try Self.demoteSuperseded($0, by: &replacement, in: db) }
             let evicted = try Self.pruneMemoriesToBound(
                 in: db,
                 limit: memoryLimit,
@@ -421,23 +444,28 @@ public actor MemoryStorage {
         }
     }
 
-    public func memoriesOwingVectors(limit: Int, epoch: MemoryEmbeddingEpoch) async throws -> [(id: String, content: String)] {
+    public func memoriesOwingVectors(limit: Int, epoch: MemoryEmbeddingEpoch,
+                                    afterRowID: Int64? = nil) async throws -> [(rowID: Int64, id: String, content: String)] {
         try await dbPool.read { db in
             try Row.fetchAll(db, sql: """
-                SELECT id, content FROM memories
+                SELECT rowid AS row_id, id, content FROM memories
                 WHERE embedding IS NULL AND status = 'active' AND TRIM(COALESCE(content, '')) <> ''
+                  AND (? IS NULL OR rowid > ?)
                   AND NOT EXISTS (SELECT 1 FROM memory_embedding_failures f
                     WHERE f.kind = 'memory' AND f.row_id = memories.id
                       AND f.content = CAST(memories.content AS BLOB) AND f.epoch = ?)
                 ORDER BY rowid LIMIT ?
-                """, arguments: [epoch.rawValue, max(1, limit)]).map { ($0["id"], $0["content"]) }
+                """, arguments: [afterRowID, afterRowID, epoch.rawValue, max(1, limit)])
+                .map { row in
+                    (try row.decode(forColumn: "row_id"), try row.decode(forColumn: "id"), try row.decode(forColumn: "content"))
+                }
         }
     }
 
-    enum OwedVectorLanding { case landed, archived(reason: String), superseded }
+    enum OwedVectorLanding { case landed, archived(reason: String), unreadable(reason: String), superseded }
 
     /// Land owed vectors under warm-write checks in one exact-content transaction. Newer writes win; rejected paraphrases and collapsed duplicates retain their
-    /// archival reason.
+    /// archival reason. Unreadable supersession intent leaves the row and its targets untouched.
     func landOwedVector(id: String, content: String, vector: [Float],
                         epoch: MemoryEmbeddingEpoch) async throws -> OwedVectorLanding {
         let (outcome, changed) = try await dbPool.write { db -> (OwedVectorLanding, [StoredMemory]) in
@@ -445,6 +473,12 @@ public actor MemoryStorage {
                 SELECT * FROM memories WHERE id = ? AND embedding IS NULL AND content = ? AND status = 'active'
                 """, arguments: [id, content]).map(Self.decodeMemory) else { return (.superseded, []) }
             try Self.requireWritableEpoch(in: db, vector: vector, epoch: epoch.rawValue)
+            let supersessions: [SupersedingAcceptance]
+            do {
+                supersessions = try Self.owedSupersessions(owed.metadata)
+            } catch let error as ToolFailureError where error.code == "memory_supersession_stale" {
+                return (.unreadable(reason: error.message), [])
+            }
             owed.embedding = vector
             owed.embeddingEpoch = epoch.rawValue
             var reason: String?
@@ -468,15 +502,18 @@ public actor MemoryStorage {
                 }
             }
             // Admit replacements and demote unchanged targets atomically; target drift refuses the replacement.
-            let supersessions = Self.owedSupersessions(owed.metadata)
             if reason == nil || folded != nil, !supersessions.isEmpty {
-                let replacement = folded ?? owed
+                var replacement = folded ?? owed
                 do {
                     try db.inSavepoint {
                         demoted = try supersessions.filter { $0.targetId != replacement.id }
-                            .map { try Self.demoteSuperseded($0, by: replacement, in: db) }
+                            .map { try Self.demoteSuperseded($0, by: &replacement, in: db) }
                         return .commit
                     }
+                    if folded != nil { folded = replacement } else { owed = replacement }
+                } catch let error as ToolFailureError where error.code == "memory_restatement_steered" {
+                    // This refusal must undo any duplicate fold too; no part of a refused own-past write may survive.
+                    throw error
                 } catch {
                     reason = "a memory it was to replace changed or left before its owed vector landed: \(error)"
                 }
@@ -503,6 +540,7 @@ public actor MemoryStorage {
                 .map(Self.decodeMemory)
             return (.archived(reason: reason), [archived, folded].compactMap { $0 } + demoted)
         }
+        guard !changed.isEmpty else { return outcome }
         invalidateRecallCache()
         for row in changed {
             pokeUserMDRegen(persona: row.personaId)
@@ -528,20 +566,20 @@ public actor MemoryStorage {
         }
     }
 
-    /// A conditional edit skips a row whose approved original has changed.
+    /// A conditional edit skips a row whose approved original has changed. An edit that leaves the row as it is writes nothing and says so.
     public func updateMemory(
         id: String, patch: MemoryPatch, expectedContent: String? = nil,
         onlyIf: (@Sendable (StoredMemory) -> Bool)? = nil,
         context: MemoryWriteContext
-    ) async throws -> StoredMemory? {
+    ) async throws -> (memory: StoredMemory, changed: Bool)? {
         let turnProvenance = try MemorySenseProvenance.stamping(nil, reads: context.senseReads)
-        let turnDataProvenance = MemoryDataProvenance.stamping(nil, turn: context.turn)
-        let (updated, demoted) = try await dbPool.write { db -> (StoredMemory?, [StoredMemory]) in
+        let (updated, changed, demoted) = try await dbPool.write { db -> (StoredMemory?, Bool, [StoredMemory]) in
             guard var existing = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory) else {
-                return (nil, [])
+                return (nil, false, [])
             }
-            if let expectedContent, existing.content != expectedContent { return (nil, []) }
-            if let onlyIf, !onlyIf(existing) { return (nil, []) }
+            if let expectedContent, existing.content != expectedContent { return (nil, false, []) }
+            if let onlyIf, !onlyIf(existing) { return (nil, false, []) }
+            let prior = existing
             let priorMetadata = existing.metadata
             let contentChanged = patch.content.map { $0 != existing.content } == true
             let owesVector = contentChanged && patch.embedding == nil
@@ -581,8 +619,14 @@ public actor MemoryStorage {
             }
             // A content edit keeps the writer's named date; words cannot move it.
             existing.metadata = try MemorySenseProvenance.preserving(existing: priorMetadata, incoming: existing.metadata)
-            existing.metadata = MemoryDataProvenance.preserving(existing: priorMetadata, incoming: existing.metadata)
-            existing.metadata = MemoryDataProvenance.preserving(existing: turnDataProvenance, incoming: existing.metadata)
+            let priorRoots = try MemoryRoot.roots(in: priorMetadata)
+            let roots = try Self.rewrittenRoots(prior: priorRoots, patch: patch, contentChanged: contentChanged, context: context)
+            existing.metadata = MemoryRoot.setting(roots, in: existing.metadata)
+            if patch.restating != nil, roots != priorRoots, let first = MemoryRoot.firstKnown(roots)?.at {
+                // A restatement that changes the roots moves the memory's truth start and observation to when the agent first knew it.
+                existing.validFrom = first
+                existing.observedAt = first
+            }
             let provenance = MemorySenseProvenance.merging(existing: existing.metadata, incoming: turnProvenance)
             if !provenance.isEmpty {
                 var metadata: [String: JSONValue] = [:]
@@ -599,12 +643,13 @@ public actor MemoryStorage {
             var demoted: [StoredMemory] = []
             let admittingOwedVector = existing.status == "active" && existing.embedding != nil
                 && Self.metadataFlag(priorMetadata, Self.pendingAdmissionKey)
+            if Self.unchanged(prior, existing) { return (prior, false, []) }
             if patch.content != nil || patch.embedding != nil || admittingOwedVector {
                 try Self.requireNotTombstoned(existing, in: db)
             }
             if admittingOwedVector {
                 // Available vectors must pass landing checks before an active pending row becomes visible.
-                demoted = try Self.owedSupersessions(priorMetadata).map { try Self.demoteSuperseded($0, by: existing, in: db) }
+                demoted = try Self.owedSupersessions(priorMetadata).map { try Self.demoteSuperseded($0, by: &existing, in: db) }
                 if case .object(var metadata)? = existing.metadata {
                     for key in [Self.pendingAdmissionKey, Self.preservesIDKey, Self.pendingSupersedesKey] { metadata[key] = nil }
                     existing.metadata = .object(metadata)
@@ -638,14 +683,48 @@ public actor MemoryStorage {
                 existing.id
             ])
             return (try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [existing.id]).map(Self.decodeMemory),
-                    demoted)
+                    true, demoted)
         }
-        for u in [updated].compactMap({ $0 }) + demoted {
+        guard let updated else { return nil }
+        guard changed else { return (updated, false) }
+        for u in [updated] + demoted {
             invalidateRecallCache()
             pokeUserMDRegen(persona: u.personaId)
             await pokeProjectionHooks(u)
         }
-        return updated
+        return (updated, true)
+    }
+
+    /// Restatements retain every carried root; an untrusted turn retains every held root.
+    /// A telling matching a held root keeps its attribution and instant. Other tellings use this write's attested provenance.
+    /// Changed words add the writer's root; other edits retain their roots.
+    static func rewrittenRoots(prior held: [MemoryRoot], patch: MemoryPatch, contentChanged: Bool,
+                               context: MemoryWriteContext) throws -> [MemoryRoot] {
+        var roots = held
+        if let restating = patch.restating {
+            let restated = restating.map { telling in held.first { Self.restates(telling, $0) } ?? context.rooting(telling) }
+            let turnSteered = !MemoryDataProvenance.steering(context.through).isEmpty
+            let kept = turnSteered ? held : held.filter { !$0.through.isEmpty }
+            roots = MemoryRoot.union([kept, restated])
+        }
+        guard contentChanged else { return roots }
+        return MemoryRoot.union([roots, [try context.root()]])
+    }
+
+    /// A telling names this held root: the same how and by, and no since or the same instant as its time.
+    static func restates(_ telling: MemoryRoot.Telling, _ root: MemoryRoot) -> Bool {
+        guard telling.how == root.how, telling.by?.lowercased() == root.by?.lowercased() else { return false }
+        guard let since = telling.since else { return true }
+        return root.date.map { abs($0.timeIntervalSince(since)) < 0.001 } ?? false
+    }
+
+    /// The row an edit would write is the row already stored: same words, standing, times, evidence, metadata and vector state.
+    static func unchanged(_ prior: StoredMemory, _ next: StoredMemory) -> Bool {
+        prior.content == next.content && prior.source == next.source && prior.confidence == next.confidence
+            && prior.status == next.status && prior.lifecycle == next.lifecycle && prior.validFrom == next.validFrom
+            && prior.validTo == next.validTo && prior.observedAt == next.observedAt && prior.evidence == next.evidence
+            && prior.metadata == next.metadata && prior.embeddingEpoch == next.embeddingEpoch
+            && (prior.embedding == nil) == (next.embedding == nil)
     }
 
     @discardableResult

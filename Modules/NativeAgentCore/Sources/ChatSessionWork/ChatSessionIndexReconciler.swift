@@ -30,9 +30,6 @@ public actor ChatSessionIndexReconciler {
     /// Share exact version identity with transcript writers and retention through ChatSessionIndexFile.
     static let transcriptStampKey = "reconciledTranscriptModifiedAt"
 
-    /// Skip contended transcripts and bound stale reads so launch repair cannot block live work.
-    static let staleReadCeiling: TimeInterval = 5
-
     /// Recheck selected updatedAt/stamp values before writing a repair computed outside the index lock.
     private struct StaleCandidate: Sendable {
         let sessionID: String
@@ -252,14 +249,10 @@ public actor ChatSessionIndexReconciler {
             recoveredRow[ChatSessionIndexFile.transcriptGenerationKey] = .int(1)
             recovered.append(recoveredRow)
         }
-        // Read each transcript under its own lock with a bounded deadline so launch repair cannot hold up live appends.
+        // Each transcript read holds its own lock through completion.
         var repairs: [StaleRepair] = []
-        let deadline = Date().addingTimeInterval(Self.staleReadCeiling)
-        for (offset, candidate) in selection.candidates.enumerated() {
-            guard Date() < deadline else {
-                report.skippedForBounds += selection.candidates.count - offset
-                break
-            }
+        for candidate in selection.candidates {
+            try Task.checkCancellation()
             report.transcriptsExamined += 1
             guard maximumBytes >= 0, consumedBytes <= maximumBytes else {
                 report.skippedForBounds += 1

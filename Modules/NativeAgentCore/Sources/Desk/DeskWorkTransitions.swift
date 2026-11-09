@@ -73,7 +73,8 @@ extension SwiftNativeDeskStore {
         )
     }
     /// Queue lookup, provenance and budget checks share the write transaction.
-    func addQueueStep(_ incoming: DeskStep, replacing: MyQueue.Entry? = nil) async throws -> (entry: MyQueue.Entry, change: MyQueue.Change) {
+    func addQueueStep(_ incoming: DeskStep, replacing: MyQueue.Entry? = nil, matchingWords: Bool = true) async throws
+        -> (entry: MyQueue.Entry, change: MyQueue.Change) {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             var feed = try await readFeedUnlocked()
             var state = Self.compact(base: feed.base, feed.ops)
@@ -98,12 +99,13 @@ extension SwiftNativeDeskStore {
                 guard let current = open.first(where: { $0.item.handle == replacing.item.handle }),
                       current.item.updatedAt == replacing.item.updatedAt else { throw MyQueue.Superseded() }
                 same = current
-            } else { same = incoming.scheduledJobID == nil
+            } else { same = incoming.scheduledJobID == nil && matchingWords
                 ? open.first { Self.equivalentDeskText($0.step.words) == words } : nil }
             var step = incoming
             step.lifeID = try DataRootLife.current(in: dataRoot)
             if let same {
                 if incoming.source != nil, replacing == nil { step = same.step }
+                step.promiseCaptures = incoming.promiseCaptures
                 step.peers = incoming.peers
                 step.elevated = incoming.elevated
                 step.preserveOrigin(of: same.step)
@@ -115,20 +117,17 @@ extension SwiftNativeDeskStore {
                     step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
                 }
             } else {
-                if step.source != nil, open.filter({ $0.step.source != nil }).count >= MyQueue.inferredCap {
-                    throw MyQueue.Full()
-                }
                 step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
             }
-            let title = step.peers.isEmpty && step.elevated.isEmpty
-                ? String(step.words.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
-                : "A step from \((step.peers + step.elevated).joined(separator: ", "))'s turn"
+            let title = step.title
             let handle = same?.item.handle ?? DeskClock.newHandle()
             var bodies: [DeskOpBody] = []
             if same == nil {
                 let alias = try Self.nextAlias(parentHandle: nil, parentAlias: nil, base: feed.base, ops: feed.ops)
                 bodies.append(.createItem(alias: alias, kind: .plan, project: MyQueue.project, title: title,
                     parent: nil, summary: nil, assignee: nil, laneOf: nil, origin: .agent, pursuit: nil))
+                bodies.append(.setStatus(status: .todo, blockedReason: nil, waitingOn: nil,
+                    progress: nil, assignee: nil, laneOf: nil))
             }
             bodies.append(.addRef(ref: DeskRef(kind: .step(step))))
             if step.action != same?.step.action {
@@ -136,10 +135,6 @@ extension SwiftNativeDeskStore {
                 bodies.append(.appendNote(text: note, author: "agent"))
             }
             if let same, same.item.title != title { bodies.append(.updateTitle(title: title, summary: nil)) }
-            if same == nil {
-                bodies.append(.setStatus(status: .todo, blockedReason: nil, waitingOn: nil,
-                    progress: nil, assignee: nil, laneOf: nil))
-            }
             try DeskOp.requireComplete(bodies.map { DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: $0) })
             for body in bodies {
                 let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: body)
@@ -228,6 +223,9 @@ extension SwiftNativeDeskStore {
                     if !refreshRefs && step != existing.step {
                         bodies.append(.addRef(ref: DeskRef(kind: .step(step))))
                     }
+                } else if refreshRefs, let previous = existing.refs.last(where: { $0.kind.token == "step" }),
+                          case .step(let step) = previous.kind, !step.promiseCaptures.isEmpty {
+                    incomingRefs.append(previous)
                 }
                 let nextTitle = existing.title != title ? title : nil
                 let nextSummary = summary?.isEmpty == false && existing.summary != summary ? summary : nil

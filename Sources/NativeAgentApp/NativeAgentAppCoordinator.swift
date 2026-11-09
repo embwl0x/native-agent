@@ -1,18 +1,57 @@
 import AppKit
 import AppToolRuntime
+import EngineRuntime
 import Foundation
 import MemoryV2
+import NativeAgentShared
 import Observation
 import PersistenceCore
 
 // Blueprint: | `NativeAgentAppCoordinator.swift` | `ApplicationLifetime`: bootstrap and scene navigation; delivery proves acceptance only |
 
 enum NativeAgentNavigationDestination: Equatable, Sendable {
+    /// The window process's page for this destination; nil opens the window where it is.
+    var faceDestination: FaceDestination? {
+        switch self {
+        case .sidebar(let item):
+            if let home = SidebarItem.shellHome(for: item), var destination = Self.sidebar(home.parent).faceDestination {
+                destination.item = home.tab
+                return destination
+            }
+            // The window resolves page names through the same QuietPages owner (QuietPage.item is the forward map).
+            let page: String? = switch item {
+            case .chat: "chat"
+            case .activity: "today"
+            case .inboxPolicy: "inbox"
+            case .memories: "memories"
+            case .desk: "desk"
+            case .bots: "bots"
+            case .personality: "personality"
+            case .providers: "providers"
+            case .trust: "trust"
+            case .connectors: "connectors"
+            case .capabilities: "capabilities"
+            case .diagnostics: "diagnostics"
+            case .settings: "settings"
+            default: nil
+            }
+            return page.map { FaceDestination(page: $0, item: nil, session: nil, message: nil) }
+        case .ownPage(let id): return FaceDestination(page: id, item: nil, session: nil, message: nil)
+        case .activity(let section):
+            let page = switch section {
+            case .approvals: "approvals"
+            case .inbox: "today_inbox"
+            case .memoryProposals: "memory_proposals"
+            case .cognitionProposals: "cognition"
+            }
+            return FaceDestination(page: page, item: nil, session: nil, message: nil)
+        }
+    }
+
     case sidebar(SidebarItem)
+    /// A page of the agent's own, by its id.
+    case ownPage(String)
     case activity(ActivitySection)
-    case skillsTools(SkillsToolsSection)
-    case chatShortcut(ChatSlashPage)
-    case savedThing(PaletteSavedDestination)
 
     static func route(_ rawRoute: String?) -> Self? {
         guard var route = rawRoute?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -28,17 +67,12 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
             return .activity(.inbox)
         case "activity/memory-proposals", "activity/memory_proposals", "memory-proposals":
             return .activity(.memoryProposals)
-        case "activity/self-improvement", "activity/self_improvement",
-             "autoimprovement", "self-improvement", "self_improvement":
-            return .activity(.selfImprovement)
         case "chat":
             return .sidebar(.chat)
         case "activity":
             return .sidebar(.activity)
         case "memories":
             return .sidebar(.memories)
-        case "skills":
-            return .skillsTools(.skills)
         case "desk":
             return .sidebar(.desk)
         case "bots":
@@ -63,26 +97,14 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
             return .sidebar(.cognition)
         case "diagnostics", "doctor", "logs":
             return .sidebar(.diagnostics)
-        case "telegram":
-            return .sidebar(.telegram)
         case "inboxpolicy":
             return .sidebar(.inboxPolicy)
-        case "tools":
-            return .skillsTools(.tools)
         case "inspector", "turn_inspector", "readout":
             return .sidebar(.inspector)
-        case "macintegration", "mac_integration":
-            return .sidebar(.macIntegration)
         default:
             return nil
         }
     }
-}
-
-/// Delivery proves mounted-scene acceptance only, never finished rendering or work.
-enum NativeAgentNavigationRequestReceipt: Equatable, Sendable {
-    case deliveredToMountedScene
-    case queuedForMainScene
 }
 
 @MainActor @Observable
@@ -108,71 +130,18 @@ final class ApplicationLifetime {
     static let shared = ApplicationLifetime()
 
     private let notificationCenter = NotificationCenter.default
-    private var openMainWindow: @MainActor () -> Void = {}
     private var didFinishLaunching = false
     private var didBootstrapProcessServices = false
     private var routeObserverTokens: [NSObjectProtocol] = []
-    private var pendingDestinations: [NativeAgentNavigationDestination] = []
-    private var mountedScene: (
-        id: UUID,
-        visiblePageInput: () -> [String: JSONValue]?,
-        deliver: (NativeAgentNavigationDestination) -> Void
-    )?
-
-    func configureMainWindowOpening(_ open: @escaping @MainActor () -> Void) {
-        openMainWindow = open
-        if !pendingDestinations.isEmpty {
-            NSApp.activate()
-            open()
-        }
-    }
-
     func applicationDidFinishLaunching() {
         guard !didFinishLaunching else { return }
         didFinishLaunching = true
-        installLegacyRouteObservers()
+        installRouteObservers()
         bootstrapProcessServicesIfReady()
     }
 
-    @discardableResult
-    func mountMainScene(
-        visiblePageInput: @escaping () -> [String: JSONValue]? = { nil },
-        deliver: @escaping (NativeAgentNavigationDestination) -> Void
-    ) -> UUID {
-        let id = UUID()
-        mountedScene = (id, visiblePageInput, deliver)
-        _ = drainPendingDestinations()
-        return id
-    }
-
-    func unmountMainScene(id: UUID) {
-        guard mountedScene?.id == id else { return }
-        mountedScene = nil
-    }
-
-    var visiblePageInput: [String: JSONValue]? { mountedScene?.visiblePageInput() }
-    var currentPage: QuietPage? {
-        guard SimpleViewMode.current == SimpleViewMode.advanced,
-              case .string(let page)? = visiblePageInput?["page"] else { return nil }
-        return QuietPages.page(named: page)
-    }
-
-    @discardableResult
-    func request(_ destination: NativeAgentNavigationDestination) -> NativeAgentNavigationRequestReceipt {
-        pendingDestinations.append(destination)
-        NSApp.activate()
-        openMainWindow()
-        return drainPendingDestinations()
-            ? .deliveredToMountedScene
-            : .queuedForMainScene
-    }
-
-    /// Quiet routing requires a mounted scene and never queues: a deferred route would interrupt the person when a window next opens.
-    func deliverQuietly(_ destination: NativeAgentNavigationDestination) -> Bool {
-        guard let deliver = mountedScene?.deliver else { return false }
-        UserDefaults.standard.set(SimpleViewMode.advanced, forKey: SimpleViewMode.key)
-        deliver(destination)
-        return true
+    func request(_ destination: NativeAgentNavigationDestination) {
+        AppDelegate.requestFaceWindowIfInstalled(destination: destination.faceDestination)
     }
 
     private func bootstrapProcessServicesIfReady() {
@@ -180,8 +149,6 @@ final class ApplicationLifetime {
               !didBootstrapProcessServices,
               let appModel else { return }
         didBootstrapProcessServices = true
-        DetachedChatWindowController.shared.attach(appModel: appModel)
-        DetachedChatWindowController.shared.restoreFromPersist()
         Task { @MainActor in await appModel.loadChatState() }
         NativeAgentHotkeyBootstrap.shared.start(appModel: appModel)
         Task.detached(priority: .utility) {
@@ -190,24 +157,12 @@ final class ApplicationLifetime {
         }
     }
 
-    @discardableResult
-    private func drainPendingDestinations() -> Bool {
-        guard let deliver = mountedScene?.deliver, !pendingDestinations.isEmpty else { return false }
-        let destinations = pendingDestinations
-        pendingDestinations.removeAll(keepingCapacity: true)
-        for destination in destinations {
-            deliver(destination)
-        }
-        return true
-    }
-
-    private func installLegacyRouteObservers() {
+    private func installRouteObservers() {
         guard routeObserverTokens.isEmpty else { return }
 
         observe(.openApprovalsRequest) { _ in .activity(.approvals) }
-        observe(.openTelegramRequest) { _ in .sidebar(.telegram) }
         observe(.openTrustMultimodalRequest) { _ in
-            Task { @MainActor in SettingsLink.open(.trust, tab: TrustTab.features.rawValue) }
+            Task { @MainActor in SettingsLink.open(.trust) }
             return nil
         }
         observe(.openChatDraftRequest) { _ in .sidebar(.chat) }

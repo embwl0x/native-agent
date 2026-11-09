@@ -1,13 +1,136 @@
 import ChatSessionWork
 import ChatToolParsing
 import ChatTurnContracts
+import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import ToolRegistry
 // Blueprint: | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`, `impl_tool_result_page`: Retain turn-bound results without loss. |
 
-/// Lossless, turn-scoped spill storage for provider results that are too large to inject in one model message. Files live under the user's private temp
-/// directory with owner-only permissions, are addressed by random handles, and can only be read from the same chat session and turn.
+private enum ResultRecoveryScopePart: TurnPart { static let unset: ProviderToolResultRecoveryStore.Scope? = nil }
+
+extension Turn {
+    /// The result owner's held resource scope, shared by nested calls; a derived turn binds its own identity.
+    package var resultRecoveryScope: ProviderToolResultRecoveryStore.Scope? {
+        get { self[ResultRecoveryScopePart.self] }
+        set { self[ResultRecoveryScopePart.self] = newValue }
+    }
+}
+
+/// Bound a view only after its exact, already-redacted body is retained. Script steps and outer calls use this same owner.
+package enum ProviderToolResultPage {
+    package static let defaultMaxUTF8Bytes = 48_000
+
+    /// Non-loop doors and helpers release only the scope they admitted, after their operation settles on every exit.
+    package static func holding<Value: Sendable>(turn: Turn, sessionId: String?,
+        operation: @Sendable (Turn) async throws -> Value) async throws -> Value {
+        let scope = ProviderToolResultRecoveryStore.Scope(sessionId: sessionId, turnId: turn.id)
+        if scope == turn.resultRecoveryScope { return try await operation(turn) }
+        let outcome: Result<Value, Error>
+        do { outcome = .success(try await operation(turn.with(\.resultRecoveryScope, scope))) }
+        catch { outcome = .failure(error) }
+        if let scope { await settle { await ProviderToolResultRecoveryStore.shared.remove(scope: scope) } }
+        return try outcome.get()
+    }
+
+    package struct View: Sendable {
+        package let content: String
+        package let recovery: JSONValue?
+        package let failed: Bool
+    }
+
+    package struct ContextResult: Sendable {
+        package let dataRoot: URL
+        package let callID: String
+        package init(dataRoot: URL, callID: String) { self.dataRoot = dataRoot; self.callID = callID }
+    }
+
+    private static func digest(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    @concurrent package static func project(
+        toolName: String,
+        content: String,
+        sessionId: String?,
+        turnId: String,
+        originalResultClass: ChatToolOutcome.ExactResultClass,
+        appDoor: Bool,
+        inlineLimit: Int = defaultMaxUTF8Bytes,
+        includeSections: Bool = true,
+        contextResult: ContextResult? = nil
+    ) async -> View {
+        guard content.utf8.count > inlineLimit else { return View(content: content, recovery: nil, failed: false) }
+        var recovery: JSONValue?
+        do {
+            // A plain-text tool answer has no parsed envelope; it is still retained byte for byte.
+            let parsed = try? JSONValue.parse(Data(content.utf8))
+            let durableURL = contextResult.map {
+                $0.dataRoot.appendingPathComponent("chat/tool_results/\(digest(turnId))", isDirectory: true)
+                    .appendingPathComponent(digest($0.callID + "\u{0}" + content) + ".txt")
+            }
+            let receipt = try await ProviderToolResultRecoveryStore.shared.store(
+                content: content, parsed: parsed, toolName: toolName, sessionId: sessionId, turnId: turnId,
+                originalResultClass: originalResultClass, durableURL: durableURL)
+            var reference: [String: JSONValue] = [
+                "result_handle": .string(receipt.handle), "full_result_retained": .bool(true),
+                "original_bytes": .int(Int64(receipt.bytes)),
+                "next_call": .object(["tool": .string("app"), "input": .object([
+                    "action": .string("result.page"), "args": .object([
+                        "result_handle": .string(receipt.handle), "page": .int(0), "raw": .bool(true)])])]),
+            ]
+            if let durableURL { reference["saved_result_path"] = .string(durableURL.path) }
+            recovery = .object(reference)
+            var fields = reference
+            if includeSections {
+                let result = await ProviderToolResultRecoveryStore.shared.page(
+                    handle: receipt.handle, page: 0, sessionId: sessionId, turnId: turnId, query: "")
+                guard case .object(let page) = result, ToolResult(result).said("completed") else {
+                    return View(content: try result.serialize(pretty: false), recovery: recovery, failed: true)
+                }
+                fields.merge(page) { _, page in page }
+                fields["recovery_tool"] = .string(appDoor ? "app result.page" : "tool_result_page")
+                if appDoor, case .string(let detail)? = fields["detail"] {
+                    fields["detail"] = .string(ToolNameAliases.foldedProse(detail))
+                }
+            }
+            fields["provider_projection"] = .string("bounded_tool_result")
+            fields["tool"] = .string(appDoor ? ToolNameAliases.appAction(toolName) ?? toolName : toolName)
+            fields["original_result_class"] = .string(originalResultClass.rawValue)
+            fields["verification_scope"] = .string("tool_response_not_external_outcome")
+            fields["original_characters"] = .int(Int64(content.count))
+            fields["retained_bytes"] = .int(Int64(receipt.bytes))
+            fields["retention_reason"] = .string("response_exceeds_inline_limit")
+            if case .object(let receipt)? = parsed {
+                fields["repeat"] = receipt["repeat"]
+                fields["repeat_note"] = receipt["repeat_note"]
+            }
+            // Exact live home controls stay outside paged reading evidence.
+            if includeSections, toolName == "app", case .object(var frame)? = parsed {
+                fields["version"] = frame["version"]
+                if case .object(let view)? = frame["view"] { frame.merge(view) { top, _ in top } }
+                let keys: Set<String> = ["status", "workspace", "path", "actions", "windows", "places", "desktop"]
+                var candidate = fields
+                candidate["navigation"] = .object(frame.filter { keys.contains($0.key) })
+                if try JSONValue.object(candidate).serialize(pretty: false).utf8.count <= inlineLimit { fields = candidate }
+            }
+            return View(content: try JSONValue.object(fields).serialize(pretty: false), recovery: recovery, failed: false)
+        } catch {
+            // Retention failure is its own failure, never an unretained prefix or a verdict about the original effects.
+            let kept = recovery?.objectValue?["result_handle"]?.stringValue.map {
+                " The whole body is retained as \($0); read app result.page with result_handle:\"\($0)\", raw:true, page:0 and follow next_page."
+            } ?? " The body could not be retained."
+            return View(content: """
+                Tool result retention/projection failed: \(error.localizedDescription). Original result class: \(originalResultClass.rawValue). \
+                No clipped result was delivered.\(kept) Inspect the original dispatch receipt and repair result storage before repeating an action.
+                """, recovery: recovery, failed: true)
+        }
+    }
+}
+
+/// Lossless, turn-scoped result storage. Live views spill to private temp files; context-overflow bodies stay at their existing durable chat path.
+/// Owner-only files have scope/content-bound handles readable only in the originating session and turn.
 package actor ProviderToolResultRecoveryStore {
     package static let shared = ProviderToolResultRecoveryStore()
 
@@ -27,13 +150,7 @@ package actor ProviderToolResultRecoveryStore {
             return 12
         }
     }
-    package static let maxEntryBytes = 64 * 1024 * 1024
-    package static let maxTotalBytes = 128 * 1024 * 1024
-    package static let maxEntries = 32
     package static let ttl: TimeInterval = 30 * 60
-
-    /// Turns retain handles until scope removal or this absolute wall-clock ceiling.
-    package static let liveTurnMaxLifetime: TimeInterval = 6 * 60 * 60
 
     package struct Scope: Hashable, Sendable {
         package let sessionId: String
@@ -60,7 +177,8 @@ package actor ProviderToolResultRecoveryStore {
         let handle: String
         let toolName: String
         let scope: Scope
-        let url: URL
+        var url: URL
+        var removeOnRelease: Bool
         let characters: Int
         let bytes: Int
         let resultClass: ChatToolOutcome.ExactResultClass
@@ -72,10 +190,9 @@ package actor ProviderToolResultRecoveryStore {
         var sectionPages: (query: String, pages: [[JSONValue]], counts: [Int])?
     }
 
-    // Turn-scoped UTF-8 envelopes in OS temporary storage, excluded from backup/export/phone sync and the data-root PrivacyMap; expiry owns removal.
+    // Live result spills are outside backup/export/phone sync. Durable context bodies retain the chat owner's existing retention policy.
     private let root: URL
     private var entries: [String: Entry] = [:]
-    private var totalBytes = 0
     private struct ReadCursor {
         let handle: String
         let nextPage: Int?
@@ -87,23 +204,6 @@ package actor ProviderToolResultRecoveryStore {
         .appendingPathComponent(InstallPaths.current.name("NativeAgent"), isDirectory: true)
         .appendingPathComponent("provider_tool_results", isDirectory: true)) {
         self.root = root
-        let fm = FileManager.default
-        try? fm.createDirectory(at: root, withIntermediateDirectories: true)
-        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
-
-        // Crash leftovers have no in-memory authorization record and are never readable. Remove old ones eagerly; newer ones remain protected by the 0700
-        // directory until a later cleanup pass.
-        if let urls = try? fm.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            let cutoff = Date().addingTimeInterval(-Self.ttl)
-            for url in urls {
-                let modified = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-                if modified.map({ $0 < cutoff }) ?? true { try? fm.removeItem(at: url) }
-            }
-        }
     }
 
     package func store(
@@ -113,15 +213,36 @@ package actor ProviderToolResultRecoveryStore {
         sessionId: String?,
         turnId: String?,
         originalResultClass: ChatToolOutcome.ExactResultClass,
-        sectionBudget: Int = ToolResultSections.pageBudget
-    ) throws -> Receipt? {
-        guard let scope = Scope(sessionId: sessionId, turnId: turnId) else { return nil }
+        sectionBudget: Int = ToolResultSections.pageBudget,
+        durableURL: URL? = nil
+    ) throws -> Receipt {
+        guard let scope = Scope(sessionId: sessionId, turnId: turnId) else {
+            throw ToolFailureError("A retained result needs its originating session and turn.", effects: .unknown,
+                owner: toolName, code: "missing_result_scope", recovery: .reconcile)
+        }
         cleanupExpired(now: Date())
 
         let data = Data(content.utf8)
-        guard data.count <= Self.maxEntryBytes else { return nil }
-        guard entries.count < Self.maxEntries,
-              totalBytes + data.count <= Self.maxTotalBytes else { return nil }
+        let fields = parsed?.objectValue ?? [:]
+        let receipt = if case .string(let id)? = fields["dispatch_receipt_id"] { UUID(uuidString: id) } else { nil as UUID? }
+        let source = if case .string(let source)? = fields["dispatch_receipt_source"] { source } else { "" }
+        // The same receipt can have distinct redacted views. Never overwrite bytes already promised by another view's handle.
+        let digest = SHA256.hash(data: Data((scope.sessionId + "\u{0}" + scope.turnId + "\u{0}" + toolName + "\u{0}").utf8) + data)
+            .map { String(format: "%02x", $0) }.joined()
+        let handle = (source == "detail" ? receipt : nil)
+            .map { "receipt-" + $0.uuidString.lowercased() + "." + digest } ?? digest
+        if var entry = entries[handle] {
+            if let durableURL, entry.url != durableURL {
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: durableURL)
+                let temporary = entry.removeOnRelease ? entry.url : nil
+                entry.url = durableURL
+                entry.removeOnRelease = false
+                entries[handle] = entry
+                if let temporary { try? FileManager.default.removeItem(at: temporary) }
+            }
+            return Receipt(handle: handle, pageCount: entry.pageByteOffsets.count - 1,
+                characters: entry.characters, bytes: entry.bytes, resultClass: entry.resultClass)
+        }
 
         // Build valid Unicode-scalar byte boundaries once. Bounding bytes (not grapheme count) prevents a pathological combining sequence from becoming an
         // unexpectedly huge provider page.
@@ -149,18 +270,10 @@ package actor ProviderToolResultRecoveryStore {
         }
 
         let sections = try ToolResultSections.projection(content: content, value: parsed, budget: sectionBudget)
-        let fields = parsed?.objectValue ?? [:]
-        let receipt = if case .string(let id)? = fields["dispatch_receipt_id"] { UUID(uuidString: id) } else { nil as UUID? }
-        let source = if case .string(let source)? = fields["dispatch_receipt_source"] { source } else { "" }
-        let handle = (source == "detail" ? receipt : nil)
-            .map { "receipt-" + $0.uuidString.lowercased() } ?? UUID().uuidString.lowercased()
-        let url = root.appendingPathComponent(handle, isDirectory: false)
-        do {
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
-        } catch {
-            try? FileManager.default.removeItem(at: url)
-            return nil
-        }
+        let url = durableURL ?? root.appendingPathComponent(handle, isDirectory: false)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
 
         let now = Date()
         let version = fields["version"]
@@ -169,6 +282,7 @@ package actor ProviderToolResultRecoveryStore {
             toolName: toolName,
             scope: scope,
             url: url,
+            removeOnRelease: durableURL == nil,
             characters: content.count,
             bytes: data.count,
             resultClass: originalResultClass,
@@ -179,7 +293,6 @@ package actor ProviderToolResultRecoveryStore {
             sectionProjection: sections
         )
         entries[handle] = entry
-        totalBytes += data.count
         return Receipt(
             handle: handle,
             pageCount: max(1, entry.pageByteOffsets.count - 1),
@@ -253,7 +366,7 @@ package actor ProviderToolResultRecoveryStore {
     }
 
     private func unavailable(handle: String, reason: String, sessionId: String?) -> JSONValue {
-        let receipt = handle.hasPrefix("receipt-") ? UUID(uuidString: String(handle.dropFirst(8))) : nil
+        let receipt = handle.hasPrefix("receipt-") ? UUID(uuidString: String(handle.dropFirst(8).prefix(36))) : nil
         var args: [String: JSONValue] = ["view": .string("receipts")]
         if let receipt { args["receipt_id"] = .string(receipt.uuidString.lowercased()) }
         if let sessionId { args["session_id"] = .string(sessionId) }
@@ -337,15 +450,19 @@ package actor ProviderToolResultRecoveryStore {
         }
         let startByte = entry.pageByteOffsets[page]
         let endByte = entry.pageByteOffsets[page + 1]
-        guard let file = try? FileHandle(forReadingFrom: entry.url) else {
-            remove(handle: handle)
-            return unavailable(handle: handle, reason: "result_spill_unreadable", sessionId: sessionId)
-        }
-        defer { try? file.close() }
-        guard (try? file.seek(toOffset: UInt64(startByte))) != nil,
-              let data = endByte == startByte ? Data() : (try? file.read(upToCount: endByte - startByte)),
-              let content = String(data: data, encoding: .utf8) else {
-            remove(handle: handle)
+        let content: String
+        do {
+            let file = try FileHandle(forReadingFrom: entry.url)
+            defer { try? file.close() }
+            try file.seek(toOffset: UInt64(startByte))
+            let data: Data?
+            if endByte == startByte { data = Data() }
+            else { data = try file.read(upToCount: endByte - startByte) }
+            guard let data, data.count == endByte - startByte, let text = String(data: data, encoding: .utf8) else {
+                return unavailable(handle: handle, reason: "result_spill_incomplete", sessionId: sessionId)
+            }
+            content = text
+        } catch {
             return unavailable(handle: handle, reason: "result_spill_unreadable", sessionId: sessionId)
         }
         let hasMore = page + 1 < pageCount
@@ -375,12 +492,7 @@ package actor ProviderToolResultRecoveryStore {
     }
 
     private func cleanupExpired(now: Date) {
-        for entry in Array(entries.values) {
-            // The absolute ceiling binds even on a live turn — it is the only thing that frees a scope whose `remove(scope:)` never arrived.
-            if now.timeIntervalSince(entry.createdAt) >= Self.liveTurnMaxLifetime {
-                remove(handle: entry.handle)
-            }
-        }
+        // A live turn owns its handles until settlement; age and later results never evict promised output.
         let liveNames = Set(entries.values.map { $0.url.lastPathComponent })
         let cutoff = now.addingTimeInterval(-Self.ttl)
         let urls = try? FileManager.default.contentsOfDirectory(
@@ -401,8 +513,7 @@ package actor ProviderToolResultRecoveryStore {
     private func remove(handle: String) {
         for scope in readCursors.keys.filter({ readCursors[$0]?.handle == handle }) { readCursors.removeValue(forKey: scope) }
         guard let entry = entries.removeValue(forKey: handle) else { return }
-        totalBytes = max(0, totalBytes - entry.bytes)
-        try? FileManager.default.removeItem(at: entry.url)
+        if entry.removeOnRelease { try? FileManager.default.removeItem(at: entry.url) }
     }
 }
 

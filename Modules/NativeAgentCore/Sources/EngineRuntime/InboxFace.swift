@@ -1,16 +1,13 @@
 import PersistenceCore
-import AppToolRuntime
 import ApprovalInbox
 import ApprovalTransactions
 import AuthoredCapabilities
-import ChatTurnContracts
-import Desk
 import Experiences
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-import TrustCenter
-// Blueprint: | `InboxFace.swift` | Inbox's one face reads ForPerson's matters and change stream; person actions use existing owners and agent actions retain the invoking turn's inbox admission |
+import Privacy
+// Blueprint: | `InboxFace.swift` | Inbox's one face reads ForPerson's matters, put-away ones as folded history; each answer is its one door call, the person's tap and the agent's call alike |
 
 extension NativeAgentEngine {
     @MainActor func inboxFaceRead() -> PartFaces.Read {
@@ -28,7 +25,7 @@ extension NativeAgentEngine {
         }
     }
 
-    @MainActor func inboxFace() async throws -> (PartFace, UInt64) {
+    @concurrent func inboxFace() async throws -> (PartFace, UInt64) {
         let now = Date()
         let epoch = UInt64(now.timeIntervalSince1970 * 1000)
         let matters = try await ForPerson.at(dataRoot).matters().filter(ForPerson.isRow)
@@ -43,6 +40,7 @@ extension NativeAgentEngine {
         let earlier = matters.filter {
             [.archived, .dismissed].contains(ForPerson.reading($0))
         }
+        let history = await inboxHistoryRows(earlier)
         let since = now.addingTimeInterval(-24 * 60 * 60)
         let archived = earlier.filter { ForPerson.reading($0) == .archived }
         let recent = archived.filter { matter in
@@ -62,13 +60,75 @@ extension NativeAgentEngine {
             .init(id: "news", title: "News", style: .list, footer: news.isEmpty ? "No news in the current reading." : nil,
                   rows: news.map { inboxFaceRow($0) }),
         ]
-        sections.append(.init(id: "earlier", title: "Earlier", style: .values,
-                              footer: undated == 0 ? nil : "\(undated) archived matters have no settlement time; the count excludes those matters.", rows: [
-            .init(id: "inbox.earlier", title: "Archived in the last day", value: String(recent.count), open: "page:inbox/earlier"),
-        ]))
+        // The history: every matter put away, newest first, folded under its counts.
+        let counts = "\(recent.count) archived in the last day; \(earlier.count) put away in all."
+            + (undated == 0 ? "" : " \(undated) archived matters have no settlement time; the day's count excludes those matters.")
+        sections.append(.init(id: "earlier", title: "Earlier", style: .list, footer: counts,
+                              rows: history, folded: true))
         return (.init(title: "Inbox", line: "Requests, things that went wrong, and news.", sections: sections), epoch)
     }
 
+    /// Retained approval faces may predate their latest execution receipt. Read that saved owner once, only for history, without writing a copy.
+    private func inboxHistoryRows(_ matters: [Experience]) async -> [PartFace.Row] {
+        let ids = Set(matters.flatMap { $0.evidence.filter { $0.source == Matter.approvals }.map(\.id) })
+        guard !ids.isEmpty else { return matters.map { inboxHistoryRow($0) } }
+        do {
+            let records = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .all)
+            var faces: [String: Experience.Face] = [:]
+            for record in records where ids.contains(record.id) && record.status != "pending" {
+                faces[record.id] = record.decisionExperience.face
+            }
+            return matters.map { matter in
+                guard let ref = matter.evidence.first(where: { $0.source == Matter.approvals }) else { return inboxHistoryRow(matter) }
+                guard let face = faces[ref.id] else {
+                    return inboxHistoryRow(matter, unavailable: "The approval owner has no saved settled result for \(ref.id).")
+                }
+                return inboxHistoryRow(matter, savedFace: face)
+            }
+        } catch {
+            // This owner's read failure concerns its approval rows; interaction and note history still render.
+            return matters.map { matter in
+                inboxHistoryRow(matter, unavailable: matter.evidence.contains { $0.source == Matter.approvals }
+                    ? "The saved approval result could not be read: \(NativeAppSecretRedactor.redactText(error.localizedDescription))" : nil)
+            }
+        }
+    }
+
+    /// A decided card leads with its owner's saved outcome, then the original request. Only continuation retry survives; consent never reopens.
+    private func inboxHistoryRow(_ matter: Experience, savedFace: Experience.Face? = nil, unavailable: String? = nil) -> PartFace.Row {
+        guard let face = savedFace ?? matter.face, let row = face.row else {
+            return .init(id: matter.id, title: "This matter has no face row", detail: "The experience owner must supply the missing row.",
+                         at: matter.at, tone: .attention)
+        }
+        var title = row.title
+        var detail = [row.detail, face.words].compactMap { $0 }.filter { !$0.isEmpty }
+        if detail.count == 2, detail[0] == detail[1] { detail.removeLast() }
+        let card = face.from == InlineInteractionDelivery.source || matter.evidence.contains { $0.source == Matter.approvals }
+        if card, matter.owes["decide"] != nil {
+            let words = face.words.trimmingCharacters(in: .whitespacesAndNewlines)
+            var receipt = words.components(separatedBy: "\n\n").filter { !$0.isEmpty }
+            if let unavailable {
+                title = "Unknown: the saved approval result is unavailable."
+                detail = [unavailable, row.title]
+            } else if !receipt.isEmpty {
+                title = receipt.removeFirst()
+                detail = [row.title] + receipt
+                if let context = row.detail, context != face.words, !context.isEmpty { detail.append(context) }
+            } else {
+                title = "Unknown: no outcome words were recorded for this card."
+                detail = [row.title]
+            }
+        }
+        let retry = row.actions?.filter { $0.call?.action == "card.try_again" }
+        return .init(id: matter.id, title: title, detail: detail.joined(separator: "\n\n"),
+                     value: ForPerson.reading(matter).rawValue.capitalized, at: matter.at,
+                     symbol: row.symbol ?? "bell.fill", tone: unavailable == nil ? row.tone : .attention,
+                     actions: retry?.isEmpty == false ? retry : nil)
+    }
+
+    /// A waiting or new matter's row: the face its owner composed, each answer bound to its one door call. An answer whose owner composed its
+    /// call keeps it; the Inbox's own verbs (read, archive, dismiss) and the inbox vocabulary a producer names by id take their `inbox.*`
+    /// verb. An answer with no call is not drawn: a row's action always runs through the door, for the person's tap and the agent's call alike.
     private func inboxFaceRow(_ matter: Experience, tone: PartFace.Tone? = nil) -> PartFace.Row {
         let reading = ForPerson.reading(matter)
         guard let face = matter.face, let row = face.row else {
@@ -76,22 +136,14 @@ extension NativeAgentEngine {
                          at: matter.at, tone: .attention)
         }
         let approval = matter.evidence.contains { $0.source == Matter.approvals }
-        var actions: [PartFace.Action] = (row.actions ?? []).filter {
-            InboxActionVocabulary.nativeActionIDs.contains($0.id)
-                || (matter.id.hasPrefix("interaction:") && $0.id.hasPrefix("interaction_choice_"))
-        }
-        if approval {
-            actions = actions.map { .init(id: $0.id, label: $0.id == "reject" ? "Deny" : $0.label, role: $0.role) }
-        }
-        let declared = actions.map { InboxActionRecord(id: $0.id, label: $0.label, description: nil) }
-        let owned = InboxActionVocabulary.actions(declared: declared, approvalLinked: approval)
-        let existing = Set(actions.map(\.id))
-        actions += owned.filter { !existing.contains($0.id) && ($0.id != "read" || reading == .unread) }.map {
-            .init(id: $0.id, label: $0.label)
-        }
-        actions = actions.filter { $0.id != "read" || reading == .unread }.map {
-            .init(id: $0.id, label: $0.label,
-                  role: ["archive", "dismiss", "reject"].contains($0.id) ? .destructive : $0.role)
+        let declared = (row.actions ?? []).map { InboxActionRecord(id: $0.id, label: $0.label, description: nil) }
+        let actions: [PartFace.Action] = InboxActionVocabulary.actions(declared: declared, approvalLinked: approval).compactMap { answer in
+            guard answer.id != "read" || reading == .unread else { return nil }
+            let composed = row.actions?.first { $0.id == answer.id }
+            guard let call = composed?.call ?? Self.inboxCall(answer.id, matter: matter.id, approval: approval) else { return nil }
+            let role: PartFace.Action.Role? = ["archive", "dismiss", "reject"].contains(answer.id) ? .destructive : composed?.role
+            return .init(id: answer.id, label: approval && answer.id == "reject" ? "Deny" : answer.label, role: role, doors: composed?.doors,
+                         call: call)
         }
         var detail = [row.detail, face.words].compactMap { $0 }.filter { !$0.isEmpty }
         if detail.count == 2, detail[0] == detail[1] { detail.removeLast() }
@@ -103,89 +155,25 @@ extension NativeAgentEngine {
                      actions: actions.isEmpty ? nil : actions)
     }
 
-    @MainActor func inboxAct(row: String, action: String, value: String?, by actor: PartFaces.Actor) async throws -> String? {
-        do { return try await applyInboxAct(row: row, action: action, value: value, by: actor) }
-        catch {
-            await settle { _ = await self.pages.refresh(page: "inbox") }
-            if error is CancellationError { throw error }
-            if let owned = error as? PartCallError { throw owned }
-            throw PartCallError(code: "inbox_action_failed", message: error.localizedDescription)
+    /// The inbox vocabulary's door verbs: deciding an approval is `inbox.approve` / `inbox.deny`; a request's Open on Mac, Not now and choices
+    /// are `inbox.open_on_mac`, `inbox.not_now` and `inbox.act`; read, archive and dismiss put the row away with the words a tap records as
+    /// its reason. Nil for an id the vocabulary does not bind.
+    private static func inboxCall(_ id: String, matter: String, approval: Bool) -> PartFace.Call? {
+        let row: [String: PartFace.Value] = ["id": .string(matter)]
+        let putAway: [String: PartFace.Value] = ["id": .string(matter), "reason": .string("put away from its Inbox row")]
+        let request = matter.hasPrefix("interaction:")
+        switch id {
+        case "approve" where approval: return .init("inbox.approve", row)
+        case "reject" where approval: return .init("inbox.deny", row)
+        case "reject" where request: return .init("inbox.not_now", row)
+        case "act" where request: return .init("inbox.open_on_mac", row)
+        case "act": return .init("inbox.act", row.merging(["action": .string("act")]) { $1 })
+        case "open_approvals": return .init("inbox.open_approvals", row)
+        case "read": return .init("inbox.mark_read", putAway)
+        case "archive": return .init("inbox.archive", putAway)
+        case "dismiss": return .init("inbox.dismiss", putAway)
+        case _ where request && id.hasPrefix("interaction_choice_"): return .init("inbox.act", row.merging(["action": .string(id)]) { $1 })
+        default: return nil
         }
-    }
-
-    @MainActor private func applyInboxAct(row: String, action: String, value: String?, by actor: PartFaces.Actor) async throws -> String? {
-        guard let matter = try await ForPerson.at(dataRoot).matter(row), ForPerson.isRow(matter),
-              [.unread, .read].contains(ForPerson.reading(matter)),
-              inboxFaceRow(matter).actions?.contains(where: { $0.id == action }) == true else {
-            throw PartCallError(code: "inbox_changed", message: "That Inbox row no longer offers this action. Read Inbox again.")
-        }
-        let executor = ports.appTools(SwiftNativeSecurityCenter(dataRoot: dataRoot), false)
-        guard hasBody, let host = executor.quietHost() as? any QuietInboxHost,
-              host.inboxDataRoot == dataRoot, host.dataRootOverride == dataRoot else {
-            throw PartCallError(code: "inbox_unavailable", message: "The Inbox action owner is unavailable for this data root.")
-        }
-        switch actor {
-        case .agent(let turn): return try await agentInboxAct(row: row, action: action, reason: value, turn: turn)
-        case .person(let door, let device):
-            guard door == "mac" || door == "phone" else {
-                throw PartCallError(code: "unknown_door", message: "This Inbox action has no recognized person door.")
-            }
-            if ["approve", "reject"].contains(action), let approval = matter.evidence.first(where: { $0.source == Matter.approvals }) {
-                // The phone answers with the paired device its router verified, as its signed approval card does; with none, nothing is invented.
-                let phone = door == "phone" ? device.flatMap { $0.isEmpty ? nil : $0 } : nil
-                guard door == "mac" || phone != nil else {
-                    throw PartCallError(code: "approval_identity_required",
-                        message: "This phone's identity was not verified, so the approval was not answered. Pair the phone again, then answer it.")
-                }
-                let current = try await SwiftNativeApprovalInbox(root: dataRoot).get(approval.id)
-                guard OwnerAttentionPolicy.approvalWaits(status: current.status, agentOwned: current.isAgentsOwnDecision),
-                      ApprovalChatCards.canResolve(current) else {
-                    throw PartCallError(code: "approval_unavailable", message: "This approval does not offer a person decision with readable details.")
-                }
-                let record: ApprovalRecord
-                if let phone {
-                    let signed = ApprovalResolutionProvenance.signedIOS(clientID: phone, decidedBy: "ios_signed_operator")
-                    record = try await ports.backgroundWork.approvals.resolveApproval(id: approval.id, decision: action,
-                        provenance: signed, turn: signed.resolvingTurn)
-                } else {
-                    record = try await approvals.resolveApproval(id: approval.id, decision: action,
-                        coordinator: ports.backgroundWork.approvals,
-                        turn: ApprovalResolutionProvenance.local(decidedBy: "mac_ui").resolvingTurn)
-                }
-                guard let decision = record.decision else {
-                    throw PartCallError(code: "approval_unconfirmed", message: "The approval owner returned no recorded decision. Read Inbox again.")
-                }
-                return "Approval recorded as " + decision + "."
-            }
-            let envelope: TurnEnvelope = door == "mac" ? .personOnMac("mac_ui:inbox." + action) : .init(surface: "ios")
-            let turn = Turn().with(\.envelope, envelope)
-            try await host.performInboxAction(row, action: action, metadata: [:], quiet: false, dataRootOverride: dataRoot, turn: turn)
-            return "Inbox action completed: " + action + "."
-        }
-    }
-
-    @MainActor private func agentInboxAct(row: String, action: String, reason: String?, turn: Turn) async throws -> String? {
-        guard let surface = turn.runtime?.surface, !surface.isEmpty else {
-            throw PartCallError(code: "turn_unavailable", message: "This Inbox action has no originating turn surface.")
-        }
-        var args: [String: JSONValue] = ["id": .string(row)]
-        let verb: String
-        switch action {
-        case "archive", "dismiss", "read":
-            guard let reason, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw PartCallError(code: "missing_reason", message: "The agent must supply a reason through the existing inbox action.")
-            }
-            args["reason"] = .string(reason)
-            verb = action == "read" ? "inbox.mark_read" : "inbox." + action
-        case "approve": verb = "inbox.approve"
-        case "reject": verb = row.hasPrefix("interaction:") ? "inbox.not_now" : "inbox.deny"
-        default: verb = "inbox.act"; args["action"] = .string(action)
-        }
-        let result = try await ports.appTools(SwiftNativeSecurityCenter(dataRoot: dataRoot), false).execute(
-            tool: "app", input: ["action": .string(verb), "args": .object(args)], surface: surface, turn: turn)
-        guard result.objectValue?["status"] == .string("ok") else {
-            throw PartCallError(code: "inbox_refused", message: try result.serialize(pretty: false))
-        }
-        return try result.serialize(pretty: false)
     }
 }

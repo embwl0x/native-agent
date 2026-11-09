@@ -292,7 +292,12 @@ extension SwiftNativeDeskStore {
 
     /// Evict low-priority refs first because tracking references carry identity.
     /// A newest-only cap could orphan tracked rows; survivors retain insertion order.
-    static func appendRefCapped(_ item: inout DeskItem, _ ref: DeskRef) {
+    static func appendRefCapped(_ item: inout DeskItem, _ incoming: DeskRef) {
+        var ref = incoming
+        if case .step(var step) = ref.kind, let previous = item.step {
+            step.promiseCaptures = previous.promiseCaptures + step.promiseCaptures.filter { !previous.promiseCaptures.contains($0) }
+            ref.kind = .step(step)
+        }
         item.refs.append(ref)
         guard item.refs.count > refsCap else { return }
         let overflow = item.refs.count - refsCap

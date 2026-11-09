@@ -28,10 +28,6 @@ public protocol ClaudeBridgeMessagePort: Sendable {
 public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     public typealias Response = @Sendable (Int, [String: Any], @escaping @Sendable (Bool) -> Void) -> Void
     private typealias PreparedResponse = @Sendable (Int, [String: Any]) -> Void
-    /// HTTP response deadline; accepted turns continue through durable settlement.
-    public static let messageWorkDeadlineSeconds: Int = 600
-    /// Enqueue acknowledgement deadline; expiry ends only the HTTP wait.
-    public static let enqueueAckDeadlineSeconds: Int = 30
     private let port: any ClaudeBridgeMessagePort
     private let tasks: AgentContactTasks
     private let eventPublisher: @Sendable (String, [String: Any]) -> Void
@@ -463,12 +459,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 response(409, ["status": "unavailable", "requestId": requestID, "task_id": taskID,
                     "sessionId": session, "detail": error.localizedDescription + ". Inspect this task before resending."])
             }
-        }
-        latch.arm(afterSeconds: enqueuedMode ? Self.enqueueAckDeadlineSeconds : Self.messageWorkDeadlineSeconds) { [self] in
-            guard latch.claim() else { return }
-            self.eventPublisher("message_deadline_released", ["requestId": requestID, "task_id": taskID, "sessionId": session])
-            response(202, ["status": "still_working", "requestId": requestID, "task_id": taskID, "sessionId": session,
-                "detail": "Only the HTTP wait ended. Admission and execution remain owned by this retained task; do not resend the message."])
         }
     }
 

@@ -475,7 +475,7 @@ public actor SwiftNativeProviderRouting: Sendable {
     static let connectableProviderIds = [
         "anthropic", "anthropic_oauth_direct",
         "openai", "openai_oauth_direct", "codex",
-        "xai_oauth_direct", "moonshot", "kimi-code", "openrouter",
+        "xai_oauth_direct", "moonshot", "kimi-code", "meta", "openrouter",
     ]
     /// Name discovery routes so a snapshot can pre-read their configs exactly once.
     static var soleConnectedProbeIds: [String] { connectableProviderIds }

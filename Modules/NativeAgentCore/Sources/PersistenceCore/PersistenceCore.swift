@@ -169,14 +169,6 @@ public enum SwiftNativePersistenceCore {
         return payload
     }
 
-    /// Append caller-serialized receipts without chmod on existing files; multiple writers must hold the shared file lock.
-    public static func appendAuditLineRaw(_ jsonLine: String, to path: URL) async throws {
-        let dir = path.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let line = jsonLine + "\n"
-        try Self.appendBytes(Data(line.utf8), to: path, createMode: 0o666)
-    }
-
     public static func readJSONL(_ path: URL) async throws -> [JSONValue] {
         let read = try await readJSONLReporting(path)
         guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine else {
@@ -366,7 +358,6 @@ public enum SwiftNativePersistenceCore {
     static func appendBytes(
         _ data: Data,
         to path: URL,
-        createMode: mode_t = 0o600,
         durable: Bool = false
     ) throws {
         // Path-owned feeds accept bytes only inside the capped append's task-local permit.
@@ -401,7 +392,7 @@ public enum SwiftNativePersistenceCore {
         } else if errno != ENOENT {
             throw PersistenceCoreError.ioFailure("Cannot open append framing at \(path.path): \(String(cString: strerror(errno)))")
         }
-        let fd = open(path.path, O_WRONLY | O_CREAT | O_APPEND, createMode)
+        let fd = open(path.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
         if fd < 0 {
             throw PersistenceCoreError.ioFailure("open(append) failed: \(String(cString: strerror(errno)))")
         }

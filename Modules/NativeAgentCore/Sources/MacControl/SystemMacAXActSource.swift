@@ -1,4 +1,6 @@
 import Foundation
+import CoreFoundation
+import Synchronization
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
@@ -16,16 +18,64 @@ import AppKit
 import Carbon
 import NativeAgentShared
 #endif
-// Blueprint: | `SystemMacAXActSource.swift` | Main-lane AX, CF-equal identity and scoped read gaps; actual target-pid Write and driver gates precede mutation |
-/// AX mutations synchronously enter target AppKit handlers; keep the complete resolve/mutate/read transaction on the host main lane.
+// Blueprint: | `SystemMacAXActSource.swift` | Dedicated AX thread and run loop; CF-equal identity, scoped gaps and target-pid Write/driver gates |
+/// AX IPC and observer delivery share one serial thread, independently of the app's windows.
+/// Synchronous clients enter only from non-main execution; async surface entries must suspend their actor before calling.
 enum MacAXExecutionLane {
-    static func sync<T>(_ body: () -> T) -> T {
-        if Thread.isMainThread { return body() }
-        return withoutActuallyEscaping(body) { operation in
-            // GCD completes the explicit closure (and its captured turn/context) before return.
-            nonisolated(unsafe) let synchronousOperation = operation
-            return DispatchQueue.main.sync { synchronousOperation() }
+    /// The lane thread's run loop, published once; CFRunLoop perform/wake calls are thread-safe.
+    private final class Loop: @unchecked Sendable {
+        var loop: CFRunLoop?
+    }
+
+    nonisolated(unsafe) private static let lane: CFRunLoop = {
+        let ready = DispatchSemaphore(value: 0)
+        let published = Loop()
+        let thread = Thread {
+            published.loop = CFRunLoopGetCurrent()
+            // A port keeps the run loop alive even with no AX observers installed.
+            let port = Port()
+            RunLoop.current.add(port, forMode: .default)
+            ready.signal()
+            withExtendedLifetime(port) { CFRunLoopRun() }
         }
+        thread.name = "com.nativeagent.mac-ax"
+        thread.qualityOfService = .userInitiated
+        thread.start()
+        // The thread publishes its loop before signaling.
+        ready.wait()
+        return published.loop!
+    }()
+
+    /// One crossing of the lane: the borrowed closure in, the result out. The block clears the closure before it signals, so nothing
+    /// holds the borrowed closure once the caller resumes, however long the run loop keeps the block itself.
+    private final class Crossing<T>: @unchecked Sendable {
+        var work: (() -> T)?
+        var value: T?
+    }
+
+    static func sync<T>(_ body: () -> T) -> T {
+        let loop = lane
+        if CFEqual(CFRunLoopGetCurrent(), loop) { return body() }
+        return withoutActuallyEscaping(body) { operation in
+            let completed = DispatchSemaphore(value: 0)
+            let crossing = Crossing<T>()
+            crossing.work = operation
+            CFRunLoopPerformBlock(loop, CFRunLoopMode.defaultMode.rawValue) {
+                autoreleasepool { crossing.value = crossing.work?() }
+                crossing.work = nil
+                completed.signal()
+            }
+            CFRunLoopWakeUp(loop)
+            completed.wait()
+            return crossing.value!
+        }
+    }
+
+    /// Enqueue even on the lane so a burst of observer callbacks coalesces before its next tree read.
+    static func async(_ body: @escaping @Sendable () -> Void) {
+        let loop = lane
+        CFRunLoopPerformBlock(loop, CFRunLoopMode.defaultMode.rawValue) { autoreleasepool(invoking: body) }
+        CFRunLoopWakeUp(loop)
     }
 }
 #if canImport(ApplicationServices) && os(macOS)
@@ -83,8 +133,8 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
     private func resolveMenuOnExecutionLane(path: [Int], pid: Int32, titlePath: [String]?, context: MacOperationContext) -> MacAXPidResolution {
         #if canImport(AppKit)
-        // Self-process AX can re-enter AppKit and deadlock, so apply the shared resolve fence.
-        guard pid != getpid() else { return .appGone }
+        // Person-only UI cannot supply an AX action target.
+        guard !PersonOnlyWindows.isOwnProcess(pid) else { return .appGone }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return .appGone }
         let appElement = AXUIElementCreateApplication(pid)
         guard let current = MacAXAttributeRead.copyElement(appElement, kAXMenuBarAttribute, context: context) else { return .appGone }
@@ -95,8 +145,8 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
     private func resolveOnExecutionLane(path: [Int], pid: Int32, context: MacOperationContext) -> MacAXPidResolution {
         #if canImport(AppKit)
-        // Never resolve our own AX tree: synchronous in-process AppKit reads can deadlock the main lane.
-        guard pid != getpid() else { return .appGone }
+        // Her body and window share the person-only boundary.
+        guard !PersonOnlyWindows.isOwnProcess(pid) else { return .appGone }
         // Probe process existence directly: AX can construct dead-pid references whose failed reads cannot establish window absence.
         guard NSRunningApplication(processIdentifier: pid) != nil else { return .appGone }
         let appElement = AXUIElementCreateApplication(pid)
@@ -116,7 +166,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     public func windowPresence(_ window: MacAXWindowRef, context: MacOperationContext) -> Bool? {
         MacAXExecutionLane.sync {
             let pid = window.identity.pid
-            guard pid != getpid(), let target = element(window.handle) else { return nil }
+            guard !PersonOnlyWindows.isOwnProcess(pid), let target = element(window.handle) else { return nil }
             guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return false }
             let appElement = AXUIElementCreateApplication(pid)
             // Require a successful typed AXWindows read because an empty-on-error helper cannot prove absence.
@@ -137,7 +187,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     private func windowsOnExecutionLane(pid: Int32, context: MacOperationContext) throws -> [MacAXWindowRef] {
         #if canImport(AppKit)
         // Apply the same self-process fence as path resolution.
-        guard pid != getpid() else { return [] }
+        guard !PersonOnlyWindows.isOwnProcess(pid) else { return [] }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return [] }
         let appElement = AXUIElementCreateApplication(pid)
         let windows = MacAXWindowInventory.union(
@@ -166,7 +216,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     private func focusedWindowOnExecutionLane(pid: Int32, context: MacOperationContext) throws -> MacAXWindowRef? {
         #if canImport(AppKit)
         // Apply the same self-process fence as path resolution.
-        guard pid != getpid() else { return nil }
+        guard !PersonOnlyWindows.isOwnProcess(pid) else { return nil }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
         guard let focused = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute, context: context) else { return nil }
@@ -191,9 +241,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
     public func uniqueTarget(role: String, label: String, labelSource: String, inWindow window: MacAXWindowRef,
         context: MacOperationContext) throws -> MacAXActTarget? {
-        // Read-only search uses ranged fetches and a deadline rather than holding the main lane across the whole app.
+        // Read-only search uses ranged fetches and the caller's read deadline across the whole app.
         return try MacAccessibilityReader.withReadBudget(context: context) { context in
-            guard window.identity.pid != getpid(),
+            guard !PersonOnlyWindows.isOwnProcess(window.identity.pid),
                   NSRunningApplication(processIdentifier: window.identity.pid) != nil,
                   let root = element(window.handle),
                   ["title", "value", "descendant_text"].contains(labelSource) else { return nil }
@@ -262,8 +312,8 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
     private func resolveOnExecutionLane(path: [Int], inWindow window: MacAXWindowRef, context: MacOperationContext) -> MacAXPidResolution {
         #if canImport(AppKit)
-        // Reject stale self-process handles too; a minted table entry cannot bypass the deadlock fence.
-        guard window.identity.pid != getpid() else { return .appGone }
+        // A retained handle cannot bypass the person-only boundary.
+        guard !PersonOnlyWindows.isOwnProcess(window.identity.pid) else { return .appGone }
         guard NSRunningApplication(processIdentifier: window.identity.pid) != nil else { return .appGone }
         // Retain the identity-matched window root; substituting focused or first windows would redirect the act.
         guard let current = element(window.handle) else { return .windowGone }
@@ -308,6 +358,11 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     /// Exact-element clients share mutation ownership and driver authority, retaining the real AX status.
     package func performNative(_ element: AXUIElement, action: String, turn: Turn, context: MacOperationContext) -> Result<AXError, MacNativeActionFailure> {
         MacAXExecutionLane.sync {
+            var pid: pid_t = 0
+            guard AXUIElementGetPid(element, &pid) == .success, pid > 0 else {
+                return .failure(.evidence("The AX action target's process identity is unavailable; no action was attempted."))
+            }
+            guard !PersonOnlyWindows.isOwnProcess(pid) else { return .failure(.selfTarget) }
             // Scroll and raise actions support read/open intent rather than write admission.
             if !["AXScrollUpByPage", "AXScrollDownByPage", "AXScrollLeftByPage", "AXScrollRightByPage", "AXScrollToVisible", kAXRaiseAction].contains(action),
                let refusal = MacAppActGate.elementRefusal(element, context: context) {
@@ -421,7 +476,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
     public func isFocusedElement(_ target: MacAXActTarget, pid: Int32, context: MacOperationContext) -> Bool {
         MacAXExecutionLane.sync {
-            guard pid != getpid(), let element = element(target.handle) else { return false }
+            guard !PersonOnlyWindows.isOwnProcess(pid), let element = element(target.handle) else { return false }
             guard let focused = MacAXAttributeRead.copyElement(
                 AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute
             , context: context) else { return false }
@@ -456,7 +511,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
     public func elementAtPosition(x: Double, y: Double, pid: Int32, context: MacOperationContext) -> MacAXActTarget? {
         MacAXExecutionLane.sync {
-            guard pid > 0, pid != getpid(), x.isFinite, y.isFinite else { return nil }
+            guard pid > 0, !PersonOnlyWindows.isOwnProcess(pid), x.isFinite, y.isFinite else { return nil }
             guard (try? SystemMacAXElementSource.ensureRenderer(AXUIElementCreateApplication(pid), refresh: true, context: context)) != nil else { return nil }
             var target: AXUIElement?
             guard AXUIElementCopyElementAtPosition(
@@ -467,7 +522,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
     public func focusedElement(pid: Int32, context: MacOperationContext) -> MacAXActTarget? {
         MacAXExecutionLane.sync {
-            guard pid != getpid(),
+            guard !PersonOnlyWindows.isOwnProcess(pid),
                   let focused = MacAXAttributeRead.copyElement(
                     AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute
                   , context: context) else { return nil }
@@ -549,13 +604,6 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             guard let element = element(target.handle) else { return .invalidTarget }
             if let refusal = settableOutcome(element, attribute: kAXSelectedTextAttribute, context: context) { return refusal }
             return actionOutcome(setNativeAttribute(element, attribute: kAXSelectedTextAttribute, value: text as CFTypeRef, turn: turn, context: context))
-        }
-    }
-    public func setSelected(_ target: MacAXActTarget, turn: Turn, context: MacOperationContext) -> MacAXActOutcome {
-        MacAXExecutionLane.sync {
-            guard let element = element(target.handle) else { return .invalidTarget }
-            if let refusal = settableOutcome(element, attribute: "AXSelected", context: context) { return refusal }
-            return actionOutcome(setNativeAttribute(element, attribute: "AXSelected", value: kCFBooleanTrue, turn: turn, context: context))
         }
     }
     private func setFocusedOnExecutionLane(_ target: MacAXActTarget, turn: Turn, context: MacOperationContext) -> MacAXActOutcome {

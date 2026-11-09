@@ -2,6 +2,7 @@ import AuthoredCapabilities
 import Foundation
 import CryptoKit
 import NativeAgentCore
+import NativeAgentShared
 import MacControl
 import PersistenceCore
 import TrustCenter
@@ -31,6 +32,10 @@ extension FileSystemActions {
         return nil
     }
     static func mutationRefusal(_ resolved: URL, _ ctx: ConnectorActionContext, write: Bool = true) -> JSONValue? {
+        if write, ctx.turn?.fileAccessCeiling.readOnly == true {
+            return errResult("request.fileAccess=read_only blocks file changes. The request issuer must resubmit with write access.",
+                code: "path_not_allowed")
+        }
         if ctx.appDataWrite != nil, write {
             let dataRoot = ctx.dataRoot ?? PersistenceCore.defaultDataRoot()
             let protected = (Array(connectorSensitiveDataSubpaths) + connectorPartPrivateDataSubpaths + CapabilityLifecycle.protectedStores)

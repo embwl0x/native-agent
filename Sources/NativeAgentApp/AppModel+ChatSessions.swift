@@ -82,9 +82,9 @@ extension AppModel: MacChatSessionSelectionPort {
     /// Prepare the draft before routing so a handoff before the first session cannot lose its starter; preserve existing edits.
     @MainActor
     @discardableResult
-    func requestSkillBuild(starter: String = "Create a skill from this conversation: ") -> SkillLifecycleActionPresentation.Build {
+    func requestSkillBuild(starter: String = "Create a skill from this conversation: ") -> SkillBuildRequestPresentation.DraftOutcome {
         let sessionID = activeChatSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let outcome = SkillLifecycleActionPresentation.build(
+        let outcome = SkillBuildRequestPresentation.build(
             activeSessionID: sessionID,
             existingDraft: sessionID.isEmpty ? "" : chatDraft(for: sessionID)
         )
@@ -115,6 +115,7 @@ extension AppModel: MacChatSessionSelectionPort {
     ) async {
         let transactions = engine.transcripts.sessionTransactions
         var needsReplacement = false
+        var admittedIndex: [ChatSession]?
         _ = await transactions.indexRead.read({ () async -> Result<[ChatSession], Error> in
         do {
             let refreshed = try await load()
@@ -131,23 +132,23 @@ extension AppModel: MacChatSessionSelectionPort {
         }, publish: { result in
         switch result {
         case .success(let refreshed):
-            let knownSessionIds = Set(refreshed.map(\.id))
-            chatSessionIndexRefreshFailed = false
-            guard refreshed != engine.transcripts.sessions else { return }
+            let changed = refreshed != engine.transcripts.sessions
             engine.transcripts.publishSessionIndexRead(refreshed)
+            guard changed else { return }
             pruneChatDrafts()
-            pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
+            admittedIndex = refreshed
             if !activeChatSessionId.isEmpty, !refreshed.contains(where: { $0.id == activeChatSessionId && $0.archived != true }) {
                 chatSelectionGeneration += 1
                 activeChatSessionId = ""
                 needsReplacement = true
             }
-        case .failure:
-            if !chatSessionIndexRefreshFailed {
-                chatSessionIndexRefreshFailed = true
-            }
+        case .failure(let error):
+            engine.transcripts.publishSessionIndexFailure(error)
         }
         })
+        if let admittedIndex, engine.transcripts.sessions == admittedIndex {
+            await pruneStaleSessionChatState(knownSessionIds: Set(admittedIndex.map(\.id)))
+        }
         if needsReplacement {
             do { try await selectAutomaticChatSession() }
             catch { setFailureStatus(error, action: "open your conversation") }
@@ -166,12 +167,14 @@ extension AppModel: MacChatSessionSelectionPort {
     /// Without a conversation list, Simple follows the user's cross-surface anchor; local selection lasts until that anchor moves.
     @MainActor
     func followMovedAnchorInSimple() async {
-        engine.transcripts.refreshNavigationIdentity()
+        await engine.transcripts.refreshNavigationIdentity()
         guard SimpleViewMode.isShowing,
               let anchorId = engine.transcripts.conversationAnchor?.sessionId,
               anchorId != MacChatSelectionIntent.lastSeenAnchorSessionId else { return }
-        MacChatSelectionIntent.lastSeenAnchorSessionId = anchorId
-        guard anchorId != activeChatSessionId else { return }
+        if anchorId == activeChatSessionId {
+            MacChatSelectionIntent.lastSeenAnchorSessionId = anchorId
+            return
+        }
         if !engine.transcripts.sessions.contains(where: { $0.id == anchorId }) {
             let selection = chatSelectionGeneration
             await refreshChatSessionIndex()
@@ -182,6 +185,7 @@ extension AppModel: MacChatSessionSelectionPort {
         })
         else { return }
         await selectChatSession(session, userInitiated: false)
+        if activeChatSessionId == anchorId { MacChatSelectionIntent.lastSeenAnchorSessionId = anchorId }
     }
 
     @MainActor
@@ -199,10 +203,16 @@ extension AppModel: MacChatSessionSelectionPort {
         do {
             _ = try? await engine.trust.load()
             let transactions = engine.transcripts.sessionTransactions
-            _ = try await transactions.indexRead.read({ try await engine.transcripts.list() }, publish: { fetchedSessions in
-                chatSessionIndexRefreshFailed = false
-                engine.transcripts.publishSessionIndexRead(fetchedSessions)
+            let index = await transactions.indexRead.read({
+                do { return Result<[ChatSession], Error>.success(try await engine.transcripts.list()) }
+                catch { return .failure(error) }
+            }, publish: { result in
+                switch result {
+                case .success(let rows): engine.transcripts.publishSessionIndexRead(rows)
+                case .failure(let error): engine.transcripts.publishSessionIndexFailure(error)
+                }
             })
+            _ = try index.get()
             // Automatic selection requires a live direct row; only an explicit selection this launch may retain a helper.
             guard chatSelectionGeneration == selectionGenerationAtStart else { return }
             let currentIsLive = engine.transcripts.sessions.contains { $0.id == activeChatSessionId && $0.archived != true }
@@ -230,7 +240,7 @@ extension AppModel: MacChatSessionSelectionPort {
             if engine.transcripts.sessions == indexSnapshot {
                 pruneChatDrafts()
                 // Pruning must preserve unsent composer work.
-                pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
+                await pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
             }
             let targetSessionId = activeChatSessionId
             if targetSessionId == remembered { await firstRead?.value }
@@ -248,15 +258,19 @@ extension AppModel: MacChatSessionSelectionPort {
         await engine.readMountedTranscript(sessionId: sessionId, failure: { setFailureStatus($0, action: "refresh your chats") })
     }
 
-    func readDetachedTranscript(sessionId: String) async {
-        guard DetachedChatWindowController.shared.isDetached(sessionId) else { return }
-        var failures: [String] = []
-        await engine.readMountedTranscript(sessionId: sessionId, failure: { _ in failures = ["messages"] })
-        detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
-            previous: detachedChatRefreshStatus[sessionId], failedEndpoints: failures, at: Date())
+    @MainActor
+    func selectChatSession(id: String) async {
+        do {
+            guard let session = try await engine.transcripts.readSessionIdentity(id) else {
+                statusText = "This conversation is not in the current index."
+                return
+            }
+            await selectChatSession(session)
+        } catch {
+            setFailureStatus(error, action: "open your conversation")
+        }
     }
 
-    @MainActor
     func selectChatSession(_ session: ChatSession) async {
         await selectChatSession(session, userInitiated: true)
     }
@@ -289,6 +303,7 @@ extension AppModel: MacChatSessionSelectionPort {
             // Seed before publishing because the next suspension lets the composer start a turn that owns these rows.
             engine.transcripts.setMessages([], for: session.id)
             activeChatSessionId = session.id
+            MacChatSelectionIntent.lastSeenAnchorSessionId = engine.transcripts.conversationAnchor?.sessionId
             await refreshChatSessionIndex()
             migrateEmptySessionChatState(to: activeChatSessionId)
             statusText = "New chat session ready"
@@ -313,20 +328,11 @@ extension AppModel: QuietChatSessionCommandPort {
     var chatSessionTransactions: MacChatSessionTransactions { engine.transcripts.sessionTransactions }
     var chatCommandTranscripts: TranscriptsFacade { engine.transcripts }
     var quietPinnedChatSessionIDs: [String] { engine.transcripts.pinnedSessionIDs }
-    func quietChatIsDetached(_ sessionId: String) -> Bool {
-        DetachedChatWindowController.shared.isDetached(sessionId)
-    }
-    func openQuietChatWindow(sessionId: String) {
-        DetachedChatWindowController.shared.open(sessionId: sessionId)
-    }
-    func closeQuietChatWindow(sessionId: String) {
-        DetachedChatWindowController.shared.close(sessionId: sessionId)
-    }
-    func unpinQuietChatSession(_ sessionId: String) -> Bool? {
+    func unpinQuietChatSession(_ sessionId: String) async -> Bool? {
         do {
-            switch try engine.transcripts.closePinnedTab(sessionId) {
+            switch try await engine.transcripts.closePinnedTab(sessionId) {
             case .closed(let encoded):
-                _ = engine.transcripts.publishPins(encoded, includeTranscripts: false)
+                _ = await engine.transcripts.publishPins(encoded, includeTranscripts: false)
                 return true
             case .refusedAlreadyUnpinned: return false
             case .refusedInvalidSessionID: return nil

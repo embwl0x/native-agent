@@ -31,50 +31,41 @@ extension ProviderModelInfo {
 
 public enum OpenRouterModelCatalog {
     public enum CachedModelAvailability: Equatable, Sendable {
-        /// Only recent live-backed rows establish membership.
+        /// Saved provider rows establish membership for their bound credential.
         case available
-        /// Only recent complete live-backed rows establish absence.
+        /// Only a complete provider response establishes absence.
         case unavailable
-        /// No recent live-backed catalog exists; stale bytes or no list at all are insufficient evidence to reject a user pin.
+        /// No usable catalog establishes membership or absence.
         case unknown
     }
-    public static let endpoint = URL(string: "https://openrouter.ai/api/v1/models?output_modalities=text")!
+    public static let endpoint = URL(string: "https://openrouter.ai/api/v1/models?output_modalities=text")
 
-    /// ModelCatalogTTLCache owns TTL and backoff; OpenRouter supplies parsing, fetching and capabilities.
-    static let ttlCache = ModelCatalogTTLCache(
+    /// The cache owns credential binding and publication; OpenRouter owns the wire format.
+    static let cache = ModelCatalogCache(
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
-        readCache: { readDecodedCache(dataRoot: $0) },
+        readCache: { try readDecodedCache(dataRoot: $0) },
         providerConfigFile: "openrouter.json",
         fetchLive: { try await fetchLiveModels(key: $0, session: $1) }
     )
 
-    public static func models(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        session: URLSession = .shared,
-        refresh: Bool = false
-    ) async -> [ProviderModelInfo] {
-        await ttlCache.models(dataRoot: dataRoot, session: session, refresh: refresh)
-    }
-
     /// Discovery provenance retains whether the network was reached and why not.
     public static func modelsWithFreshness(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        session: URLSession = .shared,
+        session: URLSession = ProviderHTTP.session,
         refresh: Bool = false
     ) async -> ModelCatalogRead {
-        await ttlCache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
+        await cache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
-    /// Only a complete, recent catalog can establish that a model is absent.
+    /// Only a complete credential-bound catalog can establish that a model is absent.
     public static func cachedAvailability(
         of modelID: String,
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        now: Date = Date()
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> CachedModelAvailability {
         // Membership and completeness come from one decode of the same bytes.
         let decoded: DecodedModelCatalog?
-        do { decoded = try ttlCache.currentCache(dataRoot: dataRoot, now: now) }
+        do { decoded = try cache.currentCache(dataRoot: dataRoot) }
         catch { return .unknown }
         guard let cached = decoded,
               !cached.models.isEmpty else {
@@ -151,9 +142,10 @@ public enum OpenRouterModelCatalog {
         key: String?,
         session: URLSession
     ) async throws -> ModelCatalogFetch {
+        guard let endpoint else { throw URLError(.badURL) }
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
-        request.timeoutInterval = 10
+        request.timeoutInterval = .infinity
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("NativeAgent", forHTTPHeaderField: "X-Title")
         if let key {
@@ -161,7 +153,8 @@ public enum OpenRouterModelCatalog {
         }
 
         let (data, response) = try await session.data(for: request)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        let code = http.statusCode
         guard (200..<300).contains(code) else {
             throw ProviderRoutingError.invalidResponse(status: code)
         }
@@ -268,9 +261,9 @@ public enum OpenRouterModelCatalog {
 
     private static func providerModelSortKey(_ model: ProviderModelInfo) -> (provider: String, model: String) {
         let id = model.id.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parts = id.split(separator: "/", maxSplits: 1).map(String.init)
-        if parts.count == 2 {
-            return (provider: parts[0], model: parts[1])
+        let parts = id.split(separator: "/", maxSplits: 1)
+        if let provider = parts.first, let model = parts.dropFirst().first {
+            return (provider: String(provider), model: String(model))
         }
         return (provider: id, model: model.name)
     }
@@ -284,27 +277,30 @@ public enum OpenRouterModelCatalog {
     /// Path/mtime caching preserves fail-closed reads and exposes replacement or removal on the next read.
     static func cacheFault(dataRoot: URL) -> String? {
         do {
-            return try ttlCache.currentCache(dataRoot: dataRoot) == nil
+            return try cache.currentCache(dataRoot: dataRoot) == nil
                 ? "OpenRouter model catalog is not available. Refresh its models in Providers." : nil
         } catch { return error.localizedDescription }
     }
 
     static func readCache(dataRoot: URL) -> [ProviderModelInfo]? {
-        do { return try ttlCache.currentCache(dataRoot: dataRoot)?.models }
+        do { return try cache.currentCache(dataRoot: dataRoot)?.models }
         catch { return nil } // cacheFault carries the unavailable cause.
     }
 
     private static let decodedCache = ModelCatalogDecodeCache()
 
-    private static func readDecodedCache(dataRoot: URL) -> DecodedModelCatalog? {
-        decodedCache.read(url: cachePath(dataRoot: dataRoot)) {
-            decodeCache(data: $0)
+    private static func readDecodedCache(dataRoot: URL) throws -> DecodedModelCatalog? {
+        try decodedCache.read(url: cachePath(dataRoot: dataRoot)) {
+            guard let decoded = try decodeCache(data: $0) else {
+                throw ProviderRoutingError.configurationFailed("The saved OpenRouter model catalog is malformed. Refresh its models in Providers.")
+            }
+            return decoded
         }
     }
 
-    private static func decodeCache(data: Data) -> DecodedModelCatalog? {
-        guard let root = try? JSONValue.parse(data),
-              case .object(let obj) = root,
+    private static func decodeCache(data: Data) throws -> DecodedModelCatalog? {
+        let root = try JSONValue.parse(data)
+        guard case .object(let obj) = root,
               case .array(let rows)? = obj["models"] else {
             return nil
         }
@@ -348,7 +344,7 @@ public enum OpenRouterModelCatalog {
                 supports_fast: row["supports_fast"]?.boolValue
             )
         }
-        guard !models.isEmpty, models.count == rows.count else { return nil }
+        guard models.count == rows.count else { return nil }
         let fetchedAt: Date?
         if case .string(let raw)? = obj["updated_at"] {
             fetchedAt = ISO8601DateFormatter().date(from: raw)
@@ -366,7 +362,7 @@ public enum OpenRouterModelCatalog {
 
     private static func positiveInt(_ value: Any?) -> Int? {
         if let i = value as? Int, i > 0 { return i }
-        if let i = value as? Int64, i > 0 { return Int(i) }
+        if let i = value as? Int64, i > 0 { return Int(exactly: i) }
         if let d = value as? Double, d > 0 { return Int(exactly: d.rounded(.towardZero)) }
         if let s = value as? String, let d = Double(s), d > 0 { return Int(exactly: d.rounded(.towardZero)) }
         return nil

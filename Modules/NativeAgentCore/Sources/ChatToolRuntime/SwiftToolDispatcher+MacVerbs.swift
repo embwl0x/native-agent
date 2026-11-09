@@ -22,7 +22,7 @@ import NativeAgentShared
 
 extension SwiftToolDispatcher {
     /// A watch shares four-verb access for opening and each act; revoking screen control ends it.
-    public func openScreenWatch(turn: Turn, invocation: ChatToolInvocation, _ request: MacScreenWatch.Request, hands: Bool,
+    @concurrent public func openScreenWatch(turn: Turn, invocation: ChatToolInvocation, _ request: MacScreenWatch.Request, hands: Bool,
         surface: String) async throws -> MacScreenWatch {
         let verbs: @Sendable () async throws -> MacFourVerbs = {
             let access = try await self.fullMacToolAccess(turn: turn, surface: surface)
@@ -63,7 +63,7 @@ extension SwiftToolDispatcher {
 
     /// Screen and wait request read authority; act and go request write authority. All require Full Mac accessibility. Ordinary calls use words; workspace
     /// selections return exact bindings through the same gate and owner.
-    func impl_mac_four_verbs_tool(turn: Turn, invocation: ChatToolInvocation,
+    @concurrent func impl_mac_four_verbs_tool(turn: Turn, invocation: ChatToolInvocation,
         tool: String,
         input: [String: JSONValue],
         surface: String
@@ -219,7 +219,7 @@ extension SwiftToolDispatcher {
             reply = seen.ok ? pixels?.attach().map { line in
                 var detail = seen.detail
                 detail["pixel_capture_status"] = .string(line)
-                detail["image"] = pixels?.imageFrame
+                detail["image"] = pixels?.imageFrame ?? .null
                 return MacFourVerbsReply(ok: true, text: seen.text + "\n" + line, detail: detail)
             } ?? seen : seen
         case "act":
@@ -510,7 +510,7 @@ extension SwiftToolDispatcher {
     }
 
     /// Raw MacControl calls share accessibility admission; only injected actions carry body-bound, single-use capabilities. Clipboard reads stay redacted.
-    func impl_mac_control_tool(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
+    @concurrent func impl_mac_control_tool(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
         surface: String) async throws -> JSONValue {
         let access = try await fullMacToolAccess(turn: turn, surface: surface)
         guard access.accessibilityAllowed else {
@@ -551,7 +551,7 @@ extension SwiftToolDispatcher {
 
     /// Reads require Full Mac Accessibility authority; explicit paths also require file authority. Without a path, MacControl reads live window text and
     /// restores any viewport it moves. Explicit file reads retain workspace policy and sensitive-path fences.
-    func impl_mac_read_tool(turn: Turn, invocation: ChatToolInvocation,
+    @concurrent func impl_mac_read_tool(turn: Turn, invocation: ChatToolInvocation,
         tool: String,
         input: [String: JSONValue],
         surface: String

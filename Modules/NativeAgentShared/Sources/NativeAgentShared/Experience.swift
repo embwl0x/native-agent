@@ -6,7 +6,7 @@ import Foundation
 /// door's `<surface>:<destination>`.
 public struct Experience: Codable, Sendable, Equatable {
     public enum Kind: String, Codable, Sendable {
-        case heard, answer, act, decision, run, message
+        case heard, answer, act, decision, run, message, happening, thought
     }
 
     /// A raw record this experience stands on: its store, named the way that store names itself, and the record's id there. Never a copy.
@@ -79,6 +79,8 @@ public struct Experience: Codable, Sendable, Equatable {
     public var kind: Kind
     public var at = ""
     public var updatedAt: String?
+    /// The last committed event sequence, projected by the store; zero identifies a birth with no appended events.
+    public var sequence: Int64?
     public var progress: String?
     public var cause: [String]
     public var evidence: [Ref]
@@ -87,9 +89,14 @@ public struct Experience: Codable, Sendable, Equatable {
     public var addressedTo: [String]
     public var owes: [String: Obligation]
     public var claims: [Claim]
+    /// The change itself, on an experience of kind `happening`.
+    public var happening: Happening?
+    /// What it attended, on an experience of kind `thought`.
+    public var thought: Thought?
 
     public init(id: String, kind: Kind, cause: [String] = [], evidence: [Ref] = [], outcome: Outcome? = nil,
-                face: Face? = nil, addressedTo: [String] = [], owes: [String: Obligation] = [:], claims: [Claim] = []) {
+                face: Face? = nil, addressedTo: [String] = [], owes: [String: Obligation] = [:], claims: [Claim] = [],
+                happening: Happening? = nil, thought: Thought? = nil) {
         self.id = id
         self.kind = kind
         self.cause = cause
@@ -99,6 +106,8 @@ public struct Experience: Codable, Sendable, Equatable {
         self.addressedTo = addressedTo
         self.owes = owes
         self.claims = claims
+        self.happening = happening
+        self.thought = thought
     }
 
     /// It still owes something; the open experiences are the picture the agent is in.
@@ -146,7 +155,3 @@ public enum ObligationPhase: String, Codable, Sendable, Hashable {
         return from.contains(self) ? .allowed : .refused
     }
 }
-
-
-/// An experience this build cannot read is left out of what carries it, never fatal to it.
-extension Experience: LeftOutWhenUnreadable {}

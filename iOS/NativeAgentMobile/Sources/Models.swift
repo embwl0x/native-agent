@@ -83,3 +83,31 @@ typealias ProviderModelInfo = NativeAgentShared.ProviderModelInfo
 
 
 typealias ProviderTestResult = NativeAgentShared.ProviderTestResult
+
+/// One built-in guidance entry in the skills snapshot.
+struct SkillManifestEntry: Decodable, Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+    let description: String
+    let source: String
+    let bodyRevision: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, description, source, bodyRevision
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DecodingError.dataCorruptedError(forKey: .id, in: c, debugDescription: "Guidance requires its canonical identity.")
+        }
+        description = try c.decode(String.self, forKey: .description)
+        source = try c.decode(String.self, forKey: .source)
+        guard source == "persona_body" else {
+            throw DecodingError.dataCorruptedError(forKey: .source, in: c, debugDescription: "Built-in guidance requires persona_body provenance.")
+        }
+        bodyRevision = try c.decodeIfPresent(String.self, forKey: .bodyRevision)
+    }
+}

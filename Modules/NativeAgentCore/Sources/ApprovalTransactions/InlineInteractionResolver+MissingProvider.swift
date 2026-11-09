@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import ChatTurnContracts
 import NativeAgentShared
+import PersistenceCore
 import ProviderRouting
 
 // Blueprint: | `InlineInteractionResolver+MissingProvider.swift` | `InlineInteractionResolver.raiseMissingChatProvider`; Text-only resume. |

@@ -6,8 +6,8 @@ import PersistenceCore
 
 // MARK: - Subconscious vitals (Cognition)
 // Capsule drift may leave chat looking normal; measure bounded context snapshots and chemistry explicitly in Doctor. Name the window from this build's launch;
-// rates and variety describe observations without grading the agent's health. Read wording only from retained cognitiveCue; missing or clipped wording cannot
-// be measured.
+// rates and variety describe observations without grading the agent's health. The full feelingFrame and bounded cognitiveCue are measured independently;
+// missing or clipped wording cannot be measured.
 
 public struct SubconsciousVitalsCheck: DoctorCheck {
     public let id: String = "subconscious_vitals"
@@ -54,6 +54,9 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         var innerLines: [String: Int] = [:]
         var innerTurns = 0
         var wordingTurns = 0
+        var feelingFrameTurns = 0
+        var feelingFrameBytes = 0
+        var feelingFrameMaxBytes = 0
         var seenTurns = Set<String>()
 
         let moment = Date()
@@ -89,25 +92,37 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                     capsuleUnjudged.insert(key)
                 }
 
-                guard case .object(let cue)? = payload["cognitiveCue"],
-                      cue["truncated"]?.boolValue == false,
-                      let kind = cue["kind"]?.stringValue,
-                      let line = cue["line"]?.stringValue, !line.isEmpty else { return }
-                wordingTurns += 1
-                if kind == "felt" {
-                    let felt = line.split(separator: ",").map { Self.feelingWord(in: $0) }
-                        .filter { !$0.isEmpty }
-                    feltTurns += 1
-                    for word in felt { feltCounts[word, default: 0] += 1 }
+                var wordingMeasured = false
+                if case .object(let frame)? = payload["feelingFrame"], frame["complete"]?.boolValue == true,
+                   let paragraph = frame["paragraph"]?.stringValue, !paragraph.isEmpty,
+                   frame["bytes"]?.integerValue == Int64(paragraph.utf8.count),
+                   case .array(let words)? = frame["words"],
+                   words.allSatisfy({ $0.stringValue?.isEmpty == false }) {
+                    wordingMeasured = true
+                    feelingFrameTurns = min(feelingFrameTurns, Int.max - 1) + 1
+                    let bytes = paragraph.utf8.count
+                    feelingFrameBytes = min(feelingFrameBytes, Int.max - bytes) + bytes
+                    feelingFrameMaxBytes = max(feelingFrameMaxBytes, bytes)
+                    let felt = words.compactMap(\.stringValue).map { $0.lowercased() }
+                    if !felt.isEmpty { feltTurns = min(feltTurns, Int.max - 1) + 1 }
+                    for word in felt {
+                        feltCounts[word] = min(feltCounts[word, default: 0], Int.max - 1) + 1
+                    }
                 }
-                if kind == "sound" {
-                    soundTurns += 1
-                    if line.localizedCaseInsensitiveContains(rutMarker) { rutTurns += 1 }
+                if case .object(let cue)? = payload["cognitiveCue"], cue["truncated"]?.boolValue == false,
+                   let kind = cue["kind"]?.stringValue,
+                   let line = cue["line"]?.stringValue, !line.isEmpty {
+                    wordingMeasured = true
+                    if kind == "sound" {
+                        soundTurns += 1
+                        if line.localizedCaseInsensitiveContains(rutMarker) { rutTurns += 1 }
+                    }
+                    if kind == "inner" {
+                        innerTurns += 1
+                        innerLines[line.lowercased(), default: 0] += 1
+                    }
                 }
-                if kind == "inner" {
-                    innerTurns += 1
-                    innerLines[line.lowercased(), default: 0] += 1
-                }
+                if wordingMeasured { wordingTurns = min(wordingTurns, Int.max - 1) + 1 }
             }
         } catch {
             return CheckResult(source: TurnTraceWindowReader.source,
@@ -169,13 +184,16 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                     + " byte count and were UNJUDGED rather than counted as missing"
             )
         }
-        // Cadence can intentionally leave a turn quiet; attachment is an observation.
+        parts.append(
+            "feeling paragraph measured on \(feelingFrameTurns) of \(eligibleTurns.count) turn(s);"
+                + " \(feelingFrameBytes) UTF-8 bytes in full, largest \(feelingFrameMaxBytes) bytes"
+        )
         parts.append(
             "capsule wording measured on \(wordingTurns) of \(eligibleTurns.count) turn(s);"
                 + " missing or clipped wording is NOT MEASURED"
         )
 
-        let feltTotal = feltCounts.values.reduce(0, +)
+        let feltTotal = feltCounts.values.reduce(0) { min($0, Int.max - $1) + $1 }
         if feltTotal > 0, let top = feltCounts.max(by: { lhs, rhs in
             lhs.value == rhs.value ? lhs.key > rhs.key : lhs.value < rhs.value
         }) {
@@ -188,7 +206,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 )
             )
         } else {
-            parts.append("felt vocabulary UNMEASURED — no turn yielded a readable feeling line")
+            parts.append("felt vocabulary UNMEASURED — no complete feeling paragraph supplied described feeling words")
         }
 
         if soundTurns > 0 {
@@ -297,17 +315,5 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 missing.isEmpty ? nil : "unmeasured"
             )
         }
-    }
-
-    /// Strip the feeling's subject so a new topic cannot inflate apparent emotional vocabulary.
-    private static func feelingWord(in entry: some StringProtocol) -> String {
-        var value = entry.trimmingCharacters(in: .whitespaces)
-        for separator in [" — ", " – ", " - ", "—", "–"] {
-            if let range = value.range(of: separator) {
-                value = String(value[..<range.lowerBound])
-                break
-            }
-        }
-        return value.trimmingCharacters(in: .whitespaces).lowercased()
     }
 }

@@ -24,8 +24,35 @@ import DeviceSync
 
 @MainActor
 extension AppModel {
+    var providerSettingsIssue: String? {
+        face.slot(.settings).select("providers.issue", as: SettingsFace.self) { $0?.providers.error }
+    }
+
+    var providerAccounts: [ProviderInfo] {
+        face.slot(.settings).select("providers.accounts", as: SettingsFace.self) { $0?.providers.snapshot?.providers } ?? []
+    }
+
+    var providerReadiness: ProviderSettingsFace.Readiness {
+        face.slot(.settings).select("providers.readiness", as: SettingsFace.self) { $0?.providers.readiness } ?? .loading
+    }
+
+    /// Drawing readers are separate from the command getters, including while a saved frame is in flight.
+    var displayedChatModel: String {
+        pendingChatBrainSelection?.model
+            ?? face.slot(.settings).select("providers.chatModel", as: SettingsFace.self) { $0?.providers.chatChoice?.model } ?? ""
+    }
+
+    var displayedChatProvider: String {
+        pendingChatBrainSelection?.provider
+            ?? face.slot(.settings).select("providers.chatProvider", as: SettingsFace.self) { $0?.providers.chatChoice?.provider } ?? ""
+    }
+
+    var providerSavingChatBrain: Bool {
+        face.slot(.settings).select("providers.savingChatBrain", as: SettingsFace.self) { $0?.providers.isSavingChatBrain } == true
+    }
+
     func missingProviderChatGuidance() -> String? {
-        guard engine.providers.settings != nil, !engine.providers.hasReadyConnection else { return nil }
+        guard providerReadiness == .needsConnection else { return nil }
         return """
         No AI provider is connected yet, so I can't reply.
 
@@ -35,9 +62,15 @@ extension AppModel {
 
     @discardableResult
     func enqueueChatBrainDefaultsSave(_ choice: ProviderTurnChoice? = nil) -> UInt64? {
+        guard let requested = choice ?? currentChatBrainSelection,
+              !requested.provider.isEmpty, !requested.model.isEmpty else {
+            let detail = "Chat's saved account and model are unavailable. Read Providers before changing its choice."
+            setFailureStatus(detail, cause: ProviderRoutingError.underlying(detail))
+            return nil
+        }
         if let choice { pendingChatBrainSelection = choice }
         return engine.providers.enqueueChatBrainSave(
-            currentChatBrainSelection,
+            requested,
             failure: { UserFacingError.cause($0, action: "save the model choice") },
             completion: { [weak self] result, error in
                 guard let self else { return }
@@ -60,16 +93,27 @@ extension AppModel {
 
     @discardableResult
     func saveChatBrainDefaults() async -> ProvidersFacade.ChatBrainSaveResult {
-        guard let generation = enqueueChatBrainDefaultsSave() else {
-            return .unchanged(currentChatBrainSelection)
+        guard let selection = currentChatBrainSelection, !selection.provider.isEmpty, !selection.model.isEmpty else {
+            return .failed(message: "Chat's saved account and model are unavailable. Read Providers before changing its choice.")
         }
+        guard let generation = enqueueChatBrainDefaultsSave(selection) else { return .unchanged(selection) }
         let result = await engine.providers.awaitChatBrainSave(generation: generation)
         if case .failed(_, nil) = result { statusText = result.userMessage }
         return result
     }
 
-    private var currentChatBrainSelection: ProviderTurnChoice {
-        .init(provider: chatProvider, model: chatModel, reasoningEffort: chatReasoningEffort, fast: chatFastMode)
+    var currentChatBrainSelection: ProviderTurnChoice? {
+        pendingChatBrainSelection ?? engine.providers.chatBrainCanonicalSelection
+    }
+
+    func stageChatBrainSelection(model: String? = nil, reasoningEffort: String? = nil, fast: Bool? = nil) {
+        guard let selection = currentChatBrainSelection else {
+            let detail = "Chat's saved account and model are unavailable. Read Providers before changing its choice."
+            setFailureStatus(detail, cause: ProviderRoutingError.underlying(detail))
+            return
+        }
+        pendingChatBrainSelection = .init(provider: selection.provider, model: model ?? selection.model,
+            reasoningEffort: reasoningEffort ?? selection.reasoningEffort, fast: fast ?? selection.fast)
     }
 
     private func publishProviderCatalogStatusAfterBrainSave() {

@@ -137,12 +137,6 @@ public enum OpenAIExecutionControls {
         ) {
             body["reasoning"] = ["effort": effort]
         }
-        // Opt in even when the provider chooses its default reasoning effort. Summary frames renew the guard but never become answer/code content.
-        if call.lifetime.stallOnly {
-            var reasoning = body["reasoning"] as? [String: String] ?? [:]
-            reasoning["summary"] = "auto"
-            body["reasoning"] = reasoning
-        }
         if let tier = try serviceTier(
             model: model,
             requested: call.admission?.serviceTier,

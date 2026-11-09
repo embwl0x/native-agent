@@ -1,8 +1,8 @@
 import Foundation
 
-// Blueprint: | `ICloudDeliveryNudgeQueue.swift` | `ICloudDeliveryNudgeQueue`; Bounded single-flight wake hints. |
+// Blueprint: | `ICloudDeliveryNudgeQueue.swift` | Acceptance-triggered wake hints; one worker joins each KVS completion. |
 
-/// Nudges only prompt a transport drain; a bounded single worker prevents chat bursts spawning unbounded sleeping tasks.
+/// A wake hint reports local synchronization, never recipient acceptance.
 enum ICloudDeliveryNudgeDisposition: Sendable, Equatable {
     case synchronized
     case unavailable
@@ -19,41 +19,26 @@ actor ICloudDeliveryNudgeQueue {
     typealias NudgeSender = @Sendable (String) async -> Bool
     typealias OutcomeObserver = @Sendable (ICloudDeliveryNudgeOutcome) async -> Void
 
-    private struct PendingNudge: Sendable {
-        let messageID: String
-        let dueAt: Date
-    }
-
-    private let delaysNanoseconds: [UInt64]
     private let isAvailable: Availability
     private let sendNudge: NudgeSender
     private let observeOutcome: OutcomeObserver
 
-    private var pending: [PendingNudge] = []
+    private var pending: [String] = []
     private var workerTask: Task<Void, Never>?
 
     init(
-        delaysNanoseconds: [UInt64] = ICloudDeliveryNudgePlan.delaysNanoseconds,
         isAvailable: @escaping Availability,
         sendNudge: @escaping NudgeSender,
         observeOutcome: @escaping OutcomeObserver = { _ in }
     ) {
-        self.delaysNanoseconds = delaysNanoseconds.filter { $0 > 0 }
         self.isAvailable = isAvailable
         self.sendNudge = sendNudge
         self.observeOutcome = observeOutcome
     }
 
-    /// One worker owns all delayed nudges so bursts cannot multiply tasks per message and delay.
+    /// Each acceptance event queues one wake; the active send owns its actual completion.
     func schedule(for messageID: String) {
-        let scheduledAt = Date()
-        for delayNanoseconds in delaysNanoseconds {
-            let delaySeconds = Double(delayNanoseconds) / 1_000_000_000
-            pending.append(PendingNudge(
-                messageID: messageID,
-                dueAt: scheduledAt.addingTimeInterval(delaySeconds)
-            ))
-        }
+        pending.append(messageID)
         startWorkerIfNeeded()
     }
 
@@ -76,41 +61,29 @@ actor ICloudDeliveryNudgeQueue {
             startWorkerIfNeeded()
         }
         while !Task.isCancelled {
-            guard let next = pending.map(\.dueAt).min() else { return }
-            let remaining = next.timeIntervalSinceNow
-            if remaining > 0 {
-                try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-            }
-
-            let now = Date()
-            let due = pending.filter { $0.dueAt <= now }
-            guard !due.isEmpty else { continue }
-            pending.removeAll { $0.dueAt <= now }
-            for nudge in due {
-                guard !Task.isCancelled else { return }
-                await deliver(nudge)
-            }
+            guard !pending.isEmpty else { return }
+            let messageID = pending.removeFirst()
+            await deliver(messageID)
         }
     }
 
-    private func deliver(_ nudge: PendingNudge) async {
+    private func deliver(_ messageID: String) async {
         let outcome: ICloudDeliveryNudgeOutcome
         if await isAvailable() {
-            if await sendNudge(nudge.messageID) {
+            if await sendNudge(messageID) {
                 outcome = ICloudDeliveryNudgeOutcome(
-                    messageID: nudge.messageID,
+                    messageID: messageID,
                     disposition: .synchronized
                 )
             } else {
                 outcome = ICloudDeliveryNudgeOutcome(
-                    messageID: nudge.messageID,
+                    messageID: messageID,
                     disposition: .synchronizeFailed
                 )
             }
         } else {
             outcome = ICloudDeliveryNudgeOutcome(
-                messageID: nudge.messageID,
+                messageID: messageID,
                 disposition: .unavailable
             )
         }

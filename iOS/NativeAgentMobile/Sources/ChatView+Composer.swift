@@ -140,88 +140,95 @@ extension ChatView {
             || !selectedPhotoItems.isEmpty || isLoadingPhotos || fileLoadID != nil
     }
 
-    private var queuedSendStrip: some View {
+    @ViewBuilder private var queuedSendStrip: some View {
         let turns = queuedTurns
-        let next = turns[0]
-        let primaryAction = QueuedSendStripAction.resolve(
-            id: next.id,
-            isLoading: store.isLoading
-        )
-        return HStack(spacing: 10) {
-            Text(!store.canDeliverQueuedSend(next) ? "Saved for another pairing" : store.isSelectedQueuePaused ? "Paused" : turns.count > 1
-                ? "Next of \(turns.count)" : "Next")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(AlivePalette.secondary)
-                .fixedSize()
+        if let next = turns.first {
+            let primaryAction = QueuedSendStripAction.resolve(
+                id: next.id,
+                isLoading: store.isLoading
+            )
+            HStack(spacing: 10) {
+                Text(!store.canDeliverQueuedSend(next) ? "Saved for another pairing" : store.isSelectedQueuePaused ? "Paused" : turns.count > 1
+                    ? "Next of \(turns.count)" : "Next")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(AlivePalette.secondary)
+                    .fixedSize()
 
-            Text(next.preview)
-                .font(.footnote)
-                .foregroundStyle(AlivePalette.text)
-                .lineLimit(1)
-                .truncationMode(.tail)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(next.preview)
+                        .font(.footnote)
+                        .foregroundStyle(AlivePalette.text)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if let failure = next.steeringFailure {
+                        Text(failure).font(.caption).foregroundStyle(AlivePalette.secondary)
+                    }
+                }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            Menu {
-                Button {
-                    if !store.canDeliverQueuedSend(next) {
-                        store.submitSavedSendToCurrentPairing(next.id, client: bridgeClient)
-                    } else { primaryAction.apply(
-                        onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
-                        onSend: { store.resumeQueuedSends(startingWith: $0) }
-                    ) }
-                } label: {
-                    Label(store.canDeliverQueuedSend(next) ? primaryAction.primaryTitle : "Submit to this Mac as new", systemImage: "arrow.up")
-                }
-                Button(role: .destructive) {
-                    store.removeQueuedSend(next.id)
-                } label: {
-                    Label("Remove", systemImage: "xmark")
-                }
-                if turns.count > 1 {
-                    Section(AliveWords.count(turns.count, "message") + " waiting") {
-                        ForEach(Array(turns.enumerated().dropFirst()), id: \.element.id) { index, queued in
-                            let action = QueuedSendStripAction.resolve(
-                                id: queued.id,
-                                isLoading: store.isLoading
-                            )
-                            Button {
-                                if !store.canDeliverQueuedSend(queued) {
-                                    store.submitSavedSendToCurrentPairing(queued.id, client: bridgeClient)
-                                } else { action.apply(
-                                    onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
-                                    onSend: { store.resumeQueuedSends(startingWith: $0) }
-                                ) }
-                            } label: {
-                                Label(store.canDeliverQueuedSend(queued) ? action.menuTitle(position: index + 1, preview: queued.preview)
-                                    : "Submit to this Mac as new: \(queued.preview)", systemImage: "arrow.up")
-                            }
-                            Button(role: .destructive) {
-                                store.removeQueuedSend(queued.id)
-                            } label: {
-                                Label("Remove \(index + 1): \(queued.preview)", systemImage: "xmark")
+                Menu {
+                    Button {
+                        if !store.canDeliverQueuedSend(next) {
+                            store.submitSavedSendToCurrentPairing(next.id, client: bridgeClient)
+                        } else { primaryAction.apply(
+                            onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
+                            onSend: { store.resumeQueuedSends(startingWith: $0) }
+                        ) }
+                    } label: {
+                        Label(store.canDeliverQueuedSend(next) ? primaryAction.primaryTitle : "Submit to this Mac as new", systemImage: "arrow.up")
+                    }
+                    Button(role: .destructive) {
+                        store.removeQueuedSend(next.id)
+                    } label: {
+                        Label("Remove", systemImage: "xmark")
+                    }
+                    if turns.count > 1 {
+                        Section(AliveWords.count(turns.count, "message") + " waiting") {
+                            ForEach(Array(turns.enumerated().dropFirst()), id: \.element.id) { index, queued in
+                                let action = QueuedSendStripAction.resolve(
+                                    id: queued.id,
+                                    isLoading: store.isLoading
+                                )
+                                Button {
+                                    if !store.canDeliverQueuedSend(queued) {
+                                        store.submitSavedSendToCurrentPairing(queued.id, client: bridgeClient)
+                                    } else { action.apply(
+                                        onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
+                                        onSend: { store.resumeQueuedSends(startingWith: $0) }
+                                    ) }
+                                } label: {
+                                    Label(store.canDeliverQueuedSend(queued) ? action.menuTitle(position: index + 1, preview: queued.preview)
+                                        : "Submit to this Mac as new: \(queued.preview)", systemImage: "arrow.up")
+                                }
+                                if let failure = queued.steeringFailure { Text(failure) }
+                                Button(role: .destructive) {
+                                    store.removeQueuedSend(queued.id)
+                                } label: {
+                                    Label("Remove \(index + 1): \(queued.preview)", systemImage: "xmark")
+                                }
                             }
                         }
                     }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(AlivePalette.text)
+                        .frame(width: 30, height: 30)
+                        .background(AlivePalette.fill, in: Circle())
+                        .overlay(Circle().strokeBorder(AlivePalette.rim, lineWidth: 1))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AlivePalette.text)
-                    .frame(width: 30, height: 30)
-                    .background(AlivePalette.fill, in: Circle())
-                    .overlay(Circle().strokeBorder(AlivePalette.rim, lineWidth: 1))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
+                .accessibilityLabel("Queued message actions")
             }
-            .accessibilityLabel("Queued message actions")
+            .padding(.leading, 12)
+            .padding(.trailing, 0)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(AlivePalette.divider).frame(height: 1).padding(.horizontal, 8)
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Send-next queue, \(turns.count) queued")
         }
-        .padding(.leading, 12)
-        .padding(.trailing, 0)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(AlivePalette.divider).frame(height: 1).padding(.horizontal, 8)
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Send-next queue, \(turns.count) queued")
     }
 
     private var pendingPhotoStrip: some View {
@@ -551,24 +558,117 @@ final class MobileChatDraft {
 }
 
 private struct MobileChatComposerField: View {
-    @Bindable var draft: MobileChatDraft
+    let draft: MobileChatDraft
     let placeholder: String
-    let focused: FocusState<Bool>.Binding
+    @Binding var focused: Bool
     let accessibilitySize: Bool
     let isSwitchingSession: Bool
     let onSubmit: () -> Void
 
     var body: some View {
-        TextField(placeholder, text: $draft.text,
-            prompt: Text(placeholder).foregroundStyle(AlivePalette.secondary), axis: .vertical)
-            .textFieldStyle(.plain)
-            .focused(focused)
-            .font(.system(.body, weight: .regular))
-            .lineLimit(accessibilitySize ? 1...8 : 1...5)
+        MobileComposerTextView(text: draft.text, placeholder: placeholder, isFocused: focused, maxLines: accessibilitySize ? 8 : 5,
+                               enabled: !isSwitchingSession, onChange: { draft.text = $0 }, onFocus: { focused = $0 }, onSubmit: onSubmit)
+            .overlay(alignment: .topLeading) {
+                if draft.isEmpty {
+                    Text(placeholder)
+                        .font(.system(.body, weight: .regular))
+                        .foregroundStyle(AlivePalette.secondary)
+                        .lineLimit(1)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
             .padding(.vertical, 11)
             .frame(minHeight: 44)
-            .submitLabel(.send)
-            .onSubmit(onSubmit)
-            .disabled(isSwitchingSession)
+    }
+}
+
+/// A vertical SwiftUI TextField runs full text layout for every size its stack proposes, several times a keystroke.
+/// This view lays the text out once per change and answers every other proposal from that one measure.
+private struct MobileComposerTextView: UIViewRepresentable {
+    let text: String
+    let placeholder: String
+    let isFocused: Bool
+    let maxLines: Int
+    let enabled: Bool
+    let onChange: (String) -> Void
+    let onFocus: (Bool) -> Void
+    let onSubmit: () -> Void
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: MobileComposerTextView
+        var measured: [CGFloat: CGFloat] = [:]
+        var measuredFont: UIFont?
+        var width: CGFloat = 0
+        init(_ parent: MobileComposerTextView) { self.parent = parent }
+
+        func textViewDidChange(_ textView: UITextView) {
+            measured.removeAll()
+            parent.onChange(textView.text)
+            textView.invalidateIntrinsicContentSize()
+        }
+        func textView(_ textView: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String) -> Bool {
+            guard text == "\n", textView.markedTextRange == nil else { return true }
+            parent.onSubmit()
+            return false
+        }
+        func textViewDidBeginEditing(_ textView: UITextView) { parent.onFocus(true) }
+        func textViewDidEndEditing(_ textView: UITextView) { parent.onFocus(false) }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.delegate = context.coordinator
+        view.backgroundColor = .clear
+        view.textContainerInset = .zero
+        view.textContainer.lineFragmentPadding = 0
+        view.font = .preferredFont(forTextStyle: .body)
+        view.adjustsFontForContentSizeCategory = true
+        view.textColor = .label
+        view.tintColor = .label
+        view.returnKeyType = .send
+        view.isScrollEnabled = false
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        context.coordinator.parent = self
+        if view.text != text {
+            view.text = text
+            context.coordinator.measured.removeAll()
+            view.invalidateIntrinsicContentSize()
+        }
+        view.isEditable = enabled
+        view.accessibilityLabel = placeholder
+        guard isFocused != view.isFirstResponder else { return }
+        // First responder changes cannot run inside a view update; the latest wish decides when this runs.
+        let coordinator = context.coordinator
+        Task { @MainActor [weak view] in
+            guard let view, coordinator.parent.isFocused != view.isFirstResponder else { return }
+            if coordinator.parent.isFocused { view.becomeFirstResponder() } else { view.resignFirstResponder() }
+        }
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView view: UITextView, context: Context) -> CGSize? {
+        let coordinator = context.coordinator
+        if coordinator.measuredFont != view.font {
+            coordinator.measured.removeAll()
+            coordinator.measuredFont = view.font
+        }
+        let line = ceil(view.font?.lineHeight ?? 22)
+        var width = proposal.width ?? coordinator.width
+        if !width.isFinite { width = coordinator.width }
+        // The stack's probes at no width need no text layout: the field takes whatever room is left.
+        guard width > 44 else { return CGSize(width: proposal.width ?? 44, height: line) }
+        coordinator.width = width
+        let full = coordinator.measured[width] ?? ceil(view.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height)
+        coordinator.measured[width] = full
+        let limit = line * CGFloat(maxLines)
+        let scrolls = full > limit
+        if view.isScrollEnabled != scrolls { view.isScrollEnabled = scrolls }
+        return CGSize(width: proposal.width.map { $0.isFinite ? $0 : width } ?? width, height: min(full, limit))
     }
 }

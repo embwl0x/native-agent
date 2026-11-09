@@ -15,7 +15,7 @@ public final class ChatGPTTransport: LLMTransport {
 
     public let providerId: String = "openai_oauth_direct"
 
-    public static let productionSession: URLSession = makeProductionSession()
+    public static let productionSession: URLSession = ProviderHTTP.makeSession()
     /// The backend requires the official Codex client identity for routing; a neutral originator receives overload failures.
     public static let codexBackendOriginator = "codex_cli_rs"
     public static var codexBackendUserAgent: String {
@@ -29,8 +29,8 @@ public final class ChatGPTTransport: LLMTransport {
         return "codex_cli_rs/0.145.0 NativeAgent/\(nativeAgentVersion)"
     }
     internal let session: URLSession
-    private let endpoint: URL
-    internal let refreshEndpoint: URL
+    private let endpoint: URL?
+    internal let refreshEndpoint: URL?
     internal let authPathOverride: URL?
     internal let dataRootOverride: URL?
     internal let openAIPublicClientID: String
@@ -41,18 +41,10 @@ public final class ChatGPTTransport: LLMTransport {
     static func sharedRefreshActor(for path: URL) -> AsyncSerialQueue {
         refreshQueueRegistry.queue(for: path)
     }
-    static func makeProductionSession(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> URLSession {
-        OAuthProductionSession.make(
-            requestTimeout: environment["NATIVE_AGENT_OPENAI_OAUTH_REQUEST_TIMEOUT_SEC"],
-            resourceTimeout: environment["NATIVE_AGENT_OPENAI_OAUTH_RESOURCE_TIMEOUT_SEC"]
-        )
-    }
     public init(
         session: URLSession = ChatGPTTransport.productionSession,
-        endpoint: URL = URL(string: "https://chatgpt.com/backend-api/codex/responses")!,
-        refreshEndpoint: URL = URL(string: ProviderOAuthConfig.openai.tokenEndpoint)!,
+        endpoint: URL? = URL(string: "https://chatgpt.com/backend-api/codex/responses"),
+        refreshEndpoint: URL? = URL(string: ProviderOAuthConfig.openai.tokenEndpoint),
         authPathOverride: URL? = nil,
         dataRootOverride: URL? = nil,
         openAIPublicClientID: String = ProviderOAuthConfig.openai.clientId,
@@ -95,7 +87,7 @@ public final class ChatGPTTransport: LLMTransport {
         guard !safe.isEmpty else { return nil }
         return String(safe.prefix(128))
     }
-    private func responsesRequest(accessToken: String, call: LLMCall) throws -> URLRequest {
+    private func responsesRequest(endpoint: URL, accessToken: String, call: LLMCall) throws -> URLRequest {
         guard let accountID = try currentAccountID(accessToken: accessToken) else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
@@ -114,13 +106,8 @@ public final class ChatGPTTransport: LLMTransport {
         }
         return req
     }
-    /// Retain the failing token so refresh can reuse another caller's completed rotation.
-    public func codexAccessContext(
-        forceRefresh: Bool = false,
-        staleToken: String? = nil
-    ) async throws -> CodexOAuthAccessContext {
-        let access = try await ensureFreshAccessToken(
-            forceRefresh: forceRefresh, staleToken: staleToken)
+    public func codexAccessContext() async throws -> CodexOAuthAccessContext {
+        let access = try await ensureFreshAccessToken()
         guard let accountID = try currentAccountID(accessToken: access) else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
@@ -151,6 +138,10 @@ public final class ChatGPTTransport: LLMTransport {
         let endpoint = self.endpoint
         return AsyncThrowingStream { continuation in
             let task = Task {
+                guard let endpoint else {
+                    continuation.finish(throwing: LLMError.providerError(message: "ChatGPT response endpoint is invalid; correct its provider configuration."))
+                    return
+                }
                 // Validate inside the nonthrowing stream factory so an invalid model reaches the caller as a thrown finish.
                 let coercedModel: String
                 let substitutedFrom: String?
@@ -164,82 +155,70 @@ public final class ChatGPTTransport: LLMTransport {
                     continuation.finish(throwing: error)
                     return
                 }
-                var forceTokenRefresh = false
-        // Retain the sent token to detect a rotation completed by another caller.
-        let requestAccount = OAuthRequestAccount()
-        var lastSentAccessToken: String?
-                for attempt in 0...1 {
+                let requestAccount = OAuthRequestAccount()
+                do {
+                    try Task.checkCancellation()
+                    let access: String
                     do {
-                        try Task.checkCancellation()
-                        let access: String
-                        do {
-                            access = try await ensureFreshAccessToken(
-                                forceRefresh: forceTokenRefresh,
-                                staleToken: lastSentAccessToken, requestAccount: requestAccount
-                            )
-                            forceTokenRefresh = false
-                            lastSentAccessToken = access
-                        } catch is CancellationError { throw CancellationError() }
-                        catch let err as LLMError { throw err }
-                        catch let err as any ProviderFailureWrapping { throw err }
-                        catch {
-                            throw ProviderFailure.Diagnostic(cause: .routingUnavailable,
-                                detail: "\(resolveAuthPath().path): \(ProviderFailure.diagnosticDescription(error))")
-                        }
-                        var req = try responsesRequest(accessToken: access, call: call)
-
-                        guard let accountRow = accountModel(coercedModel, preview: call.preview) else {
-                            throw LLMError.providerError(
-                                message: "The selected ChatGPT account's controls for \(coercedModel) are unavailable. Refresh its models in Providers.")
-                        }
-                        let bodyDict = try Self.buildResponsesBodyFromMessages(
-                            model: coercedModel, messages: messages, system: system, tools: tools,
-                            supportedEfforts: accountRow.supportedReasoningEfforts,
-                            supportsFast: accountRow.supportsFast, call: call
+                        access = try await ensureFreshAccessToken(
+                            requestAccount: requestAccount
                         )
-                        do {
-                            req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
-                        } catch {
-                            throw LLMError.underlying(message: "encode body: \(error)")
-                        }
-                        let requestStartNs = DispatchTime.now().uptimeNanoseconds
-                        let bytes: URLSession.AsyncBytes
-                        let response: URLResponse
-                        do {
-                            (bytes, response) = try await ProviderWire.open(session, req, call: call)
-                        } catch {
-                            throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
-                        }
-                        defer { bytes.task.cancel() }
-                        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                        if status == 401 {
-                            if attempt == 0 {
-                                forceTokenRefresh = true
-                                continue
-                            }
-                            throw exhaustedCredentialError()
-                        }
-                        if !(200..<300).contains(status) {
-                            let body = try await Self.boundedBodyString(from: bytes)
-                            try throwIfChatCompletionsError(
-                                status: status, data: Data(body.utf8), response: response)
-                        }
-                        try await Self.consumeResponsesStream(
-                            bytes: bytes, request: req, model: coercedModel,
-                            providerId: self.providerId, telemetry: self.telemetry,
-                            requestStartNs: requestStartNs, substitutedFrom: substitutedFrom,
-                            providerLabel: "openai oauth", errorPrefix: "chatgpt-backend",
-                            networkError: { self.transientNetworkError($0, endpoint: endpoint, operation: "streamMessages") },
-                            continuation: continuation, call: call
-                        )
-                        continuation.finish()
-                        return
-                    } catch {
-                        continuation.finish(throwing: error)
-                        return
+                    } catch is CancellationError { throw CancellationError() }
+                    catch let err as LLMError { throw err }
+                    catch let err as any ProviderFailureWrapping { throw err }
+                    catch {
+                        throw ProviderFailure.Diagnostic(cause: .routingUnavailable,
+                            detail: "\(resolveAuthPath().path): \(ProviderFailure.diagnosticDescription(error))")
                     }
+                    var req = try responsesRequest(endpoint: endpoint, accessToken: access, call: call)
+
+                    guard let accountRow = accountModel(coercedModel, preview: call.preview) else {
+                        throw LLMError.providerError(
+                            message: "The selected ChatGPT account's controls for \(coercedModel) are unavailable. Refresh its models in Providers.")
+                    }
+                    let bodyDict = try Self.buildResponsesBodyFromMessages(
+                        model: coercedModel, messages: messages, system: system, tools: tools,
+                        supportedEfforts: accountRow.supportedReasoningEfforts,
+                        supportsFast: accountRow.supportsFast, call: call
+                    )
+                    do {
+                        req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
+                    } catch {
+                        throw LLMError.underlying(message: "encode body: \(error)")
+                    }
+                    let requestStartNs = DispatchTime.now().uptimeNanoseconds
+                    let bytes: ProviderHTTPBytes
+                    let response: URLResponse
+                    do {
+                        (bytes, response) = try await ProviderWire.open(session, req, call: call)
+                    } catch {
+                        throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
+                    }
+                    defer { bytes.cancel() }
+                    guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+                    let status = http.statusCode
+                    if status == 401 {
+                        throw exhaustedCredentialError()
+                    }
+                    if !(200..<300).contains(status) {
+                        let body = try await Self.boundedBodyString(from: bytes)
+                        try throwIfChatCompletionsError(
+                            status: status, data: Data(body.utf8), response: response)
+                    }
+                    try await Self.consumeResponsesStream(
+                        bytes: bytes, request: req, model: coercedModel,
+                        providerId: self.providerId, telemetry: self.telemetry,
+                        requestStartNs: requestStartNs, substitutedFrom: substitutedFrom,
+                        providerLabel: "openai oauth", errorPrefix: "chatgpt-backend",
+                        networkError: { self.transientNetworkError($0, endpoint: endpoint, operation: "streamMessages") },
+                        continuation: continuation, call: call
+                    )
+                    continuation.finish()
+                    return
+                } catch {
+                    continuation.finish(throwing: error)
+                    return
                 }
-                continuation.finish(throwing: LLMError.notConfigured(provider: "openai_oauth_direct"))
             }
             call.replyWork?.own(task)
             continuation.onTermination = { _ in task.cancel() }
@@ -264,12 +243,12 @@ public final class ChatGPTTransport: LLMTransport {
                 """)
     }
     private static func boundedBodyString(
-        from bytes: URLSession.AsyncBytes,
+        from bytes: ProviderHTTPBytes,
         maxBytes: Int = 4_096
     ) async throws -> String {
         // One lookahead byte preserves the existing truncation annotation.
         let collected = try await ProviderErrorBodyDrain.read(
-            bytes, maxBytes: maxBytes + 1, timeout: 2.0
+            bytes, maxBytes: maxBytes + 1
         )
         var text = String(decoding: collected.prefix(maxBytes), as: UTF8.self)
         if collected.count > maxBytes { text += "\n...(truncated)" }

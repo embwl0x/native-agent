@@ -1,33 +1,37 @@
 import Foundation
-// Blueprint: | `TranscriptBuild.swift` | A conversation's face built once for every door: replies, tool runs with the agent's words, cards under their host reply, approvals where they were asked, quiet gaps, other-room rows, and each door's own physics |
+// Blueprint: | `TranscriptBuild.swift` | Content-keyed conversation blocks for the press and phone |
 
 /// What a door shows of one conversation. The rows are the transcript's own (the Mac's, or the records the phone received), each read through
 /// its face; the agent's words come from the presentation part; cards are the ids a row carries. The door adds only its physics.
 public struct TranscriptThread<Row: TranscriptRow> {
     public var groups: [TranscriptGroup<Row>]
     public var exchanges: [OtherRoomExchange]
-    /// What the Mac read of a row. The Mac reads it in process; the phone takes the row's carried face, else `TranscriptRowFace.plain`.
+    /// Mac-owned presentation, or the explicitly local row's own presentation.
     public var face: (Row) -> TranscriptRowFace
     /// The agent's words by key ("headline:<first fold row id>", "detail:<row id>") when the door holds them live; a face's carried words otherwise.
-    public var words: (String) -> String?
+    public var words: ((String) -> String?)?
     /// The card ids a row carries, in mount order.
     public var cards: (String) -> [String]
     /// Changes when a face's inputs beyond its row change, so built groups read their faces again.
     public var faceEpoch: String
+    /// The press's completed markdown and open tail, already parsed for the live row.
+    public var livePieces: [String: [TranscriptPiece]]
     /// Asked once per run content whose headline is not prepared yet (the Mac prepares it; the phone receives it).
     public var wanted: (([Row]) -> Void)?
     public var door: TranscriptDoor
 
     public init(groups: [TranscriptGroup<Row>], exchanges: [OtherRoomExchange] = [], face: @escaping (Row) -> TranscriptRowFace,
-                words: @escaping (String) -> String? = { _ in nil }, cards: @escaping (String) -> [String] = { _ in [] },
-                faceEpoch: String = "", wanted: (([Row]) -> Void)? = nil, door: TranscriptDoor = TranscriptDoor()) {
+                words: ((String) -> String?)? = nil, cards: @escaping (String) -> [String] = { _ in [] },
+                faceEpoch: String = "", livePieces: [String: [TranscriptPiece]] = [:],
+                wanted: (([Row]) -> Void)? = nil, door: TranscriptDoor = TranscriptDoor()) {
         (self.groups, self.exchanges, self.face, self.words, self.cards) = (groups, exchanges, face, words, cards)
         (self.faceEpoch, self.wanted, self.door) = (faceEpoch, wanted, door)
+        self.livePieces = livePieces
     }
 }
 
 /// One door's physics around the conversation: never a second reading of it.
-public struct TranscriptDoor: Sendable {
+public struct TranscriptDoor: Equatable, Sendable {
     /// The reply streaming here: its first word block is its waiting line until words arrive, so the words replace it in place.
     public struct Live: Equatable, Sendable {
         public var rowID: String
@@ -52,7 +56,6 @@ public struct TranscriptDoor: Sendable {
 public enum TranscriptBuilder {
     /// The whole conversation. A group unchanged since the last build reuses its blocks; ids never depend on anything but the row, so an
     /// unchanged conversation is no edit and a reader's place holds.
-    @MainActor
     public static func build<Row>(_ thread: TranscriptThread<Row>, cache: TranscriptBuildCache<Row>) -> TranscriptDocument {
         let groups = thread.groups
         let hosts = TranscriptGrouping.cardHosts(groups)
@@ -60,7 +63,6 @@ public enum TranscriptBuilder {
         let rooms = thread.exchanges.isEmpty ? [:] : OtherRoomExchange.anchored(thread.exchanges, to: groups.compactMap { group in
             group.messages.first.flatMap { row in UserDisplayFormatters.parseISOTimestamp(row.createdAt).map { (id: group.id, at: $0) } }
         })
-        cache.pass += 1
         var blocks = thread.door.leading
         blocks.reserveCapacity(blocks.count + groups.count * 2)
         for group in groups {
@@ -71,12 +73,11 @@ public enum TranscriptBuilder {
         for exchange in rooms[""] ?? [] { blocks.append(roomBlock(exchange)) }
         blocks += thread.door.trailing
         if !blocks.isEmpty { blocks[0].lead = .none }
-        cache.trim()
+        cache.trim(retaining: Set(groups.map(\.id)))
         return TranscriptDocument(blocks: blocks)
     }
 
-    /// The blocks of one streaming reply from the text revealed so far. For a finished text they equal what `build` gives that row's words
-    /// (same ids, kinds and runs), so settling a reply is no edit.
+    /// Live blocks close unfinished Markdown; settlement restores the authored text with the same block identities.
     public static func liveBlocks(messageID: String, role: String, text: String, lead: TranscriptBlock.Lead) -> [TranscriptBlock] {
         TranscriptDocument.stamp(TranscriptDocument.replyPieces(TranscriptGrouping.readableText(text), ink: .primary, edge: true),
                                  messageID: messageID, role: role, lead: lead)
@@ -125,11 +126,9 @@ public enum TranscriptBuilder {
 
     // MARK: Rows
 
-    /// One row that is not a tool: its images, voice notes and files, then its words (or, streaming, its waiting line), then the cards it
-    /// hosts. The person's words sit right in one bubble under their tag; a delegated reply's envelope folds; everything else is a reply,
-    /// with a left-seated row's bridge or provenance as its quiet first line. A voice note carries the words, so a row with one draws none.
+    /// Row content and attachments retain their order; voice notes carry their own words.
     static func rowBlocks(_ row: some TranscriptRow, face: TranscriptRowFace, slots: [TranscriptCardSlot],
-                          live: TranscriptDoor.Live?) -> [TranscriptBlock] {
+                          live: TranscriptDoor.Live?, prepared: [TranscriptPiece]?) -> [TranscriptBlock] {
         let id = row.id
         let role = row.role
         let text = face.words ?? row.content
@@ -157,23 +156,22 @@ public enum TranscriptBuilder {
         let lead: TranscriptBlock.Lead = out.isEmpty ? .message : .paragraph
         let readable = TranscriptGrouping.readableText(text)
         let hasWords = readable.contains { !$0.isWhitespace }
-        if let live, live.rowID == id, !hasWords {
+        if let live, live.rowID == id, !hasWords, prepared?.isEmpty != false {
             out.append(TranscriptBlock(id: id + "#0", messageID: id, role: role,
                                        kind: .reply(runs: [TranscriptRun(text: TranscriptDocument.lineBreaks(live.waiting))], ink: .quiet),
                                        source: "", lead: lead, foldGroup: nil))
             return out + cardBlocks(slots)
         }
         var pieces: [TranscriptPiece] = []
-        if !voices.isEmpty {
-            // The voice note is the words.
-        } else if face.seat == .right {
+        if voices.isEmpty, face.seat == .right {
             let runs = TranscriptDocument.flattened(TranscriptDocument.replyPieces(readable, ink: .primary, edge: false))
             if !runs.isEmpty {
                 let tag = face.tag.map { TranscriptBlock.Tag(symbol: $0.symbol, label: $0.label, automated: $0.automated) }
                 pieces.append(TranscriptPiece(kind: .user(runs: runs, tag: tag), source: text))
             }
-        } else {
-            pieces = TranscriptDocument.replyPieces(readable, ink: face.quiet == true ? .quiet : .primary, edge: false)
+        } else if voices.isEmpty {
+            if let prepared { pieces = prepared }
+            else { pieces = TranscriptDocument.replyPieces(readable, ink: face.quiet == true ? .quiet : .primary, edge: false) }
         }
         // The reply has no tag, so a left-seated row's bridge or provenance line is its own quiet first paragraph.
         if face.seat == .left, let label = face.label, !pieces.isEmpty || !out.isEmpty {
@@ -182,9 +180,7 @@ public enum TranscriptBuilder {
         return out + TranscriptDocument.stamp(pieces, messageID: id, role: role, lead: lead) + cardBlocks(slots)
     }
 
-    /// A tool run as one fold: the agent's headline over the rows that are not receipts or asks, one line per row (the agent's words for it,
-    /// else its title and target, then its duration), receipts open in it. A decision still owed never folds: it draws its approval where it was
-    /// asked. A run of receipts alone shows them open; a mirrored card is its card.
+    /// Tool rows fold beneath their authored headline; receipts and decisions remain visible.
     static func runBlocks<Row: TranscriptRow>(_ group: TranscriptGroup<Row>, slots: [TranscriptCardSlot], thread: TranscriptThread<Row>)
         -> (blocks: [TranscriptBlock], wordKeys: [String], foldRows: [Row]) {
         if group.messages.count == 1, group.messages[0].metadata?.interactionMirror != nil { return (cardBlocks(slots), [], []) }
@@ -197,13 +193,15 @@ public enum TranscriptBuilder {
         if let first = foldRows.first {
             let key = "headline:" + first.row.id
             wordKeys = [key] + foldRows.map { "detail:" + $0.row.id }
-            let headline = thread.words(key) ?? first.face.headline ?? "Reading activity…"
+            let authored: String? = if let words = thread.words { words(key) } else { first.face.headline }
+            let headline = authored ?? ""
             blocks.append(TranscriptBlock(id: "fold-" + group.id, messageID: group.id, role: "tool",
                                           kind: .foldHeadline(text: TranscriptDocument.lineBreaks(headline), failed: !failed.isEmpty),
                                           source: headline, lead: .message, foldGroup: nil))
         }
         for (row, face) in rows where face.asks != true {
-            let line = face.receipt ?? detailLine(row, face: face, words: thread.words("detail:" + row.id) ?? face.detail)
+            let detail: String? = if let words = thread.words { words("detail:" + row.id) } else { face.detail }
+            let line = face.receipt ?? detailLine(row, words: detail)
             blocks.append(TranscriptBlock(id: "tool-" + row.id, messageID: row.id, role: row.role,
                                           kind: .foldDetail(text: TranscriptDocument.lineBreaks(line), failed: failed.contains(row.id)),
                                           source: line, lead: folds ? .detail : .message, foldGroup: folds ? group.id : nil))
@@ -215,9 +213,9 @@ public enum TranscriptBuilder {
         return (blocks + cardBlocks(slots), wordKeys, foldRows.map(\.row))
     }
 
-    /// A tool row's line: the agent's words for it when prepared, else its title and target; its duration after.
-    static func detailLine(_ row: some TranscriptRow, face: TranscriptRowFace, words: String?) -> String {
-        let line = words ?? face.line ?? ToolActivityPresentation.title(row.metadata?.toolName ?? "tool")
+    /// Authored detail and its observed duration, or the missing presentation evidence.
+    static func detailLine(_ row: some TranscriptRow, words: String?) -> String {
+        let line = words ?? "Waiting for activity detail · " + row.id
         guard let ms = row.metadata?.durationMs else { return line }
         return line + " · \(ms)ms"
     }
@@ -232,7 +230,6 @@ public struct TranscriptCardSlot: Equatable, Sendable {
 /// Built blocks per group, reused while the group's rows, gap, cards, face epoch, live line and the agent's words are unchanged. A door keeps one
 /// for the conversation it shows.
 @available(macOS 15, iOS 18, *)
-@MainActor
 public final class TranscriptBuildCache<Row: TranscriptRow> {
     struct Entry {
         var rows: [Row]
@@ -240,26 +237,27 @@ public final class TranscriptBuildCache<Row: TranscriptRow> {
         var slots: [TranscriptCardSlot]
         var faceEpoch: String
         var live: TranscriptDoor.Live?
+        var livePieces: [String: [TranscriptPiece]]
         var wordKeys: [String]
         var words: [String?]
         var blocks: [TranscriptBlock]
-        var pass: Int
     }
 
     var entries: [String: Entry] = [:]
     /// The rows each run's headline was last asked for, by its words key.
     var asked: [String: [Row]] = [:]
-    var pass = 0
     let limit: Int
 
     public init(limit: Int = 4_096) { self.limit = limit }
 
     func blocks(_ group: TranscriptGroup<Row>, slots: [TranscriptCardSlot], thread: TranscriptThread<Row>) -> [TranscriptBlock] {
         let live = thread.door.live.flatMap { live in group.messages.contains { $0.id == live.rowID } ? live : nil }
-        if var entry = entries[group.id], entry.rows == group.messages, entry.gapAbove == group.gapAbove, entry.slots == slots,
-           entry.faceEpoch == thread.faceEpoch, entry.live == live, entry.wordKeys.map(thread.words) == entry.words {
-            entry.pass = pass
-            entries[group.id] = entry
+        let prepared = thread.livePieces.filter { key, _ in group.messages.contains { $0.id == key } }
+        if let entry = entries[group.id],
+           entry.rows == group.messages,
+           entry.gapAbove == group.gapAbove, entry.slots == slots,
+           entry.faceEpoch == thread.faceEpoch, entry.live == live, entry.livePieces == prepared,
+           entry.wordKeys.map({ thread.words?($0) }) == entry.words {
             return entry.blocks
         }
         var blocks = TranscriptBuilder.gapBlock(group).map { [$0] } ?? []
@@ -268,22 +266,25 @@ public final class TranscriptBuildCache<Row: TranscriptRow> {
             let run = TranscriptBuilder.runBlocks(group, slots: slots, thread: thread)
             blocks += run.blocks
             wordKeys = run.wordKeys
-            if let key = wordKeys.first, let wanted = thread.wanted, asked[key] != run.foldRows {
-                asked[key] = run.foldRows
-                wanted(run.foldRows)
+            if let key = wordKeys.first, let wanted = thread.wanted {
+                if asked[key] != run.foldRows {
+                    asked[key] = run.foldRows
+                    wanted(run.foldRows)
+                }
             }
         } else if let row = group.messages.first {
-            blocks += TranscriptBuilder.rowBlocks(row, face: thread.face(row), slots: slots, live: live)
+            blocks += TranscriptBuilder.rowBlocks(row, face: thread.face(row), slots: slots, live: live, prepared: prepared[row.id])
         }
-        entries[group.id] = Entry(rows: group.messages, gapAbove: group.gapAbove, slots: slots, faceEpoch: thread.faceEpoch, live: live,
-                                  wordKeys: wordKeys, words: wordKeys.map(thread.words), blocks: blocks, pass: pass)
+        entries[group.id] = Entry(rows: group.messages, gapAbove: group.gapAbove, slots: slots,
+                                  faceEpoch: thread.faceEpoch, live: live, livePieces: prepared, wordKeys: wordKeys,
+                                  words: wordKeys.map { thread.words?($0) }, blocks: blocks)
         return blocks
     }
 
-    /// Past the limit, entries no build used this pass go; a group seen again builds once.
-    func trim() {
+    /// Past the limit, groups outside the current reading go; a group seen again builds once.
+    func trim(retaining groups: Set<String>) {
         guard entries.count > limit else { return }
-        entries = entries.filter { $0.value.pass == pass }
+        entries = entries.filter { groups.contains($0.key) }
         if asked.count > limit { asked.removeAll() }
     }
 }

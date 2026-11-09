@@ -1,4 +1,5 @@
 import ApprovalTransactions
+import AuthoredCapabilities
 import ChatTurnContracts
 import ChatToolRuntime
 import ChatToolParsing
@@ -21,7 +22,6 @@ extension AppToolExecutor {
     private enum InteractionControlRoute {
         case permissionGrant
         case capabilityFlag
-        case providerKey
         case inlineSelection
         case needsGlass(String)
     }
@@ -42,7 +42,6 @@ extension AppToolExecutor {
         switch route {
         case .permissionGrant: return "Granting Mac access"
         case .capabilityFlag: return "Turning on a Trust capability"
-        case .providerKey: return "Writing a provider key"
         case .inlineSelection, .needsGlass: return nil
         }
     }
@@ -196,13 +195,13 @@ extension AppToolExecutor {
             return .success(CardPlan(appModel: appModel, dataRoot: dataRoot, sessionID: sessionID, current: current,
                                      posture: posture, route: nil, value: value, choice: choice))
         }
-        let descriptor = InlineInteractionResolver.descriptor(for: current, dataRoot: dataRoot)
+        let descriptor = await InlineInteractionResolver.descriptor(for: current, dataRoot: dataRoot)
         let route = Self.route(
             control: descriptor.control, interaction: current,
             descriptor: descriptor, value: value, choice: choice
         )
         if case .needsGlass(let reason) = route {
-            return refuse(interactionReceipt(
+            return refuse(await interactionReceipt(
                 current, action: action, status: "needs_glass",
                 posture: posture, surface: surface, dataRoot: dataRoot,
                 extra: ["reason": .string(reason)]
@@ -221,7 +220,7 @@ extension AppToolExecutor {
             }
             effective = fresh
             guard fresh.name == Self.fullMacModeName else {
-                return refuse(interactionReceipt(
+                return refuse(await interactionReceipt(
                     current, action: action, status: "needs_glass",
                     posture: fresh, surface: surface, dataRoot: dataRoot,
                     extra: ["reason": .string(
@@ -236,9 +235,11 @@ extension AppToolExecutor {
                                  posture: effective, route: route, value: value, choice: choice))
     }
 
-    /// cardGate checks precede execution; authority mutations recheck Full Mac at the write boundary.
+    /// cardGate checks precede the agent's execution; authority mutations recheck Full Mac at the write boundary. The person's own tap on
+    /// the card's row answers as the person instead.
     @MainActor
     func runCardAction(input: [String: JSONValue], surface: String, turn: Turn) async -> JSONValue {
+        if Self.personDecided(tool: "interaction_act", input: input, turn: turn) { return await runPersonCardAction(input: input, turn: turn) }
         let plan: CardPlan
         switch await cardGate(input: input, surface: surface, turn: turn) {
         case .failure(let refusal): return refusal.answer
@@ -250,13 +251,21 @@ extension AppToolExecutor {
         let rawAction = Self.interactionText(input["action"]).lowercased()
         let action = rawAction.isEmpty ? "primary" : rawAction
         var effective = plan.posture
+        // An answer that changes the person's authority over the agent (a grant, a capability, a key) or picks a model is the person's at
+        // every posture. The agent may withdraw its own ask, never answer it.
+        if let route = plan.route, Self.authorityMutation(route) != nil || current.kind == .modelChoice {
+            return Self.interactionFailure("owners_call", """
+                \(current.title) is the person's to answer (a model pick, or a widening of what you may do), at every posture. card.not_now \
+                takes back your ask; nothing changed.
+                """)
+        }
         guard let route = plan.route else {
             do {
                 let declined = try await InlineInteractionResolver.decline(
                     id: id, sessionID: sessionID,
                     expectedRevision: current.revision, turn: turn, dataRoot: dataRoot
                 )
-                return interactionReceipt(
+                return await interactionReceipt(
                     declined, action: action, status: "ok",
                     posture: effective, surface: surface, dataRoot: dataRoot,
                     extra: continuationExtra(id)
@@ -311,7 +320,7 @@ extension AppToolExecutor {
                     "The saved Trust policy stopped saying which mode this Mac is in, so "
                     + "\(authority) was not changed. The person answers this card on the glass."
                 )
-                return interactionReceipt(
+                return await interactionReceipt(
                     pending, action: action, status: "needs_glass",
                     posture: atMutation ?? effective, surface: surface, dataRoot: dataRoot,
                     extra: ["reason": .string(reason)]
@@ -330,7 +339,7 @@ extension AppToolExecutor {
         case .permissionGrant:
             // cardGate already refused user-only kinds below Full Mac.
             grant = await grantInteractionPermissions(current, appModel: appModel, dataRoot: dataRoot)
-            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "card.answer \(current.kind.rawValue)",
+            BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "card.answer \(current.kind.rawValue)",
                                    sessionID: sessionID, dataRoot: dataRoot)
 
         case .capabilityFlag:
@@ -342,16 +351,8 @@ extension AppToolExecutor {
                 policyKey: flag.policyKey, appModel: appModel,
                 dataRoot: dataRoot, logTag: "interaction_act"
             )
-            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "card.answer \(current.kind.rawValue)",
+            BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "card.answer \(current.kind.rawValue)",
                                    sessionID: sessionID, dataRoot: dataRoot)
-
-        case .providerKey:
-            // Checked with the provider before it is saved, as the card does.
-            let outcome = await appModel.saveProviderKey(
-                value, provider: InlineInteractionRegistry.canonicalProviderID(current.target)
-            )
-            setupError = outcome.error
-            note = outcome.note
 
         case .inlineSelection:
             selection = choice.isEmpty ? nil : choice
@@ -379,7 +380,7 @@ extension AppToolExecutor {
                 note: note,
                 byAgent: true, turn: turn, dataRoot: dataRoot
             )
-            return interactionReceipt(
+            return await interactionReceipt(
                 settled, action: action,
                 status: settled.state.failureReason == nil ? "ok" : "failed",
                 posture: effective, surface: surface, dataRoot: dataRoot,
@@ -393,6 +394,55 @@ extension AppToolExecutor {
                 extra: ["interaction_id": .string(id)]
                     .merging(grant.map { ["grant_outcome": $0.receipt] } ?? [:]) { a, _ in a }
             )
+        }
+    }
+
+    /// The person's own tap on a card's answer (`card.answer`, `card.try_again`, `card.not_now` on the card's row) answers as the person, at
+    /// every posture and from any conversation, with none of the agent's lane, posture or Full Mac checks; the agent's turn never carries
+    /// the person's act, so it never reaches here. At the Mac the card's own control runs as a tap on the card always did (System Settings,
+    /// a sign-in window, a page); at another door a pick or Not now settles there, and a control that needs the Mac says so.
+    @MainActor
+    private func runPersonCardAction(input: [String: JSONValue], turn: Turn) async -> JSONValue {
+        let id = Self.cardID(input)
+        let action = Self.interactionText(input["action"]).lowercased()
+        let choice = Self.interactionText(input["choice"])
+        guard let host = quietHost() else {
+            return Self.interactionFailure("app_window_unavailable", "The app's own controls are not available in this process.")
+        }
+        let dataRoot = host.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        do {
+            let sessionID = try await InlineInteractionDelivery.pointer(id: "interaction:" + id, dataRoot: dataRoot).sessionID
+            guard let current = try await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot) else {
+                return Self.interactionFailure("not_found", "No card has that id in any conversation.", extra: ["interaction_id": .string(id)])
+            }
+            if action == "retry", current.continuationFailure != nil {
+                try await InlineInteractionResolver.retryContinuation(current, sessionID: sessionID, dataRoot: dataRoot, turn: nil)
+            } else if action == "decline" {
+                // The person's Not now wakes the conversation that raised the card with its promised consequence.
+                _ = try await InlineInteractionResolver.decline(id: id, sessionID: sessionID, expectedRevision: current.revision, turn: nil,
+                    dataRoot: dataRoot)
+            } else if turn.personAct?.door == "mac" {
+                await host.runCardControl(id: id, sessionID: sessionID, choice: choice.isEmpty ? nil : choice)
+            } else if !choice.isEmpty, current.kind == .choose {
+                _ = try await InlineInteractionResolver.complete(id: id, sessionID: sessionID, selection: choice,
+                    expectedRevision: current.revision, turn: nil, dataRoot: dataRoot)
+            } else if !choice.isEmpty, current.kind == .modelChoice, choice != InlineInteractionRegistry.persistentChoiceOptionID {
+                _ = try await InlineInteractionResolver.answerModelChoice(current, sessionID: sessionID, picked: choice,
+                    scope: current.primaryScope, controls: { InlineInteractionResolver.platform.interactionControls() }, dataRoot: dataRoot)
+            } else {
+                return Self.interactionFailure("needs_mac", "This card's control runs on the Mac: answer it there. Nothing was changed.",
+                    extra: ["interaction_id": .string(id)])
+            }
+            guard let after = try await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot) else {
+                return .object(["status": .string("outcome_unknown"), "interaction_id": .string(id),
+                    "detail": .string("The answer returned, but the card is absent from readback. Check before repeating it.")])
+            }
+            let failure = after.continuationFailure ?? after.state.failureReason
+            let words = failure ?? after.state.outcome?.summary ?? "The card is \(after.state.name)."
+            return .object(["status": .string(failure == nil ? "ok" : "failed"), "interaction_id": .string(id),
+                            "state": .string(after.state.name), "answered_by": .string("person"), "detail": .string(words)])
+        } catch {
+            return Self.cardTransitionFailure("not_settled", error, id: id)
         }
     }
 
@@ -412,7 +462,7 @@ extension AppToolExecutor {
         case .pairDevice:
             return .needsGlass("Pairing needs the person's iPhone and the Pair button on the Mac.")
         case .connectorManualToken:
-            let connector = InlineInteractionRegistry.canonicalConnectorID(interaction.target)
+            let connector = ConnectorSetup.canonicalID(interaction.target)
             // Slack's and Telegram's setup is a token PLUS their allowlists; there is no one-value write that means the same thing.
             return .needsGlass(
                 "\(connector)'s setup takes more than one token — it has to be done in "
@@ -433,13 +483,7 @@ extension AppToolExecutor {
         case .keyring:
             return .needsGlass("A secret goes from the person's card into the keyring, never through you: they paste it or sign in on the Mac.")
         case .providerAPIKey:
-            guard !value.isEmpty else {
-                return .needsGlass(
-                    "Pass the \(descriptor.displayName) API key as `value`, or the person types "
-                    + "it in Providers."
-                )
-            }
-            return .providerKey
+            return .needsGlass("Enter the key or sign in in \(descriptor.displayName)'s protected entry on the Mac. A card accepts no provider secret.")
         case .providerGroupModel:
             guard !choice.isEmpty,
                   choice != InlineInteractionRegistry.persistentChoiceOptionID,
@@ -692,7 +736,7 @@ extension AppToolExecutor {
         do { reachesUser = try await Self.reachesUser(surface: surface, fullMac: posture?.name == Self.fullMacModeName,
                                                dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot(), turn: turn) }
         catch { return ChatToolOutcome.failure(error: error, tool: "interaction_act", effects: ToolFailureError.Effects.none) }
-        return host.composerFence(
+        return await host.composerFence(
             verb: verb, value: Self.interactionText(input["value"]), sessionId: Self.interactionText(input["session_id"]),
             reachesUser: reachesUser,
             turnSessionId: Self.interactionText(input["__session_id"]), turn: turn
@@ -792,8 +836,8 @@ extension AppToolExecutor {
         surface: String,
         dataRoot: URL,
         extra: [String: JSONValue] = [:]
-    ) -> JSONValue {
-        let descriptor = InlineInteractionResolver.descriptor(
+    ) async -> JSONValue {
+        let descriptor = await InlineInteractionResolver.descriptor(
             for: interaction, dataRoot: dataRoot
         )
         let card = InlineCards.model(interaction, descriptor: descriptor)

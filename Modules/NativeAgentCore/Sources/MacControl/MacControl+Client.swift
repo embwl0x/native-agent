@@ -166,17 +166,6 @@ public actor SwiftNativeMacControl: MacControlClient {
                 try await dispatchCore(action: action, body: rawBody, capability: capability, turn: turn, context: context)
             }
         }
-        if context.deadline == nil {
-            do {
-                return try await OperationWaitBudget.withDeadline(
-                    seconds: Double(Self.operationTimeoutSeconds(action: action, body: rawBody)),
-                  budget: context.waitBudget) { budget in
-                    let context = context.with(\.deadline, budget.deadline)
-                    return try await self.dispatchCore(action: action, body: rawBody, capability: capability, turn: turn, context: context) }
-            } catch is OperationWaitBudget.Exceeded {
-                return Self.deadlineResult(action: action)
-            }
-        }
         guard !context.expired else { return Self.deadlineResult(action: action) }
         try Task.checkCancellation()
         if context.dataRoot != permissionDataRoot {
@@ -312,12 +301,12 @@ public actor SwiftNativeMacControl: MacControlClient {
         switch begin {
         case .replay(let record):
             if let retained = MacControlInFlightRegistry.shared.execution(key: executionKey)?.settledResult {
-                return try retained.get()
+                return retained
             }
             return Self.replayResult(record)
         case .duplicateActive(let record):
             if let retained = MacControlInFlightRegistry.shared.execution(key: executionKey)?.settledResult {
-                return try retained.get()
+                return retained
             }
             return MacControlResult(
                 ok: false,
@@ -380,11 +369,11 @@ public actor SwiftNativeMacControl: MacControlClient {
         // Actual exit is the sole terminal settlement owner. Caller cancellation resolves only its response signal, never this retained body result.
         Task {
             let bodyResult = (await task.result).map { self.driverCheckedResult($0, action: normalized, context: context) }
-            let settled: Result<MacControlResult, Error> = await settle {
-                do { return .success(try await self.finishKnownOperationResult(bodyResult,
-                    action: normalized, operationId: operationId, trigger: .ordinary)) }
-                catch { return .success(Self.settlementFailure(error, body: bodyResult,
-                    action: normalized, operationId: operationId, context: context)) }
+            let settled: MacControlInFlightExecution.Settlement = await settle {
+                do { return .init(response: try await self.finishKnownOperationResult(bodyResult,
+                    action: normalized, operationId: operationId, trigger: .ordinary), failure: nil) }
+                catch { return .init(response: Self.settlementFailure(error, body: bodyResult,
+                    action: normalized, operationId: operationId, context: context), failure: error) }
             }
             execution.finish(settled)
             MacControlInFlightRegistry.shared.finished(key: executionKey)
@@ -430,7 +419,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         } onCancel: {
             execution.requestCancellation()
         }
-        if let result = execution.settledResult { return try result.get() }
+        if let result = execution.settledResult { return result }
         // Only the response wait ended. Publish uncertainty without consuming the actual-exit result or authorizing another physical execution.
         let timedOut = signal == .deadline
         let pending: Result<MacControlOperationRecord, Error> = await settle {
@@ -440,7 +429,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
         let record = try pending.get()
         // Actual settlement can win while the reporting record is written.
-        if let result = execution.settledResult { return try result.get() }
+        if let result = execution.settledResult { return result }
         return Self.unknownResult(action: normalized, record: record)
     }
 
@@ -458,41 +447,40 @@ public actor SwiftNativeMacControl: MacControlClient {
                 mac.look before further action.
                 """)
         }
-        if current.state.isTerminal {
+        if current.state.isTerminal, current.terminalAt != nil {
             return MacControlCancellationResult(
                 operationId: operationId,
                 state: current.state,
                 acknowledged: current.state == .cancelAcknowledged
             )
         }
-        if current.state != .cancelRequested {
-            _ = try await operationStore.transition(
+        var pending = current
+        if !current.state.isTerminal, current.state != .cancelRequested {
+            pending = try await operationStore.transition(
                 operationId: operationId,
                 to: .cancelRequested,
                 verification: .pending,
-                expectedNextEvidence: "Process-group death acknowledgement",
+                expectedNextEvidence: "Operation owner terminal settlement",
                 outcomeCode: "cancel_requested"
             )
         }
         guard let execution = MacControlInFlightRegistry.shared.execution(key: executionKey) else {
             return MacControlCancellationResult(
                 operationId: operationId,
-                state: .cancelRequested,
+                state: pending.state,
                 acknowledged: false
             )
         }
         execution.requestCancellation()
-        // The dispatch owner, not the requester, decides whether the work actually stopped, raced to a real completion, or became unknowable. Wait only for the
-        // bounded settlement grace; never hang the cancel requester on an adapter that ignores cooperative cancellation.
-        let settled = try await operationStore.waitForCancellationSettlement(
-            operationId: operationId, until: .now.advanced(by: .milliseconds(1_500)))
-        let terminal: MacControlOperationRecord?
-        if let settled { terminal = settled }
-        else { terminal = try await operationStore.record(operationId: operationId) }
+        try await execution.waitForSettlement()
+        guard let terminal = try await operationStore.record(operationId: operationId),
+              terminal.state.isTerminal, terminal.terminalAt != nil else {
+            throw MacControlError.operation("Cancellation settlement is not durably recorded for operation \(operationId); its outcome is unconfirmed.")
+        }
         return MacControlCancellationResult(
             operationId: operationId,
-            state: terminal?.state ?? .cancelRequested,
-            acknowledged: terminal?.state == .cancelAcknowledged
+            state: terminal.state,
+            acknowledged: terminal.state == .cancelAcknowledged
         )
     }
 
@@ -527,7 +515,7 @@ public actor SwiftNativeMacControl: MacControlClient {
             let named = !(body["app"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
                 || body["background"] == .bool(true)
             let behind = named && body["require_front"] != .bool(true) && body["require_front_pid"] == nil
-            if !behind { await PersonOnlyWindows.stepAsideForScreen(turn: turn) }
+            if !behind { try await PersonOnlyWindows.stepAsideForScreen(turn: turn) }
             return nil
         } catch let refusal as WakeAttentionRefusal {
             return refusal.result
@@ -633,7 +621,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "clipboard_read":  return handleClipboardRead(body)
         case "clipboard_write": return handleClipboardWrite(body)
         // Keep menu discovery read-only; pressing uses the actuator's mutation authority.
-        case "menu":        return handleMenu(body, context: context)
+        case "menu":        return await handleMenu(body, context: context)
         case "menu_press":  return await handleMenuPress(body, turn: turn, context: context)
         // Retain document text through the existing spill pager so extraction adds no second owner.
         case "read":        return await handleRead(body, turn: turn, context: context)

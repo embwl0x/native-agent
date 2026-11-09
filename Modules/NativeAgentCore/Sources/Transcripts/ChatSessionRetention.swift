@@ -77,7 +77,7 @@ public enum ChatSessionRetention {
             return (rows, ChatSessionRetentionReport())
         }
 
-        let protectedSessionIds = try resolvedProtectedSessionIds(policy, dataRoot: dataRoot)
+        let protectedSessionIds = try resolvedProtectedSessionIds(policy, dataRoot: dataRoot, rows: rows)
         let reasons = plannedArchiveReasons(
             rows: rows,
             now: now,
@@ -100,13 +100,14 @@ public enum ChatSessionRetention {
                 continue
             }
             if try archive(row: row, reason: reason, dataRoot: dataRoot, now: now,
-                           commitIndexRemoval: { try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath) }) {
+                           commitIndexRemoval: { try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath) }) != nil {
                 report.archivedSessions += 1
                 switch reason {
                 case .activeCap:
                     report.archivedForCap += 1
                 case .staleEmpty:
                     report.archivedEmptySessions += 1
+                case .manual: break
                 }
             } else {
                 if reason == .staleEmpty { staleEmptyAborts += 1 }
@@ -124,7 +125,7 @@ public enum ChatSessionRetention {
             )
             for (index, row) in kept.enumerated() where secondReasons[index] == .activeCap {
                 if try archive(row: row, reason: .activeCap, dataRoot: dataRoot, now: now,
-                               commitIndexRemoval: { try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath) }) {
+                               commitIndexRemoval: { try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath) }) != nil {
                     report.archivedSessions += 1
                     report.archivedForCap += 1
                 }
@@ -156,29 +157,19 @@ public enum ChatSessionRetention {
         }
     }
 
-    /// Manual archive keeps the transcript in place and commits its row to the archive before removing it from the hot index. Both archive writers use the same
-    /// checked schema and durable append under the archive lock.
+    /// Manual archive uses retention's index → transcript → archive transaction and writes the same restorable transcript locator.
     public static func archiveSession(id: String, dataRoot: URL) async throws -> [String: JSONValue]? {
         guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { return nil }
         let index = dataRoot.appendingPathComponent("chat/sessions.json")
-        let archive = dataRoot.appendingPathComponent("chat/archive/sessions.jsonl")
         return try await SwiftNativePersistenceCore.withFileLock(index) {
             var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: index)
-            guard let position = rows.firstIndex(where: { $0["id"] == .string(id) }) else { return nil }
-            var archived = rows[position]
-            archived["archived"] = .bool(true)
-            archived["archivedBy"] = .string("mac_chat")
-            archived["archivedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
-            let row = archived
-            try await SwiftNativePersistenceCore.withFileLock(archive) {
-                var latest = try archiveIndexRows(dataRoot: dataRoot).last { $0["id"] == .string(id) }
-                // Ignore only this operation's timestamp when recognizing a retry.
-                latest?["archivedAt"] = row["archivedAt"]
-                if latest != row { try appendJSONL(.object(row), to: archive) }
+            guard let row = rows.first(where: { $0["id"] == .string(id) }) else { return nil }
+            guard let archived = try archive(row: row, reason: .manual, dataRoot: dataRoot, now: Date(), commitIndexRemoval: {
+                try ChatSessionIndexFile.removeArchivedRow(row, from: &rows, at: index)
+            }) else {
+                throw PersistenceCoreError.ioFailure(
+                    "The conversation is busy; its transcript and active row were left in place. Archive it when its writer finishes.")
             }
-            // The archived claim survives an index failure, so a retry only removes the hot row rather than appending another archive record.
-            rows.remove(at: position)
-            try ChatSessionIndexFile.write(rows, to: index, removeWhenEmpty: true)
             return archived
         }
     }
@@ -186,6 +177,7 @@ public enum ChatSessionRetention {
     private enum ArchiveReason: String {
         case activeCap = "active_cap"
         case staleEmpty = "stale_empty"
+        case manual
     }
 
     private static func plannedArchiveReasons(
@@ -220,7 +212,8 @@ public enum ChatSessionRetention {
 
     private static func resolvedProtectedSessionIds(
         _ policy: ChatSessionRetentionPolicy,
-        dataRoot: URL
+        dataRoot: URL,
+        rows: [[String: JSONValue]]
     ) throws -> Set<String> {
         var protected = policy.protectedSessionIds
         if policy.includeMacPinnedSessions {
@@ -232,7 +225,7 @@ public enum ChatSessionRetention {
         // an empty conversation.
         protected.formUnion(try doorMappedSessionIds(dataRoot: dataRoot))
         // Contact panes read their owned conversation; archiving it would blank the pane.
-        protected.formUnion(try contactSessionIds(dataRoot: dataRoot))
+        protected.formUnion(try contactSessionIds(dataRoot: dataRoot, rows: rows))
         return protected
     }
 
@@ -242,7 +235,7 @@ public enum ChatSessionRetention {
         return "agent-" + digest.map { String(format: "%02x", $0) }.joined().prefix(12) + "-"
     }
 
-    private static func contactSessionIds(dataRoot: URL) throws -> Set<String> {
+    private static func contactSessionIds(dataRoot: URL, rows: [[String: JSONValue]]) throws -> Set<String> {
         var owners = ["codex", "claude", "omp"]
         let path = dataRoot.appendingPathComponent("agents/peers.json")
         do {
@@ -252,8 +245,16 @@ public enum ChatSessionRetention {
             }
             for case .object(let peer) in peers { if case .string(let id)? = peer["id"] { owners.append(id) } }
         } catch CocoaError.fileReadNoSuchFile {}
-        // Each contact's one conversation (ContactThread.session), not every session it opened: a peer starting a context per task stays bounded.
-        return Set(owners.map { contactSessionPrefix(owner: $0) + "mcp-" + $0 })
+        // Unknown caller liveness stops retention before any transcript is moved.
+        var ids = Set(owners.map { contactSessionPrefix(owner: $0) + ContactCaller.shared(peer: $0) })
+        let prefixes = owners.map { ($0, contactSessionPrefix(owner: $0)) }
+        for case .string(let id)? in rows.map({ $0["id"] }) {
+            for (owner, prefix) in prefixes where id.hasPrefix(prefix) {
+                guard let caller = ContactCaller(conversation: String(id.dropFirst(prefix.count)), peer: owner) else { continue }
+                if try caller.isLive() { ids.insert(id) }
+            }
+        }
+        return ids
     }
 
     private static func doorMappedSessionIds(dataRoot: URL) throws -> Set<String> {
@@ -293,10 +294,10 @@ public enum ChatSessionRetention {
         dataRoot: URL,
         now: Date,
         commitIndexRemoval: () throws -> Void
-    ) throws -> Bool {
+    ) throws -> [String: JSONValue]? {
         guard case .string(let sessionId)? = row["id"],
               let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
-            return false
+            return nil
         }
 
         let messagesPath = dataRoot
@@ -309,68 +310,86 @@ public enum ChatSessionRetention {
             .appendingPathComponent("sessions.jsonl")
         var baseArchivedRow = row
         baseArchivedRow["archived"] = .bool(true)
-        baseArchivedRow["archivedBy"] = .string("chat_session_retention")
-        baseArchivedRow["retentionArchivedAt"] = .string(NativeTimestampFormat.fractionalZulu(now))
-        baseArchivedRow["retentionReason"] = .string(reason.rawValue)
+        baseArchivedRow["archivedBy"] = .string(reason == .manual ? "mac_chat" : "chat_session_retention")
+        if reason == .manual {
+            baseArchivedRow["archivedAt"] = .string(ISO8601DateFormatter().string(from: now))
+        } else {
+            baseArchivedRow["retentionArchivedAt"] = .string(NativeTimestampFormat.fractionalZulu(now))
+            baseArchivedRow["retentionReason"] = .string(reason.rawValue)
+        }
 
-        let archived = try CredentialFileLock.tryWithLock(messagesPath) { () throws -> Bool in
-            if reason == .activeCap, ChatSessionIndexFile.hasPendingTranscriptIndexSync(at: messagesPath) {
-                return false
+        let archived = try CredentialFileLock.tryWithLock(messagesPath) { () throws -> [String: JSONValue]? in
+            if reason != .staleEmpty, ChatSessionIndexFile.hasPendingTranscriptIndexSync(at: messagesPath) {
+                return nil
             }
             // Recheck emptiness under the transcript lock before archiving a stale-empty session.
             if reason == .staleEmpty, transcriptIsNonEmpty(messagesPath) {
-                return false
+                return nil
             }
             // Archive only the transcript version acknowledged by the session index.
             if reason == .activeCap, transcriptModifiedDate(messagesPath) != nil {
                 // Pending writers alter bytes before index sync; retain unacknowledged versions until reconciliation confirms them.
                 guard let version = ChatSessionIndexFile.transcriptVersion(at: messagesPath),
                       row[ChatSessionIndexFile.acknowledgedTranscriptKey] == version else {
-                    return false
+                    return nil
                 }
             }
             // Check existence only after locking: a writer may be creating the first row while retention is selecting this session.
             var archivedMessagesPath: URL?
-            if FileManager.default.fileExists(atPath: messagesPath.path) {
-                let archiveDir = dataRoot
-                    .appendingPathComponent("chat", isDirectory: true)
-                    .appendingPathComponent("archive", isDirectory: true)
-                    .appendingPathComponent("messages", isDirectory: true)
-                try FileManager.default.createDirectory(at: archiveDir, withIntermediateDirectories: true)
-                let destination = try uniqueArchivePath(
-                    directory: archiveDir,
-                    safeSessionId: safeSessionId,
-                    now: now
-                )
-                try ContactThread.replace(Data(contentsOf: messagesPath), to: destination)
-                archivedMessagesPath = destination
+            var archivedRow = baseArchivedRow
+            var reused = false
+            let hotExists = FileManager.default.fileExists(atPath: messagesPath.path)
+            if hotExists || reason == .manual {
+                let bytes: Data
+                do { bytes = try Data(contentsOf: messagesPath) }
+                catch CocoaError.fileReadNoSuchFile where row["messageCount"] == .int(0) { bytes = Data() }
+                if reason == .manual, let latest = try archiveIndexRows(dataRoot: dataRoot).last(where: { $0["id"] == .string(sessionId) }),
+                   case .string(let relative)? = latest["messagesArchivePath"] {
+                    var comparable = latest
+                    comparable.removeValue(forKey: "messagesArchivePath")
+                    comparable["archivedAt"] = baseArchivedRow["archivedAt"]
+                    let existing = dataRoot.appendingPathComponent(relative)
+                    if comparable == baseArchivedRow, try Data(contentsOf: existing) == bytes {
+                        // Its archive commit survived a failed hot-index removal. Finish that transaction without another copy or archive row.
+                        archivedRow = latest
+                        archivedMessagesPath = existing
+                        reused = true
+                    }
+                }
+                if !reused {
+                    let archiveDir = dataRoot
+                        .appendingPathComponent("chat", isDirectory: true)
+                        .appendingPathComponent("archive", isDirectory: true)
+                        .appendingPathComponent("messages", isDirectory: true)
+                    try FileManager.default.createDirectory(at: archiveDir, withIntermediateDirectories: true)
+                    let destination = try uniqueArchivePath(directory: archiveDir, safeSessionId: safeSessionId, now: now)
+                    try ContactThread.replace(bytes, to: destination)
+                    archivedMessagesPath = destination
+                    archivedRow["messagesArchivePath"] = .string(relativePath(destination, under: dataRoot))
+                }
             }
 
-            var archivedRow = baseArchivedRow
-            if let archivedMessagesPath {
-                archivedRow["messagesArchivePath"] = .string(relativePath(archivedMessagesPath, under: dataRoot))
-            }
             // Lock archive after transcript. On contention, discard the copy and keep the session hot; no removal may precede its durable archive row.
             let indexRowWritten = try CredentialFileLock.tryWithLock(archiveIndex) {
-                try appendJSONL(.object(archivedRow), to: archiveIndex)
+                if !reused { try appendJSONL(.object(archivedRow), to: archiveIndex) }
                 return true
             }
             guard indexRowWritten == true else {
-                if let archivedMessagesPath {
+                if let archivedMessagesPath, !reused {
                     try? FileManager.default.removeItem(at: archivedMessagesPath)
                 }
-                return false
+                return nil
             }
 
             // Both archive bytes and its row exist before the active row goes. If interrupted after this checkpoint, the hot copy may survive and be recovered
             // as an orphan; an active row never loses history.
             try commitIndexRemoval()
-            if archivedMessagesPath != nil {
+            if archivedMessagesPath != nil && hotExists {
                 try FileManager.default.removeItem(at: messagesPath)
             }
-            return true
+            return archivedRow
         }
-        return archived ?? false
+        return archived ?? nil
     }
 
     /// Under the transcript lock, detect a non-blank JSONL line. Unreadable bytes count as empty, allowing stale-empty sessions to leave the hot tier.

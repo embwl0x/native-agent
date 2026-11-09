@@ -6,6 +6,8 @@ import PersistenceCore
 // Blueprint: | `OwnedProgramPrelude.swift` | Frozen app/host namespaces, preview/version propagation, ordered batches and strict replay |
 extension OwnedProgramRunner {
     public static let hostPrimitiveNamespaces: Set<String> = ["files", "network", "program", "apps", "model"]
+    /// The stem's own file readers: a snapshot SQLite query and a MIME message read. Every other files.* call is the gated door action.
+    public static let hostFilePrimitives: Set<String> = ["files.query", "files.mime"]
     public static let hostDoorActions: Set<String> = [
         "calendar.upcoming", "calendar.create", "calendar.modify", "calendar.delete",
         "reminders.query", "reminders.create", "reminders.update", "reminders.delete",
@@ -84,7 +86,7 @@ extension OwnedProgramRunner {
             Object.defineProperty(globalThis, \"host\", {value: Object.freeze({state: partState})});
             """ : "") : state + """
           function primitive(operation, args) {
-            if (operation.indexOf("files.") === 0) return door(operation, args);
+            if (operation.indexOf("files.") === 0 && \(Self.hostFilePrimitives.sorted()).indexOf(operation) < 0) return door(operation, args);
             return invoke("primitive", operation, args === undefined ? [] : [args]);
           }
           function primitives(space) {
@@ -144,7 +146,10 @@ extension OwnedProgramRunner {
         let reach = !turn ? "" : """
           Object.defineProperty(globalThis, "turn", {value: Object.freeze(["persona", "pins", "recall", "context"]
             .reduce(function (t, name) { t[name] = function () { return invoke("turn", name, []); }; return t; }, {}))});
-          Object.defineProperty(globalThis, "run", {value: function (input) { return step(input.state, input.event); }});
+          Object.defineProperty(globalThis, "run", {value: function (input) {
+            if (input.weigh) return typeof weigh === "function" ? {worth: weigh(input.weigh.happening, input.weigh.felt)} : {grown: false};
+            if (input.hear) return typeof hear === "function" ? {heard: hear(input.hear.happening, input.hear.felt)} : {grown: false};
+            return step(input.state, input.event); }});
         """
         return """
         var app = (function (ids, call, say, __dataRoot, __workspace) {
@@ -160,6 +165,8 @@ extension OwnedProgramRunner {
             var e = new Error(out.detail);
             e.name = "AppError"; e.reason = out.reason; e.action = id; e.stopped = out.stopped;
             e.scriptLine = out.line; e.callNumber = out.n; e.receipt = out.receipt;
+            // Pre-dispatch and runtime failures share this envelope field.
+            e.try_instead = out.try_instead;
             // A reply that says nothing of effects is a refusal before anything ran.
             e.effects = out.effects === undefined ? "none" : out.effects; e.call = out.call || id;
             throw e;

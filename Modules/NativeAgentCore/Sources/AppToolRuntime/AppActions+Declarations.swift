@@ -83,11 +83,11 @@ extension AppActions {
     private static func composer(_ verb: String) -> [String: JSONValue] {
         ["target": .string("composer"), "verb": .string(verb)]
     }
-    private static func verb(_ verb: String) -> [String: JSONValue] { ["verb": .string(verb)] }
-    private static func press(_ button: String) -> [String: JSONValue] {
+    static func verb(_ verb: String) -> [String: JSONValue] { ["verb": .string(verb)] }
+    static func press(_ button: String) -> [String: JSONValue] {
         ["verb": .string("act"), "action": .string(button)]
     }
-    private static func card(_ action: String) -> [String: JSONValue] { ["action": .string(action)] }
+    static func card(_ action: String) -> [String: JSONValue] { ["action": .string(action)] }
 
     package static var seedActions: [AppAction] { get throws { try seedInventory.get() } }
     private static let seedInventory: Result<[AppAction], Error> = Result {
@@ -95,17 +95,6 @@ extension AppActions {
         AppAction("find", "*", "Discover actions, pages and skills by intent", ["what|query"],
                   warn: "The same discovery as app {find:\"words\"}. Pass what or query inside args.",
                   tool: "app_find", read: true),
-        AppAction("chrome.history", "browser", """
-            Read visited sites and browsing history in Chrome (the whole Default profile, every tab and window, not just the agent's own tab): \
-            most visited domains, title/URL search or recent pages
-            """,
-                  ["mode?", "query?", "since?", "limit?:int"],
-                  warn: """
-                      mode: recent (default when omitted), top_domains (since required) or search (query required, since optional). since: inclusive ISO 8601 \
-                      with timezone. limit: default 15, max 50. Chrome Default profile only, independent of extension/tab group; local ISO 8601 times. Domain \
-                      counts: visits since since; page counts: lifetime visits. Requires Full Mac and file-read permission; no card. Deadline: 2 seconds.
-                      """,
-                  tool: "read_file", read: true),
         AppAction("photos.count", "files", "Count how many photos, pictures or recorded videos are in Photos by creation date and media type",
                   ["start?", "end?", "media_type?"],
                   warn: """
@@ -142,12 +131,18 @@ extension AppActions {
         AppAction("inbox.withdraw", "inbox", "Withdraw my own pending approval", ["id", "reason?"], subject: ["id"], irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: verb("withdraw")),
         AppAction("inbox.open_on_mac", "inbox", "Open on Mac", ["id"], subject: ["id"], owner: .person("it opens the card for the owner at the Mac",
-                  instead: "inbox.not_now declines it; inbox.archive retires a stale one"), tool: "inbox", input: press("act")),
-        AppAction("inbox.approve", "inbox", "Approve", ["id"], subject: ["id"], owner: .person(
-                      "it is the person's consent; the person approves on Today or the banner"),
-                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: press("approve")),
-        AppAction("inbox.deny", "inbox", "Deny", ["id"], subject: ["id"], owner: .person("it decides an approval; the person answers on Today or the banner"),
-                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: press("reject")),
+                  instead: "inbox.not_now declines it; inbox.archive retires a stale one", asks: false), tool: "inbox", input: press("act")),
+        AppAction("inbox.approve", "inbox", "Approve", ["id"], subject: ["id"], irreversible: true,
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: press("approve"), scope: """
+                  Approve this exact waiting card when the person tells you in their own Mac chat, paired-phone or allowlisted Telegram message. \
+                  Read the Inbox card first: any other call in this turn requires a fresh message or their tap. \
+                  A message joining a running turn needs a fresh message after that turn ends so the decision can name its authorizing message. \
+                  Peer-steered turns, helpers and wakes cannot decide it; permanent deletion needs their tap
+                  """),
+        AppAction("inbox.deny", "inbox", "Deny", ["id"], subject: ["id"], irreversible: true,
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: press("reject"), scope: """
+                  Deny this exact waiting card on the person's own authenticated message, under the same authority as inbox.approve
+                  """),
 
         // Version-exempt: chat appends through Reach without overwriting page state.
         AppAction("chat.post", "chat", "Tell the person directly", ["message"], irreversible: true,
@@ -190,6 +185,10 @@ extension AppActions {
                   input: composer("speak")),
         AppAction("chat.scratch", "chat", "Scratch", ["key", "value", "session_id?"], tool: "interaction_act",
                   input: composer("write_scratch"), rename: ["key": "choice"]),
+        AppAction("chat.working_memory", "chat", """
+            Hold a private choice or plan in this conversation (up to 1200 characters); shown privately to you each turn until replaced or cleared
+            """, ["text:secret"], warn: "Empty text clears it. Its words stay out of scratch reads, receipts and the person's surfaces.",
+                  tool: "chat_working_memory", versionExempt: true),
         AppAction("page.show", "*", "Go to page", ["page", "item?"], subject: ["page"], screen: true, tool: "interaction_act",
                   input: composer("set_page"), rename: ["page": "value", "item": "choice"]),
         AppAction("browser.show", "chat", "Show your own built-in browser (NativeAgent's browser, not Chrome)", screen: true, tool: "interaction_act",
@@ -199,9 +198,9 @@ extension AppActions {
         AppAction("pane.hide", "chat", "Close the Work pane", screen: true, tool: "interaction_act",
                   input: composer("hide_pane")),
         // Version-exempt: adding a version never overwrites an existing one.
-        AppAction("make.add", "chat", "Add a file to Make as a new version of ref (a new ref when left out); returns the ref",
+        AppAction("make.add", "make", "Add a file to Make as a new version of ref (a new ref when left out); returns the ref",
                   ["path", "ref?", "prompt?", "model?"], tool: "make_studio", input: verb("add"), versionExempt: true),
-        AppAction("make.read", "chat", "A Make ref's versions: n, path, prompt, created (the newest ref when left out)",
+        AppAction("make.read", "make", "A Make ref's versions: n, path, prompt, created (newest ref when left out). Read page:make for the paged shelf.",
                   ["ref?"],tool: "make_studio", input: verb("read"), read: true),
         AppAction("studio.intake.read", "personality", """
             Read neutral consult or corrected complete-history facts for unanswered-work intake; carry snapshot through every page
@@ -232,6 +231,7 @@ extension AppActions {
                   readWhen: ["show": .string("material"), "trial_id": .null, "digest": .null], lifecycle: .change,
                   schema: arguments("sense_make", AbilityStore.partArgumentSchemas.merging(["code": ToolSchema.strSchema(), "trial_id": ToolSchema.strSchema(),
                       "digest": ToolSchema.strSchema(),
+                      "apps": .object(["type": .string("array"), "items": .object(["type": .string("string")])]),
                     "keep": .object(["type": .string("boolean")]), "place": ToolSchema.strSchema(), "why": ToolSchema.strSchema(), "show": ToolSchema.strSchema(
                         )]) { owned, _ in owned })),
         AppAction("sense.versions", "senses", "Read a sense's current and retained versions", ["sense_id"], subject: ["sense_id"],tool: "sense_lifecycle",
@@ -269,8 +269,9 @@ extension AppActions {
                  tool: "app_setting_get", read: true, scope: "setting value read get home timezone phone preferences appearance shortcut memory"),
         AppAction("setting.set", "*", "Set", ["setting", "value:any", "because?"], subject: ["setting"],
                   warn: """
-                      Your own mind settings need no request. For other settings below Full Mac on model turns, because must quote at least 3 words from \
-                      a person or trusted agent in this conversation; you may restore a switch whose last change was yours.
+                      Your own mind settings need no request. For other settings below Full Mac, because must quote at least 3 words from a person \
+                      or trusted agent in this conversation (a run with no conversation has none to quote); you may restore a switch whose last \
+                      change was yours. An owner_only setting is the person's alone.
                       """,
                   tool: "app_setting_set", schema: arguments("app_setting_set", ["setting": ToolSchema.strSchema(), "because": ToolSchema.strSchema(),
                       "value": .object([
@@ -283,7 +284,7 @@ extension AppActions {
                       Screenshot of one of your own NativeAgent pages (your current page, chat, settings…), drawn offscreen; returns the PNG's path. Not the \
                       Mac screen. tab is a tab key as page.show takes it\u{20}
                       """
-                  + "(trust_access…), the page's default tab when left out", ["page", "tab?", "height?:int"],
+                  + "(knowledge, dreams…), the page's default tab when left out", ["page", "tab?", "height?:int"],
                   warn: "saves a PNG and prunes old page captures", tool: "app_page_screenshot", versionExempt: true),
         // Phone, Telegram and below-Full-Mac authority cards remain user-owned; answering runs an irreversible control.
         AppAction("permissions.request", "chat", "Ask for a macOS permission in your own words", ["capability", "why", "mode?", "also_needed?:list"],
@@ -309,18 +310,21 @@ extension AppActions {
         AppAction("provider.test", "providers", "Test the connection", ["provider"], subject: ["provider"],tool: "provider",
                   input: verb("test"), read: true),
         AppAction("provider.refresh", "providers", "Refresh", tool: "provider", input: verb("refresh_models")),
+        AppAction("provider.cancel_refresh", "providers", "Cancel the model catalog refresh", tool: "provider", input: verb("cancel_refresh")),
         AppAction("provider.set_fallback_model", "providers", "Model it falls back to", ["provider", "model"], subject: ["provider"],
                   tool: "provider", input: verb("set_default_model")),
-        AppAction("provider.sign_in", "providers", "Sign in",
-                  owner: .person("the person signs in through the browser window Providers → Sign in opens, or pastes the key there")),
+        // Opening the protected entry is an ask, not the credential: only the person types the key or signs in there.
+        AppAction("provider.sign_in", "providers", "Sign in", ["provider"], subject: ["provider"],
+                  tool: "connections", input: verb("provider_sign_in")),
         AppAction("provider.disconnect", "providers", "Disconnect", ["provider"], subject: ["provider"],
                   owner: .person("only the person can sign back in, and disconnects on Providers"), irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "provider", input: verb("disconnect")),
 
-        // Connector and pairing controls may lower access, never raise it.
-        AppAction("connector.off", "connectors", "Turn off", ["id", "reason?"], subject: ["id"], tool: "connections", input: verb("connector_off")),
-        AppAction("connector.on", "connectors", "Turn on", ["id"], subject: ["id"], owner: .person("it raises Trust; the person turns it on in Connectors"),
-                  tool: "connections", input: verb("connector_on")),
+        // Connector and pairing controls may lower access, never raise it. A switch's change names the position it moves to (value).
+        AppAction("connector.off", "connectors", "Turn off", ["id", "reason?", "value?:bool"], subject: ["id"], tool: "connections",
+                  input: verb("connector_off")),
+        AppAction("connector.on", "connectors", "Turn on", ["id", "value?:bool"], subject: ["id"],
+                  owner: .person("it raises Trust; the person turns it on in Connectors"), tool: "connections", input: verb("connector_on")),
         AppAction("connector.disconnect", "connectors", "Disconnect", ["id"], subject: ["id"],
                   owner: .person("only the person can sign back in, and disconnects in Connectors", instead: "connector.off stops one"),
                   irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections", input: verb("connector_disconnect")),
@@ -366,10 +370,13 @@ extension AppActions {
                   + "Archived entries include what replaced them",
                   ["status?", "sort?", "offset?:int", "after_id?", "limit?:int", "kind?"],tool: "list_memories",
                   read: true),
-        AppAction("memory.rewrite", "memories", "Rewrite, pin, unpin or restore a memory",
-                  ["id", "text?", "pinned?:bool", "restore?:bool", "reason?"], subject: ["id"],
+        AppAction("memory.rewrite", "memories", "Rewrite, pin, unpin or restore a memory, or restate its roots: how, from whom and since when you know it",
+                  ["id", "text?", "pinned?:bool", "restore?:bool", "reason?", "roots?:[{how,by?,since?}]"], subject: ["id"],
                   capabilities: ["memory_write", "tool_call"], warn: "text is the thing itself, one or two sentences, no date, source, ids or preamble; "
-                      + "a restore that matches something forgotten stays archived",
+                      + "a restore that matches something forgotten stays archived; roots restates every root of yours in one call, one per telling: "
+                      + "how is told, noticed, inferred, verified or remembered, by who told you or where your own past was kept, since when you "
+                      + "first knew it (an ISO-8601 date-time); roots an untrusted agent steered stay as they are; a rewrite that changes nothing "
+                      + "writes nothing",
                   // Rewrites and restores need versions because they can overwrite another conversation's correction; commit supersedes is idempotent.
                   tool: "rewrite_memory"),
         AppAction("memory.pin", "memories", """
@@ -379,29 +386,22 @@ extension AppActions {
                   capabilities: ["memory_write", "tool_call"], tool: "rewrite_memory", input: ["pinned": .bool(true)]),
 
         AppAction("mind.dream", "personality", "Run a dream pass", tool: "mind_run", input: verb("dream")),
+        AppAction("mind.sleep", "personality", "Sleep now: a dream pass, the night's reading, a thought if it asks", tool: "mind_run", input: verb("sleep")),
         AppAction("mind.canon", "diagnostics", "Tend studio canon now; skip its clock wait, retain proposal and seat gates", tool: "mind_run", input: verb(
             "canon")),
         AppAction("mind.horizon", "diagnostics", "Refresh horizon expectations now from current sources", tool: "mind_run", input: verb("horizon")),
         AppAction("mind.rhythm", "diagnostics", """
             Read the person's day now with the standing-time boundary satisfied; keep real history and care admission
             """, tool: "mind_run", input: verb("rhythm")),
-        AppAction("mind.wander", "diagnostics", "Offer the wander hour now; skip quiet/refractory waits, retain installation and live-turn gates",
-            tool: "mind_run", input: verb("wander")),
-        AppAction("mind.reach", "diagnostics", "Consider Reach now; skip scan wait, retain every person-facing gate", tool: "mind_run", input: verb("reach")),
-        AppAction("mind.carried", "diagnostics", """
-            Consider carried work now with free-time quiet satisfied; retain real readiness and Desk revision
-            """, tool: "mind_run", input: verb("carried")),
-        AppAction("mind.cross", "diagnostics", "Send a line through the real care crossing on this watch; no synthetic care or wake", ["line", "watch"],
+        AppAction("mind.cross", "diagnostics", "Post a line as a world happening on this watch; attention weighs it like any source's", ["line", "watch"],
             tool: "mind_run", input: verb("cross")),
         AppAction("mind.maintenance", "diagnostics", "Run the checked substrate maintenance now, satisfying only its interval", tool: "mind_run", input: verb(
             "maintenance")),
         AppAction("mind.residual_repair", "diagnostics", "Run eligible bounded residual repair now, satisfying only its quiet wait", tool: "mind_run",
             input: verb("residual_repair")),
         AppAction("mind.rem", "personality", "Run a REM pass", ["repair?:bool"], tool: "mind_run", input: verb("rem")),
-        AppAction("scheduler.trigger_fire", "desk", "Reconcile a claimed trigger", ["surface", "name", "occurrence?"], subject: ["name"], tool: "mind_run",
+        AppAction("scheduler.trigger_fire", "desk", "Publish an inbox trigger's card now", ["name"], subject: ["name"], tool: "mind_run",
             input: verb("trigger_fire")),
-        AppAction("mind.self_improvement", "today", "Self-Improvement: Run now", tool: "mind_run",
-                  input: verb("self_improvement")),
         AppAction("mind.misses", "today", "Your misses: corrections by lesson, this week against last, each with its history locator",
                  tool: "mind_run", input: verb("misses"), read: true),
         AppAction("mind.think_now", "diagnostics", "Think now", tool: "mind_run", input: verb("think_now")),
@@ -410,6 +410,10 @@ extension AppActions {
             """, tool: "mind_run", input: verb("body"), read: true),
         AppAction("mind.why", "personality", "Why a felt cue or memory surfaced on a turn (default: latest recorded completed turn)",
                   ["turn?"],tool: "mind_run", input: verb("why"), read: true),
+        AppAction("mind.night", "personality", """
+            The night's reading of your parts, as numbers and ids: open trials' verdicts, and the parts whose surprise rose above their own record \
+            (since: ISO time, default 24 hours ago)
+            """, ["since?"], tool: "mind_run", input: verb("night"), read: true),
         AppAction("mind.reject", "personality",
                   "Stop a memory, care or dream phrase surfacing for this kind of thing (source from mind.why)",
                   ["source", "turn?", "always?:bool"], tool: "mind_run", input: verb("reject")),
@@ -417,6 +421,8 @@ extension AppActions {
                   "Undo an undertone nudge of yours; no item lists them",
                   ["item?"], tool: "mind_run", input: verb("undo")),
         AppAction("mind.reflect", "diagnostics", "Reflect", tool: "mind_run", input: verb("reflect")),
+        AppAction("mind.workspace", "cognition", "Include or leave out the workspace in thinking", ["value:bool"],
+                  tool: "mind_run", input: verb("workspace")),
         AppAction("mind.settle_body", "diagnostics", "Settle your body state (calm down when wound up)", tool: "mind_run", input: verb("settle_body")),
         AppAction("mind.reset_body", "diagnostics", "Reset body", tool: "mind_run", input: verb("reset_body")),
         AppAction("mind.pin_concern", "diagnostics", """
@@ -561,7 +567,36 @@ extension AppActions {
                       + """
                           below Full Mac or on a turn started by an untrusted agent, it remains unkept; ability.enable files the owner's card. wake defaults \
                           []; face {page?,action?,projection?} places the action and may name an unclaimed app action id. projection:true declares \
-                          face(input) → {sections:[{id,title?,rows:[{id,title,detail?,value?}]}]} from frozen native sources, with no host effects/state. \
+                          face(input) → {title?,line?,detail?:{of:sectionId},sections:[{id,title?,style?:list|values|timeline|flow|note|waiting,\
+                          footer?,folded?,filter?:label,revision?:string,more?:{next:cursor,total?,revision?},rows?:[{id,\
+                          title,detail?,value?,at?:ISO,symbol?:SF Symbol,tone?:plain|quiet|attention|failed|done|live,\
+                          open?:chat:|page:|approval:|card:|dream:|url:,actions?:[{id,label,role?,unavailable?:reason}],control?:{on}|{options,selected}|\
+                          {text,placeholder?}|{number:{value,min?,max?,step?}}|{date:ISO},rows?:[rows],expands?:true}],\
+                          block?:{kind:"document",key,text?,format?:plain|markdown|code,language?,copy?}|{kind:"leaf",key,leaf,ref,alt}|\
+                          {kind:"form",key,fields:[{id,label,kind:line|lines|choice|switch|number|date|secret,value?,placeholder?,required?,\
+                          options?:[{id,label}],min?,max?,step?}],submit:[{id,label,role?,unavailable?}],revision?,protected?,receiver?,doors?}}]} \
+                          from a frozen packet, with no host effects. A section has rows or block, never both. Inline document text is at most \
+                          16 KiB; longer text is read on demand. A document key declares read:{action,args?}; the action must declare itself \
+                          read-only. Its frozen result enters face(input) as input.read; return the requested document block with its text. \
+                          Collections use their section id's read, with args.cursor, revision and anchor from the held demand. Inline nested rows \
+                          share the section's 256-row bound and nest at most four deep; expands names that row's read for deeper evidence. \
+                          A selected row links page:<page>/<item>; detail.of names the list section. Each held item read returns its face, \
+                          outside the top-level phone snapshot. A filter searches retained rows; an owner query travels with its held result. \
+                          A row that opens, acts or holds a control has an id its packet's keys declare, with only that key's open and actions; \
+                          a key {open?,actions?:[{id,role?,doors?,unavailable?:reason,call:{action,args?}|open}],set?:{action,args?},read?:{action,args?},\
+                          submit?:{<id>:{action,args?}}} \
+                          says what each action calls \
+                          (an app call, the same one you make) and what a control's change calls with its value as args.value. A form's key \
+                          owns each submit call; its public fields enter args and the key's fixed args win. A protected authored form has \
+                          protected:true, receiver:"keyring:<name>", doors:["mac"] and exactly one secret field without value; its submit \
+                          calls that exact receiver without args. Native protected entry stores its transient bytes in Keychain, never in \
+                          form args, drafts, records or feedback; you read only set/not set. Other secret receivers belong to native owners. A person's tap \
+                          runs a row's call through their door; on a page of your own it is your call, asked of them. With \
+                          projection, a new page:"<id>" makes the part a page of your own, drawn from its host.state notebook (declare keys there), \
+                          placed by layout.write as page:<id> on rail or more. native-desk, native-memories, native-personality and \
+                          native-diagnostics draw those pages; native-document draws passive document packets. The person's levers \
+                          (consent, models, forgetting, reset, approvals) are the app's: \
+                          a page's drawn first, a key's actions after yours on each row with that id. \
                           part.call(id,input) calls a declared authored.<id> → {ok:true,value} or {ok:false,error:{code,message}}; input: frozen JSON \
                           object, \
                           max 4 MiB. host.model.call may pass tools:[\"app\"] and a routing surface, limited by this ability's reach and caller. params \
@@ -581,7 +616,8 @@ extension AppActions {
             One ability of yours: what it declares, its status and versions, and its code in pages; a built-in skill's guidance reads too
             """,
                   ["id", "offset?:int", "step?:int"], subject: ["id"], tool: "ability_manage", input: verb("read"), read: true),
-        AppAction("ability.list", "tools", "Your abilities with runs and last_run_at; follow next_call when has_more", ["offset?:int"], tool: "ability_manage",
+        AppAction("ability.list", "tools", "Your abilities with run_counts (all_versions, current_version) and last_run_at; follow next_call when has_more",
+            ["offset?:int"], tool: "ability_manage",
             input: verb("list"), read: true),
         AppAction("ability.validate", "tools", "Validate an unkept version on supplied input or one captured run; intercepted replies prove no live behavior",
                   ["id", "input?:object*", "capture?:bool"], subject: ["id"], tool: "ability_manage", input: verb("validate"), read: true,
@@ -656,15 +692,24 @@ extension AppActions {
                       when and until use queue.add's grammar. The receipt names the stored habit.
                       """,
                   tool: "my_queue", input: verb("update"), versionExempt: true, schema: queueUpdateSchema),
-        AppAction("queue.done", "desk", "Mark a MY QUEUE step done", ["id", "reason?"], subject: ["id"],tool: "my_queue",
-                  input: verb("done"), versionExempt: true),
+        AppAction("queue.done", "desk", "Mark a MY QUEUE step done; put why it is done in reason", ["id", "reason?"], subject: ["id"],tool: "my_queue",
+                  input: verb("done"), argumentNames: ["reason": ["evidence", "summary"]], versionExempt: true),
         AppAction("queue.drop", "desk", "Drop a MY QUEUE step", ["id", "reason?"], subject: ["id"],tool: "my_queue",
                   input: verb("drop"), versionExempt: true),
         // Owed repair settles only when its operation works again or an explicit reason releases it.
         AppAction("repair.let_go", "desk", """
-            Let go of something you owe (a repair on your home's OWED line, or a reply no door can carry), saying why
-            """, ["id", "reason"], subject: ["id"],
+            Let go of something you owe (a repair on your home's OWED line, or a reply no door can carry), saying why. \
+            operation_prefix instead of id lets go of every open repair whose operation starts with it, each through the same checks
+            """, ["id?", "operation_prefix?", "reason"], subject: ["id"],
                   tool: "repair_let_go", versionExempt: true),
+        AppAction("record.read", "desk", """
+            Read your own committed experiences or details, newest first. of selects experiences or details; filters combine. \
+            Experiences take id, id_prefix, kind and open_only (default false). Details take subject, subject_prefix, kind, source and \
+            since (inclusive ISO 8601 time). Prefixes are literal. limit defaults to 20; raise it for more. matched_total and returned \
+            distinguish the page from all matches. Detail rows return whole parsed JSON up to the store's 8 MiB row cap; unreadable rows name gaps
+            """, ["of:experiences|details", "id?", "id_prefix?", "kind?", "open_only?:bool", "subject?", "subject_prefix?", "source?", "since?",
+                  "limit?:int"],
+            capabilities: ["app_data_read"], tool: "record_read", read: true),
         AppAction("abilities.restore_state", "diagnostics",
             "Restore recovered ability run state, preserving damaged bytes and existing authority", ["state:object", "expected_digest"],
                   warn: """
@@ -675,13 +720,12 @@ extension AppActions {
                   schema: arguments("abilities_restore_state", ["state": AbilityStore.recoveryStateSchema, "expected_digest": ToolSchema.strSchema()])),
         AppAction("turn.reconcile", "chat", "Reconcile a saved turn without repeating completed effects", ["session_id", "turn_id?"], subject: ["session_id"],
             tool: "turn_reconcile", versionExempt: true),
-        AppAction("home.accept", "desk", "Accept kept arrivals", ["id?"], subject: ["id"], tool: "arrival_accept", versionExempt: true),
-        // Between-turn part arrivals reach the news board, never context (AGENT_IS_THE_APP contract #2).
+        // A part's line is a world happening the agent's attention weighs, never context (AGENT_IS_THE_APP contract #2).
         AppAction("home.arrive", "desk", """
-            From a part's run: one line on your home; event_key deduplicates this occurrence durably within this part, otherwise the same line is offered \
-            once per local day
+            From a part's run: one line for your attention, weighed by your turn program; event_key deduplicates this occurrence durably within this \
+            part, otherwise the same line is offered once per local day
             """,
-                  ["line", "event_key?"],tool: "resident_wake", versionExempt: true),
+                  ["line", "event_key?"], tool: "home_arrive", versionExempt: true),
         AppAction("house.file", "desk", "File something to tend, with who owns it", ["title", "summary", "owner", "refs?:array"],
                  warn: "owner is me, builder or user; refs contains strings or Desk ref objects {kind,…}", tool: "house_file", versionExempt: true),
 
@@ -691,7 +735,9 @@ extension AppActions {
             Read deeper context by its offered atom id or a history: id from a replayed receipt; offset defaults to 0, pages cap at 12000 characters, \
             continue with next_offset until null
             """,
-              ["atom_id", "max_characters?:int", "offset?:int"], read: true),
+              ["atom_id", "max_characters?:int", "offset?:int"], read: true,
+              argumentReferences: ["message_id": .init(parameter: "atom_id", prefix: "history:", qualifiers: ["agent"]),
+                                   "history": .init(parameter: "atom_id", prefix: "history:", qualifiers: ["agent"])]),
         .fold("inner_state", "personality",
               "Your inner state, from your organs' record; asked how you feel, read this first, then speak",
               ["window_hours?:int", "detail?:compact|full"], read: true),
@@ -726,7 +772,8 @@ extension AppActions {
         .fold("desk_blocked_on", "desk"),
         .fold("desk_defer", "desk"),
         .fold("desk_breakdown", "desk"),
-        .fold("desk_close", "desk"),
+        .fold("desk_close", "desk", argumentNames: ["reason": ["evidence", "summary"], "canceled": ["status"]],
+              argumentValues: ["canceled": ["canceled": .bool(true), "cancelled": .bool(true), "done": .bool(false)]]),
         .fold("desk_archive", "desk"),
         .fold("desk_work_log", "desk"),
         .fold("desk_set_cadence", "desk"),
@@ -737,13 +784,9 @@ extension AppActions {
         .fold("task_ledger_post", "desk", "Post to the shared task ledger (separate from your Desk)"),
         .fold("scheduler_list_jobs", "desk", read: true),
         .fold("scheduler_create_job", "desk", """
-            Schedule a body rhythm: dream, rem, part, connector_action, harness_benchmark or proactive_scan; for intentions, check-ins and reminders use \
-            queue.add
+            Schedule a read on the clock: connector_action (a watch) or proactive_scan; for intentions, check-ins and reminders use queue.add
             """),
-        .fold("scheduler_update_job", "desk", "Edit a body rhythm; for intentions, check-ins and reminders use queue.add"),
-        .fold("scheduler_pause_job", "desk"),
-        .fold("scheduler_resume_job", "desk"),
-        .fold("scheduler_cancel_job", "desk", "Cancel future runs; keep history and allow schedule.resume; running work continues"),
+        .fold("scheduler_cancel_job", "desk", "Cancel a scheduled read: it leaves the clock; a read already running finishes"),
         .fold("scheduler_cancel_job", "desk", id: "schedule.delete"),
         .fold("recall_memory", "memories", "Recall saved facts, decisions and preferences; use studio.recall for journal entries", read: true, advisory: true),
         // Version-exempt: it appends a new memory; supersedes demotes the ids it names, which a repeat leaves demoted.
@@ -781,7 +824,7 @@ extension AppActions {
         // The peer-data latch binds subsequent scripted calls as it does a turn.
         .fold("agent_contacts", "agents", read: true),
         // The send schema owns wait_seconds and the live/async receipt contract.
-        .fold("agent_message", "agents"),
+        .fold("agent_message", "agents", argumentNames: ["agent": ["to"]]),
         .fold("agent_read", "agents", read: true),
         AppAction("claude.worklog", "agents", """
             Read what Claude has been doing and working on, newest first: the worklog of shipped features, fixes, builds and work in progress
@@ -838,21 +881,8 @@ extension AppActions {
                   ["text", "done?:bool", "agent?", "exchange?"], tool: "agent_message"),
         .fold("delegation_status", "agents", read: true),
 
-        .fold("mail_list_recent", "mail", """
-            Read Apple Mail drafts to a person/address with mailbox:\"drafts\"; also inbox or sent. Read one body with scope + message_id\u{20}
-            """
-              + "+ expected_message_id + expected_account_id", read: true),
-        .fold("mail_read_batch", "mail", read: true),
-        .fold("mail_search", "mail", read: true),
+        // The rest of mail.* is answered by the native-mail part.
         .fold("mail_save_attachment", "mail"),
-        .fold("mail_senders", "mail", "Read top and most frequent email senders and unread counts to identify unsubscribe candidates", read: true),
-        .fold("mail_triage_batch", "mail"),
-        .fold("mail_mark_read", "mail"),
-        .fold("mail_archive", "mail"),
-        .fold("mail_delete", "mail", irreversible: true),
-        .fold("mail_send", "mail", irreversible: true),
-        .fold("mail_reply", "mail", irreversible: true),
-        .fold("mail_draft", "mail", "Compose an email draft or draft a reply without sending it"),
         .fold("mac_calendar_list_upcoming", "calendar", read: true),
         .fold("mac_calendar_calendars", "calendar", read: true),
         .fold("mac_calendar_free_busy", "calendar", read: true),
@@ -870,17 +900,9 @@ extension AppActions {
         .fold("mac_reminders_update", "reminders"),
         .fold("mac_reminders_complete", "reminders"),
         .fold("mac_reminders_delete", "reminders", irreversible: true),
-        .fold("notes_search", "notes", read: true),
-        .fold("notes_create", "notes"),
-        .fold("notes_update", "notes"),
-        .fold("notes_delete", "notes", nil, ["id|title"]),
         .fold("contacts_search", "contacts", read: true),
         .fold("contacts_create_or_update", "contacts"),
         .fold("contacts_delete", "contacts", irreversible: true),
-        .fold("messages_recent_threads", "messages", """
-            List Messages threads with selected fields, latest-unread filtering and a since window; or read sent, received and exact conversation history
-            """, read: true),
-        .fold("messages_send", "messages", irreversible: true),
         .fold("mac_notify", "notifications"),
         .fold("mobile_notify", "notifications"),
         .fold("phone_request", "pairing"),
@@ -942,7 +964,10 @@ extension AppActions {
               warn: """
                   find reads matching paragraphs with surroundings; without find the whole extracted text is read. raw:true bypasses the sense view; \
                   wrong:true reads the original view and offers repair guidance after success (why is an optional explanation). Every successful fetch \
-                  retains a source receipt with its path and purpose.
+                  retains a source receipt with its path and purpose. Thin JavaScript pages use Chrome in another background tab through the same browser \
+                  gates, say used_browser:true and retain the HTTP receipt separately. text_reader names browser only when it has more readable content; \
+                  otherwise HTTP text stays at the top with the browser result and cause attached. \
+                  Chrome may use the signed-in session. Consent is never dismissed.
                   """),
         .fold("web_search", "web", read: true),
         .fold("maps_route", "web", "Read a route, distance and driving time between places", read: true,
@@ -1000,16 +1025,12 @@ extension AppActions {
         .fold("mac_volume", "mac", "Read or change volume; no args reads only", readWhen: ["level": .null, "adjust": .null, "muted": .null]),
         .fold("mac_media", "mac", "Control Now Playing across Music, Spotify, browsers and podcasts: play/pause toggle, next or previous", screen: true),
         .fold("activity_query", "mac", read: true),
-        .fold("music_now_playing", "music", "Playing, paused or stopped, with first-observed time and current track", read: true),
-        .fold("music_search_library", "music", "Search library tracks with count, total and has_more", read: true),
-        .fold("music_list_library", "music", "Page library tracks; sort title/artist/added and filter artist/album/genre", read: true),
-        .fold("music_list_playlists", "music", "Page playlists labeled owner, smart or library with count and total", read: true),
-        .fold("music_control", "music", "Play, pause, stop or skip; play takes seconds (1–30) and stops itself", screen: true),
         .fold("context_lookup", "capabilities", read: true),
         .fold("request_interaction", "chat"),
         .fold("artifact_find", "chat", read: true),
         .fold("work_context", "desk", read: true),
-        ]
+        // What a page's rows call, declared once beside every other verb: the person's tap and the agent's call are the same call.
+        ] + agentPageVerbs + trustSettingsInboxVerbs + providersConnectorsCapabilitiesVerbs + cardVerbs
         requireDeclaredArgumentShapes(actions)
         return actions
     }

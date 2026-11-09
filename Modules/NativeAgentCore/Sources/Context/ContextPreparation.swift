@@ -6,7 +6,7 @@ import TrustCenter
 import CryptoKit
 import GRDB
 import PersonaEngine
-// Blueprint: | `ContextPreparation.swift` | Context lifecycle, health, publication admission and shutdown drain |
+// Blueprint: | `ContextPreparation.swift` | Context lifecycle, health invalidation, publication admission and shutdown drain |
 
 public enum ContextFlowMode: String, Codable, CaseIterable, Sendable {
     case off
@@ -89,9 +89,9 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     let compiledProjectionProviders: [any ContextCompiledProjectionProvider]
     var monitor: ContextSourceMonitor?
     private var coalescer: ContextSourceEventCoalescer?
-    var started = false
-    var lastReconciledAt: Date?
-    var lastError: String?
+    var started = false { didSet { if started != oldValue { arena.healthEvents.signal() } } }
+    var lastReconciledAt: Date? { didSet { if lastReconciledAt != oldValue { arena.healthEvents.signal() } } }
+    var lastError: String? { didSet { if lastError != oldValue { arena.healthEvents.signal() } } }
     /// Current preparation availability, separate from retained leased bytes and maintenance diagnostics.
     var reconciliationFailure: String?
     var feedbackRestoreFailure: String? = "Context feedback has not been restored."
@@ -104,7 +104,7 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     var activeStoredGeneration: ContextStoredGeneration?
     var activeCompiledSources: [ContextSourceID: ContextCompiledSource] = [:]
     let feedbackReducer = ContextFeedbackReducer()
-    var feedbackEvents: [ContextFeedbackEvent] = []
+    var feedbackEvents: [ContextFeedbackEvent] = [] { didSet { arena.healthEvents.signal() } }
     var feedbackOrdinal: UInt64 = 0
     /// The last feedback that applied; a failed update never replaces it.
     var cachedFeedback: (
@@ -127,13 +127,17 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     var compileDone = ScopedWaiter()
     /// Housekeeping rebuilds a turn requested or launch started; no turn awaits it.
     private var backgroundReconciliation: Task<Void, Never>?
-    var degradedSourceIDs: Set<ContextSourceID> = []
+    var degradedSourceIDs: Set<ContextSourceID> = [] {
+        didSet { if degradedSourceIDs != oldValue { arena.healthEvents.signal() } }
+    }
     enum SourceReadOwner: Hashable {
         case registered
         case projection(String)
     }
     /// Last committed source reads, including failures before any source row exists.
-    var sourceReadFailures: [SourceReadOwner: [ContextSourceID: String]] = [:]
+    var sourceReadFailures: [SourceReadOwner: [ContextSourceID: String]] = [:] {
+        didSet { if sourceReadFailures != oldValue { arena.healthEvents.signal() } }
+    }
     /// Cache only immutable generation derivations; keep feedback and live effects outside.
     var generationDerivedCache: [GenerationDerivedCacheKey: GenerationDerivedTurnState] = [:]
     /// Error-level diagnostic sink for context health and vocabulary drift.

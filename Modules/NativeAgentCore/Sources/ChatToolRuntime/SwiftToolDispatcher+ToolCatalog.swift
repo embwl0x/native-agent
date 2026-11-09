@@ -161,6 +161,15 @@ extension SwiftToolDispatcher {
         nativeToolDescriptors[ToolNameAliases.canonical(tool)]?.schema.macIntegration
     }
 
+    /// The integration switch a call needs: a built-in's own, or the one a part's answered verb carries from its app reach, whether the verb is named
+    /// directly or run as its part with the verb in its input. An unreadable catalog throws; it never means no switch.
+    public static func integrationGate(tool: String, input: [String: JSONValue], turn: Turn?) throws -> MacIntegrationAccess? {
+        if let native = macIntegrationAccess(forTool: tool) { return native }
+        let verb = try AppActionBinding.answeredVerb(tool: tool, input: input, turn: turn) ?? tool
+        guard let binding = try AppActionBinding.binding(verb, turn: turn), binding.fixedInput["verb"] == .string(verb) else { return nil }
+        return binding.descriptor?.schema.macIntegration
+    }
+
     private static func nativeBucket(_ schema: LLMToolSchema) -> ChatToolCatalogBucket {
         let name = schema.name
         if Self.fullMacBuilderToolNames.contains(name)

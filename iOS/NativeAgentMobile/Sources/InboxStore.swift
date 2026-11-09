@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import UserNotifications
 import SwiftUI
-// Blueprint: | `InboxStore.swift` | Inbox refresh/actions and notification permission; the Mac's routed alert is the phone's only inbox alert |
+// Blueprint: | `InboxStore.swift` | Inbox refresh and notification permission; the Mac's routed alert is the phone's only inbox alert |
 
 // MARK: - Store
 
@@ -31,25 +31,6 @@ final class InboxStore: ObservableObject {
     func applySyncedInboxFromSnapshot() {
         NSLog("[InboxStore] refresh via iCloud fetched=%d", iCloudSyncEngine.shared.inboxItems.count)
         bannerError = iCloudSyncEngine.shared.syncError
-    }
-
-    // MARK: - Actions
-
-    func performAction(id: String, actionID: String, pairingStore: PairingStore) async {
-        guard pairingStore.usesICloudTransport else { bannerError = "Pair to view"; return }
-        do {
-            let response = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: actionID)
-            openInteraction(response, id: id, actionID: actionID)
-            applySyncedInboxFromSnapshot()
-        } catch {
-            bannerError = "Failed: \(error.localizedDescription)"
-        }
-    }
-
-    private func openInteraction(_ response: [String: String], id: String, actionID: String) {
-        guard id.hasPrefix("interaction:"), actionID == "act", let session = response["sessionID"] else { return }
-        NativeAgentNotificationLaunchIntent.stage(screen: "chat", sessionID: session)
-        NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil, userInfo: ["screen": "chat"])
     }
 
     // MARK: - Notification permission (the Mac's pushes need it)

@@ -183,9 +183,9 @@ extension SwiftNativeChatOrchestrationClient {
         }
         record["metadata"] = .object(metadata)
         let toolRow: JSONValue = .object(record)
-        try await Self.appendTranscriptRow(
+        let filed = try await Self.appendTranscriptRow(
             toolRow, to: path)
-        if stampedInteraction != nil {
+        if stampedInteraction != nil, filed.changed {
             NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: sessionId)
         }
         await observeCognitiveTool(
@@ -313,6 +313,10 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     package static func inlineInteractionReceiptEnvelope(_ interaction: InlineInteraction) -> JSONValue {
+        if let reason = interaction.continuationFailure {
+            return .object(["status": .string("failed"), "ok": .bool(false), "error": .string(reason),
+                "consent": .string(interaction.state.outcome?.summary ?? interaction.declineConsequence)])
+        }
         switch interaction.state {
         case .stopped(let reason):
             return .object(["status": .string("stopped"), "reason": .string(reason)])
@@ -355,7 +359,7 @@ extension SwiftNativeChatOrchestrationClient {
         toolCallId: String? = nil, requestingTool: String? = nil,
         origin: TurnEnvelope, dataRoot: URL,
         turn: Turn
-    ) async throws -> InlineInteraction {
+    ) async throws -> (card: InlineInteraction, changed: Bool) {
         guard let safeSession = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
             throw ChatOrchestrationError.underlying("invalid chat session id")
         }
@@ -390,19 +394,89 @@ extension SwiftNativeChatOrchestrationClient {
             "metadata": .object(metadata),
         ])
         let path = dataRoot.appendingPathComponent("chat/messages/\(safeSession).jsonl")
-        guard let retained = try await appendTranscriptRow(row, to: path) else {
+        let filed = try await appendTranscriptRow(row, to: path)
+        guard let retained = filed.card else {
             throw ChatOrchestrationError.underlying("The interaction append returned no card.")
         }
-        return retained
+        return (retained, filed.changed)
     }
 
     @discardableResult
-    package static func appendTranscriptRow(_ row: JSONValue, to path: URL) async throws -> InlineInteraction? {
+    package static func appendTranscriptRow(_ row: JSONValue, to path: URL) async throws -> (card: InlineInteraction?, changed: Bool) {
         let lifeID: String?
         if row.objectValue?["metadata"]?.objectValue?["kind"] == .string(InlineInteractionWire.transcriptKind) {
             lifeID = try DataRootLife.current(in: path.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent())
         } else { lifeID = nil }
-        return try await SwiftNativePersistenceCore.withFileLock(path) { () async throws -> InlineInteraction? in
+        if let card = try checkedInlineInteraction(in: row, lifeID: lifeID), card.kind == .apiKey, card.secret == nil, card.state.isOpen {
+            let root = path.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            // One provider ask across conversations and producers. This lock carries no credential or copied account state.
+            return try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("chat/provider-asks")) {
+                let retained = try await appendLockedTranscriptRow(row, to: path, lifeID: lifeID)
+                if let card = retained.card { await supersedeProviderAsks(card, except: path, root: root, lifeID: lifeID) }
+                return retained
+            }
+        }
+        return try await appendLockedTranscriptRow(row, to: path, lifeID: lifeID)
+    }
+
+    private static func supersedeProviderAsks(_ incoming: InlineInteraction, except path: URL, root: URL, lifeID: String?) async {
+        let directory = path.deletingLastPathComponent()
+        let files: [URL]
+        do { files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) }
+        catch CocoaError.fileReadNoSuchFile { return } // No conversation has been created yet.
+        catch {
+            RepairOwed.owe(root, id: "provider-ask-directory:" + directory.path, kind: .run, operation: "provider-asks", owner: directory.path,
+                words: "The replacement request is saved, but previous requests could not be enumerated: \(error.localizedDescription)")
+            return
+        }
+        for file in files where file.pathExtension == "jsonl" {
+            let read: (rows: [JSONValue], report: JSONLReadReport)
+            do { read = try await SwiftNativePersistenceCore.readJSONLReporting(file) }
+            catch {
+                RepairOwed.owe(root, id: "provider-ask-file:" + file.path, kind: .run, operation: "provider-asks", owner: file.path,
+                    words: "Saved requests could not be read; their identities remain unknown: \(error.localizedDescription)")
+                continue
+            }
+            if !read.report.isClean {
+                RepairOwed.owe(root, id: "provider-ask-file:" + file.path, kind: .run, operation: "provider-asks", owner: file.path,
+                    words: "This conversation has damaged or incomplete rows. "
+                        + "Its requests are preserved until the transcript is repaired; the replacement request is saved.")
+                // Replacement rewrites the whole feed and requires a clean read. Never rewrite a damaged sibling or let it block the new ask.
+                continue
+            }
+            // An unreadable item keeps its repair and cannot prevent its readable siblings from being reconciled.
+            let cards = read.rows.enumerated().compactMap { index, row -> InlineInteraction? in
+                do { return try checkedInlineInteraction(in: row, lifeID: lifeID) }
+                catch {
+                    RepairOwed.owe(root, id: "provider-ask-row:\(file.path):\(index + 1)", kind: .run,
+                        operation: "provider-asks", owner: file.path,
+                        words: "Saved request row \(index + 1) could not be read; its identity remains unknown: \(error.localizedDescription)")
+                    return nil
+                }
+            }.filter { $0.kind == .apiKey && $0.secret == nil && $0.target == incoming.target }
+            let retained = file == path ? cards.last(where: { $0.state.isOpen })?.id : nil
+            for prior in cards {
+                guard prior.id != incoming.id, prior.id != retained, prior.state.isOpen || prior.state.isRetryable else { continue }
+                var replaced = prior
+                replaced.state = .superseded
+                replaced.revision += 1
+                replaced.continuation?.state = .invalidated
+                do { try await persistInlineInteraction(replaced, at: file, ifRevision: prior.revision) }
+                catch {
+                    RepairOwed.owe(root, id: "provider-ask-settle:" + prior.id, kind: .run, operation: "provider-asks", owner: file.path,
+                        words: "The replacement request is saved, but request \(prior.id) could not be superseded: \(error.localizedDescription)")
+                    continue
+                }
+                let session = file.deletingPathExtension().lastPathComponent
+                await Owed.record(root, id: "interaction:" + prior.id, kind: .decision, key: "decide", to: "person",
+                    phase: .letGo(.cancelled), evidence: [.init(source: "chat/messages/" + session, id: prior.id)], born: false).value
+                NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: session)
+            }
+        }
+    }
+
+    private static func appendLockedTranscriptRow(_ row: JSONValue, to path: URL, lifeID: String?) async throws -> (card: InlineInteraction?, changed: Bool) {
+        return try await SwiftNativePersistenceCore.withFileLock(path) { () async throws -> (card: InlineInteraction?, changed: Bool) in
             let incoming = try checkedInlineInteraction(in: row, lifeID: lifeID)
             if let incoming {
                 let read = try await SwiftNativePersistenceCore.readJSONLReporting(path)
@@ -412,15 +486,16 @@ extension SwiftNativeChatOrchestrationClient {
                 func tool(_ card: InlineInteraction, _ row: JSONValue) -> String? {
                     card.continuation?.toolName ?? row.objectValue?["metadata"]?.objectValue?["toolName"]?.stringValue
                 }
-                func retainReceipt(pointingTo card: InlineInteraction) async throws {
+                func retainReceipt(pointingTo card: InlineInteraction) async throws -> Bool {
                     guard case .object(var receipt) = row,
                           case .object(var metadata)? = receipt["metadata"],
-                          metadata["toolInvocationId"] != nil else { return }
+                          metadata["toolInvocationId"] != nil else { return false }
                     metadata["kind"] = .string(ChatTranscriptToolMessageKind.toolUse)
                     metadata.removeValue(forKey: InlineInteractionWire.metadataKey)
                     metadata["interactionId"] = .string(card.id)
                     receipt["metadata"] = .object(metadata)
                     try await ContactThread.append(.object(receipt), to: path)
+                    return true
                 }
                 for (index, prior) in read.rows.enumerated().reversed() {
                     let card: InlineInteraction
@@ -444,24 +519,22 @@ extension SwiftNativeChatOrchestrationClient {
                         continue
                     }
                     if card.id == incoming.id {
-                        try await retainReceipt(pointingTo: card)
-                        return card
+                        return (card, try await retainReceipt(pointingTo: card))
                     }
                     if card.state.isOpen,
-                       tool(card, prior) == tool(incoming, row),
+                       (card.kind == .apiKey && card.secret == nil || tool(card, prior) == tool(incoming, row)),
                        card.kind == incoming.kind,
                        card.allTargets.sorted() == incoming.allTargets.sorted(),
                        card.mode == incoming.mode, card.secret == incoming.secret,
                        (card.kind != .choose || (row.objectValue?["metadata"]?.objectValue?["choiceSubject"] != nil
                         && prior.objectValue?["metadata"]?.objectValue?["choiceSubject"] == row.objectValue?["metadata"]?.objectValue?["choiceSubject"])),
                        card.options.sorted(by: { $0.id < $1.id }) == incoming.options.sorted(by: { $0.id < $1.id }) {
-                        try await retainReceipt(pointingTo: card)
-                        return card
+                        return (card, try await retainReceipt(pointingTo: card))
                     }
                 }
             }
             try await ContactThread.append(row, to: path)
-            return incoming
+            return (incoming, true)
         }
     }
 

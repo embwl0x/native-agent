@@ -219,19 +219,17 @@ struct NativeAgentMobileApp: App {
         foregroundRefreshID = generation
         foregroundRefreshPairing = pairing
         // Await activation's presence read before treating an old Mac sighting as lost contact.
-        bridgeClient.connectingStartedAt = Date()
+        bridgeClient.isConnecting = true
         bridgeClient.refreshConnection()
         PhonePlaces.shared.resume()
         foregroundRefreshTask = Task { @MainActor in
             defer { if foregroundRefreshID == generation { foregroundRefreshTask = nil } }
             await iCloudBridge.shared.deviceIncomingSetupTask?.value
-            await iCloudBridge.shared.setupTask?.value
             guard !Task.isCancelled, pairing == pairingStore.iCloudPairingSecret else { return }
             let sync = iCloudSyncEngine.shared
             await sync.refreshLightweightSnapshots()
             guard !Task.isCancelled, pairing == pairingStore.iCloudPairingSecret else { return }
             let group = sync.foregroundSnapshotGroup
-            if group == .advanced { _ = await sync.refreshCatalogSnapshot() }
             await sync.refreshSnapshotGroup(group)
         }
     }
@@ -417,7 +415,6 @@ struct NativeAgentMobileApp: App {
             let sync = iCloudSyncEngine.shared
             sync.snapshotDir = URL.documentsDirectory.appendingPathComponent("fixture", isDirectory: true)
             for group in [NAMobileSnapshotGroup.core, .chat, .faces] { _ = await sync.refreshSnapshotGroup(group) }
-            // The conversation with the most of his own words is his main chat.
             let main = sync.chatTranscripts.max { a, b in
                 a.value.messages.filter { $0.role == .user }.count < b.value.messages.filter { $0.role == .user }.count
             }?.key
@@ -426,10 +423,11 @@ struct NativeAgentMobileApp: App {
                   main.flatMap { sync.chatTranscripts[$0]?.messages.count } ?? 0)
             // A launch's replay of retained live records: one finished turn whose saved reply is here, one older than the window.
             guard ProcessInfo.processInfo.arguments.contains("-replayOldLive"), let main,
-                  let saved = sync.chatTranscripts[main]?.records.first(where: { $0.role == "assistant" && $0.runId != nil && !$0.content.isEmpty })
+                  let saved = sync.chatTranscripts[main]?.records.first(where: { $0.role == "assistant" && $0.runId != nil && !$0.content.isEmpty }),
+                  let savedRun = saved.runId
             else { return }
             let hourAgo = Date().addingTimeInterval(-3600)
-            for run in [saved.runId!, "replayed-older-run"] {
+            for run in [savedRun, "replayed-older-run"] {
                 for seq in 1...12 {
                     let text = String(saved.content.prefix(saved.content.count * seq / 12))
                     await ChatStore.shared.receiveICloudReply(BridgeMessage.make(

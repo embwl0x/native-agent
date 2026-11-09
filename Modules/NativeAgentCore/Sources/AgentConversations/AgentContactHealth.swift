@@ -15,8 +15,7 @@ public actor AgentContactHealth {
     public static let shared = AgentContactHealth()
     private var running: Set<String> = []
     private var pending: Set<String> = []
-    private var appQueries: [Probe: UUID] = [:]
-    private var appObservations: [Probe: (Bool, Date)] = [:]
+    private var appQueries: [Probe: Task<(Bool, Date), Never>] = [:]
     private var grokVerifiers: [String: @Sendable (String) async throws -> Void] = [:]
     private var cardsRead: Set<String> = []
 
@@ -37,7 +36,7 @@ public actor AgentContactHealth {
         return health
     }
 
-    /// Pull hosts receive queued messages on their next call; only a call within 30 minutes proves live presence.
+    /// A pull host's last call is evidence of that call; its next call owns delivery.
     public nonisolated static func checkIn(_ peer: AgentPeerContact) -> AgentLocalHealth? {
         guard peer.transport == .mcpHost, !ChatGPTDotIPCTransport.owns(peer),
               AgentPeerStore.hostRowID(peer.endpoint).flatMap(AgentHostDirectory.row(named:))?.commandLine == nil else { return nil }
@@ -47,16 +46,9 @@ public actor AgentContactHealth {
                 detail: "\(peer.name)'s saved check-in timestamp is unreadable. Repair its provenInboundAt in agents/peers.json before judging its presence.",
                 checkedAt: .distantPast, authenticated: false)
         }
-        let clock = DateFormatter()
-        clock.dateFormat = "HH:mm"
-        guard let at, Date().timeIntervalSince(at) < 1800 else {
-            return AgentLocalHealth(status: "waiting", detail: "Messages wait for \(peer.name)'s next check-in"
-                + (at.map { " (last call \(NativeTimestampFormat.plainZulu($0)))" } ?? " (it has not called in yet)")
-                + "; they go out in the result of its next call.", checkedAt: at ?? .distantPast, authenticated: false)
-        }
-        return AgentLocalHealth(status: "live",
-            detail: "Live: \(peer.name) called in at \(clock.string(from: at)); a message goes out in the result of its next call.",
-                                checkedAt: at, authenticated: false)
+        return AgentLocalHealth(status: "waiting", detail: "Messages wait for \(peer.name)'s next check-in"
+            + (at.map { " (last call \(NativeTimestampFormat.plainZulu($0)))" } ?? " (it has not called in yet)")
+            + "; they go out in the result of its next call.", checkedAt: at ?? .distantPast, authenticated: false)
     }
 
     /// The transport owns directionality: a local ChatGPT window permits two-way delivery; inbound-only is not broken.
@@ -115,7 +107,7 @@ public actor AgentContactHealth {
             instruction: "Inspect and repair this contact's authored connection with agent.verify; the failed message is never resent automatically.",
             nextCall: .object(["tool": .string("app"), "input": .object([
                 "action": .string("agent.verify"), "args": .object(["agent": .string(row.agent)])])]))
-        failed["harness_item"] = await file(failed, reason: reason, row: row, dataRoot: dataRoot,
+        failed["body_item"] = await file(failed, reason: reason, row: row, dataRoot: dataRoot,
             then: """
                 Inspect the retained send before any new send. Read agent.recipe, correct it with agent.recipe_write, then explicitly verify or send.
                 """).map(JSONValue.string)
@@ -127,7 +119,7 @@ public actor AgentContactHealth {
         let at = text(failed["selector"]) ?? text(failed["method"]) ?? text(failed["phase"]) ?? ""
         var labels: [String] = []
         if reason == "not_confirmed", case .array(let seen)? = failed["labels"] { labels = seen.compactMap { text($0) } }
-        return try? await HarnessQueue.file(HarnessFinding(
+        return try? await BodyQueue.file(BodyFinding(
             key: "bridge|\(row.agent.dropFirst("peer:".count))|\(reason)|\(at)",
             title: "\(row.name): \(reason.replacingOccurrences(of: "_", with: " ")) at \(at)",
             summary: (text(failed["detail"]) ?? "") + (labels.isEmpty ? "" : "\nWindow labels nearest \(at): "
@@ -139,7 +131,7 @@ public actor AgentContactHealth {
     private static func resolve(_ agent: String, _ keys: [String], note: String, dataRoot: URL) async {
         guard !keys.isEmpty else { return }
         let prefix = "bridge|" + agent.dropFirst("peer:".count) + "|"
-        try? await HarnessQueue.resolve(keyPrefixes: Dictionary(keys.map { (prefix + $0, note) }) { first, _ in first }, dataRoot: dataRoot)
+        try? await BodyQueue.resolve(keyPrefixes: Dictionary(keys.map { (prefix + $0, note) }) { first, _ in first }, dataRoot: dataRoot)
     }
 
     private static func passed(_ found: JSONValue) -> Bool {
@@ -170,7 +162,6 @@ public actor AgentContactHealth {
     private struct ReplyEvidence {
         var good: Date?
         var newest: AgentConversationRecord?
-        var expired: Date?
         var failure: AgentConversationRecord?
         var unsent: AgentConversationRecord?
         var interrupted: Date?
@@ -184,19 +175,12 @@ public actor AgentContactHealth {
             + [peer?.roundTripProof?.at, peer?.mcpReturnProof?.at,
                pullReplyProof].compactMap { $0.flatMap(NativeTimestampFormat.parseISO8601) }).max()
         let newest = history.max { $0.updatedAt < $1.updatedAt }
-        let expired = newest.flatMap { row -> Date? in
-            guard row.stop == nil, !sentNothing(row.sendEvidence), case .object(let receipt)? = row.receipt,
-                  receipt["reply_state"] == .string("no_reply_expired"),
-                  case .string(let stamp)? = receipt["reply_deadline"], let deadline = NativeTimestampFormat.parseISO8601(stamp),
-                  (good ?? .distantPast) < deadline else { return nil }
-            return deadline
-        }
         let failed = history.filter { row in
             row.stop == nil && row.phase == "attention" && !AgentConversationSession.awaitingApproval(row)
                 && (row.sendFailed || sentNothing(row.sendEvidence)) && (good ?? .distantPast) < row.updatedAt
         }
-        let failure = failed.filter { !sentNothing($0.sendEvidence)
-            && $0.sendEvidence["status"] != .string("no_reply_expired") }.min { $0.updatedAt < $1.updatedAt }
+        let failure = failed.filter { !sentNothing($0.sendEvidence) && !AgentConversationSession.mayHaveReached($0.sendEvidence) }
+            .min { $0.updatedAt < $1.updatedAt }
         let unsent = failed.filter { sentNothing($0.sendEvidence) }.max { $0.updatedAt < $1.updatedAt }
         // A relaunch-interrupted send does not prove a broken reply path.
         let interrupted = newest.flatMap { row -> Date? in
@@ -206,11 +190,11 @@ public actor AgentContactHealth {
         }
         let stalled = newest.flatMap { row -> Date? in
             guard row.stop == nil, row.phase == "attention", !sentNothing(row.sendEvidence),
-                  row.sendEvidence["status"] == .string("outcome_unknown") else { return nil }
+                  AgentConversationSession.mayHaveReached(row.sendEvidence) else { return nil }
             let at = row.exchanges?.last { $0.id == row.operationID }?.settledAt ?? row.updatedAt
             return (good ?? .distantPast) < at ? at : nil
         }
-        return ReplyEvidence(good: good, newest: newest, expired: expired, failure: failure,
+        return ReplyEvidence(good: good, newest: newest, failure: failure,
                              unsent: unsent, interrupted: interrupted, stalled: stalled)
     }
 
@@ -274,14 +258,14 @@ public actor AgentContactHealth {
             let history = records.filter { $0.agent == agent }
             let peer = peers.first { "peer:" + $0.id == agent }
             let evidence = Self.replyEvidence(history, peer: peer)
-            let good = evidence.good, expired = evidence.expired, failure = evidence.failure
+            let good = evidence.good, failure = evidence.failure
             let interrupted = evidence.interrupted, stalled = evidence.stalled
-            let operation = failure?.operationID ?? (expired == nil ? nil : evidence.newest?.operationID)
+            let operation = failure?.operationID
             // Inbound-only contacts have no outbound reply path to mark broken.
             let inboundOnly = peer.map { ChatGPTDotIPCTransport.owns($0) && ChatGPTDotIPCTransport.inboundOnly } == true
             // Unavailable alone says nothing about delivery; the send receipt owns reply health.
             let broken = inboundOnly ? nil : failure?.updatedAt
-            if !inboundOnly, broken == nil, expired == nil, interrupted == nil, stalled == nil,
+            if !inboundOnly, broken == nil, interrupted == nil, stalled == nil,
                let unsent = evidence.unsent {
                 let observed = Self.notReached(unsent, peer: peer, good: good)
                 if observed.replyStatus != previous[agent]?.replyStatus || observed.detail != previous[agent]?.detail
@@ -325,10 +309,10 @@ public actor AgentContactHealth {
             let unverified = recipeChanged || programChanged
                 || (peer?.transport == .desktopChat && proof != nil && (proof?.appVersion == nil || appVersion == nil))
                 || (peer?.appBundleIDs.isEmpty == false && proof?.appVersion.map { $0 != appVersion } == true)
-            // Inbound-only contacts cannot have broken, expired, interrupted or unverified sends.
-            if !inboundOnly, broken != nil || expired != nil || interrupted != nil || stalled != nil || unverified {
+            // Inbound-only contacts have no outbound reply path to judge.
+            if !inboundOnly, broken != nil || interrupted != nil || stalled != nil || unverified {
                 var observed = previous[agent] ?? AgentLocalHealth(status: "broken", detail: "", checkedAt: Date(), authenticated: false)
-                observed.status = broken != nil ? "broken" : expired != nil ? "no_reply_by_deadline" : interrupted != nil ? "interrupted"
+                observed.status = broken != nil ? "broken" : interrupted != nil ? "interrupted"
                     : stalled != nil ? "stalled" : "unverified"
                 observed.brokenSince = broken
                 observed.lastGoodAt = good
@@ -344,18 +328,12 @@ public actor AgentContactHealth {
                 } else { nil }
                 observed.detail = dotWords ?? broken.map {
                     Self.brokenDetail(since: $0, good: good, name: peer?.name ?? agent)
-                } ?? expired.map {
-                    """
-                        No reply by the deadline \(NativeTimestampFormat.plainZulu($0)); last good \
-                        \(good.map(NativeTimestampFormat.plainZulu) ?? "never"). Run agent.verify for \(peer?.name ?? agent); do not resend the \
-                        message.
-                        """
                 } ?? (interrupted ?? stalled).map { at in
                     let clock = DateFormatter()
                     clock.dateFormat = "HH:mm"
                     return interrupted != nil
                         ? "Last send to \(peer?.name ?? agent) was interrupted by a relaunch at \(clock.string(from: at)); the next message proves the path."
-                        : "A reply stalled at \(clock.string(from: at)) with its outcome unknown; the next message to \(peer?.name ?? agent) proves the path."
+                        : "A send broke in flight at \(clock.string(from: at)) and may have reached \(peer?.name ?? agent); the next message proves the path."
                 } ?? "Unverified since " + (recipeChanged ? "the recipe changed"
                     : programChanged ? "\(peer?.name ?? agent) updated to \(programShown ?? "")"
                     : appVersion.map { "\(peer?.name ?? agent) updated to \($0)" } ?? "\(peer?.name ?? agent)'s app could not be found")
@@ -456,7 +434,7 @@ public actor AgentContactHealth {
                 : "Restore \(name)'s reply endpoint or sign-in, then run agent.verify."
         }
         guard var health = try? AgentLocalHealth.checkedRead(dataRoot) else { return }
-        guard health[agent]?.repairFor == operation, health[agent]?.brokenSince != nil || health[agent]?.status == "no_reply_by_deadline" else { return }
+        guard health[agent]?.repairFor == operation, health[agent]?.brokenSince != nil else { return }
         health[agent]?.repairDetail = detail
         for key in health.keys { health[key]?.retainReplyEvidence() }
         do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(health), to: AgentLocalHealth.url(dataRoot)) }
@@ -471,22 +449,22 @@ public actor AgentContactHealth {
         return await AgentPeerDiscovery.a2aCheck(conversation: conversation, peer, bearerToken: token, sending: true).receipt
     }
 
-    /// A status must persist for a minute before waking the agent, so flapping creates no arrivals.
+    /// A contact falling into a problem, or recovering from one, is a body happening: owed, it opens a thought at once. The check's time is the occurrence.
     private func arrive(_ agent: String, from old: AgentLocalHealth, to new: AgentLocalHealth,
                         peers: [AgentPeerContact], dataRoot: URL) {
         let problems: Set<String> = ["signed_out", "unavailable"]
         let name = peers.first { "peer:" + $0.id == agent }?.name ?? agent.prefix(1).uppercased() + agent.dropFirst()
         let key = "health:" + agent, stamp = String(Int(new.checkedAt.timeIntervalSince1970))
         if problems.contains(new.status), new.status != old.status {
-            ResidentWake.shared.request(dataRoot: dataRoot, reason: "what resolved", items: [.init(
-                id: key + ":" + new.status + ":" + stamp, line: name + ": " + new.detail, key: key, thread: key, hold: 60)])
-        } else if problems.contains(old.status), ["ready", "installed"].contains(new.status),
-                  !ResidentWake.shared.withdraw(dataRoot: dataRoot, key: key) {
+            Attention.post(Happening(.body, subject: "contact:" + agent, door: "contact:" + agent, who: "self",
+                words: name + ": " + new.detail, once: key + ":" + new.status + ":" + stamp), dataRoot: dataRoot)
+        } else if problems.contains(old.status), ["ready", "installed"].contains(new.status) {
             var evidence = new
             evidence.retainReplyEvidence()
-            ResidentWake.shared.request(dataRoot: dataRoot, reason: "what resolved", items: [.init(
-                id: key + ":recovery:" + stamp, line: name, key: key, thread: key, home: true, hold: 60,
-                at: new.checkedAt, recoveredFrom: old.status, recovery: evidence)])
+            Attention.post(Happening(.body, subject: "contact:" + agent, door: "contact:" + agent, who: "self",
+                words: name + ": " + old.status.replacingOccurrences(of: "_", with: " ") + " cleared at "
+                    + ISO8601DateFormatter().string(from: evidence.checkedAt) + "; " + evidence.detail,
+                once: key + ":recovery:" + stamp), dataRoot: dataRoot)
         }
     }
 
@@ -519,34 +497,17 @@ public actor AgentContactHealth {
         case .dot:
             return Self.dotPresence()
         case .app(let bundles):
-            // Retain a stuck Launch Services lookup and its waiter so later samples cannot multiply work.
-            if appQueries[probe] != nil {
-                guard let observation = appObservations.removeValue(forKey: probe) else {
-                    return result("unknown", "Health check timed out")
+            let query: Task<(Bool, Date), Never>
+            if let current = appQueries[probe] { query = current }
+            else {
+                query = Task.detached(priority: .utility) {
+                    (bundles.contains { AgentHostRow.applicationURL($0) != nil }, Date())
                 }
-                appQueries.removeValue(forKey: probe)
-                return appObservation(observation)
+                appQueries[probe] = query
             }
-            let queryID = UUID()
-            appQueries[probe] = queryID
-            let query = Task.detached(priority: .utility) {
-                let installed = bundles.contains { bundle in
-                    AgentHostRow.applicationURL(bundle) != nil
-                }
-                let observation = (installed, Date())
-                await self.keepAppObservation(observation, for: probe, queryID: queryID)
-                return observation
-            }
-            switch await raceAgainstTimeout(seconds: 4, { await query.value }) {
-            case .value(let observation):
-                if appQueries[probe] == queryID {
-                    appQueries.removeValue(forKey: probe)
-                    appObservations.removeValue(forKey: probe)
-                }
-                return appObservation(observation)
-            case .timedOut: return result("unknown", "Health check timed out")
-            case .failure, .cancelled: return result("unknown", "Health check unavailable")
-            }
+            let observation = await query.value
+            appQueries.removeValue(forKey: probe)
+            return appObservation(observation)
         case .command(let name, let path):
             // Inspect files without launching; only exchanges establish whether the model answers.
             guard let path, FileManager.default.isExecutableFile(atPath: path) else {
@@ -573,11 +534,6 @@ public actor AgentContactHealth {
             return present(tokens["access_token"]) || present(tokens["refresh_token"]) || present(auth["OPENAI_API_KEY"])
                 ? result("ready", "Ready", authenticated: true) : result("signed_out", "Signed out — run codex login")
         }
-    }
-
-    private func keepAppObservation(_ observation: (Bool, Date), for probe: Probe, queryID: UUID) {
-        guard appQueries[probe] == queryID else { return }
-        appObservations[probe] = observation
     }
 
     private func appObservation(_ observation: (Bool, Date)) -> AgentLocalHealth {

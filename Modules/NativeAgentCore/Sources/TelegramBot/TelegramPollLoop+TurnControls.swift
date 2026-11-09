@@ -54,7 +54,7 @@ extension TelegramPollLoop {
             await answer("Showing safe work details.")
             await card.showDetails()
         case .stop:
-            // Acknowledge before awaiting cancellation; only the turn's CancellationError may mark its card canceled.
+            // The stopped turn owns settlement; the poller only requests it.
             await answer("Stopping this Telegram turn.")
             _ = await requestLiveTurnStop(
                 destination: parsed.destination,
@@ -76,7 +76,7 @@ extension TelegramPollLoop {
         destination: TelegramDestination,
         turnId: UUID? = nil,
         pauseQueuedTurns: Bool = false
-    ) async -> TelegramTurns.StopOutcome {
+    ) async -> Task<TelegramTurns.StopOutcome, Never> {
         await turnCoordinator.requestStop(
             destination: destination,
             turnId: turnId,

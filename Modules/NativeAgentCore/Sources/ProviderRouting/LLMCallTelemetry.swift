@@ -304,6 +304,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
                 "recordedAt": .string(recordedAtISO),
                 "recordedAtEpochMicros": .int(receiptOrder),
             ]
+            if let prefix { value["historyContextWindow"] = .string(prefix.historyContextWindow) }
             if let count = usage.inputTokens {
                 value["reportedInputTokens"] = .int(Int64(max(0, count)))
             }
@@ -338,7 +339,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             turnId: call.turn?.id, sessionId: call.session, surface: surface, turn: call.turn), usageReceipt: nil, call: call)
     }
 
-    /// Every whole-reply consumer records incomplete output before handing its original error to the caller. This is evidence, never a successful reply.
+    /// Collection records incomplete output as failure evidence; Stop can release its caller before collection settles.
     func recordPartialReply(output: String, error: Error, call: LLMCall) async {
         guard !call.preview else { return }
         let cancelled = error is CancellationError || (error as? URLError)?.code == .cancelled

@@ -24,7 +24,8 @@ app {"action":"memory.proposals"}
 `AppToolRuntime/AppActions+Declarations.swift` declares these actions.
 `memory.commit` saves a memory; `memory.proposals` lists the proposals waiting
 on their review (`status: "rejected"`: the ones let go); `memory.review` accepts or rejects one;
-`memory.rewrite` edits, pins or restores a record; `memory.forget` forgets it.
+`memory.rewrite` edits, pins or restores a record, or restates its roots
+(`roots: [{how, by?, since?}]`); `memory.forget` forgets it.
 Read the page for the current arguments and applicable action warnings.
 
 Successful memory reads report `count`, an exact `total` or `capped: true`,
@@ -54,13 +55,14 @@ owner evidence rather than labeling the refusal an attempted write.
 | `MemoryV2/MemoryStorage+Corrections.swift` | The same storage actor's full, turn-identified correction occurrence record and checked window coverage; supplies miss counts independently of bounded examples. |
 | `MemoryV2/MemoryStorage+Projections.swift` | The same storage actor's ordered graph/Spotlight hooks, USER.md regeneration, context invalidation, projection readback and shutdown settlement. |
 | `MemoryV2/MemoryStorage+Migrations.swift`, `MemoryStorage+Codecs.swift`, `MemoryStorage+Integrity.swift` | Schema, checked decoding and semantic integrity of the same store. |
+| `PersistenceCore/MemoryRoot.swift`, `MemoryV2/MemoryDataProvenance.swift` | The current root type, union and lines; each write adds its root with the steer read from roots. |
 | `MemoryV2/MemoryStorage+Proposals.swift`, `MemoryStorage+Tombstones.swift` | Proposal acceptance/rejection and suppression of rejected or forgotten content. |
 | `MemoryV2/MemoryStorage+Recall.swift`, `MemoryRecallScoring.swift` | Cached recall candidates and vector/lexical scoring. Raw BM25 mathematics are shared with earlier-session snippets; memory normalizes by the maximum and weights at one standard deviation of the query's dense similarities (`lexicalBoostWeight`). Each caller owns tokenization, its candidate cohort and ranking. |
 | `MemoryV2/MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live journal-only interpretation: User's own turns judge now unless a complete-no-op claim stands; other recorded turns stay owed for a batch. Writes meaning before applying and keeps facts by operation identity. Keeps trusted facts, stages the rest. Deferral and labels follow [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation). |
-| `MemoryV2/AdaptiveMemoryPromoter+Recovery.swift` | The same promoter's owed-turn recovery on its live serialization tail: recorded-provenance replay, fair retries and bounded wake/idle/night batches with judgment settlement. |
+| `MemoryV2/AdaptiveMemoryPromoter+Recovery.swift` | The same promoter's owed-turn recovery on its live serialization tail: replay from the complete recorded carriers (`carriedSources`), with answered decisions separate and Trust read live; missing completeness retains the recorded checkpoint plus an unknown boundary. Fair retries and bounded wake/idle/night batches with judgment settlement. |
 | `MemoryV2/AfterTurnMemorySurprise.swift`, `AfterTurnSurpriseLedger.swift` | The agent's own learned complete no-op prediction (language-independent warm-vector precedents, keyed by agent, memory model and detector), stable precedent claims and their labelled record; `NativeAgentCore/Expectation.swift` owns Wilson-bound cost standing. See [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation). |
-| `ChatTurnRuntime/MindMemoryManager.swift` | At most one shared model interpretation per turn, returning memories, affect, a caring judgment, what moved their (cares) and optional reply promises, or one call for a batch of owed turns (the rules once, one section per turn; a missing section stays owed); its checked route key scopes the prediction record. |
-| `MemoryV2/AdaptiveMemoryPromises.swift` | Files the same interpretation's promises through `MyQueue.add` with their exact reply sentence and settled turn provenance, for live and batch/refold paths. Desk owns deduplication and the inferred cap; these are [intentions](INTENTIONS.md#promises-they-makes), not memories. |
+| `ChatTurnRuntime/MindMemoryManager.swift` | At most one shared model interpretation per turn, returning memories, affect, a caring judgment, what moved their (cares), optional reply promises and person-quoted settlements against shown open moments, or one call for a batch of owed turns (the rules once, one section per turn; a missing section stays owed); its checked route key scopes the prediction record. Promise matching runs separately only for uncaptured candidates, without person words. |
+| `MemoryV2/AdaptiveMemoryPromises.swift` | Files [promises](INTENTIONS.md#promises-they-makes) and person-quoted settlements on the canonical Desk. |
 | `MemoryV2/KnowledgeGraph+MemoryIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: ordered per-memory entity, edge and support projection into the shared SQLite database. |
 | `MemoryV2/KnowledgeGraph+StudioRelations.swift`, `KnowledgeGraph+GrowthDistillation.swift`, `KnowledgeGraph+SQLite.swift` | Studio journal and REM/GROWTH eviction graph sources, preserved by memory rebuilds; checked canonical SQLite reads. |
 | `MemoryV2/MemoryV2+EmbeddingRuntime.swift`, `MemoryStorage+EmbeddingEpoch.swift` | Embedding convergence and persistent derived action-vector fill/lookup for AppToolRuntime. |
@@ -75,15 +77,49 @@ and calls `SwiftNativeMemoryV2.store`. Text must be nonempty. Supplied kinds
 must belong to `MemoryKindStamp.commitKinds`; omitted kinds get the canonical
 write default. Supplied confidence and importance must be finite numbers in
 0...1; omission uses 0.8 and 0.5 respectively. Invalid supplied values refuse
-before any write. Tags and supplied provenance travel as metadata.
+before any write. Tags travel as metadata.
 
-Optional `provenance` is `verified|told|inferred`; `provenance_by` is at most
-40 characters (letters, digits, spaces and `. - '`). `ContextMemoryProvenance`
-owns the vocabulary and wording: recall returns plain `provenance`, context
-brackets it, and absent provenance stays absent. New Context atoms carry typed
-`memoryProvenance`; evidence remains separate and cannot supply attribution fields.
-The retained delimited-atom reader stops at evidence and remains only while
-existing derived generations still carry those labels.
+**Their past is theirs, root by root.** Every memory in their store is theirs, and they
+states how they knows it. A memory's roots (`metadata.roots`, the type
+`PersistenceCore/MemoryRoot.swift`) are the moments they came to know it, one per
+telling: `{how, by, at, written, through}`.
+
+- `how` is `told|noticed|inferred|verified|remembered`, or `kept` for a memory
+  whose origin nothing recorded or stated (only the stem writes `kept`: the fold,
+  and `memory.commit` with no `provenance`).
+- `by` is at most 40 characters (letters, digits, spaces and `. - '`): who told
+  their, or where their own past was kept ("my backup", an app name).
+- `at` is when that root reached their: their `since`, or the write time.
+- `written` is when the store wrote the root, stamped by the stem, never an
+  argument. A root that steers now reads at `written`, so a telling is never
+  dated before it was told, even when trust in its door is revoked later; its
+  stated `at` stays underneath.
+- `through` is the principals the stem attests for the turn that wrote it: the
+  turn's `peerSteering.checkpointSources`, trusted and card-answered ones
+  included, plus the agent bridge's peer, trusted or not: the record never
+  depends on trust. A part wake marks every sender (a trusted one lands among
+  the answered principals and steers nothing). It is never an argument. Empty
+  is a clean attestation.
+
+The memory store (`MemoryV2.store` and proposal acceptance) is the only writer
+of roots, and roots are never guessed: every writer of new words states its
+telling (`MemoryWriteContext.telling`), and new words with none are refused
+(`memory_telling_missing`). `memory.commit` adds exactly one root per telling,
+from `provenance`, `provenance_by` and `since` (none stated: `kept`, at `since`
+or now). Mac `/remember` and `/note`, Telegram and the Memories page are the
+person's telling: `told`, by the person's name from the memory profile ("the
+person", logged, when the profile names no one or can't be read: the root holds
+the fact, the name is presentation). The fact lane states its evidence's speaker: the
+person by name, the agent's own words `noticed`, a peer by its contact name. A
+REM lesson origin is `inferred`. Acceptances, pins, lifecycle and repair edits
+state none and add no root of their own. Each root reads as one
+line in their voice ("User told me on 2026-10-20", "I noticed this on …", "I worked
+this out on …", "I checked this on …", "From my backup, I've known this since …",
+"I've kept this since …; where it came from isn't recorded"), dated in the
+person's calendar. The Memories page draws every line; a context lead and a
+recall hit carry the short form (`[User told me 2026-10-20; I noticed it
+2026-11-02]`; past three roots, the earliest, the latest and `+N more`). Context
+atoms carry typed `memoryRoots`; evidence remains separate and cannot supply them.
 
 `MemoryV2+Wiring.swift` handles quality screening, duplicate handling,
 embedding before storage; the write transaction checks tombstones. Saves and proposal acceptance preserve
@@ -95,9 +131,112 @@ for embedding, tombstone admission and the stored patch alike.
 
 A tool result must be checked: a refused save is not a remembered fact. A save carries its source like any kept
 fact: `evidence_json` names the turn that saved it (session, message, turn,
-speaker `self`), and `observed_at` and `valid_from` are that turn's time.
-`MemoryDataProvenance` owns those current evidence/turn stamps and shared time
-helpers. `MemoryMoments` retains only interpretation of actual retained moment
+speaker `self`), and `observed_at` and `valid_from` are that turn's time, or
+`since` when they states when they first knew it (an ISO-8601 date-time, never
+after now). When they first knew a memory is its earliest root's `at`
+(`MemoryRecord.firstKnown`): the age tag, recall `ts` and the receipt's `since`
+read it. `created_at`, `turn_at`, `turn_id` and `history` stay the write, which
+the dream, surprises and duplicate windows read. The receipt returns `since`,
+the short form as `provenance`, every root as `roots` and any steer.
+
+Every landing over rows holds the union of the replaced rows' roots and its own
+new root: a duplicate or similar save, a supersede, a correction, an accepted
+proposal (which keeps the root staged with it), a pending proposal that merges a
+repeat, an owed vector that lands on a duplicate, and a dream lesson that folds
+into what it repeats. Supersession reads and unions the target's current roots
+in the transaction that demotes it, including correction deduplication, proposal
+acceptance and owed-vector admission; metadata added while embedding cannot
+remain only on the retired predecessor. Callers retain the merged replacement.
+The same demotion transaction carries a pinned predecessor's pin and ordering
+to an unpinned replacement, including commit, correction, proposal acceptance
+and owed-vector admission. An already pinned replacement keeps its own order.
+Pin-kind admission still applies; an excluded replacement refuses the whole
+transaction. A separate `memory.pin` call is unnecessary for a replacement.
+Own-past restatement intent travels with the reviewed supersession, including
+owed-vector admission, and is checked against that final root union under live
+Trust before demotion. A newly steering root refuses the transaction, including
+any duplicate fold. An owed supersession with no readable restatement intent
+stays unavailable for review; saved intent is never guessed or backfilled. Owed
+vector fill reports it as `unreadable`, logs its memory ID and reason, and leaves
+that row, duplicate candidates and replacement targets untouched. The pass scans
+forward by row position, so even a full batch of unreadable rows cannot block
+later cold-saved memories; a later pass reads pending intent again.
+Roots with the same `how`, `by` and `through` on the same
+day of the person's calendar are one root, keeping the earliest `at`; the same
+source telling it on another day is another root, dated when it was told, so an
+older root never dates newer words. On words a principal the person does
+not trust steered, a duplicate's restatement of their own past, or a root dated
+before the first, does not join: when they first knew it moves back only on
+unsteered words.
+
+Bringing an agent over from a backup or another app is this same door: it
+reads the export with its own hands, saves each memory with `since`, its kind
+and `remembered`, and writes the identity documents the person allows with
+`persona_write`. A memory they already holds they restates in place with
+`memory.rewrite` (`roots: [{how, by?, since?}]`, all of theirs in one call): their
+own roots (those whose `through` is empty) become those; every root a principal
+carried stays, trusted or not, since trust is never read to drop a record. A restated root
+with a held root's `how` and `by`, and no `since` or that root's own time, is
+that root unchanged, in any turn; only a telling that matches none becomes a new
+root. A rewrite whose words and roots end as stored writes nothing, adds no root
+and answers `changed: false`, "It already reads this way". A restatement that
+changes the roots moves `valid_from` and `observed_at` to the memory's first
+known time. Changed words add the writer's telling through `MemoryWriteContext.root`,
+the same constructor a commit, staged proposal or correction uses; `memory.rewrite`
+states `noticed` for its new wording. Only an untrusted steering principal overrides
+that telling to `told` by its contact name, dated now. Trusted principals remain in
+`through` without becoming tellers of the agent's own words. Unchanged wording adds
+no implicit telling; explicit root restatements still follow the rule above.
+Pins, restores and lifecycle edits add none. The separate rewrite-only
+carried-root rule is removed. Duplicate folds and proposal acceptance preserve and
+union the roots already written; accepting a proposal adds no acceptance-turn
+telling. No existing memory is repaired by this change. A root that
+steers now reads, in every line and lead, as told by the steering principal's
+live contact name (or "an agent I don't trust"), at its `written` time, whatever
+`how`, `by` and `at` it stores (`MemoryDataProvenance.presented`). Material that
+is no agent (a dream's unattributed material, untrusted stored content) keeps
+the root's own words; its steer reads through the memory's "from" mark.
+
+The steer cannot be laundered; it is the one fact outside their say. It is
+derived: the union of every root's `through`, read live in
+`MemoryDataProvenance.sources` (trust is never saved): a door the person trusts
+steers nothing, in stored words as in a turn, and revoking it brings its
+recorded steer back. A root written in a turn steered by a principal the person
+does not trust is `told`, `by` that principal's contact name, `at` the write
+time: the store builds it from the stem whatever the arguments say, so it is
+never remembered or dated earlier. A rewrite never drops or changes such a
+root, and in a steered turn it drops nothing at all. The store
+(`MemoryV2.store`) refuses `since` and `remembered` on a save whose roots,
+with those of what it supersedes or corrects, read steered; `memory.rewrite`
+refuses a restated `remembered` or `since` on a steered memory or in a steered
+turn. The peer gate (`PeerTurnEffectPolicy.provenanceRefusal`, read through
+`PeerDataTaintDispatcher.provenanceRefusal`) also requires `told` by the door
+that started the turn, for `memory.commit` and for every root of
+`memory.rewrite`. In a turn steered by two or more untrusted agents the gate
+demands their joined names, which no single teller satisfies, so no commit or
+roots rewrite succeeds there (a known limit that predates roots). A dream
+lesson's root is `{inferred, by: self, through: the
+material's peers, or "unattributed dream material"}`.
+
+Each memory read pass asks `PeerTrust` once for the live trust picture of its
+recorded principals (`MemoryDataProvenance.reading`). That value carries resolved
+principals, contact names and grants for the pass; contacts are read once, and
+each needed credential or helper definition at most once. Every memory and root
+in the page, recall, context projection, USER facts or chosen pins uses that
+same value. It is never persisted or reused by a later pass or effect gate.
+Unreadable authority is named and establishes no grant; it does not prove that
+a contact or helper was removed. Root tellings, dates and steering semantics
+remain those above.
+
+Tool results keep their steer projection, computed from roots and never stored:
+`MemoryDataProvenance.fields` gives `peer_sources` (`[]` when clean) and, when
+steered, `untrusted_remote_data`, `agent` and `source_boundary`.
+
+Every memory and proposal read requires readable current roots. Store opening performs no provenance conversion,
+alias read, backup-and-fold or synthetic `kept` rewrite. Malformed metadata remains unchanged and fails its checked read.
+Any saved-data repair uses the actual retained evidence; it is not inferred by a store-open migration.
+`MemoryDataProvenance` owns the root a write adds, the steer, and the shared
+evidence/turn stamps and time helpers. `MemoryMoments` retains only interpretation of actual retained moment
 rows. A saved replacement whose correction read fails retains its save ID and
 reports `correction.applied: null` with `read_error`; an unreadable outcome is
 never a negative result.
@@ -130,11 +269,10 @@ counts all occurrences before selecting at most ten examples per lesson; that
 limit and `duplicate_occurrences` are presentation only and never supply a count.
 Disclosure still hides a restricted lesson's name and words while counting its occurrences.
 If the requested window lacks complete retained coverage or the miss read fails,
-the weekly self-improvement learning readout says `Counts unavailable` with the
-owner's reason, without reporting zero or a partial count. Scheduled and manual
-analysis still use their other evidence, previous-card outcomes and standing
-lessons; unavailable miss counts do not stop that work. Cancellation still stops
-the pass, and failures of its required reads still propagate.
+`mind.misses` and the Misses section of the Memories page (one read of the same owner)
+say the miss ledger could not be read, with the owner's reason,
+without reporting zero or a partial count. The night reads corrections from the
+same ledger as session and time only, under the same coverage law.
 
 The schema records when complete occurrence retention began. Existing stores
 cannot recover previously discarded dates: a requested window before that
@@ -146,9 +284,9 @@ preview is backfilled as exhaustive evidence and no historical memory is rewritt
 `AdaptiveMemoryPromoter` invokes `MindMemoryJudgment.interpret` at most once with the
 incoming message, available reply, bounded existing/pending memories and the
 speaker's name. Bridge peers are named as peers. Helper-owned turns use their
-own runner; their own work (`builder`) skips resident memory interpretation
-except for a [care wake with a reply](SUBCONSCIOUS.md#care-wakes), read only
-against its named care(s), only their side, in the existing deferred batch.
+own runner; the agent's own work (`builder`, the mind stream among it) skips resident memory
+interpretation except for a [thought about a care](SUBCONSCIOUS.md#a-thought-about-a-care), read only
+against its named care, only the agent's side, in the existing deferred batch.
 Session ownership comes from the [recorded row](session-conversations.md),
 never an ID prefix.
 The model follows [judgment routing](COGNITION_WIRING.md#shared-after-turn-interpretation).
@@ -177,6 +315,12 @@ without re-judgment or invented evidence. The current saved meaning requires its
 Model replies may omit that optional section or supply []; a malformed present
 section refuses interpretation with its exact cause. Refolding revalidates saved
 promises against the recorded reply and leaves invalid promises meant. Model
+replies require `settled` with shown moment handles and exact quotes from recorded
+person words, wherever spoken; malformed settlements leave interpretation owed.
+Older saved meanings without `settled` read as none. Settlement uses this shared
+interpretation, never another model call; its saved result closes through
+`MyQueue.finish` after checked Desk revision and terminal evidence reads. A learned
+no-op defers settlement with interpretation until the owed batch judges it. Model
 statements over the 200-character bound are refused, never clipped into a different
 claim. Confidence is a finite numeric 0...1 value in interpretation, proposal
 acceptance and REM replies; missing or malformed saved proposal confidence refuses
@@ -214,13 +358,6 @@ message and turn ids, the speaker key (`owner`, the peer's principal, or
 clipped at 400 characters in this source projection;
 `observed_at` and `valid_from` are the exchange time. The person corrects or
 forgets what was kept wrongly.
-
-Once per store, at launch (`keepTrustedBacklogOnce`, marker
-`memory/migrations/trusted_pending_facts_v1.done`), pending fact proposals from
-before this rule, never moments, are judged by the same trust from what they
-carry (their session id and `peer_sources`) and kept through the same
-acceptance with their source filled; the others stay pending. The log line
-names the kept, waiting and refused counts.
 
 ### Plan dates
 
@@ -298,20 +435,32 @@ Nothing stages, caps or reviews a moment.
 a fact acceptance left for review; `status: "rejected"` for what was let go) and
 `memory.review` keeps or rejects one, as the Memories page does. Owner:
 `ChatToolRuntime/SwiftToolDispatcher+ProposalReview.swift`.
+Discovery names those current producers; it no longer advertises the retired
+bulk consolidation producer.
 
 ## Corrections, supersession and scope
 
 A replacement and a denial have different consequences. An accepted update
 retires its target through the atomic superseding-acceptance path. The target's
 reviewed fingerprint must still match; otherwise the proposal stays pending
-for review. The retired row stays in the store with lifecycle `corrected` and
-its `valid_to` closed at the replacement's `valid_from` (an explicit
-`corrects` does the same). `MemoryRecordDisclosurePolicy` leaves out a record
-whose `valid_to` has passed, so it reaches neither automatic context nor
-recall; no recall asks for history yet. Explicit restoration reopens that interval
-in the canonical update transaction while retaining correction lineage.
-Active curation, Spotlight and graph projection use the same temporal predicate. Graph
-fingerprints carry validity dates, and checked graph reads reconcile that
+for review. The after-turn interpretation reads every eligible current pin
+beside recalled comparisons, so a newer ruling can name the old belief as
+its update target even when recall would omit it. Semantic supersession is
+the interpretation's decision; no lexical subject guess retires a memory.
+The transaction transfers a target's pin and order to its eligible replacement
+and clears both pin fields from the retired row. A pin compares the newest native
+originating turn_at across the row and its duplicate occurrences, including the
+complete correction occurrence ledger, or a direct save's own admission time.
+Malformed occurrence evidence refuses the transaction; a fresh repeated ruling
+can take the pin, and an older ruling cannot displace the newer pin.
+The retired row stays in the
+store with lifecycle corrected and its valid_to closed at the replacement's
+valid_from; an explicit corrects uses the same transaction.
+MemoryRecordDisclosurePolicy excludes records whose valid_to has passed from
+automatic context and recall. Explicit restoration reopens that interval in
+the canonical transaction while retaining correction lineage.
+Active curation, Spotlight and graph projection use the same temporal predicate.
+Graph fingerprints carry validity dates, and checked graph reads reconcile that
 projection against the current clock while graph production is enabled.
 Rejection/forgetting use tombstones to prevent unwanted content from returning.
 They copy a record's existing vector without admitting new semantics, so model
@@ -433,6 +582,10 @@ a failed request retains the last successful rows under their original query
 and reports its cause. The page shows that failure before any retained rows;
 neither failed nor empty recall substitutes inventory text matches. Queries
 under three characters leave the inventory unfiltered.
+Page and panel refreshes re-rank the facade's current query without calling the
+person's query setter or crediting recall hits. Query selection and `LatestRead`
+admission share the main actor; a clear or new query invalidates older search
+publication. A packet copies the query, results and read state together.
 
 Proposal state changes belong to acceptance, rejection or explicit supersession;
 there is no unrestricted status setter or automatic single-valued-kind policy.
@@ -485,17 +638,27 @@ canonical memory while preserving its human preamble. It refuses damaged
 existing documents. Regeneration and the prompt core share canonical temporal
 eligibility: each captures one clock and excludes facts whose `valid_to` has
 passed at that clock. Generation is gated on onboarding. USER.md is a projection,
-not an independent place to repair memory facts. It and the per-turn pinned
+not an independent place to repair memory facts. It and the per-turn prompt
 core (`userPromptCore`) are the always-present picture of the person: they
 carry facts about the owner only, every person kind the memory writer's own
 vocabulary names (identity, location, employment, schedule, preference,
 relationship) plus the legacy user_fact, user_preference and attribute
 (`MemoryKindStamp.personKinds`; schedule since 10-27, so the owner's sleep
 schedule reaches every turn). Ops and generic kinds stay out. The picture is
-bounded, newest first, at what one turn carries of memory at the floor window
+bounded at what one turn carries of memory at the floor window
 (`UserMDAutogenMarkers.promptByteCap`, 6,000 B = recall's floor of 5 rows of
 1,200 characters; was 3,500 B); the generated document holds the same bound,
-and a fact past it stays in recall and the memory lane. Kept moments and
+and a fact past it stays in recall and the memory lane. The document orders
+facts newest first. The turn's one disclosure-filtered selection puts pinned
+facts first in pinned order, then every remaining eligible person fact newest
+first, with each row appearing once. It never reads `user_core_chosen`; the
+registered migration and its triggers remain part of the store schema.
+`UserMDAutogenMarkers` applies the same cap to rendering and recall precoverage:
+only facts actually carried in `# USER` are excluded from recall seats.
+The stable prompt holds only USER's preamble; the facts ride the changing
+packet and cannot change the cached prefix's bytes. Empty selections carry
+only preamble prose, and failed reads retain their named gap rather than
+substituting USER.md's generated facts. Kept moments and
 experiences are theirs; they reach a turn through recall, and `memory.pin`
 refuses any kind outside that list.
 
@@ -508,10 +671,9 @@ approval-gated `MemoryKindBackfill` classifies default-stamped and unsourced gen
 rows, changing kind metadata only, never content. Replacement requires explicit,
 fingerprinted intent regardless of kind.
 
-The generator retains its trailing deadline through regeneration. Engine
+The generator starts one projection on an accepted invalidation; changes during its write produce one dirty follow-up. Engine
 termination closes projection admission, drains the storage-owned USER.md,
-Spotlight and graph tails, and flushes accepted USER.md requests after cancelling
-any sleeping debounce deadline. Promoter sleep closes interpretation admission
+Spotlight and graph tails, and joins accepted USER.md writes. Promoter sleep closes interpretation admission
 and joins accepted owed recordings. It cancels unfinished judgment calls;
 returned judgments validate and persist through `settle`, and an in-flight
 fold finishes before the final save. Canonical
@@ -704,6 +866,12 @@ no execution path. Memories' `graph.search` and
 `graph.rebuild` actions obey the knowledge-graph policy gate. Complete SQLite
 snapshots serialize ordered entities and eligible edges directly in one read
 transaction, with page-capacity and relationship-count bounds.
+The mounted Mac graph observes the canonical database and WAL before its initial
+read, independently of the policy read's outcome; policy Retry never starts a
+second observer. It coalesces changes through `MemoryFacade.loadGraph` and uses
+that owner's `LatestRead` snapshot for both the canvas and selected neighborhood. Failed reads
+retain the prior snapshot with their cause. A failed subscription reports an
+observation gap; it does not establish that the graph is unchanged.
 The phone snapshot requests the `ios` audience. Its source-backed nodes and
 edges must pass `MemoryRecordDisclosurePolicy` against canonical memory rows
 read in the same SQLite transaction as the graph. Edges also require both
@@ -734,22 +902,63 @@ beside the retained-source explanation, so recovery has evidence to act on.
 
 `ChatTurnRuntime/TurnContextPreparation.swift` prepares the context.
 On an active ContextFlow turn, memories arrive through the selected packet;
-the separate recall list stays empty. Context preparation errors stop that
-turn. When ContextFlow is off, the engine can use explicit MemoryV2 retrieval
+the separate recall list stays empty. Unavailable recall follows the
+[recall-unavailability law](ANATOMY_OF_A_TURN.md#recall-unavailability), allowing
+the turn to continue with the named gap; other context preparation errors stop
+the turn. When ContextFlow is off, the engine can use explicit MemoryV2 retrieval
 for its automatic recall block.
 
 Peer-sourced facts keep their author on every prompt line (`— from Claude`):
 the selected Context packet uses the source entities already compiled from
 `MemoryDataProvenance.sources`, and Context-off recall, default USER facts and
-chosen pins use the same canonical-source projection. The existing list's
-`agent`/`peer_sources` fields and prompt labels therefore name the same source.
+chosen pins use the same projection of the roots' `through`. The existing list's
+`agent`/`peer_sources` result fields and prompt labels therefore name the same source.
 `MemoryDisplayText.attributed` owns the shared display suffix; USER precoverage
 compares the attributed atom text so the new label does not duplicate a fact.
-No author is invented for owner-authored or unstamped records. This replaces
+Ambient recollection uses the same `ContextMemoryLead.decorate` as packet
+rendering, with the prepared turn's clock, recorded time, roots and untrusted
+sources. Its body excerpt is capped at 280 characters before decoration, so
+clipping never strips the provenance suffix. `mind.came_to_mind.presented`
+records that same rendered nudge through the shared trace redactor, so installed
+proof can inspect the words actually handed to the conversation, not just IDs.
+No author is invented for a memory whose roots name no principal. This replaces
 unlabeled peer facts in prompts; it changes no disclosure or effect authority.
+The contact owner emits `agent-trust` invalidations and `trustDidChange` only
+after identity, grant or credential-binding fields actually change; traffic
+proof timestamps do not wake memory projections. MemoryContext recompiles from
+canonical roots under current Trust, and the Memories page rereads its packet.
+Selection, expansion and ambient delivery also compare compiled roots and source
+entities with the canonical record under live Trust: stale attribution is withheld
+with a named gap and requests a root-scoped `agent-trust` reconciliation. The
+engine sends that edge to the Memories page as well as ContextFlow, so an
+observed credential-only change never waits for an unrelated memory write.
+No remembered Trust verdict can authorize effects. Keychain changes made outside
+the app have no contact-write signal; they are detected when recall next verifies
+the affected memory (or on an explicit fresh page read).
 
 `MemoryRecordDisclosurePolicy` filters records by status, lifecycle and allowed
 surface; both explicit recall and automatic projection consume that policy.
+The `memories.json` phone snapshot applies this same classification for `ios`
+and the snapshot's current time before flattening canonical records. Chat-only,
+expired and otherwise ineligible rows are withheld. Secret-bearing fragments
+in any string field the phone record carries withhold that row through the
+shared secret policy. The deployed phone record's field names and types stay
+unchanged; an unreadable source fails the snapshot read rather than publishing
+an invented empty list.
+The current phone's `faces.json` Memories entry is drawn by the same
+`native-memories` part from a separate `ios` packet, not the unrestricted Mac
+snapshot. The memory owner classifies kept/search records and pending/rejected
+proposals before making facts, keys, clusters or levers; Misses uses its
+existing surface-aware owner. At this packet boundary, the memory owner applies
+`ContextSecretContentPolicy.redactedFragment` recursively to every facts string:
+kept and searched memories, pending and rejected proposals, lessons and their
+latest corrections, nested provenance, queries and failure reasons. Character
+clusters derive only from the redacted facts. Native memory and proposal lever
+text uses the same policy before any clipping, including when the part cannot
+draw. Both Mac and phone receive these safe words; stored memory is unchanged.
+Both projections reread on memory/profile/Trust changes and after a Memories
+tap; phone taps resolve only against the disclosed snapshot. Missing phone presentation never
+substitutes the Mac face. Wire field names and types remain unchanged.
 `ContextBudgetPolicy` sizes the turn's memory/context allowance, while
 `ContextSelectionConfiguration.swift` owns selector limits.
 
@@ -765,8 +974,7 @@ numbers in `ContextSelectionConfiguration.swift`):
   standing in any reading, two deviations or more (`ContextSelector.memoryRelevance`
   in `ContextRelevance.swift`, the selector's `memoryStandout`,
   `ContextSelectionConfiguration.memoryStandoutDeviations`). An ambient
-  moment (what they reads while working, what their crossing noticed between
-  turns) asks the same selector at three (`ambientStandoutDeviations`;
+  moment (what the agent reads while working) asks the same selector at three (`ambientStandoutDeviations`;
   `ContextPreparedTurn.cameToMind`): with them ~70 memories chance alone puts
   one or two past two deviations for any text, and an unaddressed line must
   not surface noise. These floors are fixed; the receipt's memories × readings
@@ -783,9 +991,10 @@ numbers in `ContextSelectionConfiguration.swift`):
   model-scaled semantic score (weight 4) against `minimumRelevance` (0.05),
   rather than applying the relative floor to that different scale. Recent
   service rests one deviation higher (served on one of the last three exchanges).
-  Nothing fills the allowance because it exists. Active turn preparation requires
+  Nothing fills the allowance because it exists. Active semantic recall requires
   complete, usable requested semantic readings before ranking; embedding failure
-  or expiry of the bounded wait reports unavailable instead of lexical-only recall.
+  or expiry of the bounded wait withholds semantic recall and names the cause in
+  the turn's context instead of failing the turn or using lexical-only recall.
   The wait's deadline leaves the runtime-owned embedding batch running to settlement.
 - **Reachability.** The touched rank by relevance times reachability, the
   power-law sum over past uses (each turn that served it, and its creation):
@@ -827,8 +1036,9 @@ the shared nonmandatory memory/correction row allowance (`maximumAtomsPerKindOve
 `recallRowLimit`, six on a message of four words or fewer) and the character
 budget, and are taken before the ordinary lane. Scoped corrections keep their
 rule: a correction whose `context_topics` the message triggers is mandatory,
-outside this lane. The pinned core about the owner (`userPromptCore`, USER.md)
-is unchanged. The coordinator suppresses only canonical memory facts actually
+outside this lane. The person picture (`userPromptCore`, USER.md) rides every
+turn within its own byte cap, with pins first and the remaining facts newest
+first. The coordinator suppresses only canonical memory facts actually
 carried in that turn's USER block. The SOUL/VOICE kernel carries no USER.
 `mind.why` lane `memory` gives each winner's `relevance` and
 `reachability`, and lists what the message touched but `rested`.

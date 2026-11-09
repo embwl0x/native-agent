@@ -4,9 +4,9 @@ import PersistenceCore
 // Blueprint: | `LLMClient+OpenAIResponsesDecoding.swift` | `ChatGPTTransport`: `consumeResponsesStream`, `incompleteReasonText`, `incompleteNote` |
 
 extension ChatGPTTransport {
-    /// Shared SSE execution leaves authentication and HTTP retry ownership with each adapter.
+    /// Authentication belongs to the adapter; this owner interprets the Responses stream.
     static func consumeResponsesStream(
-        bytes: URLSession.AsyncBytes,
+        bytes: ProviderHTTPBytes,
         request req: URLRequest,
         model: String,
         providerId: String,
@@ -28,6 +28,9 @@ extension ChatGPTTransport {
         var replyTextSettled = false
         var sawFunctionCall = false
         var yieldedToolCall = false
+        var hasAnswerText = false
+        var completedResponse = false
+        var refused = false
         func resumeReply() {
             if replyTextSettled {
                 replyTextSettled = false
@@ -40,7 +43,6 @@ extension ChatGPTTransport {
         // Keep the provider's explicit incomplete reason.
         var incompleteReason: String?
         var refusalTextByPart: [String: String] = [:]
-        var runaway = RunawayOutputDetector(diagnosticDataRoot: telemetry.diagnosticDataRoot(call: call), call: call)
 
         func stampTTFT() {
             if ttftMs == nil {
@@ -75,6 +77,7 @@ extension ChatGPTTransport {
                     detail: "\(providerLabel): malformed Responses stream frame")
             }
             let etype = event["type"] as? String ?? ""
+            if etype == "response.refusal.delta" || etype == "response.refusal.done" { refused = true }
             var textDelta: String?
             if etype == "response.output_text.delta" {
                 textDelta = event["delta"] as? String
@@ -95,13 +98,11 @@ extension ChatGPTTransport {
             }
             if let delta = textDelta {
                 if !delta.isEmpty {
+                    hasAnswerText = hasAnswerText || delta.contains(where: { !$0.isWhitespace })
                     lastRawDelta = ContinuousClock.now
                     resumeReply()
                     stampTTFT()
-                    let boundary = runaway.feed(delta)
-                    let kept = runaway.takeCommittedText()
-                    if !kept.isEmpty { continuation.yield(.textDelta(kept)) }
-                    if boundary { return true }
+                    continuation.yield(.textDelta(delta))
                 }
             } else if etype == "response.output_item.added" {
                 if let item = event["item"] as? [String: Any],
@@ -164,6 +165,9 @@ extension ChatGPTTransport {
                 }
             } else if etype == "response.completed" || etype == "response.done" {
                 let respObj = event["response"] as? [String: Any]
+                let status = respObj?["status"]
+                completedResponse = respObj != nil && (status as? String == "completed"
+                    || (etype == "response.completed" && status == nil))
                 if let usageObj = respObj?["usage"] as? [String: Any] {
                     capturedUsage = LLMUsage.fromOpenAIResponses(usageObj)
                 }
@@ -193,7 +197,7 @@ extension ChatGPTTransport {
                     "\(errorPrefix) error: \(detail)"
                 )
             } else if etype.hasPrefix("response.reasoning") {
-                // Reasoning frames renew liveness without becoming reply text, preventing idle cuts during active thinking.
+                // Reasoning frames report movement without becoming reply text.
                 continuation.yield(.keepAlive)
             }
             return false
@@ -217,22 +221,6 @@ extension ChatGPTTransport {
         } catch {
             throw mapTransportError(error, fallback: networkError(error))
         }
-        if let reason = runaway.toolBoundaryReason {
-            await telemetry.record(call: call,
-                requestBody: req.httpBody,
-                provider: providerId,
-                model: model,
-                streaming: true,
-                usage: capturedUsage,
-                ttftMs: ttftMs,
-                durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
-                status: "ok",
-                substitutedFrom: substitutedFrom,
-                stopReason: "client_tool_boundary"
-            )
-            continuation.yield(.toolBoundary(reason))
-            return
-        }
         guard shouldStop else {
             // A stream without a terminal event is truncated, never a complete reply.
             throw LLMError.streamTruncated(
@@ -253,7 +241,6 @@ extension ChatGPTTransport {
                 stopReason: reason
             )
             if reason == "max_output_tokens" || reason == "max_tokens" {
-                RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit", dataRoot: telemetry.diagnosticDataRoot(call: call), call: call)
                 continuation.yield(.toolBoundary(.outputLimit))
                 return
             }
@@ -262,9 +249,14 @@ extension ChatGPTTransport {
         if !pendingByItemId.isEmpty {
             throw LLMError.providerError(message: "\(providerLabel): response ended before function-call completion; no unfinished call was emitted")
         }
-        if lastRawDelta == nil, !yieldedToolCall {
-            throw LLMError.streamTruncated(
-                message: "\(providerLabel) stream produced no content (terminal event, empty)"
+        if refused, !hasAnswerText {
+            throw ProviderFailure.Diagnostic(cause: .refused,
+                detail: "\(providerLabel): response refused without answer text")
+        }
+        let silentCompletion = call.allowsSilentCompletion && completedResponse
+        if !hasAnswerText, !yieldedToolCall, !silentCompletion {
+            throw ProviderFailure.Diagnostic(cause: .malformedResponse,
+                detail: "\(providerLabel) stream produced no content (terminal event, empty)"
             )
         }
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
@@ -276,8 +268,11 @@ extension ChatGPTTransport {
             usage: capturedUsage,
             ttftMs: ttftMs,
             durationMs: durationMs,
-            substitutedFrom: substitutedFrom
+            status: refused ? "incomplete" : "ok",
+            substitutedFrom: substitutedFrom,
+            stopReason: refused ? "refusal" : nil
         )
+        if refused { continuation.yield(.toolBoundary(.refusal)) }
     }
 
     static func incompleteReasonText(from event: [String: Any]) -> String {

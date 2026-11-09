@@ -30,6 +30,17 @@ public enum MacAppWindowText {
               let node = source.attributes(of: selected.ref, context: context), node.frame == frame, node.title == identity.title else {
             throw SenseFailure(code: "source_unavailable", message: "The AX window changed before its independent text view could be captured.")
         }
+        let deadline = Date().addingTimeInterval(MacAXLimits.readSeconds)
+        func inspect() throws -> [MacAXNode] {
+            let nodes = try MacScreenViewTextRedaction.inspectSecretFields(source: source, root: selected.ref,
+                deadline: deadline, context: context)
+            guard let root = nodes.first, root.attributes.role == role, MacAXWindowIdentity.rectsMatch(root.attributes.frame, frame) else {
+                throw SenseFailure(code: "redaction_coverage_unavailable", message: "The inspected text window changed identity or geometry.")
+            }
+            return nodes
+        }
+        let before = try inspect()
+        let captureStarted = Date()
         let capture = await defaultMacScreenCaptureSource().capture(window: identity, context: context)
         try Task.checkCancellation()
         let shot: MacScreenShot
@@ -38,30 +49,69 @@ public enum MacAppWindowText {
         case .failure(let failure):
             throw SenseFailure(code: failure.rawValue, message: failure.localizedDescription, remedy: failure.remedy(app: bundleID))
         }
-        guard let image = shot.cgImage else {
-            throw SenseFailure(code: "image_encode_failed", message: "The captured window has no image for text recognition.",
-                remedy: MacScreenCaptureFailure.encodeFailed.remedy(app: bundleID))
+        guard MacAXWindowIdentity.rectsMatch(shot.bounds, frame), let provenance = shot.capture,
+              provenance.capturedAt >= captureStarted, provenance.capturedAt <= Date(), provenance.windows.count == 1,
+              let capturedWindow = provenance.windows.first, capturedWindow.pid == app.processIdentifier,
+              MacAXWindowIdentity.rectsMatch(capturedWindow.frame, frame) else {
+            throw SenseFailure(code: "source_unavailable", message: "The text capture no longer matches the inspected window frame.")
         }
-        let recognized = try await recognize(image: image)
+        let after = try inspect()
+        let geometry = MacScreenViewGeometry(shot: shot)
+        guard let beforeMasks = MacScreenViewTextRedaction.secretFrames(nodes: before, geometry: geometry, deadline: deadline, context: context),
+              let afterMasks = MacScreenViewTextRedaction.secretFrames(nodes: after, geometry: geometry, deadline: deadline, context: context) else {
+            throw SenseFailure(code: "redaction_coverage_unavailable", message: "Secret mask compilation exceeded its deadline.")
+        }
+        let masks = beforeMasks + afterMasks.filter { !beforeMasks.contains($0) }
+        let recognized = try await readCaptured(shot, excluding: masks)
         guard source.runningApps().contains(where: { $0.processIdentifier == app.processIdentifier && $0.bundleIdentifier == bundleID }),
               let current = source.attributes(of: selected.ref, context: context), current.frame == frame, current.title == node.title else {
-            throw SenseFailure(code: "source_unavailable", message: "The app window changed during text recognition; this material was discarded.")
+            throw SenseFailure(code: "source_unavailable",
+                message: "The app window changed; recognized text was discarded.")
         }
-        return material(recognized, geometry: MacScreenViewGeometry(shot: shot))
+        return recognized
         #else
         throw SenseFailure(code: "source_unavailable", message: "On-device app window text recognition requires macOS Vision.")
         #endif
     }
 
-    /// Recognize the read's ephemeral capture before retaining any material. Only redacted text and positions may leave this boundary.
-    public static func readCaptured(_ shot: MacScreenShot) async throws -> (rows: JSONValue, text: String) {
+    /// Whole-window caption redaction precedes mask filtering. Callers supply complete pre/post AX masks for this exact capture.
+    public static func readCaptured(_ shot: MacScreenShot, excluding masks: [MacAXFrame]) async throws -> (rows: JSONValue, text: String) {
         #if canImport(Vision) && canImport(ApplicationServices) && os(macOS)
         let bounds = shot.bounds
         guard let image = shot.cgImage, bounds.w > 0, bounds.h > 0,
-              bounds.x.isFinite, bounds.y.isFinite, bounds.w.isFinite, bounds.h.isFinite else {
+              shot.pixelWidth > 0, shot.pixelHeight > 0, image.width == shot.pixelWidth, image.height == shot.pixelHeight,
+              [bounds.x, bounds.y, bounds.w, bounds.h, bounds.x + bounds.w, bounds.y + bounds.h].allSatisfy(\.isFinite) else {
             throw SenseFailure(code: "source_unavailable", message: "The app capture is incomplete; no live screen was substituted.")
         }
-        return material(try await recognize(image: image), geometry: MacScreenViewGeometry(shot: shot))
+        let geometry = MacScreenViewGeometry(shot: shot)
+        guard geometry.scaleX.isFinite, geometry.scaleX > 0, geometry.scaleY.isFinite, geometry.scaleY > 0 else {
+            throw SenseFailure(code: "redaction_coverage_unavailable", message: "The capture has no finite AX-to-pixel scale; recognized text was withheld.")
+        }
+        func finite(_ rect: VisionRect) -> Bool {
+            [rect.x, rect.y, rect.w, rect.h, rect.maxX, rect.maxY].allSatisfy(\.isFinite) && rect.w > 0 && rect.h > 0
+        }
+        // VisionKitTextRecognizer flips normalized bottom-left boxes into top-left image pixels. imageRect maps AX frames into those same pixels.
+        let mappedMasks = masks.map(geometry.imageRect)
+        guard mappedMasks.allSatisfy(finite) else {
+            throw SenseFailure(code: "redaction_coverage_unavailable",
+                message: "Secret masks cannot be mapped to this text capture; recognized text was withheld.")
+        }
+        // Match the renderer's outward rounding to whole image pixels.
+        let imageMasks = mappedMasks.map { rect in
+            let x = rect.x.rounded(.down), y = rect.y.rounded(.down)
+            return VisionRect(x: x, y: y, w: rect.maxX.rounded(.up) - x, h: rect.maxY.rounded(.up) - y)
+        }
+        let recognized = try await recognize(image: image)
+        let visible = try recognized.filter { line in
+            guard let rect = line.rect, finite(rect), rect.x >= 0, rect.y >= 0,
+                  rect.maxX <= Double(image.width), rect.maxY <= Double(image.height) else {
+                throw SenseFailure(code: "redaction_coverage_unavailable",
+                    message: "OCR positions cannot be bound to this capture; recognized text was withheld.")
+            }
+            // A row may contain multiple words: withhold the whole row on any overlap, never select words by its center.
+            return !imageMasks.contains { $0.intersection(rect).area > 0 }
+        }
+        return material(visible, geometry: geometry)
         #else
         throw SenseFailure(code: "source_unavailable", message: "On-device app window text recognition requires macOS Vision.")
         #endif

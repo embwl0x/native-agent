@@ -1,108 +1,50 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ProviderErrorBodyDrain.swift` | `ProviderErrorBodyDrain`: bounded request-owned diagnostics |
+// Blueprint: | `ProviderErrorBodyDrain.swift` | Error diagnostics settled by body EOF, read error, byte cap or cancellation |
 
-/// Best-effort error diagnostics with exact-request ownership. HTTP status classification remains with each adapter; a failed/stalled body read is not a
-/// new provider verdict. User cancellation remains cancellation.
 enum ProviderErrorBodyDrain {
-    static func read(
-        _ bytes: URLSession.AsyncBytes, maxBytes: Int, timeout: TimeInterval
-    ) async throws -> Data {
-        defer { bytes.task.cancel() }
-        try Task.checkCancellation()
-        guard maxBytes > 0 else { return Data() }
-        // Read on the caller's task; its progress writer wakes the sole deadline. `timeout` limits idle time; arriving bytes extend the read up to the
-        // absolute cap.
-        let progress = ProviderErrorBodyDrainProgress()
-        let absoluteCap = max(timeout * 5, 10)
-        let watchdog = Task {
-            while !Task.isCancelled {
-                let (lastActivity, finished, wake) = progress.observe()
-                guard !finished else { return }
-                let now = ProcessInfo.processInfo.systemUptime
-                if progress.expire(now: now, idle: timeout, absolute: absoluteCap) {
-                    bytes.task.cancel()
-                    return
-                }
-                let delay = max(0, min(lastActivity + timeout, progress.startedAt + absoluteCap) - now)
-                await withTaskGroup(of: Void.self) { group in
-                    group.addTask { await wake.park() }
-                    group.addTask { try? await Task.sleep(for: .seconds(delay)) }
-                    await group.next()
-                    group.cancelAll()
-                }
-            }
+    struct Incomplete: Error, Sendable, LocalizedError, ProviderFailureWrapping {
+        let cause: any Error
+        let partialBody: Data
+        let status: Int?
+        let retryAfter: Int?
+
+        private var detail: String {
+            let response = status.map { "HTTP \($0)" } ?? "Provider response (HTTP status unavailable)"
+            let body = ContextSecretContentPolicy.redactedFragment(String(decoding: partialBody, as: UTF8.self))
+            return "\(response) diagnostic body failed after \(partialBody.count) bytes: \(ProviderFailure.diagnosticDescription(cause)); body: \(body)"
         }
-        let result = await withTaskCancellationHandler {
+
+        var errorDescription: String? { detail }
+
+        var providerFailureCause: any Error {
+            guard let status else { return cause }
+            return ProviderFailure.Diagnostic(cause: ProviderFailure.http(status: status, detail: String(decoding: partialBody, as: UTF8.self),
+                retryAfter: retryAfter), detail: detail, retryAfter: retryAfter)
+        }
+    }
+
+    static func read(_ bytes: ProviderHTTPBytes, maxBytes: Int) async throws -> Data {
+        defer { bytes.cancel() }
+        guard maxBytes > 0 else { throw POSIXError(.EINVAL) }
+        return try await withTaskCancellationHandler {
             var body = Data()
             do {
                 for try await byte in bytes {
+                    try Task.checkCancellation()
                     body.append(byte)
-                    progress.recordActivity()
-                    if body.count >= maxBytes { break }
+                    if body.count == maxBytes { break }
                 }
-            } catch {}
+            } catch {
+                try Task.checkCancellation()
+                throw Incomplete(cause: error, partialBody: body, status: (bytes.task.response as? HTTPURLResponse)?.statusCode,
+                                 retryAfter: parseRetryAfterSeconds(from: bytes.task.response))
+            }
+            try Task.checkCancellation()
             return body
         } onCancel: {
-            // Cancel exactly this request, never the shared URLSession.
-            progress.finish()
-            bytes.task.cancel()
+            bytes.cancel()
         }
-        progress.finish()
-        watchdog.cancel()
-        await watchdog.value
-        // A timeout/ordinary read error still returns diagnostic bytes for normal HTTP mapping. User cancellation must not refresh catalogs or masquerade
-        // as a retryable provider error after Stop/Steer.
-        try Task.checkCancellation()
-        return result
-    }
-}
-
-/// One read owns progress, wake registration and its terminal transition.
-private final class ProviderErrorBodyDrainProgress: @unchecked Sendable {
-    private let lock = NSLock()
-    let startedAt = ProcessInfo.processInfo.systemUptime
-    private var lastActivity = ProcessInfo.processInfo.systemUptime
-    private var finished = false
-    private var wake: ScopedWaiter?
-
-    func observe() -> (TimeInterval, Bool, ScopedWaiter) {
-        lock.withLock {
-            let waiter = wake ?? ScopedWaiter()
-            wake = waiter
-            return (lastActivity, finished, waiter)
-        }
-    }
-
-    func recordActivity() {
-        lock.lock()
-        guard !finished else { lock.unlock(); return }
-        lastActivity = ProcessInfo.processInfo.systemUptime
-        signalAndUnlock()
-    }
-
-    func expire(now: TimeInterval, idle: TimeInterval, absolute: TimeInterval) -> Bool {
-        lock.lock()
-        guard !finished, now - lastActivity >= idle || now - startedAt >= absolute else {
-            lock.unlock()
-            return false
-        }
-        finished = true
-        signalAndUnlock()
-        return true
-    }
-
-    func finish() {
-        lock.lock()
-        finished = true
-        signalAndUnlock()
-    }
-
-    private func signalAndUnlock() {
-        let waiter = wake
-        wake = nil
-        lock.unlock()
-        waiter?.resume()
     }
 }

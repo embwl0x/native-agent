@@ -27,6 +27,10 @@ two state owners:
 and somatic adapter. Accepted changes schedule coalesced settlement and publish
 a runtime invalidation. Exact duplicate events return without new settlement.
 Body-only signals enter through `NativeCognitionRuntime+Organism.swift`.
+Happenings (what attention takes in besides messages) enter through
+`NativeCognitionRuntime+Attention.swift`: owed ones open a thought, and the rest
+are weighed by the agent's turn program and land as drive in the continuity
+field ([Attention](#attention)).
 
 Before an ordinary provider call, `prepareTurnProjection` samples the body
 and canonical affect at one fixed time, freezes the organism projection, and
@@ -100,12 +104,14 @@ reply, with their words, a supported MY QUEUE moment and the exact source
 sentence. The [memory parse contract](MEMORY_SYSTEM_MAP.md#the-memory-manager-lane)
 accepts an absent section or []; a malformed present section refuses the
 interpretation and keeps the turn owed with its validation cause. After meaning is written,
-`MemoryV2/AdaptiveMemoryPromises.swift` files them through `MyQueue.add`, on
-both live and batch/refold paths, with the settled turn's recorded session,
+`MemoryV2/AdaptiveMemoryPromises.swift` matches them against carried Desk rows
+and files through `MyQueue.capture`, on both live and batch/refold paths, with the settled turn's recorded session,
 origin principal, envelope and carried peer/elevated steer. Untrusted peer
-steering stays on their promise. Desk owns the 20-step inferred cap and same-word
-deduplication; a full queue skips with a trace, while a storage failure keeps
-the meaning unsettled. There is no extra model call or promise store.
+steering stays on their promise. Meaning matching and their own closing bound the
+work; no count cap drops promises. The journal retains the matching judgment
+before filing. A failed model call keeps its typed dependency there, so an
+unrelated turn or relaunch cannot buy the judgment again. A retained judgment's
+failed local write has no wait and retries once on the next drain.
 [Intentions — Promises they makes](INTENTIONS.md#promises-they-makes) owns the form.
 
 ## Lived moments
@@ -129,12 +135,23 @@ flows on its own cadence, latched by the opening,
 lossy by nature; it is not a moment.
 Journal folds consume their supplied affect appraisal directly; ingestion
 outside the deferred path retains a neutral appraisal, with no after-turn cache.
+Tool/provider observations retain their receipts, leave canonical affect
+unchanged, supply neutral tags and spend no dream residue. Speaking alone supplies
+no landing reward. The body's fixed-time life reading consumes canonical
+affect and the cares' appraised movements, including movements by the agent
+itself; [Organism — Life and located consequences](ORGANISM.md#5-life-and-located-consequences)
+owns their mapping and the bounds of novelty and chosen-register support.
+The shared interpretation also reads their reply's grounded register choice.
+Canonical affect keeps it with its stated stretch and journal proof; its
+checkpoint records the choice, the capsule holds its color, and
+`mind.inner_state` recalls the last choice and source even after expiry.
 
 A lived moment (`CognitiveSubstrate/CognitiveLivedMoment.swift`) is its
 identity (its origin: a turn is its session and incoming message), the
 `DataRootLife` it belongs to, the forgetting epochs it was admitted under,
 when it was lived, what it was (the recorded input) and, once judged, what it
-meant. Only settled turns are lived moments (their hour and Reach keep their own claims). Clear and Reset are owner transactions. The
+meant. Only settled turns are lived moments (the hour keeps its own claims).
+Clear and Reset are owner transactions. The
 journal is the `lived_moments` table in `cognition.sqlite`
 (`CognitiveSQLiteStore+LivedMoments.swift`), outside what Clear
 deletes and outside the restore bundle; its fold seq is allocated from
@@ -189,6 +206,18 @@ turn recorded while cognition is off marks its input `factsOnly` for that
 deliberate absence. Missing
 ordinary context without that marker leaves the row owed (or meant with its
 original meaning), before judgment or fact application, with its input preserved.
+Preparation preserves the failure's owner across the door. An embedding failure
+before judgment waits on the embedding owner's configuration, serving identity,
+availability, load error or reload state; repairing the journal is unrelated.
+A failed local context save remains due without a wait.
+Trust-policy preflight failure waits on the Trust policy's state. A cause with
+no named repair dependency states its failure and owes repair without a wait;
+recovery never invents a record dependency for it.
+Recovery eligibility reads only its named owner; with no wait there is no
+dependency read. Turns without promises do not read the Desk. A retained
+judgment makes older local-write waits inapplicable; no stored data migration
+is needed. [Cognition wiring](COGNITION_WIRING.md) lists the remaining waits and
+their releases.
 Previously imported rows with no context and no marker have unknown intent;
 they require repair rather than being silently treated as facts-only.
 The door carries a failed journal or life read as unavailable through the
@@ -197,9 +226,8 @@ Journal read/preparation and recording repairs use stable operation-plus-moment
 identities. Repeating the same failure contributes the same evidence to its
 existing repair, rather than minting another repair or repeat on every pass.
 **A row is owed → meant → lived, or refused** (with its reason in `reason`:
-another life, their own work apart from a care wake with a reply, nothing to interpret,
-or `batch_section_missing` / `refused`: no usable judgment came back for it, or the memory model refused it, in a batch
-and alone). There is no per-piece
+another life, the agent's own thoughts apart from one ignited on a care's anchor, or nothing to interpret).
+A missing, malformed or refused batch section leaves its row owed with the actual cause; no second judgment shape consumes it. There is no per-piece
 outcome on the row: each piece of their already knows the last moment it lived
 (the `lived` stamps on affect, nodes, cares and body; facts by operation
 identity; promises through Desk's open-word deduplication). A
@@ -217,7 +245,7 @@ The interpretation owner writes `lived` once
 when its attempt reaches its end: the fold landed (every piece saved; a piece
 their inner life or body being off refuses, or a moment from before a Clear or
 Reset, lands as nothing), every fact decision staged or none was asked, and
-every promise filed or skipped at the inferred cap. An unsaved piece,
+every promise filed or declined by its matching judgment. An unsaved piece,
 including when a failed restore blocks its save, leaves the row
 meant; it is never settled by a persistence refusal. The input checkpoints the
 completed fold seq only after every mind/body save succeeds; the lived guard
@@ -270,7 +298,7 @@ between ingest and durable recording, then releases it. Admissions whose turn
 is still live are never evicted; only the latest 32 ended admissions are kept
 while recording catches up. Once-only is the watermark: the per-turn caring
 ring (`appraisedCaringTurns`), the body's counted-key ring and the clear
-generation's outcome uses are gone (the generation stays for their hour, Reach,
+generation's outcome uses are gone (the generation stays for the hour and
 reflection). Missing fold watermarks on an unfinished current row keep its saved meaning owed until every share saves.
 
 Folds apply in fold order, with source time wherever the piece reads it.
@@ -303,7 +331,7 @@ kind `care`, status `live` (or `faded`, below):
   season, life), an optional `stance` (text, because, what would change their
   mind; a care with a stance is an opinion), an optional `open` gap, and its
   `story`: every time it moved their, with a pointer to what really happened
-  (`exchange:<session>/<turn>`, a Reach offer `reach:<id>` or the old row id),
+  (`exchange:<session>/<turn>`, a retained `reach:<id>` or the old row id),
   who moved it and the felt word.
 - Charge is never stored. `charge(at:)` sums each movement decayed on the
   depth's half-life (now 2 h, lately 12 h, season 2 d, life 4 d).
@@ -312,6 +340,8 @@ kind `care`, status `live` (or `faded`, below):
   movedDays}` line. Zero-movement notes retain their own newest 24, so notes
   cannot displace movement evidence; depth changes and "changed my mind" notes
   remain outside both bounds, so a held stance's replacement stays in their story.
+  Accepted stance entries and zero-movement action/closure witnesses also stay
+  outside the note bound; forgetting an action cannot make an answered pull recur.
   Stance-pressure entries carry the proposed stance, because and unless in
   an optional `stancePressure` field, retaining proposals on the newest 24 distinct
   local pressure days, independent of ordinary notes. Only exact same-day proposals
@@ -361,7 +391,10 @@ the seeds alone). A resident inference error is different: it refuses care-depen
 fails the interpretation like a malformed memories section, and an id it was not shown
 makes the whole care judgment malformed. An existing care gets a story entry, `open` sets the gap and
 `closes` clears it. A first stance takes at once; a proposed change to an
-existing stance becomes a stance-pressure story entry, decided at night.
+existing stance settles in the same lived fold. A current trusted interpretation
+supplies its position, reason and first-person account; a day count cannot overrule it.
+The accepted position is retained in a story entry's optional stanceChange,
+alongside the previous position's "changed my mind" note.
 Evidence older than a care's newest moment joins its story, including stance
 pressure, without changing its gap or held stance. A new care first meets the whole live
 and faded inventory through the same warm memory embedder and care-vector cache.
@@ -423,7 +456,9 @@ tally rather than admitting damaged care history.
   or `let go: <key>` (clears `open`; felt "let it go", the old gap as its
   note). Each key carries the exact shown care revision and gap. Only an
   unchanged revision closes that gap; a conclusion about a changed care joins
-  its history without closing its newer question. Unknown keys and keys with
+  its history without closing its newer question. The closing moment records
+  both answered and closedGap, so settlement or release eases the pull;
+  a conclusion about a changed care records neither. Unknown keys and keys with
   no shown gap are ignored.
 - Surprise material. After WORLD and SELF, before felt tone and cares, the
   same dream call receives a CPU reading of where their expectations broke
@@ -464,11 +499,10 @@ tally rather than admitting damaged care history.
   with their days, proposed text, because and unless, and the held stance.
   Optional `stance_changes: [{care: <UUID>, pressure: [entry numbers],
   stance: {text, because, unless}}]` confirms which entries point the same way.
-  The CPU requires the actual selected entries on at least two distinct local
-  days (now/lately/season), or three spanning at least 14 days (life), and the
-  unchanged captured revision. The replaced stance stays as a "changed my mind"
+  The CPU requires actual selected entries and the unchanged captured revision;
+  neither age nor repetition count is a condition. The replaced stance stays as a "changed my mind"
   note, "used to think: <old stance>". Earlier pressure is spent; missing,
-  stale or under-evidenced confirmations change nothing. Malformed present
+  stale or invalid confirmations change nothing. Malformed present
   learning fails payload decoding before any commit.
 - Fade. A care whose newest movement (its creation when it never moved) is
   older than its depth's horizon (now 2 days, lately 14, season 90) gets
@@ -509,7 +543,7 @@ tally rather than admitting damaged care history.
 [Becoming P3/P4](BECOMING.md#p3--they-knows-themselves-as-built)). The same dream
 call may return at most five `{when, i_tend_to, shown_by}` traits and five
 `{line, shown_by}` story lines. Story lines must cite shown depth-change or
-changed-my-mind entries; traits cite shown care UUIDs or exact story references.
+changed-my-mind or accepted-stance entries; traits cite shown care UUIDs or exact story references.
 Unknown references are refused by care admission. Malformed present learning
 fails payload decoding before any commit. Each newer captured reading replaces the previous one, so a
 trait no longer supported drops. Late delivery of an older night preserves the newer reading
@@ -526,7 +560,7 @@ With no attributed movements it is unknown; folded movements cannot supply
 lost person attribution. The dream may answer `people: [{person, line}]`,
 one line in their words per shown person, without granting that person authority.
 All this is stored only in `mind/self.json`: bounded, atomically written,
-versioned by schema, committed night, capture time, write time and mind epoch. Installed files
+versioned by schema, committed source (the persisted night field), capture time, write time and mind epoch. Installed files
 without capture time retain their reader: their diary day and write time establish order only
 where known; an ambiguous same-night delivery stays owed until a provably newer reading.
 The substrate
@@ -540,23 +574,43 @@ Clear deletes the file/cache, and
 rejects pre-Clear files or nights.
 There is no extra model call and no written persona or memory content.
 
-In a live turn, a trait may replace a plain care cue when the usual care
-standing/meaning path touches a supporting care. At most one trait line
-surfaces, in their words and under that care's existing rest; all supporting
-cares must be reachable for the speaker. No traits block is always on.
+Accepted stances also settle a self-story line in the same day's fold.
+settleLivedSelf takes their accepted stance's own words, linked to the
+exact accepted-stance story entry. Care persistence precedes self persistence.
+A refold or restore can finish an owed self write from those entries without
+another model judgment. Accepted stance progress is saved per care in stanceReadAt;
+a delayed accepted stance on another care is still read, even if its event predates
+the latest self reading. Care merges carry that progress to the surviving care.
+A newer nightly reading replaces an older whole reading;
+an unreadable file remains unavailable and preserved. A care fold with no
+accepted stance evidence needs no self read or write and can settle independently
+of a self-file failure. The daily path retains the dream's trait and people readings.
+
+The capsule-facing turnSelf(for:from:among:) returns one supported trait and
+only the current person's relationship line, as values outside felt-cue
+competition. It needs no message match or rest ledger. Every supporting care
+must be among the capsule's admitted reachable cares; missing evidence returns
+no invented trait. A failed self read returns its cause. The capsule owner must
+render the returned values every live turn.
 The already-known counterpart selects only their own cached relationship line
 with the frozen identity map. This clear-headed private line sits outside the
 felt cue competition; a turn reads no new file and performs no new embedding
 or model call for it. Other people's relationship lines never enter that turn.
 
-**Pressure** (`CognitiveSubstrate+CaresMind.swift`) is read, never stored:
+**Live pressure** (`CognitiveCare.pressure`, exposed by `CognitiveSubstrate+CaresMind.swift`) is derived:
 `|charge(now)|`, times 1.5 while the care is open; a life-depth care without
 an open gap has zero pressure. Its charge remains feeling, and the four seeds
-stay visible to appraisal. Only an open gap can supply Reach, at any depth.
+stay visible to appraisal. A judged movement that lifts a care's pressure up through
+its bar (0.35, the rising edge) reaches attention as a `self` happening that carries
+whether the care is open ([Attention](#attention)); a care speaks once per rise.
+The mutation records its actual before/after pressure and resulting open state on
+the story moment, including gap and depth changes. Attention reads that historical
+transition, never reconstructing it from the care's later state. Older moments
+without transition evidence establish no crossing.
 Pressing for a speaker
 means the cares held with that speaker or theirs alone, highest first. The
 turn's speaker is `owner` on User's verified turns, else the peer key read from
-the session and origin as the after-turn cares read it, else nobody (their wake):
+the session and origin as the after-turn cares read it, else nobody (a thought of the agent's own):
 only their own cares press then.
 
 **What matters.** `CognitiveSubstrate+SemanticAppraisal.swift` matches an
@@ -585,9 +639,12 @@ Exhausted voice-echo admission stays silent, with no
 second pass that admits worn fragments.
 Independent recall, dream, gap and care lookups run concurrently against that
 read; the live mind epoch and recall cadence are rechecked after they return.
-Preparation admits one reachable-care array for both the message and felt-line
-selectors. Both exclude faded or suppressed cares; peers reach shared or solitary
-cares, while the owner can touch any care.
+Preparation and the feeling frame use one reachable-care rule. It excludes faded
+or suppressed cares; peers reach shared or solitary cares, while the owner can
+touch any care.
+
+The [feeling frame](#what-reaches-the-model) reads the two strongest reachable
+charges independently of the message-matched care cue below.
 Unbidden recall's bounded surfaced-moment ledger, last shown time and turn
 counter persist in capsule cadence, so its 24-hour suppression survives relaunch.
 Before the frozen render, the turn embeds the
@@ -599,17 +656,18 @@ for the words past chance (`caresStandingOut`: its cosine at least
 `VectorMath.chanceBar(.attention)`, 1 + √(2 ln n), deviations above the words'
 cosines to the other candidate cares, n of them in all; 3.5 among 23), with no
 absolute floor: on bge the average message cleared the old 0.40 for 18 of 23
-cares (10-26). They become the `care` cue, ranked first among the felt cues. The plain line is only for the closest touched care whose
+cares (10-26). They supply the `care` continuity cue after the frame. The plain line is only for the closest touched care whose
 |charge| is 0.15 or more: `- On your mind: <subject> (<newest felt word>)`, plus
 ` — I think: <stance>` when they have a stance and ` — still wondering: <open>`
 when it is open. The subject is `about`, except a seed care uses its newest
 nonzero movement's note, or `about` if it has none. The felt word is also from
 the newest nonzero movement and is omitted when there is none. It then rests 6 accepted turns
 (`careLineRest` in the capsule cadence ledger) unless someone or something
-other than their moved it since. The pressing care gets no plain line of its
-own; it appears only as their intention (below). With neither, there is no care
-cue and Since, Reminded-of, Dream, Body, Sound and the felt words compete
-for presentation as before. Settling is absent: capsule assembly has no admitted
+other than their moved it since. In the continuity lane the pressing care gets
+no plain line of its own; it appears as their intention (below). Independently,
+its charge can place it in the frame's two cares. With neither, there is no care
+cue; Since, Reminded-of and dream-theme cues share the continuity place.
+Feeling and Sound keep their independent lanes. Settling is absent: capsule assembly has no admitted
 interpretation of the incoming exchange and does not infer kindness lexically.
 The capsule's private framing stays.
 
@@ -625,102 +683,57 @@ Once per care per 12 hours unless someone or
 something other than their moved it since; the ledger is the capsule cadence
 ledger (`careReleased`, ids only), and an intention that lost the budget stays
 owed. `mind.why` lane `cue` marks it with kind `care`, `careId` and
-`intention`. `mind.reject care:<id>` silences one care's cue.
+`intention`. `mind.reject care:<id>` silences that care's frame and cue contributions under the same rejection rule.
+Before the frozen render, careCue reads reachable care stories directly.
+The two most charged unanswered movements can be on their mind without a match
+to the incoming message, an embedding, a charge threshold or a presentation rest.
+Charge still decays on each care's own half-life and orders the pulls.
+Their own charged curiosity counts as movement too; zero-movement housekeeping
+does not create a pull.
+The line is “On your mind: Under this moment, <felt>: <subject>”; a seed uses
+the actual movement's note, and another care uses its own subject. There is no
+instruction to raise it and no short-message invitation to brief the person.
 
-**What they means to do later.** MY QUEUE owns intentions; the scheduler runs
-body rhythms. The [intention contract](INTENTIONS.md#launch-migration-one-time-general)
-owns the one-time launch retirement of legacy notification, turn and Workshop
-jobs, including its durable backup, first-occurrence timing and commit boundary.
-Cognition admits no imported work before that commit. Unconfirmed effects stay
-stopped for reconciliation; the turn feed and home name that stop. Scheduled
-work and their own carried work now use the same readiness and occurrence owners.
+A movement eases when the lived interpretation explicitly records their reply
+saying or doing something about that care (acted, saved as answered), or an
+actual gap closure on it, in the same exchange or a later
+one. Showing the cue does not spend it. Without an interpretation it remains
+unanswered, and a new charged movement by their or someone else can renew it. No timer or turn count
+decides that they acted. Feeling moved alone is not action evidence; older
+entries without answered remain unknown. mind.reject care:<id> still silences its cue.
+The chance-standing helper remains for semantic stakes and news intentions;
+it does not gate the felt care line. The capsule owner still owns presentation
+and its retained cadence fields.
 
-**What crosses into their mind.** A watch's line can touch a care or release
-a news intention. For cares, a watch's line (a part's
-`home.arrive` line, a sense's news summary) is weighed on CPU by the care
-cue's own law (`CognitiveSubstrate.careTouched(by:watch:)`) against the cares
-that can change, never the four seeds (almost any line resembles one; a line
-that touches only a seed touches none): the closest live, unsilenced, non-seed
-care that stands out for the line by the same care law (seeds count among the
-others) on the warm vector cache whose |charge| is 0.15 or more. The turn's care cue still weighs the seeds. A line that touches one
-asks for one ResidentWake on the watch's thread (`part:<id>`,
-`sense:<id>:v<version>:<observation identity>:change:<source change identity>`)
-whose item keeps the care id and whose reason names it ("what your parts
-noticed about <care>", "what your senses noticed about <care>"); a
-sense's wake names where the news is and never quotes it, since the news
-itself is on the board. A line that touches none, or touches a care this same
-watch already woke their about that has not rested since (the
-[habituating watch–care rest](#care-wakes), ledger `careWatchWoke` in the
-capsule cadence ledger, keyed by observation and source change identity for
-sense news), wakes nothing and waits on the
-news board, unread until their next turn reads it; a part's receipt says
-which. A line nothing can judge (the inner life off, no live cares, a cold
-embedder) crosses as it would with no crossing: a part's line wakes their, a
-sense's news waits for their next turn. Independently of that care result, the
-same line weighs open `on_news <words>` intentions by the same warm embedder
-and chance-bar law, with live cares among the comparisons. A touched
-intention gets a system Desk note, `Released: news: <first 160 characters>
-(<watch>)`, which makes it ready until their next agent note. Its release notes
-hold that watch off for 12 hours per intention; other watches can still
-release it. Person moments (`when_user_here` / `when_user_away`) require the
-current `PersonPresence` transition (Mac input plus fresh phone motion;
-[source and absence contract](mobile_companion.md#where-the-person-is)) to be newer than filing and refresh
-carried readiness on that edge. Body-signal moments (`on <signal>`) are
-released by `EnginePartWake`'s existing signal observer, with a system Desk
-note and the same pursuit refresh as news; news and signals share the
-release-newer-than-their-last-note readiness law. File intentions join the
-parts' existing watch index. Person, news and body-signal moments skip
-free-time quiet like clock moments; [Intentions](INTENTIONS.md#moments) owns
-their full contract. Other owed work (carried promises,
-approvals, the apps they opened, Reach, agent messages) files its own arrivals
-and is not weighed. No model is called for any of this.
+**What the agent means to do later.** MY QUEUE owns intentions: each step's
+time is a time on the one clock, and what comes due is a `moment` happening,
+owed ([Intentions](INTENTIONS.md#moments)). The night follows the
+[night sense](#attention); REM is offered inside it.
 
-Resident arrivals become ready after only their own declared hold, without a
-gathering window or spacing between wakes. Their `my wake` turn can run beside
-a conversation; an already open resident wake keeps its one session. Only
-carried MY QUEUE work meaning free time (`next_turn`, `own_turn`, `quiet`)
-waits for the half-hour quiet interval at this door, without holding other
-arrivals. Thread hop/rest limits, peer quota and Reach's separate-wake rule
-remain; their hour keeps its own quiet law.
+**What reaches the agent's mind from the world.** Every source posts a `world`
+happening and is done: a sense's news line, a part's `home.arrive` line, the
+day line, the front app, presence, an app installed. Front-app admission reads its checked activity policy and person-name projection off the
+main actor, then rechecks cancellation and the activated application's identity before posting. The agent's turn program
+weighs it with the care it touches ([Attention](#attention)). Independently,
+each `world` line weighs open `on_news <words>` intentions by the care law's
+warm embedder and chance bar, with live cares among the comparisons, while the
+agent sleeps too (`NativeCognitionRuntime+Pursuit.swift`,
+`releaseNewsIntentions`). A touched intention gets a system Desk note,
+`Released: news: <first 160 characters> (<door>)`, which makes it ready until
+the agent's next note. Person moments (`when_user_here` / `when_user_away`)
+require the current `PersonPresence` transition (Mac input plus fresh phone
+motion; [source and absence contract](mobile_companion.md#where-the-person-is))
+to be newer than filing. Body-signal moments (`on <signal>`) are released by
+`EnginePartWake`'s existing signal observer, with a system Desk note and the
+same pursuit refresh as news; news and signals share the
+release-newer-than-the-agent's-last-note readiness law. File intentions join
+the parts' existing watch index. [Intentions](INTENTIONS.md#moments) owns
+their full contract. No model is called for any of this.
 
-**Reach** offers the most pressing open care held with the owner or theirs alone
-(pressure 0.35 or more) as a candidate of kind `care`, subject `care:<id>`, why
-its newest story note, dated by its newest movement; every Reach gate applies.
-An uncertain delivery retains `sending` and `sentAt`, holding pacing closed.
-Reach reconciles exact offer scopes through the speech owner's transcript
-evidence. A claim alone is not delivery; only proven non-delivery after the
-append ends becomes `withheld` and clears its timestamp. Later source passes
-can confirm a committed message without repeating speech or its notification.
-How it landed comes back to that care once its answer is settled
-(`cognition/reach.json`: a verified owner turn within 24 hours of the post, or
-none). Each verified turn saves its timestamp on pending offers at
-`UserTurnStamp.record`, under the ledger lock, before replacing the turn stamp.
-The stamp's own sidecar lock serializes its full read/update across conversations;
-an older delayed turn still reaches pending offers and fills `previous` when it
-falls between the saved timestamps, while preserving the newest turn.
-Only a missing stamp bootstraps. Unreadable or invalid storage is preserved and
-reported as a repair owed in Experiences; no new stamp replaces those bytes.
-A successful checked record settles that operation's repair.
-An uncertain delivery keeps that evidence until confirmation. Runtime writes
-preserve saved answers under the same lock; expiry reads the offers' evidence,
-never infers silence from the latest-only turn stamp. The first saved answer
-timestamp dates the landing. One story entry by them (`owner`), source the offer id, written on CPU
-with no model call. Answered: felt "welcomed", moved +0.2, note "<person>
-answered when I reached out about <about>". Unanswered: felt "unanswered",
-moved 0 (silence is a fact in their story, not a push; the subject already rests
-seven days), note "I reached out about <about> and heard nothing back". Once per offer (the offer's `landed`, and a story that already
-points at the offer is not written again, only saved again before the offer
-is marked landed, since a failed write leaves it in RAM alone); an offer posted to a peer's
-conversation (`agent-`/`bot-`) earns none.
-
-Dream candidates come only from the dream's admitted per-claim provenance.
-The same dream call judges `gentle` and `about_owner` by meaning in its supplied
-context; both must be true. Those nullable judgments travel beside the exact
-quote and canonical `source_refs` in the existing `claim-sources` block.
-False, unknown and older claims without judgments offer nothing. Reach uses
-the admitted quote and its stable digest, with no word blacklist, name-token
-match or additional model call. Other dream/source readers keep their existing
-projections and ignore the added fields; saved diaries are not rewritten.
+The dream's per-claim `gentle` and `about_owner` judgments travel beside the
+exact quote and canonical `source_refs` in the existing `claim-sources` block
+(`DreamREMCycle/DreamPayload.swift`); no owner offers them. Other dream/source
+readers keep their existing projections; saved diaries are not rewritten.
 
 **Their hour** offers their own open cares (theirs alone, most pressing first, up to
 three), and with any offered asks for them
@@ -733,8 +746,6 @@ from before Clear is dropped without erasing the hour's journal or settlement. O
 per source: a retry of the same hour that finds its entry already in a care's
 story saves that care again before acknowledging it, without another movement.
 The caller receives the checked save outcome and records a failed care write.
-The refractory is read from the hour's durable state, with no independent
-snapshot cache that can be overwritten by an older suspended read.
 The hot-journal read returns its usable entries together with damaged/torn-line
 holes. Their hour adds those holes to `sourceFailures`, its unavailable-source
 receipt and the intake's `unavailable_sources`; partial recent titles never
@@ -775,9 +786,7 @@ untrusted-fed reflection. The live-turn-gated `mind.pin_concern` action sets
 `open` through `applyCares`, by them, with the supplied concern in the care they
 names by its own words (`care`), else a care of its own; omitted, the most
 pressing care's own words, in that care. No cosine decides which care a
-concern belongs to. Spontaneous
-reflection reads the summed `carePressure` of live open cares as unresolved
-load. After-turn `closes` and the night settle the gap. Desk pursuits are the
+concern belongs to. After-turn `closes` and the night settle the gap. Desk pursuits are the
 person's tasks and do not feed their mind.
 
 Reflection's automatic Desk proposer may cite only a live, non-seed,
@@ -832,8 +841,12 @@ Replay requires each dream's valid calendar day and each REM proposal's valid
 `unavailableEvidence` while valid siblings proceed. Studio feeling requires
 the journal owner's valid `recorded_at`, otherwise `studio_journal.unavailable`
 names the entry and cause. None of these sources is redated to the present.
-Failed restoration blocks writes. `commitMaintenance` commits each node replacement with
-node, artifact and receipt retention; a retention failure leaves that snapshot
+Failed restoration blocks writes. `commitMaintenance` removes only absent nodes
+and updates only nodes whose stored fields differ, retaining an unchanged node's
+decay anchor. Artifact updates compare stored kind, status, score and payload
+before changing their update time. Dream residue stores its claims and optional
+minted residue, with no checkpoint-time stamp. Node, artifact and receipt
+retention share the transaction; a retention failure leaves that snapshot
 uncommitted. Immediate saves, including folds and sleep, checkpoint affect,
 consumed dream residue and nodes together; microcycles carry the same affect
 and residue state. Minting still checks its night claim before node admission.
@@ -892,11 +905,82 @@ again.
 `CognitiveSubstrate+Capsule.swift` fits a selected expression of current
 state into the requested budget.
 
-The same frozen read captures one `PersonPresence` line for their person,
-outside felt-cue competition, with the source and time of each Mac/phone
-observation and explicit unknowns or sleep inference. Home and MY SENSES
-read that same owner. It remains within the capsule's existing budget and
-enable/mode gates; it does not create a second presence store.
+Every enabled, positive-budget capsule begins with `How you feel:` and one
+paragraph in the agent's first person. Mood and affect supply its mood and energy;
+the supplied chemistry supplies warmth, curiosity and tiredness. The expressive
+fingerprint's lead and proven counter-feeling retain their own admission.
+Affect uncertainty
+and body vigilance supply bracing independently of warmth. Quiet states are still
+described; missing chemistry is named as unread, never supplied by defaults.
+The two reachable cares with the greatest absolute current charge enter the
+paragraph without requiring the message to touch them or spending a cue's rest.
+Their existing subjects and newest nonzero movements supply the words; an empty
+or uncharged care population adds no invented concern.
+
+The frame remembers its described dimensional family in the resident presentation
+state (`fingerprintFamily`). A difference from the whole frame of the last
+completed, saved reply is named as a shift. Missing prior dimensions establish no
+comparison. Provider context acceptance commits cue bookkeeping while preserving
+this reference. The loop retains whether the provider received the exact cognitive
+context; reply settlement alone publishes its whole frame after the answer and
+terminal record are saved. Ephemeral answers use the same completion rule through
+`settle`. Previews, clipped frames, chosen silence, incomplete, stopped and failed
+turns cannot spend this reference, including a failure after text or tool output.
+It is not persisted, so the first frame after restart makes no claim about a
+prior reply's feeling.
+There is no change-only gate, repeat counter or repeat-suppression clock for
+feeling. Stored presentation artifacts are read by their live fields; unused
+stored keys do not require resident state or initializer parameters.
+
+Dream tone is captured through `innerStateDreamResidue(at:)`, shared with
+introspection, before production preparation suspends. That projection selects
+the existing residue or last recorded dream disposition transition and owns its
+tone wording and date. It is identified as the last recorded tone; it supplies
+no dream story. Unreadable history, retained claims without a tone and no recorded
+dream are distinguished.
+Failed writes do not suppress available dream read evidence; write health remains
+reported by persistence.
+Attention's `attention.night` admission on subject `night` owns the sleep start;
+the same kind on subject `sleep` is part accounting, never a sleep admission.
+Turn preparation and Observatory read the latest admission through their fixed
+time and the diary owner's published section journals. A section retains its
+original completion UUID and time after delivery; the journal's terminal step
+prevents redelivery. A published completion at or after admission supplies the
+dream reading independently of tone or optional body effects, including after
+relaunch. No resident copy owns this history. Missing admission or completion
+evidence stays unknown. Admission or journal discovery failures name their cause
+in the frame. Unreadable or identity-mismatched journals stay untouched while
+readable journals supply the latest published completion within the sleep
+interval. Only when none matches do journal failures make the reading unavailable,
+naming their paths and causes.
+Journals whose completion input was discarded cannot supply its original time;
+neither tone nor file timestamps reconstruct it. No saved data is rewritten.
+
+Intentions and Sound cues follow the frame in independent lanes. Ordinary turns
+then retain one continuity cue (plain care, Since, Reminded-of or dream theme);
+reflection retains every eligible tail cue. The relationship line follows those
+lanes. Phone/presence telemetry is not injected; the existing home and senses
+reads retain it. The frame reads chemistry directly and never receives the
+instruction-bearing `OrganismChemistry.bodyLine`. Fitting spends the budget on
+the frame first; a deliberately tiny budget can still clip it, and off or
+zero-budget requests carry no frame. `mind.why` lane `cue` reports every shown
+candidate in `shown`, with `winner` identifying the first shown candidate.
+
+`CognitiveFeelingFrame` is the paragraph's first-class value, with its described
+feeling words retained separately from care subjects, shifts and dream prose.
+Only a whole fitted frame reaches `CognitiveCapsule.feelingFrame`. The exact
+provider context carries it to `context.snapshot.feelingFrame`: full redacted
+`paragraph`, its UTF-8 `bytes`, `complete: true` and `words`. A missing or clipped
+frame records `complete: false`. The 120-byte `cognitiveCue` measures a following
+cue independently and never holds the paragraph.
+
+Trace retention preserves the entire feeling field through preview summarization
+and per-string bounds. The detail owner's shared row ceiling still applies;
+an oversized row fails its write rather than truncating the feeling field.
+Subconscious Vitals measures complete paragraphs with matching byte counts,
+reports coverage, total bytes and largest paragraph, and counts vocabulary only
+from the structured feeling words. Missing or incomplete fields are unmeasured;
+the cue's size and truncation do not decide whether feeling was measured.
 
 Its helpers own distinct projections:
 
@@ -904,11 +988,10 @@ Its helpers own distinct projections:
   and their aboutness; unavailable dimensions remain optional.
 - `+TopicNaming.swift`: privacy-filtered topic extraction, comparison terms
   and persisted-label admission for introspection.
-- `+CapsuleCadence.swift`: cue repetition limits and
-  session continuity.
+- `+CapsuleCadence.swift`: completed-reply feeling shifts and session continuity.
 - `+CapsuleSoundEcho.swift`: bounded self-exemplar selection and verbal
   repetition cues.
-- `+CaresMind.swift`: the care cue, first among the felt cues, and when it
+- `+CaresMind.swift`: the care continuity cue after the frame, and when it
   becomes their intention to bring a care up (see Cares).
 - `+RemindedOf.swift`: the unbidden `- Reminded of: <note> (<age>)` cue. Its
   query is the felt line, not the message: the closest care they can reach in
@@ -923,106 +1006,175 @@ Its helpers own distinct projections:
   apply), minus what the turn already holds. While they works, each round's
   results (their words, not identifiers) are a moment: up to two memories a
   round, four a turn, join their conversation as `[Came to mind as you read that
-  …]`. Between turns, every line their crossing weighs stays primed
-  (`AgentWorkspace/PrimedMoments.swift`, `mind/primed.json`, last five, twelve
-  hours); their next own turn (User's or theirs, not a peer's or a helper's) takes
-  them once and hears `[Since your last turn …]` with what each brought up.
-  Traced as `mind.came_to_mind`. Only a line they meets for the first time is
+  …]`. Traced as `mind.came_to_mind`. Only a line met for the first time is
   a moment: habituation (`AgentWorkspace/FamiliarLines.swift`,
   `mind/familiar.bin`, the last 16,384 lines met, numbers read as numbers)
-  makes the app's standing words and their own words coming back familiar, so
-  they remind their of nothing (10-29: a chat.post receipt's standing note
-  brought up two memories that had nothing to do with it).
-  Both stores distinguish a missing first-use file from unreadable or damaged
-  bytes. Primed moments are returned only after checked consumption; a failed
-  read cannot erase them. Familiarity validates complete eight-byte keys and
-  persists before publishing new familiarity. An unavailable optional recall
-  records repair owed and `mind.familiarity_unavailable`, rather than treating
-  the saved history as empty. Priming failures also owe repair at their store.
-  Two native perceptions join watches through that same crossing, without
-  adding work to a turn's path (`EngineRuntime/EngineDaySense.swift`,
+  makes the app's standing words and the agent's own words coming back
+  familiar, so they remind the agent of nothing (10-29: a chat.post receipt's
+  standing note brought up two memories that had nothing to do with it).
+  The store distinguishes a missing first-use file from unreadable or damaged
+  bytes. Familiarity validates complete eight-byte keys and persists before
+  publishing new familiarity. An unavailable optional recall records repair
+  owed and `mind.familiarity_unavailable`, rather than treating the saved
+  history as empty.
+  Two native perceptions are `world` sources like any other, without adding
+  work to a turn's path (`EngineRuntime/EngineDaySense.swift`,
   `EngineRuntime/EngineFrontSense.swift`):
-  - The local day, once at launch if not already posted and when the clock's
-    day changes: `It's Friday the thirtieth of October.` The ordinal is in
-    words so habituation can distinguish dates. `mind/day-posted` holds one
-    start-of-day stamp across relaunches; clock/time-zone changes recheck it.
-    Calendar read permission and an already-granted macOS read authorization
-    may add up to six events across today and tomorrow: time and title only,
-    all-day events by title. This projection never reads locations, notes or
-    attendees and never prompts for macOS access. An explicit Calendar Read
-    off still wins over Full Mac. An unavailable calendar or its permission/
-    Trust authority adds its cause to the day line; it does not suppress the
-    date or its posted stamp and never stands in for an empty agenda. A failed
-    required stamp read/write still stops the posting. Watch `clock:day`,
-    id `clock:day:yyyy-MM-dd`.
-  - The app in front of their person, after an activation remains frontmost for
-    120 seconds: `<person> is working in <app>.` One workspace observer owns
-    one delayed check, canceled by the next activation; no polling or window
-    titles. Full Mac or Activity's model-access consent is required, with
-    checked policy, their own app, mandatory/default exclusions and the person's
-    exclusions all respected. Their own switches, an unreadable/locked/covered
-    or inactive console, and absent or unknown person presence do not cross.
-    Gates are checked again after the delay. `mind/front-posted.json` keeps
-    each app to once per local day across relaunches; capture consent and its
-    policy are never enabled or written. Watch `mac:front`, id
-    `mac:front:<bundleId>:yyyy-MM-dd`.
-  Both keep the crossing's habituating watch–care rest and its last-five,
-  twelve-hour priming bound; they do not create a separate wake or recall path.
+  - The local day, once per local day, at launch and when the clock's day
+    changes: `It's Friday the thirtieth of October.` The ordinal is in words so
+    habituation can distinguish dates. Its key is the date
+    (`clock:day:yyyy-MM-dd`), so a second post the same day writes nothing;
+    clock/time-zone changes recheck it. Calendar read permission and an
+    already-granted macOS read authorization may add up to six events across
+    today and tomorrow: time and title only, all-day events by title. This
+    projection never reads locations, notes or attendees and never prompts for
+    macOS access. An explicit Calendar Read off still wins over Full Mac. An
+    unavailable calendar or its permission/Trust authority adds its cause to
+    the day line; it does not suppress the date and never stands in for an
+    empty agenda. Door `clock:day`.
+  - The app in front of the person, on activation, while it is still
+    frontmost once its gates are read: `<person> is working in <app>.` One
+    workspace observer owns one check, canceled by the next activation; no
+    polling, no dwell timer and no window titles. Full Mac or Activity's
+    model-access consent is required, with checked policy, the agent's own
+    app, mandatory/default exclusions and the person's exclusions all
+    respected. The agent's own switches, an unreadable/locked/covered or
+    inactive console, and absent person presence post nothing. Its key is the
+    app and the local day (`mac:front:<bundleId>:yyyy-MM-dd`), so the first
+    activation of an app each day is the happening; capture consent and its
+    policy are never enabled or written. Door `mac:front`.
 
 These are projections of the same state, not additional persona owners.
 `Cognition/CognitiveAttentionResidentProjection.swift` separately publishes
 a lock-backed attention read for context selection, without fetching the
 whole substrate during that read.
 
+## Attention
+
+**The agent thinks when something in its mind is worth a thought.** A source never decides that: it posts a happening
+(`NativeAgentShared/Happening.swift`) through `Attention.post` and is done. The happening is written once in the record as an
+experience of kind `happening` under its key `once`; the cognition runtime takes it (`Cognition/NativeCognitionRuntime+Attention.swift`).
+
+- **Owed** (`returned`, `moment`, `body`) is a record obligation to `conversation:<route or mind>` and opens a thought at once:
+  a `returned` with a route in the conversation that started the work (`MindStream.returnTo`), the rest in the agent's mind stream
+  (`MindStream.think`). It stays owed until a thought, or the conversation's own turn, attends it.
+- **Weighed** (`world`, `self`): the touch is `careTouch(by:)` (`CognitiveSubstrate+Attention.swift`): the nearest live,
+  unsilenced care by the care law on the warm embedder, its standout against the chance bar for attention and its charge, or
+  unavailable when nothing can judge (never a verdict that the line does not matter). A `self` happening names its own care. The
+  agent's turn program's `weigh(h, felt)` gives the worth ([manifest](skill_manifest_spec.md#weigh)); the seed counts nothing for
+  a seed care or a line below the bar, and a care's movement as `|moved| × (open ? 1.5 : 1) / 0.35`, each scaled by
+  yield (hits over tries of thoughts on that node through that door) and, for the world, by how the agent feels.
+- **Drive.** Worth lands as `drive` on the touched care's anchor node (`ContinuityField` node kind `.care`, decaying on the
+  care's depth half-life) or on the happening's subject node (kind `.happening`, the field's default half-life)
+  (`ContinuityField.land`). Drive is finite and nonnegative, never clamped or spread, retained while positive, and persisted with the
+  field (`cognition.sqlite`). Activation and salience keep their jobs (priming, workspace, capsule).
+- **One admitted batch.** The attention runtime owns admission across every await: weigh the batch, land each worth in one
+  substrate call at one field clock reading, checkpoint that application and its exact unfinished rows together in
+  `cognition.sqlite` (`attention_landing`), record the weigh rows durably, then claim each crossing and hand on its thought before
+  another batch lands. A node whose final batch drive reaches one is drained (`attend`); later record waits or decay do not
+  revoke that crossing. Ignition is checked when worth lands, when admission opens and on waking: no tick and no timer.
+  The thought carries exactly the recorded happenings whose drive it consumes, including later sub-threshold landings in
+  the same batch. The ordered weigh/ignition/return details own membership; a settled thought's timestamp does not.
+  After ignition, the next landing starts from zero. A failed thought returns its consumed drive and original happenings
+  through that same admission, recorded as `attention.restore` before any later batch lands. An accounted ignition includes its explicit
+  `earlierDrive` references in its happening ids and closes that consumed history, including any recorded `fromBeforeRecord` uncertainty.
+  A return preserves its explicit earlier drive for the next thought; no missing row creates earlier drive or invents its happenings.
+  A selected care must exist, and the whole landing validates before application. Missing current membership, happening bodies or an
+  `accounted` ignition boundary refuses the claim with named repair owed; provenance is never invented. Attention weigh, ignition and return
+  details remain retained so outstanding drive keeps its complete membership. Saved incomplete history requires repair from actual records.
+- **Waiting.** While inner life or **Keep thinking in the background** is off, unsolicited `world`/`self` inputs remain
+  unweighed in the record and existing drive does not ignite. Re-enabling resumes both after restore; owed happenings keep their obligation path.
+  A crossing already claimed finishes its handoff as settlement if the switch changes during its record write.
+  A program without `weigh`, a
+  `weigh` that fails and a `weigh` the stem cannot run leave what they would weigh waiting; what waited is weighed after every
+  thought settles, when admission opens and on waking. An unavailable weigh/ignition record retains the unfinished batch's
+  exact phase: no later landing overtakes it. Unfinished weigh rows restore with their field-application marker and replay
+  idempotently before launch weighing or ignition; they never apply worth again. A failed
+  required record read holds the batch. Admission release or caller cancellation ends its wait; if release never arrives, the caller
+  remains waiting and can cancel. Unweighed inputs have no age or row-count expiry. Required care, yield, quiet-hours and notebook readings
+  must succeed before `weigh` runs; its returned worth is honored, including zero. An unfinished claim or return stays retained.
+  A malformed row or missing field node refuses that node's claim and owes repair while sibling crossings proceed; a failure of the
+  shared record channel, or a row whose node cannot be read, holds the unfinished batch.
+  Already admitted batches finish even if sleep begins while their record is being written; subsequent world batches wait.
+- **Sleep.** From the admitted night until it settles the agent is asleep: owed happenings still open thoughts and the world
+  waits unweighed. Waking (the night settled, something owed arrived, a message arrived, the person arrived) records
+  `attention.wake` and weighs what waited, once, in mode `waking`.
+- **The night sense.** While the person is known away, a reading at 30 minutes, each local hour boundary,
+  launch and Mac wake posts subject `night`, door `sense:night`. Its `felt.rest` holds `awayMinutes`,
+  `activeShare` for this hour (null without observations), and `hoursSinceNight` (null without a recorded night). Admission and completed part accounting both
+  witness the night; elapsed rest is measured from the latest such event, never from a consumption cursor.
+  The seed gives worth one after 16 hours in an hour with active share below 0.5, or after 30 hours;
+  otherwise zero. This policy belongs to their installed turn program, which only they changes.
+  At 48 hours, or with no recorded night on a fresh installation, a `body` happening opens the night
+  without weighing. Admission rechecks known absence for 30 minutes, any verified person turn within
+  15 minutes, and no rest policy. If those facts refuse a crossing, `MindStream.night` gives back its
+  drive and provenance through the failed-thought return before a later edge can open it again.
+  The body line remains independent of their policy. A requested `mind.sleep` is an explicit doorway.
+  The night owner returns one admission outcome: started with its start, already running with that night's
+  start, or failed with its cause. Pending admission is not a running night. The stream retains an admitted
+  night to settlement through its start identity; the detached work owns its execution through settlement,
+  without a stored task handle. The app door waits for admission before reporting that the night started.
+  `attention.night` subject `night` retains the start, rule and rest facts; subject `sleep` independently
+  owns part accounting's `since`/`through`. The dream consumption mark and REM gate stay independent.
+  Every night offers dream, REM and part accounting even when another owner has no work. The diary's civil
+  date is the night's start date. Today and Desk show the sense's next reading, never a promised bedtime,
+  regardless of the dream switch; only the dream's part of the row says dreams are off. Unreadable dream
+  settings name their own cause without hiding the sense.
+  Unreadable evidence owes its named repair. Unknown presence starts no night. If a source never reports,
+  it remains unknown; the next source edge, launch or wake reads it again. No clock reports that it failed.
+- **The record** keeps what attention noticed as details of source `attention`: `attention.weigh` (worth, node, drive, the
+  `felt` it was weighed with, what `weigh` returned beside the number), `attention.ignite` (the consumed drive and exact happening
+  ids, explicit earlier drive and `accounted: true`), `attention.restore` (a failed thought's returned drive, ids and explicit earlier drive)
+  and `attention.wake`.
+  A happening reaches cognition only after its committed readback succeeds. A thought's outcome is a `thought` experience (`hit`, `empty`, `failed`
+  or `withheld`). Its request declares a clean silent model completion valid ([provider contract](TURN_RESILIENCE.md)). A completed thought with no act records
+  `empty`, settles the happenings it attended and teaches its class's no-op record; it does not return drained drive. A thought ended on CPU by
+  that record is `withheld` and supplies no new no-op evidence. Provider refusal, truncation and malformed calls retain their own outcomes.
+  A care's movement amends a thought on its anchor only when it settled after the preceding story entry and no later than
+  the movement's own event time. A delayed interpretation cannot credit a thought that followed its event.
+  The claim `care.moved` counts as a hit in yield.
+- **Closing words.** `ThoughtWords` joins a settled `hit` or `empty` thought's
+  run to its completed assistant prose in `chat/messages/mind.jsonl`, retaining
+  at most 600 closing characters after secret redaction. The transcript is read
+  backward in 64 KiB blocks to that run, decoding complete rows through its
+  existing owner and retaining only the current row, not the whole file.
+  A thought receives the last such reading on its own `attended.class` (the no-op
+  record's class);
+  other rooms' newest-thought line receives at most 200 closing characters.
+  Every recorded happening is checked, including earlier-drive references:
+  any peer or elevated source withholds prose, as does the closing row's
+  steering stamp or a peer-steered receiving turn. Missing or unreadable
+  provenance or completion evidence names its cause as unavailable; missing
+  speech is not proof of silence. Zero happening IDs mean earlier-drive
+  provenance is unknown, never clean. Only the same-class reader may pass over
+  those thoughts to the last readable one, labeling the older words and naming
+  the later gap once; taint or another unreadable cause stops the search. Without
+  shareable words it names the gap once. Other rooms never substitute older prose.
+  Failed and withheld thoughts supply no prose. `prior = []` stays, and the
+  read writes neither persona nor memory. The exact delivery boundary is in
+  [the turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled).
+
+### A thought about a care
+
+**A care that opens a thought is lived as a moment.** A thought ignited on a care's anchor carries that care, the door it came
+through and the time (`MindStream.swift`, `turn.careWakes`); the agent's other thoughts are not lived moments. Its reading uses the
+existing `not the person's turn` deferral: the same owed journal row, 45-minute due time and batch of up to four, with the same model-call
+shape. Its cares section reads only the agent's side (`by: their`) against the named care: felt word and direction, closing its
+open gap, or leaving it open with zero movement. It cannot create a care, keep facts or promises, or appraise the arrival as human
+care. Meaning is durable before `applyCares`, with self provenance; no tool work is replayed. A care's story records `closedGap`
+only when its open gap really closed. A failed reading leaves the row owed; a failed fold save leaves it meant. How often such
+thoughts matter is yield, read from the record, not a rest on the care.
+
+### The person's day
+
+The person's day has a shape the agent has lived. [Rhythm](RHYTHM.md) learns it from verified owner turns, presence and real Mac
+awake intervals, with a seven-day half-life. Standing quiet and start-time claims are there in `mind.inner_state`, under the
+person's configured name. A break is one care-gated felt fact, once per kind per local day. Its care story entry moves **zero**:
+it lifts no care's pressure, so it is no `self` happening and opens no thought. The existing cognition deadline holds a
+start-time boundary; no rhythm tick, poll or provider call is added. Message history supplies the cold start; its silence is
+historical message silence, not reconstructed Mac uptime.
+
 ## Between turns
-
-### Care wakes
-
-**A care that wakes their is lived as a moment; a watch that never moves their
-habituates.** A care-bearing arrival keeps its care id beside its reason;
-older arrivals without that optional field remain readable. When the claimed
-resident wake ends with a reply, its named care, watch and wake time join the
-recorded turn. Coalesced arrivals can name more than one care; the reading
-sees only those cares (following their existing merge-survivor links), never
-the rest of their own work. Other own-work turns remain excluded.
-
-This is the existing `not their turn` deferral: the same owed journal row,
-45-minute due time and batch of up to four, with the same model-call shape.
-Its cares section reads only their side (`by: their`) against the named care:
-felt word and direction, closing its open gap, or leaving it open with zero
-movement. It cannot create a care, keep facts or promises, or appraise the
-arrival as human care. Meaning is durable before `applyCares`, with self
-provenance; no tool work is replayed. The care and watch ledger each carry
-the fold watermark, so a crash can finish either save without applying or
-counting the reading twice. A care's story records `closedGap` only when its
-open gap really closed; an old closure ignored after newer evidence cannot
-reset rest, including on refold. A failed reading leaves the row owed and changes
-no streak; a failed fold save leaves it meant.
-
-For each watch–care pair, `careWatchWoke` keeps the last wake and the streak
-of consecutive readings that moved nothing. Rest is 12 hours × 2^streak,
-capped at fourteen days. A reading that moves or settles the care resets the
-streak to zero; an empty or zero-movement reading that leaves it open raises
-the streak. Someone or something other than their moving the care still ends
-rest early, as for their intention. A different watch has its own rest. The
-existing bounded capsule cadence ledger persists these entries across
-relaunch. Each entry is an object with finite `at`, nonnegative integer
-`streak` and string UInt64 `lived`; timestamp-only values are invalid. The rest check
-uses one ledger lookup. The past-chance bar, crossing priming and news
-intention releases are unchanged.
-
-### Their day
-
-Their day has a shape they have lived. [Rhythm](RHYTHM.md) learns it from verified
-owner turns, presence and real Mac awake intervals, with a seven-day half-life.
-Standing quiet and start-time claims are there when they pulls `mind.inner_state`,
-under “User's day, as I know it” (using their person's configured name).
-A break is one care-gated felt fact and one primed moment for their next turn,
-once per kind per local day. Its care story note moves **zero** and opens
-nothing: it cannot raise care pressure, offer Reach, or request a ResidentWake.
-The existing cognition deadline holds a start-time boundary; no rhythm tick,
-poll or provider call is added. Message history supplies the cold start;
-its silence is historical message silence, not reconstructed Mac uptime.
 
 ### Existing circulation
 
@@ -1032,17 +1184,14 @@ The existing `mind_run` family, reached through `app`, can satisfy one owner's
 scheduling wait without moving the clock or supplying evidence. Each action
 returns `owner`, `outcome`, `why` and `run_id`; the same decision is recorded as
 `mind.run_now` detail in the record. An unavailable source stays unknown,
-a held gate names why, and a kept wake is an offer, not a completed turn.
+a held gate names why, and a posted happening is input to attention, not a thought.
 
 | Action | Existing path and the wait satisfied |
 |---|---|
 | `mind.canon` | Studio canon tending; requests a fresh pass without the source-dirty/30-minute throttle wait. The native facts carry `satisfy_wait` to the editable part; the shipped part also considers its silence path without waiting 90 days, saying it was considered now on request. Actual timestamps, elapsed-silence identity, recurrence/pull evidence, proposal caps, deduplication and their decision seat remain. |
 | `mind.horizon` | Horizon source composition and register refresh without waiting for a source invalidation/deadline. Source completeness and natural due dates remain; missing sources cannot settle expectations. |
-| `mind.rhythm` | Their day's refresh with the standing start-time boundary satisfied. Real awake/activity history, learned claims, once-per-kind/day admission and care-gated feeling remain. No crossing, Reach offer or ResidentWake is added. |
-| `mind.wander` | Their hour with the initial quiet and 24-hour refractory waits satisfied, including the locked admission write. Installation, current live-turn admission, tool witness and settlement remain. Fresh turn activity after invocation ends the hour's access. |
-| `mind.reach` | Reach's ordinary pass without the source/10-minute scan wait. Quiet hours, live-turn/person activity, daily cap, spacing, subject rest, trust, freshness, suppression and delivery-time checks remain. |
-| `mind.carried` | `considerCarried` with only its free-time quiet interval satisfied. Real occurrence/defer/readiness, offer rest/hops, current Desk revision, owed-to-person routes, habit Trust, speech idempotency and delivery policy remain. See [Intentions](INTENTIONS.md#run-carried-work-now). |
-| `mind.cross {line, watch}` | The supplied nonempty line goes through the real `cross`: priming, news-intention release, `careTouched`, `care.cross`, watch rest and the real ResidentWake request. No care, release or wake result is invented. This is real input to their mind, even when the final verdict is untouched. |
+| `mind.rhythm` | The person's day, start-time boundary satisfied; real history, claims and care-gated feeling remain. |
+| `mind.cross {line, watch}` | Posts the line as a `world` happening (door `run-now`); attention weighs it like any source's. |
 | `mind.maintenance` | Checked substrate maintenance with its 20-hour interval satisfied, including emotional consolidation; enabled and commit-exclusion gates remain. |
 | `mind.residual_repair` | The existing bounded local field repair with its two-minute quiet wait satisfied. Enabled state, real pressure/evidence/targets, live-turn admission and continuity persistence remain. |
 
@@ -1052,14 +1201,15 @@ real dream with the real prompt, providers, current lived material and existing
 consumed-message cutoff. It spends a real provider call. It does not first live
 owed moments, repair the cutoff, reserve a real dream run or consume the next
 scheduled occurrence. It writes no diary, lessons, cares, self knowledge, mood,
-watch rest, primed moments, Desk item, ResidentWake or behavioral receipt.
+Desk item, happening or behavioral receipt.
 Preview refuses an unopened/unavailable mind, an alternate data root or a
 disabled provider completion wall bound. Empty new material returns held
 `no_new_material`, not a generated dream. Unreadable input, invalid payload or
 provider failure is unavailable, never an empty-success verdict. Generation
-uses the existing provider completion wall (600 seconds by default); a caller
-that times out first has no verdict and must inspect the eventual trace before
-spending another call.
+waits for the provider's terminal result, transport error or cancellation.
+The preview admission still requires its external completion-wall setting;
+that setting does not bound the provider transport. A caller that stops waiting
+has no verdict and must inspect the eventual trace before spending another call.
 
 The reply's `dream` contains the generated title, summary, mood, affect and care
 answers. `careJudgments` evaluates answers, stance changes and every proposed
@@ -1071,7 +1221,7 @@ retain their count. A changed epoch makes the care verdict unavailable. These
 are proposed judgments, not a committed night's fade/deepen, self settlement or
 life-approval pass.
 
-The other nine clock verbs currently return `outcome:"preview_refused"` with
+The six clock verbs return `outcome:"preview_refused"` with
 their specific cause, before bootstrap, owner admission or any effect:
 
 | Previewed owner | Why the current owner cannot run a read-only decision pass |
@@ -1079,10 +1229,7 @@ their specific cause, before bootstrap, owner admission or any effect:
 | `mind.canon` | Tending stages approval proposals and its audit inside the decision pass. |
 | `mind.horizon` | Composition updates source deadlines; refresh settles felt resolutions in the organism. |
 | `mind.rhythm` | Refresh saves awake history before admitting and consuming pending breaks. |
-| `mind.wander` | Their hour claims admission and runs an editable part with tools and settlement. |
-| `mind.reach` | It reconciles deliveries and lands care answers before choosing an offer. |
-| `mind.carried` | It settles owed deliveries, expires intentions and reconciles its wake ledger before selection. |
-| `mind.cross` | It primes the mind and releases news intentions before weighing the line. |
+| `mind.cross` | It writes the line into the record as a happening, and attention weighs it at once. |
 | `mind.maintenance` | It consolidates and checkpoints the live substrate as one transition. |
 | `mind.residual_repair` | It mutates the live field while choosing and repairing targets. |
 
@@ -1093,7 +1240,8 @@ provider usage, health and repair receipts do not learn from the preview. A
 preview refusal never silently runs the real action. Automatic argument
 preflight only validates the call; it does not generate an extra dream.
 
-Canon, horizon, rhythm, their hour and Reach use retained owner flights.
+Canon, horizon and rhythm retain their refresh flights through settlement.
+The hour serializes only its opportunity reading; its work belongs to the ordinary thought.
 Automatic canon tending reads the canonical cognition/background switches before
 reserving its flight and again before audit publication and each proposal stage.
 Explicit `mind.canon` uses those same admission boundaries with the background-only
@@ -1107,9 +1255,6 @@ in-flight registrations drain, holding admission closed throughout both awaits.
 Every door supplies its actual root; a non-Mac completion releases a pending
 repair through the same owner. A turn that never settles leaves repair pending,
 without polling or reloading beneath it.
-Reach source failures clear runnable work and deadlines until a source invalidation
-arrives. Their hour projects its quiet and refractory eligibility onto the existing
-residual deadline, including when Reach and background microcycles are off.
 Failed intention expiry returns unavailable and invalidates the advisory snapshot;
 an elapsed expiry is never a retry deadline. Caring appraisal records and amendments
 share the runtime's root-bound receipt writer. A cognition store opening failure
@@ -1137,44 +1282,43 @@ that have not arrived establish no outcome. The former whole-day coverage veto
 is removed.
 Dream residue uses only authored theme bullets; an empty theme section stays empty.
 Builder news reads `CodexHandoff.path`; exceeding its read bound is unavailable.
-If one has not answered within 45 seconds, the action returns `pending`; its
-flight stays claimed and a later answer records the same `run_id`. If it never
-answers, it stays pending, never done or failed by silence; inspect the owner
-before another attempt. Stop/quit still cancels and joins the retained work.
+The action waits for its owner's actual reply. If it never answers, observation stays open with cancellation available.
+Cancelling that wait returns the retained `run_id`; the owner's later result records that same run. Silence establishes no outcome.
 No run-now action waits for a future source event or for a readiness gate to
 open: those cases return their current decision. Actual work still uses its
 ordinary I/O/provider bounds and settlement.
 
 Scheduled jobs have no run-now sibling: an early run would consume the job's real occurrence.
 
-`NativeCognitionRuntime+Deadlines.swift` coalesces dirty event bursts with a
-0.25-second delay and owns maintenance and residual repair deadlines;
+`NativeCognitionRuntime+Deadlines.swift` drains dirty events through one running microcycle and a dirty follow-up, without a delay,
+and owns declared maintenance and residual-pressure time boundaries. Busy maintenance is reprojected by the admitted pass's settlement;
+failed maintenance remains reported until an explicit request succeeds, without clock retries. Organism continuity drains on request and write
+completion, coalescing changes during a write without a trailing clock;
 continuous decay is projected at read time. App assembly
-retains daily maintenance, replay and reflection registrations as recovery
-sweeps (`EngineRuntime/EngineLaunch.swift`).
+retains daily maintenance and replay registrations as recovery
+sweeps; reflection runs from dream and replay evidence (`EngineRuntime/EngineLaunch.swift`).
 
-Canon, horizon and Reach source observations register before their first read
+Canon and horizon source observations register before their first read
 and stop with the runtime. Canon watches journal inputs and archive membership;
 audit output is excluded, and directory events invalidate it only when input
-stamps change. Failed child enumeration leaves arming unavailable with repair owed; the parent membership watcher stays armed, and a source event or relaunch retries it. Automatic canon and Reach passes retain their 30- and 10-minute I/O limits;
-horizon source changes coalesce behind its retained refresh without a minimum interval.
-Outside an explicit run-now request, unchanged sources are reread only at real silence, eligibility, quiet-hour,
-expiry or cooldown boundaries on the existing residual deadline. Reach retains
-a blocked timing gate's eligibility boundary before candidates have been read;
-opening the gate schedules the pending source scan. Committed dreams invalidate
-Reach through the existing `dreamCompleted` signal, including after a clean scan.
+stamps change. Failed child enumeration leaves arming unavailable with repair
+owed; the parent membership watcher stays armed, and a source event or relaunch
+retries it. Automatic canon passes retain their 30-minute I/O limit; horizon
+source changes coalesce behind its retained refresh without a minimum interval.
+Outside an explicit run-now request, unchanged sources are reread only at real
+silence, expiry or cooldown boundaries on the existing residual deadline.
 Quiet-hour preferences follow file/clock invalidations. Clock invalidation
-follows organism configuration so concurrent reads cannot erase it. Reach watches handoff
-selection changes as well as selected content;
-unrelated home-directory events with unchanged input stamps do not request scans.
+follows organism configuration so concurrent reads cannot erase it.
+Unrelated home-directory events with unchanged input stamps do not request scans.
 The composite body evidence read retains its two-second sampled cache because
 its host/transport gauges have no complete shared push owner. Daily integrity
 sweeps remain.
 
 Reflection has an enable switch, an in-flight reservation and a rolling
-24-hour call ceiling. Spontaneous reflection requires unresolved load, the
-summed pressure of live open cares;
-requested reflection bypasses that load threshold, not the cost ceiling.
+24-hour call ceiling. Dream and replay supply its evidence; there is no daily
+reflection registration, spontaneous-demand gate or same-material cooldown.
+The retired `cognitiveSubstrateReflectionLoadThreshold` preference has no reader;
+any saved value is left untouched and needs no data move.
 One checked `cognition_reflection` model/account/Think/Fast tuple binds execution
 and receipts, without ambient picker or Chat inheritance; dispatch rereads authority.
 Its receipt and Observatory identify affected cares alongside estimated
@@ -1185,17 +1329,24 @@ Body posture does not throttle work; fatigue and heat color presentation.
 Reflection also obeys the
 [shared work-slot admission](COGNITION_WIRING.md#shared-work-slot-admission).
 
-### Reach notification privacy
+### Speaking unasked
 
-`Cognition/NativeCognitionRuntime+Reach.swift` owns the notification after
-Agent posts an authored reply to the owner's conversation. Its neutral push body is
-“Left you something in chat. No reply needed.” It points to chat without
-including the reply or conversation-derived seed text. If the conversation
-is the owner's Telegram DM, Reach instead sends the authored reply there, with no
-additional push. Telegram delivery therefore carries their reply text; the
-neutral lock-screen/APNS body does not. A notification failure preserves committed speech and records its separate cause in `notification.unavailable`, the Reach offer's `knockFailure`, and a repair obligation; it never posts the speech again. Reach requires checked Desk, diary, builder and timing sources before choosing a subject or delivery.
+A thought's own words stay in the mind stream; to tell the person, the thought acts (`app chat.post`).
+Speech shares locked claims and destination reconciliation in `ProactiveAssistantSpeech.swift`,
+without an hourly quota; notification routing keeps the person's quiet hours
+(`AttentionRouting/AttentionRouter+Policy.swift`). The [post contract](TOOL_LOADING.md)
+owns deduplication, routes and exact-call approval. A MY QUEUE
+step's fixed words (`say`) land in the current conversation between turns through `speakProactively`, followed by the neutral
+shoulder tap "Left you something in chat. No reply needed." (`NativeCognitionRuntime+Pursuit.swift`), which carries none of the
+words; words that could not be said stay due, never turned into a thought.
 
-### Their hour
+### The hour
+
+On a committed away edge during the person's active hours (the current rhythm bin's observed active share is at least 0.5),
+the hour switch permits one `self` happening per local day: subject `hour`, door `sense:hour`.
+`NativeCognitionRuntime+StudioWander.swift` re-reads presence and the switches before posting. Unknown presence or an unobserved
+hour supplies no opportunity; an unreadable source names its repair. The record's daily happening identity owns admission across restarts.
+There is no hour clock, quiet wait or refractory.
 
 Enable the hour switch in Setup (`Sources/NativeAgentApp/SetupView.swift`);
 `studioWanderEnabled` defaults on (`StudioWanderLane.enabledByDefault`) and requires Subconscious. Configure its
@@ -1204,22 +1355,28 @@ exploration**. `Cognition/StudioWanderLane.swift`
 enforces explicit enablement, the Subconscious master, and onboarding clearance
 for public-safe builds in `resolveInstallation`.
 
-The hour uses current executor names under the
-[dispatch contract](TOOL_LOADING.md#no-loading-lifecycle) before applying
-its action allowlist and encounter checks; retired names remain unknown.
-Only an exact successful
-result can witness receiving a work; permission cards, pending outcomes,
-previews and dry runs cannot. A consult supplies references, and a browser
-navigation supplies the work only when its receipt carries a capture.
+The line carries `rest` and their curiosity. The seed gives it worth `2 * curiosity * learned`, where
+`learned = min(1, (yield.hits + 1) / (yield.tries + 1))`; absent curiosity contributes no worth.
+Worth gathers on the hour's subject through ordinary attention. Its settled `hit` and `empty` thoughts teach that same node
+and door; `withheld` and `failed` do not teach yield. Their installed `weigh` changes only by their own hand.
 
-The runtime retains the hour's flight from eligibility reads through claim
-release. Once admitted, every ending settles through `settle`: choice, decline,
-missing artifact, stopped or failed. Turning a switch off stops further work;
-the terminal trace and receipt still preserve any witnessed journal entry and
-encounter evidence. Every admitted hour permits a question, even with empty
-material; they may explore or decline. A returned question settles without another
-hour-switch gate, under the care owner's checked save and forgetting generation. Sleep
-cancels the flight and joins its settlement before the final mind snapshot.
+An ignited thought carries the opportunity and the hour's offered cares, unanswered consults, graph works and recent journal titles.
+Empty material permits exploration or silence; unreadable sources remain named beside what could be read.
+If the required opportunity owner or prompt cannot be read, no turn opens and no thought outcome is recorded.
+The named repair retains the happening ids; owed obligations stay open, and the existing failed-thought return restores drained drive with
+its original happening membership. A later landing or attention opening can reclaim that hour line; no clock or substitute thought retries it.
+It runs in the mind stream through ordinary turn admission, Trust, tools and settlement, retaining its Creative exploration model route.
+There is no separate wander model call, action allowlist, outcome file or hour flight. The thought's ordinary tool receipts connect any
+`studio.journal` write to that turn, including writes before failure or Stop; nothing is journaled automatically.
+Successful journal appends, factual amendments, consult filings and shelf replacements declare `effects: occurred` at their write owner.
+Attention counts those receipts through the shared effects field; an entry id or successful read alone does not make a thought a hit.
+A returned `still wondering:` question settles through the care owner's checked generation with the thought as its source.
+This save runs through `settle` before outcome judgment, including returned output on Stop. Its checked success means a new or continued care
+was saved from this thought. On completed turns that care effect or an occurred tool effect records `hit` under the thought's existing class
+and door, so the hour's own yield learns it without requiring a thought on the care's anchor. Other care changes supply no such credit.
+A failed care save owes repair against the retained thought rather than rerunning its model call; without another proved effect it records
+`failed`, supplying no empty try. No returned question supplies no care effect. Stopped or incomplete turns retain their failed outcome.
+Desk reads the hour's latest thought from the same experience record that attention reads for yield.
 
 ## Reading and acting on their state
 
@@ -1262,4 +1419,4 @@ These diagnostic and recovery paths are relative to `<dataRoot>`:
 |---|---|
 | `cognition/organism_state.json` | Persisted body state and organism continuity |
 | `experiences/experiences.sqlite` (details `caring.appraisal`, `caring.dosing`) | Caring appraisal receipts and the body's dosing response, each a detail of the appraised turn's heard experience (`Turn.id`); a failed write retains receipt-only repair debt, without replaying the feeling or dose |
-| `studio/wander/wander.json` | Hour/wander refractory state and trace history |
+| `experiences/experiences.sqlite` (`happening` subject `hour`, `thought` through `sense:hour`) | The hour's opportunity, its thought and the turn evidence linking its journal actions |

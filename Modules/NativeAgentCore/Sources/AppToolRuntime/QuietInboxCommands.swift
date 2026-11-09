@@ -1,4 +1,6 @@
 import ApprovalInbox
+import ApprovalTransactions
+import AuthoredCapabilities
 import ChatTurnContracts
 import ChatToolParsing
 import ChatToolRuntime
@@ -9,7 +11,7 @@ import NativeAgentShared
 import NotificationInbox
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `QuietInboxCommands.swift` | `QuietInboxHost`; Inbox fences and receipts; committed effects survive unknown readback |
+// Blueprint: | `QuietInboxCommands.swift` | `QuietInboxHost`; tap/message authority and receipts; committed effects survive unknown readback |
 
 @MainActor public protocol QuietInboxHost: QuietToolHost {
     var inboxDataRoot: URL { get }
@@ -19,6 +21,8 @@ import TrustCenter
     func inboxPresentation(_ item: InboxItemRecord) -> (hidden: Bool, linkedApproval: Bool, actions: [InboxActionRecord])
     func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?, turn: Turn) async throws
     func withdrawApproval(id: String, decidedBy: String) async throws
+    /// The person's decision of an approval, recorded with the provenance of the door that verified the person.
+    func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord
     func refreshInboxSurfaces() async
     func inboxActDescription(_ item: InboxItemRecord, action: String) -> String
 }
@@ -32,8 +36,12 @@ private struct QuietInboxTarget {
     var byID: [String: InboxItemRecord] = [:]
     var approval: (id: String, title: String)?
     var press: (item: InboxItemRecord, action: String)?
-    /// Full Mac admits user-only buttons with a decided row visible to the user.
+    /// Full Mac admits the agent's interaction buttons with a decided row visible to the person.
     var decided = false
+    /// The person decided this exact call (`AppToolExecutor.personDecided`): it runs as theirs, not quietly as the agent's.
+    var person = false
+    /// A checked tap or person-message decision, naming its verifying door.
+    var provenance: ApprovalResolutionProvenance?
 }
 
 private struct QuietInboxRefusal: Error { let json: JSONValue }
@@ -60,6 +68,7 @@ extension QuietInboxHost {
         }
         var target = QuietInboxTarget(items: items)
         if verb == "list" { return .success(target) }
+        target.person = AppToolExecutor.personDecided(tool: "inbox", input: input, turn: turn)
 
         var ids = [text("id")].filter { !$0.isEmpty }
         if case .array(let many)? = input["ids"] {
@@ -77,6 +86,21 @@ extension QuietInboxHost {
         target.ids = ids
         target.byID = byID
 
+        func decisionAuthority(_ item: InboxItemRecord) async -> JSONValue? {
+            do {
+                if !target.person, ids.count != 1 {
+                    return AppToolExecutor.failure("owners_call",
+                        "Answer one exact approval id on the person's own message; multiple approvals wait for the person's tap.")
+                }
+                target.provenance = try await ApprovalExecution.decisionProvenance(id: item.related_approval_id ?? item.id,
+                    turn: target.person ? turn : turn.with(\.personAct, nil), dataRoot: self.dataRootOverride ?? inboxDataRoot)
+                return nil
+            } catch {
+                return AppToolExecutor.ownedFailure(error, code: "approval_authority_unavailable", owner: "approval " + item.id,
+                    instruction: "Read this card before another decision.", next: ["page": .string("inbox"), "item": .string(item.id)], effects: .none)
+            }
+        }
+
         switch verb {
         case "read":
             break
@@ -84,6 +108,18 @@ extension QuietInboxHost {
             guard !text("reason").isEmpty else {
                 return refuse(AppToolExecutor.failure("missing_reason",
                     "Say why in reason (a few words, e.g. \"stale test note\"); it is saved on the note."))
+            }
+            if verb != "mark_read" {
+                for id in ids {
+                    guard let item = byID[id], let approvalID = item.related_approval_id else { continue }
+                    do {
+                        let record = try await SwiftNativeApprovalInbox(root: self.dataRootOverride ?? inboxDataRoot).get(approvalID)
+                        if record.status == "pending", let refusal = await decisionAuthority(item) { return refuse(refusal) }
+                    } catch {
+                        return refuse(AppToolExecutor.failure("approval_unreadable",
+                            "Approval \(approvalID) did not read; nothing was put away. \(error.localizedDescription)"))
+                    }
+                }
             }
         case "withdraw":
             // The agent may withdraw its own pending ask; answering another agent's is the owner's call.
@@ -133,11 +169,15 @@ extension QuietInboxHost {
                         : "This note has no \(action) action. Its actions: \(shown.joined(separator: ", ")).",
                     extra: ["actions": .array(shown.map { .string($0) })]))
             }
-            // Full Mac makes the person's buttons available to the agent.
+            // Every decision verb reads the same tap or authenticated person-message authority.
+            if item.source != self.interactionSource, ["approve", "reject"].contains(action) {
+                if let refusal = await decisionAuthority(item) { return refuse(refusal) }
+            }
+            // Full Mac makes the agent's interaction buttons available to it; the person's own act needs no posture.
             let fullMac = await AppToolExecutor.freshQuietPosture(
                 dataRoot: self.dataRootOverride ?? PersistenceCore.defaultDataRoot())?.name == AppToolExecutor.fullMacModeName
             let opensForUser = item.source == self.interactionSource && action == "act"
-            if !fullMac, opensForUser {
+            if !target.person, !fullMac, opensForUser {
                 return refuse(AppToolExecutor.failure("opens_for_owner",
                     """
                         That card's Open on Mac only opens it for the person at the Mac (inbox.open_on_mac is theirs). inbox.not_now declines it; if it is \
@@ -145,49 +185,14 @@ extension QuietInboxHost {
                         """,
                     extra: ["id": .string(item.id)]))
             }
-            let fence = opensForUser ? nil : await inboxFloor(item, action: action, dataRoot: self.inboxDataRoot)
-            let peerSteered = CapabilityLifecycle.writeRefusal(turn: turn) != nil
-                || (PeerTurnEffectPolicy.isPeerBridge(surface: TurnEnvelope.current(turn: turn, surface: "").surface) && !PeerDataTaint.trustedTurn(turn))
-            if action == "approve", peerSteered, item.related_approval_id == nil {
-                return refuse(AppToolExecutor.failure("owners_call",
-                    "This inbox item has no owner-review approval record. A peer-steered turn cannot supply the person's consent.",
-                    extra: ["remedy": Repair.why(owner: "inbox item \(item.id)", tap: "Today > \(item.title) > Approve")]))
-            }
-            // Executable keeps and destructive approvals require a person's tap even under Full Mac; agent approval cannot substitute.
-            if action == "approve", let approvalID = item.related_approval_id {
-                let record: ApprovalRecord
-                do { record = try await SwiftNativeApprovalInbox(root: self.inboxDataRoot).get(approvalID) }
-                catch {
-                    return refuse(AppToolExecutor.failure("approval_unavailable",
-                        "workflows/approvals/requests.json card \(approvalID) could not be read: \(error.localizedDescription). No consent was supplied."))
-                }
-                let install = record.requiresExecutableReview
-                if peerSteered,
-                   !SwiftNativeApprovalInbox.ownerReviewActions.contains(record.action) {
-                    return refuse(AppToolExecutor.failure("owners_call",
-                        "Approval \(record.id) is \(record.action), not a review of your own work. A peer-steered turn cannot supply the person's consent.",
-                        extra: ["remedy": Repair.why(owner: "workflows/approvals/requests.json card \(record.id)",
-                            tap: "Today > \(record.title) > Approve")]))
-                }
-                let ownerOnly: Bool
-                do { ownerOnly = try install || PermissionLaw.humanDecides(action: record.action, payload: record.payload, turn: turn) }
-                catch { return refuse(ChatToolOutcome.failure(error: error, tool: "app")) }
-                if ownerOnly {
-                    return refuse(AppToolExecutor.failure("owners_call",
-                        "That's the owner's even under Full Mac: " + (install
-                            ? "approving installs the script as theirs."
-                            : "what this card would run cannot be undone on their side, so it waits for their tap.")
-                        + " Leave it for them; inbox.withdraw takes back your ask.",
-                        extra: ["id": .string(item.id), "action": .string(action)]))
-                }
-            }
+            let fence = opensForUser || target.person ? nil : await inboxFloor(item, action: action, dataRoot: self.inboxDataRoot)
             if !fullMac, let fence {
                 return refuse(AppToolExecutor.failure("owners_call",
                     "That's the owner's — leave it for them (\(fence)). If it is stale, archive or dismiss it with a reason.",
                     extra: ["id": .string(item.id), "action": .string(action)]))
             }
             target.press = (item, action)
-            target.decided = opensForUser || fence != nil
+            target.decided = !target.person && (opensForUser || fence != nil)
         }
         return .success(target)
     }
@@ -240,8 +245,8 @@ extension QuietInboxHost {
                 }
                 do {
                     try await self.performInboxAction(id, action: action, metadata: [
-                        "settled_by": .string("agent"), "settled_reason": .string(reason),
-                    ], quiet: true, dataRootOverride: self.dataRootOverride, turn: turn)
+                        "settled_by": .string(target.person ? "person" : "agent"), "settled_reason": .string(reason),
+                    ], quiet: !target.person, dataRootOverride: self.dataRootOverride, turn: turn)
                     done.append(.object(["id": .string(id), "was": .string(item.status)]))
                 } catch {
                     await self.refreshInboxSurfaces()
@@ -314,7 +319,20 @@ extension QuietInboxHost {
         default:
             let (item, action) = target.press!
             do {
-                try await self.performInboxAction(item.id, action: action, metadata: [:], quiet: true, dataRootOverride: self.dataRootOverride, turn: turn)
+                if let provenance = target.provenance, let approvalID = item.related_approval_id {
+                    let record = try await self.resolveApproval(id: approvalID, decision: action, provenance: provenance)
+                    await self.refreshInboxSurfaces()
+                    // The decision is recorded either way; what it ran is said as it went, a failed run named with its words.
+                    let ran = record.executionResultClass.isFailure ? " What it ran did not succeed: \(record.detail ?? "no words came back")." : ""
+                    // The person's door is told the decision itself ("Denied: <the act>."), the act named when it fits one short line.
+                    let decided = (record.decision ?? action).capitalized
+                    let words = (record.title.count <= 60 ? "\(decided): \(record.title)." : "\(decided).") + ran
+                    return .object(["status": .string("ok"), "id": .string(item.id), "action": .string(action),
+                                    "approval_id": .string(approvalID), "did": .string(words), "detail": .string(words)])
+                }
+                // The person's own tap runs as theirs (a request's Not now wakes the conversation that raised it); the agent's runs quietly.
+                try await self.performInboxAction(item.id, action: action, metadata: [:], quiet: !target.person,
+                    dataRootOverride: self.dataRootOverride, turn: turn)
             } catch {
                 return AppToolExecutor.ownedFailure(error, code: "inbox_act_failed", owner: "inbox \(item.id) action \(action)",
                     instruction: "Read this note's current state and resolve the reported cause before acting again.",
@@ -322,12 +340,13 @@ extension QuietInboxHost {
             }
             await self.refreshInboxSurfaces()
             if target.decided {
-                HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "inbox.\(action)",
+                BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "inbox.\(action)",
                                        sessionID: input["__session_id"]?.scalarText,
                                        dataRoot: self.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             }
-            return .object(["status": .string("ok"), "id": .string(item.id), "action": .string(action),
-                            "did": .string(self.inboxActDescription(item, action: action))])
+            let did = self.inboxActDescription(item, action: action)
+            return .object(["status": .string("ok"), "id": .string(item.id), "action": .string(action), "did": .string(did),
+                            "detail": .string(did)])
         }
     }
 
@@ -381,11 +400,9 @@ extension QuietInboxHost {
         return .object(row)
     }
 
-    /// Below Full Mac, note button ownership determines the refusal; nil means the agent may act.
+    /// Request buttons retain their own authority; approval decisions read the shared decision authority before this.
     private func inboxFloor(_ item: InboxItemRecord, action: String, dataRoot: URL) async -> String? {
-        guard item.source == self.interactionSource else {
-            return ["approve", "reject"].contains(action) ? "it decides an approval" : nil
-        }
+        guard item.source == self.interactionSource else { return nil }
         // "Not now" withdraws the agent's own ask; it grants nothing.
         if action == "reject" { return nil }
         let found: InlineInteraction?

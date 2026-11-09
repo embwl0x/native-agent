@@ -40,190 +40,26 @@ import UniformTypeIdentifiers
 // Blueprint: | `QuietComposerCommands+Presentation.swift` | Quiet composer command port, checked routing projection and mounted-page effects |
 
 extension QuietComposerCommands {
+    static let tabs: [String: (page: SidebarItem, tab: String)] = [
+        "knowledge": (.memories, "knowledge"), "dreams": (.personality, "dreams"),
+        "cognition": (.diagnostics, "Cognition"), "inspector": (.diagnostics, "Inspector"),
+    ]
     static let cardNames = ChatComposerCard.allCases.map(\.rawValue)
 
     @MainActor
     struct Routing {
         let appModel: AppModel
         let sessionID: String
-        init(appModel: AppModel, sessionID: String? = nil) {
+        let suppliedPresentation: ProviderComposerPresentation?
+        init(appModel: AppModel, sessionID: String? = nil, presentation: ProviderComposerPresentation? = nil) {
             self.appModel = appModel; self.sessionID = sessionID ?? appModel.activeChatSessionId
+            suppliedPresentation = presentation
         }
     }
 
     @MainActor
     fileprivate static func draft(_ sessionID: String, appModel: AppModel) -> String {
         appModel.chatDraft(for: sessionID)
-    }
-
-    private static func card(named raw: String) -> ChatComposerCard? {
-        switch raw {
-        case "effort", "thinking": return .effort
-        case "receipt": return .context
-        default: return ChatComposerCard(rawValue: raw)
-        }
-    }
-
-    @MainActor
-    fileprivate static func openCard(_ raw: String, appModel: AppModel) -> Outcome {
-        guard let shell = QuietSelfAdmin.shared.composerCards else {
-            return .refuse("composer pane", "composer_unavailable", "No composer is mounted.")
-        }
-        guard let card = card(named: raw) else {
-            return .refuse(
-                "composer pane", "unknown_card",
-                "The composer panes are: " + cardNames.joined(separator: ", ") + "."
-            )
-        }
-        let changed = shell.activePane != card
-        guard shell.open(card) else {
-            return .refuse("composer pane", "composer_unavailable", "That composer control is not mounted.")
-        }
-        return .done(
-            "composer \(card.rawValue) pane",
-            "The pane is open.",
-            changed: changed
-        )
-    }
-
-    @MainActor
-    fileprivate static func closeCard() -> Outcome {
-        guard let shell = QuietSelfAdmin.shared.composerCards else {
-            return .refuse("composer pane", "composer_unavailable", "No composer is mounted.")
-        }
-        let was = shell.activePane?.rawValue
-        shell.dismiss()
-        return .done(
-            "composer \(was ?? "shell") pane",
-            was == nil ? "No pane was open." : "The pane is closed.",
-            changed: was != nil
-        )
-    }
-
-    @MainActor
-    static func showPane(_ raw: String, ref: String) -> Outcome {
-        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let tab: WorkPaneTab
-        switch key {
-        case "steps": tab = .steps
-        case "screen": tab = .screen
-        case "make":
-            let ref = ref.trimmingCharacters(in: .whitespacesAndNewlines)
-            tab = .make(ref: ref.isEmpty ? nil : ref)
-        default:
-            return .refuse("Work pane", "unknown_view", "No Work pane view is called that. The views are: steps, screen, make.")
-        }
-        let mode = SimpleViewMode.resolved(UserDefaults.standard.string(forKey: SimpleViewMode.key) ?? "")
-        guard mode == SimpleViewMode.advanced else {
-            return .refuse("Work pane", "no_work_pane",
-                           "\(mode.capitalized) view is on screen and has no Work pane, so nothing was opened.")
-        }
-        WorkPaneState.shared.agentShow(tab)
-        // The pane belongs to Chat, so changing it must not force navigation from another page.
-        let onChat = ApplicationLifetime.shared.currentPage?.item == .chat
-        return .done("Work pane", "The Work pane is open on \(key)"
-            + (onChat ? "." : ", but the person is on another page; they see it when they go back to Chat."))
-    }
-
-    static let sheets: [String: ActivitySection] = [
-        "approvals": .approvals, "today_inbox": .inbox, "memory_proposals": .memoryProposals,
-        "self_improvement": .selfImprovement,
-    ]
-    static let tabs: [String: (page: SidebarItem, tab: String)] = [
-        "knowledge": (.memories, "knowledge"), "minds": (.personality, "minds"),
-        "dreams": (.personality, "dreams"), "agents": (.connectors, "agents"),
-        "cognition": (.diagnostics, "Cognition"),
-        "inspector": (.diagnostics, "Inspector"),
-        "skills": (.diagnostics, "skills"), "tools": (.diagnostics, "tools"),
-        "trust_access": (.trust, TrustTab.access.rawValue),
-        "trust_features": (.trust, TrustTab.features.rawValue),
-        "trust_mac_browser": (.trust, "mac"),
-        "trust_advanced": (.trust, TrustTab.advanced.rawValue),
-    ]
-
-    /// Quiet delivery changes the mounted scene without activating a window.
-    @MainActor
-    static func setPage(
-        _ raw: String, item: String, appModel: AppModel, coordinator: ApplicationLifetime = .shared
-    ) async -> Outcome {
-        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let destination: NativeAgentNavigationDestination
-        let shown: SidebarItem
-        var tab: String?
-        var title = key
-        if key == "inbox" {
-            guard item.isEmpty || item == "earlier" else {
-                return .refuse("Inbox", "unknown_item", "Inbox opens the current reading or earlier matters.")
-            }
-            destination = item == "earlier" ? .sidebar(.inboxPolicy) : .activity(.inbox)
-            shown = item == "earlier" ? .inboxPolicy : .activity
-        } else if let section = sheets[key] {
-            destination = .activity(section)
-            shown = section == .memoryProposals ? .memories : .activity
-        } else if let home = tabs[key] {
-            (destination, shown, tab) = (.sidebar(home.page), home.page, home.tab)
-        } else if let page = QuietPages.page(named: raw) {
-            destination = .sidebar(page.item)
-            shown = SidebarItem.shellHome(for: page.item)?.parent ?? page.item
-            (tab, title) = (page.tab, page.id)
-        } else {
-            return .refuse(
-                "rail", "unknown_page",
-                "No page is called that. The pages are: " + QuietPages.ids.joined(separator: ", ")
-                + ". Inside them: " + (Array(sheets.keys) + Array(tabs.keys)).sorted().joined(separator: ", ")
-                + ". item opens one of the page's own tabs, or a Desk item's handle on page desk."
-            )
-        }
-        let handle = key == "inbox" ? "" : item.trimmingCharacters(in: .whitespacesAndNewlines)
-        let memoryTarget = shown == .memories ? MemoriesFaceTarget(row: handle) : nil
-        // An item opens a page's tab, a Memories row, a Diagnostics run, or a Desk item by handle.
-        var opened: String?
-        var diagnosticsRun: String?
-        if let memoryTarget {
-            opened = memoryTarget.row
-            tab = "memories"
-        } else if !handle.isEmpty, shown == .diagnostics, appModel.engine.runs.rows.contains(where: { $0.id == handle }) {
-            (tab, opened, diagnosticsRun) = ("diagnostics", "Run details", handle)
-        } else if !handle.isEmpty, shown != .desk {
-            let pageTabs = ShellRailTab.all(appModel.engine.layout.availability).first { $0.page == shown }?.tabs ?? []
-            guard let match = pageTabs.first(where: {
-                $0.key.caseInsensitiveCompare(handle) == .orderedSame || $0.title.caseInsensitiveCompare(handle) == .orderedSame
-            }) else {
-                return .refuse("rail", "unknown_item", pageTabs.isEmpty
-                    ? "The \(title) page has no tabs, so item \(handle) opens nothing there; nothing was opened. On page desk, item is a Desk item's handle."
-                    : "The \(title) page has no item \(handle); nothing was opened. Its items: \(pageTabs.map(\.key).joined(separator: ", ")).")
-            }
-            (tab, opened) = (match.key, match.title)
-        } else if !handle.isEmpty {
-            do {
-                guard try await appModel.engine.desk.store.liveState().items.contains(where: { $0.handle == handle }) else {
-                    return .refuse("Desk item", "unknown_desk_item", "No Desk item has the handle \(handle). app desk.read lists the handles.")
-                }
-            } catch {
-                return .refuse("Desk item", "desk_unreadable", "The Desk could not be read (\(error.localizedDescription)), so nothing was opened. Try again.")
-            }
-        }
-        let leftOtherView = SimpleViewMode.current != SimpleViewMode.advanced
-        guard coordinator.deliverQuietly(destination) else {
-            return .refuse(
-                "rail", "no_mounted_window",
-                "The main window is not mounted in this process, so the rail cannot be moved "
-                + "without opening one — and opening one is not quiet."
-            )
-        }
-        if let tab { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(shown)) }
-        if key == "inbox", item == "earlier" { InboxHistoryNavigation.shared.isPresented = true }
-        if let memoryTarget { appModel.pendingMemoryFaceTarget = memoryTarget }
-        if let diagnosticsRun { appModel.diagnosticsRunID = diagnosticsRun }
-        if shown == .desk, !handle.isEmpty { appModel.pendingDeskHandle = handle }
-        guard coordinator.currentPage?.item == shown else {
-            return .refuse("rail", "page_not_shown", "The window has not switched to \(title).", effects: .unknown)
-        }
-        return .done(
-            "rail row \"\(title)\"",
-            "The window is now showing \(title)" + (opened.map { " on its \($0) tab" } ?? (handle.isEmpty ? "" : ", opening Desk item \(handle)"))
-                + (leftOtherView ? ", in Advanced view." : ".")
-        )
     }
 
 }
@@ -245,25 +81,21 @@ extension AppModel: QuietComposerCommandPort {
     func clearQuietAcceptedDraft(_ message: String, sessionID: String, editedAt: Date) {
         clearChatDraftAfterSend(message, sessionId: sessionID, editedAt: editedAt)
     }
-    func quietComposerPaneClosed(turnID: String?) -> Bool { WorkPaneState.shared.userClosed(turnID: turnID) }
     func quietComposerPresentation(verb: String, value: String, choice: String) async -> QuietComposerOutcome {
-        switch verb {
-        case "open_card": return QuietComposerCommands.openCard(value, appModel: self)
-        case "close_card": return QuietComposerCommands.closeCard()
-        case "set_page": return await QuietComposerCommands.setPage(value, item: choice, appModel: self)
-        case "show_browser":
-            BrowserWindowController.shared.showWindow()
-            return .done("Window > Browser", "The browser window is in front.")
-        case "show_pane": return QuietComposerCommands.showPane(value, ref: choice)
-        case "hide_pane":
-            WorkPaneState.shared.agentHide()
-            return .done("Work pane", "The Work pane is closed.")
-        case "check_updates":
-            let check = await UpdateController.shared.probeForUpdate()
-            return check.refusal.map { .refuse("Check for Updates", $0.reason, $0.detail) }
-                ?? .done("Check for Updates", check.detail, changed: false)
-        default: preconditionFailure("Core requested an unknown composer presentation effect")
-        }
+        do {
+            let face = try BodyFacePresentation.current(model: self)
+            if let result = await face.composerPresentation(verb: verb, value: value, choice: choice, callerTurn: nil) { return result }
+            switch verb {
+            case "show_browser":
+                BrowserWindowController.shared.showWindow()
+                return .done("Window > Browser", "The browser window is in front.")
+            case "check_updates":
+                let check = await UpdateController.shared.probeForUpdate()
+                return check.refusal.map { .refuse("Check for Updates", $0.reason, $0.detail) }
+                    ?? .done("Check for Updates", check.detail, changed: false)
+            default: return .refuse(verb, "presentation_unavailable", "This presentation has no window owner.")
+            }
+        } catch { return .refuse(verb, "window_unavailable", error.localizedDescription) }
     }
     func selectQuietComposerModel(_ model: ModelCatalogItem, provider: String) -> Task<String?, Never>? {
         QuietComposerCommands.Routing(appModel: self).select(model: model, provider: provider)
@@ -287,7 +119,7 @@ extension AppModel: QuietComposerCommandPort {
     }
     func quietComposerPresentationState(sessionID: String) async -> [String: JSONValue] {
         let projection = await engine.providers.refreshSession(sessionID)
-        let routing = QuietComposerCommands.Routing(appModel: self, sessionID: sessionID)
+        let routing = QuietComposerCommands.Routing(appModel: self, sessionID: sessionID, presentation: projection.controls)
         var body: [String: JSONValue] = [
             "provider": .string(routing.routeChoice?.provider ?? ""),
             "model": .string(routing.routeChoice?.model ?? ""),
@@ -295,7 +127,7 @@ extension AppModel: QuietComposerCommandPort {
             "think": .string(routing.routeChoice?.reasoningEffort ?? ""), "think_word": .string(routing.effortWord),
             "think_choices": .array(routing.efforts.map { .string($0.id) }), "fast": .bool(routing.fastIsOn),
             "trust_word": .string(routing.trustWord), "persona": .string(chatPersona),
-            "open_card": .string(QuietSelfAdmin.shared.composerCards?.activePane?.rawValue ?? "none"),
+            "open_card": .null,
         ]
         if !sessionID.isEmpty, let status = projection.context {
             let usage = ContextFillPresentation.usage(status)
@@ -314,14 +146,18 @@ extension AppModel: QuietComposerCommandPort {
 }
 
 extension QuietComposerCommands.Routing {
-    var presentation: ProvidersFacade.SessionPresentation? {
-        guard var value = appModel.engine.providers.sessions[sessionID] else { return nil }
+    var presentation: ProviderComposerPresentation? {
+        let sessionID = sessionID
+        let posted = suppliedPresentation ?? appModel.face.slot(.settings).select("providers.composer.\(sessionID)", as: SettingsFace.self) {
+            $0?.providers.sessions[sessionID]?.controls
+        }
+        guard var value = posted else { return nil }
         if value.contract == nil, let pending = appModel.pendingChatBrainSelection { value.choice = pending }
         return value
     }
-    var residentPresentation: ProvidersFacade.SessionPresentation? { presentation.flatMap { $0.contract == nil ? $0 : nil } }
+    var residentPresentation: ProviderComposerPresentation? { presentation.flatMap { $0.contract == nil ? $0 : nil } }
     var routeChoice: ProviderTurnChoice? { presentation?.choice }
-    var botContract: BotChatContract? { presentation?.contract }
+    var botContract: ProviderHelperPresentation? { presentation?.contract }
     var isBotConversation: Bool { botContract != nil }
     var providerGroups: [ChatComposerModelGroup] { residentPresentation?.providerGroups ?? [] }
     var efforts: [ReasoningEffortOption] { presentation?.efforts ?? [] }
@@ -352,16 +188,12 @@ extension QuietComposerCommands.Routing {
     var fastIsOn: Bool { presentation?.fastIsOn == true }
 
     var trustWord: String {
-        guard let policy = appModel.engine.trust.policy else { return "Trust unavailable" }
-        let access = TrustAccessModeCapabilityCatalog.agentAccessMode(from: policy, fallback: appModel.chatFileAccess)
-        return MobileTrustAction.Preset.matching(policy: policy, accessMode: access)?.title
-            ?? "Custom Trust"
+        appModel.face.slot(.settings).select("trust.word", as: SettingsFace.self) { $0?.trust.word } ?? "Trust unavailable"
     }
 
     var activeTrustPreset: MobileTrustAction.Preset? {
-        guard let policy = appModel.engine.trust.policy else { return nil }
-        let access = TrustAccessModeCapabilityCatalog.agentAccessMode(from: policy, fallback: appModel.chatFileAccess)
-        return MobileTrustAction.Preset.matching(policy: policy, accessMode: access)
+        let raw = appModel.face.slot(.settings).select("trust.activePreset", as: SettingsFace.self) { $0?.trust.activePreset }
+        return raw.flatMap(MobileTrustAction.Preset.init(rawValue:))
     }
 
 

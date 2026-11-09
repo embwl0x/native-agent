@@ -73,13 +73,14 @@ public func defaultMacAppActivationObserverSource() -> any MacAppActivationObser
 
 /// Coalesce AX and activation signals until drained.
 public final class MacWaitSignals: @unchecked Sendable {
-    private let collector = MacAXEffectCollector()
+    let collector: MacAXEffectCollector
+    let startedAt: Date
     private let effects: (any MacAXEffectObservation)?
     private let activation: (any MacAXEffectObservation)?
     private let lock = NSLock()
     private var stopped = false
 
-    /// Whether AX observation is installed; activation alone cannot observe in-window changes.
+    /// Whether this wait installed AX observation; activation alone cannot observe in-window changes.
     public let isObserving: Bool
     public let installationFailure: String?
 
@@ -88,7 +89,9 @@ public final class MacWaitSignals: @unchecked Sendable {
         activation activationSource: any MacAppActivationObserverSource,
         pid: Int32?
     ) {
-        let sink = collector
+        startedAt = Date()
+        let sink = MacAXEffectCollector()
+        self.collector = sink
         let installedEffects: (any MacAXEffectObservation)? = pid.flatMap { pid in
             effects.install(
                 pid: pid,
@@ -104,6 +107,16 @@ public final class MacWaitSignals: @unchecked Sendable {
             : installedEffects == nil ? "Accessibility change observation could not be installed for this app."
             : installedActivation == nil ? "App activation observation could not be installed."
             : nil
+    }
+
+    /// Borrow a caller's signal sink without installing or owning its observers.
+    init(collector: MacAXEffectCollector, startedAt: Date = Date()) {
+        self.startedAt = startedAt
+        self.collector = collector
+        effects = nil
+        activation = nil
+        isObserving = false
+        installationFailure = nil
     }
 
     public func consume() -> Bool {

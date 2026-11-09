@@ -4,7 +4,8 @@ import Foundation
 
 public enum TurnSecretRedactor {
     // Pagination cursors are inputs, not credentials.
-    private static let credentialName = #"(?!(?:next|pagination)_token(?![\w-]))(?:[\w-]*(?:password|passwd|token|secret)|(?:[\w-]*[_-])?(?:api[_-]?key|private[_-]?key)|authorization)"#
+    private static let credentialName = #"(?!(?:next|pagination)_token(?![\w-]))"#
+        + #"(?:[\w-]*(?:password|passwd|token|secret)|(?:[\w-]*[_-])?(?:api[_-]?key|private[_-]?key)|authorization)"#
 
     public static func isCredentialName(_ name: String) -> Bool {
         name.range(of: "^" + credentialName + "$", options: [.regularExpression, .caseInsensitive]) != nil
@@ -19,7 +20,8 @@ public enum TurnSecretRedactor {
             (
                 "NAMED_SECRET",
                 // URLs are prose; credential-shaped query values still match.
-                #"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|key|token|secret|password|passwd|openai|anthropic|github)(?![A-Za-z0-9])\s*[=:]\s*(?!(?:https?|ftp)://)[^\s"']{8,}"#,
+                #"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|key|token|secret|password|passwd|openai|anthropic|github)"#
+                    + #"(?![A-Za-z0-9])\s*[=:]\s*(?!(?:https?|ftp)://)[^\s"']{8,}"#,
                 [.caseInsensitive]
             ),
             ("BEARER_TOKEN", #"\bBearer\s+[A-Za-z0-9._~+/=-]+"#, [.caseInsensitive]),
@@ -45,6 +47,7 @@ public enum TurnSecretRedactor {
             ("JWT", "\\beyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}", []),
             ("OPENAI_KEY", "\\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\\b", []),
             ("ANTHROPIC_KEY", "\\bsk-ant-[A-Za-z0-9_-]{20,}\\b", []),
+            ("META_KEY", "\\bLLM_[0-9]+_[A-Za-z0-9._~+/=-]+", []),
             ("STRIPE_KEY", "\\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\\b", []),
             ("SLACK_TOKEN", "\\bxox[baprs]-[A-Za-z0-9-]{20,}|\\bxapp-[A-Za-z0-9-]{20,}\\b", []),
             ("GOOGLE_API_KEY", "\\bAIza[0-9A-Za-z_-]{25,}\\b", []),
@@ -58,9 +61,26 @@ public enum TurnSecretRedactor {
         }
     }()
 
+    /// ASCII credential introducers avoid unnecessary regex work; Unicode always reaches ICU recognition.
+    public static func mayContainCredential(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        for i in bytes.indices {
+            let byte = bytes[i]
+            if byte >= 128 || byte == 45 || byte == 95 || byte == 46 { return true }
+            let lower = byte | 32
+            if lower == 98, i + 5 < bytes.count,
+               (bytes[i + 1] | 32) == 101, (bytes[i + 2] | 32) == 97, (bytes[i + 3] | 32) == 114,
+               (bytes[i + 4] | 32) == 101, (bytes[i + 5] | 32) == 114 { return true }
+            if lower == 97, i + 3 < bytes.count,
+               (bytes[i + 1] | 32) == 105, (bytes[i + 2] | 32) == 122, (bytes[i + 3] | 32) == 97 { return true }
+        }
+        return false
+    }
+
     /// `<credential name> = <value>` with the name captured separately, so the label survives and only a value that PROVES itself a secret is cut.
     private static let displayNamedSecretPattern: NSRegularExpression = {
-        let pattern = #"((?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?key|private[_-]?key|token|secret|password|passwd)(?![A-Za-z0-9])["']?\s*[=:]\s*["']?)([^\s"']+)"#
+        let pattern = #"((?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}"#
+            + #"(?:api[_-]?key|access[_-]?key|private[_-]?key|token|secret|password|passwd)(?![A-Za-z0-9])["']?\s*[=:]\s*["']?)([^\s"']+)"#
         guard let expression = try? NSRegularExpression(
             pattern: pattern, options: [.caseInsensitive]
         ) else {

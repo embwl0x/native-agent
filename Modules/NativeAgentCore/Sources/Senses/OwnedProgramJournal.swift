@@ -28,12 +28,14 @@ extension OwnedProgramRunner {
         var logBytes = 0
         var actions = 0
         var reads = 0
+        /// Positive evidence from the notebook owner's committed-write boundary, including writes outside the call ledger.
+        var notebookChanged = false
+        var notebookChangeKnown = true
         var stopped: [String: JSONValue]?
         var refusedAfterStop = 0
         /// In-flight unjournaled calls must not create ledger rows.
         var unjournaled = false
         var returned: JSONValue = .null
-        var returnedNote: String?
         var error: [String: JSONValue]?
         var timedOut = false
         var steps: [(label: String, guidance: String)] = []
@@ -95,8 +97,9 @@ extension OwnedProgramRunner {
                 let message = report["message"]?.scalarText ?? "error"
                 if report["name"] == .string("SyntaxError") {
                     report["reason"] = .string("script_syntax")
-                    report["rule"] = .string("javascript_function_body")
-                    report["instruction"] = .string("Fix the JavaScript syntax reported in message at line. "
+                    report["rule"] = .string(programEntry == .functionBody ? "javascript_function_body" : "javascript_entry")
+                    report["instruction"] = .string(part ? "Fix the reported JavaScript syntax in \(partID) with ability.save."
+                        : "Fix the JavaScript syntax reported in message at line. "
                         + """
                             Top-level await is not supported: app.* calls return synchronously. Use const result = app.read(\"inbox\"); return result; \
                             without await.
@@ -126,7 +129,21 @@ extension OwnedProgramRunner {
                 if case .int(let n)? = report["n"], ledger.indices.contains(Int(n) - 1),
                    case .object(let row) = ledger[Int(n) - 1] {
                     report["call"] = row["call"] ?? .null
-                    for key in ["nearest", "remedy", "argument_path"] { report[key] = row[key] }
+                    for key in ["try_instead", "remedy", "argument_path"] { report[key] = row[key] }
+                }
+                if part {
+                    report["ability"] = .string(partID)
+                    report["version"] = .string(partVersion)
+                    report["cause"] = .string(message)
+                    let place = report["line"]?.scalarText.map { " at line " + $0 } ?? " (source line unavailable)"
+                    report["message"] = .string("Ability \(partID)\(place): \(message)")
+                    if report["reason"] == nil { report["reason"] = .string("javascript_exception") }
+                    if report["remedy"] == nil {
+                        report["remedy"] = Repair.remedy(owner: "ability " + partID + place,
+                            nextCall: .object(["tool": .string("app"), "input": .object([
+                                "action": .string("ability.read"), "args": .object(["id": .string(partID)])])]), tap: nil,
+                            instruction: "Read the named ability and repair its expression with ability.save; inspect reached effects before running it again.")
+                    }
                 }
                 error = report
             }
@@ -136,7 +153,6 @@ extension OwnedProgramRunner {
                                 "origin": .string("javascript")] }
             }
             returned = fields["returned"] ?? .null
-            returnedNote = fields["returnedNote"]?.scalarText
             if strict, stopped == nil, !timedOut, let code = expectFail {
                 stopped = ["reason": .string("expected_failure_not_seen"),
                            "detail": .string("app.expect_fail(\"\(code)\") was never closed, so nothing failed as declared.")]
@@ -163,8 +179,8 @@ extension OwnedProgramRunner {
             logBytes += kept.utf8.count; log.append(kept)
         }
         func sourceLine(_ line: Int) -> JSONValue {
-            guard line >= 1, !lines.isEmpty else { return .null }
-            let text = lines[min(line, lines.count) - 1].trimmingCharacters(in: .whitespaces)
+            guard line >= 1, line <= lines.count else { return .null }
+            let text = lines[line - 1].trimmingCharacters(in: .whitespaces)
             // Never echo a line naming an action that takes a key.
             if host.secretLine(text) {
                 return .string("[redacted: this line names an action that takes a key or token]")
@@ -174,7 +190,7 @@ extension OwnedProgramRunner {
         /// Journal calls on the script's thread so resumed calls answer from Replay without executing effects again.
         func call(kind: String, id: String, args: String, line: Int) async -> String {
             // Validate transport before replay classification or any host call.
-            guard case .array? = try? JSONValue.parse(Data(args.utf8)) else {
+            guard case .array(let given)? = try? JSONValue.parse(Data(args.utf8)) else {
                 stopped = ["line": .int(Int64(line)), "reason": .string("invalid_args"),
                            "detail": .string("The helper call arguments are not a JSON array. Repair the helper protocol; no call ran.")]
                 return encode(["ok": .bool(false), "reason": .string("invalid_args"),
@@ -186,7 +202,9 @@ extension OwnedProgramRunner {
             guard strict, ["action", "primitive", "read", "find", "decide", "state"].contains(kind), stopped == nil else {
                 return await dispatch(kind: kind, id: id, args: args, line: line)
             }
-            let signature = JSONValue.array([.string(kind), .string(id), .string(args), .int(Int64(line))])
+            let evidence = try kind == "action" ? host.callArgumentsForEvidence(id, given: given) : given
+            let signature = JSONValue.array([.string(kind), .string(id),
+                .string(try JSONValue.array(evidence).serialize(pretty: false)), .int(Int64(line))])
             guard replayed < replay.count else {
                 let rows = ledger.count
                 let out = await dispatch(kind: kind, id: id, args: args, line: line)
@@ -324,9 +342,16 @@ extension OwnedProgramRunner {
         }
         func encode(_ fields: [String: JSONValue], line: Int, n: Int) -> String {
             var fields = fields
+            // Every failure exposes advice at the same envelope field; a returned receipt owns its advice.
+            if fields["ok"] == .bool(false) {
+                let advice: JSONValue?
+                if let receipt = fields["receipt"] { advice = receipt.objectValue?["try_instead"] }
+                else { advice = fields["try_instead"] }
+                fields["try_instead"] = advice ?? .null
+            }
             fields["line"] = .int(Int64(line))
             fields["n"] = .int(Int64(n))
-            return (try? JSONValue.object(fields).serialize(pretty: false)) ?? #"{"ok":false,"reason":"internal","detail":"unreadable"}"#
+            return (try? JSONValue.object(fields).serialize(pretty: false)) ?? #"{"ok":false,"reason":"internal","detail":"unreadable","try_instead":null}"#
         }
         func append(_ row: JSONValue) {
             guard !unjournaled else { return }
@@ -399,13 +424,19 @@ extension OwnedProgramRunner {
                 if programEntry == .face { return refuse("projection_only", "A face reads only its frozen sources, never a notebook.", stop: true) }
                 guard case .array(let values)? = try? JSONValue.parse(Data(args.utf8)),
                       id == "get" && values.isEmpty || id == "set" && values.count == 1 else {
+                    notebookChangeKnown = false
                     return refuse("bad_state", "Use host.state.get() or host.state.set(value).", stop: false)
                 }
                 do {
                     let value = try AbilityStore.notebook(dataRoot: notebookRoot, id: partID,
-                        setting: id == "set", value: values.first ?? .null, failure: { SenseFailure(code: $0, message: $1) })
+                        setting: id == "set", value: values.first ?? .null,
+                        writing: { self.notebookChanged = true }, failure: { SenseFailure(code: $0, message: $1) })
                     return answer(["ok": .bool(true), "value": value])
-                } catch { return refuse("bad_state", error.localizedDescription, stop: false) }
+                } catch {
+                    // A failed durable write may already have renamed the file. Even a caught notebook error cannot certify no change.
+                    notebookChangeKnown = false
+                    return refuse("bad_state", error.localizedDescription, stop: false)
+                }
             }
             func halt(_ reason: String, _ detail: String, call name: String) -> String {
                 row["call"] = .string(name)
@@ -466,22 +497,25 @@ extension OwnedProgramRunner {
                 if reason == expected { row["expected"] = .bool(true); expectFailMatched = true } else { expectFailOther = reason }
             }
             /// Pre-dispatch refusal proves no effect occurred.
-            func refused(_ reason: String, _ detail: String, call name: String) -> String {
+            func refused(_ reason: String, _ detail: String, call name: String, tryInstead: JSONValue? = nil) -> String {
                 row["call"] = .string(name)
                 row["status"] = .string("failed")
                 row["reason"] = .string(reason)
                 row["detail"] = .string(detail)
                 row["effects"] = .string("none")
+                row["try_instead"] = tryInstead
                 failed(reason)
                 append(.object(row))
-                return answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail), "stopped": .bool(false),
-                               "effects": .string("none"), "call": .string(name)])
+                var reply: [String: JSONValue] = ["ok": .bool(false), "reason": .string(reason), "detail": .string(detail),
+                    "stopped": .bool(false), "effects": .string("none"), "call": .string(name)]
+                reply["try_instead"] = tryInstead
+                return answer(reply)
             }
             func stopCall(_ reason: String, _ detail: String, call name: String, receipt: JSONValue?) -> String {
                 stopped = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
                            "reason": .string(reason), "detail": .string(detail)]
                 if case .object(let fields)? = receipt {
-                    for key in ["nearest", "remedy", "argument_path"] { stopped?[key] = fields[key] }
+                    for key in ["try_instead", "remedy", "argument_path"] { stopped?[key] = fields[key] }
                 }
                 var fields: [String: JSONValue] = ["ok": .bool(false), "reason": .string(reason), "detail": .string(detail),
                                                    "stopped": .bool(true), "call": .string(name), "effects": row["effects"] ?? .string("none")]
@@ -518,7 +552,7 @@ extension OwnedProgramRunner {
                 case .success(let built):
                     input = built
                     if !host.scriptKey.isEmpty { input[host.scriptKey] = .bool(true) }
-                case .failure(let problem): return refused(problem.reason, problem.detail, call: name)
+                case .failure(let problem): return refused(problem.reason, problem.detail, call: name, tryInstead: problem.tryInstead)
                 }
                 // Strict writes must use the version of the page this run read.
                 let callArgs: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
@@ -612,6 +646,7 @@ extension OwnedProgramRunner {
                 fields["effects"] = row["effects"] ?? .string(write ? "occurred" : "none")
                 return .object(fields)
             }
+            row["result"] = receipt
             if kind == "action" || kind == "primitive" { record(receipt, envelope: envelope, into: &row) } else if case .object(let read) = receipt {
                 if let version = read["version"] { row["version"] = version }
             }
@@ -674,13 +709,14 @@ extension OwnedProgramRunner {
                     for key in ["approvalId", "not_run_status", "remedy"] { stopped?[key] = fields[key] }
                 }
                 return answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail.isEmpty ? reason : detail),
-                               "stopped": .bool(true), "call": .string(name), "effects": row["effects"] ?? .string("none")])
+                               "stopped": .bool(true), "receipt": receipt, "call": .string(name), "effects": row["effects"] ?? .string("none")])
             }
         }
-        /// Keep a compact effect record here because the script already received the complete receipt.
+        /// Keep every answer, including steps the program does not return. Only the shared model-result owner bounds their view.
         func record(_ receipt: JSONValue, envelope: JSONValue, into row: inout [String: JSONValue]) {
             guard case .object(let fields) = receipt else { return }
-            for key in ["nearest", "remedy", "argument_path", "irreversible", "effect", "execution", "captured", "card_id"] { row[key] = fields[key] }
+            for key in ["try_instead", "remedy", "argument_path", "irreversible", "effect", "execution", "captured", "card_id",
+                        "argument_form", "understood", "next_call"] { row[key] = fields[key] }
             // A receipt's declared read policy overrides static action classification.
             if let read = fields["read_only"] { row["read_only"] = read }
             if let changed = fields["changed"] { row["changed"] = changed }
@@ -710,21 +746,6 @@ extension OwnedProgramRunner {
             for key in ["would_card", "approver", "would_hand_back"] where fields[key] != nil { row[key] = fields[key] }
             // Folded tools expose their own result without an enclosing door receipt.
             if let result = fields["action"] == nil ? receipt : fields["result"] {
-                var shown = result
-                if case .object(var body) = result {
-                    for key in ["status", "trust_mode", "decided_by", "effects", "remedy", "failure_code", "message",
-                                "argument_path", "accepted"] { body.removeValue(forKey: key) }
-                    shown = .object(body)
-                }
-                do {
-                    let bytes = try shown.serializedData(pretty: false).count
-                    if bytes <= 600 { row["result"] = shown } else { row["result_bytes"] = .int(Int64(bytes)) }
-                } catch {
-                    row["result_unavailable"] = .string("""
-                        Receipt serialization failed: \(error.localizedDescription). Inspect the completed call before repeating any effect.
-                        """)
-                    stopped = ["reason": .string("serialization_failed"), "detail": row["result_unavailable"] ?? .null]
-                }
                 // Retain write destinations and shell directories even when the full result is too large.
                 if fields["read_only"] != .bool(true), case .object(let body) = result {
                     let at = body.filter { key, value in
@@ -785,6 +806,7 @@ extension OwnedProgramRunner {
                 "execution": .string(preview ? "preview" : status == "ok" ? "executed" : "attempted"),
                 "returned": returned,
                 "calls": .array(ledger),
+                "notebook_changed": notebookChangeKnown ? .bool(notebookChanged) : .null,
                 "landed": .array(landed),
                 "side_effects_not_observed": .string("Continuations a card wakes, and anything the app does after a call returns."),
             ]
@@ -794,7 +816,6 @@ extension OwnedProgramRunner {
                 out["approver"] = card ? .string("owner") : .null
                 out["preview_scope"] = .string("calls_reached")
             }
-            if let returnedNote { out["returned_note"] = .string(returnedNote) }
             if !log.isEmpty { out["log"] = .array(log.map(JSONValue.string)) }
             if var stopped {
                 if refusedAfterStop > 0 { stopped["refused_after"] = .int(Int64(refusedAfterStop)) }
@@ -803,7 +824,10 @@ extension OwnedProgramRunner {
             if timedOut, let detail = error?["message"]?.scalarText {
                 out["detail"] = .string(detail + " Calls already recorded retain their reported effects.")
             }
-            if let error { out["error"] = .object(error) }
+            if let error {
+                out["error"] = .object(error)
+                if part, error["origin"] == .string("javascript") { out["detail"] = error["message"] }
+            }
             out["effects"] = .string(!unknown.isEmpty || !unsure.isEmpty ? "unknown" : partial ? "partial"
                 : changed.isEmpty ? "none" : "occurred")
             if !changed.isEmpty { out["changed"] = .array(changed) }
@@ -850,8 +874,8 @@ extension OwnedProgramRunner {
                 ])
                 if let recovery = at?["remedy"], recovery != .null {
                     out["remedy"] = recovery
-                    out["nearest"] = at?["nearest"]
                 }
+                out["try_instead"] = at?["try_instead"]
                 if timedOut, part, at?["remedy"] == nil || at?["remedy"] == .null {
                     out["remedy"] = Repair.reconcile(
                         instruction: """

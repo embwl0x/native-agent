@@ -46,6 +46,8 @@ package struct SessionReplaySpec: Codable, Sendable {
     package let replacementUserMessageID: String?
     // Only replay inputs persist; the live request holds the already-read snapshot for fitting.
     package var historySnapshot: SessionHistoryTail? = nil
+    /// One transcript/query snapshot selects leads against the bodies each composed request actually holds.
+    package var historyLeads: (@Sendable (Set<String>) -> String?)? = nil
     private enum CodingKeys: String, CodingKey { case historyLimit, excludedRunID, replacementUserMessageID }
     package init(historyLimit: Int, excludedRunID: String?, replacementUserMessageID: String?) {
         self.historyLimit = historyLimit; self.excludedRunID = excludedRunID
@@ -66,11 +68,10 @@ package enum SessionRequestMessages {
         package let sent: SentTurnContext
         package let currentUserIndex: Int
     }
-    /// Live assembly and saved-plan sizing must use identical blocks.
-    package static func seed(history: [LLMMessage], replayed: [SentTurnContext], fullBlock: String,
-        model: String, provider: String?, window: String, userText: String, images: [LLMContentBlock]) -> Seed {
-        let sent = SentTurnContext.delivery(full: fullBlock, replayed: replayed,
-            model: model, provider: provider, window: window, userText: userText)
+    /// Public moment context leads user words; live assembly adds private choices after capturing this evidence.
+    package static func seed(history: [LLMMessage], block: String,
+        model: String, provider: String?, userText: String, images: [LLMContentBlock]) -> Seed {
+        let sent = SentTurnContext(block: block, model: model, provider: provider, userText: userText)
         var blocks: [LLMContentBlock] = []
         if !sent.block.isEmpty { blocks.append(.text(sent.block)) }
         blocks += images.isEmpty ? [.text(userText)] : LLMMessage.userWithImages(userText, images: images).content
@@ -111,13 +112,11 @@ package struct SessionContextPlan: Codable, Sendable {
                   return SentTurnContext.matches(fields, runID: currentRunID, userMessageID: currentUserMessageID)
               })?.objectValue,
               let sent = SentTurnContext(metadata: row["metadata"]?.objectValue),
-              sent.model == model, sent.provider == provider,
-              let full = sent.fullBlock, sent.userText != nil else {
+              sent.model == model, sent.provider == provider, sent.userText != nil else {
             throw ProviderRoutingError.configurationFailed(
                 "The admitted request's exact user context is unavailable. Repair its saved user-row delivery before measuring this conversation.")
         }
-        // Size the next replay, including the producing turn's answer and tool receipts; user words replay from their row.
-        // Only context state may require a new keyframe.
+        // Size the next replay including the producing turn's answer and tool receipts; user words replay from their row.
         let nextReplay = SessionReplaySpec(historyLimit: replay.historyLimit,
             excludedRunID: nil, replacementUserMessageID: nil)
         let messages = try nextReplay.messages(rows, sessionId: sessionId, dataRoot: dataRoot)
@@ -126,19 +125,21 @@ package struct SessionContextPlan: Codable, Sendable {
         let (fixedCharacters, overflow) = systemAndToolsCharacters.addingReportingOverflow(additionalCharacters)
         guard !overflow else { throw ProviderRoutingError.configurationFailed("The admitted request size is not representable.") }
         func request(_ history: SessionHistoryMessages.Result) throws -> SessionContextRequest {
-            let seed = SessionRequestMessages.seed(history: history.messages, replayed: history.replayedContexts,
-                fullBlock: full, model: model, provider: provider, window: history.contextWindow, userText: "", images: [])
+            let seed = SessionRequestMessages.seed(history: history.messages, block: sent.block,
+                model: model, provider: provider, userText: "", images: [])
             return try SessionContextRequest(messages: seed.messages, systemAndToolsCharacters: fixedCharacters,
                 historyCharacters: history.characters, rowCharacters: history.rowCharacters)
         }
         guard let admission else { return try request(.empty) }
         let history = SessionHistoryMessages.project(admission)
         var built = try request(history)
-        let inputBudget = Double(max(0, windowTokens - outputTokens)) * charactersPerToken
+        let inputBudget = Double(ContextBudgetPolicy.inputTokens(windowTokens: windowTokens, outputTokens: outputTokens)) * charactersPerToken
         if Double(built.characters) > inputBudget {
             let tail = SessionHistoryTail(admission, rowCharacters: history.rowCharacters)
             let halfBudget = SessionHistoryTail.halfBudgetCharacters(windowTokens: windowTokens, outputTokens: outputTokens)
-            for checkpoint in tail.checkpoints(halfBudgetCharacters: halfBudget) {
+            let fixed = built.characters - history.characters
+            for checkpoint in tail.fittingCheckpoints(halfBudgetCharacters: halfBudget,
+                maximumRetainedCharacters: inputBudget - Double(fixed)) {
                 built = try request(tail.project(after: checkpoint))
                 if Double(built.characters) <= inputBudget { break }
             }

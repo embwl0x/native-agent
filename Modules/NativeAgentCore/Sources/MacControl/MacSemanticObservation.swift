@@ -40,7 +40,7 @@ extension SwiftNativeMacControl {
         ]
         // Resolve the app before walking; Chromium’s AXWebArea appears only after activation.
         let pid = anchorPid ?? anchorWindow?.pid ?? accessibilitySource(context: context).frontmostApp()?.processIdentifier
-        if pid == getpid() { return (nil, seam, .selfProcess) }
+        if PersonOnlyWindows.isOwnProcess(pid) { return (nil, seam, .selfProcess) }
         let app = pid.flatMap { accessibilitySource(context: context).appInfo(pid: $0) }
         let chromium: Bool
         do { chromium = try MacChromiumAccessibility.looksChromium(bundleId: app?.bundleIdentifier, pid: pid, snapshot: nil) }
@@ -352,6 +352,20 @@ extension SwiftNativeMacControl {
             anchorPid = app.processIdentifier
             anchoredApp = app
         }
+        if context.observationMode != .passive {
+            let pid = turn.macContinuation.flatMap { $0.isPending ? $0.app?.processIdentifier : nil }
+                ?? anchorPid ?? accessibilitySource(context: context).frontmostApp()?.processIdentifier
+            if let pid {
+                if let refusal = await macAdmissionRefusal(pid: pid, action: "look", context: context) { return (refusal, nil) }
+                anchorPid = pid
+                if grade == "stare", accessibilitySource(context: context).frontmostApp()?.processIdentifier != pid {
+                    return (injectionRefusal(action: "look", error: "front_changed", status: 409), nil)
+                }
+            }
+        }
+        // The reading budget begins with reading, after the app's admission wait.
+        let context = context.observationMode == .passive ? context
+            : context.with(\.readDeadline, Date().addingTimeInterval(MacAXLimits.readSeconds))
         if grade == "stare" {
             let tree = handleAXTree(body, context: context)
             var output: [String: JSONValue] = [:]
@@ -434,11 +448,11 @@ extension SwiftNativeMacControl {
         let frontmostAppJSON: JSONValue = {
             guard anchoredApp != nil, let front = accessibilitySource(context: context).frontmostApp(),
                   case .object(var object) = front.toJSON() else { return .null }
-            if front.processIdentifier != getpid(),
+            if !PersonOnlyWindows.isOwnProcess(front.processIdentifier),
                let window = accessibilityActSource(context: context).focusedWindow(pid: front.processIdentifier, context: context) {
                 object["window"] = window.identity.toJSON()
                 context.capture?.foreground = MacForegroundSnapshot(app: front, window: window.identity)
-            } else if front.processIdentifier == getpid() {
+            } else if PersonOnlyWindows.isOwnProcess(front.processIdentifier) {
                 // Our own process is activated through AppKit, never self-AX.
                 context.capture?.foreground = MacForegroundSnapshot(app: front, window: nil)
             } else {
@@ -489,7 +503,7 @@ extension SwiftNativeMacControl {
                     + "Its menu bar still works: mac.act app:\"\(name)\" target:\"File > New\" makes a new window."
                 )
             } else if anchoredApp == nil, let front = accessibilitySource(context: context).frontmostApp(),
-                      front.processIdentifier != getpid() {
+                      !PersonOnlyWindows.isOwnProcess(front.processIdentifier) {
                 // Windowless front apps still take keys, so retain their identity.
                 output["frontmost_app"] = front.toJSON()
             } else if let anchoredApp, case .windowGone? = anchor {

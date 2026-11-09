@@ -5,6 +5,8 @@ import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import MacControl
+import NativeAgentShared
 
 // Blueprint: | `NativeCognitionRuntime+Rhythm.swift` | `NativeCognitionRuntime`. |
 
@@ -19,6 +21,8 @@ struct RhythmRuntimeState: Sendable {
     var due: Date?
     var dueClaim: PersonRhythm.Claim?
     var zone: String?
+    var nightDue: Date?
+    var nightEpoch = UUID().uuidString
 }
 
 extension NativeCognitionRuntime {
@@ -55,12 +59,17 @@ extension NativeCognitionRuntime {
     }
 
     /// Use workspace wake/sleep edges rather than sampled uptime.
-    public func rhythmAwakeChanged(awake: Bool) async {
+    public func rhythmAwakeChanged(awake: Bool, here: Bool?) async {
         guard !isFlushedForTermination else { return }
-        do { try refreshRhythmInterval(at: now()) }
-        catch { reportRhythmFailure(error); return }
-        rhythm.awakeSince = awake ? now() : nil
-        if !awake { rhythm.present = false }
+        let at = now()
+        do {
+            try refreshRhythmInterval(at: at)
+            rhythm.awakeSince = awake ? at : nil
+            if awake { rhythm.nightEpoch = UUID().uuidString }
+            // Resume from the presence owner's reading, never the false value left by sleep.
+            rhythm.present = awake && here == true
+            if rhythm.present { try observeRhythmActivity(.init(at: at, door: "presence")) }
+        } catch { reportRhythmFailure(error); return }
         await rhythmChanged()
     }
 
@@ -72,19 +81,19 @@ extension NativeCognitionRuntime {
         let rows = try ChatHistoryIndex.shared(dataRoot: dataRoot).ownerActivity(
             since: at.addingTimeInterval(-30 * 86_400), until: at,
             telegramOwnerUserId: host.telegramOwnerUserId(dataRoot: dataRoot))
-        value.coldStart(rows.map { .init(at: $0.at, door: $0.door) }, at: at)
+        try value.coldStart(rows.map { .init(at: $0.at, door: $0.door) }, at: at)
         return value
     }
 
     private func refreshRhythmInterval(at: Date) throws {
         var value = try loadRhythm()
-        if value.timeZone != TimeZone.current.identifier { value.recompute(at: at) }
+        if value.timeZone != TimeZone.current.identifier { try value.recompute(at: at) }
         if let since = rhythm.awakeSince {
             if rhythm.present, let claim = value.claims.first(where: { $0.kind == .quiet }) {
                 var cursor = max(since, at.addingTimeInterval(-86_400))
                 while cursor < at, let hour = Calendar.current.dateInterval(of: .hour, for: cursor) {
                     if claim.contains(hour: Calendar.current.component(.hour, from: cursor)) {
-                        keepRhythmBreak("quiet", claim: claim, at: cursor, in: &value)
+                        try keepRhythmBreak("quiet", claim: claim, at: cursor, in: &value)
                     }
                     cursor = min(at, hour.end)
                 }
@@ -92,26 +101,27 @@ extension NativeCognitionRuntime {
             value.observed(from: since, to: at, present: rhythm.present)
             rhythm.awakeSince = at
         }
-        value.recompute(at: at)
+        try value.recompute(at: at)
         rhythm.value = value
     }
 
     private func observeRhythmActivity(_ activity: PersonRhythm.Activity) throws {
         var value = try loadRhythm()
-        if value.timeZone != TimeZone.current.identifier { value.recompute(at: now()) }
+        if value.timeZone != TimeZone.current.identifier { try value.recompute(at: now()) }
         let h = Calendar.current.component(.hour, from: activity.at)
         if let claim = value.claims.first(where: { $0.kind == .quiet && $0.contains(hour: h) }) {
-            keepRhythmBreak("quiet", claim: claim, at: activity.at, in: &value)
+            try keepRhythmBreak("quiet", claim: claim, at: activity.at, in: &value)
         }
         value.activity(activity)
-        value.recompute(at: now())
+        try value.recompute(at: now())
         rhythm.value = value
     }
 
-    private func keepRhythmBreak(_ kind: String, claim: PersonRhythm.Claim, at: Date, in value: inout PersonRhythm) {
+    private func keepRhythmBreak(_ kind: String, claim: PersonRhythm.Claim, at: Date, in value: inout PersonRhythm) throws {
         let day = Calendar.current.startOfDay(for: at)
         let parts = Calendar.current.dateComponents([.year, .month, .day], from: at)
-        let id = "rhythm:\(kind):\(parts.year!)-\(parts.month!)-\(parts.day!)"
+        guard let year = parts.year, let month = parts.month, let date = parts.day else { throw CocoaError(.coderReadCorrupt) }
+        let id = "rhythm:\(kind):\(year)-\(month)-\(date)"
         guard value.breaks[id] == nil else { return }
         value.breaks[id] = day
         value.pending[id] = .init(at: at, claim: claim)
@@ -121,7 +131,7 @@ extension NativeCognitionRuntime {
         guard !isFlushedForTermination, rhythm.refresh == nil else {
             reply?(.init("held", "The person's day is already refreshing or the runtime is stopping.")); return
         }
-        guard runNow || rhythm.dirty || rhythm.due.map({ $0 <= now() }) == true else { return }
+        guard runNow || rhythm.dirty || rhythm.due.map({ $0 <= now() }) == true || rhythm.nightDue.map({ $0 <= now() }) == true else { return }
         rhythm.dirty = false
         rhythm.refresh = Task { [weak self] in
             guard let self else { reply?(.init("unavailable", "The runtime was released.")); return }
@@ -132,8 +142,70 @@ extension NativeCognitionRuntime {
     }
 
     private func finishRhythmRefresh() async {
+        await senseNight()
         rhythm.refresh = nil
         await rescheduleResidualRepairDeadline()
+    }
+
+    /// The record owns night identity; part accounting and dream consumption have independent cursors.
+    public func restReading(at: Date) async throws -> JSONValue {
+        let last = try await ExperienceStore.at(dataRoot).details(.init(sources: [Attention.detailSource], subjects: ["night", "sleep"],
+            kinds: [Attention.nightKind], limit: 1, newestFirst: true)).first?.at
+        let presence = PersonPresence.read(dataRoot: dataRoot, now: at).transition
+        let value = try loadRhythm()
+        let hour = Calendar.current.component(.hour, from: at)
+        guard let bin = value.bins.dropFirst(hour).first else { throw CocoaError(.coderReadCorrupt) }
+        return .object([
+            "awayMinutes": presence.flatMap { !$0.here ? .double(max(0, at.timeIntervalSince($0.since)) / 60) : nil } ?? .null,
+            "activeShare": bin.observed > 0 ? .double(bin.active / bin.observed) : .null,
+            "hoursSinceNight": last.map { .double(max(0, at.timeIntervalSince($0)) / 3600) } ?? .null
+        ])
+    }
+
+    /// The next reading is a sense boundary, never a promised bedtime.
+    public func nextNight() async throws -> JSONValue {
+        let rest = try await restReading(at: now())
+        return .object(["state": .string("available"), "rest": rest,
+            "at": rhythm.nightDue.map { .double($0.timeIntervalSince1970) } ?? .null,
+            "reason": .string(rhythm.nightDue == nil ? "Waiting for the person to be away." : "The next reading of the night; sleep is my judgment.")])
+    }
+
+    func personTurnAt() throws -> Date? {
+        struct Stamp: Decodable { let at: Double }
+        let data: Data
+        do { data = try Data(contentsOf: dataRoot.appendingPathComponent("cognition/user_turn.json")) }
+        catch CocoaError.fileReadNoSuchFile { return nil }
+        let stamp = try JSONDecoder().decode(Stamp.self, from: data)
+        guard stamp.at.isFinite else { throw CocoaError(.coderReadCorrupt) }
+        return Date(timeIntervalSince1970: stamp.at)
+    }
+
+    /// A source deadline reports time; only the turn program judges the world line. The body owns its 48-hour need.
+    private func senseNight() async {
+        rhythm.nightDue = nil
+        guard !isFlushedForTermination, !Task.isCancelled else { return }
+        let at = now()
+        guard let presence = PersonPresence.read(dataRoot: dataRoot, now: at).transition, !presence.here else { return }
+        do {
+            let rest = try await restReading(at: at)
+            guard let boundary = Calendar.current.dateInterval(of: .hour, for: at)?.end else { throw CocoaError(.coderReadCorrupt) }
+            let first = presence.since.addingTimeInterval(30 * 60)
+            rhythm.nightDue = first > at ? min(first, boundary) : boundary
+            guard at >= first else { return }
+            let hours = rest.objectValue?["hoursSinceNight"]?.numberValue(coercingStrings: false, finiteOnly: true)
+            if let hours, hours < 48 {
+                rhythm.nightDue = min(boundary, at.addingTimeInterval((48 - hours) * 3600))
+            }
+            let body = hours == nil || hours.map { $0 >= 48 } == true
+            guard let slot = Calendar.current.dateInterval(of: .hour, for: at)?.start else { throw CocoaError(.coderReadCorrupt) }
+            let once = ["night", body ? "body" : "world", rhythm.nightEpoch,
+                        String(presence.since.timeIntervalSince1970), String(slot.timeIntervalSince1970)].joined(separator: ":")
+            let happening = Happening(body ? .body : .world, subject: "night", door: "sense:night", who: "self",
+                words: body ? "My body needs a night." : "The person is away; this is the hour and the rest I have had.",
+                once: once,
+                shows: try rest.serialize(pretty: false))
+            await Attention.post(happening, dataRoot: dataRoot).value
+        } catch { reportRhythmFailure(error) }
     }
 
     private func refreshRhythm(satisfyWait: Bool = false) async -> MindClockResult {
@@ -167,7 +239,7 @@ extension NativeCognitionRuntime {
             if let due = rhythm.due, satisfyWait || due <= at, let claim = rhythm.dueClaim {
                 rhythm.due = nil
                 if !value.started(on: day) {
-                    keepRhythmBreak("starts", claim: claim, at: at, in: &value)
+                    try keepRhythmBreak("starts", claim: claim, at: at, in: &value)
                 }
             }
             // Publish canonical state before awaiting so reentrant arrivals update the current value.
@@ -183,21 +255,21 @@ extension NativeCognitionRuntime {
                     subject: .init(type: "person_rhythm", id: id, label: "the person's day"),
                     sourceClass: .observed, occurredAt: pending.at, summary: words, importance: 0.6,
                     metadata: ["feltValence": .double(0), "feltArousal": .double(0.2), "resolutionKind": .string("rhythm")])
-                // Without a live care, emit no fact; presence felt admission cannot release news or wake a resident turn.
+                // Without a live care, emit no fact; presence felt admission cannot release news or open a thought.
                 if try await substrate.feelRhythmBreak(event) {
                     felt += 1
-                    PrimedMoments.prime(dataRoot: dataRoot, line: words, source: "rhythm", now: pending.at)
                     scheduleDirtyMicrocycle(reason: "rhythm_break")
                 }
                 rhythm.value?.pending.removeValue(forKey: id)
             }
-            try rhythm.value?.save(dataRoot)
+            // Pending settlement or an arrival during suspension may change the current value; an identical second write does nothing.
+            if let current = rhythm.value, current != value { try current.save(dataRoot) }
             RepairOwed.settle(dataRoot, operation: "mind.rhythm",
                              evidence: .init(source: PersonRhythm.path(dataRoot).path, id: "\(at.timeIntervalSince1970)"))
             return .init("refreshed",
                 """
                     The person's real awake and activity history was kept; \(felt) care-admitted rhythm breaks felt, \(value.pending.count) considered. \
-                    No crossing or wake.
+                    No thought was opened.
                     """, fields: [
                 "felt": .int(Int64(felt)), "considered": .int(Int64(value.pending.count)),
                 "path": .string(PersonRhythm.path(dataRoot).path)
@@ -217,8 +289,7 @@ extension NativeCognitionRuntime {
         guard var value = rhythm.value else { return }
         let at = now()
         if let since = rhythm.awakeSince { value.observed(from: since, to: at, present: rhythm.present) }
-        value.recompute(at: at)
-        do { try value.save(dataRoot); rhythm.value = value }
+        do { try value.recompute(at: at); try value.save(dataRoot); rhythm.value = value }
         catch { reportRhythmFailure(error) }
         rhythm.awakeSince = nil
     }

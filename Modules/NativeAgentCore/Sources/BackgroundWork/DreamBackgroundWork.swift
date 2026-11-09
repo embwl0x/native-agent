@@ -29,13 +29,15 @@ public enum DreamBackgroundWork {
         cognitionRuntime: NativeCognitionRuntime,
         force: Bool,
         trigger: DreamTrigger,
-        notifications: any REMProposalNotificationPort
+        notifications: any REMProposalNotificationPort,
+        parent: Turn,
+        beganAt: Date
     ) async throws -> DreamReport {
         let asked = trigger == .manual ? "asked: " : ""
         let report: DreamReport
         do {
             report = try await dream(dataRoot: dataRoot, cycle: cycle, cognitionRuntime: cognitionRuntime, force: force,
-                                     trigger: trigger, notifications: notifications)
+                                     trigger: trigger, notifications: notifications, parent: parent, beganAt: beganAt)
         } catch {
             beatThrown(dreamOrgan, error, note: asked, cadence: dreamCadence)
             throw error
@@ -76,11 +78,13 @@ public enum DreamBackgroundWork {
         cognitionRuntime: NativeCognitionRuntime,
         force: Bool,
         trigger: DreamTrigger,
-        notifications: any REMProposalNotificationPort
+        notifications: any REMProposalNotificationPort,
+        parent: Turn,
+        beganAt: Date
     ) async throws -> DreamReport {
         // Live owed moments, including deferrals, before the dream reads the day.
         await AdaptiveMemoryPromoter.shared.drainOwedAtNight(dataRoot: dataRoot)
-        return try await cycle.runDream(force: force, trigger: trigger) { delivery in
+        return try await cycle.runDream(force: force, trigger: trigger, delivery: { delivery in
             switch delivery.effect {
             case .reflectionJudgment(let material):
                 switch try await cognitionRuntime.produceDreamReflection(id: delivery.id, material: material) {
@@ -133,7 +137,7 @@ public enum DreamBackgroundWork {
                     occurredAt: occurredAt, metadata: metadata)
                 return applied ? .done : .skipped("body disabled")
             }
-        }
+        }, parent: parent, beganAt: beganAt)
     }
 
     /// Apply approved life depth before the substrate pass; offer each newly eligible care only once.
@@ -210,7 +214,7 @@ public enum DreamBackgroundWork {
         catch {
             if case DreamREMCycleError.remDecodeFailure(let detail) = error {
                 do {
-                    try await HarnessQueue.file(HarnessFinding(key: "loop-failure:nativeagent-weekly-rem",
+                    try await BodyQueue.file(BodyFinding(key: "loop-failure:nativeagent-weekly-rem",
                         title: "REM could not read its model's reply", summary: detail,
                         owner: .agent, refs: [], source: .loop), dataRoot: dataRoot)
                 } catch { nativeLog("REM decode finding could not be filed: %@", error.localizedDescription) }
@@ -218,7 +222,7 @@ public enum DreamBackgroundWork {
             throw error
         }
         guard result.skipReason == nil else { return result }
-        try await HarnessQueue.resolve(key: "loop-failure:nativeagent-weekly-rem",
+        try await BodyQueue.resolve(key: "loop-failure:nativeagent-weekly-rem",
             note: "REM decoded its next run.", dataRoot: dataRoot)
         let proposals = result.proposalsGenerated
         let archived = result.archivedEntries

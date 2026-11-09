@@ -1,8 +1,11 @@
+import AgentConversations
+import ChatTurnContracts
 import Foundation
+import Context
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SwiftToolDispatcher+MemoryCurationTools.swift` | `MemoryCuration`: `listMemories`, `rewriteMemory` retain provenance on readback (a read steers nothing); `rewriteTarget` shares read-only preview validation; `SwiftToolDispatcher`: `impl_forget_memory`, `impl_rebuild_knowledge_graph` |
+// Blueprint: | `SwiftToolDispatcher+MemoryCurationTools.swift` | `MemoryCuration`: `listMemories`, `rewriteMemory` restates roots and writes nothing when the memory already reads that way (a read steers nothing); `rewriteTarget` shares read-only preview validation; `SwiftToolDispatcher`: `impl_forget_memory`, `impl_rebuild_knowledge_graph` |
 
 
 /// Share the Memories page’s owner and store so curation cannot diverge across doors.
@@ -20,6 +23,47 @@ public struct MemoryCuration: Sendable {
     public init(memoryV2: SwiftNativeMemoryV2, dataRoot: URL) {
         self.memoryV2 = memoryV2
         self.dataRoot = dataRoot
+    }
+
+    /// How the agent knows a memory, restated whole: one telling per root, each {how, by?, since?}. The agent's unsteered roots become these; roots
+    /// a principal the person does not trust steered stay as they are.
+    func statedRoots(_ input: [String: JSONValue]) throws -> [MemoryRoot.Telling]? {
+        let accepted = "roots: [{how: \(MemoryRoot.How.stated.map(\.rawValue).joined(separator: "|")), by?, since?}], at least one"
+        switch input["roots"] {
+        case nil, .null?: return nil
+        case .array(let items)? where !items.isEmpty:
+            return try items.enumerated().map { index, item in
+                let path = "roots[\(index)]"
+                guard case .object(let fields) = item, Set(fields.keys).isSubset(of: ["how", "by", "since"]) else {
+                    throw ToolFailureError("\(path) must be an object with how, and by and since if they apply.", argumentPath: path,
+                        accepted: accepted, effects: .none, code: "memory_roots_invalid", status: .refused,
+                        instruction: "Correct \(path) in memory.rewrite.", recovery: .correctArguments)
+                }
+                guard let telling = try SwiftToolDispatcher.telling(how: fields["how"], by: fields["by"], since: fields["since"],
+                    names: (path + ".how", path + ".by", path + ".since")), telling.how != .kept else {
+                    throw ToolFailureError("\(path) needs how.", argumentPath: path + ".how", accepted: accepted, effects: .none,
+                        code: "memory_provenance_required", status: .refused, instruction: "Name how you know it in \(path).how.",
+                        recovery: .correctArguments)
+                }
+                return telling
+            }
+        default:
+            throw ToolFailureError("roots must be a nonempty list.", argumentPath: "roots", accepted: accepted, effects: .none,
+                code: "memory_roots_invalid", status: .refused, instruction: "Correct roots in memory.rewrite, or omit it.",
+                recovery: .correctArguments)
+        }
+    }
+
+    /// Why a rewrite wrote nothing, in words that match what is stored. A restatement leaves every root a door carried as it is (so a change of
+    /// trust can bring its steer back), and a telling from the same source on the same day is the root already held.
+    static func unchangedNote(_ metadata: JSONValue?, restated: Bool, trust: PeerDataTaint.TrustRead) -> String {
+        guard restated, case .held(let roots) = MemoryRoot.reading(metadata) else { return "It already reads this way; nothing was written." }
+        let doors = Array(Set(roots.flatMap(\.through))).sorted().map { trust.sourceName($0) ?? $0 }
+        guard !doors.isEmpty else {
+            return "Nothing was written: each root you stated is one this memory already holds, from the same source on the same day."
+        }
+        return "Nothing was written: roots carried through " + doors.joined(separator: ", ") + " stay as they are whatever a rewrite states, so a "
+            + "change of trust can bring their steer back, and a telling from the same source on the same day is the root already held."
     }
 
     func curationString(_ input: [String: JSONValue], _ key: String) -> String? {
@@ -106,13 +150,15 @@ public struct MemoryCuration: Sendable {
             return SwiftToolDispatcher.memoryFailure(error)
         }
         let page = listing.records
+        let trust = MemoryDataProvenance.reading(page.map(\.extras))
         let rows: [JSONValue] = page.map { record in
             var row: [String: JSONValue] = [
                 "id": .string(record.id),
                 "text": .string(record.text),
                 "created_at": .string(record.createdAt),
             ]
-            row.merge(MemoryDataProvenance.fields(in: record.extras, dataRoot: dataRoot)) { _, value in value }
+            row.merge(MemoryDataProvenance.fields(in: record.extras, trust: trust)) { _, value in value }
+            row["roots"] = MemoryDataProvenance.rootsJSON(record.extras, trust: trust)
             if let kind = record.memoryKind { row["kind"] = .string(kind) }
             if let warning = MemorySenseProvenance.warning(in: record.extras) {
                 row["sense_warning"] = .string(warning)
@@ -164,12 +210,13 @@ public struct MemoryCuration: Sendable {
         let text = curationString(input, "text")
         let pinned = curationBool(input, "pinned")
         let restore = curationBool(input, "restore") == true
-        guard text != nil || pinned != nil || restore else {
-            throw ToolFailureError("memory.rewrite needs a change.", argumentPath: "text / pinned / restore",
-                accepted: "text: nonempty string; pinned: true or false; restore: true", effects: .none,
-                nextCall: ToolFailureError.call("app", ["find": .string("memory.rewrite")]),
+        let roots = try statedRoots(input)
+        guard text != nil || pinned != nil || restore || roots != nil else {
+            throw ToolFailureError("memory.rewrite needs a change.", argumentPath: "text / pinned / restore / roots",
+                accepted: "text: nonempty string; pinned: true or false; restore: true; roots: [{how, by?, since?}]",
+                effects: .none, nextCall: ToolFailureError.call("app", ["find": .string("memory.rewrite")]),
                 code: "memory_rewrite_change_required", status: .refused,
-                instruction: "Supply text, pinned or restore in memory.rewrite.", recovery: .correctArguments)
+                instruction: "Supply text, pinned, restore or roots in memory.rewrite.", recovery: .correctArguments)
         }
         let row: MemoryRecord?
         do {
@@ -233,8 +280,34 @@ public struct MemoryCuration: Sendable {
         let text = curationString(input, "text")
         let pinned = curationBool(input, "pinned")
         let restore = curationBool(input, "restore") == true
+        let roots: [MemoryRoot.Telling]?
+        do { roots = try statedRoots(input) } catch { return SwiftToolDispatcher.memoryFailure(error) }
+        // The teller of words a peer steered is the door that carried them, the one rule memory.commit keeps; the agent's own turn names any teller.
+        if roots != nil, let refusal = PeerDataTaintDispatcher.provenanceRefusal(
+            tool: "rewrite_memory", input: input, surface: surface, turn: turn, peerStore: AgentPeerStore(dataRoot: dataRoot)) {
+            return SwiftToolDispatcher.memoryFailure(ToolFailureError(refusal, argumentPath: "roots", effects: .none,
+                code: "memory_teller_steered", status: .refused,
+                instruction: "Restate each root as told by the door that started this turn, without since, or leave how you know it as it is.",
+                recovery: .correctArguments))
+        }
+        // The steer is the one fact outside the agent's say: words an untrusted agent steered, in this turn or in the memory's own roots, are never
+        // restated as the agent's own past.
+        // New wording is the agent's observation. The store's one root constructor attributes untrusted steering to its teller, as on commit;
+        // trusted principals remain recorded without turning the agent's own words into their telling. Unchanged words and metadata edits add none.
+        let context = MemoryWriteContext(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads,
+                                         telling: text == nil ? nil : MemoryRoot.Telling(how: .noticed))
+        let trust = MemoryDataProvenance.reading([row.extras], principals: context.through)
+        let steer = MemoryDataProvenance.steering(context.through, trust: trust) + MemoryDataProvenance.sources(in: row.extras, trust: trust)
+        if !steer.isEmpty, let restating = roots?.firstIndex(where: \.restatesOwnPast) {
+            let who = Array(Set(steer)).sorted().joined(separator: ", ")
+            return SwiftToolDispatcher.memoryFailure(ToolFailureError("""
+                These words came through \(who), so they stay its telling, dated when it told you. How and since when you know your own past is \
+                restated only for words no untrusted agent steered, in a turn none started.
+                """, argumentPath: "roots[\(restating)]", effects: .none,
+                code: "memory_restatement_steered", status: .refused,
+                instruction: "Leave this memory as it is, or restate that root as told by \(steer[0]) without since.", recovery: .correctArguments))
+        }
         var update: [String: JSONValue] = [:]
-        if case .object(let stamped)? = MemoryDataProvenance.stamping(.object(update), turn: turn) { update = stamped }
         if let text { update["text"] = .string(text) }
         if let pinned { update["pinned"] = .bool(pinned) }
         if restore {
@@ -247,16 +320,23 @@ public struct MemoryCuration: Sendable {
             if text == nil { update["text"] = .string(row.text) }
         }
         do {
-            let updated = try await memoryV2.updateMemory(id: row.id, update: .object(update),
-                context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads))
+            let (updated, changed) = try await memoryV2.updateMemory(id: row.id, update: .object(update), restating: roots, context: context)
+            // A write may introduce principals: read the committed row afresh, independently of its effect-time gate.
+            let resultTrust = MemoryDataProvenance.reading([updated.extras])
             var result: [String: JSONValue] = [
                 "status": .string("ok"),
+                // A rewrite whose words and roots end as stored writes nothing and adds no root.
+                "changed": .bool(changed),
                 "id": .string(updated.id),
                 "text": .string(updated.text),
                 "pinned": .bool(updated.pinned == true),
                 "memory_status": .string(updated.status ?? "active"),
+                "since": MemoryDataProvenance.firstKnown(updated.extras, trust: resultTrust).map(JSONValue.string) ?? .null,
+                "provenance": .string(MemoryDataProvenance.lead(updated.extras, trust: resultTrust)),
+                "roots": MemoryDataProvenance.rootsJSON(updated.extras, trust: resultTrust),
             ]
-            result.merge(MemoryDataProvenance.fields(in: updated.extras, dataRoot: dataRoot)) { _, value in value }
+            if !changed { result["note"] = .string(Self.unchangedNote(updated.extras, restated: roots != nil, trust: resultTrust)) }
+            result.merge(MemoryDataProvenance.fields(in: updated.extras, trust: resultTrust)) { _, value in value }
             return .object(result)
         } catch MemoryV2Error.recordNotFound {
             return ChatToolOutcome.failure(error: ToolFailureError(

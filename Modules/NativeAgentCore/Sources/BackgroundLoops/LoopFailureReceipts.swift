@@ -213,7 +213,7 @@ extension SwiftNativeLoopScheduler {
         await recordFailureOutcome(loopId: loopId, error: error)
     }
 
-    /// Noncompleted work preserves completion; cadence uses admission time, while real work keeps its completion time.
+    /// Skips update live status only; completed work owns durable cadence, completion and recovery evidence.
     func recordResult(
         loopId: String, result: String, completedWork: Bool = true, startedAt: Date? = nil
     ) async {
@@ -229,6 +229,7 @@ extension SwiftNativeLoopScheduler {
         st.tickCount += 1
         st.nextTickAt = (loops[loopId]?.loop.wake.period).map { (startedAt ?? now).addingTimeInterval($0) }
         states[loopId] = st
+        guard completedWork else { return }
         await recordDurableRun(loopId: loopId, at: startedAt ?? now)
         consecutiveFailures[loopId] = 0
         if failureRecoveryProbePending.contains(loopId),

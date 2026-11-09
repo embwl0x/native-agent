@@ -46,13 +46,10 @@ public actor UserMDGenerator {
     private let storage: MemoryStorage
     private let dataRoot: URL
     private let personaRoot: URL?
-    private let debounceInterval: TimeInterval
     private let nowProvider: @Sendable () -> Date
-    private var lastRegen: Date?
     private var pendingPersonas: Set<String> = []
-    /// Owns the deadline AND regeneration, until the flight actually exits.
+    /// One running projection drains mutations accepted while its write is suspended.
     private var pendingTask: Task<Void, Never>?
-    private var pendingTaskWaiting = false
     private var stopped = false
     private var shutdownTask: Task<Void, Never>?
 
@@ -60,13 +57,11 @@ public actor UserMDGenerator {
         storage: MemoryStorage,
         dataRoot: URL,
         personaRoot: URL? = nil,
-        debounceInterval: TimeInterval = 30,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.storage = storage
         self.dataRoot = dataRoot
         self.personaRoot = personaRoot
-        self.debounceInterval = debounceInterval
         self.nowProvider = now
     }
 
@@ -87,25 +82,19 @@ public actor UserMDGenerator {
     }
 
     /// Coalesced requests owe one trailing run rather than a second concurrent write.
-    @discardableResult
-    public func requestRegeneration(persona: String = MemoryV2Defaults.personaID) async throws -> URL? {
+    public func requestRegeneration(persona: String = MemoryV2Defaults.personaID) async throws {
         guard !stopped else { throw CancellationError() }
         guard onboardingHasCompleted else {
             throw UserMDGeneratorError.onboardingIncomplete
         }
         let projectionPersona = projectionPersona(for: persona)
-        if pendingTask != nil {
-            pendingPersonas.insert(projectionPersona)
-            return nil
-        }
-        if let last = lastRegen {
-            let elapsed = nowProvider().timeIntervalSince(last)
-            if elapsed < debounceInterval {
-                scheduleTrailingEdge(persona: projectionPersona, after: debounceInterval - elapsed)
-                return nil
+        pendingPersonas.insert(projectionPersona)
+        if pendingTask == nil {
+            pendingTask = Task {
+                await flushPending()
+                pendingTask = nil
             }
         }
-        return try await regenerateDocument(persona: projectionPersona)
     }
 
     /// The active document uses the stable runtime persona, independent of display names or mutation sources.
@@ -114,53 +103,26 @@ public actor UserMDGenerator {
         return MemoryV2Defaults.personaID
     }
 
-    private func scheduleTrailingEdge(persona: String, after delay: TimeInterval) {
-        guard delay.isFinite, delay >= 0,
-              let nanoseconds = UInt64(exactly: (delay * 1_000_000_000).rounded(.towardZero)) else {
-            nativeLog("UserMDGenerator: invalid trailing-edge delay %@", String(describing: delay))
-            return
-        }
-        pendingPersonas.insert(persona)
-        guard pendingTask == nil else { return }
-        pendingTaskWaiting = true
-        pendingTask = Task {
-            defer {
-                pendingTaskWaiting = false
-                pendingTask = nil
-                if !stopped, let persona = pendingPersonas.first {
-                    let elapsed = lastRegen.map { nowProvider().timeIntervalSince($0) } ?? debounceInterval
-                    scheduleTrailingEdge(persona: persona, after: max(0, debounceInterval - elapsed))
+    private func flushPending() async {
+        while !pendingPersonas.isEmpty {
+            let personas = pendingPersonas
+            pendingPersonas.removeAll()
+            for persona in personas {
+                do {
+                    _ = try await regenerateDocument(persona: persona)
+                } catch {
+                    // regenerateDocument retains the exact failure through RepairOwed.
+                    nativeLog("UserMDGenerator: regeneration failed for %@: %@", persona, String(describing: error))
                 }
             }
-            do {
-                try await Task.sleep(nanoseconds: nanoseconds)
-                try Task.checkCancellation()
-            }
-            catch { return }
-            pendingTaskWaiting = false
-            await flushPending()
         }
     }
 
-    private func flushPending() async {
-        let personas = pendingPersonas
-        pendingPersonas.removeAll()
-        for persona in personas {
-            do {
-                _ = try await regenerateDocument(persona: persona)
-            } catch {
-                nativeLog("UserMDGenerator: trailing-edge regeneration failed for %@: %@",
-                      persona, String(describing: error))
-            }
-        }
-    }
-
-    /// Stop future pokes, cancel only a sleeping deadline, then flush accepted requests. A regeneration already writing is joined without cancellation.
+    /// Stop future pokes and join the projection owner through every accepted write.
     public func shutdown() async {
         if let shutdownTask { await shutdownTask.value; return }
         guard !stopped else { return }
         stopped = true
-        if pendingTaskWaiting { pendingTask?.cancel() }
         let trailing = pendingTask
         let drain = Task {
             await trailing?.value
@@ -186,7 +148,7 @@ public actor UserMDGenerator {
         let manifestPath = dataRoot.appendingPathComponent("onboarding/pending-completion.json")
         // Match onboarding's lock order and hold its manifest lock from the completion check through replacement of the derived document.
         do {
-            let generatedAt = try await SwiftNativePersistenceCore.withFileLock(manifestPath) { [self, storage, nowProvider, target] in
+            try await SwiftNativePersistenceCore.withFileLock(manifestPath) { [self, storage, nowProvider, target] in
                 guard onboardingHasCompleted else {
                     throw UserMDGeneratorError.onboardingIncomplete
                 }
@@ -201,14 +163,10 @@ public actor UserMDGenerator {
                     let existing = try Self.loadPreambleForRegeneration(at: target)
                     let payload = Self.assemble(preamble: existing.preamble, body: body)
                     try Self.atomicReplaceIfChanged(payload, existingBytes: existing.bytes, at: target)
-                    return now
                 }
             }
-            lastRegen = generatedAt
             RepairOwed.settle(dataRoot, operation: "memory.user_projection", evidence: .init(source: "memory", id: projectionPersona))
             return target
-        } catch UserMDGeneratorError.onboardingIncomplete {
-            throw UserMDGeneratorError.onboardingIncomplete  // expected on a blank install; onboarding supplies the initial content
         } catch {
             RepairOwed.owe(dataRoot, id: "user-projection:" + UUID().uuidString, kind: .act, operation: "memory.user_projection",
                 owner: target.path, words: "USER.md regeneration failed: \(error)")
@@ -240,7 +198,8 @@ public actor UserMDGenerator {
     }
 
     static func userFacts(memories: [StoredMemory], now: Date = Date(), dataRoot: URL) -> some Sequence<String> {
-        memories.lazy.compactMap { m -> String? in
+        let trust = MemoryDataProvenance.reading(memories.map(\.metadata))
+        return memories.lazy.compactMap { m -> String? in
             // Admit only known person kinds; excluded kinds remain recallable outside USER.md.
             guard let kind = MemoryRecallScoring.kind(of: m.metadata),
                   Self.userIdentityKinds.contains(kind) else { return nil }
@@ -261,7 +220,7 @@ public actor UserMDGenerator {
             )
             guard !content.isEmpty else { return nil }
             return MemoryDataProvenance.presentation(
-                MemorySenseProvenance.presentation(content, metadata: m.metadata), metadata: m.metadata, dataRoot: dataRoot)
+                MemorySenseProvenance.presentation(content, metadata: m.metadata), metadata: m.metadata, trust: trust)
         }
     }
 

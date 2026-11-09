@@ -279,26 +279,6 @@ public enum ProviderRoutingError: Error, LocalizedError {
 
 // MARK: - Resolved surface preferences
 
-/// Group members share a unanimous override or inherit Chat's model/account with independent effort/tier; partial/conflicting tuples remain unavailable.
-public struct SurfacePreference: Sendable, Codable, Equatable {
-    public var surface: String
-    public var model: String
-    public var reasoningEffort: String
-    public var serviceTier: String
-
-    public init(
-        surface: String,
-        model: String,
-        reasoningEffort: String,
-        serviceTier: String = "default"
-    ) {
-        self.surface = surface
-        self.model = model
-        self.reasoningEffort = reasoningEffort
-        self.serviceTier = serviceTier
-    }
-}
-
 /// Read back the canonical group after commit.
 public struct ProviderGroupWriteResult: Sendable {
     public let surfacesChanged: [String]
@@ -322,68 +302,24 @@ public struct ProviderCatalogSnapshot: Sendable {
     public let rowSet: ProviderSurfaceRowSet
 }
 
-/// Execution consumes one reconciled picker tuple so model, route and pins cannot come from different commits.
-public struct ProviderRoutingSnapshot: Sendable, Equatable {
-    /// The checked picker files' committed source revision, read under their lock.
-    public let revision: Double
-    public let preferences: [String: SurfacePreference]
-    public let activeProviders: [String: String]
-    public let pinnedModels: [String: String]
-    /// Model/account inheritance is independent of effort and Fast.
-    public var modelOverrideSurfaces: Set<String> {
-        Set(pinnedModels.keys).union(preferences.keys.filter { surface in
-            surface != "chat" && (preferences[surface]?.model != preferences["chat"]?.model
-                || (activeProviders[surface] ?? activeProviders["chat"]) != activeProviders["chat"])
-        })
-    }
-    /// Unusable saved picks leave the surface unset with a reason; no replacement is selected.
-    public let unusablePicks: [String: String]
-
-    public init(
-        preferences: [String: SurfacePreference],
-        activeProviders: [String: String],
-        pinnedModels: [String: String],
-        unusablePicks: [String: String] = [:],
-        revision: Double = 0
-    ) {
-        self.revision = revision
-        self.preferences = preferences
-        self.activeProviders = activeProviders
-        self.pinnedModels = pinnedModels
-        self.unusablePicks = unusablePicks
-    }
-
-    /// An unset surface must name why its saved model cannot run.
+extension ProviderRoutingSnapshot {
+    /// An unset surface names why its saved model cannot run.
     public func unusablePickNotice(for surface: String) -> String? {
         ProviderRoutingSurfaceLookup.value(unusablePicks, surface)
     }
 }
 
+extension ProviderSurfaceRowSet {
+    public init(surfacePreferenceKeys: Set<String>, activeProviderKeys: Set<String>) {
+        let stored = Set(surfacePreferenceKeys.union(activeProviderKeys).map(canonicalRoutingSurface))
+        self.init(visibleSurfaces: MODEL_SURFACES, unsupportedStoredKeys: stored.subtracting(Set(MODEL_SURFACES)).sorted())
+    }
+}
 // MARK: - Routing vocabulary
 
 /// One group inventory governs all model consumers. Model/account inherit only with no override; effort/tier mutate independently, and partial/conflicting
 /// tuples remain unavailable.
 public let MODEL_SURFACES: [String] = ProviderSurfaceGroups.all.flatMap(\.surfaces)
-
-/// Unsupported saved keys remain visible as adverse state.
-public struct ProviderSurfaceRowSet: Sendable, Equatable {
-    public let visibleSurfaces: [String]
-    public let unsupportedStoredKeys: [String]
-
-    public init(
-        surfacePreferenceKeys: Set<String>,
-        activeProviderKeys: Set<String>
-    ) {
-        let stored = Set(surfacePreferenceKeys
-            .union(activeProviderKeys)
-            .map(canonicalRoutingSurface))
-        let visible = Set(MODEL_SURFACES)
-        self.visibleSurfaces = MODEL_SURFACES
-        self.unsupportedStoredKeys = stored
-            .subtracting(visible)
-            .sorted()
-    }
-}
 
 /// Normalize current surface spelling consistently; unsupported names fail admission.
 public func canonicalRoutingSurface(_ surface: String) -> String {
@@ -396,17 +332,6 @@ public let SERVICE_TIER_OPTIONS: [String] = ["default", "priority"]
 
 /// Default effort still requires model/account compatibility admission.
 public let DEFAULT_REASONING_EFFORT: String = "high"
-
-extension SwiftNativeProviderRouting {
-    /// Context sizing may look up a model independently of selection.
-    public func modelStringForSurface(_ surface: String) async throws -> String? {
-        let prefs = try await computeModelPreferences()
-        if let m = ProviderRoutingSurfaceLookup.value(prefs, surface)?.model, !m.isEmpty {
-            return m
-        }
-        return nil
-    }
-}
 
 /// Surface maps read the current normalized name only.
 public enum ProviderRoutingSurfaceLookup {

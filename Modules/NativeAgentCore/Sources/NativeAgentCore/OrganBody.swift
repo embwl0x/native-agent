@@ -52,8 +52,7 @@ public struct OrganBody: Sendable, Equatable {
 
     // MARK: Felt memory
 
-    /// What a deviation was when it was last felt. The same deviation (kind and onset) is felt again only once its size has doubled, so a lasting fault
-    /// is felt at its start and as it grows, never on every read.
+    /// The last felt deviation's identity and size; repeated reads of that same evidence do not repeat its signal.
     public struct Mark: Codable, Sendable, Equatable {
         public let kind: OrganRecord.Deviation.Kind
         /// Whole seconds: the loop-state file keeps beats at that precision, so an onset read after a relaunch is the same onset.
@@ -75,11 +74,11 @@ public struct OrganBody: Sendable, Equatable {
         }
     }
 
-    /// The deviations `marks` has not felt: new, changed in kind or onset, or doubled since they were felt.
+    /// New deviations and changes in their kind, onset or size.
     public func unfelt(_ marks: [String: Mark]) -> [Line] {
         felt.filter { line in
             guard let deviation = line.deviation, let mark = marks[line.organ], mark.names(deviation) else { return true }
-            return deviation.size >= 2 * max(1, mark.size)
+            return deviation.size != mark.size
         }
     }
 

@@ -6,7 +6,7 @@ import PersistenceCore
 
 // Blueprint: | `CognitiveSelfKnowledge.swift` | Evidence-linked nightly self reading; cached, epoch-checked atomic mind/self.json |
 
-/// The agent's night reading of its own care stories, never a second persona or fact store.
+/// The agent's reading of its own care stories, never a second persona or fact store.
 public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
     public struct Trait: Codable, Sendable, Equatable {
         public var when: String
@@ -54,6 +54,8 @@ public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
     public var people: [Person]
     /// Capture order belongs to the reading, never its later save; nil provides no ordering evidence.
     public var readAt: Date? = nil
+    /// Accepted stance progress belongs to each care; delayed evidence on another care remains unread.
+    public var stanceReadAt: [String: Date]? = nil
 
     public static func path(_ root: URL) -> URL { root.appendingPathComponent("mind/self.json") }
 
@@ -110,6 +112,7 @@ public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
         }
         let value = try JSONDecoder().decode(Self.self, from: data)
         guard value.version == 1, !value.night.isEmpty, value.night.count <= 160,
+              (value.stanceReadAt ?? [:]).allSatisfy({ UUID(uuidString: $0.key) != nil && $0.value.timeIntervalSince1970.isFinite }),
               value.traits.count <= 5, value.story.count <= 5, value.people.count <= maximumPeople,
               value.traits.allSatisfy({ trait in
                   words(.string(trait.when), limit: 120) != nil && words(.string(trait.iTendTo), limit: 160) != nil
@@ -137,7 +140,96 @@ public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
     }
 }
 
+/// A turn's own signature and relationship, outside competition for a felt cue.
+public struct CognitiveTurnSelf: Sendable, Equatable {
+    public var trait: String?
+    public var withPerson: String?
+    public var unavailable: String?
+}
+
 extension CognitiveSubstrate {
+    /// The capsule supplies its admitted reachable cares; this read needs no message match, file access or presentation ledger.
+    public func turnSelf(for speaker: String?, from read: CognitiveFrozenRead, among reachable: [CognitiveCare]) -> CognitiveTurnSelf {
+        guard read.configuration.enabled else { return CognitiveTurnSelf(unavailable: "Inner life is off.") }
+        guard read.mindEpoch == mindEpoch, !forgettingInFlight else {
+            return CognitiveTurnSelf(unavailable: "The self reading is outside this turn's mind epoch.")
+        }
+        if let failure = selfKnowledgeReadFailure { return CognitiveTurnSelf(unavailable: failure) }
+        let inventory = Dictionary(read.cares.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let reachableIDs = Set(reachable.map(\.id))
+        let trait = read.selfTraits.first { trait in
+            !trait.shownBy.isEmpty && trait.shownBy.allSatisfy { reference in
+                guard let surviving = CognitiveSelfKnowledge.survivorReference(reference, among: inventory),
+                      let id = CognitiveSelfKnowledge.careID(for: surviving) else { return false }
+                return reachableIDs.contains(id)
+            }
+        }
+        let person = speaker.map { CognitiveCareProvenance.personKey($0, aliases: read.carePersonAliases) }
+            .flatMap { read.carePeopleAvailable || CognitiveCareProvenance.independentPersonKey($0) ? $0 : nil }
+        return CognitiveTurnSelf(trait: trait?.line, withPerson: person.flatMap { read.personLines[$0] })
+    }
+
+    /// Care stories retain the accepted position before this save, so a refold can finish it without another interpretation.
+    func settleLivedSelf(_ ids: [UUID], at now: Date) async throws {
+        await waitForMaintenanceTransition()
+        guard configuration.enabled, configuration.persistenceEnabled, !forgettingInFlight else { throw CognitiveWriteDiscarded() }
+        guard !ids.isEmpty else { return }
+        var progress: [String: Date] = [:]
+        for (key, at) in selfKnowledge?.stanceReadAt ?? [:] {
+            guard let id = UUID(uuidString: key), let survivor = CognitiveCare.survivorID(for: id, among: cares) else { continue }
+            let key = survivor.uuidString
+            progress[key] = progress[key].map { max($0, at) } ?? at
+        }
+        var changes: [(UUID, CognitiveCare.Moment)] = []
+        for care in ids.compactMap({ cares[$0] }) {
+            let readAt: Date? = progress[care.id.uuidString]
+            for moment in care.story where moment.stanceChange != nil {
+                if let readAt, moment.at <= readAt { continue }
+                changes.append((care.id, moment))
+            }
+        }
+        changes.sort { left, right in
+            left.1.at != right.1.at ? left.1.at < right.1.at : left.0.uuidString < right.0.uuidString
+        }
+        guard !changes.isEmpty || unsavedStages.contains("mind.self") else { return }
+        if let failure = selfKnowledgeReadFailure {
+            throw CognitiveCareNotSaved(detail: "mind/self.json is unreadable; preserved for repair: \(failure)")
+        }
+        var reading = selfKnowledge
+        for (id, moment) in changes {
+            guard let stance = moment.stanceChange,
+                  let reference = CognitiveSelfKnowledge.reference(moment, in: id),
+                  let entry = CognitiveSelfKnowledge.Story(.object([
+                    "line": .string(stance.text.split(whereSeparator: { (c: Character) in c.isNewline }).joined(separator: " ")), "shown_by": .array([.string(reference)]),
+                  ])) else {
+                throw CognitiveCareNotSaved(detail: "The accepted care stance has no encodable self-story evidence.")
+            }
+            progress[id.uuidString] = moment.at
+            if reading?.story.contains(where: { $0.shownBy.contains(reference) }) == true {
+                reading?.stanceReadAt = progress
+                continue
+            }
+            var story = reading?.story ?? []
+            story.insert(entry, at: 0)
+            reading = CognitiveSelfKnowledge(mindEpoch: mindEpoch, night: moment.source, writtenAt: now,
+                traits: reading?.traits ?? [], story: Array(story.prefix(5)), people: reading?.people ?? [],
+                readAt: reading?.readAt.map { max($0, moment.at) } ?? moment.at, stanceReadAt: progress)
+        }
+        guard let value = reading, value != selfKnowledge || unsavedStages.contains("mind.self") else { return }
+        try await checkingPersistence("mind.self") {
+            guard value.mindEpoch == mindEpoch, !forgettingInFlight else { throw CognitiveWriteDiscarded() }
+            guard !persistenceHealth.writesBlocked else {
+                throw CognitivePersistenceError.writesBlocked(status: persistenceHealth.status, detail: persistenceHealth.failureDetail)
+            }
+            selfKnowledge = value
+            cacheSelfPeople()
+            try value.save(conversationDataRoot)
+        }
+        await recordReceipt(kind: "cares.self", payload: .object([
+            "source": .string(value.night), "story": .int(Int64(value.story.count)),
+        ]))
+    }
+
     /// Called on restore and address-book invalidation, never from a turn.
     public func refreshCarePeople() async {
         await waitForMaintenanceTransition()
@@ -181,6 +273,12 @@ extension CognitiveSubstrate {
                 throw error
             }
         }
+        if selfKnowledgeReadFailure == nil, configuration.enabled, configuration.persistenceEnabled, !persistenceHealth.writesBlocked {
+            do { try await settleLivedSelf(Array(cares.keys), at: dependencies.now()) }
+            catch {
+                await recordReceipt(kind: "cares.self_unavailable", payload: .object(["error": .string(String(describing: error))]))
+            }
+        }
     }
 
     func settleSelfKnowledge(_ night: CognitiveCareNight, at now: Date) async throws {
@@ -208,9 +306,15 @@ extension CognitiveSubstrate {
         }
         var seen = Set<String>()
         let people = night.people.filter { night.selfPeople.contains($0.person) && seen.insert($0.person).inserted }
+        var progress = selfKnowledge?.stanceReadAt ?? [:]
+        for care in night.keys.values {
+            if let at = care.story.last(where: { $0.stanceChange != nil })?.at {
+                progress[care.id.uuidString] = progress[care.id.uuidString].map { max($0, at) } ?? at
+            }
+        }
         let value = CognitiveSelfKnowledge(mindEpoch: mindEpoch, night: night.source, writtenAt: now,
             traits: Array(traits.prefix(5)), story: Array(story.prefix(5)),
-            people: Array(people.prefix(CognitiveSelfKnowledge.maximumPeople)), readAt: night.readAt)
+            people: Array(people.prefix(CognitiveSelfKnowledge.maximumPeople)), readAt: night.readAt, stanceReadAt: progress)
         try await checkingPersistence("mind.self") {
             guard value.mindEpoch == mindEpoch, !forgettingInFlight else { throw CognitiveWriteDiscarded() }
             guard !persistenceHealth.writesBlocked else {
@@ -294,19 +398,19 @@ extension CognitiveSubstrate {
         remaining += 16_000
 
         // Include recent changes even when that care was quiet today. They are actual prior depth/stance entries, never predictions of tonight's pass.
-        let changed = cares.values.filter { $0.story.contains { $0.depthChange != nil || $0.felt == "changed my mind" } }
+        let changed = cares.values.filter { $0.story.contains { $0.depthChange != nil || $0.stanceChange != nil || $0.felt == "changed my mind" } }
             .sorted { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id.uuidString < $1.id.uuidString }
         var candidates = Array(keys.values)
         for care in changed.prefix(10) where !candidates.contains(where: { $0.id == care.id }) { candidates.append(care) }
         candidates.sort { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id.uuidString < $1.id.uuidString }
         _ = append("--- YOUR CARE STORIES (a bounded retained window; read your if-then signature from what really happened) ---")
         for care in candidates.prefix(48) {
-            let changes = care.story.filter { $0.depthChange != nil || $0.felt == "changed my mind" }.suffix(5)
+            let changes = care.story.filter { $0.depthChange != nil || $0.stanceChange != nil || $0.felt == "changed my mind" }.suffix(5)
             let recent = care.story.filter { $0.moved != 0 }.suffix(3)
             var rows: [(reference: String, line: String, change: Bool)] = []
             for moment in Array(recent) + Array(changes) {
                 guard let ref = CognitiveSelfKnowledge.reference(moment, in: care.id) else { continue }
-                let change = moment.depthChange != nil || moment.felt == "changed my mind"
+                let change = moment.depthChange != nil || moment.stanceChange != nil || moment.felt == "changed my mind"
                 let depth = moment.depthChange.map { " | depth: \($0.from.rawValue) → \($0.to.rawValue)" } ?? ""
                 rows.append((ref, """
                     \(ref): \(NativeTimestampFormat.calendarDay(moment.at)) | \(moment.by.rawValue)\(moment.who.map { " (\($0))" } ?? "") | moved \
@@ -323,8 +427,8 @@ extension CognitiveSubstrate {
             You may return \"traits\": at most 5 {\"when\": \"<condition, at most 120 characters>\", \"i_tend_to\": \"<your tendency, at most 160 \
             characters>\", \"shown_by\": [\"<shown care UUID or exact story reference>\"]}. Read them afresh tonight: a trait the shown stories no longer \
             support drops. Never invent adjectives or evidence. You may also return \"story\": at most 5 {\"line\": \"<one line in your voice, at most 400 \
-            characters, telling how you changed>\", \"shown_by\": [\"<exact depth-change or changed-my-mind story reference>\"]}. Each shown_by has 1–8 \
-            references. These optional fields replace your previous night's reading; omit or use [] when there is nothing supported to say.
+            characters, telling how you changed>\", \"shown_by\": [\"<exact change story reference>\"]}. Each shown_by has 1–8 references to depth changes, \
+            changed-my-mind or accepted-stance entries. These optional fields replace your previous night's reading; omit or use [] when unsupported.
             """)
         return (lines, storyRefs, changeRefs, people)
     }

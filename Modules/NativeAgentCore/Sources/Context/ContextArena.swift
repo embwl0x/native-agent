@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ContextArena.swift` | `ContextArena`: bounded generations, leases and pressure |
+// Blueprint: | `ContextArena.swift` | `ContextArena`: bounded generations, leases, pressure and post-lock health invalidations |
 
 public enum ContextArenaBudget: Int, CaseIterable, Sendable, Codable {
     case mib32 = 32
@@ -258,6 +258,7 @@ public final class ContextArena: @unchecked Sendable {
 
     public let budget: ContextArenaBudget
     public let hotTierByteLimit: Int
+    public let healthEvents: ContextHealthEvents
 
     private struct PublishedSnapshot {
         let sequence: UInt64
@@ -283,7 +284,8 @@ public final class ContextArena: @unchecked Sendable {
 
     public init(
         budget: ContextArenaBudget = .default,
-        hotTierByteLimit: Int = ContextArena.defaultHotTierByteLimit
+        hotTierByteLimit: Int = ContextArena.defaultHotTierByteLimit,
+        healthEvents: ContextHealthEvents = ContextHealthEvents()
     ) throws {
         guard hotTierByteLimit > 0,
               hotTierByteLimit <= Self.defaultHotTierByteLimit,
@@ -293,6 +295,7 @@ public final class ContextArena: @unchecked Sendable {
         }
         self.budget = budget
         self.hotTierByteLimit = hotTierByteLimit
+        self.healthEvents = healthEvents
     }
 
     public func currentSnapshot() -> ContextGenerationSnapshot? {
@@ -304,7 +307,8 @@ public final class ContextArena: @unchecked Sendable {
     @discardableResult
     public func publish(_ candidate: ContextGenerationSnapshot) -> ContextArenaPublicationOutcome {
         lock.lock()
-        defer { lock.unlock() }
+        var changed = false
+        defer { lock.unlock(); if changed { healthEvents.signal() } }
 
         if let currentGeneration = state.current?.snapshot.generationID,
            candidate.generationID <= currentGeneration {
@@ -325,6 +329,7 @@ public final class ContextArena: @unchecked Sendable {
 
         let previousGeneration = state.current?.snapshot.generationID
         state.current = makePublishedSnapshot(candidate)
+        changed = true
         return .published(
             generationID: candidate.generationID,
             previousGenerationID: previousGeneration
@@ -337,7 +342,8 @@ public final class ContextArena: @unchecked Sendable {
         _ candidate: ContextGenerationSnapshot
     ) -> ContextArenaPublicationOutcome {
         lock.lock()
-        defer { lock.unlock() }
+        var changed = false
+        defer { lock.unlock(); if changed { healthEvents.signal() } }
 
         guard let current = state.current?.snapshot else {
             return .retainedLastGood(
@@ -380,6 +386,7 @@ public final class ContextArena: @unchecked Sendable {
         }
 
         state.current = makePublishedSnapshot(candidate)
+        changed = true
         return .rehydrated(generationID: candidate.generationID)
     }
 
@@ -397,6 +404,7 @@ public final class ContextArena: @unchecked Sendable {
         active.leaseCount += 1
         state.activeSnapshots[published.sequence] = active
         lock.unlock()
+        healthEvents.signal()
 
         return ContextGenerationLease(snapshot: published.snapshot) { [weak self] in
             self?.releaseLease(sequence: published.sequence)
@@ -406,11 +414,13 @@ public final class ContextArena: @unchecked Sendable {
     @discardableResult
     public func applyMemoryPressure(_ pressure: ContextArenaPressure) throws -> ContextArenaTrimReceipt {
         lock.lock()
-        defer { lock.unlock() }
+        var changed = false
+        defer { lock.unlock(); if changed { healthEvents.signal() } }
         guard let current = state.current else {
             throw ContextArenaError.noPublishedSnapshot
         }
 
+        changed = state.pressure != pressure
         state.pressure = pressure
         state.prewarmingAllowed = pressure == .normal
         // Descriptors cannot free payload retained by the generation owner; pressure closes optional prewarming only.
@@ -475,7 +485,8 @@ public final class ContextArena: @unchecked Sendable {
 
     private func releaseLease(sequence: UInt64) {
         lock.lock()
-        defer { lock.unlock() }
+        var changed = false
+        defer { lock.unlock(); if changed { healthEvents.signal() } }
         guard var active = state.activeSnapshots[sequence] else { return }
         active.leaseCount -= 1
         if active.leaseCount == 0 {
@@ -483,6 +494,7 @@ public final class ContextArena: @unchecked Sendable {
         } else {
             state.activeSnapshots[sequence] = active
         }
+        changed = true
     }
 
     private func pinnedGenerationsLocked() -> [Int64: Int] {

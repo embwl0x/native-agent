@@ -120,12 +120,12 @@ package enum FileSystemActions {
         var obj: [String: JSONValue] = ["ok": .bool(false), "error": .string(message)]
         if let code { obj["error_code"] = .string(code) }
         if let folder { obj["folder"] = .string(folder) }
-        if let path, let pathKind {
-            obj["path"] = .string(path.path); obj["path_kind"] = .string(pathKind)
-            if pathKind == "missing" {
-                var directory: ObjCBool = false
-                let exists = FileManager.default.fileExists(atPath: path.deletingLastPathComponent().path, isDirectory: &directory)
-                obj["parent_exists"] = .bool(exists && directory.boolValue)
+        if let path {
+            obj["path"] = .string(path.path)
+            let kind = code == "file_not_found" ? "missing" : pathKind
+            if let kind { obj["path_kind"] = .string(kind) }
+            if kind == "missing" {
+                obj.merge(VerifiedPath.missingReadEvidence(path)) { _, value in value }
             }
         }
         return .object(obj)

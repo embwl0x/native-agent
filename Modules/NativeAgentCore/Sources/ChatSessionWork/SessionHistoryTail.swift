@@ -23,21 +23,29 @@ package struct SessionHistoryTail: Sendable {
     package init(_ admission: SessionHistoryMessages.Admission, rowCharacters: [String: Int]) {
         self.admission = admission
         var prefix = [0]
-        var runEnds: [String: Int] = [:]
         for (index, entry) in admission.renderables.enumerated() {
             prefix.append(prefix[index] + (rowCharacters[entry.row.historyIdentity] ?? 0))
-            if let run = entry.row.runId, !run.isEmpty { runEnds[run] = index }
         }
         prefixCharacters = prefix
-        var starts: [Int] = []
-        var heldThrough = -1
-        for (index, entry) in admission.renderables.enumerated() {
-            if index > 0, index > heldThrough, entry.row.role == "user", !entry.row.isTool { starts.append(index) }
-            if let run = entry.row.runId, let end = runEnds[run] { heldThrough = max(heldThrough, end) }
-        }
+        var starts = Self.turnStarts(admission.renderables.map(\.row))
         // The end of prior history is the current turn's start, including a single oversized prior turn.
         if !admission.renderables.isEmpty { starts.append(admission.renderables.count) }
         self.starts = starts
+    }
+
+    /// A whole turn starts at a person's row that no earlier run still holds; the first row opens the first turn.
+    static func turnStarts(_ rows: [SessionHistoryPromptRenderer.Renderable]) -> [Int] {
+        var runEnds: [String: Int] = [:]
+        for (index, row) in rows.enumerated() {
+            if let run = row.runId, !run.isEmpty { runEnds[run] = index }
+        }
+        var starts: [Int] = []
+        var heldThrough = -1
+        for (index, row) in rows.enumerated() {
+            if index > 0, index > heldThrough, row.role == "user", !row.isTool { starts.append(index) }
+            if let run = row.runId, let end = runEnds[run] { heldThrough = max(heldThrough, end) }
+        }
+        return starts
     }
 
     package static func select(_ messages: [ChatMessage], beforeQuestionID: String? = nil,
@@ -75,7 +83,19 @@ package struct SessionHistoryTail: Sendable {
     }
 
     package static func halfBudgetCharacters(windowTokens: Int, outputTokens: Int) -> Int {
-        max(1, Int(Double(max(0, windowTokens - outputTokens)) * ContextBudgetPolicy.transcriptCharactersPerToken / 2))
+        max(1, Int(Double(ContextBudgetPolicy.inputTokens(windowTokens: windowTokens, outputTokens: outputTokens))
+            * ContextBudgetPolicy.transcriptCharactersPerToken / 2))
+    }
+
+    /// Skip checkpoints whose remaining row bodies cannot fit, without constructing their messages or measuring requests.
+    /// Keep the final whole-turn start when even an empty history cannot make the current input fit.
+    package func fittingCheckpoints(halfBudgetCharacters: Int, maximumRetainedCharacters: Double,
+                                   afterCharacters: Int = -1) -> ArraySlice<Checkpoint> {
+        let candidates = checkpoints(halfBudgetCharacters: halfBudgetCharacters).filter { $0.characters > afterCharacters }
+        guard let first = candidates.firstIndex(where: { Double(characters - $0.characters) <= maximumRetainedCharacters }) else {
+            return candidates.suffix(1)
+        }
+        return candidates[first...]
     }
 
     package func project(after checkpoint: Checkpoint) -> SessionHistoryMessages.Result {

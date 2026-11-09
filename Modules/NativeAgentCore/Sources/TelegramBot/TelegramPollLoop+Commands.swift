@@ -5,7 +5,7 @@ import ChatTurnRuntime
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `TelegramPollLoop+Commands.swift` | `TelegramPollLoop`, `handleControlHandoff`, `clearQueueAcknowledgement`, `handleSlashCommand` |
+// Blueprint: | `TelegramPollLoop+Commands.swift` | `TelegramPollLoop`: verified command admission and explicit saved-answer resends |
 // Commands and callbacks carry verified sender, surface and work identity; Telegram has no command-signature scheme.
 
 extension TelegramPollLoop {
@@ -25,24 +25,14 @@ extension TelegramPollLoop {
         let (turnId, card) = await turnCoordinator.prepareControlHandoff(destination: message.destination)
         await revokeDriverControl()
         admissionReady()
-        let outcome = await requestLiveTurnStop(
+        let settlement = await requestLiveTurnStop(
             destination: message.destination, turnId: turnId ?? UUID(), pauseQueuedTurns: true
         )
+        let outcome = await settlement.value
         let activity = await card?.snapshot().state.activities.last(where: { !$0.phase.isTerminal })?.detail
         let reply = UserMessageIntentSignals.controlHandoffReply(lastActivity: activity)
             + (outcome == .outcomeUnknown ? " Turn cancellation is not yet confirmed." : "")
         await sendCommandReply(reply, kind: "control_handoff", update: update, message: message, text: text)
-    }
-
-    func clearQueueAcknowledgement(chatId: Int, messageId: Int) async {
-        do { try await Self.defaultDeleteMessage(token, chatId, messageId) }
-        catch {
-            await recordError(context: "queue_acknowledgement_delete", error:
-                """
-                    Queue acknowledgement \(messageId) in chat \(chatId) could not be removed: \(error). The turn has started; inspect \
-                    that message before removing it. Do not repeat the turn.
-                    """)
-        }
     }
 
     /// True transfers claim settlement to a tracked turn; ordinary commands leave settlement with the poll loop.
@@ -86,7 +76,8 @@ extension TelegramPollLoop {
 
         switch parsed.definition.handler {
         case .stop:
-            let outcome = await requestLiveTurnStop(destination: message.destination)
+            let settlement = await requestLiveTurnStop(destination: message.destination)
+            let outcome = await settlement.value
             switch outcome {
             case .confirmed:
                 await recordReceipt(
@@ -164,12 +155,13 @@ extension TelegramPollLoop {
             chatId: parsed.chatId, fromUserId: parsed.fromUserId)
         guard authorization != .allowlistEmpty else {
             await recordBlocked(reason: "allowlist_empty_fail_closed", update: update, message: nil, text: nil)
-            try? await answerCallbackQuery(token, parsed.callbackId, "Telegram allowlist is empty — add an approved sender in settings.")
+            await answerRecordedCallback(parsed.callbackId, text: "Telegram allowlist is empty — add an approved sender in settings.",
+                context: "model_callback_answer", update: update)
             return true
         }
         guard authorization == .allowed else {
             await recordBlocked(reason: "not_allowlisted", update: update, message: nil, text: nil)
-            try? await answerCallbackQuery(token, parsed.callbackId, "This Telegram chat is not allowlisted.")
+            await answerRecordedCallback(parsed.callbackId, text: "This Telegram chat is not allowlisted.", context: "model_callback_answer", update: update)
             return true
         }
 
@@ -183,7 +175,8 @@ extension TelegramPollLoop {
         let menu: TelegramModelMenu
         do { menu = try await bot.telegramModelMenuForSurface("telegram") }
         catch {
-            try? await answerCallbackQuery(token, parsed.callbackId, "Model menu unavailable: \(error.localizedDescription)")
+            await answerRecordedCallback(parsed.callbackId, text: "Model menu unavailable: \(error.localizedDescription)",
+                context: "model_callback_answer", update: update)
             return true
         }
         let providers = menu.providers
@@ -199,9 +192,9 @@ extension TelegramPollLoop {
                     presentation.text,
                     presentation.markup
                 )
-                try? await answerCallbackQuery(token, parsed.callbackId, "Choose a provider.")
+                await answerRecordedCallback(parsed.callbackId, text: "Choose a provider.", context: "model_callback_answer", update: update)
             } catch {
-                try? await answerCallbackQuery(token, parsed.callbackId, "Could not update model menu.")
+                await answerRecordedCallback(parsed.callbackId, text: "Could not update model menu.", context: "model_callback_answer", update: update)
                 await recordError(context: "model_menu_callback_edit", error: String(describing: error), update: update, message: nil, text: nil)
             }
             return true
@@ -211,11 +204,11 @@ extension TelegramPollLoop {
                 TelegramModelSelectionCallback.selectionKey(providers[$0].id) == key
             }
             guard matches.count == 1, let providerIndex = matches.first else {
-                try? await answerCallbackQuery(token, parsed.callbackId, "That provider is no longer available.")
+                await answerRecordedCallback(parsed.callbackId, text: "That provider is no longer available.", context: "model_callback_answer", update: update)
                 return true
             }
             if let issue = providers[providerIndex].catalogIssue {
-                try? await answerCallbackQuery(token, parsed.callbackId, "Model catalog unavailable: \(issue)")
+                await answerRecordedCallback(parsed.callbackId, text: "Model catalog unavailable: \(issue)", context: "model_callback_answer", update: update)
                 return true
             }
             do {
@@ -227,9 +220,9 @@ extension TelegramPollLoop {
                     presentation.text,
                     presentation.markup
                 )
-                try? await answerCallbackQuery(token, parsed.callbackId, "Choose a model.")
+                await answerRecordedCallback(parsed.callbackId, text: "Choose a model.", context: "model_callback_answer", update: update)
             } catch {
-                try? await answerCallbackQuery(token, parsed.callbackId, "Could not open model list.")
+                await answerRecordedCallback(parsed.callbackId, text: "Could not open model list.", context: "model_callback_answer", update: update)
                 await recordError(context: "model_provider_callback_edit", error: String(describing: error), update: update, message: nil, text: nil)
             }
             return true
@@ -239,18 +232,18 @@ extension TelegramPollLoop {
                 TelegramModelSelectionCallback.selectionKey($0.id) == providerKey
             }
             guard matchingProviders.count == 1, let provider = matchingProviders.first else {
-                try? await answerCallbackQuery(token, parsed.callbackId, "That provider is no longer available.")
+                await answerRecordedCallback(parsed.callbackId, text: "That provider is no longer available.", context: "model_callback_answer", update: update)
                 return true
             }
             if let issue = provider.catalogIssue {
-                try? await answerCallbackQuery(token, parsed.callbackId, "Model catalog unavailable: \(issue)")
+                await answerRecordedCallback(parsed.callbackId, text: "Model catalog unavailable: \(issue)", context: "model_callback_answer", update: update)
                 return true
             }
             let models = provider.models.filter {
                 TelegramModelSelectionCallback.selectionKey($0.id) == modelKey
             }
             guard models.count == 1, let model = models.first else {
-                try? await answerCallbackQuery(token, parsed.callbackId, "That model is no longer available.")
+                await answerRecordedCallback(parsed.callbackId, text: "That model is no longer available.", context: "model_callback_answer", update: update)
                 return true
             }
             do {
@@ -268,10 +261,10 @@ extension TelegramPollLoop {
                     presentation.text,
                     presentation.markup
                 )
-                try? await answerCallbackQuery(token, parsed.callbackId, "Chat model set to \(model.id).")
+                await answerRecordedCallback(parsed.callbackId, text: "Chat model set to \(model.id).", context: "model_callback_answer", update: update)
             } catch {
                 let reply = "Failed to set Telegram model: \(TurnSecretRedactor.redactText(String(describing: error)))"
-                try? await answerCallbackQuery(token, parsed.callbackId, reply)
+                await answerRecordedCallback(parsed.callbackId, text: reply, context: "model_callback_answer", update: update)
                 await recordError(context: "model_selection_callback_save", error: String(describing: error), update: update, message: nil, text: nil)
             }
             return true
@@ -486,20 +479,30 @@ extension TelegramPollLoop {
             await recordError(context: "retry_session", error: String(describing: error), update: update)
             return false
         }
+        do {
+            _ = try await updateInbox.transition(updateId: update.updateId, from: [.processing], to: .processing,
+                resolvedRetryText: retryText, resolvedRetryMessage: retryMessage, resolvedSessionId: sessionId)
+        } catch {
+            await recordError(context: "retry_input", error: String(describing: error), update: update)
+            return false
+        }
         let retryOperation: @Sendable (UUID) async -> Void = { turnId in
-            if let messageId = retryClaim.queueAcknowledgementMessageId {
-                await clearQueueAcknowledgement(chatId: message.chatId, messageId: messageId)
-            }
             let turn = telegramTurn(message: message, session: sessionId, run: turnId.uuidString)
             await runTurn(turnId: turnId, turn: turn, update: update, message: message,
                 text: text, sessionId: sessionId) { card in
                 await card.transition(.retrying(action: "Taking another run at your last message"))
                 let prepared: (text: String, attachments: [TelegramMediaAttachment], receiptKind: String)
                 if let retryMessage {
-                    prepared = try await prepareIncomingMedia(text: retryText,
-                        caption: retryMessage.text ?? Self.caption(from: retryMessage),
-                        voice: Self.voiceAttachment(from: retryMessage), media: Self.chatAttachment(from: retryMessage),
-                        update: update, message: retryMessage, turn: turn)
+                    do {
+                        prepared = try await prepareIncomingMedia(text: retryText,
+                            caption: retryMessage.text ?? Self.caption(from: retryMessage),
+                            voice: Self.voiceAttachment(from: retryMessage), media: Self.chatAttachment(from: retryMessage),
+                            update: update, message: retryMessage, turn: turn)
+                    } catch {
+                        guard !Task.isCancelled, Self.isSpeechPermissionDenial(error) else { throw error }
+                        await retainForSpeechPermission(error: error, card: card, update: update, message: message, text: retryText)
+                        return nil
+                    }
                 } else { prepared = (retryText, [], "reply") }
                 return (prepared.text, prepared.attachments, "retry_reply",
                     TelegramChatAttemptContext(turn: turn, replyTo: retryMessage?.replyTo,
@@ -527,9 +530,9 @@ extension TelegramPollLoop {
         let inbox = TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot)
         await turnCoordinator.beginUpdateProcessing(update.updateId)
         do {
-            // The run and conversation are pinned now, so a replay at launch keeps both.
+            // Persist the generation boundary before invoking the turn.
             let processing = try await inbox.transition(
-                updateId: update.updateId, from: [.queued, .processing], to: .processing,
+                updateId: update.updateId, from: [.processing], to: .processing,
                 assistantRunId: turnId.uuidString, assistantSessionId: sessionId, resolvedSessionId: sessionId)
             guard processing.phase == .processing else {
                 await turnCoordinator.endUpdateProcessing(update.updateId)
@@ -544,7 +547,8 @@ extension TelegramPollLoop {
         let card = await makeTurnProgressCard(destination: message.destination, turnId: turnId,
             errorContext: "turn_card", update: update, message: message, text: text)
         guard await turnCoordinator.attachCard(card, destination: message.destination, turnId: turnId) else {
-            _ = try? await inbox.transition(updateId: update.updateId, from: [.processing], to: .outcomeUnknown)
+            do { _ = try await inbox.transition(updateId: update.updateId, from: [.processing], to: .outcomeUnknown) }
+            catch { await recordError(context: "turn_card_claim", error: String(describing: error), update: update, message: message) }
             await turnCoordinator.endUpdateProcessing(update.updateId)
             return nil
         }
@@ -554,7 +558,6 @@ extension TelegramPollLoop {
         var preparedText: String?
         var readBy: String?
         var silent = false
-        var heldForLaunch = false
         do {
             guard let prepared = try await prepare(card) else {
                 await turnCoordinator.endUpdateProcessing(update.updateId)
@@ -605,7 +608,6 @@ extension TelegramPollLoop {
             }
         } catch is CancellationError {
             let held = await turnCoordinator.shutdownInterruptedTurn(destination: message.destination, turnId: turnId)
-            heldForLaunch = held
             await settle {
                 await delivery.stop()
                 await card.transition(.canceled(reason: held ? "Interrupted by shutdown" : "Stopped by user"))
@@ -622,10 +624,11 @@ extension TelegramPollLoop {
             await deliverTurnNotice(notice, delivery: delivery, receiptKind: "error_notice",
                 sendErrorContext: "send_error_notice", update: update, message: message, text: text)
         }
-        await settle { [readBy, silent, heldForLaunch] in
+        await settle { [readBy, silent] in
             do {
-                // Shut down before the agent's turn started it: the claim stays in .processing and launch runs it again.
-                if heldForLaunch, try await neverStarted(inbox.claim(updateId: update.updateId)) {
+                if readBy != nil || silent {
+                    _ = try await inbox.transition(updateId: update.updateId, from: [.processing],
+                        to: .completed, noRecoverableAnswer: true)
                     await turnCoordinator.endUpdateProcessing(update.updateId)
                     return
                 }
@@ -633,7 +636,7 @@ extension TelegramPollLoop {
                 let failedBeforeAnswer = try inbox.claim(updateId: update.updateId).failedBeforeAnswer
                 let phase = await card.snapshot().state.phase
                 _ = try await inbox.transition(updateId: update.updateId, from: [.processing],
-                    to: readBy != nil || silent ? .completed : saved == nil && phase == .canceled ? .stopped : saved?.isDelivered == true ? (failedBeforeAnswer
+                    to: saved == nil && phase == .canceled ? .stopped : saved?.isDelivered == true ? (failedBeforeAnswer
                         ? .failedBeforeAnswer : .completed) : saved?.outcomeUnknown == true ? .sentUnconfirmed : .outcomeUnknown)
             } catch {
                 await recordError(context: "queued_update_complete", error: String(describing: error),
@@ -739,7 +742,7 @@ extension TelegramPollLoop {
             do {
                 _ = try await TelegramUpdateInbox(offsetURL: loop.offsetURL, dataRoot: loop.dataRoot).transition(
                     updateId: update.updateId,
-                    from: [.processing, .queued],
+                    from: [.processing],
                     to: .completed
                 )
             } catch {

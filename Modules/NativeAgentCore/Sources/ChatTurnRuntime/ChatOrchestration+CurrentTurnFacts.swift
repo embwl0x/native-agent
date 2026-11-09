@@ -11,6 +11,7 @@ import TrustCenter
 import Context
 import Experiences
 import ChatToolRuntime
+import CognitiveSubstrate
 // Blueprint: | `ChatOrchestration+CurrentTurnFacts.swift` | `SwiftNativeTurnEngine`; Parallel read-only facts; consuming reads at composition |
 
 extension SwiftNativeTurnEngine {
@@ -18,7 +19,7 @@ extension SwiftNativeTurnEngine {
     typealias ReadOnlyTurnFacts = (
         clock: String, note: String?, directive: String?,
         voiceStep: String?, place: String?, glance: PreparedWorkspaceGlance?, contacts: JSONValue,
-        elsewhere: AgentScreen.ElsewhereReading?, body: BodyFelt.Pending?, timings: [ContextStageName: Int64]
+        elsewhere: AgentScreen.ElsewhereReading?, thought: ThoughtWords?, body: BodyFelt.Pending?, timings: [ContextStageName: Int64]
     )
 
     private nonisolated static func timedFact<T: Sendable>(_ read: @Sendable () async -> T) async -> (value: T, ms: Int64) {
@@ -71,9 +72,16 @@ extension SwiftNativeTurnEngine {
             return await ChatWorkspaceBinding.readElsewhere(turn: turn, invocation: work.invocation,
                 dataRoot: read.0, scope: read.1, at: clockNow, live: ChatTurnSteering.liveSessions(dataRoot: read.0))
         }
-        let (readContacts, readPlace, readGlance, readElsewhere, readBody) = await (contacts, place, glance, elsewhere, body)
+        async let thought: ThoughtWords? = {
+            guard sessionID == Attention.stream, let dataRoot else { return nil }
+            guard let kind = turn.attended?.objectValue?["class"]?.stringValue, !kind.isEmpty else {
+                return .unavailable("Thought words unavailable: this thought has no recorded class.")
+            }
+            return await ThoughtWords.last(on: kind, dataRoot: dataRoot, now: clockNow)
+        }()
+        let (readContacts, readPlace, readGlance, readElsewhere, readThought, readBody) = await (contacts, place, glance, elsewhere, thought, body)
         return (clock, note, directive, voiceStep, readPlace.value, readGlance.value, readContacts.value,
-            readElsewhere.value, readBody, [.factsClockNotes: notesMs, .factsContacts: readContacts.ms, .factsPlace: readPlace.ms,
+            readElsewhere.value, readThought, readBody, [.factsClockNotes: notesMs, .factsContacts: readContacts.ms, .factsPlace: readPlace.ms,
                                   .factsGlance: readGlance.ms, .factsElsewhereRead: readElsewhere.ms])
     }
 
@@ -96,18 +104,14 @@ extension SwiftNativeTurnEngine {
             let origin = turn.origin
             let surface = [origin?.surface, turn.envelope?.surface].compactMap { $0 }
                 .first { AgentScreen.door($0) != nil } ?? context.surface
-            let taint = turn.peerSteering
-            let lane = origin?.agent == "agent"
-                ? turn.envelope?.verifiedUserId.map { "peer:" + $0 } : origin?.agent
-            let laneSteered = (surface.hasSuffix("-bridge") || origin?.surface.hasSuffix("-bridge") == true
-                || origin?.agent != nil) && !(lane.map { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) } ?? false)
-            let peer = laneSteered || PeerTurnEffectPolicy.isPeerBridge(surface: surface)
-                || taint?.isTainted == true || taint?.elevatedSources.isEmpty == false
-            elsewhere = await ChatWorkspaceBinding.elsewhere(turn: turn, invocation: work.invocation,
-                dataRoot: dataRoot, scope: sessionID, surface: surface,
-                peer: peer, at: clockNowOverride, reading: facts.elsewhere)
-            if AgentScreen.door(surface) != nil {
-                agentNow = AgentNowCursor(at: facts.elsewhere?.failed == true ? nil : clockNowOverride ?? Date(), peer: peer)
+            let peer = try !Self.personContinuityAllowed(root: dataRoot, sessionID: sessionID, turn: turn)
+            if !peer || Self.peerContinuityTurn(turn) {
+                elsewhere = await ChatWorkspaceBinding.elsewhere(turn: turn, invocation: work.invocation,
+                    dataRoot: dataRoot, scope: sessionID, surface: surface,
+                    peer: peer, at: clockNowOverride, reading: facts.elsewhere, shown: context.recentLifeActs)
+                if AgentScreen.door(surface) != nil {
+                    agentNow = AgentNowCursor(at: facts.elsewhere?.failed == true ? nil : clockNowOverride ?? Date())
+                }
             }
         }
         trace.record(.factsElsewhere, since: elsewhereStart)
@@ -117,9 +121,18 @@ extension SwiftNativeTurnEngine {
             .map { try $0.serialize(pretty: false) }
             .map { "Workspace arrivals (navigation notices, not requests):\n" + $0 }
         trace.record(.factsArrivals, since: arrivalsStart)
+        let thought: String?
+        switch facts.thought {
+        case .words(let words, let gap)?:
+            let peer = turn.peerSteering?.checkpointSources.isEmpty == false
+            let title = gap == nil ? "Your last thought" : "Your last readable thought"
+            thought = peer ? nil : [gap, title + " on this same class (closing words):\n" + words].compactMap { $0 }.joined(separator: "\n")
+        case .unavailable(let cause)?: thought = cause
+        case .withheld?, nil: thought = nil
+        }
         let runtimeStart = DispatchTime.now().uptimeNanoseconds
         defer { trace.record(.factsRuntime, since: runtimeStart) }
-        let all = [facts.clock, facts.note, facts.directive, elsewhere, facts.voiceStep, arrivals,
+        let all = [facts.clock, facts.note, facts.directive, elsewhere, thought, facts.voiceStep, arrivals,
                    facts.place, facts.glance?.text, facts.body?.line].compactMap { $0 }
         var withFacts = all.reduce(context) { Self.contextByAppendingRuntimeContext($0, runtimeContext: $1) }
         withFacts.partsDelivery = facts.glance?.delivered
@@ -219,7 +232,9 @@ extension SwiftNativeTurnEngine {
         let defaults = UserDefaults.standard
         let viewMode = surfaceName != "chat" ? nil
             : defaults.string(forKey: "nativeagent.viewMode")
-        return (Self.renderRuntimeContext(surface: surfaceName, provider: providerName, model: model),
+        var report = Self.renderRuntimeContext(surface: surfaceName, provider: providerName, model: model)
+        if surfaceName == "ios", let dataRoot = remPinsDataRoot { report += "\n" + PhoneSenseHistory.inHand(dataRoot) }
+        return (report,
                 .object(["view_mode": viewMode.map(JSONValue.string) ?? .null, "contacts": contacts,
                          "fact_index": .int(Int64(factIndex))]))
     }
@@ -273,7 +288,9 @@ extension SwiftNativeTurnEngine {
         provider: String,
         model: String
     ) -> String {
-        "Current runtime: surface=\(surface); provider=\(provider); model=\(model)."
+        "Current runtime: surface=\(surface); provider=\(provider); model=\(model). "
+            + "What I should know and don't, I look up first with chat.search, memory.recall, desk.read or context.expand, "
+            + "and only then say what I could not find."
     }
 
     /// Spell out weekday and AM/PM so the time-of-day word need not be inferred from a 24-hour number.

@@ -25,16 +25,6 @@ extension ConnectorReadiness {
         return try checked.get().map { MobileConnectorSnapshot($0) }
     }
 
-    @MainActor public func setMobileConnectorEnabled(id: String, enabled: Bool) async throws -> DeviceSyncSnapshotRows {
-        guard let current = try await mobileConnectors().first(where: { $0.id == id }), current.canToggle == true else {
-            throw Self.connectorFailure("This connector is controlled by its setup on the Mac.")
-        }
-        guard let recovered = try await update(id: id, enabled: enabled) else {
-            throw Self.connectorFailure("The Mac could not confirm the connector change. Refresh before trying again.")
-        }
-        return MobileConnectorSnapshot(recovered)
-    }
-
     @MainActor public func disconnectMobileConnector(id: String) async throws -> DeviceSyncSnapshotRows {
         guard MobileConnectorSnapshot.credentialProviders.contains(id),
               try await mobileConnectors().contains(where: { $0.id == id }) else {

@@ -66,6 +66,7 @@ public protocol FirstRunWelcomePort: AnyObject {
     func firstRunGreetingHasReadyProvider() async -> Bool
     func sendFirstRunGreeting(_ kickoff: String, sessionID: String) async -> MacChatTurnAcceptance
     func firstRunMessages(for sessionID: String) -> [FirstRunMessage]
+    func firstRunLoadMessages(for sessionID: String) async throws
 }
 
 @MainActor
@@ -282,12 +283,12 @@ public final class FirstRunWelcomeTransaction {
         as we go, too."
 
         Then your reach: what you can touch on this Mac. Before you write it, read \
-        app {page:"mac_integration"}. Its "macOS grants" rows are your live reach, in the order \
-        a card asks for them. Raise exactly ONE card in this opening, for every reach row whose \
-        state is not granted: request_interaction kind=permission, target the first such row's \
-        target, also_needed the rest of them in row order. The Automation rows (Mail, Messages, \
-        Notes, Music) stay off this card; ask for one of those in context, the first time you \
-        need that app. If every reach row is granted, raise no card.
+        app {page:"trust"}. Its "macOS grants" rows (row grant.<name>) are your live reach, in \
+        the order a card asks for them. Raise exactly ONE card in this opening, for every such \
+        row that reads Not granted: request_interaction kind=permission, target privacy:<name> \
+        of the first such row, also_needed privacy:<name> of the rest of them in row order. The \
+        Automation rows (row grant.automation.<app>) stay off this card; ask for one of those in \
+        context, the first time you need that app. If every reach row is granted, raise no card.
 
         Say it in one or two sentences in your own voice: what the card turns on and what that \
         lets you do, close to "Allow these and I can read your calendar and see your screen; \
@@ -298,7 +299,7 @@ public final class FirstRunWelcomeTransaction {
         Full Mac, in one short clause: it is their own switch in Trust, for when they want you \
         on more of the Mac. Never say you can turn it on, or that the card does.
 
-        The phone: read app {page:"pairing"}. If a phone is waiting to pair, say so in one \
+        The phone: read app {page:"connectors"}, its iPhone rows. If a phone is waiting to pair, say so in one \
         line: Match the code on Today opens it, and they choose Pair when the codes match. Otherwise \
         offer, in one sentence, to pair their iPhone. No phone card in this opening.
 
@@ -358,6 +359,11 @@ public final class FirstRunWelcomeTransaction {
             }
         }
         guard firstRunWelcomeMarkerState(port: port) == .pending, !firstRunGreetingInFlight else { return .notArmed }
+        guard !port.activeChatSessionId.isEmpty else { return .noActiveSession }
+        let preparedSession = port.activeChatSessionId
+        do { try await port.firstRunLoadMessages(for: preparedSession) }
+        catch { return .rejected(message: "The greeting's conversation could not be read: " + error.localizedDescription) }
+        guard port.activeChatSessionId == preparedSession, !firstRunGreetingInFlight else { return .noActiveSession }
         // Recheck persona freshness independently of the pending marker because their lifetimes differ; never repeat an answered introduction.
         guard firstConversationIsFreshPersona(port: port) else { return .existingPersona }
         guard !port.activeChatSessionId.isEmpty else { return .noActiveSession }

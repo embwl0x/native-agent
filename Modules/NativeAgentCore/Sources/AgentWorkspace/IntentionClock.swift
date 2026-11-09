@@ -4,7 +4,7 @@ import Desk
 import PersistenceCore
 import TriggerScheduler
 
-// Blueprint: | `IntentionClock.swift` | `IntentionClock`: shared scheduler occurrence identity |
+// Blueprint: | `IntentionClock.swift` | `IntentionClock`: a MY QUEUE rhythm's occurrences from its own anchors, grace and end |
 // Apply rhythm grace and until bounds; intervals start from filing or clockStart, and imported anchors retain full civil precision.
 
 /// Read occurrences from rhythm and anchors without another state ledger.
@@ -49,15 +49,6 @@ public enum IntentionClock {
         }
         guard let next, MyQueue.Until(step.until).endsAt.map({ next < $0 }) ?? true else { return nil }
         return next
-    }
-
-    /// Keep imported calendar civil identity through zone changes so an occurrence cannot acquire a second effect key.
-    public static func occurrenceID(_ step: DeskStep, at now: Date) -> String? {
-        guard let at = occurrence(step, at: now) else { return nil }
-        if step.clockStart != nil, let rhythm = step.rhythm, SchedulerJobNormalizer.rhythmInterval(rhythm) == nil {
-            return SchedulerJobRuntime.occurrence(at: at, zone: .autoupdatingCurrent)
-        }
-        return String(at.timeIntervalSince1970)
     }
 
     static func filed(_ step: DeskStep) -> Date? { step.filedAt.flatMap(DeskClock.parseISO) }

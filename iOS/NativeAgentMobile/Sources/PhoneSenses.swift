@@ -6,7 +6,7 @@ import NativeAgentShared
 import SwiftUI
 import UIKit
 
-// Blueprint: | `PhoneSenses.swift` | Opt-in sense outbox; local opt-out, checked pairing and durable delivery; bounded wake-only sampling |
+// Blueprint: | `PhoneSenses.swift` | Opt-in sense outbox; callback-owned wake readings and pairing-bound durable delivery |
 @MainActor
 final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = PhoneSenses()
@@ -30,11 +30,14 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
     private let file = URL.applicationSupportDirectory.appendingPathComponent("phone-senses.json")
     private let motion = CMMotionActivityManager()
     private let location = CLLocationManager()
-    private var motionQuery: UUID?
-    private var motionDeadline: Task<Void, Never>?
+    @Published private var motionQuery: UUID?
     private var focusAuthorization: Task<Void, Never>?
     private lazy var bodyReadings = PhoneBodyReadings(owner: self)
     private(set) var restorationTask: Task<Void, Never>?
+
+    var waitingSources: [PhoneSenseEvent.Source] {
+        (motionQuery == nil ? [] : [.motion]) + bodyReadings.waitingSources
+    }
 
     private override init() {
         super.init()
@@ -75,7 +78,7 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
         try change(&next)
         try await storage.checkpoint(next, to: file)
         for pending in state.pending where !next.pending.contains(where: { $0.event.id == pending.event.id }) {
-            iCloudBridge.shared.stopDeliveryNudges(for: pending.event.id)
+            iCloudBridge.shared.retireDelivery(for: pending.event.id)
         }
         state = next; enabled = next.enabled
     }
@@ -105,7 +108,7 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
                 self.requestFocusAuthorization(authority: authority)
             }
             if source == .motion {
-                self.motionQuery = nil; self.motionDeadline?.cancel(); self.motionDeadline = nil
+                self.motionQuery = nil
             }
             if source == .motion, value { self.queryMotion(allowPrompt: true) }
             if value { self.bodyReadings.requestPermission(for: source) }
@@ -165,7 +168,7 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
         }
         UIDevice.current.isBatteryMonitoringEnabled = false
         location.stopMonitoringSignificantLocationChanges()
-        motionQuery = nil; motionDeadline?.cancel(); motionDeadline = nil
+        motionQuery = nil
         bodyReadings.stop()
     }
 
@@ -256,17 +259,6 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
         }
         let query = UUID(), key = pairing
         motionQuery = query
-        motionDeadline = Task {
-            do { try await Task.sleep(for: .seconds(5)) } catch { return }
-            guard self.motionQuery == query else { return }
-            self.motionQuery = nil
-            let observedAt = Date()
-            self.enqueue {
-                guard self.state.enabled.contains(.motion), self.pairing == key else { return }
-                self.errorMessage = "Phone motion did not answer during this wake. It remains unknown."
-                try await self.record(.motion, value: "unknown", at: observedAt); await self.publishNow()
-            }
-        }
         let end = Date()
         motion.queryActivityStarting(from: end.addingTimeInterval(-15 * 60), to: end, to: .main) { activities, error in
             let last = activities?.max { $0.startDate < $1.startDate }
@@ -290,12 +282,13 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
             }
             let value = flags.isEmpty ? "unknown" : flags.joined(separator: "+")
             // Immutable Sendable scalars only in the MainActor task.
-            let reportedConfidence = confidence, activityTime = began
+            let reportedConfidence = confidence, activityTime = began, failure = error?.localizedDescription
             Task { @MainActor in
                 guard self.motionQuery == query else { return }
-                self.motionQuery = nil; self.motionDeadline?.cancel(); self.motionDeadline = nil
+                self.motionQuery = nil
                 self.enqueue {
                     guard self.state.enabled.contains(.motion), self.pairing == key else { return }
+                    if let failure { self.errorMessage = "Phone motion unavailable: \(failure)" }
                     try await self.record(.motion, value: value, at: end, confidence: reportedConfidence, activityStartedAt: activityTime)
                     try await self.record(.motion, value: "setup", setup: self.setup(for: .motion))
                     await self.publishNow()
@@ -310,7 +303,9 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
         let slot = source.rawValue + (value == "setup" ? "/setup" : "")
         let previous = state.latest[slot]
         guard previous.map({ $0.timestamp <= at }) ?? true else { return }
-        guard previous?.value != value || previous?.localNight != night || previous?.setup != setup
+        // Unchanged is not unknown: a reading re-reports before the Mac's fifteen minutes would call it historical.
+        let held = value != "setup" && previous.map { at.timeIntervalSince($0.timestamp) > 10 * 60 } == true
+        guard held || previous?.value != value || previous?.localNight != night || previous?.setup != setup
             || previous?.confidence != confidence || previous?.activityStartedAt != activityStartedAt || previous?.summary != summary else { return }
         guard state.pending.count < 128 else {
             throw DeviceSyncError.underlying(message: "Phone sense changes are waiting to sync. Open NativeAgent with the Mac connected.")
@@ -369,47 +364,56 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
 
 struct PhoneSensesSettings: View {
     @ObservedObject private var senses = PhoneSenses.shared
+    private var session: FacePageSession { iCloudSyncEngine.shared.pageSessions.page("phone-senses") }
     var body: some View {
-        AliveSection("Phone senses") {
-            VStack(alignment: .leading, spacing: 12) {
-                toggle(.motion,
-                    "Shares stationary, walking, running, cycling or driving estimates and confidence when this app wakes. Requires Motion & Fitness access.")
-                toggle(.focus,
-                    "Shares Focus on, off or unknown with your Mac. iOS does not share its name (such as Sleep or Work). Requires Focus Status access.")
-                toggle(.charging,
-                    "Shares charging and whether it is night here. With Motion enabled, your Mac may infer probably asleep; it never treats this as fact.")
-                otherSenses
-                Text("""
-                    All start off. These switches explicitly allow the selected summary to travel through your paired iCloud connection to your Mac and the \
-                    AI provider selected there. Setup state (switch, required permission and missing steps) is shared so your agent can help you. No \
-                    coordinates are shared by these senses. Always location, if already allowed for Places, also lets significant location changes wake a \
-                    brief reading. iOS may delay updates; silence means unknown.
-                    """)
-                    .font(.footnote).foregroundStyle(AlivePalette.secondary)
-                if let error = senses.errorMessage { Text(error).font(.footnote).foregroundStyle(.red) }
-            }.aliveRow()
-        }.task { senses.wake() }
+        FaceView(face: face, door: door, session: session).task { senses.wake() }
     }
-    private var otherSenses: some View {
-        Group {
-            toggle(.battery, "Shares battery percentage when this app wakes; it never reads battery history.")
-            toggle(.headphones,
-                "Shares whether this app's audio route is headphones, Bluetooth or another route; no device names. Bluetooth does not prove headphones.")
-            toggle(.network, "Shares Wi-Fi, cellular, wired or unavailable from the phone's network path; no network names or addresses.")
-            toggle(.music, """
-                Shares the Music app's playback state and available song title and artist when this app wakes; no audio or listening history. Requires Media \
-                & Apple Music access.
-                """)
-            toggle(.photos, """
-                Shares only a count of visible photos dated today, including synced or imported photos; Limited Access counts only your selection, never the \
-                images.
-                """)
+    private var face: PartFace {
+        var rows = senses.settingControls.map { control -> PartFace.Row in
+            let row = control.row()
+            return .init(id: control.id, title: control.label, detail: row.unavailableReason ?? description(control.id),
+                control: row.value.map { .init(on: $0 == "true", call: .init("phone.sense.set", ["id": .string(control.id)])) })
+        }
+        rows += senses.waitingSources.map { .init(id: "waiting-" + $0.rawValue,
+            title: "Waiting on \($0.title)", detail: "Turn off its switch to cancel.", tone: .quiet) }
+        if let error = senses.errorMessage { rows.append(.init(id: "error", title: error, tone: .failed)) }
+        return .init(sections: [.init(id: "senses", title: "Phone senses", footer: """
+            All start off. A switch explicitly allows its summary through paired iCloud to your Mac and the selected AI provider. Setup state is shared \
+            so your agent can help. No coordinates travel through these senses. Always location, if allowed for Places, can wake a reading. \
+            iOS may delay updates; silence means unknown.
+            """, rows: rows)])
+    }
+    private var door: ClosureFaceDoor {
+        ClosureFaceDoor(open: { _ in }, waitingOn: "this iPhone's sense preferences") { submission in
+            do {
+                guard let id = submission.expectedCall.args["id"]?.stringValue,
+                      let control = senses.settingControls.first(where: { $0.id == id }), let write = control.write else {
+                    throw PhoneLocalSetting.failure("Read the phone sense before changing it.")
+                }
+                if !submission.checking {
+                    guard let value = submission.value, ["on", "off"].contains(value) else {
+                        throw PhoneLocalSetting.failure("This phone sense switch takes on or off.")
+                    }
+                    try await write(value == "on" ? "true" : "false", .person)
+                }
+                let value = try control.read()
+                return .init(effects: .known, accepted: true,
+                    committed: [.init(id: "value", value: .string(value == "true" ? "on" : "off"))])
+            } catch { return .interrupted(error) }
         }
     }
-    private func toggle(_ source: PhoneSenseEvent.Source, _ description: String) -> some View {
-        VStack(alignment: .leading) {
-            Toggle(source.title, isOn: Binding(get: { senses.enabled.contains(source) }, set: { senses.set(source, enabled: $0, authority: .person) }))
-            Text(description).font(.footnote).foregroundStyle(AlivePalette.secondary)
+    private func description(_ id: String) -> String {
+        switch id {
+        case "phone.senses.motion": "Shares activity estimates and confidence at wake. Requires Motion & Fitness access."
+        case "phone.senses.focus": "Shares Focus on, off or unknown, without its name. Requires Focus Status access."
+        case "phone.senses.charging": "Shares charging and whether it is night. Sleep is only an inference, never a fact."
+        case "phone.senses.battery": "Shares the current battery percentage, without battery history."
+        case "phone.senses.headphones": "Shares this app's audio route, without device names. Bluetooth does not prove headphones."
+        case "phone.senses.network": "Shares network kind or unavailability, without names or addresses."
+        case "phone.senses.music":
+            "Shares Music playback state, song title and artist, without audio or listening history. Requires Media & Apple Music access."
+        case "phone.senses.photos": "Shares only today's visible photo count; Limited Access counts your selection, never images."
+        default: "Read this phone sense's setup before enabling it."
         }
     }
 }

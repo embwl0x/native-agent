@@ -73,8 +73,12 @@ struct ContinuityField: Sendable {
             node.confidence = (max(node.confidence, confidence)).clamped01()
             node.sourceClass = strongerSource(lhs: node.sourceClass, rhs: event.sourceClass)
             node.lastActivatedAt = now
-            node.summary = boundedSummary.isEmpty ? node.summary : boundedSummary
-            node.metadata = mergeMetadata(existing: node.metadata, incoming: boundedMetadata, configuration: configuration)
+            // Progress and cancellation do not resolve a failed act; keep its receipt and cause until another terminal outcome arrives.
+            let holdsFailure = Self.holdsToolFailure(node) && (event.kind == .toolStarted || event.kind == .toolCancelled)
+            if !holdsFailure {
+                node.summary = boundedSummary.isEmpty ? node.summary : boundedSummary
+                node.metadata = mergeMetadata(existing: node.metadata, incoming: boundedMetadata, configuration: configuration)
+            }
             nodesByKey[key] = node
             decayAnchorsByKey[key] = now
             associationTokensByKey[key] = associationTokens(for: node)
@@ -111,6 +115,79 @@ struct ContinuityField: Sendable {
         // Report a touched node only if it survives capacity enforcement; an evicted key cannot receive the promised stamp.
         guard nodesByKey[key] != nil else { return nil }
         return IngestOutcome(key: key, isNewNode: isNewNode)
+    }
+
+    // MARK: - Attention
+
+    /// Where worth lands: a care's anchor, fading on that care's depth, or a happening's own subject.
+    struct Landing: Sendable, Equatable {
+        var kind: CognitiveNodeKind
+        var subject: CognitiveSubjectReference
+        var halfLife: TimeInterval
+        var summary: String
+    }
+
+    func key(of landing: Landing) -> String { nodeKey(kind: landing.kind, subject: landing.subject) }
+
+    /// Worth not yet attended gathers on what it means as drive, never clamped and never spread: it fades on the node's own half-life and only a thought
+    /// attending the node drains it. Activation and salience take the worth as an ordinary arrival, so the node also primes and competes as any other.
+    mutating func land(_ worth: Double, on landing: Landing, now: Date, makeUUID: () -> UUID,
+                       configuration: CognitiveConfiguration) throws -> (key: String, drive: Double) {
+        guard worth.isFinite, worth >= 0 else { throw AttentionInputError.invalidWorth }
+        guard landing.halfLife.isFinite, landing.halfLife > 0 else { throw AttentionInputError.invalidHalfLife }
+        let key = key(of: landing)
+        applyDecay(at: now, matchingLivedState: true)
+        let input = eventActivationInput(worth)
+        let summary = Self.boundedString(landing.summary, maxCharacters: configuration.maximumSummaryCharacters)
+        var node = nodesByKey[key] ?? CognitiveNode(id: makeUUID(), kind: landing.kind, subjectReference: landing.subject,
+            activation: 0, salience: 0, confidence: confidenceSeed(for: .observed), sourceClass: .observed, createdAt: now,
+            lastActivatedAt: now, decayHalfLife: landing.halfLife, summary: summary, metadata: [:])
+        node.activation = (node.activation + input * (nodesByKey[key] == nil ? 1 : 0.45)).clamped01()
+        node.salience = max(node.salience, node.activation * 0.7 + worth.clamped01() * 0.3).clamped01()
+        let drive = node.drive + worth
+        guard drive.isFinite, drive >= 0 else { throw AttentionInputError.invalidDrive }
+        node.drive = drive
+        node.lastActivatedAt = now
+        node.decayHalfLife = landing.halfLife
+        if !summary.isEmpty { node.summary = summary }
+        nodesByKey[key] = node
+        decayAnchorsByKey[key] = now
+        nonLiveNodeKeys.remove(key)
+        associationTokensByKey[key] = associationTokens(for: node)
+        enforceCapacity(configuration.maximumActiveNodes, retaining: key)
+        return (key, drive)
+    }
+
+    /// Clear a crossing the attention owner already read at its batch clock. Do not project again after the record await, or move the activation's
+    /// decay anchor backwards if unrelated field work advanced it while the record was being written. Nil when the node is gone.
+    mutating func drain(_ key: String) -> Double? {
+        guard var node = nodesByKey[key] else { return nil }
+        let drive = node.drive
+        node.drive = 0
+        nodesByKey[key] = node
+        return drive
+    }
+
+    /// Drive returned to a node unattended; false when the node is gone.
+    mutating func restore(_ drive: Double, to key: String, now: Date) throws -> Bool {
+        guard drive.isFinite, drive >= 0 else { throw AttentionInputError.invalidDrive }
+        guard var node = nodesByKey[key] else { return false }
+        guard drive > 0 else { return true }
+        node = decayedNode(node, forKey: key, at: now) ?? node
+        let restored = node.drive + drive
+        guard restored.isFinite, restored >= 0 else { throw AttentionInputError.invalidDrive }
+        node.drive = restored
+        nodesByKey[key] = node
+        decayAnchorsByKey[key] = now
+        return true
+    }
+
+    /// Nodes whose unattended worth, projected to now, has reached one thought, most driven first.
+    func igniting(at now: Date) -> [(key: String, node: CognitiveNode)] {
+        nodesByKey.compactMap { key, node -> (key: String, node: CognitiveNode)? in
+            let projected = decayedNode(node, forKey: key, at: now) ?? node
+            return projected.drive >= 1 ? (key, projected) : nil
+        }.sorted { $0.node.drive > $1.node.drive }
     }
 
     // MARK: - Emotional tag stamping
@@ -398,6 +475,7 @@ struct ContinuityField: Sendable {
         var decayed = node
         decayed.activation = (decayed.activation * factor).clamped01()
         decayed.salience = (decayed.salience * factor).clamped01()
+        decayed.drive *= factor
         return decayed
     }
 
@@ -412,11 +490,12 @@ struct ContinuityField: Sendable {
         }
     }
 
-    private mutating func enforceCapacity(_ maximumActiveNodes: Int) {
+    private mutating func enforceCapacity(_ maximumActiveNodes: Int, retaining retainedKey: String? = nil) {
         let cap = max(1, maximumActiveNodes)
         guard nodesByKey.count > cap else { return }
         let hasNonLiveNodes = !nonLiveNodeKeys.isEmpty
         let victims = nodesByKey
+            .filter { $0.key != retainedKey && $0.value.drive == 0 && !Self.holdsToolFailure($0.value) }
             .sorted { lhs, rhs in
                 if hasNonLiveNodes {
                     let lhsLived = !nonLiveNodeKeys.contains(lhs.key)
@@ -442,6 +521,12 @@ struct ContinuityField: Sendable {
         for key in victims {
             removeNode(forKey: key)
         }
+    }
+
+    /// Unresolved lived consequences, like unattended drive, cannot be evicted as quiet background activation.
+    private static func holdsToolFailure(_ node: CognitiveNode) -> Bool {
+        node.kind == .toolObservation && node.turnKind.contributesToLivedState
+            && node.metadata["eventKind"] == .string(CognitiveEventKind.toolFailed.rawValue)
     }
 
     private mutating func spreadActivation(
@@ -642,6 +727,9 @@ struct ContinuityField: Sendable {
     private static func orderedMetadataKeys(_ metadata: [String: JSONValue]) -> [String] {
         let priority = [
             CognitiveTurnKind.metadataKey,
+            // The terminal receipt and act identity keep a failed hand's cause through progress and cancellation.
+            "eventKind",
+            "motorDomain",
             // Attention maps these record IDs to context activation; retain them under the metadata key cap.
             "memoryRecordIds",
             "sessionId",

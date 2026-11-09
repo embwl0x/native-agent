@@ -21,6 +21,7 @@ public enum MacInjectionArgRedaction {
         "browser.chrome_fill": ["text", "value", "fields"],
         "browser.chrome_navigate": ["text", "value", "fields"],
         "interaction_act": ["value"],
+        "chat_working_memory": ["text"],
     ]
 
     public static func carriesSecretArgs(tool: String, turn: Turn?, catalog: [String: AppActionBinding]? = nil) -> Bool {
@@ -99,17 +100,6 @@ public enum MacInjectionArgRedaction {
     public static let appDoorScriptPlaceholder =
         "[redacted: this script names an action that takes a key or token]"
 
-    public static func appDoorCarriesSecret(_ input: [String: JSONValue], turn: Turn?, catalog: [String: AppActionBinding]? = nil) -> Bool {
-        if !appDoorSecretKeys(input).isEmpty { return true }
-        if let action = input["action"]?.stringValue, argumentProtectionReason(action, turn: turn, catalog: catalog) != nil,
-            input["args"] != nil { return true }
-        if case .string(let script)? = input["script"], namesAppDoorSecretAction(script) { return true }
-        if case .array(let entries)? = input["actions"] {
-            return entries.contains { if case .object(let call) = $0 { appDoorCarriesSecret(call, turn: turn, catalog: catalog) } else { false } }
-        }
-        return false
-    }
-
     /// Replace secret text and form values with count/digest while preserving non-secret arguments.
     public static func redacted(tool: String, input: [String: JSONValue], turn: Turn?, catalog: [String: AppActionBinding]? = nil) -> [String: JSONValue] {
         if withheldArgumentReason(in: .object(input)) != nil {
@@ -123,10 +113,6 @@ public enum MacInjectionArgRedaction {
         }
         if normalized(tool) == "app" {
             var out = input
-            if let action = input["action"]?.stringValue, let reason = argumentProtectionReason(action, turn: turn, catalog: catalog), input["args"] != nil {
-                out["args"] = .object(withheld(reason))
-                return out
-            }
             if case .string(let script)? = input["script"], namesAppDoorSecretAction(script) {
                 out["script"] = .string(appDoorScriptPlaceholder)
             }
@@ -134,8 +120,24 @@ public enum MacInjectionArgRedaction {
                 out["actions"] = .array(entries.map { if case .object(let call) = $0 { .object(redacted(tool: "app", input: call, turn: turn,
                     catalog: catalog)) } else { $0 } })
             }
-            let keys = appDoorSecretKeys(input)
-            if !keys.isEmpty, case .object(let args)? = input["args"] {
+            if let action = input["action"]?.stringValue, let reason = argumentProtectionReason(action, turn: turn, catalog: catalog), input["args"] != nil {
+                out["args"] = .object(withheld(reason))
+                return out
+            }
+            if let action = input["action"]?.stringValue, case .object(let args)? = input["args"] {
+                do {
+                    guard let binding = try AppActionBinding.binding(action, turn: turn, catalog: catalog) else {
+                        out["args"] = .object(withheld("The action has no argument contract. Submit the original call after repairing its catalog."))
+                        return out
+                    }
+                    out["args"] = .object(try binding.boundArguments(args))
+                } catch {
+                    out["args"] = .object(withheld("The action's arguments could not be bound: \(error.localizedDescription)"))
+                    return out
+                }
+            }
+            let keys = appDoorSecretKeys(out)
+            if !keys.isEmpty, case .object(let args)? = out["args"] {
                 let safeArgs = redacting(keys, in: args)
                 let foldedTool = ToolNameAliases.ranTool("app", input: input)
                 out["args"] = .object(foldedTool == "app" ? safeArgs : redacted(tool: foldedTool, input: safeArgs, turn: turn, catalog: catalog))
@@ -145,8 +147,15 @@ public enum MacInjectionArgRedaction {
         guard let keys = secretKeysByTool[normalized(tool)] else {
             return argumentProtectionReason(tool, turn: turn, catalog: catalog).map(withheld) ?? input
         }
-        var out = redacting(keys, in: input)
-        if normalized(tool) == "act", case .array(let steps)? = input["steps"] {
+        // Folded ranCall evidence can arrive under the host name with the caller's unbound names still on it.
+        let canonical: [String: JSONValue]
+        if let id = ToolNameAliases.appAction(tool, input: input), let binding = AppActionBinding.declaredBinding(id) {
+            do {
+                canonical = binding.arguments(try binding.boundArguments(ToolNameAliases.doorArgs(tool, input, reportShim: false)))
+            } catch { return withheld("The action's arguments could not be bound: \(error.localizedDescription)") }
+        } else { canonical = input }
+        var out = redacting(keys, in: canonical)
+        if normalized(tool) == "act", case .array(let steps)? = canonical["steps"] {
             out["steps"] = .array(steps.map { step in
                 guard case .object(let args) = step else { return step }
                 return .object(redacting(keys, in: args))
@@ -182,12 +191,16 @@ public enum MacInjectionArgRedaction {
     }
 
     /// Extracted secrets stay in caller memory only, never on disk or over a wire.
-    public static func extractSecrets(tool: String, input: [String: JSONValue]) -> [String: String] {
+    public static func extractSecrets(tool: String, input: [String: JSONValue], turn: Turn?) throws -> [String: String] {
         if normalized(tool) == "app" {
             guard case .object(let args)? = input["args"] else { return [:] }
+            guard let binding = try AppActionBinding.action(input: input, turn: turn) else {
+                throw ToolFailureError("This call has no argument contract for protected replay. Nothing ran.", effects: .none,
+                    code: "tool_schema_unavailable")
+            }
             return extractSecrets(
                 tool: ToolNameAliases.ranTool("app", input: input),
-                input: args,
+                input: try binding.boundArguments(args),
                 keys: appDoorSecretKeys(input)
             )
         }
@@ -202,7 +215,7 @@ public enum MacInjectionArgRedaction {
         if normalized(tool) == "act", case .array(let steps)? = input["steps"] {
             for (index, step) in steps.enumerated() {
                 guard case .object(let args) = step else { continue }
-                for (key, secret) in extractSecrets(tool: "keystroke", input: args) {
+                for (key, secret) in extractSecrets(tool: "keystroke", input: args, keys: keys) {
                     out["steps.\(index).\(key)"] = secret
                 }
             }

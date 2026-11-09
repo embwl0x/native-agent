@@ -26,21 +26,14 @@ public enum AppActions {
         try seedActions
     }
 
-    public static func integrationRoutes(_ integration: String) throws -> [JSONValue] {
-        return try all.compactMap { action in
-            guard let gate = action.schema?.macIntegration, gate.integration == integration else { return nil }
-            return .object(["action": .string(action.id), "mode": .string(action.read ? "read" : "write"),
-                            "required_permission": .string(gate.mode.rawValue)])
-        }
-    }
-
     public static func action(_ id: String, dataRoot: URL = PersistenceCore.defaultDataRoot(), turn: Turn?) throws -> AppAction? {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !key.isEmpty else { return nil }
         let own = try checkedInventory(dataRoot: dataRoot, turn: turn).actions
         if let action = own.first(where: { $0.id == key }) { return action }
-        // An ability dispatches under its own id: the tool its authored action binds.
-        return own.first(where: { $0.authored && $0.tool.lowercased() == key })
+        // An ability dispatches under its own id: the tool its authored action binds. A part that answers verbs stands for its strictest verb, so a
+        // judgment made by its id alone is never looser than one of its verbs; each call is judged by the verb it carries.
+        return strictest(own.filter { $0.authored && $0.tool.lowercased() == key })
     }
 
     /// A bounded receipt projection pass resolves against one checked catalog, including misses. It never re-discovers parts for each historical row.
@@ -50,8 +43,15 @@ public enum AppActions {
         let base = inventory.actions.filter { !$0.authored }
         var bindings = Dictionary((base + actions).map { ($0.id.lowercased(), $0.binding) }, uniquingKeysWith: { first, _ in first })
         // Abilities run under their own id; that tool name resolves to its action too.
-        for action in actions where bindings[action.tool.lowercased()] == nil { bindings[action.tool.lowercased()] = action.binding }
+        for (tool, owned) in Dictionary(grouping: actions, by: { $0.tool.lowercased() }) where bindings[tool] == nil {
+            bindings[tool] = strictest(owned)?.binding
+        }
         return bindings
+    }
+
+    /// The strictest of one part's actions: highest class, irreversible first.
+    static func strictest(_ actions: [AppAction]) -> AppAction? {
+        actions.max { ($0.toolClass, $0.irreversible ? 1 : 0) < ($1.toolClass, $1.irreversible ? 1 : 0) }
     }
 
     // Leave synchronous file-backed discovery off the MainActor app door.
@@ -66,7 +66,12 @@ public enum AppActions {
         let page = AppDoorNames.resolve(String(parts[0])), verb = String(parts[1])
         let actions = try on(page: page, dataRoot: dataRoot, turn: turn).filter { $0.page != "*" }
         if let action = try action(verb, dataRoot: dataRoot, turn: turn), actions.contains(where: { $0.id == action.id }) { return action }
-        let matches = actions.filter { $0.id.split(separator: ".", maxSplits: 1).last.map(String.init) == verb }
+        // A page-prefixed call names a family too: chat.read is never Make's read just because Make lives on the Chat page.
+        let family = String(parts[0])
+        let matches = actions.filter {
+            let own = $0.id.split(separator: ".", maxSplits: 1)
+            return own.last.map(String.init) == verb && own.first.map { [family, page].contains(String($0)) } == true
+        }
         return matches.count == 1 ? matches[0] : nil
     }
 

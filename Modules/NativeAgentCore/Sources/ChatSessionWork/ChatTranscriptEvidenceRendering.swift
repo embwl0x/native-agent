@@ -49,6 +49,18 @@ package enum ChatTranscriptEvidenceRendering {
         return (toolResultProjection(call: call, status: status, effects: effects, returnedID: returnedID) + inputNote, fields)
     }
 
+    /// A past call as replayed in the agent's own earlier turn. It reads as a record, never as JSON shaped like a call: with a whole conversation held,
+    /// hundreds of those taught the model to write a call out as text instead of making it, and the call never ran.
+    package static func replayedReceipt(content: String, metadata: [String: JSONValue]?) -> String {
+        let receipt = historicalReceipt(content: content, metadata: metadata)
+        guard let fields = receipt.fields else { return "[Earlier call] " + receipt.text }
+        let json = receiptValue(.object(fields))
+        guard receipt.text.hasPrefix(json) else { return "[Earlier call] " + receipt.text }
+        let facts = fields.filter { $0.key != "action" }.sorted { $0.key < $1.key }.map { $0.key + ": " + receiptValue($0.value) }
+        let action = fields["action"].map(receiptValue) ?? "tool"
+        return "[Earlier call] " + ([action] + facts).joined(separator: "; ") + receipt.text.dropFirst(json.count)
+    }
+
     /// Retain returned facts before clipping the body; script input and arbitrary returned objects cannot establish settlement or identity.
     package static func receiptEvidence(call: String, result: JSONValue) -> JSONValue {
         var evidence: [String: JSONValue] = ["action": .string(SessionHistoryPromptRenderer.cap(SessionHistoryPromptRenderer.normalize(call), 120))]

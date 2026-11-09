@@ -31,14 +31,17 @@ extension FileSystemActions {
             } else {
                 let parent = try VerifiedPath.openParent(of: resolved)
                 defer { parent.release() }
-                guard fstatat(parent.fd, parent.name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+                guard fstatat(parent.fd, parent.name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
+                    let code = errno
+                    throw code == ENOENT ? VerifiedPath.Failure.notFound : VerifiedPath.Failure.posix(code)
+                }
             }
             let type = metadata.st_mode & mode_t(S_IFMT)
             let modified = Date(timeIntervalSince1970: Double(metadata.st_mtimespec.tv_sec) + Double(metadata.st_mtimespec.tv_nsec) / 1e9)
             return .object(["name": .string(resolved.lastPathComponent), "directory": .bool(type == mode_t(S_IFDIR)),
                 "regular": .bool(type == mode_t(S_IFREG)), "size": .int(metadata.st_size),
                 "modified": .string(ISO8601DateFormatter().string(from: modified))])
-        } catch let failure as VerifiedPath.Failure { return errResult(failure.message, code: failure.code) }
+        } catch let failure as VerifiedPath.Failure { return errResult(failure.message, code: failure.code, path: resolved) }
         catch { return errResult(error.localizedDescription, code: "read_failed") }
     }
     static func listDir(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
@@ -99,11 +102,13 @@ extension FileSystemActions {
                 code: "path_not_allowed"
             )
         }
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        let exists = fm.fileExists(atPath: resolved.path, isDirectory: &isDir)
-        if !exists { return errResult("Directory not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing") }
-        if !isDir.boolValue { return errResult("Not a directory: \(resolved.path)", code: "wrong_path_kind", path: resolved, pathKind: "file") }
+        do {
+            guard let isDirectory = try readPathIsDirectory(resolved) else {
+                return errResult("Directory not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing")
+            }
+            if !isDirectory { return errResult("Not a directory: \(resolved.path)", code: "wrong_path_kind", path: resolved, pathKind: "file") }
+        } catch let failure as FileReadFailure { return errResult(failure.message, code: failure.code, path: resolved) }
+        catch { return errResult(error.localizedDescription, code: "read_failed", path: resolved) }
         // Parent dirent types avoid entering dormant child mounts. Unknown and symlink types display as files; listing must not follow them.
         struct Entry {
             let name: String; let isFile: Bool; var modified: Date? = nil; var added: Date? = nil
@@ -116,7 +121,7 @@ extension FileSystemActions {
         // Reopen each authorized component with O_DIRECTORY|O_NOFOLLOW and list its descriptor to refuse swapped-in symlinks.
         let directoryFD: Int32
         do { directoryFD = try VerifiedPath.open(resolved, flags: O_RDONLY | O_DIRECTORY) }
-        catch let failure as VerifiedPath.Failure { return errResult(failure.message, code: failure.code) }
+        catch let failure as VerifiedPath.Failure { return errResult(failure.message, code: failure.code, path: resolved) }
         catch { return errResult("could not open directory") }
         guard let directory = fdopendir(directoryFD) else {
             let code = errno
@@ -193,7 +198,7 @@ extension FileSystemActions {
         #else
         if sort == "size" || sort == "added" { return errResult("Allocated disk usage and added-date ordering require macOS", code: "unavailable") }
         do {
-            entries = try fm.contentsOfDirectory(atPath: resolved.path)
+            entries = try FileManager.default.contentsOfDirectory(atPath: resolved.path)
                 .map { Entry(name: $0, isFile: true) }
         } catch {
             return errResult(error.localizedDescription)

@@ -24,6 +24,7 @@ import MemoryV2
 import StandingBots
 import TurnTrace
 import Studio
+import DreamREMCycle
 // Blueprint: | `QuietSetting.swift` | Throwing read/choice contract, explicit turn-bound writes, checked Trust and MainActor receipt detail |
 
 public typealias QuietSettingsHostProvider = @MainActor @Sendable () -> (any QuietSettingsHost)?
@@ -92,8 +93,6 @@ public struct QuietSetting: Sendable {
     public let note: String
     /// User-owned posture rows stay readable but reject agent writes so self-administration cannot widen its own authority.
     public let ownerOnly: Bool
-    /// Writable only in Full Mac, with receipts; raising to Full Mac remains the owner's call.
-    public let fullMacOnly: Bool
     /// The agent's own thought and memory controls do not ask for a person's request or Trust posture.
     public private(set) var mindOwned = false
     /// The preference owner this row reads; page invalidation watches only its declared keys.
@@ -101,6 +100,8 @@ public struct QuietSetting: Sendable {
     /// Page reads list remote settings without waiting on another device; setting.get performs that read.
     public let readsAnotherDevice: Bool
     public let read: @MainActor @Sendable (any QuietSettingsHost) async throws -> JSONValue
+    /// File-backed reads name their owner without retaining the mounted host.
+    public private(set) var storedRead: StoredRead?
     public let write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue, QuietSettingWrite) async throws -> Void)?
     /// Preview shares the read-only direction/value rule that write checks before mutation.
     public let check: (@MainActor @Sendable (any QuietSettingsHost, JSONValue, Turn) async -> QuietSettingError?)?
@@ -114,7 +115,6 @@ public struct QuietSetting: Sendable {
         liveChoices: (@MainActor @Sendable (@escaping QuietSettingsHostProvider) async throws -> [String])? = nil,
         note: String = "",
         ownerOnly: Bool = false,
-        fullMacOnly: Bool = false,
         readsAnotherDevice: Bool = false,
         read: @escaping @MainActor @Sendable (any QuietSettingsHost) async throws -> JSONValue,
         write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue, QuietSettingWrite) async throws -> Void)? = nil,
@@ -125,10 +125,10 @@ public struct QuietSetting: Sendable {
         self.label = label
         self.kind = kind
         self.choices = choices
+        self.storedRead = nil
         self.liveChoices = liveChoices
         self.note = note
         self.ownerOnly = ownerOnly
-        self.fullMacOnly = fullMacOnly
         self.readsAnotherDevice = readsAnotherDevice
         self.read = { host in
             if page == "trust", host.trustPolicy == nil {
@@ -152,6 +152,105 @@ public struct QuietSetting: Sendable {
         }
     }
 
+    public init(
+        id: String, page: String, label: String, kind: Kind,
+        note: String = "", read: StoredRead,
+        write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue, QuietSettingWrite) async throws -> Void)? = nil
+    ) {
+        self.init(id: id, page: page, label: label, kind: kind, note: note,
+                  read: { host in try await read.value(dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot()) },
+                  write: write)
+        self.storedRead = read
+    }
+
+    /// Only values cross into a page builder; registry closures (including platform writers) stay with the host.
+    public struct Descriptor: Sendable {
+        public let id: String
+        public let label: String
+        public let kind: Kind
+        public let note: String
+        public let editable: Bool
+    }
+
+    public var descriptor: Descriptor {
+        Descriptor(id: id, label: label, kind: kind, note: note, editable: write != nil && !readsAnotherDevice)
+    }
+
+    public struct ReadSnapshot: Sendable {
+        public enum Reading: Sendable {
+            case value(JSONValue)
+            case stored(StoredRead)
+            case unavailable(String)
+        }
+        public let setting: Descriptor
+        public let choices: [String]?
+        public let reading: Reading
+
+        public func value(dataRoot: URL) async throws -> JSONValue {
+            switch reading {
+            case .value(let value): return value
+            case .stored(let read): return try await read.value(dataRoot: dataRoot)
+            case .unavailable(let problem): throw QuietSettingError.unavailable(problem)
+            }
+        }
+    }
+
+    /// In-memory reads and choices are copied together in the face's one host hop. No file reader runs here.
+    @MainActor
+    public func snapshot(host: any QuietSettingsHost) async throws -> ReadSnapshot {
+        var offered: [String]?
+        let reading: ReadSnapshot.Reading
+        do {
+            if kind == .choice { offered = try await liveChoices?({ host }) ?? choices }
+            if let storedRead { reading = .stored(storedRead) }
+            else { reading = .value(try await read(host)) }
+        } catch is CancellationError { throw CancellationError() }
+        catch { reading = .unavailable(error.localizedDescription) }
+        return ReadSnapshot(setting: descriptor, choices: offered, reading: reading)
+    }
+
+    /// The same typed reader serves setting.get/write readback and the host-free Settings face.
+    public enum StoredRead: Sendable {
+        case multimodal(KeyPath<TrustMultimodalPolicy, Bool> & Sendable)
+        case memory(KeyPath<TrustMemoryPolicy, Bool> & Sendable)
+        case dreams
+        case remCycle
+        case meaningBasedMemory
+
+        @concurrent public func value(dataRoot: URL) async throws -> JSONValue {
+            try Task.checkCancellation()
+            switch self {
+            case .multimodal(let key):
+                let policy = try await QuietSettings.readMindPolicy(root: dataRoot)
+                return .bool((policy.multimodalPolicy ?? TrustMultimodalPolicy())[keyPath: key])
+            case .memory(let key):
+                let policy = try await QuietSettings.readMindPolicy(root: dataRoot)
+                return .bool((policy.memoryPolicy ?? TrustMemoryPolicy())[keyPath: key])
+            case .dreams:
+                let policy = try SwiftNativeTrustCenter(dataRoot: dataRoot).loadSavedPolicyChecked()
+                return .bool(try DreamREMGatePolicy(policy: policy).dreamEnabled)
+            case .remCycle:
+                let policy = try await QuietSettings.readMindPolicy(root: dataRoot)
+                return .bool(policy.trainingPolicy?.rem_cycle_enabled ?? true)
+            case .meaningBasedMemory:
+                let owner = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+                let runtime: ManagedEmbeddingProvider
+                do { runtime = try await owner.managedEmbeddingRuntime() }
+                catch is CancellationError { throw CancellationError() }
+                catch {
+                    throw QuietSettingError.unavailable(error.localizedDescription
+                        + " Open Memories and repair its reported storage problem before reading this setting.")
+                }
+                let snapshot = runtime.snapshot()
+                guard snapshot.requestedBackend != ManagedEmbeddingProvider.failClosedBackend else {
+                    throw QuietSettingError.unavailable((snapshot.lastLoadError ?? "The saved embeddings configuration could not be read.")
+                        + " Repair config/embeddings.json in the app data folder before reading or changing meaning-based memory.")
+                }
+                return .bool(snapshot.requestedBackend != ManagedEmbeddingProvider.mockBackend)
+            }
+        }
+    }
+
     public func onTab(_ tab: String) -> QuietSetting {
         var row = self
         row.tab = tab
@@ -170,19 +269,16 @@ public struct QuietSetting: Sendable {
         return row
     }
 
-    /// Read fullMac fresh so catalog writability and the write's refusal use the same authority.
-    public func writable(fullMac: Bool) -> Bool {
-        guard !ownerOnly, write != nil else { return false }
-        return fullMac || !fullMacOnly
-    }
+    /// The agent may write a row that is not the person's alone; which direction a write goes is the row's own check, at any posture.
+    public var writable: Bool { !ownerOnly && write != nil }
 
-    public func catalogRow(fullMac: Bool, host: @escaping QuietSettingsHostProvider) async throws -> JSONValue {
+    public func catalogRow(host: @escaping QuietSettingsHostProvider) async throws -> JSONValue {
         var row: [String: JSONValue] = [
             "id": .string(id),
             "page": .string(page),
             "label": .string(label),
             "type": .string(kind.rawValue),
-            "writable": .bool(writable(fullMac: fullMac)),
+            "writable": .bool(writable),
         ]
         let offered = try await (liveChoices?(host) ?? choices)
         if !offered.isEmpty { row["choices"] = .array(offered.map { .string($0) }) }
@@ -192,10 +288,6 @@ public struct QuietSetting: Sendable {
         if ownerOnly {
             row["owner_only"] = .bool(true)
             row["refusal"] = .string(QuietSettings.ownerOnlyRefusal)
-        }
-        if fullMacOnly {
-            row["full_mac_only"] = .bool(true)
-            if !fullMac { row["refusal"] = .string(QuietSettings.belowFullMacRefusal) }
         }
         return .object(row)
     }

@@ -27,12 +27,13 @@ public enum ChatRichContentParser {
     }
 
     /// Uncached for growing streaming text; settled callers retain by content.
-    public static func inline(_ content: String) -> InlineOutcome {
+    public static func inline(_ content: String, sourcePositions: Bool = false) -> InlineOutcome {
         do {
             let raw = try AttributedString(
                 markdown: content,
                 options: AttributedString.MarkdownParsingOptions(
-                    interpretedSyntax: .inlineOnlyPreservingWhitespace, failurePolicy: .throwError)
+                    interpretedSyntax: .inlineOnlyPreservingWhitespace, failurePolicy: .throwError,
+                    appliesSourcePositionAttributes: sourcePositions)
             )
             return .parsed(ChatLinkPolicy.sanitized(raw))
         } catch {

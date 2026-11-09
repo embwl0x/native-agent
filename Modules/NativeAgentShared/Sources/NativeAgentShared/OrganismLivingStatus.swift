@@ -11,6 +11,7 @@ public enum OrganismLivingStatusAvailability: String, Codable, Hashable, Sendabl
 /// Rebuildable, read-only organism projection shared by the Mac snapshot writer and the iOS display client. Cognition remains Mac-owned; this DTO is
 /// transport tissue only and deliberately carries no behavior.
 public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
+    /// When this complete mobile state last changed, including its Desk availability.
     public var generatedAt: Date
     public var enabled: Bool
     public var posture: String

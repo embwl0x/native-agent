@@ -1,12 +1,10 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `ChatStore+PendingExchanges.swift` | Durable bounded reply observation; unknown delivery retains exact retry and late replies |
+// Blueprint: | `ChatStore+PendingExchanges.swift` | Durable reply observation; unknown delivery retains its exact request and late replies |
 
 /// Waiting repeats only evidenced Mac activity and its age; silence is not failure.
 enum ChatWaitStatusPresentation {
     static let unacknowledged = "Waiting for your Mac to receive this"
-    static let silent = "No update yet"
-    static let stillSending = "Still sending…"
     static let deliveryUnconfirmed = "Couldn't confirm it arrived — Retry"
     static let deliveryUnconfirmedWithoutRetry = "Couldn't confirm it arrived. Still watching for a reply."
 
@@ -19,12 +17,11 @@ enum ChatWaitStatusPresentation {
         return hours == 1 ? "1 hr ago" : "\(hours) hr ago"
     }
 
-    static func line(activity: String?, age: TimeInterval, isSilent: Bool) -> String {
+    static func line(activity: String?, age: TimeInterval) -> String {
         let clean = (activity ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else {
-            return isSilent ? silent : unacknowledged
+            return unacknowledged
         }
-        if isSilent { return "\(silent) · \(clean) \(ageText(age))" }
         return "\(clean) · \(ageText(age))"
     }
 }
@@ -51,12 +48,8 @@ struct ChatPendingExchange: Codable, Equatable, Sendable {
     var activity: String?
     var updatedAt: Date
     var acknowledged: Bool
-    /// Silence beyond the wait window is a phone status, never a verdict about the Mac.
-    var isSilent: Bool
     /// Only signed expiry authorizes a user-requested Send now; retain its refused request arguments.
     var expiredRequest: ExpiredRequest? = nil
-    /// Persist the observation deadline before dispatch so relaunch observes the same envelope without uploading again.
-    var deliveryConfirmationDeadline: Date? = nil
     var deliveryUnconfirmed: Bool = false
     /// Positive transport evidence; independent of Mac execution/reply.
     var deliveryAccepted: Bool = false
@@ -65,11 +58,10 @@ struct ChatPendingExchange: Codable, Equatable, Sendable {
 
     func statusLine(now: Date = Date()) -> String {
         if deliveryUnconfirmed { return ChatWaitStatusPresentation.deliveryUnconfirmed }
-        if deliveryConfirmationDeadline != nil, !acknowledged { return ChatWaitStatusPresentation.stillSending }
+        if !deliveryAccepted, !acknowledged { return ChatWaitStatusPresentation.unacknowledged }
         return ChatWaitStatusPresentation.line(
             activity: acknowledged ? (activity ?? "Mac received it") : nil,
-            age: now.timeIntervalSince(updatedAt),
-            isSilent: isSilent
+            age: now.timeIntervalSince(updatedAt)
         )
     }
 }
@@ -130,8 +122,7 @@ extension ChatStore {
             partialText: "",
             activity: nil,
             updatedAt: Date(),
-            acknowledged: false,
-            isSilent: false
+            acknowledged: false
         )
         showWaitStatus(correlationID: correlationID)
     }
@@ -148,10 +139,9 @@ extension ChatStore {
         correlationID: String,
         message: String
     ) {
-        iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
+        iCloudBridge.shared.retireDelivery(for: correlationID)
         guard var record = pendingExchanges[correlationID] else { return }
         record.expiredRequest = ChatPendingExchange.ExpiredRequest(message: message)
-        record.isSilent = false
         record.updatedAt = Date()
         pendingExchanges[correlationID] = record
     }
@@ -166,7 +156,6 @@ extension ChatStore {
         noteDeliveryAccepted(correlationID)
         guard var record = pendingExchanges[correlationID] else { return }
         record.acknowledged = true
-        record.isSilent = false
         record.updatedAt = Date()
         if let activity = activity?.trimmingCharacters(in: .whitespacesAndNewlines), !activity.isEmpty {
             record.activity = activity
@@ -180,7 +169,6 @@ extension ChatStore {
         queuedSends.removeAll { $0.id.uuidString == correlationID }
         guard var record = pendingExchanges[correlationID] else { return }
         let wasUnconfirmed = record.deliveryUnconfirmed
-        record.deliveryConfirmationDeadline = nil
         record.deliveryUnconfirmed = false
         record.deliveryAccepted = true
         pendingExchanges[correlationID] = record
@@ -195,7 +183,7 @@ extension ChatStore {
         }
     }
 
-    /// An exhausted observation window proves uncertainty only; retain the exact retry envelope and late-reply observation.
+    /// An unknown transport outcome retains the exact request and reply observation.
     func markDeliveryUnconfirmed(_ correlationID: String) {
         guard var record = pendingExchanges[correlationID], !record.acknowledged, !record.deliveryAccepted, !record.isExpired else { return }
         record.deliveryUnconfirmed = true
@@ -204,7 +192,7 @@ extension ChatStore {
         let status = canRetry ? ChatWaitStatusPresentation.deliveryUnconfirmed
             : ChatWaitStatusPresentation.deliveryUnconfirmedWithoutRetry
         // Automatic drains must use durable exchange uncertainty; successful reads can clear the unrelated transport-recovery pause.
-        iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
+        iCloudBridge.shared.retireDelivery(for: correlationID)
         if let index = messages.firstIndex(where: { $0.id == record.placeholderID }) {
             messages[index].text = status
             messages[index].isStreaming = false
@@ -218,17 +206,9 @@ extension ChatStore {
         // Uncertainty leaves Talk open to late replies, so do not issue its terminal callback.
     }
 
-    /// Silence may change status only; preserve partial words, bubble and observation.
-    func notePendingExchangeSilent(correlationID: String) {
-        guard var record = pendingExchanges[correlationID] else { return }
-        record.isSilent = true
-        pendingExchanges[correlationID] = record
-        showWaitStatus(correlationID: correlationID)
-    }
-
     /// Only a terminal reply, error, cancel or session retirement closes the record.
     func closePendingExchange(_ correlationID: String) {
-        iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
+        iCloudBridge.shared.retireDelivery(for: correlationID)
         pendingExchanges.removeValue(forKey: correlationID)
     }
 
@@ -272,7 +252,7 @@ extension ChatStore {
                 }
                 pendingICloudPlaceholders[record.correlationID] = record.placeholderID
                 resolvedICloudReplyIds.remove(record.correlationID)
-                timedOutPendingIds.removeValue(forKey: record.correlationID)
+                retiredPendingPlaceholders.removeValue(forKey: record.correlationID)
                 markDeliveryUnconfirmed(record.correlationID)
                 restored.append(record.correlationID)
                 continue
@@ -299,7 +279,7 @@ extension ChatStore {
             pendingICloudPlaceholders[record.correlationID] = record.placeholderID
             // The durable unfinished record permits a live reply to resume because no terminal state was reached.
             resolvedICloudReplyIds.remove(record.correlationID)
-            timedOutPendingIds.removeValue(forKey: record.correlationID)
+            retiredPendingPlaceholders.removeValue(forKey: record.correlationID)
             showWaitStatus(correlationID: record.correlationID)
             restored.append(record.correlationID)
         }
@@ -340,42 +320,12 @@ extension ChatStore {
         }
         pendingICloudPlaceholders.removeValue(forKey: record.correlationID)
         streamingHintsByMessageId.removeValue(forKey: record.placeholderID)
-        timedOutPendingIds.removeValue(forKey: record.correlationID)
+        retiredPendingPlaceholders.removeValue(forKey: record.correlationID)
     }
 
-    /// Restoration observes the already dispatched request; never send it again.
-    func resumeObservingPendingExchanges(using client: MacBridgeClient) {
+    /// Restoration observes the dispatched request without sending it again.
+    func resumeObservingPendingExchanges() {
         restorePendingExchanges(for: selectedSessionID)
         armReplyStatus()
-        resumeDeliveryConfirmations()
-    }
-
-    func resumeDeliveryConfirmations() {
-        for record in pendingExchanges.values where record.deliveryConfirmationDeadline != nil && !record.deliveryUnconfirmed && !record.isExpired {
-            guard !inFlightSendIDs.contains(record.correlationID),
-                  let deadline = record.deliveryConfirmationDeadline else { continue }
-            let queued = queuedSends.first(where: { $0.id.uuidString == record.correlationID })
-            // A changed pairing cannot inspect the old peer's record but must not extend its saved deadline.
-            let message = queued.flatMap { canDeliverQueuedSend($0) ? $0.preparedMessage : nil }
-            let correlation = record.correlationID
-            inFlightSendIDs.insert(correlation)
-            Task { [self] in
-                defer { inFlightSendIDs.remove(correlation) }
-                let confirmed: Bool
-                if let message {
-                    confirmed = await iCloudBridge.shared.confirmMessageDelivery(message, until: deadline) {
-                        self.pendingExchanges[correlation]?.acknowledged == true
-                    }
-                } else {
-                    // Missing local bytes prove neither rejection nor permission to write again; retain bounded original observation.
-                    do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
-                    catch { return }
-                    confirmed = pendingExchanges[correlation]?.acknowledged == true
-                }
-                guard !Task.isCancelled, pendingExchanges[correlation] != nil else { return }
-                if confirmed { noteDeliveryAccepted(correlation); showWaitStatus(correlationID: correlation) }
-                else { markDeliveryUnconfirmed(correlation) }
-            }
-        }
     }
 }

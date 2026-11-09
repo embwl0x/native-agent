@@ -17,7 +17,7 @@ public enum ProviderToolWire: Sendable, Equatable {
 public enum ProviderToolCapability {
     static func transport(providerID: String) -> (any LLMTransport.Type)? {
         switch providerID {
-        case "anthropic", "kimi-code": AnthropicTransport.self
+        case "anthropic", "kimi-code", "meta": AnthropicTransport.self
         case "anthropic_oauth_direct": AnthropicOAuthTransport.self
         case "openai": OpenAITransport.self
         case "openai_oauth_direct": ChatGPTTransport.self

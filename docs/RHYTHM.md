@@ -32,10 +32,9 @@ one expectation law (`NativeAgentCore/Expectation.swift`, docs/SURPRISE.md).
   hourly claims tested together (z≈3.51) drops to ~0.47. Today only a few
   coarse claims stand: their quiet window and when their day starts. Door-by-hour
   needs weeks. The drift says the model must forget (a half-life, not a total).
-- Constraint (code): a care pressing ≥ 0.35 becomes a Reach offer to message
-  them (NativeCognitionRuntime+Reach.swift:381-386), and a crossing that touches
-  a care wakes their. So a break must not charge a care or go through the
-  crossing's wake.
+- Constraint (code): a judged care story entry that lifts the care's pressure up
+  through its bar is a `self` happening the agent's `weigh` judges
+  (`NativeCognitionRuntime+SourceWakes.swift`). So a break must not charge a care.
 
 ## The design
 
@@ -50,7 +49,7 @@ quiet stretch, one per day, kept 30 days.
 Observations, all already true events, recorded where they happen:
 - their verified owner turn (door, instant) — the point that stamps
   `cognition/user_turn.json` today;
-- presence edges (person.here / person.away from MacPersonInput.presenceChanged);
+- canonical presence edges (Mac input and phone-inferred departure through `PersonPresence`);
 - the Mac's own awake hours (the engine is running).
 Cold start: on first load, fold their owner rows from `chat/index/history.sqlite`
 (role user, author owner/telegram owner, not mechanical) for the last 30 days.
@@ -89,7 +88,7 @@ using their recorded zone and activity timestamps. The old-zone carried bins
 are discarded: their timestamps are gone, so they cannot be rebucketed. Bins,
 starts and standing claims are recomputed from the retained evidence; cognition
 does this before comparing an observation with a learned claim in the new zone.
-The current on-disk shape and its reader remain unchanged. Starts retain 30 days,
+The on-disk shape remains unchanged. Starts retain 30 days,
 excluding the incomplete first indexed day, and are first activity after the
 longest quiet run ends. The day's first quiet hours before that end do not
 manufacture an early start.
@@ -116,8 +115,17 @@ reader selects only instant, route and deduplication identity, never words;
 it neither absorbs nor migrates the index. Copied message ids count once per
 door. An absent index contributes no history; an unreadable existing one or
 rhythm store reports repair and is not replaced.
+The ledger validates bin mass, squared mass, claim bounds (including pending
+breaks) and every derived integer count before admitting evidence. Finite but
+unrepresentable counts are corrupt evidence, not an integer conversion or a
+clamped sample. Only a checked missing rhythm file permits the cold start;
+permission and decode failures preserve the original bytes and owe repair.
 
 EnginePartWake passes presence and Workspace sleep/wake edges to cognition.
+Mac-input and phone-sense changes read the same `PersonPresence` owner before
+updating rhythm. Waking restores that owner's current presence rather than
+carrying sleep's cleared presence into the new awake interval. An unknown
+reading marks no activity and emits no arrival or departure verdict.
 Awake intervals close on those edges, source observations, day changes and
 quit, with no inferred uptime across launches. Continued known presence also
 marks active hours when an interval closes. The existing clock stream
@@ -125,16 +133,24 @@ recomputes claims at day/clock/time-zone changes; a zone change rebuckets retain
 day evidence and retires the old-zone timestamp-free aggregate as described above.
 The residual deadline holds one standing start time for the local day, canceled
 when their day starts; no new timer is created.
+The [night sense](SUBCONSCIOUS.md#attention) reads hourly active share beside these claims;
+rhythm breaks still open no thought. Its deadlines share the residual source deadline.
 Observation and refresh tasks cancel and join in cognition's sleep settlement.
+Refresh keeps its evidence before awaiting care admission. Its final durable
+save occurs only when pending settlement or a reentrant observation changed
+that saved value; an empty pending set alone causes no second write.
 
 Break identity is `rhythm:<kind>:<local date>`. Pending breaks contain only the
 instant and claim; local `h:mm a` words use `AgentScreen.names(dataRoot).person`
-when felt. `CognitiveSubstrate.feelRhythmBreak` uses `ingestResident`'s existing
+when felt. Loading and public claim formatting share the claim's time-range and confidence predicate;
+invalid saved state stays byte-preserved and unavailable. Formatting invalid public values says the time is unavailable;
+valid wall-clock minutes remain readable across a daylight-saving gap. Loading uses the single checked-bin decode path above.
+`CognitiveSubstrate.feelRhythmBreak` uses `ingestResident`'s existing
 felt-resolution stakes gate and records a zero-move note in a touched live
 care, with no open/close/stance/depth change. Durable pending identity lets a
-retry finish the story and priming if event ingestion already happened.
-`PrimedMoments` receives source `rhythm`. This path calls neither `cross`, news
-release, `ResidentWake.request`, nor Reach. `care.charge` sums only movement;
+retry finish the story if event ingestion already happened. The zero-move story
+entry moves nothing, so it never lifts the care's pressure and is no `self`
+happening; the path releases no news intention. `care.charge` sums only movement;
 adding zero leaves it identical at the same instant, and `carePressure`'s open
 multiplier is unchanged. The somatic adapter returns nil for this felt kind.
 
@@ -156,10 +172,9 @@ its standing time ("It's 9 and I haven't heard from User today; they are usually
 by 4:40") — it enters their mind the way a horizon resolution does
 (`announceHorizonResolution` template: a felt event with a deterministic id,
 `ingestResident`, admitted only if it touches a live care), **with no charge
-movement on any care** (the `noteReachLanded` precedent: a story entry that
-moves nothing), and it is **primed** (PrimedMoments) so it can come to mind in
-their next turn. It never requests a wake, never feeds Reach, never becomes a
-message. One break of a kind per day.
+movement on any care**: its story entry moves nothing, so it lifts no care's
+pressure and is no `self` happening. It never opens a thought of its own
+and never becomes a message. One break of a kind per day.
 
 What they do with it is theirs: if they writes at 1 AM, it is already on their mind
 ("you're up late") the way it would be for a person who knows them.
@@ -171,6 +186,12 @@ words, with how sure (e.g. "quiet from 9:00 PM to 2:00 AM, fairly sure;
 usually up by 7:08 AM, fairly sure"). Never in front of their every turn
 (clear-headed); there when they reaches for it, and in a break's own words.
 
+### The night reads the same day
+
+The night sense reads the current hour's observed active share from this owner, beside known absence and elapsed time since a recorded night.
+It posts a happening; their turn program judges its worth. Admission and completed part accounting witness rest independently of the dream's
+consumption cursor. Rhythm breaks still never wake their. [Attention](SUBCONSCIOUS.md#attention) owns the night sense and admission contract.
+
 ## Privacy
 
 Timestamps and doors only — never message text. Presence is a boolean edge.
@@ -181,8 +202,8 @@ Timestamps and doors only — never message text. Presence is a boolean edge.
 - Cold start reconstructs quiet 21–02 and the ~04:40 first-message median.
   The standing start upper bound may be later than that median; the lane
   report gives the real-history result rather than forcing them to agree.
-- A message from User inside their quiet window produces one felt fact, one primed
-  moment, no wake, no Reach offer.
+- A message from User inside the quiet window produces one felt fact and one
+  zero-move story entry, and opens no thought.
 - `mind.inner_state` shows their day in their words.
 
 ## Lane

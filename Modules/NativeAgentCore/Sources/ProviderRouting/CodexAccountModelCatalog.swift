@@ -258,9 +258,17 @@ public enum CodexAccountModelCatalog {
     }
 
     private static func cacheSource(dataRoot: URL, environment: [String: String]) -> URL {
-        let authURL = authPath(dataRoot: dataRoot, environment: environment)
-        let sibling = authURL.deletingLastPathComponent().appendingPathComponent("models_cache.json")
-        return sibling
+        cacheSource(authURL: authPath(dataRoot: dataRoot, environment: environment))
+    }
+
+    private static func cacheSource(authURL: URL) -> URL {
+        authURL.deletingLastPathComponent().appendingPathComponent("models_cache.json")
+    }
+
+    public nonisolated static func observationPaths(dataRoot: URL) -> [URL] {
+        let auth = authPath(dataRoot: dataRoot, environment: ProcessInfo.processInfo.environment)
+        return [auth, cacheSource(authURL: auth), NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: dataRoot),
+                ChatGPTTransport.preferredAuthPath(dataRoot: dataRoot, source: .sharedCLI)]
     }
 
     private static func authPath(dataRoot: URL, environment: [String: String]) -> URL {
@@ -327,15 +335,5 @@ public enum CodexAccountModelCatalog {
         }
         let trimmed = accountID.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-
-    public static func cacheCandidate(
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
-    ) -> URL {
-        ChatGPTTransport.preferredAuthPath(environment: environment,
-            userCodexHome: homeDirectory.appendingPathComponent(".codex", isDirectory: true), source: .commandCLI)
-            .deletingLastPathComponent()
-            .appendingPathComponent("models_cache.json")
     }
 }

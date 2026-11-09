@@ -9,7 +9,7 @@ import PersistenceCore
 public struct ToolResult: Sendable {
     /// The action's own reply, for the edges.
     public let payload: JSONValue
-    /// The shared exact classification: missing, pending, partial and ambiguous evidence stay unknown.
+    /// The shared exact classification from the owner's outcome and failure evidence; effects alone do not establish failure.
     public let outcome: ChatToolOutcome.ExactResultClass
     /// The owner's own status word (`status`, else `state`), trimmed and lowercased.
     public let status: String?

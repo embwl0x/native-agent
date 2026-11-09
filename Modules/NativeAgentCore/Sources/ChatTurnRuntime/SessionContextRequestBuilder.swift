@@ -28,7 +28,20 @@ extension SwiftNativeChatOrchestrationClient {
                 model: context.modelId, providerID: context.providerId, dataRoot: dataRoot, windowTokens: window, call: call)
         }
         let before = try await measure(context)
-        guard before.tokens > max(0, window - before.outputTokens) else { return context }
+        func recordHistory(_ fitted: TurnContext, measurement: SessionContextMeasurement) {
+            guard let tail = fitted.historyReplaySpec?.historySnapshot else { return }
+            TurnTraceBus.fireFromContext(kind: "context.history.fit", sessionId: sessionId, surface: surface, payload: .object([
+                "history.heldRows": .int(Int64(fitted.historyRowCharacters.count)),
+                "history.reachedRows": .int(Int64(tail.rowCount - fitted.historyRowCharacters.count)),
+                "historyContextWindow": .string(fitted.historyContextWindow),
+                "inputTokens": .int(Int64(measurement.tokens)),
+                "inputBudgetTokens": .int(Int64(ContextBudgetPolicy.inputTokens(windowTokens: window, outputTokens: measurement.outputTokens)))
+            ]), turn: turn)
+        }
+        guard before.tokens > ContextBudgetPolicy.inputTokens(windowTokens: window, outputTokens: before.outputTokens) else {
+            recordHistory(context, measurement: before)
+            return context
+        }
         guard let tail = context.historyReplaySpec?.historySnapshot else {
             guard context.historyMessages.isEmpty else {
                 throw ProviderRoutingError.configurationFailed("This request's admitted history snapshot is unavailable.")
@@ -40,19 +53,22 @@ extension SwiftNativeChatOrchestrationClient {
         var after = before
         var selected: SessionHistoryTail.Checkpoint?
         let retainedCharacters = context.historyRowCharacters.values.reduce(0, +)
+        let historyCharacters = LLMMessage.inputCharacters(context.historyMessages, system: nil, tools: [])
+        let maximumRetained = Double(ContextBudgetPolicy.inputTokens(windowTokens: window, outputTokens: before.outputTokens))
+            * before.charactersPerToken - Double(before.requestCharacters - historyCharacters)
         // Earlier checkpoints cannot restore rows already dropped from this in-flight request.
-        for checkpoint in tail.checkpoints(halfBudgetCharacters: halfBudget)
-            where checkpoint.characters > tail.characters - retainedCharacters {
+        for checkpoint in tail.fittingCheckpoints(halfBudgetCharacters: halfBudget, maximumRetainedCharacters: maximumRetained,
+            afterCharacters: tail.characters - retainedCharacters) {
             let projected = tail.project(after: checkpoint)
             next.historyMessages = projected.messages
-            next.replayedTurnContexts = projected.replayedContexts
             next.historyContextWindow = projected.contextWindow
             next.historyRowCharacters = projected.rowCharacters
             after = try await measure(next)
             selected = checkpoint
-            if after.tokens <= max(0, window - after.outputTokens) { break }
+            if after.tokens <= ContextBudgetPolicy.inputTokens(windowTokens: window, outputTokens: after.outputTokens) { break }
         }
-        if let selected {
+        // Only an observed request head establishes movement; an absent receipt leaves that comparison unknown.
+        if let selected, let previous = before.previousHistoryContextWindow, previous != next.historyContextWindow {
             TurnTraceBus.fireFromContext(kind: "context.tail.cut", sessionId: sessionId, surface: surface, payload: .object([
                 "inputTokensBefore": .int(Int64(before.tokens)), "inputTokensAfter": .int(Int64(after.tokens)),
                 "windowTokens": .int(Int64(window)), "outputTokens": .int(Int64(after.outputTokens)),
@@ -63,6 +79,7 @@ extension SwiftNativeChatOrchestrationClient {
                 "source": .string(after.source)
             ]), turn: turn)
         }
+        recordHistory(next, measurement: after)
         return next
     }
 }

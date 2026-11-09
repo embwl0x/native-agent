@@ -48,11 +48,6 @@ public struct DelegationStatusProjector: Sendable {
         )
     }
 
-    /// Reconciliation needs complete history; the model-visible page limit must not skip older unsettled records.
-    public func allJobs(now: Date) -> [DelegationReadout] {
-        readSnapshot(now: now).jobs
-    }
-
     /// One disk read reports all jobs and availability so cursors never advance past unreadable records.
     public func allJobsWithAvailability(
         now: Date
@@ -101,8 +96,8 @@ public struct DelegationStatusProjector: Sendable {
                 var row = DelegationReadout(id: id, source: state.source ?? principal, agent: principal,
                     topicSlug: nil, deskHandle: nil, state: status == "delivered" ? "settled" : status, status: nil, runStatus: nil,
                     createdAt: nil, claimedAt: nil, startedAt: nil, lastLiveness: nil,
-                    completedAt: nil, elapsedSeconds: nil, stalled: false,
-                    stallBasis: status == "owed" ? .none : .terminal, deliveryLost: nil, deliveryOutcome: status, completionTextHead: nil)
+                    completedAt: nil, elapsedSeconds: nil, deliverySettled: status != "owed",
+                    deliveryLost: nil, deliveryOutcome: status, completionTextHead: nil)
                 row.completionDeliveryID = id
                 row.deliveryUpdatedAt = state.updatedAt
                 row.recordKind = "completion_lifecycle"
@@ -130,14 +125,6 @@ public struct DelegationStatusProjector: Sendable {
     }
 
     private static let fileCache = DelegationFileCache()
-
-    /// Schedule the exact stall crossing so quiet writers become observable without polling.
-    public func nextStallDeadline(after now: Date) -> Date? {
-        allJobs(now: now)
-            .compactMap(\.stallDeadline)
-            .filter { $0 > now }
-            .min()
-    }
 
     // MARK: - Directory scanning
 

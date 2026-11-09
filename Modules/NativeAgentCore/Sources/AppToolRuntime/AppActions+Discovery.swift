@@ -31,7 +31,7 @@ extension AppActions {
     public static let guided: Set<String> = ["mac.act", "files.read", "result.page", "memory.commit", "chat.new", "chat.list"]
 
     private static let guideArgs: [String: Set<String>] = ["files.read": ["offset", "version"],
-        "result.page": ["continue"], "memory.commit": ["provenance", "provenance_by"]]
+        "result.page": ["continue"], "memory.commit": ["provenance", "provenance_by", "since"]]
 
     private static func argumentGuide(_ action: AppAction, schema: LLMToolSchema) throws -> [String] {
         let lines = try ToolSignature.params(schema.parametersJSON, limit: .max)
@@ -223,8 +223,8 @@ extension AppActions {
         if action.id == "chat.new" { example["title"] = .string("<title>") }
         if action.id == "chat.list" { example["pinned"] = .bool(true) }
         if action.id == "schedule.create" {
-            example = ["kind": .string("rem"), "payload": .object(["objective": .string("Consolidate the week's memories")]),
-                "schedule": .object(["type": .string("daily"), "at": .string("<HH:MM>")])]
+            example = ["kind": .string("connector_action"), "payload": .object(["actionId": .string("<a read>"), "input": .object([:])]),
+                "schedule": .object(["type": .string("every"), "minutes": .int(30)])]
         }
         // Authored contracts retain required names and additionalProperties; bound forms supply fixed executor args outside the public call.
         var args: [String: JSONValue] = if action.folded, action.input.isEmpty, let native,
@@ -273,6 +273,178 @@ extension AppActions {
             result["blocker"] = .string(blocker)
         }
         return .object(result)
+    }
+
+    /// Bind only a unique meaning at the door; a collision or an unresolved name leaves the whole call for admission to refuse.
+    static func boundArguments(_ action: AppAction, _ given: [String: JSONValue], schema: JSONValue?)
+        -> (args: [String: JSONValue], understood: [String]) {
+        boundArguments(action, given, schema: schema, known: { $0 }, make: { $0 },
+            accepts: { $0.schemaProblem(schema: $1) == nil })
+    }
+
+    /// Unknown expressions retain their supplied names and structural constraints; only their runtime values remain unjudged.
+    static func boundArguments<Value>(_ action: AppAction, _ given: [String: Value], schema: JSONValue?,
+        known: (Value) -> JSONValue?, make: (JSONValue) -> Value, accepts: (Value, JSONValue) -> Bool)
+        -> (args: [String: Value], understood: [String]) {
+        guard let schema, case .object(let properties)? = schema.objectValue?["properties"] else { return (given, []) }
+        let address = ToolArguments.itemAddress(given, schema: schema)
+        let given = address.args
+        let unknown = given.keys.filter { properties[$0] == nil }.sorted { left, right in
+            let leftNamed = action.argumentReferences[left] != nil || action.argumentNames.values.contains { $0.contains(left) }
+            let rightNamed = action.argumentReferences[right] != nil || action.argumentNames.values.contains { $0.contains(right) }
+            return leftNamed == rightNamed ? left < right : leftNamed
+        }
+        guard !unknown.isEmpty, schema.objectValue?["additionalProperties"] == .bool(false) else { return (given, address.understood) }
+        func requiredNames(_ schema: JSONValue, in args: [String: Value]) -> Set<String> {
+            let fields = schema.objectValue ?? [:]
+            var names = Set((fields["required"]?.arrayValue ?? []).compactMap(\.stringValue))
+            for child in fields["allOf"]?.arrayValue ?? [] { names.formUnion(requiredNames(child, in: args)) }
+            for key in ["anyOf", "oneOf"] {
+                if let variants = fields[key]?.arrayValue {
+                    let missing = variants.map { requiredNames($0, in: args) }
+                    if !missing.contains(where: \.isEmpty) { for form in missing { names.formUnion(form) } }
+                }
+            }
+            return names.filter { args[$0] == nil }
+        }
+        func declaresType(_ schema: JSONValue, value: Value) -> Bool {
+            guard let fields = schema.objectValue else { return false }
+            if fields["type"] != nil || fields["const"] != nil || fields["enum"] != nil { return true }
+            return ["anyOf", "oneOf", "allOf"].contains { key in
+                (fields[key]?.arrayValue ?? []).contains { declaresType($0, value: value) && accepts(value, $0) }
+            }
+        }
+        var bound = given, understood = address.understood
+        for key in unknown {
+            if bound[key] == nil { continue }
+            guard !key.hasPrefix("__"), let argument = given[key], known(argument) != .null else { return (given, address.understood) }
+            let reference = action.argumentReferences[key]
+            let declared = reference.map { [$0.parameter] }
+                ?? action.argumentNames.keys.filter { action.argumentNames[$0]?.contains(key) == true }
+            let translated: Value
+            if let reference, let value = known(argument) {
+                guard let text = value.stringValue, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return (given, address.understood)
+                }
+                translated = make(.string(text.hasPrefix(reference.prefix) ? text : reference.prefix + text))
+            } else { translated = argument }
+            let candidates = (declared.isEmpty ? Array(requiredNames(schema, in: bound)) : declared).filter { name in
+                guard bound[name] == nil, let property = properties[name] else { return false }
+                let meaning: Value
+                if let meanings = action.argumentValues[name], let value = known(argument) {
+                    guard let spelling = value.stringValue, let translated = meanings[spelling] else { return false }
+                    meaning = make(translated)
+                } else { meaning = translated }
+                return declaresType(property, value: meaning) && accepts(meaning, property)
+            }
+            guard candidates.count == 1, let name = candidates.first else { return (given, address.understood) }
+            if let meanings = action.argumentValues[name], let spelling = known(argument)?.stringValue, let translated = meanings[spelling] {
+                bound[name] = make(translated)
+            } else { bound[name] = translated }
+            bound.removeValue(forKey: key)
+            understood.append("understood \(key) as \(name)")
+            for qualifier in reference?.qualifiers ?? [] {
+                guard let value = bound[qualifier] else { continue }
+                guard properties[qualifier] == nil, !qualifier.hasPrefix("__"),
+                      accepts(value, .object(["type": .string("string"), "minLength": .int(1)])) else { return (given, address.understood) }
+                bound.removeValue(forKey: qualifier)
+                understood.append("understood \(qualifier) as context for \(key); the exact reference identifies its source")
+            }
+        }
+        return (bound, understood)
+    }
+
+    /// The closest declared form is one explicit next call; unresolved values remain beside it, never become an automatic dispatch.
+    static func advisedCall(_ advice: JSONValue) -> [String: JSONValue]? {
+        if let fields = advice.objectValue {
+            if fields["action"]?.stringValue != nil, fields["args"]?.objectValue != nil { return fields }
+            if let next = fields["next_call"]?.objectValue { return next }
+            if let example = fields["example"]?.objectValue { return example }
+            if let actions = fields["actions"] { return advisedCall(actions) }
+        }
+        if let forms = advice.arrayValue {
+            for form in forms { if let call = advisedCall(form) { return call } }
+        }
+        return nil
+    }
+
+    /// Preserve supplied values in an exact call when it fits, otherwise show one proposed form beside the unresolved input.
+    static func callAdvice(_ action: AppAction, input: [String: JSONValue], discovery: [String: JSONValue],
+                           requiresChange: Bool = false) -> JSONValue {
+        let schema = discovery["args_schema"]
+        let properties = schema?.objectValue?["properties"]?.objectValue ?? [:]
+        if case .object(let given) = input["args"] ?? .object([:]) {
+            var corrected = boundArguments(action, given, schema: schema).args
+            if let schema {
+                corrected = AppToolExecutor.normalizedCallArguments(action, corrected, schema: schema, recordShims: false)
+                if (!requiresChange || corrected != given),
+                   JSONValue.object(AppToolExecutor.doorValidationArgs(action, corrected)).schemaProblem(schema: schema) == nil {
+                    var call: [String: JSONValue] = ["action": .string(action.id), "args": .object(corrected)]
+                    for key in ["preview", "expected_version"] { call[key] = input[key] }
+                    return .object(call)
+                }
+            }
+        }
+        // Missing values and collisions cannot justify a guessed call. This is explicitly a shape, with the original values kept beside it.
+        var shape: [String: JSONValue] = ["action": .string(action.id), "args_schema": schema ?? .null]
+        if !requiresChange { shape["example"] = discovery["example"] ?? .null }
+        shape["supplied_args"] = input["args"]
+        if var call = discovery["example"]?.objectValue {
+            var args = call["args"]?.objectValue ?? [:]
+            for (key, value) in input["args"]?.objectValue ?? [:] {
+                if let property = properties[key], value.schemaProblem(schema: property) == nil { args[key] = value }
+            }
+            if requiresChange, call["action"] == .string(action.id), args == input["args"]?.objectValue {
+                shape["next_call"] = .object(["find": .string(action.id)])
+                shape["instruction"] = .string("""
+                    The supplied arguments already match this form. Read the action and correct the reported cause before calling again.
+                    """)
+            } else {
+                call["args"] = .object(args)
+                for key in ["preview", "expected_version"] { if let value = input[key] { call[key] = value } }
+                shape["next_call"] = .object(call)
+                shape["instruction"] = .string("Review this proposed form against supplied_args; fill missing values before sending it. Nothing ran.")
+            }
+        }
+        return .array([.object(shape)])
+    }
+
+    /// Read an unknown id as intent words, using discovery's one checked action index. Advice never dispatches a suggestion.
+    static func callAdvice(_ id: String, input: [String: JSONValue], pages: [String: QuietToolPage], dataRoot: URL,
+                           memory: SwiftNativeMemoryV2, turn: Turn?) async throws -> JSONValue {
+        if let action = try action(id, dataRoot: dataRoot, turn: turn) {
+            return callAdvice(action, input: input, discovery: try discovery(action, dataRoot: dataRoot).objectValue ?? [:])
+        }
+        let intent = words(id).joined(separator: " ")
+        let ranking = try await ranked(intent, pages: pages, dataRoot: dataRoot, memory: memory, intentOnly: true, turn: turn)
+        // A guess is never steered into an effect: read-only actions rank first, each suggestion says which it is,
+        // so a caller that takes the first entry cannot post, send or change anything by accident.
+        // Reads lead only among the closest by meaning, so a weak read never outranks the near match.
+        let close = Array(matchedActions(ranking.actions).prefix(6))
+        let nearest = close.filter(\.read) + close.filter { !$0.read }
+        var suggestions: [JSONValue] = [], gaps: [JSONValue] = []
+        // A family that names a page is answered first by reading that page: its summary names its item reads and actions.
+        if let family = id.split(separator: ".").first.map({ AppDoorNames.resolve(String($0)) }), let page = pages[family] {
+            suggestions.append(.object(["page": .string(page.id), "effects": .string("read"), "summary": .string(page.summary),
+                                        "example": .object(["page": .string(page.id)])]))
+        }
+        for (id, reason) in ranking.gaps.sorted(by: { $0.key < $1.key }) {
+            gaps.append(.object(["action": .string(id), "ranking_gap": .string(reason)]))
+        }
+        for action in nearest {
+            do {
+                let contract = try discovery(action, dataRoot: dataRoot).objectValue ?? [:]
+                suggestions.append(.object(["action": .string(action.id), "effects": .string(action.read ? "read" : "changes something"),
+                    "args_schema": contract["args_schema"] ?? .null, "example": contract["example"] ?? .null]))
+            } catch {
+                gaps.append(.object(["action": .string(action.id),
+                    "schema_gap": ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none)]))
+            }
+            if suggestions.count >= 3 { break }
+        }
+        // A gap is never a runnable suggestion and cannot consume one of the three usable shapes.
+        if !gaps.isEmpty { return .object(["actions": .array(suggestions), "schema_gaps": .array(gaps)]) }
+        return .array(suggestions)
     }
 
     static func firstSentence(_ text: String) -> String {

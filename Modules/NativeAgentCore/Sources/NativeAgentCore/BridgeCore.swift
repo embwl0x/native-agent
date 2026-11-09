@@ -41,6 +41,12 @@ public extension BridgeHTTPServer {
 public enum BridgeCore {
     /// Cap headers before and after the terminator to bound pre-auth memory. 64 KB comfortably exceeds legitimate request headers.
     public static let headerByteCap = 65_536
+    /// Complete encoded MCP JSON-RPC envelope, including both result projections and held messages.
+    public static let mcpResponseByteCap = 1_048_576
+    /// SSE framing around that same JSON envelope.
+    public static let mcpResponseFrameByteCap = mcpResponseByteCap + 32
+    /// Room for worst-case escaping in both projections and the held-message budget.
+    public static let mcpArtifactChunkByteCap = 65_536
 
     // MARK: - Endpoint
 

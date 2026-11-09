@@ -40,9 +40,9 @@ struct MobileAskIntent: AppIntent {
         let reply: String
         if #available(iOS 27, *) {
             reply = try await performBackgroundTask {
-                try await MobileIntentRuntime.reply(to: message, timeout: 300)
+                try await MobileIntentRuntime.reply(to: message)
             }
-        } else { reply = try await MobileIntentRuntime.reply(to: message, timeout: 25) }
+        } else { reply = try await MobileIntentRuntime.reply(to: message) }
         return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
     }
 }
@@ -66,9 +66,9 @@ struct MobileRememberIntent: AppIntent {
         let reply: String
         if #available(iOS 27, *) {
             reply = try await performBackgroundTask {
-                try await MobileIntentRuntime.reply(to: text, timeout: 300)
+                try await MobileIntentRuntime.reply(to: text)
             }
-        } else { reply = try await MobileIntentRuntime.reply(to: text, timeout: 25) }
+        } else { reply = try await MobileIntentRuntime.reply(to: text) }
         return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
     }
 }

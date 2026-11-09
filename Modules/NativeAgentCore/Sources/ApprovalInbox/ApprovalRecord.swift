@@ -7,12 +7,30 @@ import Experiences
 import NativeAgentCore
 import TrustCenter
 import Privacy
-// Blueprint: | `ApprovalRecord.swift` | Approval substance, checked origin doors and the one decision face; resolution provenance remains authority |
+import Transcripts
+// Blueprint: | `ApprovalRecord.swift` | Approval substance, checked origin doors and decision faces; the person's resolution provenance owns authority. |
 
 /// Timestamps are ISO-8601; decision fields stay nil until resolution.
 public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     public var id: String
-    public var title: String
+    private var recordedTitle: String
+    /// The card's title: a tool call's act in words, a peer asker named first; otherwise the filer's own title.
+    public var title: String {
+        get {
+            guard let call else { return recordedTitle }
+            let asker = recordedTitle.range(of: Self.askerSeparator, options: .backwards).map { String(recordedTitle[..<$0.upperBound]) } ?? ""
+            return asker + call.act
+        }
+        set { recordedTitle = newValue }
+    }
+    /// An ask raised for someone else (a peer, a part, a script) names its asker first: "<asker> asked: <act>".
+    public static let askerSeparator = " asked: "
+    /// A tool call's ask in the person's words, read from the call itself; nil for asks a filer words itself.
+    public var call: (act: String, says: String)? {
+        guard let fields = payload.objectValue, fields["kind"] == .string("chat_tool_approval"),
+              let tool = fields["toolName"]?.stringValue else { return nil }
+        return ApprovalWords.call(tool: tool, input: fields["input"])
+    }
     public var action: String
     public var risk: String
     public var reason: String
@@ -22,6 +40,7 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     /// Render retained history without rewriting it to add missing-history wording.
     public var payloadPreview: String {
         get {
+            if let call { return call.says }
             guard action == "rem.proposal" else { return recordedPayloadPreview }
             let replacement: REMReplacement?
             if case .object(let fields) = payload,
@@ -119,17 +138,17 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
                 let thread = try text("threadId")
                 return PersonOrigin(thread: surface == "telegram" ? .telegram(chat: destination, thread: thread)
                                     : .slack(channel: destination, thread: thread), session: nil)
-            case "chat", "app", "ios": return PersonOrigin(thread: nil, session: try text("sessionId"))
+            case "chat", "ios": return PersonOrigin(thread: nil, session: try text("sessionId"))
             default: return nil
             }
         }
     }
 
-    public var personDoors: [Door] {
-        get throws {
-            let origin = try personOrigin
-            return Door.person(thread: origin?.thread) + (origin?.session.map { [Door.conversation($0)] } ?? [])
-        }
+    /// The person's doors for this ask: the phone, the thread it came from and the Mac, and the person's own conversation when the ask was
+    /// raised anywhere else (a conversation that raised it already holds its card), the same door an interaction's matter names.
+    public func personDoors(dataRoot: URL) throws -> [Door] {
+        let origin = try personOrigin
+        return try Door.asking(thread: origin?.thread, unless: origin?.session, dataRoot: dataRoot)
     }
 
     /// Every reader uses the inbox decision independently of execution attribution.
@@ -162,17 +181,43 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         } else {
             words = executionDetail ?? decision.map { "\(action): \($0)." } ?? payloadPreview
         }
+        // A saved decision is not proof of a successful effect. Lead its receipt with the execution owner's verdict.
+        let outcomeLead: String?
+        switch decision {
+        case "denied": outcomeLead = "Declined"
+        case "canceled": outcomeLead = "Not now"
+        case "approved":
+            switch executionResultClass {
+            case .succeeded: outcomeLead = "Done"
+            case .failed: outcomeLead = "Failed"
+            case .refused: outcomeLead = "Refused"
+            case .cancelled: outcomeLead = "Stopped"
+            case .timeout: outcomeLead = "Unknown: the approved action timed out; completion is unconfirmed"
+            case .unknown: outcomeLead = "Unknown: the approved action's completion is unconfirmed"
+            }
+        default: outcomeLead = status == "orphaned" ? "Expired: no decision was recorded" : nil
+        }
+        var receipt: String
+        if let outcomeLead {
+            let detail = words.trimmingCharacters(in: .whitespacesAndNewlines)
+            receipt = outcomeLead + (detail.isEmpty ? ": no result detail was recorded." : ": " + detail)
+        } else { receipt = words }
+        if let attribution = resolutionProvenance?.messageAttribution { receipt += " " + attribution + "." }
         // Approval is not adoption; only completed application writes this receipt.
         let applied: Bool
         let reply = ToolResult(.object(fields))
         if action == "rem.proposal", decision == "approved",
            fields["op"] == .string("rem_proposal_approve"), case .bool? = fields["growthAppended"],
            !reply.carriesFailureEvidence { applied = true } else { applied = false }
-        let row = PartFace.Row(id: id, title: matter.title, detail: matter.summary, value: matter.badge, at: createdAt,
-                               symbol: matter.symbol, tone: .attention, open: matter.open, actions: matter.choices)
+        let tone: PartFace.Tone = executionResultClass.isFailure ? .failed
+            : decision == nil || (decision == "approved" && executionResultClass == .unknown) ? .attention : .done
+        let rowDetail = [matter.summary, resolutionProvenance?.messageAttribution].compactMap { $0 }.joined(separator: "\n")
+        let row = PartFace.Row(id: id, title: matter.title, detail: NativeAppSecretRedactor.redactText(rowDetail), value: matter.badge, at: createdAt,
+                               symbol: matter.symbol, tone: tone,
+                               open: matter.open, actions: matter.choices)
         return Experience(id: id, kind: .decision, cause: cause.map { [$0] } ?? [], evidence: [ref],
                           outcome: decision.map { .init(domain: "approvals", status: $0, at: resolvedAt) },
-                          face: .init(words: NativeAppSecretRedactor.redactText(words), artifacts: [], row: row, from: "approval"),
+                          face: .init(words: NativeAppSecretRedactor.redactText(receipt), artifacts: [], row: row, from: "approval"),
                           addressedTo: [ForPerson.person],
                           owes: ["decide": obligation],
                           claims: applied ? [.init(claim: "applied", evidence: [ref])] : [])
@@ -184,6 +229,8 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         let who = switch provenance {
         case .telegram: "you, in Telegram"
         case .signedIOS: "you, on your iPhone"
+        case .personMessage(let sessionID, let messageID, let door):
+            "the agent on your message \(messageID) in conversation \(sessionID), through \(door.messageDoorName)"
         case .local(decidedBy: "mac_ui"), .local(decidedBy: "local_desk_click"): "you, in the Mac app"
         case .local(let label): label
         }
@@ -217,7 +264,7 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         detail: String? = nil
     ) {
         self.id = id
-        self.title = title
+        self.recordedTitle = title
         self.action = action
         self.risk = risk
         self.reason = reason
@@ -306,7 +353,7 @@ extension ApprovalRecord {
             if status == "canceled", decision != "canceled" { return nil }
         }
         self.id = savedID
-        self.title = title
+        self.recordedTitle = title
         self.action = action
         self.risk = risk
         self.reason = reason
@@ -332,7 +379,7 @@ extension ApprovalRecord {
     public func toJSON(forStorage: Bool = false) -> JSONValue {
         var obj: [String: JSONValue] = [
             "id": .string(id),
-            "title": .string(title),
+            "title": .string(forStorage ? recordedTitle : title),
             "action": .string(action),
             "risk": .string(risk),
             "reason": .string(reason),
@@ -393,6 +440,7 @@ public enum ApprovalResolutionProvenance: Sendable, Equatable {
     case local(decidedBy: String)
     case telegram(chatID: String, userID: String)
     case signedIOS(clientID: String, decidedBy: String)
+    indirect case personMessage(sessionID: String, messageID: String, door: ApprovalResolutionProvenance)
 
     public static let schema = "approval-resolution-provenance.v1"
 
@@ -402,13 +450,36 @@ public enum ApprovalResolutionProvenance: Sendable, Equatable {
             return decidedBy
         case .telegram:
             return "telegram_verified_user"
+        case .personMessage:
+            return "agent_on_person_message"
         }
+    }
+
+    /// Chat decisions retain the verifying transport without claiming the person tapped.
+    public var transport: ApprovalResolutionProvenance {
+        if case .personMessage(_, _, let door) = self { return door }
+        return self
+    }
+
+    fileprivate var messageDoorName: String {
+        switch self {
+        case .local: "Mac chat"
+        case .signedIOS: "your paired iPhone"
+        case .telegram: "Telegram"
+        case .personMessage: "a person-message decision"
+        }
+    }
+
+    public var messageAttribution: String? {
+        guard case .personMessage(let sessionID, let messageID, let door) = self else { return nil }
+        return "Decided by the agent on your message \(messageID) in conversation \(sessionID), through \(door.messageDoorName)"
     }
 
     var isRemote: Bool {
         switch self {
         case .telegram, .signedIOS: true
         case .local: false
+        case .personMessage(_, _, let door): door.isRemote
         }
     }
 
@@ -417,6 +488,7 @@ public enum ApprovalResolutionProvenance: Sendable, Equatable {
         case .local: "local"
         case .telegram: "telegram"
         case .signedIOS: "ios_signed"
+        case .personMessage: "person_message"
         }
     }
 
@@ -429,6 +501,14 @@ public enum ApprovalResolutionProvenance: Sendable, Equatable {
             return nil
         }
         switch channel {
+        case "person_message":
+            guard decidedBy == "agent_on_person_message",
+                  case .string(let sessionID)? = object["sessionID"],
+                  NativeAgentChatSessionID.normalizedPathComponent(sessionID) == sessionID,
+                  case .string(let messageID)? = object["messageID"], !messageID.isEmpty,
+                  case .object(let doorFields)? = object["door"], doorFields["channel"] != .string("person_message"),
+                  let door = Self(json: .object(doorFields)) else { return nil }
+            self = .personMessage(sessionID: sessionID, messageID: messageID, door: door)
         case "local":
             self = .local(decidedBy: decidedBy)
         case "ios_signed":
@@ -464,6 +544,58 @@ public enum ApprovalResolutionProvenance: Sendable, Equatable {
                 object["deviceID"] = .string(clientID)
             }
         }
+        if case .personMessage(let sessionID, let messageID, let door) = self {
+            object["sessionID"] = .string(sessionID)
+            object["messageID"] = .string(messageID)
+            object["door"] = door.toJSON()
+        }
         return .object(object)
     }
+}
+
+extension ApprovalResolutionProvenance {
+    /// Who decided, read from the person's own act at the door the person tapped: the Mac, the paired phone its router verified, or Telegram's
+    /// verified sender in its chat. Nil when that door verified no one (a phone tap with no device, a Telegram tap with no sender or chat)
+    /// or the act was no tap: nothing is invented, so no approval is answered.
+    public init?(personAct: PersonAct) {
+        func named(_ value: String?) -> String? { value.flatMap { $0.isEmpty ? nil : $0 } }
+        switch personAct.door {
+        case "mac": self = .local(decidedBy: "mac_ui")
+        case "phone":
+            guard let device = named(personAct.device) else { return nil }
+            self = .signedIOS(clientID: device, decidedBy: "ios_signed_operator")
+        case "telegram":
+            guard let chat = named(personAct.chat), let sender = named(personAct.device) else { return nil }
+            self = .telegram(chatID: chat, userID: sender)
+        default: return nil
+        }
+    }
+}
+
+extension Door {
+    /// Every door an ask (an approval, a request) reaches the person by, whoever raised it: the phone, the Mac, the thread it came from, the
+    /// person's own Telegram chat while Telegram has its one owner, and the person's own conversation unless it was raised there.
+    public static func asking(thread: Door?, unless origin: String?, dataRoot: URL) throws -> [Door] {
+        let telegram = thread.map { if case .telegram = $0 { true } else { false } } == true ? nil : try PersonsTelegram.door(dataRoot)
+        return person(thread: thread) + [telegram, try personsConversation(unless: origin, dataRoot: dataRoot)].compactMap { $0 }
+    }
+
+    /// The person's own conversation as a matter's door: the anchored direct conversation, unless the matter was raised there (its own row
+    /// already holds the card). One rule for every ask that reaches the person, approvals and interactions alike.
+    public static func personsConversation(unless origin: String?, dataRoot: URL) throws -> Door? {
+        guard let anchor = try ConversationAnchor.checkedCurrent(dataRoot: dataRoot)?.sessionId,
+              NativeAgentChatSessionID.normalizedPathComponent(anchor) == anchor,
+              origin != anchor else { return nil }
+        return .conversation(anchor)
+    }
+}
+
+/// The person's Telegram chat as an ask's door: Telegram's owner sets how it is read while Telegram runs (the one owner's private chat), and
+/// clears it when Telegram stops; with no owner, or Telegram off, an ask has no Telegram door.
+public enum PersonsTelegram {
+    public typealias Read = @Sendable (URL) throws -> Door?
+    private final class Box: @unchecked Sendable { let lock = NSLock(); var read: Read? }
+    private static let box = Box()
+    public static func use(_ read: Read?) { box.lock.withLock { box.read = read } }
+    static func door(_ dataRoot: URL) throws -> Door? { try box.lock.withLock { box.read }?(dataRoot) }
 }

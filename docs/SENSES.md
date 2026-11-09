@@ -88,7 +88,7 @@ captured-page proof), and `write_ms` (publication, including loading a
 retained trial when keeping it). An omitted phase did not finish; timing
 does not claim provider or queued-turn time. Provider wait ownership and the
 removed fixed response-head timer are documented in
-[Turn Resilience](TURN_RESILIENCE.md#4-provider-timeouts).
+[Turn Resilience](TURN_RESILIENCE.md#4-provider-liveness).
 
 Built-in records say `origin:"built in"` and omit `createdAt`; there is no
 invented birth date. Only the current `built in` origin spelling is accepted.
@@ -112,6 +112,11 @@ Real enable and
 last-use dates remain. Provenance says “built in” without an age. Retained
 version receipts add `corner_name` beside the stable machine-readable corner;
 for example, the `web` stream is “Web pages (read_page / web.read)”.
+
+Native successful reads record use even when an off/on lifecycle override has created an ability file. JavaScript helper completions own their
+accounting, including bundled senses without an override, so one read is never counted by both completion paths. Lifecycle publication updates
+only SenseRecord's uses, corrections, last-use date and unavailable reason; canonical run/trial evidence never round-trips through redacted rows.
+Enabling one sense applies owner-off authority to that sense's status transition; an unchanged owner-disabled sibling stays off and cannot refuse it.
 
 The bundle's `Senses/builtin.json` has one object shape: `schemaVersion:1`
 and a `senses` array. Every entry requires `id`, string `corner`, positive
@@ -143,17 +148,16 @@ instead its stable key, e.g. `file:docx`.
 
 App → helper:
 
-- `{"id":N,"type":"run","program":{OwnedProgram},"sense":{SenseRecord},"request":{...},"material":{...},"timeoutSeconds":30}`.
+- `{"id":N,"type":"run","program":{OwnedProgram},"sense":{SenseRecord},"request":{...},"material":{...}}`.
   The app supplies source (at most 512 KiB) inside `program`; the helper never opens an entry file or material path.
-  Before execution it validates the program's source digest, entry, identity and positive stall window,
+  Before execution it validates the program's source digest, entry and identity,
   then requires kind/entry `sense`, matching record id, integer version and reach. Request is `{"type":"read","address":null}`,
   `{"type":"act","verb":"…","address":"…","args":{...}}`, or `{"type":"watch"}`.
   The sealed Work pane may also send `{"type":"event","event":<JSON>}`;
   it calls `event(request)` and never authorizes an act.
   Events share ordinary entry admission, helper reuse and settlement; an event never starts a watch.
   Supplied material serves `source.read()` or that request's address locally; omitted
-  source addresses mean the current request's address. `timeoutSeconds` defaults to 30 and
-  must be finite and positive. Each run repeats program and sense; the program must stay
+  source addresses mean the current request's address. Each run repeats program and sense; the program must stay
   identical, and record id/version/corner/mode/reach cannot change. JS globals persist.
 - `{"id":N,"type":"source_reply","callID":C,"material":{...}}` answers a read;
   `{"id":N,"type":"source_reply","callID":C,"subscribed":true}` acknowledges watch.
@@ -164,7 +168,7 @@ App → helper:
   16 KiB; the runner also caps the whole notebook.
 - Any reply above may carry `"failure":{SenseFailure}` instead of its success
   fields. It throws in JS and fails the entry; the app does not retry that call.
-- `{"id":N,"type":"changed","material":{...},"timeoutSeconds":30}` calls
+- `{"id":N,"type":"changed","material":{...}}` calls
   `changed(material)` in the existing subscribed live context, using a fresh id.
   File data is a Uint8Array in that argument too. Deliver only between entries;
   coalesce pending source changes app-side. Reads with no address use this
@@ -220,61 +224,45 @@ uses those same read owners. Native day/front-app observations and part
 arrivals feed the cognition crossing installed before residents start; they
 do not read the registered senses and need no registration wait.
 
-Each readiness read waits at most four seconds, capped by its caller's
-earlier deadline. Missing installation or an unfinished registration returns
-`source_unavailable`, never an empty registry or permission to read raw.
-Expiry says only that this read did not run, not that installation failed.
-`ScopedWaiter` releases only that cancelled/deadline-expired waiter; it never
-cancels installation or marks it ready. File subscriptions arm the installer's
-`NativeAgent.sensesReady` success edge before reading readiness, publish their
-own unavailable news on failure, then wait for that edge to recheck the same
-owner. No edge means the subscription stays unavailable until repair or Stop;
-other part wakes and loops continue. Stop cancels and joins these subscriptions.
+Each readiness read waits for the installed task's completion/error or caller
+cancellation. Missing installation reports `source_unavailable`; an unfinished
+installation stays pending rather than becoming an empty registry. Cancelling a
+waiter leaves installation and sibling waiters alive.
+Registration failure completes that task with its original error, releasing dependent reads with the cause. Repair requires relaunching installation.
 
-Failed registration still publishes `launch.senses` with its source repair
-and waits for a canonical ability change or the observed resource/memory-file
-repair edge before attempting registration again. Only successful registration
-publishes the readiness edge. Ordinary reads and sense wakes that returned
-unavailable can be invoked again after repair; they are not silently replayed.
+Helper entries have no execution or progress deadline. They settle on their
+terminal protocol event, process exit, pipe EOF/failure, explicit cancellation
+or owner shutdown. A live but silent helper remains waiting, with Stop as its
+lever. Numeric `sense.progress(n)` values remain finite and strictly rising;
+`SenseEntryProgress` validates their high-water mark without deciding liveness.
+Each accepted numeric mark is forwarded immediately, without clock coalescing.
 
-`timeoutSeconds` is a finite, positive stall window (default 30 seconds), never
-a total run deadline. An entry may run indefinitely while it advances. Progress
-means a valid publish or notify, a successful source read of an address not yet
-read in this entry, or `sense.progress(n)` with a finite number strictly greater
-than its entry-local high-water mark (the first finite value is accepted).
-`sense.progress()` reports one completed unit by advancing that mark by one
-(starting at one); call it only after real work.
-State get/set, repeated source reads, log, present and unchanged/decreasing
-progress values advance neither watchdog. `SenseEntryProgress` owns the same
-entry-local read set and numeric high-water rule in the helper and app. The
-0.25-second JSC callback terminates only after the stall window without accepted
-progress. Accepted
-numeric progress is forwarded with its high-water value in lightweight,
-coalesced messages. The runner renews its stall window only after validating a
-publish/notify, successfully servicing a first source read, or accepting a rising
-numeric mark. A first read of the app-supplied snapshot is reported with its
-address and checked against that snapshot; it keeps the local JS read path.
-Transport traffic alone never renews the window. While the runner serves a source, notebook or act reply,
-both watchdogs suspend stall accounting and exclude only that outstanding wait
-from elapsed execution time. Reply traffic does not reset the remaining window;
-repeated reads and state calls still cannot count as progress. Same-corner
-post-action verification uses the signed raw Chrome read instead of queuing
-behind the sense act that is awaiting it. Cancellation, process exit and memory
-supervision remain active during reply waits. CPU usage has no time cap; memory
-caps remain.
-Live idle retention never cuts an active entry
-or the handoff from a published read to its automatic watch. The helper is held
-through watch startup; a watch failure is posted as separate sense news with provenance, never substituted for the completed page.
-Live slots are scoped to the sense and source file. Supervision restarts a
-failed helper from its notebook without a retry timer; a repeated failure cause
-marks that version unavailable with a reason and news. Missing, non-executable
-or launch-blocked helpers are unavailable immediately. Repair and switch on to retry.
+Same-corner post-action verification uses the signed raw Chrome read rather
+than queuing behind the sense act awaiting it. A helper stays held through
+watch startup; a watch failure is reported as separate sense news with its
+provenance. Consumer/watch release, selected-source retirement and owner shutdown
+retire helpers. A crash reports its cause and makes that selected version
+unavailable; it does not restart the failed helper. CPU execution has no time cap;
+resource memory measurements retain their independent cap.
+
 All source subscriptions share detached, generation-bound delivery, retain only
 their newest material and signal the existing part-wake owner. App content
 comparison excludes frame bookkeeping and `ax_watch_coverage` on both the
 initial baseline and later events; observer metadata alone is not a content
-change. Native app AX subscriptions install and
-renew under their own five-second/1,200-node budget, with ranged child copies.
+change. Native app AX subscriptions install and renew with a 1,200-node cap
+and ranged child copies; the subscription owner adds no clock budget.
+Their registration, callbacks, coalesced tree renewal and removal share
+`MacAXExecutionLane`'s dedicated thread and run loop; no AX work runs on the
+window's thread. Interactive Mac entry admission alone asks the target app on
+a worker with a private application element, before renderer preparation or
+lane reads. Passive source observations do not admit. Effect waits judge fresh
+evidence after event batches through `macSettle`; silence at patience remains
+unobserved, and notifications alone cannot establish the declared effect.
+`mac.settled` rows retain payload-free timing and pass evidence; the
+[MacControl contract](ARCHITECTURE_BLUEPRINT.md#maccontrol) owns the admission
+patience, IPC exception and observer lifecycle. Raw source flights explicitly
+leave the caller's actor before reading the world. The MacControl section of the
+[architecture blueprint](ARCHITECTURE_BLUEPRINT.md#maccontrol) owns this thread contract.
 An element's subscription or topology failure is its named gap; readable siblings
 and supported notifications keep working. Budget exhaustion keeps the bounded
 coverage already installed and reports unseen descendants as unknown. Partial
@@ -337,8 +325,7 @@ Helper → app (API messages have `id` and `callID`; progress has only `id`):
 - `{"id":N,"type":"progress","n":V}` reports completed work; V must be finite
   and strictly rising within the entry. The helper resolves argument-free
   `sense.progress()` to a numeric mark before sending. JS forwards accepted
-  numeric marks at most once per 0.25 seconds (or
-  one quarter of the stall window when shorter). No reply. A bare progress
+  numeric marks immediately. No reply. A bare progress
   message is invalid; it cannot serve as a heartbeat.
 - `{"id":N,"type":"progress","readAddress":A}` reports a helper's first
   successful local read of the supplied material. The runner requires the exact
@@ -350,8 +337,7 @@ Helper → app (API messages have `id` and `callID`; progress has only `id`):
   fails with `bad_output`. API call count has no execution cap; payload limits remain.
 - `{"id":N,"type":"failed","failure":{SenseFailure}}` ends the entry and the
   helper exits nonzero. If malformed input has no id, failed omits it. A JS
-  exception reports its code (or `crashed`) and message; the watchdog reports
-  `timeout`. A failed context is never reused.
+  exception reports its code (or `crashed`) and message. A failed context is never reused.
 
 Launch contract: the runner uses `/usr/bin/sandbox-exec -p <profile> <helper>` and
 `SenseSandboxProfile.build(reach:helperURL:scratch:dataRoot:personaRoot:)`.
@@ -363,10 +349,9 @@ Seatbelt can enforce. JS exposes no direct OS/network API. Extra reads still
 go through source.read and the app must enforce reach there. All source material
 delivery shares the private-root policy, explicitly permitting workspace files
 even inside the data root; the helper itself has no such exception. Network resolution
-failure is `bad_reach`, never a broad network fallback. JSC has a watchdog per
-entry (SPI unavailable = `unsupported`); the runner owns outer accepted-progress stall
-detection and memory caps, for authored JavaScript execution. App-served plug reply
-waits have no timer and are excluded from the entry's no-progress window.
+failure is `bad_reach`, never a broad network fallback. JavaScriptCore and the
+runner wait for terminal events or cancellation without an execution watchdog.
+The runner retains the memory cap. App-served plug replies have no timer.
 
 ## Live news and presentation
 
@@ -378,15 +363,13 @@ waits have no timer and are excluded from the entry's no-progress window.
   subscription changes invalidate presentation without polling.
 - Visible Senses/Work surfaces refresh from ability-file/accounting changes and the news/view owners' invalidations. Presentation reads one checked catalog without helper-retirement reconciliation; an unchanged visible page performs no periodic registry scan.
 - Live news: the runner posts every `notify` to `SenseNewsBoard.shared`.
-  `post` and non-waking `keep` accept only after the board's checked durable
-  write; an unbound or failed store refuses acceptance and restores its prior
-  news. `home.arrive` reports a rejected keep as `not_kept`, never as filed.
-  Accepted non-waking part arrivals also enter ResidentWake's same durable
-  identity ledger as waking arrivals, under its existing retention policy,
-  without pending a wake or adding a second home line. The board remains
-  their presentation owner. If that identity write fails after news was kept,
-  the action reports `identity_not_kept` with partial effects and the ledger's
-  existing repair is owed; it does not claim nothing was filed.
+  `post` and `keep` accept a changed board only after its checked durable write; an
+  unbound or failed store refuses acceptance and restores its prior news. Each
+  new item `post` accepts is posted to attention as a `world` happening (once
+  `sense:<id>:<notice id>`), weighed by the agent's turn program
+  (`Senses/SenseNewsBoard.swift`); `keep` holds a notice for the next turn without
+  posting it. A part's `home.arrive` line is a `world` happening posted through
+  `Attention.post`, never a board notice (`AppToolExecutor.swift`).
   A sense's notify throws a rejected delivery out of its request worker;
   termination follows the existing worker join, never a join of itself.
   Cancellation before news admission remains cancellation in sense and
@@ -397,14 +380,15 @@ waits have no timer and are excluded from the entry's no-progress window.
   `returned_actions`; the receipt owner folds their effects with unknown,
   partial and occurred precedence. An interrupted helper retains unknown
   effects because an unanswered call may have run.
-  A scheduled read (`connector_action` job) posts to the same board: the rows
-  new since its last read, one notice per job (`docs/AUTOMATED_SYSTEMS.md`).
+  A scheduled read (a `watch:<id>` clock time) posts to the same board: the rows
+  new since its last read, one notice per watch (`docs/AUTOMATED_SYSTEMS.md`).
   W9: the board keeps one unread notice per sense/version/observed source
   (file or tab observation identity when supplied, otherwise its address; 200 corners,
   no expiry timer). Unread notices live until their next turn reads them; a read
   notice is remembered for an hour so a repeat is not news again, and a post
   whose event is over an hour old is not news. Repeated identical notices do not refresh age or
-  unread status. Native Chrome identifies changes by the
+  unread status. An unchanged duplicate or expired notice succeeds without a write or either presentation/context invalidation;
+  pruning retained state still persists and publishes its change. Native Chrome identifies changes by the
   before/after content versions (including states), independently of summary
   text, and describes changed state values. Further changes replace the immutable notice
   ID and coalesce an update count with at most three compact update lines, newest first,
@@ -412,10 +396,12 @@ waits have no timer and are excluded from the entry's no-progress window.
   these lines and reserves space for each. Unread notices, coalesced histories
   and acknowledged-change deduplication persist privately at
   `<dataRoot>/senses/news/unread.json`, with private-state exclusions. Acknowledgement is durable before removal; expired
-  read notices are pruned on access, never revived after restart. Storage failure
-  is visible news and damaged state remains preserved. A new notice is also
-  weighed against their cares; one that touches a care asks for one wake naming
-  it, without quoting the news ([SUBCONSCIOUS.md](SUBCONSCIOUS.md) Cares).
+  read notices are pruned on access, never revived after restart. Acknowledging
+  IDs whose removal changes neither unread items nor retained histories returns
+  before persistence and either presentation/context invalidation. Storage failure
+  is visible news and damaged state remains preserved. What a new notice is worth
+  is the agent's `weigh` to say; worth that gathers on a care ignites a thought
+  ([SUBCONSCIOUS.md](SUBCONSCIOUS.md) Cares).
   File senses compare their full structural rows, not a clipped page; native
   Chrome and the site authoring example report navigation as the destination
   title and top sections with from → to. Content diffs compare only the same
@@ -434,7 +420,7 @@ waits have no timer and are excluded from the entry's no-progress window.
   A changed viewport starts at its current view. A page changing during capture
   returns what was read with one moved-page note, without a refusal or reread;
   action proofs retain their exactness checks. Live subscriptions remain work between edges;
-  their idle deadline cannot retire them. Chrome capture failures are status
+  consumer closure or owner shutdown retires them. Chrome capture failures are status
   diagnostics per tab, never news; they preserve the last successful baseline
   and observation so the next successful navigation/change is still news.
   A failed board delivery retains the exact pending notice and captured

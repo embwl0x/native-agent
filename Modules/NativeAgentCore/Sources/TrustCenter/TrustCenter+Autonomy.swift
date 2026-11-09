@@ -1,5 +1,7 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import ToolRegistry
 // Blueprint: | `TrustCenter+Autonomy.swift` | `PermissionLaw`: one posture, class, reach and effective level for authorization and scheduling |
@@ -17,6 +19,36 @@ public enum PermissionPosture: Sendable {
 /// Every executor shares judgment from declared class, saved posture, integration switch and steering authority. The agent's data and workspace roots are its
 /// own; external paths, accounts, apps and shared remotes reach the person. Irreversible changes on the person's side always ask; Safe cannot change that side.
 public enum PermissionLaw {
+    /// Request ceilings precede coordination, consent and effects. A wider saved posture or nested chain cannot lift them.
+    public static func requestFileAccessRefusal(tool: String, input: [String: JSONValue], turn: Turn?) throws -> ToolFailureError? {
+        guard let turn else { return nil }
+        let ceiling = turn.fileAccessCeiling
+        let control = "the originating request's fileAccess setting (phone: Chat > File access)"
+        if let invalid = ceiling.invalidMode {
+            return ToolFailureError("request.fileAccess=\(invalid) is unrecognized; no file access was inferred.",
+                argumentPath: "request.fileAccess", accepted: ICloudChatFileAccessPolicy.acceptedIDs.sorted().joined(separator: ", "), effects: .none,
+                instruction: "Correct \(control) to a recognized mode, then submit a new request. Accepted modes: "
+                    + ICloudChatFileAccessPolicy.acceptedIDs.sorted().joined(separator: ", ") + ".")
+        }
+        if ceiling.noPathfulReads, ToolNameAliases.canonical(tool) == "read",
+           case .string(let path)? = input["path"], !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return ToolFailureError("request.fileAccess=none blocks read with an explicit path. The request issuer must resubmit with file access.",
+                effects: .none, owner: "request.fileAccess", tap: control, personDecides: true,
+                code: "request_file_access_none", status: .refused,
+                instruction: "Ask the request issuer to grant Read only (fileAccess=read_only) or the intended broader access at \(control), "
+                    + "then submit a new request. Every originating ceiling carried by the request must permit explicit-path reads.")
+        }
+        if ceiling.readOnly, try toolClass(tool, input: input, turn: turn) != .read {
+            return ToolFailureError("request.fileAccess=read_only blocks \(tool); nothing ran. The request issuer must resubmit with write access.",
+                effects: .none, owner: "request.fileAccess", tap: control, personDecides: true,
+                code: "request_read_only", status: .refused,
+                instruction: "Ask the request issuer to grant changes at \(control): Auto (fileAccess=auto), Workspace (workspace) or Full Mac (full), "
+                    + "as intended, then submit a new request. Every originating ceiling carried by the request must permit changes; "
+                    + "an approval cannot widen read_only.")
+        }
+        return nil
+    }
+
     public static let fullMacContract = """
         Under Full Mac I make changes without asking. Permanent deletion still asks, and an untrusted agent's initiating turn asks once at its first \
         effect, quoting its ask; your answer covers that turn and lifts its Work-mode cap. macOS privacy resets still ask.
@@ -52,7 +84,24 @@ public enum PermissionLaw {
         let posture = capped ? .work : posture(policy)
         let (toolClass, level) = try judge(tool: tool, input: input, posture: posture, capabilities: capabilities, turn: turn)
         let mode = posture == .fullMac ? "Full Mac" : posture == .readOnly ? "Safe" : "Work mode"
-        var reason = "trust/policy.json: \(mode) judges \(tool) as \(toolClass), autonomy=\(level)."
+        // A part's verb is named by the verb it carries, not the part that runs it.
+        let named = try AppActionBinding.answeredVerb(tool: tool, input: input ?? [:], turn: turn)
+            ?? (tool == "app" ? input?["action"]?.stringValue : nil) ?? tool
+        if let refusal = try requestFileAccessRefusal(tool: tool, input: input ?? [:], turn: turn) {
+            return (toolClass, "blocked", refusal.localizedDescription, refusal.remedy())
+        }
+        if let input, personDecided(tool: tool, input: input, turn: turn) {
+            return (toolClass, level, "The person decided \(named) themself; it runs as theirs.", nil)
+        }
+        if let input, let lever = try lever(tool: tool, input: input, turn: turn) {
+            let why = "\(named) is the person's lever: \(lever.why)."
+            let reason = level == "confirm" ? why + " The agent's call asks them on a card and runs only on their yes."
+                : lever.asks ? why + " Safe allows no ask for it; nothing ran."
+                : why + " It needs the person themself, so the agent's call is refused; nothing ran."
+            return (toolClass, level, reason, Repair.why(owner: "the person's lever \(named)",
+                tap: level == "confirm" ? "the card it raised (Approve or Decline)" : "its own row, on the person's Mac or phone"))
+        }
+        var reason = "trust/policy.json: \(mode) judges \(named) as \(toolClass), autonomy=\(level)."
         if capped, let peer {
             let who = peer.message.components(separatedBy: ", so ").first.map { $0.replacingOccurrences(of: "This turn was steered by ", with: "") }
                 ?? "another agent"
@@ -74,6 +123,13 @@ public enum PermissionLaw {
     static func judge(tool: String, input: [String: JSONValue]?, posture: PermissionPosture,
                       capabilities: Set<String>?, turn: Turn?) throws -> (toolClass: ToolClass, level: String) {
         let toolClass = try toolClass(tool, input: input ?? [:], turn: turn)
+        // The person's own act decides its exact call at every posture: a posture is what the agent may do, never what the person may.
+        if let input, personDecided(tool: tool, input: input, turn: turn) { return (toolClass, "auto") }
+        // A lever is never the agent's call, at any posture: it raises the person's card, or is refused where no card can carry it or Safe
+        // allows no ask.
+        if let input, let lever = try lever(tool: tool, input: input, turn: turn) {
+            return (toolClass, lever.asks && posture != .readOnly ? "confirm" : "blocked")
+        }
         let users = try toolClass >= .send || reachesUser(tool, input: input, capabilities: capabilities ?? [], turn: turn)
         let level: String = switch (toolClass, posture) {
         case (.read, _): "auto"
@@ -92,12 +148,11 @@ public enum PermissionLaw {
         if AuthoredToolEffects.shellIrreversible(name, input: input) { return .destructive }
         if AuthoredToolEffects.shellReadOnly(name, input: input) { return .read }
         if name == "app" {
-            let named = ["action", "script"].contains { key in
-                if case .string(let text)? = input[key] { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                else if key == "script", case .array(let calls)? = input[key] { !calls.isEmpty }
-                else { false }
-            }
-            // Folded actions re-enter under their tool name; discovery and preview have no effects.
+            let named = if case .string(let text)? = input["action"] {
+                !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            } else { false }
+            // Composition has no effect of its own: scripts and batches re-enter admission for each step's class.
+            // Folded actions likewise re-enter under their tool name; discovery and preview have no effects.
             guard named, input["preview"] != .bool(true) else { return .read }
             guard let action = try AppActionBinding.action(input: input, turn: turn) else { return .write }
             return declaredRead(action) || action.folded ? .read : action.toolClass
@@ -108,13 +163,49 @@ public enum PermissionLaw {
         let action = try AppActionBinding.action(tool: name, input: input, turn: turn) ?? AppActionBinding.binding(ToolNameAliases.authoredAction(name),
             turn: turn)
         if let action, declaredRead(action) { return .read }
-        let declared = AppActionBinding.declaredClass(name) ?? action?.toolClass ?? .write
-        return declared == .send && input["dry_run"] == .bool(true) ? .write : declared
+        let native = AppActionBinding.declaredClass(name)
+        let declared = native ?? action?.toolClass ?? .write
+        // Only a native send declares a dry run; a part's verb is judged by its class whatever its arguments say.
+        return native == .send && input["dry_run"] == .bool(true) ? .write : declared
     }
 
     private static func declaredRead(_ action: AppActionBinding) -> Bool {
         action.read && (action.toolClass == .read ||
             (!action.readWhen.isEmpty && AppActionBinding.builtInToolName(action.tool)))
+    }
+
+    /// Whether the person decided this exact call (`Turn.personAct`): the call itself, or the tool it folds into as the door runs it.
+    public static func personDecided(tool: String, input: [String: JSONValue], turn: Turn?) -> Bool {
+        personForm(tool: tool, input: input, turn: turn) != nil
+    }
+
+    /// The gate's admission of a dispatch: the turn keeps the person's act only for the call it covers, once per form in one run; any other
+    /// call, and the same call made again inside the run, is judged without it (as the agent's).
+    public static func admitting(tool: String, input: [String: JSONValue], turn: Turn) -> Turn {
+        guard let act = turn.personAct else { return turn }
+        guard let form = personForm(tool: tool, input: input, turn: turn), act.spend(form) else { return turn.with(\.personAct, nil) }
+        return turn
+    }
+
+    private static func personForm(tool: String, input: [String: JSONValue], turn: Turn?) -> PersonAct.Form? {
+        guard let act = turn?.personAct else { return nil }
+        if act.covers(tool: tool, input: input) { return .call }
+        guard act.tool == "app", case .string(let action)? = act.input["action"],
+              let binding = AppActionBinding.declaredBinding(action), binding.folded else { return nil }
+        let ran = ToolNameAliases.ranCall("app", input: act.input)
+        // The folded tool's own call: the person's arguments under its names, plus only what the action itself fixes (and the door's own
+        // `__` keys, which carry no argument).
+        guard ran.tool == ToolNameAliases.canonical(tool), ran.input.allSatisfy({ input[$0.key] == $0.value }),
+              input.filter({ !$0.key.hasPrefix("__") }).allSatisfy({ ran.input[$0.key] != nil || binding.fixedInput[$0.key] == $0.value })
+        else { return nil }
+        return .folded
+    }
+
+    /// The lever this call is, if it is one (`AppActionBinding.lever`): an `app` action, or a tool an `app` lever folds into.
+    public static func lever(tool: String, input: [String: JSONValue], turn: Turn?) throws -> AppActionBinding.Lever? {
+        // A preview changes nothing, so it asks no one.
+        guard !(tool == "app" && input["preview"] == .bool(true)) else { return nil }
+        return try AppActionBinding.action(tool: tool, input: input, turn: turn)?.lever
     }
 
     /// Judge folded actions by the tool they actually dispatch; a missing action has no class.

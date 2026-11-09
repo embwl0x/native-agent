@@ -9,57 +9,30 @@ import BackgroundLoops
 extension NativeCognitionRuntime {
     func handleEventDrivenReplayOutcome(
         _ outcome: LoopTickOutcome,
-        reason: String,
-        allowRetry: Bool
+        reason: String
     ) async {
         switch outcome {
         case .completed:
-            replayReconciliationPending = false
-            replayRetryTask?.cancel()
-            replayRetryTask = nil
+            break
         case .skipped(let detail, _) where detail == "no new replay evidence":
-            replayReconciliationPending = false
-            replayRetryTask?.cancel()
-            replayRetryTask = nil
+            break
         case .skipped(let detail, _), .failed(error: let detail):
-            replayReconciliationPending = true
-            let shouldRetry = allowRetry && !isFlushedForTermination
             await substrate.recordReceipt(
                 kind: "replay.reconciliation_pending",
                 payload: .object([
                     "reason": .string(reason),
                     "outcome": .string(String(detail.prefix(300))),
-                    "retryScheduled": .bool(shouldRetry),
+                    "waitingOn": .string("a committed dream/REM source change or an explicit replay request"),
                 ])
             )
-            guard shouldRetry, replayRetryTask == nil else { return }
-            replayRetryTask = Task { [weak self] in
-                let nanos = UInt64(Self.replayFailureRetryDelay * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: nanos)
-                guard !Task.isCancelled else { return }
-                await self?.retryPendingReplayReconciliation()
-            }
         }
     }
 
-    private func retryPendingReplayReconciliation() async {
-        // Hold the retry-task claim across replay's await so concurrent dream signals cannot double-run it; clear only after completion.
-        guard replayReconciliationPending, !isFlushedForTermination else {
-            replayRetryTask = nil
-            return
-        }
-        let reason = "replay_event_retry"
-        _ = await runEventDrivenReplayWithDeadline(reason: reason, material: nil, allowRetry: false)
-        replayRetryTask = nil
-    }
-
-    /// Bound only the wait on retained work; its real terminal result alone settles reconciliation and reflection.
-    func runEventDrivenReplayWithDeadline(
+    /// Retained integration settles on its actual result; source commits request a fresh pass before reflection.
+    func runEventDrivenReplay(
         reason: String,
-        material: [String: CognitiveReflectionCause]? = [:],
-        allowRetry: Bool = true
+        material: [String: CognitiveReflectionCause]? = [:]
     ) async -> LoopTickOutcome {
-        replayReconciliationPending = true
         if let material {
             var pending = replayReflectionMaterial ?? [:]
             pending.merge(material) { _, new in new }
@@ -74,7 +47,7 @@ extension NativeCognitionRuntime {
                     self.eventReplayAgain = false
                     result = await self.runReplay(reason: reason, requiringFreshInput: true)
                     if !self.eventReplayAgain {
-                        await self.handleEventDrivenReplayOutcome(result, reason: reason, allowRetry: allowRetry)
+                        await self.handleEventDrivenReplayOutcome(result, reason: reason)
                     }
                     await self.reportLoopOutcome(loopId: "cognition_replay", outcome: result)
                     let complete: Bool = switch result {
@@ -93,24 +66,7 @@ extension NativeCognitionRuntime {
             }
         }
         guard let flight = eventReplayTask else { return .failed(error: "replay flight not retained") }
-        let outcome = await raceAgainstTimeout(seconds: Self.eventDrivenReplayDeadlineSeconds) {
-            await flight.value
-        }
-        switch outcome {
-        case .value(let result):
-            return result
-        case .failure(let detail):
-            return .failed(error: "event-driven replay race failed: \(detail)")
-        case .timedOut:
-            let detail = "event-driven replay '\(reason)' exceeded "
-                + "\(Self.eventDrivenReplayDeadlineSeconds)s wait deadline; retained integration is pending"
-            deadlineLogger("TIMEOUT: \(detail)")
-            return .skipped(reason: detail)
-        case .cancelled:
-            let detail = "event-driven replay '\(reason)' cancelled; reconciliation retained"
-            deadlineLogger("CANCELLED: \(detail)")
-            return .failed(error: detail)
-        }
+        return await flight.value
     }
 
     @discardableResult

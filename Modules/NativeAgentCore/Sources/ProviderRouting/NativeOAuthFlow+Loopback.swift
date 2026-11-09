@@ -13,7 +13,7 @@ extension NativeOAuthFlow {
     public static let openAILoopbackPort: UInt16 = 1455
     public static let openAILoopbackPath = "/auth/callback"
 
-    @MainActor
+    @concurrent
     public static func startOpenAILoopbackFlow(
         platform: any NativeOAuthPlatformPort.Type,
         dataRoot: URL = PersistenceCore.defaultDataRoot()

@@ -22,16 +22,25 @@ package enum MacAXAttributeRead {
         }
     }
     final class AttributeGaps: @unchecked Sendable {
+        struct Gap: Equatable {
+            let attribute: String?
+            let detail: String
+        }
         private let lock = NSLock()
-        private var gaps: [String] = []
+        private var gaps: [Gap] = []
         func record(_ error: ElementAttributeFailure) {
-            record("\(error.attribute): AX error \(error.status.rawValue)")
+            record(Gap(attribute: error.attribute, detail: "\(error.attribute): AX error \(error.status.rawValue)"))
         }
         func record(_ gap: String) {
+            record(Gap(attribute: nil, detail: gap))
+        }
+        func record(_ gap: Gap) {
             lock.lock(); defer { lock.unlock() }
             if !gaps.contains(gap) { gaps.append(gap) }
         }
-        var values: [String] { lock.lock(); defer { lock.unlock() }; return gaps }
+        var entries: [Gap] { lock.lock(); defer { lock.unlock() }; return gaps }
+        var values: [String] { entries.map(\.detail) }
+        func contains(attribute: String) -> Bool { entries.contains { $0.attribute == attribute } }
     }
 
     static func collectingAttributeGaps<Value>(context: MacOperationContext, _ body: (AttributeGaps, MacOperationContext) throws -> Value) rethrows -> Value {
@@ -121,6 +130,17 @@ package enum MacAXAttributeRead {
     package static func checkedRaw(_ element: AXUIElement, _ attribute: String, context: MacOperationContext) throws -> CFTypeRef? {
         try context.evidence?.check()
         try Task.checkCancellation()
+        // Every value path, including a foreign caption, proves the text element's own subrole before copying its value.
+        if attribute == kAXValueAttribute {
+            let role = try checkedText(element, kAXRoleAttribute, context: context)
+            guard !role.isEmpty else {
+                throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility value read has no readable AXRole.")
+            }
+            if textValueRoles.contains(role) {
+                if context.attributeGaps?.contains(attribute: kAXSubroleAttribute) == true { return nil }
+                _ = try checkedText(element, kAXSubroleAttribute, context: context)
+            }
+        }
         // Application reads begin a new source transaction. Descendant reads share the same process preparation, including native subtree callers.
         var pid: pid_t = 0
         let application = [kAXWindowsAttribute, kAXFocusedWindowAttribute, kAXMainWindowAttribute,
@@ -148,14 +168,13 @@ package enum MacAXAttributeRead {
         catch { failed(error, context: context); return nil }
     }
 
-    /// An element that does not publish AXEnabled cannot be disabled, so it is enabled (the Accessibility contract assistive apps follow);
-    /// only a failed read leaves the state unknown.
+    /// A disabled control says so. One that doesn't publish AXEnabled (TextEdit's text area) makes no claim, so it is not disabled; only a failed read leaves the state unknown.
     package static func checkedEnabled(_ element: AXUIElement, context: MacOperationContext) throws -> Bool {
         try checkedBool(element, kAXEnabledAttribute, context: context) ?? true
     }
 
     static func copyEnabled(_ element: AXUIElement, context: MacOperationContext) -> Bool? {
-        do { return try checkedEnabled(element, context: context) }
+        do { return try checkedBool(element, kAXEnabledAttribute, context: context) }
         catch { failed(error, context: context); return nil }
     }
 
@@ -232,6 +251,13 @@ package enum MacAXAttributeRead {
         context: MacOperationContext
     ) throws -> [AXUIElement] {
         let attribute = attribute == kAXChildrenAttribute ? try childAttribute(element, context: context) : attribute
+        func wholeArray() throws -> [AnyObject] {
+            guard let raw = try checkedRaw(element, attribute, context: context) else { return [] }
+            guard CFGetTypeID(raw) == CFArrayGetTypeID() else {
+                throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility \(attribute) returned a non-array value.")
+            }
+            return raw as! CFArray as [AnyObject]
+        }
         let array: [AnyObject]
         if let limit = limit ?? (context.readDeadline != nil ? MacAXLimits.deepPageMaxNodes : nil) {
             guard limit > 0 else { return [] }
@@ -239,21 +265,24 @@ package enum MacAXAttributeRead {
                 throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility child-array preparation failed or exhausted the reader time budget.")
             }
             defer { if context.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
-            var raw: CFArray?
-            let status = AXUIElementCopyAttributeValues(element, attribute as CFString, 0, CFIndex(limit), &raw)
-            try Task.checkCancellation()
-            if status == .attributeUnsupported || status == .noValue { return [] }
-            if status == .failure { throw ElementAttributeFailure(attribute: attribute, status: status) }
-            guard status == .success, let raw else {
-                throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility \(attribute) array read failed (AX error \(status.rawValue)).")
+            // A range exists to avoid bridging a pathological array. Some elements fail a range yet answer a plain read (Music's text fields, -25200),
+            // so a read that wants every child never asks for one.
+            var count: CFIndex = 0
+            if AXUIElementGetAttributeValueCount(element, attribute as CFString, &count) == .success, count <= limit {
+                array = try wholeArray()
+            } else {
+                var raw: CFArray?
+                let status = AXUIElementCopyAttributeValues(element, attribute as CFString, 0, CFIndex(limit), &raw)
+                try Task.checkCancellation()
+                if status == .attributeUnsupported || status == .noValue { return [] }
+                if status == .failure { throw ElementAttributeFailure(attribute: attribute, status: status) }
+                guard status == .success, let raw else {
+                    throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility \(attribute) array read failed (AX error \(status.rawValue)).")
+                }
+                array = raw as [AnyObject]
             }
-            array = raw as [AnyObject]
         } else {
-            guard let raw = try checkedRaw(element, attribute, context: context) else { return [] }
-            guard CFGetTypeID(raw) == CFArrayGetTypeID() else {
-                throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility \(attribute) returned a non-array value.")
-            }
-            array = raw as! CFArray as [AnyObject]
+            array = try wholeArray()
         }
         let elements: [AXUIElement] = array.compactMap { candidate in
             guard CFGetTypeID(candidate) == AXUIElementGetTypeID() else { return nil }
@@ -275,7 +304,7 @@ package enum MacAXAttributeRead {
         // Every caller, including act-time resolution, gets an element scope. A surrounding observation retains these same-element gaps.
         let owner = context.attributeGaps
         return collectingAttributeGaps(context: context) { gaps, context in
-            defer { for gap in gaps.values { owner?.record(gap) } }
+            defer { for gap in gaps.entries { owner?.record(gap) } }
             return readLabel(element, role: role, context: context, prepare: prepare)
         }
     }
@@ -348,6 +377,7 @@ package enum MacAXAttributeRead {
     }
 
     static let placeholderRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+    private static let textValueRoles = placeholderRoles.union(MacScreenViewBuilder.textRoles).union(["AXSecureTextField"])
 
     private static let hintNamedRoles: Set<String> = [
         "AXButton", "AXTextField", "AXTextArea", "AXComboBox", "AXPopUpButton", "AXMenuButton",

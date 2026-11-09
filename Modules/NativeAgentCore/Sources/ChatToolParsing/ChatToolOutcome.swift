@@ -28,6 +28,17 @@ public enum ChatToolOutcome {
         exactResultClass(output).isFailure
     }
 
+    /// The start boundary handed unstarted work back for the person's words; completed siblings retain their own receipts.
+    public static func isPersonArrivalHandBack(_ output: JSONValue) -> Bool {
+        let reply = ToolResult(output)
+        guard let status = reply.status else { return false }
+        // A step that really failed keeps the provider's error bit, whatever the hand-back says about the rest.
+        if case .array(let receipts)? = output.objectValue?["receipts"],
+           receipts.contains(where: { exactResultClass($0, inspectWrappedResult: true).isFailure }) { return false }
+        return output.objectValue?["reason"] == .string("person_arrival")
+            && ["skipped", "partial"].contains(status) && !reply.carriesFailureEvidence
+    }
+
     /// Read values may be unwrapped data; incomplete evidence cannot establish a complete snapshot.
     public static func hasReadEvidence(_ output: JSONValue, completeOnly: Bool = false, verdict: ExactResultClass? = nil) -> Bool {
         let verdict = verdict ?? exactResultClass(output)
@@ -67,6 +78,9 @@ public enum ChatToolOutcome {
         interactionState: String? = nil
     ) -> (status: FoldStatus, outcome: DisplayOutcome) {
         guard kind == InlineInteractionWire.transcriptKind else {
+            if let result, isPersonArrivalHandBack(result) {
+                return (.plain, displayOutcome(result: result, ok: ok, hasResult: hasResult))
+            }
             return (ok == false ? .failed : .plain,
                     displayOutcome(result: result, ok: ok, hasResult: hasResult))
         }

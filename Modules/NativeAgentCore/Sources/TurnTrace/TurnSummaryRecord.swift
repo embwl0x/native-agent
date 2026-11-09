@@ -117,6 +117,48 @@ public enum EncodedPrefix {
 /// Reads this day's and optionally the previous day's details under the supplied root. Read failures or unreadable details throw.
 public enum TurnSummarySource {
 
+    /// A clock-skewed detail is retained behind the sequence cursor but does not appear before its recorded time. No second pending-row cache.
+    public static func visibleGroups(_ groups: [TurnTraceGroup], now: Date = Date()) -> [TurnTraceGroup] {
+        guard groups.contains(where: { $0.lastAt > now }) else { return groups }
+        var visible: [TurnTraceGroup] = []
+        for group in groups {
+            if group.lastAt <= now { visible.append(group) }
+            else { visible += TurnTraceGrouping.group(group.events.filter { $0.ts <= now }) }
+        }
+        return visible.sorted { $0.startedAt == $1.startedAt ? $0.id > $1.id : $0.startedAt > $1.startedAt }
+    }
+
+    /// The feed retains its grouped display and the record's sequence, not a second history cache. Only newly appended details are decoded;
+    /// only turns they touch (or that cross the day boundary) are regrouped. A failed/corrupt read advances neither cursor nor display.
+    public static func readNewGroups(root: URL, groups: [TurnTraceGroup], after: Int64?, now: Date = Date()) async throws
+        -> (groups: [TurnTraceGroup], lastSeq: Int64?, changed: Bool) {
+        let calendar = TurnTracePersistLane.dayCalendar
+        let today = calendar.startOfDay(for: now)
+        guard let from = calendar.date(byAdding: .day, value: -1, to: today) else { throw CocoaError(.fileReadUnknown) }
+        // No upper timestamp bound: a late append's sequence must be consumed even if its recorded clock is ahead of ours.
+        let read = try await TurnTraceReplayReader.read(.init(from: from, after: after ?? 0), root: root)
+        guard read.isClean else { throw CocoaError(.fileReadCorruptFile) }
+        let newEvents = read.events.filter { $0.turnId != "unknown" }
+        let touched = Set(newEvents.map(\.turnId))
+        var unchanged: [TurnTraceGroup] = []
+        var old: [TurnTraceEvent] = []
+        var changed = !newEvents.isEmpty
+        for group in groups {
+            if touched.contains(group.id) || group.startedAt < from {
+                old += group.events.filter { $0.ts >= from }
+                changed = true
+            } else { unchanged.append(group) }
+        }
+        guard changed else { return (groups, read.lastSeq ?? after, false) }
+        // Preserve today's equal-time precedence, then append order within each day (old rows precede new ones).
+        let rebuilding = old + newEvents
+        let ordered = rebuilding.filter { $0.ts >= today } + rebuilding.filter { $0.ts < today }
+        let next = (unchanged + TurnTraceGrouping.group(ordered)).sorted {
+            $0.startedAt == $1.startedAt ? $0.id > $1.id : $0.startedAt > $1.startedAt
+        }
+        return (next, read.lastSeq ?? after, true)
+    }
+
     /// Append yesterday after today so equal-time grouping retains today's original arrival precedence.
     public static func loadEvents(root: URL, now: Date = Date(), includeYesterday: Bool = true) async throws -> [TurnTraceEvent] {
         let calendar = TurnTracePersistLane.dayCalendar

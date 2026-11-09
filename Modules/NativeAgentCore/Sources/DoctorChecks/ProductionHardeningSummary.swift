@@ -1,7 +1,7 @@
 import Foundation
 // Blueprint: | `ProductionHardeningSummary.swift` | `ProductionHardeningSummary` struct |
 
-public struct ProductionHardeningSummary: Codable, Hashable {
+public struct ProductionHardeningSummary: Codable, Hashable, Sendable {
     public var status: String
     public var release: ReleaseChecklist?
     public var doctorStatus: String?

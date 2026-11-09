@@ -4,9 +4,10 @@ import AgentWorkspace
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `EngineCarriedHabits.swift` | Join terminal and dispatch evidence off-turn to record carried-work trials |
+// Blueprint: | `EngineCarriedHabits.swift` | Join terminal and dispatch evidence off-turn to record carried-work trials from the agent's thoughts |
 
 enum EngineCarriedHabits {
+    /// A thought in the agent's mind stream whose work identity is one carried step (`carry.<handle>`) is a trial of how that step is handled.
     static func record(turn: String, dataRoot: URL) async {
         // Terminal persistence can overtake trace ingress; this background observer waits for accepted rows without holding the turn.
         await TurnTraceBus.shared.drainForProcessExit()
@@ -16,7 +17,7 @@ enum EngineCarriedHabits {
             ]))
             let events = read.events
             guard read.isClean,
-                  events.contains(where: { $0.kind == "turn.accepted" && $0.sessionId == ResidentWake.session }),
+                  events.contains(where: { $0.kind == "turn.accepted" && $0.sessionId == Attention.stream }),
                   let terminal = events.last(where: { TurnTraceEvent.isTerminalKind($0.kind) }),
                   let work = events.first(where: { $0.kind == "work.identified" })?.payload.objectValue?["workIdentity"]?.stringValue,
                   work.hasPrefix("carry.") else { return }

@@ -90,8 +90,7 @@ extension SwiftToolDispatcher {
             deskState = state
             let handle = try resolveDeskHandle(input, in: state)
             input["handle"] = .string(handle)
-            if let session = ChatToolSessionInjection.currentSession(turn: turn),
-               let refusal = try await deskHeld(handle, session: session) { return refusal }
+            if let refusal = try await deskHeld(handle) { return refusal }
         }
         // A contributed tool runs in its owner's executor.
         if let appTools, executorOwnedToolNames.contains(tool) {
@@ -178,6 +177,77 @@ extension SwiftToolDispatcher {
             }
             let observedURL: String = if case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"],
                 case .string(let finalURL)? = coverage["final_url"] { finalURL } else { url }
+            if case .object(let httpFields) = fetched, httpFields["coverage"]?.objectValue?["thin_page"] == .bool(true) {
+                // A successfully read script shell requires rendering. This is
+                // reader selection, never recovery from an HTTP failure.
+                func retainingHTTP(reason: String, attempted: Bool, browser: JSONValue? = nil, note: String) -> JSONValue {
+                    var fields = httpFields
+                    fields["status"] = .string("partial")
+                    fields["reason"] = .string(reason)
+                    fields["text_reader"] = .string("http")
+                    fields["used_browser"] = .bool(attempted)
+                    fields["http_read"] = fetched
+                    fields["browser_read"] = browser
+                    fields["reader_note"] = .string(note)
+                    return .object(fields)
+                }
+                guard let door = invocation.appDoor else {
+                    return retainingHTTP(reason: "browser_door_unavailable", attempted: false,
+                        note: "This call has no Chrome app door. The HTTP text is retained; rendered content remains unknown.")
+                }
+                var arguments: [String: JSONValue] = ["url": .string(observedURL), "new_tab": .bool(true)]
+                if let find, !full { arguments["find"] = .string(find) }
+                for key in ["raw", "wrong", "why"] where input[key] != nil { arguments[key] = input[key] }
+                let browser: JSONValue
+                do {
+                    // This nested navigation owns the rendered read. The enclosing
+                    // workspace sees web.read, so it cannot attach Chrome's page.
+                    browser = CanonicalToolNameDispatcher.actionResult(try await door.perform("app",
+                        ["action": .string("chrome.navigate"), "args": .object(arguments)], turn,
+                        invocation.with(\.frameSource, "direct")), action: "chrome.navigate")
+                } catch is CancellationError { throw CancellationError() }
+                catch {
+                    try Task.checkCancellation()
+                    return retainingHTTP(reason: "browser_read_unavailable", attempted: true,
+                        browser: ChatToolOutcome.failure(error: error, tool: "chrome.navigate"),
+                        note: "Chrome did not return a readable page; its actual failure is attached. The HTTP text is retained.")
+                }
+                guard case .object(var fields) = browser else {
+                    return retainingHTTP(reason: "browser_read_unavailable", attempted: true, browser: browser,
+                        note: "Chrome returned no page envelope. The HTTP text is retained; rendered content remains unknown.")
+                }
+                let page = fields["page"]?.objectValue
+                guard case .string(let httpText)? = httpFields["text"],
+                      let browserText = page?["text"]?.stringValue ?? page?["sense_page"]?.stringValue else {
+                    return retainingHTTP(reason: "browser_content_unmeasured", attempted: true, browser: browser,
+                        note: "Chrome supplied no measured readable text. The HTTP text is retained; Chrome's actual page or blocker is attached.")
+                }
+                // Measure the exact text each reader would serve, including an authored sense.
+                let browserCharacters = browserText.filter { !$0.isWhitespace }.count
+                let httpCharacters = httpText.filter { !$0.isWhitespace }.count
+                let browserIsEmpty = browserCharacters == 0
+                    || ["read_window_empty", "find_not_observed"].contains(page?["reason"]?.stringValue ?? "")
+                guard !browserIsEmpty, browserCharacters > httpCharacters else {
+                    let reason = browserIsEmpty ? "browser_read_empty" : "browser_read_not_richer"
+                    let detail = page?["reason"]?.stringValue ?? "No additional readable content was observed in this window."
+                    return retainingHTTP(reason: reason, attempted: true, browser: browser,
+                        note: "Chrome's background read did not contain more readable content "
+                            + "(\(browserCharacters) non-whitespace characters in served text; HTTP \(httpCharacters)). "
+                            + "The HTTP text is retained. Chrome: " + detail)
+                }
+                fields["text"] = .string(browserText)
+                if let status = page?["status"] { fields["status"] = status }
+                if fields["status"] == nil { fields["status"] = .string("partial") }
+                fields["used_browser"] = .bool(true)
+                fields["text_reader"] = .string("browser")
+                fields["http_read"] = fetched
+                if fields["url"] == nil { fields["url"] = .string(observedURL) }
+                fields["reader_note"] = .string("""
+                    Chrome supplied more readable content than the thin HTTP text, so its background-tab read supplies text. The HTTP extraction and its \
+                    source receipt remain in http_read. Chrome's receipt and page describe what actually happened. Consent was not accepted or dismissed.
+                    """)
+                return .object(fields)
+            }
             let corner = SenseCorner.site(host: URL(string: observedURL)?.host?.lowercased() ?? parsed.host!.lowercased())
             var senseInput = input
             senseInput["__sense_action"] = .string("web.read")
@@ -194,16 +264,6 @@ extension SwiftToolDispatcher {
                     }
                     return .pageSnapshot(document)
                 })
-            if case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"], coverage["thin_page"] == .bool(true) {
-                let continuation: [String: JSONValue] = ["reason": .string("thin_page"), "hint": coverage["hint"] ?? .null,
-                    "next_call": .object([
-                        "tool": .string("app"),
-                        "input": .object([
-                            "action": .string("chrome.navigate"),
-                            "args": .object(["url": .string(observedURL)])])])]
-                if case .object(let output) = result { return .object(output.merging(continuation) { _, next in next }) }
-                if case .string(let text) = result { return .string(text + "\n" + (try JSONValue.object(continuation).serialize(pretty: false))) }
-            }
             return result
         // Ask for the missing file-access switch; prose alone cannot resolve a workspace boundary.
         case "read_file":
@@ -414,6 +474,22 @@ extension SwiftToolDispatcher {
                             """),
                     ])
                 }
+                // A verb the part answers passes its integration switch as the native verb did: granted, or the person's inline grant request.
+                if let gate = try Self.integrationGate(tool: tool, input: input, turn: turn) {
+                    let allowed = try await macIntegrationPermissionStore.allows(gate.integration, mode: gate.mode)
+                    if !allowed {
+                        return try await Self.macIntegrationDeniedEnvelope(invocation: invocation, integration: gate.integration, mode: gate.mode,
+                            store: macIntegrationPermissionStore)
+                    }
+                } else if case .string(let verb)? = input["verb"], case .object(let reach)? = record["reach"],
+                          case .array(let paths)? = reach["readPaths"], !paths.isEmpty, !(await fullMacYoloAdmitted(turn: turn, surface: surface)) {
+                    // The person's files with no app switch over them are Full Mac's to read, refused without a card as a native reader was.
+                    return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("failed"), "reason": .string("full_mac_required"),
+                        "effects": .string("none"), "detail": .string("""
+                            \(verb) reads files outside any app's switch, which needs admitted Full Mac and file-read permission. Check Trust and file \
+                            access at the Mac; nothing was read and no card was raised.
+                            """)]))
+                }
                 // Pin the selected fingerprint so a registry or manifest swap fails with fingerprintMismatch.
                 var partInvocation = invocation.partInvocation(turn: turn, surface: surface)
                 partInvocation = Parts.Invocation(host: partInvocation.host, execution: partInvocation.execution,
@@ -443,16 +519,6 @@ extension SwiftToolDispatcher: PureToolArgumentValidating {
             return await (appTools as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input, turn: turn)
         }
         if tool == "apply_patch" { return Self.builderValidatePatch(input: input).refusal }
-        if ["mail_mark_read", "mail_archive", "mail_delete", "mail_reply", "mail_draft"].contains(tool),
-           !(tool == "mail_mark_read" && input["messages"] != nil), !(tool == "mail_draft" && input["to"] != nil) {
-            let hasLocator = ["message_id", "expected_message_id"].contains { input[$0] != nil && input[$0] != .null }
-            let subject = if case .string(let text)? = input["subject"] { text } else { "" }
-            if hasLocator ? MailReadLocator.parse(input) == nil : subject.isEmpty {
-                return ChatToolOutcome.failure(error: ToolFailureError(
-                    "Use message_id with a nonempty expected_message_id from the same read, or a subject.",
-                    argumentPath: "$.expected_message_id", accepted: "An observed exact Mail locator, or subject matching.", effects: .none), tool: tool)
-            }
-        }
         return await (macIntegrationBridge as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input, turn: turn)
     }
 }

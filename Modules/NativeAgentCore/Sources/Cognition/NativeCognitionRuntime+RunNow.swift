@@ -3,9 +3,9 @@ import CognitiveSubstrate
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
+import Experiences
 import PersistenceCore
 import Privacy
-import Senses
 import TurnTrace
 
 // Blueprint: | `NativeCognitionRuntime+RunNow.swift` | `MindClockVerb`, `MindClockResult`. |
@@ -58,7 +58,7 @@ public struct MindClockResult: Sendable {
 typealias MindClockReply = @Sendable (MindClockResult) -> Void
 
 public enum MindClockVerb: String, Sendable {
-    case canon, horizon, rhythm, wander, reach, carried, cross, maintenance
+    case canon, horizon, rhythm, cross, maintenance
     case residualRepair = "residual_repair"
 }
 
@@ -72,10 +72,7 @@ extension NativeCognitionRuntime {
             case .canon: why = "Canon tending stages approval proposals inside its decision pass and records its audit."
             case .horizon: why = "Horizon composition updates source deadlines and refresh settles felt resolutions into the live organism."
             case .rhythm: why = "The person's day refresh saves awake history before admitting and consuming pending care-felt breaks."
-            case .wander: why = "The wander hour claims its real admission and runs an editable part with tools and settlement."
-            case .reach: why = "Reach reconciles deliveries and lands care answers before selecting and saving an offer."
-            case .carried: why = "Carried work settles owed deliveries, expires intentions and reconciles its wake ledger before selection."
-            case .cross: why = "Crossing primes the mind and releases news intentions before weighing the line."
+            case .cross: why = "The line is written into the record as a happening and attention weighs it at once."
             case .maintenance: why = "Maintenance consolidates the live substrate and checkpoints it as one transition."
             case .residualRepair: why = "Residual repair mutates the live organism field while selecting and repairing its targets."
             }
@@ -108,16 +105,6 @@ extension NativeCognitionRuntime {
                 result = await waitForClockOwner(owner, runID: runID) { reply in
                     considerRhythm(runNow: true, reply: reply)
                 }
-            case .wander:
-                result = await waitForClockOwner(owner, runID: runID) { reply in
-                    considerStudioWander(runNow: true, reply: reply)
-                }
-            case .reach:
-                result = await waitForClockOwner(owner, runID: runID) { reply in
-                    considerReach(runNow: true, reply: reply)
-                }
-            case .carried:
-                result = await considerCarried(runNow: true, besides: input["__session_id"]?.stringValue).result
             case .cross:
                 guard let line = input["line"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !line.isEmpty,
@@ -125,16 +112,21 @@ extension NativeCognitionRuntime {
                       !watch.isEmpty else {
                     return Self.recordClockRun(owner, .init("unavailable", "Pass a nonempty line and watch name."), runID: runID)
                 }
-                let crossed = await cross(line, watch: watch, reason: "news from " + watch,
-                    id: "cross:" + UUID().uuidString.lowercased(), says: line, agent: nil)
-                let fields: [String: JSONValue] = ["watch": .string(watch)]
-                switch crossed {
-                case .woke(let care): result = .init("woke", "The line touched " + care + "; its ResidentWake was kept.", fields: fields)
-                case .untouched: result = .init("untouched", "The line did not touch a live care.", fields: fields)
-                case .unweighed: result = .init("unweighed", "The crossing could not weigh the line; no care verdict is available.", fields: fields)
-                case .resting(let care): result = .init("resting", "This watch already woke the agent about " + care + ".", fields: fields)
-                case .notKept(let care): result = .init("not_kept", "The line touched " + care + ", but its ResidentWake was not kept.", fields: fields)
+                // A world line like any source's: written once, then weighed by the agent's turn program where it means.
+                let happening = Happening(.world, subject: watch, door: "run-now", words: line, once: "run-now:" + runID)
+                await Attention.post(happening, dataRoot: dataRoot).value
+                do {
+                    guard try await ExperienceStore.at(dataRoot).experience(happening.id) != nil else {
+                        throw PersistenceCoreError.ioFailure("The world happening has not been committed: " + happening.id)
+                    }
+                } catch {
+                    return Self.recordClockRun(owner, .init("failed", error.localizedDescription,
+                        fields: ["happening": .string(happening.id)]), runID: runID)
                 }
+                result = .init("posted", """
+                    The line was posted as a world happening. Its attention.weigh detail (subject \(happening.id)) says its worth, where it \
+                    landed and its drive; with none, it waits unweighed while the agent sleeps or its turn program has no weigh.
+                    """, fields: ["watch": .string(watch), "happening": .string(happening.id), "asleep": .bool(isAsleep)])
             case .maintenance:
                 result = Self.clockResult(await runMaintenance(reason: "mind.maintenance", runNow: true))
             case .residualRepair:
@@ -164,16 +156,18 @@ extension NativeCognitionRuntime {
         return await substrate.carePreviewRefusal()
     }
 
-    /// Bound observation only; retained work and single-flight ownership continue, with late answers traced to the same run.
-    /// Silence remains pending, never completion or failure.
+    /// The owner's reply ends observation; cancellation withdraws this caller while the owner retains settlement.
     private func waitForClockOwner(_ verb: String, runID: String,
                                    start: (@escaping MindClockReply) -> Void) async -> MindClockResult {
-        await withCheckedContinuation { continuation in
-            let reply = MindClockReplyGate(continuation) { result in
-                Self.recordClockRun(verb, result, runID: runID)
-            }
-            start { reply.finish($0) }
-            reply.arm()
+        let reply = MindClockReplyGate(cancelled: .init("pending", "The wait was cancelled; the owner retains this run's settlement.",
+            fields: ["run_id": .string(runID), "owner": .string(verb)])) { result in
+            Self.recordClockRun(verb, result, runID: runID)
+        }
+        start { result in Task { await reply.finish(result) } }
+        return await withTaskCancellationHandler {
+            await reply.value()
+        } onCancel: {
+            Task { await reply.cancel() }
         }
     }
 
@@ -196,49 +190,40 @@ extension NativeCognitionRuntime {
         result.fields["run_id"] = .string(runID)
         result.fields["owner"] = .string(verb)
         TurnTraceBus.fire(TurnTraceEvent(turnId: "run-now:" + runID, kind: "mind.run_now",
-            sessionId: "resident-wake", surface: "chat", payload: NativeAppSecretRedactor.redactValue(.object(result.json)), turn: nil))
+            sessionId: Attention.stream, surface: "chat", payload: NativeAppSecretRedactor.redactValue(.object(result.json)), turn: nil))
         return result
     }
 }
 
-/// Keep only the reply rendezvous here; the retained owner executes, and the lock permits exactly one continuation resume.
-private final class MindClockReplyGate: @unchecked Sendable {
-    private let lock = NSLock()
+/// One reply rendezvous; the owner publishes its terminal result even if its caller withdrew.
+private actor MindClockReplyGate {
     private var continuation: CheckedContinuation<MindClockResult, Never>?
-    private var deadline: Task<Void, Never>?
+    private var result: MindClockResult?
+    private var withdrawn = false
+    private let cancelled: MindClockResult
     private let publish: @Sendable (MindClockResult) -> MindClockResult
 
-    init(_ continuation: CheckedContinuation<MindClockResult, Never>, publish: @escaping @Sendable (MindClockResult) -> MindClockResult) {
-        self.continuation = continuation; self.publish = publish
+    init(cancelled: MindClockResult, publish: @escaping @Sendable (MindClockResult) -> MindClockResult) {
+        self.cancelled = cancelled; self.publish = publish
     }
 
-    func arm() {
-        lock.lock(); defer { lock.unlock() }
-        guard continuation != nil else { return }
-        deadline = Task {
-            do { try await Task.sleep(for: .seconds(45)) } catch { return }
-            expire()
-        }
+    func value() async -> MindClockResult {
+        if let result { return result }
+        if withdrawn || Task.isCancelled { return cancelled }
+        return await withCheckedContinuation { continuation = $0 }
     }
 
     func finish(_ result: MindClockResult) {
-        lock.lock()
-        let waiting = continuation; continuation = nil
-        deadline?.cancel(); deadline = nil
+        guard self.result == nil else { return }
         let reported = publish(result)
-        lock.unlock()
+        self.result = reported
+        let waiting = continuation; continuation = nil
         waiting?.resume(returning: reported)
     }
 
-    private func expire() {
-        lock.lock()
-        let waiting = continuation; continuation = nil; deadline = nil
-        let reported = waiting.map { _ in publish(.init("pending",
-            """
-                The owner has not answered within 45 seconds. Its retained flight still owns the work; inspect this run_id for a later outcome before another \
-                attempt.
-                """)) }
-        lock.unlock()
-        if let reported { waiting?.resume(returning: reported) }
+    func cancel() {
+        withdrawn = true
+        let waiting = continuation; continuation = nil
+        waiting?.resume(returning: cancelled)
     }
 }

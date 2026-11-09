@@ -74,6 +74,7 @@ extension ChatStore {
             return false
         }
         let attachments = ChatAttachmentTypeResolver.submittingSpeech(attachments, text: text)
+        PhoneSenses.shared.wake()
         if isLoading, !steer {
             guard appendUser else { return false }
             let queued = QueuedChatSend(
@@ -172,12 +173,10 @@ extension ChatStore {
             placeholderID: placeholderId,
             args: pendingArgs
         )
-        timedOutPendingIds.removeValue(forKey: correlationID)
+        retiredPendingPlaceholders.removeValue(forKey: correlationID)
         let transport = Task {
             defer {
                 inFlightSendIDs.remove(correlationID)
-                // Rearm durable confirmation after releasing the in-flight guard so restoration cannot race a cancelled task's exit.
-                resumeDeliveryConfirmations()
             }
             do {
                 let messageId = try await client.sendMessage(
@@ -191,14 +190,6 @@ extension ChatStore {
                     preparedMessage: preparedMessage,
                     expectedPairing: pairing,
                     onPrepared: { [self] message in
-                        if iCloudBridge.shared.usesCloudKitDeviceTransport,
-                           var record = pendingExchanges[correlationID] {
-                            // Budget for upload, the first five-second proof read and the 60-second transport window.
-                            record.deliveryConfirmationDeadline = Date().addingTimeInterval(
-                                try CloudKitDeviceTransport.sendTimeoutSeconds(for: message) + 65)
-                            pendingExchanges[correlationID] = record
-                            showWaitStatus(correlationID: correlationID)
-                        }
                         try await storage.flush()
                         guard let queuedSendID else { return }
                         guard let index = queuedSends.firstIndex(where: { $0.id == queuedSendID }) else {
@@ -227,8 +218,7 @@ extension ChatStore {
                 renamePendingExchange(from: correlationID, to: messageId)
                 if messageId != correlationID { onTalkRunRenamed?(correlationID, messageId) }
                 showWaitStatus(correlationID: messageId)
-                timedOutPendingIds.removeValue(forKey: messageId)
-                armTimeout(for: messageId, placeholderId: placeholderId)
+                retiredPendingPlaceholders.removeValue(forKey: messageId)
                 armReplyStatus()
             } catch {
                 guard !Task.isCancelled else { return }
@@ -267,14 +257,14 @@ extension ChatStore {
         return true
     }
 
-    /// Transport completion cannot override a terminal or replacement run; timeout retains original observation arguments.
+    /// Transport completion cannot override a terminal or replacement run.
     func sendCompletionOwnsReply(_ correlationID: String, placeholderId: UUID) -> Bool {
         if resolvedICloudReplyIds.contains(correlationID) {
             return false
         }
         return pendingExchanges[correlationID] != nil
             && (pendingICloudPlaceholders[correlationID] == placeholderId
-                || timedOutPendingIds[correlationID] == placeholderId)
+                || retiredPendingPlaceholders[correlationID] == placeholderId)
     }
 
     /// Stop names every open run here; release the composer now, but settle only on Mac cancellation or terminal transcript evidence.
@@ -297,7 +287,7 @@ extension ChatStore {
             do {
                 try await client.cancelChat(sessionID: stoppedSessionID, runIDs: stoppedRunIDs)
             } catch {
-                // Terminal evidence outranks a late Stop ACK timeout because the terminal can arrive during the action wait.
+                // A terminal can arrive while Stop waits for its own action receipt.
                 guard stoppedRunIDs.contains(where: {
                     (pendingExchanges[$0].map { !$0.isExpired } ?? false) || liveTurnBubbles[$0] != nil
                 }) else { return }
@@ -500,7 +490,7 @@ extension ChatStore {
         )
         guard enqueueSend(retained) else { return }
         let retainedID = retained.id
-        timedOutPendingIds.removeValue(forKey: pendingId)
+        retiredPendingPlaceholders.removeValue(forKey: pendingId)
         closePendingExchange(pendingId)
         errorBanner = nil
         send(

@@ -81,7 +81,7 @@ extension AppActions {
 
     /// Ranking requires a checked catalog and one usable embedding epoch.
     static func ranked(_ query: String, pages: [String: QuietToolPage], dataRoot: URL, memory: SwiftNativeMemoryV2,
-                       inventory snapshot: (actions: [AppAction], authored: [AppAction])? = nil, turn: Turn?)
+                       inventory snapshot: (actions: [AppAction], authored: [AppAction])? = nil, intentOnly: Bool = false, turn: Turn?)
         async throws -> (actions: [AppAction], namedPages: Set<String>, gaps: [String: String]) {
         let contacts = try AgentPeerStore(dataRoot: dataRoot).list().map(\.name)
         let helpers = try BotDefinitionStore(dataRoot: dataRoot).list().map(\.name)
@@ -173,6 +173,8 @@ extension AppActions {
             }
         }
         return (ranked.sorted {
+            // An unknown id is an intent, not an exact page request: "desk list" must not promote a ledger just for saying "list".
+            if intentOnly, $0.similarity != $1.similarity { return $0.similarity > $1.similarity }
             let leftNamed = named.contains($0.action.id.lowercased())
             let rightNamed = named.contains($1.action.id.lowercased())
             if leftNamed != rightNamed { return leftNamed }

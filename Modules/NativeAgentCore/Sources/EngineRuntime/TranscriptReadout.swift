@@ -45,8 +45,8 @@ extension InlineCards {
             }
         }
         for pair in origins {
-            let interaction = await InlineInteractionResolver.liveProjection(pair.interaction, dataRoot: dataRoot)
-            let descriptor = InlineInteractionResolver.descriptor(for: interaction, dataRoot: dataRoot)
+            let interaction = pair.interaction
+            let descriptor = await InlineInteractionResolver.descriptor(for: interaction, dataRoot: dataRoot)
             var model = InlineCards.model(interaction, descriptor: descriptor,
                 repeatCount: collapsed.counts[interaction.id] ?? 1)
             model.sessionID = pair.sessionID
@@ -87,8 +87,18 @@ public struct TranscriptReadout: Sendable {
         public let sessionID: String
         public let model: InlineCardModel
         public let repeatCount: Int
+        public var secureFace: SecureCardFace {
+            SecureCardFace(identity: .init(card: interaction.id, session: sessionID, revision: interaction.revision),
+                fields: model.fields.map { .init(id: $0.id, label: $0.label, placeholder: $0.placeholder,
+                    helper: $0.helper, secret: $0.isSecret, optional: $0.isOptional) },
+                primaryLabel: model.primaryLabel, signInLabel: model.signInLabel, fullSetupLabel: model.fullSetupLabel,
+                restartNote: model.restartNote, busyNote: model.state == .running ? model.busyNote : nil,
+                acceptsEntry: model.state == .pending || model.canRetry)
+        }
     }
     public var messages: [ChatMessage]
+    /// False means these are the ending rows, never evidence about the conversation's beginning.
+    public var isComplete = true
     var interactions: [(rowID: String, interaction: InlineInteraction)] = []
     public var cardsHeading: String = ""
     public var cardsByRow: [String: [Card]] {
@@ -103,37 +113,13 @@ public struct TranscriptReadout: Sendable {
 }
 /// A Mac conversation's groups are the shared transcript groups over its rows.
 public typealias MessageGroup = TranscriptGroup<ChatMessage>
-/// Persist cards on tool rows while mounting them under the next readable reply.
-public enum InlineCardMount {
-    public struct Map {
-        public var byHost: [String: [String]] = [:]
-        public var relocated: Set<String> = []
-        public var cardsByRow: [String: [InlineCardModel]] = [:]
-    }
-    public static func map(groups: [MessageGroup], messages: [ChatMessage], readStatus: TranscriptReadout.ReadStatus) -> Map {
-        let byHost = hosts(groups: groups)
-        var mount = Map(byHost: byHost, relocated: Set(byHost.values.joined()))
-        if case .unavailable = readStatus { return mount }
-        // Prepared groups own placement; live messages own request state.
-        let rowIDs = Set(groups.flatMap { $0.messages.map(\.id) })
-        for message in messages where rowIDs.contains(message.id) {
-            mount.cardsByRow[message.id] = message.inlineCards.map(\.model)
-        }
-        return mount
-    }
-    static func hosts(groups: [MessageGroup]) -> [String: [String]] {
-        TranscriptGrouping.cardHosts(groups)
-    }
-    /// The reply's words without its protocol `<tool_use …>` markers, which draw nothing.
-    public static func readableText(_ content: String) -> String {
-        TranscriptGrouping.readableText(content)
-    }
-}
 public enum MessageGrouper {
     /// Share immutable history while streaming changes so visible-page materialization cannot copy the whole cache per delta.
     public struct GroupedTranscript: RandomAccessCollection, Sendable {
         let base: [MessageGroup]
         var liveTail: MessageGroup?
+        /// The revision these groups were actually built from, attached when their owner's read publishes.
+        public internal(set) var structureVersion: UInt64?
 
         public var startIndex: Int { base.startIndex }
         public var endIndex: Int { base.endIndex }
@@ -152,8 +138,8 @@ public enum MessageGrouper {
             return projection
         }
     }
-    public static func projection(for messages: [ChatMessage]) -> GroupedTranscript {
-        GroupedTranscript(base: _compute(for: messages))
+    public static func projection(for messages: [ChatMessage], structureVersion: UInt64? = nil) -> GroupedTranscript {
+        GroupedTranscript(base: _compute(for: messages), structureVersion: structureVersion)
     }
     static func _compute(for messages: [ChatMessage]) -> [MessageGroup] {
         TranscriptGrouping.groups(messages)

@@ -45,7 +45,8 @@ extension SwiftNativeMemoryV2 {
     /// only delivered IDs.
     public func recall(
         _ query: MemoryV2RecallRequest,
-        recordingUsage: Bool = true
+        recordingUsage: Bool = true,
+        turn: Turn? = nil
     ) async throws -> MemoryV2RecallResponse {
         guard !query.text.isEmpty else { throw MemoryV2Error.invalidQuery }
         let recallStarted = ProcessInfo.processInfo.systemUptime
@@ -196,7 +197,7 @@ extension SwiftNativeMemoryV2 {
                 candidates: disclosed.map {
                     MemoryManagerExistingMemory(id: $0.record.id, content: $0.record.text,
                         kind: $0.record.memoryKind ?? MemoryRecallScoring.kind(of: $0.record.extras))
-                }, generation: generation, topK: topK)
+                }, generation: generation, topK: topK, turn: turn)
             timings["relevance_ms", default: 0] += milliseconds(since: relevanceStarted)
             disclosed = disclosed.filter { admitted.contains($0.record.id) }
         }
@@ -250,6 +251,7 @@ extension SwiftNativeMemoryV2 {
             }
         }
         // Shape full text on selected hits without changing ranking, row selection or storage reads.
+        let trust = MemoryDataProvenance.reading(sorted.map { $0.record.extras })
         let hits: [MemoryRecallHit] = sorted.map { sr in
             let canonicalText = MemoryTextClip.memoryDisplayText(
                 sr.record.text,
@@ -258,7 +260,8 @@ extension SwiftNativeMemoryV2 {
             let displayText = (MemorySenseProvenance.warning(in: sr.record.extras).map { "[\($0)]\n" } ?? "") + canonicalText
             let content = MemoryTextClip.sentenceClip(displayText, cap: memoryRecallContentCap)
             var extras: [String: JSONValue] = ["id": .string(sr.record.id)]
-            extras.merge(MemoryDataProvenance.fields(in: sr.record.extras)) { _, value in value }
+            // The hit carries the memory's roots as stored; its steer and short form are read from them, never stored beside them.
+            if case .object(let metadata)? = sr.record.extras, let roots = metadata[MemoryRoot.key] { extras[MemoryRoot.key] = roots }
             if let origin = MemoryMoments.recallOrigin(source: sr.record.sourceRunId, metadata: sr.record.extras, dataRoot: canonicalDataRoot
                 ?? defaultDataRoot()) {
                 extras["origin"] = origin
@@ -283,20 +286,11 @@ extension SwiftNativeMemoryV2 {
             if let value = sr.record.validFrom { extras["valid_from"] = .string(value) }
             if let value = sr.record.validTo { extras["valid_to"] = .string(value) }
             if let value = sr.record.observedAt { extras["observed_at"] = .string(value) }
-            // Carry recorded provenance verbatim so recall distinguishes checked facts from reports; absence makes no claim.
-            if case .object(let metadata)? = sr.record.extras {
-                if let sources = metadata["untrusted_sources"] { extras["untrusted_sources"] = sources }
-                for key in ["provenance", "provenance_by"] {
-                    if case .string(let value)? = metadata[key], !value.isEmpty {
-                        extras[key] = .string(value)
-                    }
-                }
-            }
             return MemoryRecallHit(
                 score: sr.score,
                 sessionId: sr.record.sourceRunId,
                 role: nil,
-                ts: sr.record.createdAt,
+                ts: MemoryDataProvenance.firstKnown(sr.record.extras, trust: trust),
                 preview: MemoryTextClip.sentenceClip(displayText, cap: memoryRecallPreviewCap),
                 content: content,
                 source: "swift-native",

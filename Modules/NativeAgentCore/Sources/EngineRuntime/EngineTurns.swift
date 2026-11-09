@@ -15,7 +15,13 @@ import Dispatcher
 import Cognition
 import AppToolRuntime
 import Senses
-// Blueprint: | `EngineTurns.swift` | Canonical turn/Stop presentation and independent read-only pane publication |
+// Blueprint: | `EngineTurns.swift` | Operational turn/Stop facade, off-main face publication and independent read-only panes |
+
+@MainActor
+@Observable
+private final class StreamingBubbleSlot {
+    var messageID: String?
+}
 
 /// Share per-root Mac turn presentation across surfaces; runtime owns admission, Stop and lifecycle. Nonisolated run registry reads also
 /// serve phone and quit.
@@ -89,7 +95,7 @@ public final class TurnsFacade {
         set { runtime.lifecycleBySession = newValue }
     }
     /// Scope computer preview to the turn card; close it with intake and leave untouched turns empty.
-    public var screenPreviewBySession: [String: MacChatScreenPreview] {
+    public var screenPreviewBySession: [String: TurnFace.Preview] {
         get { runtime.screenPreviewBySession }
         set { runtime.screenPreviewBySession = newValue }
     }
@@ -103,10 +109,18 @@ public final class TurnsFacade {
     }
     // Keep restoration state unobserved; publish coalesced message updates to views.
     @ObservationIgnored public var streamingTexts: [String: String] = [:]
-    public var streamingBubbleIds: [String: String] = [:]
-    // Retain optimistic user rows across in-flight session switches until durable transcripts supply them.
-    /// Keep first-stream timestamps unobserved so reads during SwiftUI updates cannot invalidate that update.
-    @ObservationIgnored private var streamingSeenAt: [String: Date] = [:]
+    @ObservationIgnored private var streamingBubbles: [String: StreamingBubbleSlot] = [:]
+    @ObservationIgnored var turnFacePublication: Task<Void, Never>?
+    @ObservationIgnored var turnFaceProjection: TurnFaceProjection?
+    @ObservationIgnored var pendingTurnFaceInput: TurnFaceProjection.Input?
+    @ObservationIgnored var turnFlightObserver: (any NSObjectProtocol)?
+    @ObservationIgnored var approvalFaceChanges: Task<Void, Never>?
+    @ObservationIgnored var screenPreviewPublication: Task<Void, Never>?
+
+    isolated deinit {
+        if let turnFlightObserver { NotificationCenter.default.removeObserver(turnFlightObserver) }
+        approvalFaceChanges?.cancel()
+    }
 
     public nonisolated init(dataRoot: URL) {
         self.dataRoot = dataRoot
@@ -115,58 +129,39 @@ public final class TurnsFacade {
 
     // MARK: - Per-session reads
 
+    /// A room observes only its own bubble, including the first stream after an idle read.
+    public func streamingBubbleID(for sessionID: String) -> String? {
+        streamingSlot(for: sessionID).messageID
+    }
+
+    public func setStreamingBubbleID(_ messageID: String?, for sessionID: String) {
+        let slot = streamingSlot(for: sessionID)
+        if slot.messageID != messageID { slot.messageID = messageID }
+    }
+
+    public var activeStreamingBubbleIDs: Set<String> {
+        Set(streamingBubbles.values.compactMap(\.messageID))
+    }
+
+    private func streamingSlot(for sessionID: String) -> StreamingBubbleSlot {
+        if let slot = streamingBubbles[sessionID] { return slot }
+        let slot = StreamingBubbleSlot()
+        // Retain empty slots so readers stay attached through completion and the next turn.
+        streamingBubbles[sessionID] = slot
+        return slot
+    }
+
     public func lifecycle(for sessionId: String) -> MacChatTurnLifecycleState? {
         lifecycleBySession[sessionId]
     }
 
-    public func screenPreview(for sessionId: String) -> MacChatScreenPreview? {
-        screenPreviewBySession[sessionId]
-    }
-
-    /// Presentation never decides operational liveness; admission, cancellation and drain use runtime tasks and sets.
-    public func isBusy(_ sessionId: String) -> Bool {
-        guard !sessionId.isEmpty else { return false }
-        return busySessions.contains(sessionId) && !isReplyTextSettled(sessionId)
-    }
-
-    public func isStreaming(_ sessionId: String) -> Bool {
-        guard !sessionId.isEmpty else { return false }
-        return streamingSessions.contains(sessionId) && !isReplyTextSettled(sessionId)
-    }
-
     public func isReplyTextSettled(_ sessionId: String) -> Bool {
-        runtime.replyTextSettledSessions.contains(sessionId)
+        runtime.lifecycle(for: sessionId)?.replyTextSettled == true
     }
 
     public var visiblyWorkingSessionIDs: Set<String> {
         busySessions.union(streamingSessions).filter { !isReplyTextSettled($0) }
     }
-
-    public func isThinkingBeforeReply(for sessionId: String) -> Bool {
-        guard isBusy(sessionId) || isStreaming(sessionId) else { return false }
-        guard let lifecycle = lifecycle(for: sessionId) else { return true }
-        return !lifecycle.presentation.isTerminal && lifecycle.presentation.streamedTextLength == 0
-    }
-
-    /// Only orphaned markers expire; live tasks can outlast individual provider stream limits.
-    public var liveStreamingSessionIDs: Set<String> {
-        let current = streamingSessions
-        streamingSeenAt = streamingSeenAt.filter { current.contains($0.key) }
-        let ceiling = Self.streamingMarkerCeilingSeconds
-        let now = Date()
-        var live: Set<String> = []
-        for id in current {
-            let seenAt = streamingSeenAt[id] ?? now
-            streamingSeenAt[id] = seenAt
-            // An unavailable deadline cannot prove expiry; provider execution owns invalid-config refusal.
-            if tasks[id] != nil || !ceiling.isFinite || ceiling <= 0 || now.timeIntervalSince(seenAt) <= ceiling { live.insert(id) }
-        }
-        return live.filter { !isReplyTextSettled($0) }
-    }
-
-    /// Zero disables orphan expiry rather than expiring immediately.
-    public nonisolated static let streamingMarkerCeilingSeconds: TimeInterval =
-        ProviderStreamGuardConfig.fromEnvironment().wallTimeout
 
     // MARK: - Runtime
 
@@ -178,7 +173,7 @@ public final class TurnsFacade {
 
     public func clearStreamingBubbleState(_ sessionId: String) {
         streamingTexts[sessionId] = nil
-        streamingBubbleIds[sessionId] = nil
+        setStreamingBubbleID(nil, for: sessionId)
         replyingSessions.remove(sessionId)
     }
 

@@ -35,7 +35,6 @@ public protocol QuietComposerCommandPort: QuietChatSessionCommandPort {
     func quietComposerDraftRevision(_ sessionID: String) -> (Date, Int)
     func setQuietComposerDraft(_ text: String, sessionID: String)
     func clearQuietAcceptedDraft(_ message: String, sessionID: String, editedAt: Date)
-    func quietComposerPaneClosed(turnID: String?) -> Bool
     func quietComposerPresentationState(sessionID: String) async -> [String: JSONValue]
     func quietComposerPresentation(verb: String, value: String, choice: String) async -> QuietComposerOutcome
     func selectQuietComposerModel(_ model: ComposerModel, provider: String) -> Task<String?, Never>?
@@ -88,7 +87,8 @@ public enum QuietComposerCommands {
     /// The same effect-free fences admit both preview and execution.
     @MainActor
     public static func fence<Host: QuietComposerCommandPort>(
-        verb: String, value: String, sessionId: String, reachesUser: Bool, turnSessionId: String, appModel: Host, turn: Turn
+        verb: String, value: String, sessionId: String, reachesUser: Bool, turnSessionId: String, appModel: Host, turn: Turn,
+        scope: QuietChatSessionScope? = nil
     ) -> (session: String, refusal: Outcome?) {
         if !reachesUser, usersScreenVerbs.contains(verb) {
             return ("", .refuse(
@@ -106,17 +106,15 @@ public enum QuietComposerCommands {
         }
         switch verb {
         case "show_pane":
-            // The user's pane closure wins for the remainder of the turn.
-            let turnID = appModel.macChatTurns.activeTurnIDsBySession[turnSessionId]
-            if appModel.quietComposerPaneClosed(turnID: turnID) {
-                return ("", .refuse("Work pane", "owner_closed_pane", "The person closed the Work pane this turn, so it stays closed."))
+            guard scope != nil else {
+                return ("", .refuse("Work pane", "window_scope_unavailable", "Read the window's pane controls before opening it."))
             }
             return ("", nil)
         case "set_draft", "send":
             let element = verb == "send" ? "send button" : "composer draft"
-            var sessionID = appModel.activeChatSessionId
+            var sessionID = scope.map(\.selectedSessionID) ?? appModel.activeChatSessionId
             if !sessionId.isEmpty {
-                switch QuietChatSessionCommands.resolve(sessionId, appModel: appModel, turn: turn) {
+                switch QuietChatSessionCommands.resolve(sessionId, appModel: appModel, turn: turn, scope: scope) {
                 case .success(let found): sessionID = found.id
                 case .failure:
                     return ("", .refuse(
@@ -126,20 +124,25 @@ public enum QuietComposerCommands {
                 }
             }
             // User conversations own their drafts/files; turns without user reach send agent text without changing the user's composer.
-            if !reachesUser, QuietChatSessionCommands.userIsIn(sessionID, appModel),
-               verb == "set_draft" || value.isEmpty {
+            if !reachesUser, verb == "set_draft" || value.isEmpty {
+                guard let scope else {
+                    return (sessionID, .refuse(element, "window_scope_unavailable",
+                        "The person's visible conversations have not been read. Their draft was not changed."))
+                }
+                if QuietChatSessionCommands.userIsIn(sessionID, scope: scope) {
                 return (sessionID, .refuse(
                     element, "owners_draft",
                     "The person is in that conversation, so its draft and attached files are theirs. "
                     + (verb == "send" ? "Pass your own text in value." : "Ask them first, or send your own text with send and value.")
                 ))
+                }
             }
             return (sessionID, nil)
         case "write_scratch":
             // Scratchpad and explicit session resolution must retain user draft ownership unless the turn reaches the user.
             var sessionID = turnSessionId
             if !sessionId.isEmpty {
-                guard case .success(let found) = QuietChatSessionCommands.resolve(sessionId, appModel: appModel, turn: turn) else {
+                guard case .success(let found) = QuietChatSessionCommands.resolve(sessionId, appModel: appModel, turn: turn, scope: scope) else {
                     return ("", .refuse("/scratch", "unknown_session",
                                         "No open conversation has that id or title. chat.list lists them with their ids."))
                 }
@@ -148,11 +151,17 @@ public enum QuietComposerCommands {
             guard !sessionID.isEmpty else {
                 return ("", .refuse("/scratch", "no_conversation", "This turn has no conversation of its own: pass session_id."))
             }
-            if !reachesUser, QuietChatSessionCommands.userIsIn(sessionID, appModel) {
+            if !reachesUser {
+                guard let scope else {
+                    return (sessionID, .refuse("/scratch", "window_scope_unavailable",
+                        "The person's visible conversations have not been read. Their scratch was not changed."))
+                }
+                if QuietChatSessionCommands.userIsIn(sessionID, scope: scope) {
                 return (sessionID, .refuse(
                     "/scratch", "owners_draft",
                     "The person is in that conversation, so its scratch is theirs. Ask them first, or write in a conversation they are not in."
                 ))
+                }
             }
             return (sessionID, nil)
         default:
@@ -164,10 +173,10 @@ public enum QuietComposerCommands {
     public static func run<Host: QuietComposerCommandPort>(
         verb: String, value: String, choice: String,
         sessionId: String = "", attachments: [URL] = [], reachesUser: Bool = false,
-        turnSessionId: String = "", appModel: Host, turn: Turn
+        turnSessionId: String = "", appModel: Host, turn: Turn, scope: QuietChatSessionScope? = nil
     ) async -> Outcome {
         let fenced = fence(verb: verb, value: value, sessionId: sessionId, reachesUser: reachesUser,
-                           turnSessionId: turnSessionId, appModel: appModel, turn: turn)
+                           turnSessionId: turnSessionId, appModel: appModel, turn: turn, scope: scope)
         if let refusal = fenced.refusal { return refusal }
         let sessionID = fenced.session
         switch verb {

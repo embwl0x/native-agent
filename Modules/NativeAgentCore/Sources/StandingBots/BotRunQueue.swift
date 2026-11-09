@@ -57,7 +57,6 @@ public struct BotRunQueue: Sendable {
         let requestID: UUID
         let briefVersion: Int
         let admittedAt: Date
-        var deadlineExceededAt: Date? = nil
         var executionAdmittedAt: Date? = nil
     }
 
@@ -207,17 +206,6 @@ public struct BotRunQueue: Sendable {
 
     public enum RequestPresence: Sendable { case queued, running, deadlineExceeded, absent }
 
-    func markDeadlineExceeded(bot id: UUID, requestID: UUID) throws {
-        try disk.locked {
-            guard var claim = try disk.read(Claim.self, at: claimRecord(id)), claim.requestID == requestID else {
-                throw StandingBotsError.corruptStore("exact bot run claim unavailable")
-            }
-            claim.deadlineExceededAt = Date()
-            try disk.write(claim, at: claimRecord(id))
-        }
-        NotificationCenter.default.post(name: Self.didChange, object: dataRoot)
-    }
-
     func admitExecution(bot id: UUID, requestID: UUID) throws {
         try disk.locked {
             guard var claim = try disk.read(Claim.self, at: claimRecord(id)), claim.requestID == requestID else {
@@ -248,7 +236,7 @@ public struct BotRunQueue: Sendable {
             }
             if errno == EWOULDBLOCK {
                 if let saved = try disk.read(Claim.self, at: claimRecord(id)), saved.requestID == requestID {
-                    return saved.deadlineExceededAt == nil ? .running : .deadlineExceeded
+                    return .running
                 }
                 return requests[id]?.runID == requestID ? .queued : .absent
             }
@@ -414,18 +402,23 @@ public struct BotRunQueue: Sendable {
         struct Spend: Codable { var day: Int; var tokens: Int }
         try disk.locked {
             let path = disk.root.appendingPathComponent(bot.uuidString).appendingPathComponent("daily-spend.json")
-            let day = Int(floor(now.timeIntervalSince1970 / 86_400)) // UTC day
+            guard let day = Int(exactly: floor(now.timeIntervalSince1970 / 86_400)) else {
+                throw StandingBotsError.corruptStore("daily spend date")
+            }
             let saved = try disk.read(Spend.self, at: path)
-            guard saved == nil || (saved!.tokens >= 0) else {
+            if let saved, saved.tokens < 0 {
                 throw StandingBotsError.corruptStore("daily spend")
             }
             // A backwards wall-clock change must not mint another allowance.
             var spend = saved ?? Spend(day: day, tokens: 0)
             if day > spend.day { spend = Spend(day: day, tokens: 0) }
-            guard tokens > 0, tokens <= ceiling - spend.tokens else {
+            let remaining = ceiling.subtractingReportingOverflow(spend.tokens)
+            guard tokens > 0, !remaining.overflow, tokens <= remaining.partialValue else {
                 throw BotRunnerError.dailySpendLimit
             }
-            spend.tokens += tokens
+            let total = spend.tokens.addingReportingOverflow(tokens)
+            guard !total.overflow else { throw StandingBotsError.corruptStore("daily spend overflow") }
+            spend.tokens = total.partialValue
             try disk.write(spend, at: path)
         }
     }

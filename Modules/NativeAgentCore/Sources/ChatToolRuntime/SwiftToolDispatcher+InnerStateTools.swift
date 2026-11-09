@@ -120,6 +120,16 @@ extension SwiftToolDispatcher {
         var now: [String: JSONValue] = [:]
         now["felt"] = reading.fingerprint.map(JSONValue.string) ?? .null
         now["about"] = reading.fingerprintSubject.map(JSONValue.string) ?? .null
+        func registerJSON(_ chosen: CognitiveChosenRegister) -> JSONValue {
+            .object([
+                "name": .string(innerStateSafeText(chosen.choice.name, limit: 80)),
+                "stretch": .string(chosen.choice.stretch.rawValue),
+                "until": chosen.choice.until.map { .string(iso.string(from: $0)) } ?? .null,
+                "exchange_at": .string(iso.string(from: chosen.at)),
+                "source": .string(innerStateSafeText(chosen.choice.source, limit: 240)),
+            ])
+        }
+        now["chosen_register"] = reading.chosenRegister.map(registerJSON) ?? .null
 
         var body: [String: JSONValue] = [
             "words": .array(reading.chemistryWords.map(JSONValue.string)),
@@ -205,6 +215,10 @@ extension SwiftToolDispatcher {
         out["self_night"] = knowledge.map { .string($0.night) } ?? .null
         out["self_unavailable"] = reading.selfKnowledgeIssue.map { .string(innerStateSafeText($0, limit: 320)) } ?? .null
         out["people_unavailable"] = reading.carePeopleIssue.map { .string(innerStateSafeText($0, limit: 320)) } ?? .null
+        if reading.detail == .full {
+            out["register_choices"] = .array(reading.registerChoices.map(registerJSON))
+            out["register_choices_unavailable"] = reading.registerChoicesIssue.map { .string(innerStateSafeText($0, limit: 320)) } ?? .null
+        }
         out["traits"] = .array((knowledge?.traits ?? []).map { trait in
             .object([
                 "when": .string(innerStateSafeText(trait.when, limit: 120)),

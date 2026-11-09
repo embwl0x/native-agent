@@ -181,6 +181,8 @@ public struct BodySchema: Codable, Sendable, Equatable {
     public var memoryIntegrityReading: MemoryIntegrityReading?
     public var dreamIntegrityReading: DreamIntegrityReading?
     public var toolCapabilityReading: ToolCapabilityReading?
+    /// Transient projection of canonical tool receipts; absent evidence makes no recovery claim.
+    public var handPain: [OrganismHandPain] = []
     public var approvalPathReading: ApprovalPathReading?
     public var resourcePressureReading: ResourcePressureReading?
     public var memoryHealthy: Bool

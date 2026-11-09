@@ -145,13 +145,19 @@ extension SwiftToolDispatcher {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         var fields: [String] = []
         if let requested = input["fields"], requested != .null {
-            guard (turnID?.isEmpty == false || completedTurns != nil),
-                  case .array(let values) = requested, !values.isEmpty, values.count <= 16,
+            guard case .array(let values) = requested, !values.isEmpty, values.count <= 16,
                   values.allSatisfy({ value in
                       guard case .string(let key) = value else { return false }
                       return !key.isEmpty && key.count <= 80
                   }) else {
-                throw AutonomyGateError.toolDenied(reason: "fields requires turn_id or completed_turns and 1–16 payload keys of at most 80 characters.")
+                throw ToolFailureError("fields takes 1–16 payload keys of at most 80 characters.", argumentPath: "fields", effects: .none)
+            }
+            guard turnID?.isEmpty == false || completedTurns != nil else {
+                var next = input.filter { !$0.key.hasPrefix("__") }
+                next["completed_turns"] = .int(1)
+                throw ToolFailureError("fields requires turn_id or completed_turns. Nothing was read.", argumentPath: "fields", effects: .none,
+                    nextCall: ToolFailureError.call("app", ["action": .string("trace.recent"), "args": .object(next)]),
+                    instruction: "The proposed call reads the last completed turn; choose its count or supply the exact turn_id you need.")
             }
             fields = values.compactMap { $0.stringValue }
         }
@@ -291,6 +297,7 @@ extension SwiftToolDispatcher {
             if receiptView {
                 summary["phase"] = payload["phase"]
                 summary["action"] = action.map(JSONValue.string)
+                summary["result_recovery"] = payload["result_recovery"]
                 summary.removeValue(forKey: "payload_keys")
                 if effectsOnly || nonRead {
                     summary["args"] = payload["args"]

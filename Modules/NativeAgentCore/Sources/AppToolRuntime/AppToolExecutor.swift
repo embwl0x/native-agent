@@ -36,15 +36,17 @@ public final class AppToolExecutor: ChatToolExecuting {
     let actionExecution: AppActionExecution
     /// Supplementary page reads clear the same Trust gate as direct calls.
     public let chrome: @Sendable () -> ChromeControlRuntime
-    public let macPersonAway: @Sendable () -> Bool
     public let motorActionObserver: @Sendable (MotorActionReadModel) async -> Void
     public let quietHost: @MainActor @Sendable () -> (any QuietToolHost)?
     public let presentation: any QuietToolPresentationPort
-    let actionIndex: SwiftNativeMemoryV2
+    private let bindPresentation: (@MainActor @Sendable (Turn) throws -> AppToolPresentationBinding?)?
+    var actionIndex: SwiftNativeMemoryV2 {
+        get async { await Self.memoryOwner(dataRoot: securityCenter.dataRoot) }
+    }
     public let securityCenter: SwiftNativeSecurityCenter
     public let enforceAutonomySecurity: Bool
     public let browserActionRunner: @Sendable (String, Bool, [String: JSONValue], Turn, AppActionExecution) async throws -> JSONValue
-    private let mobileNotificationSender: @Sendable (String, String, [String: String], Turn) async throws -> MobileNotificationDeliveryReceipt
+    private let mobileNotificationSender: @Sendable (String, String, [String: String], Turn) async throws -> AttentionOutcome
     private let macNotificationSender: @Sendable (String, String, Turn, ContinuousClock.Instant?) async throws -> NativeAgentNotificationPostResult
     /// Executors share persisted authority; injected stores must retain the same gate.
     private let macIntegrationPermissionStore: MacIntegrationPermissionStore
@@ -60,9 +62,8 @@ public final class AppToolExecutor: ChatToolExecuting {
         enforceAutonomySecurity: Bool,
         browserActionRunner: @escaping @Sendable (String, Bool, [String: JSONValue], Turn, AppActionExecution) async throws -> JSONValue,
         chrome: @escaping @Sendable () -> ChromeControlRuntime,
-        macPersonAway: @escaping @Sendable () -> Bool,
         motorActionObserver: @escaping @Sendable (MotorActionReadModel) async -> Void,
-        mobileNotificationSender: @escaping @Sendable (String, String, [String: String], Turn) async throws -> MobileNotificationDeliveryReceipt,
+        mobileNotificationSender: @escaping @Sendable (String, String, [String: String], Turn) async throws -> AttentionOutcome,
         macNotificationSender: @escaping @Sendable (String, String, Turn, ContinuousClock.Instant?) async throws -> NativeAgentNotificationPostResult,
         macIntegrationPermissionStore: MacIntegrationPermissionStore,
         doctorStatusProvider: @escaping @Sendable (_ repair: Bool?, _ checkID: String?, _ turn: Turn) async throws -> JSONValue,
@@ -72,37 +73,28 @@ public final class AppToolExecutor: ChatToolExecuting {
         attention: @escaping @Sendable () -> AttentionRouter,
         quietHost: @escaping @MainActor @Sendable () -> (any QuietToolHost)?,
         presentation: any QuietToolPresentationPort,
-        actionExecution: AppActionExecution
+        actionExecution: AppActionExecution,
+        bindPresentation: (@MainActor @Sendable (Turn) throws -> AppToolPresentationBinding?)? = nil
     ) {
         do {
         AppActionBinding.register(Dictionary(uniqueKeysWithValues: try AppActions.seedActions.map { ($0.id, $0.binding) }),
                                  tools: Array(SwiftToolDispatcher.nativeToolDescriptors.values) + Self.sharedDescriptors,
                                  authorableToolName: SwiftToolDispatcher.isAuthorableToolName,
                                  partPolicy: { id, turn in try AppActions.action(id, dataRoot: securityCenter.dataRoot, turn: turn)?.binding },
-                                 policyCatalog: { turn in try AppActions.policyCatalog(dataRoot: securityCenter.dataRoot, turn: turn) })
+                                 policyCatalog: { turn in try AppActions.policyCatalog(dataRoot: securityCenter.dataRoot, turn: turn) },
+                                 appReadOnly: { input, turn in try Self.doorReadOnly(input, turn: turn) })
         } catch {
             // Preserve the assembly failure at the registry boundary. No action can be admitted against an empty invented catalog.
             let failure = error
             AppActionBinding.register([:], tools: Array(SwiftToolDispatcher.nativeToolDescriptors.values) + Self.sharedDescriptors,
                 authorableToolName: SwiftToolDispatcher.isAuthorableToolName,
-                partPolicy: { _, _ in throw failure }, policyCatalog: { _ in throw failure })
-        }
-        // Register a closure, not a static table dependency: app's schema already reads AppActions during descriptor assembly below.
-        RunawayOutputDetector.registerAppReadOnlyCalls { input, turn in
-            do { return try Self.doorReadOnly(input, turn: turn) }
-            catch {
-                // Only a positive registry reading proves read-only. This classification neither runs nor decides the call's outcome; the checked app door
-                // still reports its actual source error.
-                nativeLog("App read-only classification unavailable: %@", error.localizedDescription)
-                return false
-            }
+                partPolicy: { _, _ in throw failure }, policyCatalog: { _ in throw failure }, appReadOnly: { _, _ in throw failure })
         }
         self.actionExecution = actionExecution
         self.securityCenter = securityCenter
         self.enforceAutonomySecurity = enforceAutonomySecurity
         self.browserActionRunner = browserActionRunner
         self.chrome = chrome
-        self.macPersonAway = macPersonAway
         self.motorActionObserver = motorActionObserver
         self.mobileNotificationSender = mobileNotificationSender
         self.macNotificationSender = macNotificationSender
@@ -114,24 +106,26 @@ public final class AppToolExecutor: ChatToolExecuting {
         self.attention = attention
         self.quietHost = quietHost
         self.presentation = presentation
+        self.bindPresentation = bindPresentation
         let root = securityCenter.dataRoot
-        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
-        self.actionIndex = memory
         let pages: @Sendable () async throws -> [String: QuietToolPage] = {
-            try await MainActor.run {
-                Dictionary(([Self.doorInbox] + (try presentation.pages)).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-            }
+            try await Dictionary(([Self.doorInbox] + presentation.pages).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         }
         AgentWorkspacePorts.rankParts { message, root, turn in
-            do { return await AppActions.parts(message, pages: try await pages(), dataRoot: root, memory: memory, turn: turn) }
+            do {
+                let memory = await Self.memoryOwner(dataRoot: securityCenter.dataRoot)
+                return await AppActions.parts(message, pages: try await pages(), dataRoot: root, memory: memory, turn: turn)
+            }
             catch { return PreparedWorkspaceGlance("Parts could not be ranked: " + error.localizedDescription) }
         }
-        Task {
+        Task.detached {
+            let memory = await Self.memoryOwner(dataRoot: root)
             let paths = ["agents/peers.json", "config/embeddings.json", "ui/layout.json"]
                 .map { root.appendingPathComponent($0) }
                 + [defaultPersonaRoot(dataRoot: root).appendingPathComponent("skills/bodies")]
             await memory.installActionIndex(paths: paths,
-                notifications: [AbilityStore.didChange, BotRunQueue.didChange, UserDefaults.didChangeNotification]) {
+                // Catalog text reads parts, guidance, contacts, helpers and page names; no UserDefaults value is an input.
+                notifications: [AbilityStore.didChange, BotRunQueue.didChange, .pageCatalogPublished]) {
                     // The catalog, never the view of the session whose find asked for this fill: a turn's own actions are embedded with its ask.
                     let pages = try await pages()
                     let inventory = try await AppActions.inventory(dataRoot: root, turn: nil)
@@ -147,14 +141,13 @@ public final class AppToolExecutor: ChatToolExecuting {
         AppToolExecutor(copying: self, execution: execution)
     }
 
-    private init(copying owner: AppToolExecutor, execution: AppActionExecution) {
+    private init(copying owner: AppToolExecutor, execution: AppActionExecution, binding: AppToolPresentationBinding? = nil) {
         actionExecution = execution
         chrome = owner.chrome
-        macPersonAway = owner.macPersonAway
         motorActionObserver = owner.motorActionObserver
-        quietHost = owner.quietHost
-        presentation = owner.presentation
-        actionIndex = owner.actionIndex
+        quietHost = binding?.host ?? owner.quietHost
+        presentation = binding?.presentation ?? owner.presentation
+        bindPresentation = binding == nil ? owner.bindPresentation : nil
         securityCenter = owner.securityCenter
         enforceAutonomySecurity = owner.enforceAutonomySecurity
         browserActionRunner = owner.browserActionRunner
@@ -211,6 +204,10 @@ public final class AppToolExecutor: ChatToolExecuting {
 
     public func execute(tool: String, input: [String: JSONValue], surface: String, turn: Turn,
         execution: AppActionExecution) async throws -> JSONValue {
+        if let bindPresentation, let binding = try await bindPresentation(turn) {
+            return try await AppToolExecutor(copying: self, execution: execution, binding: binding)
+                .execute(tool: tool, input: input, surface: surface, turn: turn, execution: execution)
+        }
         switch tool {
         // App bodies route notifications here; bridge-only bodies use Core with the same backends and permission gates.
         case "mobile_notify", "mac_notify":
@@ -244,13 +241,12 @@ public final class AppToolExecutor: ChatToolExecuting {
 
     public static func defaultMobileNotificationSender(
         title: String, body: String, userInfo: [String: String], router: AttentionRouter, turn: Turn
-    ) async throws -> MobileNotificationDeliveryReceipt {
+    ) async throws -> AttentionOutcome {
             // Each explicit send is its own happening, even when its words match an earlier send.
             let matter = Matter(id: "mobile_notify:" + UUID().uuidString.lowercased(), form: .words,
                 from: userInfo["source"] ?? "mobile_notify", title: title, summary: body,
                 open: turn.verifiedSessionID.map { "chat:" + $0 })
-            let outcome = try await router.tell(matter, reach: .pinned(.phone, from: nil), turn: turn)
-            return try outcome.requireReceipt()
+            return try await router.tell(matter, reach: .pinned(.phone, from: nil), turn: turn)
     }
 
     // MARK: - Notifications
@@ -270,7 +266,7 @@ public final class AppToolExecutor: ChatToolExecuting {
     }
 
     public static func mobileNotify(input: [String: JSONValue], surface: String, toolName: String, turn: Turn,
-        sender: (String, String, [String: String], Turn) async throws -> MobileNotificationDeliveryReceipt
+        sender: (String, String, [String: String], Turn) async throws -> AttentionOutcome
     ) async throws -> JSONValue {
         let input = input.filter { $0.value != .string("") }
         let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: toolName)
@@ -288,8 +284,8 @@ public final class AppToolExecutor: ChatToolExecuting {
             .trimmingCharacters(in: .whitespacesAndNewlines), !sessionId.isEmpty {
             userInfo["sessionId"] = sessionId
         }
-        let receipt = try await sender(title, message, userInfo, turn)
-        var obj = receipt.deliveryFields()
+        let outcome = try await sender(title, message, userInfo, turn)
+        var obj = try outcome.phoneDeliveryFields()
         obj.merge([
             "tool": .string("mobile.notify"),
             "surface": .string(surface),
@@ -341,8 +337,15 @@ public final class AppToolExecutor: ChatToolExecuting {
                         return try await perform(name, arguments, callTurn, execution)
                     })
             }
-            let call = ChatToolSessionInjection.apply(toolName: action.tool, input: input,
+            var call = ChatToolSessionInjection.apply(toolName: action.tool, input: input,
                                                       sessionId: input["__session_id"]?.scalarText)
+            // A verb a part answers meets the workspace's names as its native executor did: names it takes are bound before it runs, and the rows it
+            // reads are named after.
+            let verb = action.partAction ? action.input["verb"]?.stringValue : nil
+            let workspace = ChatWorkspaceBinding.operation(turn: turn, invocation: execution.invocation)
+            if let verb, AgentWorkspace.takesNames.contains(verb) {
+                call = AgentWorkspace.bindMail(workspace: workspace, call, dataRoot: securityCenter.dataRoot)
+            }
             do {
                 let result = try await perform(action.tool, call, turn, execution)
                 if action.partAction, execution.valueCall?.id != action.tool,
@@ -350,8 +353,11 @@ public final class AppToolExecutor: ChatToolExecuting {
                     var answer: [String: JSONValue] = if case .object(let answer) = returned { answer } else { ["result": returned] }
                     if fields["status"] == .string("ok") || fields["status"] == .string("refused") && answer["status"] == .string("failed") {
                         // The part supplies its payload; only the runner can attest its effects and how many times it carried itself.
-                        for key in ["effects", "calls", "changed", "runs", "handed_back"] { answer[key] = fields[key] }
-                        return .object(answer)
+                        for key in ["effects", "calls", "changed", "runs", "handed_back", "ability_run"] { answer[key] = fields[key] }
+                        guard let verb, AgentWorkspace.namesRows.contains(verb) else { return .object(answer) }
+                        AgentReadBadges.shared.note(.object(answer), dataRoot: securityCenter.dataRoot)
+                        return AgentWorkspace.attachReadReferences(workspace: workspace, tool: verb, input: call, result: .object(answer),
+                                                                   dataRoot: securityCenter.dataRoot)
                     }
                 }
                 return result
@@ -390,7 +396,8 @@ public final class AppToolExecutor: ChatToolExecuting {
             let result = try await proactiveSpeechClient(root).speakProactively(
                 content: message, caller: .reachOut,
                 idempotencyKey: SwiftNativeChatOrchestrationClient.proactiveSpeechIdempotencyKey(scope: "chat.post:" + turn.id, content: message),
-                sessionId: destination, turn: turn.with(\.envelope, route))
+                sessionId: destination,
+                turn: turn.with(\.envelope, route))
             switch result {
             case .posted(let session, let run):
                 // Knock at the person's doors, including the target thread's Telegram door when present.
@@ -409,12 +416,6 @@ public final class AppToolExecutor: ChatToolExecuting {
                                 "destinations": .object(knock.destinationFields)])
             case .duplicate(let session):
                 return .object(["status": .string("ok"), "effects": .string("none"), "session_id": .string(session), "duplicate": .bool(true)])
-            case .rateLimited(let seconds):
-                let minutes = max(1, (seconds + 59) / 60)
-                return Self.doorRefusal("rate_limited",
-                    "Unprompted posts reach the person at most once an hour; the next can go in \(minutes) min. Nothing was posted.",
-                    remedy: "none", "Tell the person in your reply when they next write, or post again in \(minutes) min.",
-                    extra: ["seconds_remaining": .int(Int64(seconds))])
             }
         case "mac_apps":
             let name = input["name"]?.scalarText ?? ""
@@ -461,10 +462,20 @@ public final class AppToolExecutor: ChatToolExecuting {
             return try await doorUndo(input: input, turn: turn, execution: execution)
         case "read_file" where action.id == "reply.attach":
             return await runReplyAttach(input: input, turn: turn, execution: execution)
-        case "read_file" where action.id == "chrome.history":
-            return try await runChromeHistory(input: input, surface: surface, turn: turn, execution: execution)
         case "claude_worklog":
-            return AgentConversationView.claudeWorklog(input: input)
+            return await AgentConversationView.claudeWorklog(input: input)
+        case "chat_working_memory":
+            guard let session = turn.verifiedSessionID ?? turn.session,
+                  NativeAgentChatSessionID.isSafePathComponent(session), case .string(let text)? = input["text"] else {
+                throw ToolFailureError("A private choice needs this turn's conversation and a text string.", effects: .none)
+            }
+            guard text.count <= ChatSessionScratch.workingMemoryLimit else {
+                throw ToolFailureError("Keep the private choice within 1200 characters; nothing was changed.", effects: .none)
+            }
+            try await ChatSessionScratch.holdWorkingMemory(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+                sessionID: session, text: text)
+            return .object(["status": .string("ok"), "held": .bool(!text.isEmpty),
+                            "detail": .string(text.isEmpty ? "Private working memory cleared." : "Private choice held for this conversation.")])
         case "agent_contacts" where action.id == "agent.recipe":
             return AgentRecipeStore.read(host: input["host"]?.scalarText)
         case "agent_connect" where action.id == "agent.recipe_write":
@@ -537,6 +548,8 @@ public final class AppToolExecutor: ChatToolExecuting {
             return await runHouseFile(input: input, surface: surface, turn: turn)
         case "repair_let_go":
             return await runRepairLetGo(input: input)
+        case "record_read":
+            return await runRecordRead(input: input)
         case "abilities_restore_state":
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             let archive = try AbilityStore(dataRoot: root).restoreState(input["state"] ?? .null,
@@ -545,10 +558,9 @@ public final class AppToolExecutor: ChatToolExecuting {
                 "preserved": .string(archive.path), "detail": .string("""
                     Recovered ability run state was read back. Damaged bytes were preserved; ability files and authority were unchanged.
                     """)])
-        case "turn_reconcile", "arrival_accept":
-            return await runBackgroundRepair(tool: action.tool, input: input, workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: execution
-                .invocation))
-        case "resident_wake":
+        case "turn_reconcile":
+            return await runTurnReconcile(input: input)
+        case "home_arrive":
             let line = (input["line"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard let part = turn.partID else {
                 return Self.doorRefusal("not_a_part", "home.arrive is a part's way to you; this call came from no part's run. Nothing was filed.",
@@ -568,56 +580,29 @@ public final class AppToolExecutor: ChatToolExecuting {
             }
             let identity = Data((eventKey ?? line).utf8)
             let digest = SHA256.hash(data: identity).prefix(8).map { String(format: "%02x", $0) }.joined()
-            let id = "part:" + part + ":" + (eventKey == nil ? day : "event") + ":" + digest
-            guard !ResidentWake.knows(id, dataRoot: root) else {
-                return .object(["status": .string("ok"), "effects": .string("none"), "detail": .string("This arrival is already known on your home.")])
+            // A part's line is a world happening, judged by the agent's weigh and never by this door. Peers that steered the run travel with it, so
+            // the thought that reads it carries their authority, never more.
+            let happening = Happening(.world, subject: "part:" + part, door: "part:" + part, words: part + ": " + line,
+                once: "part:" + part + ":" + (eventKey == nil ? day : "event") + ":" + digest,
+                peers: turn.peerSteering?.checkpointSources, elevated: turn.peerSteering?.elevatedSources)
+            do {
+                guard try await ExperienceStore.at(root).experience(happening.id) == nil else {
+                    return .object(["status": .string("ok"), "effects": .string("none"), "detail": .string("This arrival is already known.")])
+                }
+            } catch {
+                return Self.failure("record_unreadable", """
+                    The record could not say whether this arrival is already known (\(error.localizedDescription)), so nothing was filed. Call it again \
+                    once the record reads.
+                    """)
             }
-            // Wake on care matches or missing judgment; other arrivals wait for the next turn.
-            let taint = turn.peerSteering.flatMap { $0.isTainted ? $0.sourceDescription : nil }
-            let says = part + ": " + line
-            let crossed = await SensesHub.shared.crossing?.cross(line, watch: "part:" + part, reason: "what your parts noticed",
-                                                               id: id, says: says, agent: taint) ?? .unweighed
-            let notKept: JSONValue = .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("not_kept"),
-                                       "detail": .string("The arrival could not be kept, so nothing was filed. Call it again.")])
-            let waits: String
-            switch crossed {
-            case .woke(let care):
-                return .object(["status": .string("ok"), "effects": .string("occurred"),
-                                "detail": .string("It touches your care about \(care): on your home; it wakes you once.")])
-            case .notKept: return notKept
-            case .unweighed:
-                // Missing judgment cannot prove irrelevance; retain the hop rule so parts cannot wake recursively.
-                guard ResidentWake.shared.request(dataRoot: root, reason: "what your parts noticed", items: [
-                    .init(id: id, line: says, thread: "part:" + part, agent: taint, home: true)
-                ]) else { return notKept }
-                return .object(["status": .string("ok"), "effects": .string("occurred"),
-                                "detail": .string("On your home; it wakes you once.")])
-            case .resting(let care):
-                waits = "It touches your care about \(care), but this part already woke you about it and the care has not rested since"
-            case .untouched:
-                waits = "It touches none of your cares"
-            }
-            guard await SenseNewsBoard.shared.keep(SenseNews(senseID: "part:" + part, version: 1, address: "home.arrive",
-                                                       summary: line, at: Date(), changeID: id)) else { return notKept }
-            guard ResidentWake.shared.request(dataRoot: root, reason: "what your parts noticed", items: [
-                .init(id: id, line: says, thread: "part:" + part, agent: taint)
-            ], waking: false) else {
-                return .object(["status": .string("failed"), "effects": .string("partial"), "reason": .string("identity_not_kept"),
-                    "detail": .string("""
-                        The news was kept, but its arrival identity could not be saved. Home arrivals are unavailable; repair the ledger before offering this \
-                        occurrence again.
-                        """)])
-            }
-            return .object(["status": .string("ok"), "effects": .string("occurred"),
-                            "detail": .string(waits + ", so it waits for your next turn without waking you.")])
+            Attention.post(happening, dataRoot: root)
+            return .object(["status": .string("ok"), "effects": .string("occurred"), "detail": .string("""
+                In your mind: your weigh judges what it is worth, and worth that gathers on what it means opens a thought.
+                """)])
         case "list_memories", "rewrite_memory":
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let curation = MemoryCuration(memoryV2: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root)
-            return action.tool == "list_memories"
-                ? try await curation.listMemories(input: input, surface: surface,
-                    persona: nil)
-                : try await curation.rewriteMemory(turn: turn, invocation: execution.toolInvocation, input: input, surface: surface,
-                    persona: nil)
+            return try await Self.curateMemory(tool: action.tool, root: root, input: input, surface: surface,
+                                              turn: turn, invocation: execution.toolInvocation)
         default:
             break
         }
@@ -634,7 +619,8 @@ public final class AppToolExecutor: ChatToolExecuting {
                     next: ["page": .string(action.page)], extra: ["effects": .string("unknown"), "action": .string(action.id), "verb": .string(verb)])
             }
             body["verb"] = .string(verb)
-            if action.tool == "connections" { body["decided_by"] = .string("agent") }
+            // Who decided it: the person when their own act admitted this call, the agent otherwise.
+            if action.tool == "connections" { body["decided_by"] = .string(turn.personAct == nil ? "agent" : "person") }
             return .object(body)
         case "upkeep", "mind_run", "ability_manage":
             let outcome = switch action.tool {
@@ -645,8 +631,12 @@ public final class AppToolExecutor: ChatToolExecuting {
                     turn: turn, invocation: execution.partInvocation(turn: turn, surface: surface, preview: input["preview"] == .bool(true)))
             }
             var body = outcome.fields
+            // Only the turn program's save asks the person this way (needs_person); no other verb's fields, a part run's among them, word
+            // the person's card.
+            let asks = action.id == "ability.save" && body["status"] == .string("needs_person")
+            let named = body["status"].flatMap { $0 == .string("needs_person") ? nil : $0 }
             body["status"] = body["preview"] == .bool(true) ? .string("preview")
-                : outcome.ok ? .string("ok") : body["status"] ?? .string("failed")
+                : asks ? .string("needs_person") : outcome.ok ? .string("ok") : named ?? .string("failed")
             body["verb"] = .string(verb)
             body["detail"] = .string(outcome.detail)
             return .object(body)
@@ -666,6 +656,24 @@ public final class AppToolExecutor: ChatToolExecuting {
         let steer = PeerDataTaint.carried(turn: turn, peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                           peerID: turn.envelope?.verifiedUserId)
         return steer.sources + steer.elevated
+    }
+
+    /// Owner resolution inspects memory storage; execution and preview must both leave the host's UI executor before resolving it.
+    @concurrent private static func memoryOwner(dataRoot: URL) async -> SwiftNativeMemoryV2 {
+        SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+    }
+
+    @concurrent private static func curateMemory(tool: String, root: URL, input: [String: JSONValue], surface: String,
+                                               turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
+        let curation = MemoryCuration(memoryV2: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root)
+        return tool == "list_memories"
+            ? try await curation.listMemories(input: input, surface: surface, persona: nil)
+            : try await curation.rewriteMemory(turn: turn, invocation: invocation, input: input, surface: surface, persona: nil)
+    }
+
+    @concurrent private static func checkMemoryRewrite(root: URL, input: [String: JSONValue], surface: String) async throws {
+        _ = try await MemoryCuration(memoryV2: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root)
+            .rewriteTarget(input: input, surface: surface, persona: nil)
     }
 
     /// Preview shares execution's read-only card, setting, composer, inbox and chat checks; nil means none refuses.
@@ -711,9 +719,7 @@ public final class AppToolExecutor: ChatToolExecuting {
         if action.tool == "rewrite_memory" {
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             do {
-                _ = try await MemoryCuration(memoryV2: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root)
-                    .rewriteTarget(input: input, surface: surface,
-                        persona: nil)
+                try await Self.checkMemoryRewrite(root: root, input: input, surface: surface)
             } catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
         }
         if action.tool == "mind_run", let verb = action.input["verb"]?.scalarText,
@@ -755,7 +761,7 @@ public final class AppToolExecutor: ChatToolExecuting {
             let reachesUser: Bool
             do { reachesUser = try await Self.reachesUser(surface: surface, fullMac: fullMac, dataRoot: root, turn: turn) }
             catch { return ChatToolOutcome.failure(error: error, tool: "chat_session", effects: ToolFailureError.Effects.none) }
-            return host.chatSessionFence(verb: verb, input: input, reachesUser: reachesUser, turn: turn)
+            return await host.chatSessionFence(verb: verb, input: input, reachesUser: reachesUser, turn: turn)
         default: return await composerRefusal(verb: verb, input: input, surface: surface, host: host, turn: turn)
         }
     }

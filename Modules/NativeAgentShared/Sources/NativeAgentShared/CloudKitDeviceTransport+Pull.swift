@@ -21,17 +21,13 @@ extension CloudKitDeviceTransport {
         inboundDirection: String,
         recovery: DeviceSyncRecovery
     ) async throws -> DeviceCKPullResult {
-        do {
-            return try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.pull", recovery: recovery, onFailure: accountFailureReporter) {
-                return try await self.pullPages(
-                    recordType: recordType,
-                    since: since,
-                    inboundDirection: inboundDirection,
-                    recovery: recovery
-                )
-            }
-        } catch is DeviceCKLandmineTimeout {
-            throw DeviceSyncError.transient(message: "CloudKit pull timed out")
+        return try await withDeviceCKOperation("CloudKitDeviceTransport.pull", onFailure: accountFailureReporter) {
+            return try await self.pullPages(
+                recordType: recordType,
+                since: since,
+                inboundDirection: inboundDirection,
+                recovery: recovery
+            )
         }
     }
 
@@ -57,7 +53,7 @@ extension CloudKitDeviceTransport {
         let pageSizes = [1, 4, 16, 64, 200]
         var pageIndex = 0
         repeat {
-            guard recovery.hasTime else { throw CancellationError() }
+            guard recovery.isActive else { throw CancellationError() }
             let op: CKQueryOperation
             // Only the first query operation sets its sort; cursors carry subsequent ordering.
             if firstPage {
@@ -68,8 +64,7 @@ extension CloudKitDeviceTransport {
                 break
             }
             op.qualityOfService = .userInitiated
-            // The container cannot filter by the watermark, so pages grow fourfold from the newest record: a quiet poll reads one record and
-            // stops at the watermark, a poll with new records reads at most about four times what is new, and only a backlog pages on at 200.
+            // Page growth reaches the server-date watermark without reading more than 200 records at once.
             op.resultsLimit = pageSizes[min(pageIndex, pageSizes.count - 1)]
             pageIndex += 1
 
@@ -83,14 +78,21 @@ extension CloudKitDeviceTransport {
                     // Old records are paging evidence, not delivery candidates. A previous pairing key must not be needed to pass them.
                     if let since, let date = ck.modificationDate, date <= since { return }
                     do {
+                        guard let direction = ck["direction"] as? String,
+                              let text = ck["text"] as? String,
+                              let createdAt = ck["createdAt"] as? String,
+                              let sender = ck["senderDevice"] as? String else {
+                            throw DeviceSyncError.underlying(message:
+                                "CloudKit record \(ck.recordID.recordName) has unreadable message fields.")
+                        }
                         let fields = NAChatMessageFields(
                             recordName: ck.recordID.recordName,
-                            direction: (ck["direction"] as? String) ?? "",
+                            direction: direction,
                             sessionId: ck["sessionId"] as? String,
-                            text: (ck["text"] as? String) ?? "",
+                            text: text,
                             payloadJSON: try Self.payload(in: ck, secret: assetSecret),
-                            createdAt: (ck["createdAt"] as? String) ?? "",
-                            senderDevice: (ck["senderDevice"] as? String) ?? "",
+                            createdAt: createdAt,
+                            senderDevice: sender,
                             kind: ck["kind"] as? String,
                             notificationTitle: ck["notificationTitle"] as? String,
                             notificationScreen: ck["notificationScreen"] as? String,
@@ -105,26 +107,29 @@ extension CloudKitDeviceTransport {
             }
 
             // Return traversal state rather than mutating captured state across the continuation.
-            let page = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(records: [(fields: NAChatMessageFields, modDate: Date?)],
-                payloadError: DeviceSyncError?,
-                modificationDates: [Date?],
-                cursor: CKQueryOperation.Cursor?), Error>) in
-                op.queryResultBlock = { result in
-                    switch result {
-                    case .success(let cursor):
-                        do {
-                            let snapshot = try holder.snapshot()
-                            cont.resume(returning: (snapshot.records, snapshot.payloadError, snapshot.modificationDates, cursor))
-                        } catch {
-                            cont.resume(throwing: Self.mapError(error))
+            let page = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(records: [(fields: NAChatMessageFields, modDate: Date?)],
+                    payloadError: DeviceSyncError?,
+                    modificationDates: [Date?],
+                    cursor: CKQueryOperation.Cursor?), Error>) in
+                    op.queryResultBlock = { result in
+                        switch result {
+                        case .success(let cursor):
+                            do {
+                                let snapshot = try holder.snapshot()
+                                cont.resume(returning: (snapshot.records, snapshot.payloadError, snapshot.modificationDates, cursor))
+                            } catch {
+                                cont.resume(throwing: Self.mapError(error))
+                            }
+                        case .failure(let err):
+                            cont.resume(throwing: Self.mapError(err))
                         }
-                    case .failure(let err):
-                        cont.resume(throwing: Self.mapError(err))
                     }
+                    self.database.add(op)
+                    if Task.isCancelled { op.cancel() }
                 }
-                self.database.add(op)
-            }
-            guard recovery.hasTime else { throw CancellationError() }
+            } onCancel: { op.cancel() }
+            guard recovery.isActive else { throw CancellationError() }
             combined.records.append(contentsOf: page.records)
             combined.payloadError = combined.payloadError ?? page.payloadError
             let crossedWatermark = Self.pullPageCrossesWatermark(

@@ -3,31 +3,6 @@ import NativeAgentShared
 
 // Blueprint: | `TurnPresentation.swift` | `TurnPresentationReducer`: bounded lifecycle evidence without payloads |
 
-/// Keep phase raw values stable for persisted presentation adapters.
-public enum TurnPresentationPhase: String, CaseIterable, Sendable, Codable, Equatable {
-    case acknowledged
-    case working
-    case tool
-    case delegation
-    case retrying
-    case waiting
-    case blocked
-    case stalled
-    case completed
-    case failed
-    case canceled
-    case outcomeUnknown = "outcome_unknown"
-
-    public var isTerminal: Bool {
-        switch self {
-        case .completed, .failed, .canceled, .outcomeUnknown:
-            return true
-        default:
-            return false
-        }
-    }
-}
-
 /// Explicit lifecycle evidence supplied by a surface or turn orchestrator. Associated strings are redacted, normalized, and bounded before entering
 /// ``TurnPresentationState``.
 public enum TurnPresentationLifecycleEvent: Sendable, Equatable {
@@ -106,6 +81,8 @@ public struct TurnPresentationState: Sendable, Equatable {
     public internal(set) var firstReplyAt: Date? = nil
     /// The call being written now; the next lifecycle step ends it.
     public internal(set) var writing: TurnCallWriting? = nil
+    /// The last call's name is evidence that this turn has begun acting, even between rounds.
+    public internal(set) var lastCallName: String? = nil
 
     public var isTerminal: Bool { phase.isTerminal }
 
@@ -129,7 +106,6 @@ public enum TurnPresentationReducer {
     // Keep a bounded receipt's explanation and next step together.
     public static let textLimit = 1_000
     public static let detailHistoryLimit = 12
-    public static let defaultStalledAfter: TimeInterval = 90
 
     public static func initialState(at instant: Date) -> TurnPresentationState {
         TurnPresentationState(startedAt: instant)
@@ -147,6 +123,7 @@ public enum TurnPresentationReducer {
         var action: String? = nil
         var delegate: String? = nil
         var resetStreamLength = false
+        var callName: String? = nil
         switch event {
         case .acknowledged:
             guard state.phase == .acknowledged else { return state }
@@ -157,6 +134,7 @@ public enum TurnPresentationReducer {
         case .tool(let name, let detail):
             phase = .tool
             action = detail ?? ToolActivityPresentation.progress(name)
+            callName = name
         case .delegation(let name, let detail):
             phase = .delegation
             action = detail
@@ -192,6 +170,7 @@ public enum TurnPresentationReducer {
             phase: phase,
             action: action,
             delegate: delegate,
+            callName: callName,
             at: instant,
             resetStreamLength: resetStreamLength,
             additionalRedactor: additionalRedactor
@@ -230,6 +209,7 @@ public enum TurnPresentationReducer {
         next.writing = writing.flatMap { call in
             sanitized(call.call, additionalRedactor: additionalRedactor).map { TurnCallWriting(call: $0, bytes: call.bytes) }
         }
+        if let writing = next.writing { next.lastCallName = writing.call }
         return next
     }
 
@@ -240,6 +220,7 @@ public enum TurnPresentationReducer {
         detail: String?,
         delegateName: String?,
         outcome: TurnPresentationActivity.Outcome? = nil,
+        callName: String? = nil,
         at instant: Date,
         resetStreamLength: Bool = false,
         additionalRedactor: AdditionalRedactor? = nil
@@ -251,6 +232,7 @@ public enum TurnPresentationReducer {
             action: detail,
             delegate: delegateName,
             outcome: outcome,
+            callName: callName,
             at: instant,
             resetStreamLength: resetStreamLength,
             additionalRedactor: additionalRedactor
@@ -274,27 +256,13 @@ public enum TurnPresentationReducer {
         return String(singleLine.prefix(textLimit - 1)) + "…"
     }
 
-    /// Derives a stalled presentation without mutating authoritative lifecycle state. Waiting, blocked, explicit-stall, and terminal states do not age into a
-    /// different meaning.
-    public static func effectivePhase(
-        _ state: TurnPresentationState,
-        secondsSinceMovement: TimeInterval,
-        stalledAfter: TimeInterval = defaultStalledAfter
-    ) -> TurnPresentationPhase {
-        guard stalledAfter > 0,
-              secondsSinceMovement >= stalledAfter,
-              canBecomeStalled(state.phase) else {
-            return state.phase
-        }
-        return .stalled
-    }
-
     private static func transition(
         _ state: TurnPresentationState,
         phase: TurnPresentationPhase,
         action: String? = nil,
         delegate: String? = nil,
         outcome: TurnPresentationActivity.Outcome? = nil,
+        callName: String? = nil,
         at instant: Date,
         streamedTextLength: Int? = nil,
         resetStreamLength: Bool = false,
@@ -302,6 +270,7 @@ public enum TurnPresentationReducer {
     ) -> TurnPresentationState {
         let safeAction = sanitized(action, additionalRedactor: additionalRedactor)
         let safeDelegate = sanitized(delegate, additionalRedactor: additionalRedactor)
+        let safeCall = sanitized(callName, additionalRedactor: additionalRedactor)
         let nextTextLength: Int
         if resetStreamLength {
             nextTextLength = 0
@@ -314,6 +283,7 @@ public enum TurnPresentationReducer {
         guard phase != state.phase
                 || safeAction != state.currentAction
                 || safeDelegate != state.delegateName
+                || (safeCall != nil && safeCall != state.lastCallName)
                 || nextTextLength != state.streamedTextLength else {
             // A step that changes nothing is no new step; it only ends the line of a call being written.
             var next = state
@@ -327,6 +297,7 @@ public enum TurnPresentationReducer {
         next.lastMovementAt = movementAt
         next.endedAt = phase.isTerminal ? movementAt : nil
         next.currentAction = safeAction
+        if let safeCall { next.lastCallName = safeCall }
         next.delegateName = safeDelegate
         next.streamedTextLength = nextTextLength
         next.writing = nil
@@ -342,14 +313,5 @@ public enum TurnPresentationReducer {
             next.activities.removeFirst(next.activities.count - detailHistoryLimit)
         }
         return next
-    }
-
-    private static func canBecomeStalled(_ phase: TurnPresentationPhase) -> Bool {
-        switch phase {
-        case .acknowledged, .working, .tool, .delegation, .retrying:
-            return true
-        case .waiting, .blocked, .stalled, .completed, .failed, .canceled, .outcomeUnknown:
-            return false
-        }
     }
 }

@@ -55,45 +55,33 @@ enum SensesAssembly {
             SensesHub.shared.install(registry: registry, runner: runner, source: source)
             installation = Task {
                 defer { installationFinished.resume() }
-                let resources = Bundle.main.resourceURL?.appendingPathComponent("Senses")
-                var paths = [dataRoot.appendingPathComponent("memory/memory.sqlite"), dataRoot.appendingPathComponent("senses/news/unread.json")]
-                if let resources { paths.append(resources.appendingPathComponent("builtin.json")) }
-                let repairs = EventDeadlinePhysiology.storeAndFileEvents(paths: paths, notifications: [AbilityStore.didChange])
-                var changes = repairs.makeAsyncIterator()
-                while !Task.isCancelled {
-                    do {
-                        guard await SenseNewsBoard.shared.configure(dataRoot: dataRoot) else {
-                            let detail = await SenseNewsBoard.shared.storageFailure
-                            throw SenseFailure(
-                                code: "news_unavailable",
-                                message: "Private sense news storage could not be installed: " + (detail ?? "binding unavailable"))
-                        }
-                        let memory = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-                        SensesHub.shared.installMemoryProvenanceSink(memory)
-                        try await BuiltInSenses.registerAll(dataRoot: dataRoot)
-                        try Task.checkCancellation()
-                        await DoctorReadout.recordReadings([CheckResult(source: "Senses installation",
-                            id: "launch.senses", title: "Senses installation", status: "ok",
-                                detail: "Senses registered; dependent reads and file subscriptions may proceed.")], dataRoot: dataRoot)
-                        NotificationCenter.default.post(name: SensesHub.didBecomeReady, object: nil)
-                        return
-                    } catch is CancellationError { throw CancellationError() }
-                    catch {
-                        let detail = "Senses registration unavailable; dependent reads are unavailable until a source repair/change: "
-                            + error.localizedDescription
-                        ModuleLog.app("[senses] %@", detail)
-                        await DoctorReadout.recordReadings([CheckResult(source: "Senses installation",
-                            id: "launch.senses", title: "Senses installation", status: "fail", detail: detail,
-                            human_action: """
-                                Preserve the failed source named in this reading; repair it at its owner. A canonical ability/resource/memory-file \
-                                change rechecks registration; otherwise relaunch after repair. Only dependent sense reads and subscriptions are \
-                                unavailable; other resident work continues.
-                                """)], dataRoot: dataRoot)
+                do {
+                    guard await SenseNewsBoard.shared.configure(dataRoot: dataRoot) else {
+                        let detail = await SenseNewsBoard.shared.storageFailure
+                        throw SenseFailure(
+                            code: "news_unavailable",
+                            message: "Private sense news storage could not be installed: " + (detail ?? "binding unavailable"))
                     }
-                    // No repair edge means still unavailable, never ready.
-                    guard await changes.next() != nil else { throw CancellationError() }
+                    let memory = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+                    SensesHub.shared.installMemoryProvenanceSink(memory)
+                    try await BuiltInSenses.registerAll(dataRoot: dataRoot)
+                    try Task.checkCancellation()
+                    await DoctorReadout.recordReadings([CheckResult(source: "Senses installation",
+                        id: "launch.senses", title: "Senses installation", status: "ok",
+                        detail: "Senses registered; dependent reads and file subscriptions may proceed.")], dataRoot: dataRoot)
+                    NotificationCenter.default.post(name: SensesHub.didBecomeReady, object: nil)
+                } catch is CancellationError { throw CancellationError() }
+                catch {
+                    let detail = "Senses registration failed: " + error.localizedDescription
+                    ModuleLog.app("[senses] %@", detail)
+                    await DoctorReadout.recordReadings([CheckResult(source: "Senses installation",
+                        id: "launch.senses", title: "Senses installation", status: "fail", detail: detail,
+                        human_action: """
+                            Preserve the failed source named in this reading; repair it at its owner and relaunch. Only dependent sense reads \
+                            and subscriptions are unavailable; other resident work continues.
+                            """)], dataRoot: dataRoot)
+                    throw error
                 }
-                throw CancellationError()
             }
             if let installation { SensesHub.shared.installReadiness(installation, finished: installationFinished) }
         }

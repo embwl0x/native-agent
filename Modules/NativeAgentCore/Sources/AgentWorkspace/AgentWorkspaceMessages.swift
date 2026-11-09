@@ -8,12 +8,12 @@ enum AgentWorkspaceMessages {
         guard let id = text(row["thread_id"]), requested == id, case .array(let participants)? = row["participants"] else { return nil }
         let handles = participants.compactMap { $0.objectValue.flatMap { text($0["handle"]) } }
         guard !handles.isEmpty, handles.count == participants.count, Set(handles).count == handles.count else { return nil }
-        return .perform(tool: "messages_send", input: ["thread_id": .string(id), "expected_participants": .array(handles.map(JSONValue.string))],
+        return .perform(tool: "messages.send", input: ["thread_id": .string(id), "expected_participants": .array(handles.map(JSONValue.string))],
             title: "Reply to \(title)", textField: "body", isEffect: true)
     }
 
     static func project(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
-        let compose = AgentWorkspaceButton(label: "Compose message", action: .configure(tool: "messages_send", input: [:], title: "Compose message"))
+        let compose = AgentWorkspaceButton(label: "Compose message", action: .configure(tool: "messages.send", input: [:], title: "Compose message"))
         let openApp = AgentWorkspaceButton(label: "Open Messages view", action: .perform(tool: "go", input: ["name": .string("Messages")],
             title: "Messages view", textField: nil, isEffect: true))
         let rowsKey = input["from_me"] == nil ? "threads" : "messages"
@@ -34,7 +34,7 @@ enum AgentWorkspaceMessages {
             let title = text(row["name"]) ?? (people.isEmpty ? "Conversation" : people.joined(separator: ", "))
             var actions: [AgentWorkspaceButton] = []
             if let id = text(row["thread_id"]), requested == nil || requested == id {
-                let location = AgentWorkspaceLocation.record(tool: "messages_recent_threads", input: ["thread_id": .string(id)], title: title)
+                let location = AgentWorkspaceLocation.record(tool: "messages.recent", input: ["thread_id": .string(id)], title: title)
                 if requested == nil {
                     actions.append(.init(label: "Open conversation", action: .open(location)))
                 } else if let reply = replyAction(row, requested: requested, title: title) {
@@ -71,22 +71,22 @@ enum AgentWorkspaceMessages {
         var actions = [openApp, compose]
         if requested == nil {
             if case .int(let next)? = content["next_offset"] {
-                actions.insert(.init(label: "More conversations", action: .open(.record(tool: "messages_recent_threads", input: input.merging(["offset": .int(
+                actions.insert(.init(label: "More conversations", action: .open(.record(tool: "messages.recent", input: input.merging(["offset": .int(
                     next)]) { _, new in new }, title: "Messages"))), at: 0)
             }
-            actions.append(.init(label: "Find messages", action: .perform(tool: "messages_recent_threads", input: [:], title: "Find messages",
+            actions.append(.init(label: "Find messages", action: .perform(tool: "messages.recent", input: [:], title: "Find messages",
                 textField: "query", isEffect: false), needsText: true))
         }
         if let requested {
             if case .int(let cursor)? = content.removeValue(forKey: "older_before_message_id"), cursor > 0 {
-                actions.append(.init(label: "Older messages", action: .open(.record(tool: "messages_recent_threads", input: ["thread_id": .string(requested),
+                actions.append(.init(label: "Older messages", action: .open(.record(tool: "messages.recent", input: ["thread_id": .string(requested),
                     "before_message_id": .int(cursor)], title: conversationTitle))))
             }
             if input["before_message_id"] != nil {
-                actions.append(.init(label: "Recent messages", action: .open(.record(tool: "messages_recent_threads", input: ["thread_id": .string(requested)],
+                actions.append(.init(label: "Recent messages", action: .open(.record(tool: "messages.recent", input: ["thread_id": .string(requested)],
                     title: conversationTitle))))
             }
-            actions.append(.init(label: "All Messages conversations", action: .open(.record(tool: "messages_recent_threads", input: ["limit": .int(16)],
+            actions.append(.init(label: "All Messages conversations", action: .open(.record(tool: "messages.recent", input: ["limit": .int(16)],
                 title: "Messages"))))
         }
         return .init(title: conversationTitle, content: .object(content), items: items, actions: actions)

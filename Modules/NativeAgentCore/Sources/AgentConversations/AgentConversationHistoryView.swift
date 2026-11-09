@@ -10,7 +10,7 @@ import PersistenceCore
 enum AgentConversationHistoryView {
     /// A contact can have inbound history before the agent ever opens a send record.
     static func adding(to presentation: JSONValue, agent: String, name: String,
-                       before: String? = nil, exchange: String? = nil, dataRoot: URL,
+                       before: String? = nil, exchange: String? = nil, limit: Int = 8, dataRoot: URL,
                        peers: [AgentPeerContact]? = nil, lines snapshot: Result<[ContactThread.Line], Error>? = nil) -> JSONValue {
         guard case .object(var result) = presentation else { return presentation }
         if before != nil || exchange != nil {
@@ -18,7 +18,7 @@ enum AgentConversationHistoryView {
             for key in ["reply", "reply_state", "reply_truncated", "artifacts", "parts", "evidence", "untrusted_remote_data"] { result.removeValue(
                 forKey: key) }
             result["viewing"] = .string(
-                "Conversation history. State and Reply controls describe the conversation now; the messages below keep their own times and states.")
+                "Conversation history. Each message keeps its own time and state.")
         }
         var metadata: [String: JSONValue] = [
             "coverage": .string("""
@@ -27,31 +27,37 @@ enum AgentConversationHistoryView {
                 """),
             "order": .string("oldest_first"), "untrusted_remote_data": .bool(false)
         ]
+        func unavailable(_ detail: String) -> JSONValue {
+            metadata["status"] = .string("unavailable")
+            metadata["detail"] = .string(detail)
+            result["session_history"] = .object(metadata)
+            // A selected history read owns its failure; the retained send's status cannot explain this read.
+            if before != nil || exchange != nil {
+                result["status"] = .string("unavailable")
+                result["detail"] = .string(detail)
+                result["effects"] = .string("none")
+            }
+            return .object(result)
+        }
         let owner = agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : agent
         let contacts: [AgentPeerContact]
         do { contacts = try peers ?? AgentPeerStore(dataRoot: dataRoot).list() }
         catch {
-            metadata["status"] = .string("unavailable")
-            metadata["detail"] = .string("Contact identity could not be read: " + error.localizedDescription
+            return unavailable("Contact identity could not be read: " + error.localizedDescription
                 + ". Repair agents/peers.json; the conversation is preserved.")
-            result["session_history"] = .object(metadata); return .object(result)
         }
         let peers = contacts
         let lines: [ContactThread.Line]
         do { lines = try snapshot?.get() ?? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: AgentContactIdentity(contacts: peers)) }
         catch {
-            metadata["status"] = .string("unavailable")
-            metadata["detail"] = .string(
+            return unavailable(
                 "This conversation's session could not be read (\(error.localizedDescription)). The conversation is preserved; no message was repeated.")
-            result["session_history"] = .object(metadata); return .object(result)
         }
         let selected: ArraySlice<ContactThread.Line>
         if let exchange {
             guard let index = lines.firstIndex(where: { $0.id == exchange }) else {
-                metadata["status"] = .string("unavailable")
-                metadata["detail"] = .string(
-                    "That message is no longer in this conversation's session. The conversation is preserved; no message was repeated.")
-                result["session_history"] = .object(metadata); return .object(result)
+                return unavailable(
+                    "That message was not found in this conversation's session. The conversation is preserved; no message was repeated.")
             }
             selected = lines[index...index]
             metadata["selected_message"] = .string(exchange)
@@ -60,18 +66,18 @@ enum AgentConversationHistoryView {
             let end: Int
             if let before {
                 guard let index = lines.firstIndex(where: { $0.id == before }) else {
-                    metadata["status"] = .string("unavailable")
-                    metadata["detail"] = .string("This earlier-page boundary is no longer in the session. Return to recent messages; no message was repeated.")
-                    result["session_history"] = .object(metadata); return .object(result)
+                    return unavailable("This earlier-page boundary was not found in the session. Return to recent messages; no message was repeated.")
                 }
                 end = index
             } else { end = lines.count }
-            let start = max(0, end - 8)
+            let start = max(0, end - min(128, max(1, limit)))
             selected = lines[start..<end]
             if start > 0 { metadata["earlier_before"] = .string(lines[start].id) }
         }
         // Only a history read failure carries its own status beside the send.
-        if lines.isEmpty { metadata["detail"] = .string("Nothing has been said in this conversation yet.") }
+        if lines.isEmpty {
+            metadata["detail"] = .string("The saved session read returned no messages; this does not prove that no earlier conversation exists.")
+        }
         // Read send state from its owning ledger, or its retained row after ledger pruning.
         let sends: Result<[String: AgentConversationExchange], Error> = Result {
             Dictionary(try AgentConversationStore(dataRoot: dataRoot).records().flatMap { ($0.exchanges ?? []) + ($0.releasing ?? []) }.map { ($0.id, $0) },

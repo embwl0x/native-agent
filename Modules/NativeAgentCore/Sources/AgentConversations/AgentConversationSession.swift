@@ -10,7 +10,7 @@ import Privacy
 import StandingBots
 import TurnTrace
 import MacControl
-// Blueprint: | `AgentConversationSession.swift` | `AgentConversationSession`, `approvalRow`, `replayApproval`, `viaAbility`, `answer`, `agent.reply`, `clear_queue`, `settle` |
+// Blueprint: | `AgentConversationSession.swift` | Conversation admission, approval replay, inline observation and one send settlement. |
 
 /// Approval execution retains the original exchange and all ordinary gates.
 public enum AgentConversationApproval {
@@ -69,7 +69,7 @@ package enum AgentConversationSession {
             $0.phase = "sending"
             if let index = $0.exchanges?.firstIndex(where: { $0.id == held.operationID }) {
                 $0.exchanges?[index].phase = "sending"
-                $0.exchanges?[index].status = "outcome_unknown"
+                $0.exchanges?[index].status = "sending"
                 $0.exchanges?[index].settledAt = nil
             }
         } } catch {
@@ -230,10 +230,21 @@ package enum AgentConversationSession {
                     args: exactArgs, surface: surface, scope: scope,
                                            dataRoot: dataRoot, waitSeconds: waitSeconds, perform: perform)
             }
-            return try await perform(tool, args, turn, conversation, mac)
+            let exact = try await perform(tool, args, turn, conversation, mac)
+            if tool == "agent_read" {
+                consumeRead(exact, peer: peer, message: string(args["message_id"]), scope: scope, conversation: conversation, dataRoot: dataRoot)
+            }
+            return exact
         }
         let name = peer?.name ?? botName ?? agent.capitalized
         let fingerprint = peer.map(AgentConversationStore.routeFingerprint)
+        // A history locator names committed words, not the current transport operation. Reading it must never depend on refreshing that operation.
+        if tool == "agent_read", historyBefore != nil || historyExchange != nil {
+            guard !fresh else { throw AgentConversationStore.Failure(message: "Start a new conversation by sending its first message.") }
+            return AgentConversationHistoryView.adding(to: .object([
+                "status": .string("read"), "agent": .string(name), "agent_id": .string(agent)
+            ]), agent: agent, name: name, before: historyBefore, exchange: historyExchange, dataRoot: dataRoot)
+        }
         if dot, tool == "agent_read" {
             return try await perform(tool, args, turn, conversation, mac)
         }
@@ -270,7 +281,7 @@ package enum AgentConversationSession {
             if peer?.transport == .grokBot, args["details"] != .bool(true), historyBefore == nil, historyExchange == nil {
                 return try await routineRead(turn: turn, mac: mac, conversation: conversation, workspace: workspace, agent: agent, name: name, peer: peer,
                     row: previous, store: store, args: args,
-                                             dataRoot: dataRoot, perform: perform)
+                                             scope: scope, dataRoot: dataRoot, perform: perform)
             }
             guard let row = previous else {
                 let result: JSONValue = .object(["agent": .string(name), "agent_id": .string(agent),
@@ -285,30 +296,39 @@ package enum AgentConversationSession {
                 return .object(fields)
             }
             let refreshed = try await refresh(turn: turn, mac: mac, conversation: conversation, row, store: store, input: args, perform: perform)
-            return AgentConversationView.view(refreshed, details: args["details"] == .bool(true), read: true, dataRoot: dataRoot,
+            let readView = AgentConversationView.view(refreshed, details: args["details"] == .bool(true), read: true, dataRoot: dataRoot,
                         historyBefore: historyBefore, historyExchange: historyExchange, includeHistory: conversation.returnsHistory)
+            consumeRead(readView, peer: peer, message: string(refreshed.readInput?["message_id"]), scope: scope, conversation: conversation,
+                            dataRoot: dataRoot)
+            return readView
         }
         guard tool == "agent_message" else { return try await perform(tool, args, turn, conversation, mac) }
-        // The existing callback owns built-in completion. Recover its exact receipt when continuing, including the executor's eventual thread ID.
-        if let row = previous, row.phase == "waiting", !fresh, !row.automaticRead, row.readInput != nil {
+        // A reservation already read settlement under the store lock; a background callback alone publishes its own terminal receipt.
+        if let row = previous, row.phase == "waiting", !fresh, reservation == nil, !backgroundSend(row),
+           !row.automaticRead, row.readInput != nil {
             previous = try await refresh(turn: turn, mac: mac, conversation: conversation, row, store: store, input: args, perform: perform)
         }
         var supersedeWaiting = false
-        if let row = previous, !fresh {
+        if var row = previous, !fresh {
             // Queued sends wait in order for evidence-based settlement or an explicit stop/release. A reservation admits its queued message; every other
             // message waits behind the queue.
             let reserved = reservation != nil && row.queueReservation == reservation
-            if !reserved, try inFlight(row, peer?.transport, dataRoot: dataRoot),
-               let queued = try queue(turn: turn, mac: mac, conversation: conversation, workspace: workspace, behind: row, name: name, peer: peer,
-                   args: args, expectsReply: expectsValue, scope: scope,
-                                      surface: surface, dataRoot: dataRoot, perform: perform) {
-                return queued
+            if !reserved, try inFlight(row, peer?.transport, dataRoot: dataRoot) {
+                if let queued = try queue(turn: turn, mac: mac, conversation: conversation, workspace: workspace, behind: row, name: name, peer: peer,
+                    args: args, expectsReply: expectsValue, scope: scope, surface: surface, dataRoot: dataRoot, perform: perform) {
+                    return queued
+                }
+                guard let current = try store.records().first(where: { $0.id == row.id }) else {
+                    throw AgentConversationStore.Failure(message: "The conversation is missing after queue admission; nothing was sent.")
+                }
+                row = current
+                previous = current
             }
             if row.phase == "waiting", (peer?.transport == .desktop || backgroundSend(row))
                     && !AgentConversationRunning.shared.routeWatching(row: row.id, operation: row.operationID) {
                 supersedeWaiting = true
             } else if ["sending", "waiting"].contains(row.phase) {
-                return attention(name, label: row.label, """
+                return notSent(name, label: row.label, """
                     The previous message has not settled. NativeAgent is preserving its state; open this conversation to see its available reply. \
                     No new message was sent.
                     """)
@@ -336,7 +356,7 @@ package enum AgentConversationSession {
                                   expectsReply: expectsValue != .bool(false),
                                   reservation: reservation, messageID: messageID)
         if let messageID { args["message_id"] = .string(messageID) }
-        // Routine conversations belong to the asking chat; reject IDs from other chats.
+        // A routine has one conversation, whichever chat asks; the send derives it, so none is carried.
         if let conversation = row.conversationID, !conversation.isEmpty,
            peer?.transport != .grokBot, !dot { args["conversation_id"] = .string(conversation) }
         if case .object(let receipt)? = row.receipt, receipt["needs_input"] == .bool(true),
@@ -346,7 +366,7 @@ package enum AgentConversationSession {
             reservation: reservation, dataRoot: dataRoot,
                                     waitSeconds: waitSeconds, dispatch: perform) { [args] turn, conversation, mac in
             if let peer, let text = string(args["text"]) {
-                try await ContactThread.attempt(.send(owner: peer.id, text: text, sendID: row.operationID,
+                try await ContactThread.attempt(.send(owner: peer.id, conversation: row.conversationID, text: text, sendID: row.operationID,
                     byPerson: row.personInitiated == true, turn: turn), dataRoot: dataRoot)
             }
             if let peer, let ability = peer.ability {
@@ -369,7 +389,7 @@ package enum AgentConversationSession {
         return peer?.transport == .grokBot ? UUID().uuidString.lowercased() : nil
     }
 
-    /// Explicit protocol identities still use the send owner and its deadline. They select a separate record rather than borrowing this chat's thread.
+    /// Explicit protocol identities select their own send record and retain the same settlement owner.
     static func sendExact(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, workspace: WorkspaceOperation, agent: String,
         peer: AgentPeerContact?, args: [String: JSONValue],
                                   surface: String, scope: String, dataRoot: URL, waitSeconds: Int,
@@ -389,8 +409,9 @@ package enum AgentConversationSession {
             dataRoot: dataRoot,
                               waitSeconds: waitSeconds, dispatch: perform) { [args] turn, conversation, mac in
             if let peer, let text = string(args["text"]) {
-                try await ContactThread.attempt(.send(owner: peer.id, text: text, sendID: row.operationID,
-                    byPerson: row.personInitiated == true, turn: turn), dataRoot: dataRoot)
+                // An exact send's line belongs to the conversation it names: a held one's own session, the contact's session for any other.
+                try await ContactThread.attempt(.send(owner: peer.id, conversation: string(args["conversation_id"]), text: text,
+                    sendID: row.operationID, byPerson: row.personInitiated == true, turn: turn), dataRoot: dataRoot)
             }
             return try await perform("agent_message", args, turn, conversation, mac)
         }
@@ -399,7 +420,7 @@ package enum AgentConversationSession {
     /// Run once; the first failure may offer its owning repair.
     static func send(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, workspace: WorkspaceOperation,
         _ row: AgentConversationRecord, store: AgentConversationStore, peer: AgentPeerContact?,
-                             reservation: String?, dataRoot: URL, waitSeconds: Int = 20, dispatch: @escaping Dispatch,
+                             reservation: String?, dataRoot: URL, waitSeconds: Int = 0, dispatch: @escaping Dispatch,
                              perform: @escaping @Sendable (Turn, AgentConversationContext,
                                  MacOperationContext) async throws -> JSONValue) async throws -> JSONValue {
         let liveReply = AgentConversationDelivery.answersLive(peer: peer)
@@ -428,18 +449,15 @@ package enum AgentConversationSession {
         let hub = AgentConversationLiveHub.shared
         await hub.begin(live, lane: peer?.transport.rawValue ?? (row.agent.hasPrefix("bot:") ? "bot" : row.agent))
         // Own the send in a separate task so cancellation reaches its lane-specific handler.
-        let (ended, end) = AsyncStream<Void>.makeStream()
         let send = Task {
-            defer { end.finish() }
             try Task.checkCancellation()
             let receipt = try await perform(turn, conversation.live(live), mac)
             if Task.isCancelled { return receipt }
             return await AgentContactHealth.heal(receipt, row: row, dataRoot: dataRoot)
         }
         AgentConversationRunning.shared.begin(row: row.id, operation: row.operationID) { send.cancel() }
-        // The response deadline releases only this call. The accepted send keeps its existing owner and settles later, without another send.
-        if reservation == nil, let peer, liveReply || peer.ability != nil || [.acp, .mcpHost, .nativeAgent].contains(peer.transport),
-           !(await finishes(ended, within: liveReply ? max(0, deadline.timeIntervalSinceNow) : 2, row: row)), !Task.isCancelled {
+        // Adopt the accepted operation immediately; an explicit inline wait observes this owner without racing its admission.
+        if reservation == nil, let peer, liveReply || peer.ability != nil || [.acp, .mcpHost, .nativeAgent].contains(peer.transport) {
             AgentConversationWatches.begin(row: row.id, operation: row.operationID)
             var running: [String: JSONValue] = ["status": .string("running"), "sent": .null, "completed": .bool(false),
                 "background_send": .bool(true), "delivery": .string("unconfirmed")]
@@ -465,7 +483,10 @@ package enum AgentConversationSession {
                     row: row, store: store, dataRoot: dataRoot)
             }
             let current: AgentConversationRecord
-            if watching { current = try await releaseWait(.object(running)) }
+            if watching {
+                try await waitInline(row: row, store: store, until: deadline)
+                current = try await releaseWait(.object(running))
+            }
             else { current = shown }
             return messageReceipt(AgentConversationView.compact(AgentConversationView.view(current, details: false, dataRoot: dataRoot,
                 includeHistory: false), row: current), live: liveReply)
@@ -476,13 +497,7 @@ package enum AgentConversationSession {
         guard watching else { return messageReceipt(receipt, live: liveReply) }
         // Subscribe before reading: a reply between the read and suspension changes `seen`, so the existing owner signal cannot be missed.
         do {
-            while !Task.isCancelled {
-                let seen = running.seen
-                guard let current = try store.records().first(where: { $0.id == row.id }),
-                      current.operationID == row.operationID,
-                      current.phase == "waiting" || heldReplyPending(current), Date() < deadline else { break }
-                await running.change(after: seen, until: deadline)
-            }
+            try await waitInline(row: row, store: store, until: deadline)
         } catch {
             throw await oweSettlement(error, stage: "read inline reply", original: receipt,
                 row: row, store: store, dataRoot: dataRoot)
@@ -495,13 +510,18 @@ package enum AgentConversationSession {
 
     private static func messageReceipt(_ receipt: JSONValue, live: Bool) -> JSONValue {
         guard case .object(var fields) = receipt else { return receipt }
-        if fields["status"] == .string("failed") {
+        // Every send names where it stands: failed (with its cause and next move), answered, queued or held (it goes by itself, so not sent
+        // yet is not a failure), or delivered.
+        let queuedOrHeld = fields["queued"] == .bool(true) || fields["state"] == .string("queued") || fields["status"] == .string("held")
+        if fields["status"] == .string("failed") || fields["delivery"] == .string("failed") || fields["sent"] == .bool(false) && !queuedOrHeld {
             fields["delivery"] = .string("failed")
         } else if fields["reply"] != nil, !["waiting", "sending", "working"].contains(string(fields["state"]) ?? "") {
             fields["delivery"] = .string("answered")
-        } else if fields["state"] == .string("waiting") || fields["state"] == .string("working")
+        } else if queuedOrHeld || fields["state"] == .string("waiting") || fields["state"] == .string("working")
                     || ["held", "queued", "accepted", "running", "waiting", "enqueued"].contains(string(fields["status"]) ?? "") {
             fields["delivery"] = .string(fields["status"] == .string("held") ? "held" : "queued")
+        } else if ["delivered", "sent"].contains(string(fields["status"]) ?? "") {
+            fields["delivery"] = .string("delivered")
         }
         fields["wait_ignored"] = live ? nil : .string("lane_is_async")
         return .object(fields)
@@ -514,17 +534,19 @@ package enum AgentConversationSession {
         return row.exchanges?.last(where: { $0.id == row.operationID })?.reply == nil
     }
 
-    /// Caller cancellation must cancel the send as well as the response wait.
-    private static func finishes(_ ended: AsyncStream<Void>, within seconds: Double,
-                                 row: AgentConversationRecord) async -> Bool {
-        await withTaskCancellationHandler {
-            await withTaskGroup(of: Bool.self) { group in
-                group.addTask { for await _ in ended {}; return !Task.isCancelled }
-                group.addTask { try? await Task.sleep(for: .seconds(seconds)); return false }
-                defer { group.cancelAll() }
-                return await group.next() ?? false
+    /// The caller's requested duration bounds observation; only the send owner settles execution.
+    private static func waitInline(row: AgentConversationRecord, store: AgentConversationStore, until deadline: Date) async throws {
+        let running = AgentConversationRunning.shared
+        try await withTaskCancellationHandler {
+            while !Task.isCancelled {
+                let seen = running.seen
+                guard let current = try store.records().first(where: { $0.id == row.id }),
+                      current.operationID == row.operationID,
+                      current.phase == "sending" || current.phase == "waiting" || heldReplyPending(current),
+                      Date() < deadline else { return }
+                await running.change(after: seen, until: deadline)
             }
-        } onCancel: { AgentConversationRunning.shared.cancel(row: row.id, operation: row.operationID) }
+        } onCancel: { running.cancel(row: row.id, operation: row.operationID) }
     }
 
     /// Settle the original send without resending; unwaited answers become arrivals in the asking chat.
@@ -578,28 +600,16 @@ package enum AgentConversationSession {
                 do { stopped = try store.update(id: row.id, operationID: row.operationID) {
                     guard $0.exchanges?.last(where: { $0.id == row.operationID })?.reply == nil else { return }
                     if AgentConversationRunning.shared.stopped(row: row.id, operation: row.operationID) {
-                        let detail = "Local work stopped; the remote outcome is unknown. Nothing was resent."
+                        let detail = Self.stoppedDetail(row.name)
                         $0.stop = AgentConversationStop(state: "stopped", operationID: row.operationID, at: Date(), detail: detail)
                         $0.phase = "ready"
-                        $0.receipt = .object(["status": .string("outcome_unknown"), "terminal": .bool(true), "completed": .bool(false),
+                        $0.receipt = .object(["status": .string("cancelled"), "terminal": .bool(true), "completed": .bool(false),
                             "detail": .string(detail)])
                         return
                     }
                     $0.phase = "attention"
                     $0.automaticRead = false; $0.nextReadAt = nil
-                    if let refusal = error as? ToolFailureError {
-                        // A send that may have gone out stays outcome_unknown: reconcile, never resend.
-                        var fields = refusal.failureEvidence(defaultCode: "agent_send_failed",
-                            defaultOwner: refusal.tap == nil ? nil : row.agent)
-                        fields["status"] = .string(refusal.effects != .none ? "outcome_unknown"
-                            : refusal.argumentPath != nil ? "invalid_arguments" : refusal.status.rawValue)
-                        fields["sent"] = refusal.effects == .none ? .bool(false) : .null
-                        fields["detail"] = .string(refusal.message)
-                        $0.receipt = .object(fields)
-                    } else {
-                        $0.receipt = .object(["status": .string("outcome_unknown"),
-                            "detail": .string(error.localizedDescription + ". The conversation was preserved; no message was resent.")])
-                    }
+                    $0.receipt = .object(Self.sendFailure(error, row: row))
                     $0.shownInline = reservation == nil && !background ? $0.operationID + ":" + $0.phase : nil
                     if background, $0.personInitiated != true, $0.phase != "waiting", !$0.automaticRead,
                        !stoppedOrReleased($0), !AgentConversationRunning.shared.watched($0.id) {
@@ -615,6 +625,12 @@ package enum AgentConversationSession {
                         includeHistory: false), row: stopped))
                 }
                 if var failure = error as? AgentConversationStore.Failure { failure.effects = .unknown; return .failure(failure) }
+                // Typed refusals carry their own remedy and card; any other fault reaches the agent in the receipt's words.
+                if !(error is ToolFailureError || error is AutonomyGateError || error is CancellationError) {
+                    let said = Self.sendFailure(error, row: row)
+                    return .failure(ToolFailureError(string(said["detail"]) ?? error.localizedDescription,
+                        effects: said["sent"] == .bool(false) ? .none : .unknown, code: "agent_send_failed", status: .failed))
+                }
                 return .failure(error)
             }
         }
@@ -633,6 +649,46 @@ package enum AgentConversationSession {
                 row: row, store: store, dataRoot: dataRoot)
         }
         return try result.get()
+    }
+
+    /// Every send ends in words the agent acts on: whether anything left, why it did not finish, and the next move. A refusal before dispatch
+    /// sent nothing; a send that broke in flight may have reached the contact, and is never resent for it.
+    static func sendFailure(_ error: Error, row: AgentConversationRecord) -> [String: JSONValue] {
+        var fields: [String: JSONValue]
+        let nothingLeft: Bool
+        if let refusal = error as? ToolFailureError {
+            fields = refusal.failureEvidence(defaultCode: "agent_send_failed", defaultOwner: refusal.tap == nil ? nil : row.agent)
+            nothingLeft = refusal.effects == .none
+            fields["status"] = .string(!nothingLeft ? "failed" : refusal.argumentPath != nil ? "invalid_arguments" : refusal.status.rawValue)
+            fields["detail"] = .string(refusal.message)
+        } else {
+            // A gate refusal never ran, and a contact door's argument refusal comes before any transport; transport faults are its own receipts.
+            nothingLeft = error is AutonomyGateError || error is AgentCommunicationError
+                || (error as? AgentConversationStore.Failure).map { $0.effects == .none } == true
+            fields = ["status": .string("failed"), "detail": .string(error.localizedDescription)]
+        }
+        var next = nothingLeft
+            ? " Nothing was sent to \(row.name). Fix the cause above, then send again."
+            : " If it reached \(row.name), the answer arrives in this conversation; nothing was resent. Send again if you still want it answered."
+        if let gate = error as? AutonomyGateError, gate.notRunStatus == .approvalUnavailable {
+            next = " Nothing was sent to \(row.name): this needs the person's approval, and a turn another agent started cannot ask for one. "
+                + "Send it from your own chat or your own thought, where the person can approve it."
+        }
+        fields["detail"] = .string((string(fields["detail"]) ?? "The send failed.") + next)
+        fields["sent"] = nothingLeft ? .bool(false) : .null
+        if nothingLeft { fields["execution"] = .string("not_run") }
+        fields["delivery"] = .string("failed")
+        return fields
+    }
+
+    /// A send that broke in flight: it may have reached the contact, so it neither proves a broken path nor invites a resend.
+    package static func mayHaveReached(_ evidence: [String: JSONValue]) -> Bool {
+        evidence["status"] == .string("outcome_unknown") || evidence["status"] == .string("failed") && evidence["sent"] == .null
+    }
+
+    /// The person's or the agent's Stop ends the local work, never the remote one.
+    static func stoppedDetail(_ name: String) -> String {
+        "Stopped here. If the message had reached \(name), its answer arrives in this conversation; nothing was resent."
     }
 
     private static func operationEvidence(_ outcome: Result<JSONValue, Error>) -> JSONValue {

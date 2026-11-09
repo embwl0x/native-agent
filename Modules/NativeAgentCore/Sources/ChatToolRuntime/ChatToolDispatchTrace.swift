@@ -19,6 +19,7 @@ import ChromeControl
 import Senses
 import StandingBots
 import ChatToolParsing
+import Desk
 // Blueprint: | `ChatToolDispatchTrace.swift` | `ChatToolDispatchTracer`, `isPreview`: Preserve redacted failure evidence. |
 
 /// TurnTrace owns bound dispatches; standalone events keep recent_trace_summary aware of tool activity. Trace outside the gates so refusals are recorded too.
@@ -42,13 +43,16 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
 
     private let inner: any ToolDispatchClient
     private let dataRoot: URL
+    private let onlyAbilities: Bool
 
     package init(
         inner: any ToolDispatchClient,
-        dataRoot: URL
+        dataRoot: URL,
+        onlyAbilities: Bool = false
     ) {
         self.inner = inner
         self.dataRoot = dataRoot
+        self.onlyAbilities = onlyAbilities
     }
 
     /// One dispatch predicate for both recording and the turn's learning readers.
@@ -57,35 +61,45 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
     }
 
     package func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
+        let ability = Self.abilityName(tool: tool, input: input)
+        if onlyAbilities, ability == nil {
+            return try await inner.dispatch(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
+        }
         if Self.isPreview(tool: tool, input: input) {
             // Keep the real gated chain. The preview owner records its inert trace; dispatch/act evidence would otherwise feed the agent's body, habits and
             // next dream as though the agent had performed the work.
             return try await inner.dispatch(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
         }
         let startNs = DispatchTime.now().uptimeNanoseconds
+        let startedAt = Date()
         let receiptID = UUID().uuidString.lowercased()
+        let target: Result<AbilityTarget?, Error>
+        do { target = .success(try await Self.abilityTarget(named: ability, input: input, turn: turn, dataRoot: dataRoot)) }
+        catch { target = .failure(error) }
         let parent = turn.act
         let enclosing = invocation.surfacedNos, inside = SurfacedNos(parent: enclosing)
         // The begin event lets Inspector show an in-flight dispatch.
         Self.fireBusEvent(turn: turn,
             tool: tool, input: input, surface: surface,
-            phase: "begin", status: "running", durationMs: nil, result: nil,
+            phase: "begin", status: "running", durationMs: nil, result: nil, resultView: nil,
             evidence: Self.dispatchEvidence(turn: turn, tool: tool, input: input, status: "running", result: nil, receiptID: receiptID),
             parent: parent
         )
         let result: JSONValue
         do {
-            result = ChatToolOutcome.normalizedFailure(try await inner.dispatch(
+            let dispatched = ChatToolOutcome.normalizedFailure(try await inner.dispatch(
                 tool: tool, input: input, surface: surface, turn: turn.with(\.act, receiptID),
                 invocation: invocation.with(\.surfacedNos, inside)), tool: tool,
                 throughAppDoor: invocation.appDoor != nil)
+            result = await Self.settleAbilityRefusal(dispatched, target: target, turn: turn, receiptID: receiptID, at: startedAt, dataRoot: dataRoot)
         } catch {
-            let failure = ChatToolOutcome.failure(error: error, tool: tool)
+            let failure = await Self.settleAbilityRefusal(ChatToolOutcome.failure(error: error, tool: tool), target: target,
+                turn: turn, receiptID: receiptID, at: startedAt, dataRoot: dataRoot)
             let reply = ToolResult(failure)
             let verdict = reply.outcome
             let evidence = Self.dispatchEvidence(turn: turn, tool: tool, input: input, status: "failed", result: failure, receiptID: receiptID,
                 verdict: verdict)
-            await recordCompletion(turn: turn,
+            await Self.recordCompletion(dataRoot: dataRoot, turn: turn,
                 tool: tool, input: input, surface: surface,
                 status: "failed", startNs: startNs,
                 receiptID: receiptID, evidence: evidence,
@@ -93,6 +107,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                 errorClass: "dispatch_threw",
                 errorDetail: ChatToolOutcome.failureDetail(error: error)
             )
+            if ability != nil { return failure }
             throw error
         }
         let reply = ToolResult(result)
@@ -103,7 +118,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         let status = waiting ? "waiting" : ChatToolOutcome.statusWord(result, verdict: verdict)
         let failureShaped = !ok && !waiting
         let evidence = Self.dispatchEvidence(turn: turn, tool: tool, input: input, status: status, result: result, receiptID: receiptID, verdict: verdict)
-        await recordCompletion(turn: turn,
+        await Self.recordCompletion(dataRoot: dataRoot, turn: turn,
             tool: tool, input: input, surface: surface,
             status: status, startNs: startNs,
             receiptID: receiptID, evidence: evidence,
@@ -118,12 +133,117 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         return .object(output)
     }
 
+    /// Native calls and app actions name the same part; native executor names never become ability ids.
+    package static func abilityName(tool: String, input: [String: JSONValue]) -> String? {
+        let action = tool == "app" ? input["action"]?.stringValue : tool
+        guard let action else { return nil }
+        if action == "ability.resume" { return action }
+        if let id = ToolNameAliases.authoredTool(action) { return id }
+        let declared = AppActionBinding.declaredBinding(action)
+        if declared == nil, tool == "app" { return action }
+        let target = declared?.tool ?? action
+        guard !target.isEmpty, !target.contains("."), !SwiftToolDispatcher.nativeCanonicalToolNames.contains(target) else { return nil }
+        return target
+    }
+
+    private struct AbilityTarget: Sendable { let id: String; let version: String }
+
+    /// Capture a resume's sealed identity before its owner may consume or close the checkpoint.
+    @concurrent private static func abilityTarget(named: String?, input: [String: JSONValue], turn: Turn, dataRoot: URL) async throws -> AbilityTarget? {
+        guard let named else { return nil }
+        if named == "ability.resume" {
+            let args = input["args"]?.objectValue ?? input
+            guard let runID = args["run_id"]?.stringValue,
+                  runID.range(of: "^run-[0-9a-f]{8}$", options: .regularExpression) != nil else { return nil }
+            let run = try await PartRunStore.read(runID, root: dataRoot)
+            guard let id = run["skill"]?.stringValue, let version = run["digest"]?.stringValue else {
+                throw ToolFailureError("The refused resume has no ability identity in its saved checkpoint.", effects: .none)
+            }
+            return AbilityTarget(id: id, version: version)
+        }
+        let binding = try AppActionBinding.action(input: ["action": .string(named)], turn: turn)
+        let reference: String
+        if let binding, !binding.tool.isEmpty { reference = binding.tool } else { reference = named }
+        guard let row = try Parts(root: dataRoot).row(reference) else { return nil }
+        guard let id = row["id"]?.stringValue, let version = row["codeFingerprint"]?.stringValue else {
+            throw ToolFailureError("Ability \(reference) has no selected version for this refusal's accounting.", effects: .none)
+        }
+        return AbilityTarget(id: id, version: version)
+    }
+
+    /// Refusals before runner entry settle beside runner receipts, through the same dispatch completion.
+    @concurrent private static func settleAbilityRefusal(_ result: JSONValue, target: Result<AbilityTarget?, Error>, turn: Turn,
+        receiptID: String, at: Date, dataRoot: URL) async -> JSONValue {
+        guard ToolResult(result).outcome.isFailure else { return result }
+        var fields = result.objectValue ?? [:]
+        if fields["ability_run"]?.objectValue != nil { return result }
+        if fields["result"]?.objectValue?["ability_run"]?.objectValue != nil { return result }
+        // A producer that could not select an identity already retained that failure; a later catalog read cannot name this run.
+        if fields["accounting_error"] != nil { return result }
+        fields["checker"] = fields["checker"] ?? .string("dispatch")
+        do {
+            guard let target = try target.get() else { return .object(fields) }
+            fields["dispatch_receipt_id"] = .string(receiptID)
+            return await AbilityStore(dataRoot: dataRoot).settleRun(id: target.id, version: target.version,
+                receipt: .object(fields), input: nil, turn: turn, at: at)
+        } catch {
+            fields["accounting_error"] = .string(error.localizedDescription)
+            return .object(fields)
+        }
+    }
+
     /// Calls refused without dispatch still belong to model activity and need failure traces.
-    package static func traceUndispatched(turn: Turn, tool: String, input: [String: JSONValue], surface: String, result: JSONValue) {
-        fireBusEvent(turn: turn, tool: tool, input: input, surface: surface, phase: "end", status: "failed", durationMs: nil, result: result,
-                     evidence: dispatchEvidence(turn: turn, tool: tool, input: input, status: "failed", result: result,
-                                                receiptID: UUID().uuidString.lowercased()),
-                     parent: nil)
+    @discardableResult
+    package static func traceUndispatched(turn: Turn, tool: String, input: [String: JSONValue], surface: String, result: JSONValue,
+        dataRoot: URL) async -> JSONValue {
+        if isPreview(tool: tool, input: input) { return result }
+        let at = Date(), startNs = DispatchTime.now().uptimeNanoseconds
+        let receiptID = UUID().uuidString.lowercased()
+        let ability = abilityName(tool: tool, input: input)
+        if ability == nil {
+            let view = await resultView(turn: turn, tool: tool, input: input, result: result, receiptID: receiptID)
+            var evidence = dispatchEvidence(turn: turn, tool: tool, input: input, status: "failed", result: result, receiptID: receiptID)
+            evidence["result_recovery"] = view.recovery
+            if view.failed { evidence["result_retention_failed"] = .bool(true) }
+            fireBusEvent(turn: turn, tool: tool, input: input, surface: surface, phase: "end", status: "failed", durationMs: nil,
+                result: result, resultView: view, evidence: evidence, parent: nil)
+            return result
+        }
+        let target: Result<AbilityTarget?, Error>
+        do { target = .success(try await abilityTarget(named: ability, input: input, turn: turn, dataRoot: dataRoot)) }
+        catch { target = .failure(error) }
+        let result = await settleAbilityRefusal(result, target: target, turn: turn, receiptID: receiptID, at: at, dataRoot: dataRoot)
+        let verdict = ToolResult(result).outcome
+        let evidence = dispatchEvidence(turn: turn, tool: tool, input: input, status: "failed", result: result, receiptID: receiptID, verdict: verdict)
+        await recordCompletion(dataRoot: dataRoot, turn: turn, tool: tool, input: input, surface: surface, status: "failed", startNs: startNs,
+            receiptID: receiptID, evidence: evidence, result: result, verdict: verdict, parent: turn.act,
+            nos: (SurfacedNos(parent: nil), nil), errorClass: ChatToolOutcome.receiptFailureClass(result, verdict: verdict),
+            errorDetail: ChatToolOutcome.failureDetail(result))
+        var fields = result.objectValue ?? [:]
+        fields["dispatch_receipt_id"] = .string(receiptID)
+        fields["dispatch_receipt_source"] = .string("detail")
+        return .object(fields)
+    }
+
+    @concurrent private static func resultView(turn: Turn, tool: String, input: [String: JSONValue], result: JSONValue,
+        receiptID: String) async -> ProviderToolResultPage.View {
+        do {
+            let ran = ToolNameAliases.ranTool(tool, input: input)
+            var redacted = TurnTraceRedactor.redactValue(MacInjectionResultRedaction.redacted(tool: ran,
+                result: MacScreenViewResultRedaction.redacted(tool: ran, result: result), turn: turn))
+            if case .object(var fields) = redacted {
+                fields["dispatch_receipt_id"] = .string(receiptID)
+                fields["dispatch_receipt_source"] = .string("detail")
+                redacted = .object(fields)
+            }
+            let content = ChatSecretRedactor.redactText(try redacted.serialize(pretty: false))
+            return await ProviderToolResultPage.project(toolName: tool, content: content,
+                sessionId: turn.resultRecoveryScope?.sessionId, turnId: turn.id,
+                originalResultClass: ToolResult(result).outcome, appDoor: true, inlineLimit: 500, includeSections: false)
+        } catch {
+            return .init(content: "Tool result could not be encoded for retention: \(error.localizedDescription). Inspect its effect before repeating it.",
+                recovery: nil, failed: true)
+        }
     }
 
     private static func fireBusEvent(turn: Turn,
@@ -134,6 +254,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         status: String,
         durationMs: Int?,
         result: JSONValue?,
+        resultView: ProviderToolResultPage.View?,
         evidence: [String: JSONValue],
         parent: String?,
         recordedAt: Date = Date()
@@ -146,7 +267,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             "receipt": .object(evidence),
             "argKeys": .array(input.keys.sorted().map { .string($0) }),
             // Redact injections before bounding; short secrets fit in a preview.
-            "args": .string(Self.truncatePreview(
+            "args": .string(Self.argumentPreview(
                 .object(MacInjectionArgRedaction.redacted(tool: tool, input: input, turn: turn))
             )),
         ]
@@ -164,15 +285,8 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                 payload.merge(Self.failureFields(result)) { _, field in field }
                 payload["errorDetail"] = ChatToolOutcome.failureDetail(result).map(JSONValue.string)
             }
-            // Redact echoed injections and screen pixels as the tool that ran.
-            let ran = ToolNameAliases.ranTool(tool, input: input)
-            payload["result"] = .string(Self.truncatePreview(
-                MacInjectionResultRedaction.redacted(
-                    tool: ran,
-                    result: MacScreenViewResultRedaction.redacted(tool: ran, result: result),
-                    turn: turn
-                )
-            ))
+            payload["result"] = resultView.map { JSONValue.string($0.content) }
+            payload["result_recovery"] = resultView?.recovery
         }
         TurnTraceBus.fire(TurnTraceEvent(
             turnId: turnId, ts: recordedAt, kind: "tool.dispatch",
@@ -245,7 +359,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
     private static func failureFields(_ result: JSONValue) -> [String: JSONValue] {
         guard case .object(let object) = result else { return [:] }
         var fields: [String: JSONValue] = [:]
-        for key in ["status", "failure_code", "code", "reason", "argument_path", "error", "detail", "message"] {
+        for key in ["status", "failure_code", "code", "reason", "checker", "remedy", "argument_path", "error", "detail", "message"] {
             guard let original = object[key] else { continue }
             let value = TurnTraceRedactor.redactValue(original)
             let target = key == "status" ? "result_status" : key
@@ -301,6 +415,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             var fields: [String: JSONValue] = [:]
             for key in ["id", "receipt_id", "run_id", "runId", "job_id", "message_id", "session_id", "handle",
                         "status", "outcome", "final_status", "preview", "effects", "execution", "read_only", "skill", "would_card", "approver",
+                        "ability", "version", "at", "reason", "checker", "detail", "message", "dispatch_receipt_id",
                             "preview_scope", "verified", "verification",
                         "exit_code", "timed_out",
                         "result_handle", "result_ref", "read_ref", "digest", "sha256", "has_more", "next", "runsPath", "report_id", "index",
@@ -320,7 +435,9 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                 })
                 if checks.count > 8 { fields["checks_not_run_omitted"] = .int(Int64(checks.count - 8)) }
             }
-            for key in ["execution", "receipt", "detail", "workers", "results", "outputs", "agents", "routing", "synthesis", "next"] {
+            if let remedy = object["remedy"] { fields["remedy"] = TurnTraceRedactor.redactValue(remedy) }
+            for key in ["execution", "receipt", "result", "error", "stopped", "detail", "workers", "results", "outputs", "agents", "routing",
+                        "synthesis", "next", "ability_run"] {
                 if let field = object[key], case .object = field { fields[key] = receiptFields(field) }
                 else if let field = object[key], case .array = field { fields[key] = receiptFields(field) }
             }
@@ -331,7 +448,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
     }
 
     /// Redact before applying the 500-character preview cap; serialization failure remains explicit.
-    private static func truncatePreview(_ value: JSONValue) -> String {
+    private static func argumentPreview(_ value: JSONValue) -> String {
         let limit = 500
         let reply = ToolResult(value)
         var value = value
@@ -368,7 +485,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         try await inner.listAvailableToolSchemas(turn: turn, surface: surface)
     }
 
-    private func recordCompletion(turn: Turn,
+    private static func recordCompletion(dataRoot: URL, turn: Turn,
         tool: String,
         input: [String: JSONValue],
         surface: String,
@@ -383,6 +500,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         errorClass: String? = nil,
         errorDetail: String? = nil
     ) async {
+        let resultView = await Self.resultView(turn: turn, tool: tool, input: input, result: result, receiptID: receiptID)
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
         let recordedAt = Date()
         let argKeys = input.keys.sorted()
@@ -422,9 +540,11 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         }
         receiptEvidence.merge(evidence) { _, evidence in evidence }
         receiptEvidence["source"] = .string("detail")
+        receiptEvidence["result_recovery"] = resultView.recovery
+        if resultView.failed { receiptEvidence["result_retention_failed"] = .bool(true) }
         Self.fireBusEvent(turn: turn,
             tool: tool, input: input, surface: surface, phase: "end",
-            status: status, durationMs: durationMs, result: result,
+            status: status, durationMs: durationMs, result: result, resultView: resultView,
             evidence: receiptEvidence, parent: parent, recordedAt: recordedAt
         )
         // The act is the turn's, or its enclosing call's; its receipt is the evidence. A preview's only receipt is the trace just emitted. Experience and
@@ -495,11 +615,11 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             try await store.begin(act)
             if worked { try await RepairOwed.settle(store, operation: operation, evidence: .init(source: "act", id: receiptID)) }
         }
-        await recordStandaloneTrace(turn: turn, tool: tool, surface: surface, status: status, argKeys: argKeys,
+        await recordStandaloneTrace(dataRoot: dataRoot, turn: turn, tool: tool, surface: surface, status: status, argKeys: argKeys,
             durationMs: durationMs, receiptID: receiptID, receiptEvidence: receiptEvidence, result: result, recordedAt: recordedAt)
     }
 
-    private func recordStandaloneTrace(turn: Turn, tool: String, surface: String, status: String, argKeys: [String],
+    private static func recordStandaloneTrace(dataRoot: URL, turn: Turn, tool: String, surface: String, status: String, argKeys: [String],
         durationMs: Int, receiptID: String, receiptEvidence: [String: JSONValue], result: JSONValue, recordedAt: Date) async {
         guard TurnTraceContext.turnId == nil else { return }
         var payload: [String: JSONValue] = [
@@ -512,6 +632,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             "turnId": .string(turn.id),
             "receipt": .object(receiptEvidence),
         ]
+        payload["result_recovery"] = receiptEvidence["result_recovery"]
         if status == "failed" { payload.merge(Self.failureFields(result)) { _, field in field } }
         let event = TurnTraceEvent(kind: "tool.dispatch", title: tool, status: status,
             // Keep argument and result bodies out of compact repair evidence.

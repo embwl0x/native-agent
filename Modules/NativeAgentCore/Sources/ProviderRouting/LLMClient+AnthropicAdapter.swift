@@ -9,18 +9,21 @@ public final class AnthropicTransport: LLMTransport {
     public let providerId: String
     // Transport seams stay module-internal so the separate native-tools file can share them without exposing them publicly.
     let session: URLSession
-    let endpoint: URL
+    let endpoint: URL?
     private let apiKeyOverride: String?
-    /// Subscription providers sharing the Messages protocol reuse this wire adapter with their own endpoint and credentials.
+    /// Messages providers reuse this wire adapter with their own endpoint and credentials.
     private let credentialConfigFile: String
     /// Injected roots confine credentials; secondary runtimes must supply their own root.
     private let dataRootOverride: URL?
     let maxTokensOverride: Int?
-    /// First-party identity gates strict schemas, signed thinking and cache markers. Set it once at construction so callers cannot disagree.
+    /// First-party identity gates key-header auth, strict schemas and conversation cache markers.
     let firstPartyAnthropicToolContract: Bool
     let telemetry: LLMCallTraceRecorder
     /// Thinking replay is memory-only and bounded by tool-call identity.
     let thinkingLedger = ToolCallReplayLedger<[AnthropicThinkingBlock]>()
+
+    /// Meta's opaque reasoning uses the same Messages blocks and tool-call ledger as Anthropic.
+    var replaysThinking: Bool { firstPartyAnthropicToolContract || providerId == "meta" }
 
     private var credentialRoot: URL {
         dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -35,9 +38,16 @@ public final class AnthropicTransport: LLMTransport {
               !key.isEmpty else {
             throw LLMError.notConfigured(provider: providerId)
         }
+        guard let endpoint else {
+            throw LLMError.providerError(message: "\(providerId) response endpoint is invalid; correct its provider configuration.")
+        }
         var req = URLRequest(url: endpoint)
         req.httpMethod = "POST"
-        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        if firstPartyAnthropicToolContract {
+            req.setValue(key, forHTTPHeaderField: "x-api-key")
+        } else {
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         req.setValue("application/json", forHTTPHeaderField: "content-type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
@@ -45,8 +55,8 @@ public final class AnthropicTransport: LLMTransport {
     }
 
     public init(
-        session: URLSession = .shared,
-        endpoint: URL = URL(string: "https://api.anthropic.com/v1/messages")!,
+        session: URLSession = ProviderHTTP.session,
+        endpoint: URL? = URL(string: "https://api.anthropic.com/v1/messages"),
         apiKeyOverride: String? = nil,
         maxTokens: Int? = nil,
         dataRootOverride: URL? = nil,
@@ -80,7 +90,7 @@ public final class AnthropicTransport: LLMTransport {
 
     /// One subscription endpoint keeps Kimi Code on the shared Messages wire with its own credential and telemetry identity.
     public static func kimiCode(
-        session: URLSession = .shared,
+        session: URLSession = ProviderHTTP.session,
         apiKeyOverride: String? = nil,
         // Kimi's separate token cap includes its always-on thinking.
         maxTokens: Int = 32_768,
@@ -89,7 +99,7 @@ public final class AnthropicTransport: LLMTransport {
     ) -> AnthropicTransport {
         AnthropicTransport(
             session: session,
-            endpoint: URL(string: "https://api.kimi.com/coding/v1/messages")!,
+            endpoint: URL(string: "https://api.kimi.com/coding/v1/messages"),
             apiKeyOverride: apiKeyOverride,
             maxTokens: maxTokens,
             dataRootOverride: dataRootOverride,
@@ -106,7 +116,8 @@ public final class AnthropicTransport: LLMTransport {
     static func makeSystemBlocks(
         _ system: String?,
         segments: SystemPromptSegments?,
-        cacheEligible: Bool
+        cacheEligible: Bool,
+        cacheControl: [String: Any] = AnthropicOAuthTransport.ephemeralCacheControl
     ) -> [[String: Any]]? {
         guard let sys = system, !sys.isEmpty else { return nil }
         if let seg = segments,
@@ -116,7 +127,7 @@ public final class AnthropicTransport: LLMTransport {
             let layout = seg.textBlockLayout
             return layout.texts.enumerated().map { index, text in
                 var block: [String: Any] = ["type": "text", "text": text]
-                if index == layout.lastStableIndex { block["cache_control"] = AnthropicOAuthTransport.ephemeralCacheControl }
+                if index == layout.lastStableIndex { block["cache_control"] = cacheControl }
                 return block
             }
         }
@@ -124,7 +135,7 @@ public final class AnthropicTransport: LLMTransport {
             return [[
                 "type": "text",
                 "text": sys,
-                "cache_control": AnthropicOAuthTransport.ephemeralCacheControl,
+                "cache_control": cacheControl,
             ]]
         }
         // One-shot caller (no chat-turn session bound): skip the breakpoint — the write premium would never be earned back by a read.
@@ -148,15 +159,26 @@ public final class AnthropicTransport: LLMTransport {
 
     // MARK: - Thinking controls
 
-    /// Kimi's declared Think value is sent exactly; unsupported pins are refused.
+    /// Meta accepts only five-minute cache markers; Anthropic's one-hour TTL is not its wire contract.
+    var systemCacheControl: [String: Any] {
+        providerId == "meta" ? ["type": "ephemeral", "ttl": "5m"] : AnthropicOAuthTransport.ephemeralCacheControl
+    }
+
+    /// Each Messages provider sends its catalog's effort through its documented field.
     func applyThinkingControls(to body: inout [String: Any], model: String, call: LLMCall) throws {
-        guard providerId == "kimi-code", let requested = call.admission?.reasoningEffort else { return }
+        guard providerId == "kimi-code" || providerId == "meta",
+              let requested = call.admission?.reasoningEffort else { return }
         let effort = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard let row = FirstPartyModelCatalog.descriptor(for: model, providerID: providerId),
               row.supportedReasoningEfforts.contains(effort) else {
-            throw LLMError.providerError(message: "Think level '\(requested)' is unsupported for \(model) on Kimi Code. Choose a supported level in Providers.")
+            throw LLMError.providerError(message: "Think level '\(requested)' is unsupported for \(model) on \(providerId). Choose a supported level in Providers.")
         }
-        body["reasoning_effort"] = effort
+        if providerId == "meta" {
+            body["thinking"] = ["type": "adaptive"]
+            body["output_config"] = ["effort": effort]
+        } else {
+            body["reasoning_effort"] = effort
+        }
     }
 
 }

@@ -25,15 +25,18 @@ public enum NotificationAuthorizationDisposition: String, Sendable, Equatable {
 
 /// Acceptance does not prove a notification was seen, heard or acted on.
 public struct NotificationPostReceipt: Sendable, Equatable {
-    public let authorization: NotificationAuthorizationDisposition
+    public let authorization: NotificationAuthorizationDisposition?
     public let requestIdentifier: String?
+    public let delivery: NotificationDeliveryOutcome
 
     public init(
-        authorization: NotificationAuthorizationDisposition,
-        requestIdentifier: String? = nil
+        authorization: NotificationAuthorizationDisposition?,
+        requestIdentifier: String?,
+        delivery: NotificationDeliveryOutcome
     ) {
         self.authorization = authorization
         self.requestIdentifier = requestIdentifier
+        self.delivery = delivery
     }
 }
 

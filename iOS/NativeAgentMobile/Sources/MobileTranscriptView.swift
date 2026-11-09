@@ -37,6 +37,8 @@ struct MobileTranscriptView: UIViewRepresentable {
 @MainActor @Observable
 final class MobileTranscriptHandle {
     var isAtEnd = true
+    var isPreparing = true
+    var issue: String?
     @ObservationIgnored weak var controller: MobileTranscriptController?
 
     init() {}
@@ -54,8 +56,6 @@ struct MobileTranscriptActions {
     var loadWholeMessage: @MainActor (UUID) -> Void = { _ in }
     var retrySend: @MainActor (UUID) -> Void = { _ in }
     var openExchange: @MainActor (OtherRoomExchange) -> Void = { _ in }
-    var inboxAction: @MainActor (_ itemID: String, _ actionID: String) -> Void = { _, _ in }
-    var openInboxItem: @MainActor (String) -> Void = { _ in }
     /// Answer again reaches only the last reply, and only while the store can replace it.
     var canRegenerate = false
     var regenerate: @MainActor () -> Void = {}
@@ -74,6 +74,11 @@ final class MobileTranscriptTextView: UITextView {
     override func layoutSubviews() {
         super.layoutSubviews()
         controller?.didLayout()
+    }
+
+    override func draw(_ rect: CGRect) {
+        super.draw(rect)
+        controller?.didDraw()
     }
 
     /// TextKit's estimate of the document's height changed: a reader following the end stays there.

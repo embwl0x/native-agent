@@ -78,7 +78,7 @@ extension BuiltInToolSchemaFactory {
                             permission: calendar, reminders, contacts, mail, messages, notes, music, notify_mac, notify_mobile, spotlight, \
                             scheduler (Trust switches); a macOS grant alone: privacy:<grant>, grant one of \(SystemPermissionCapability.requestable); \
                             Mac control: shell, file_ops, applescript:<bundle_id> (macOS Automation for one app), jxa, accessibility, system. \
-                            api_key: openai, anthropic, openrouter, moonshot, or secret:<name> for a keyring secret; sign-in: \
+                            api_key: openai, anthropic, openrouter, moonshot, meta, or secret:<name> for a keyring secret; sign-in: \
                             openai_oauth_direct (ChatGPT), anthropic_oauth_direct (Claude), xai (Grok). capability: image_generation, \
                             screen_capture, tts. Image understanding is your settings.image_understanding setting. \
                             model_choice: a Providers group id. Omit for choose.

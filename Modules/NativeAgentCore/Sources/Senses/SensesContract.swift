@@ -5,7 +5,7 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SensesContract.swift` | Sense wire records, bounds, origins, provenance and crossing contracts |
+// Blueprint: | `SensesContract.swift` | Sense wire records, bounds, origins and provenance contracts |
 
 
 // MARK: - Corners
@@ -573,22 +573,6 @@ public final class SenseAppReadCapture: @unchecked Sendable {
 /// MemoryV2 owns durable flags; lifecycle and door reporting must identify the exact version.
 public protocol SenseMemoryProvenanceSink: Sendable {
     func markVersionWrong(senseID: String, version: Int) async throws
-}
-
-/// Cognition installs CPU weighing against live cares so watched lines cross through the same care owner.
-public protocol SenseCrossing: Sendable {
-    /// Wake the watch's own thread once, naming the touched care and retaining the arrival identity.
-    func cross(_ line: String, watch: String, reason: String, id: String, says: String, agent: String?) async -> SenseCrossed
-}
-
-public enum SenseCrossed: Sendable, Equatable {
-    case woke(care: String)
-    case untouched
-    /// Without inner life, cares or a ready embedder, pass the line through without a crossing verdict.
-    case unweighed
-    /// Suppress another wake while the touched care has not rested.
-    case resting(care: String)
-    case notKept(care: String)
 }
 
 /// Expose the failure's own words instead of an opaque NSError description.

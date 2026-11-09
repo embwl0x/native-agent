@@ -81,7 +81,7 @@ enum MacTranscriptRead: Equatable {
     }
 }
 
-struct ChatAttachmentSummary: Identifiable, Hashable {
+struct ChatAttachmentSummary: Identifiable, Hashable, Sendable {
     var id: String = UUID().uuidString
     var name: String
     var type: String
@@ -138,13 +138,12 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var runId: String?
     var turnID: String?
     var failureDetail: String?
-    var interaction: InlineInteraction?
-    var interactionDescriptor: InlineInteractionDescriptor?
-    var interactionSessionID: String?
+    /// The matter whose card this row carries, by the id of its Inbox row (`ChatMessageRecord.cardMatter`).
+    var matter: String?
     var completionState: String? = nil
 
     var isTerminalReply: Bool {
-        role == .assistant && interaction == nil && interactionDescriptor == nil && !isStreaming
+        role == .assistant && matter == nil && !isStreaming
             && (completionState == "completed" || completionState == "incomplete" || completionState == "failed")
     }
 
@@ -158,9 +157,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         awaitingMacTranscript: Bool = false,
         runId: String? = nil,
         failureDetail: String? = nil,
-        interaction: InlineInteraction? = nil,
-        interactionDescriptor: InlineInteractionDescriptor? = nil,
-        interactionSessionID: String? = nil
+        matter: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -171,9 +168,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         self.awaitingMacTranscript = awaitingMacTranscript
         self.runId = runId
         self.failureDetail = failureDetail
-        self.interaction = interaction
-        self.interactionDescriptor = interactionDescriptor
-        self.interactionSessionID = interactionSessionID
+        self.matter = matter
     }
 
     nonisolated static func derivedMessageID(_ id: String) -> UUID {
@@ -186,15 +181,13 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
 
     nonisolated static func projectChatRecords(_ records: [ChatMessageRecord]) throws -> [ChatMessage] {
         // Project metadata.attachments into chat summaries so snapshot refresh preserves attachments.
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try records.compactMap { rec in
+        try records.compactMap { rec in
             let roleStr = rec.role
-            let interaction = try rec.interactionJSON.map { try decoder.decode(InlineInteraction.self, from: Data($0.utf8)) }
-            let descriptor = try rec.interactionDescriptorJSON.map { try decoder.decode(InlineInteractionDescriptor.self, from: Data($0.utf8)) }
-            guard roleStr == "user" || roleStr == "assistant" || interaction != nil else { return nil }
+            // A row carrying a card stands as its own message: the card is the matter's Inbox row, drawn where the row is.
+            let card = rec.interactionJSON != nil
+            guard roleStr == "user" || roleStr == "assistant" || card else { return nil }
             let role: ChatMessage.Role = roleStr == "user" ? .user : .assistant
-            // Derive non-UUID interaction/approval row IDs exactly as the Mac does so each row retains one stable identity.
+            // Derive non-UUID card/approval row IDs exactly as the Mac does so each row retains one stable identity.
             let uuid = UUID(uuidString: rec.id) ?? Self.derivedMessageID(rec.id)
             let attachments: [ChatAttachmentSummary] = (rec.metadata?.attachments ?? []).map { a in
                 ChatAttachmentSummary(
@@ -207,8 +200,8 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
                     utterance: a.utterance
                 )
             }
-            var message = ChatMessage(id: uuid, role: role, text: interaction == nil ? rec.content : "", attachments: attachments, runId: rec.runId,
-                interaction: interaction, interactionDescriptor: descriptor, interactionSessionID: rec.interactionSessionID)
+            var message = ChatMessage(id: uuid, role: role, text: card ? "" : rec.content, attachments: attachments, runId: rec.runId,
+                matter: try rec.cardMatter())
             message.toolEvents = rec.toolEvents ?? []
             if roleStr == "assistant" {
                 message.turnID = rec.metadata?.turnTraceId
@@ -219,6 +212,18 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
             return message
         }
     }
+}
+
+extension ChatMessageRecord {
+    /// An interaction card names its Inbox matter; malformed card identities fail the read.
+    nonisolated func cardMatter() throws -> String? {
+        try interactionJSON.map { "interaction:" + (try JSONDecoder().decode(CardIdentity.self, from: Data($0.utf8))).id }
+    }
+
+    /// An approval names its own Inbox matter.
+    nonisolated var askedMatter: String? { metadata?.approvalId }
+
+    private struct CardIdentity: Decodable { let id: String }
 }
 
 struct PendingPhotoAttachment: Identifiable, Equatable {

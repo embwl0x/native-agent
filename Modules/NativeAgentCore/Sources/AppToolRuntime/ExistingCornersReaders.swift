@@ -89,17 +89,27 @@ extension ExistingCornersSourceProvider {
                 if tool == "read_page" {
                     let fetched = try await rawRead(tool, readerInput, turn, .init(sense: operation))
                     try ExistingCornersReaders.requireReadable(fetched)
-                    guard case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"],
-                          let requestedURL = ExistingCornersReaders.string(fields["url"]) else {
+                    guard case .object(let fields) = fetched, let requestedURL = ExistingCornersReaders.string(fields["url"]) else {
                         throw SenseFailure(code: "source_unavailable", message: "The web reader did not return its fetched document.")
                     }
-                    let observedURL = ExistingCornersReaders.string(coverage["final_url"]) ?? requestedURL
+                    let observedURL: String
+                    if fields["text_reader"] == .string("browser") {
+                        guard fields["page"] != nil, fields["receipt"]?.objectValue?["action"] == .string("navigate") else {
+                            throw SenseFailure(code: "source_unavailable", message: "The rendered web reader supplied no page and navigation receipt.")
+                        }
+                        observedURL = requestedURL
+                    } else {
+                        guard case .object(let coverage)? = fields["coverage"] else {
+                            throw SenseFailure(code: "source_unavailable", message: "The HTTP reader supplied no extraction coverage.")
+                        }
+                        observedURL = ExistingCornersReaders.string(coverage["final_url"]) ?? requestedURL
+                    }
                     guard host == "*" || URL(string: observedURL)?.host?.lowercased() == host.lowercased() else {
                         throw SenseFailure(code: "source_unavailable", message: "The fetched document does not match \(corner.key).")
                     }
                     return .pageSnapshot(fetched)
                 }
-                // Match the direct route's default node limit before selecting the workspace snapshot; reads must not acquire or navigate tabs.
+                // The shared reader owns default limits. An existing-page read never navigates a tab.
                 var snapshotInput = readerInput
                 guard let chrome else { throw SenseFailure(code: "source_unavailable", message: "The Chrome source is not installed.") }
                 let address: [String: JSONValue]
@@ -111,9 +121,6 @@ extension ExistingCornersSourceProvider {
                     throw SenseFailure(code: "source_unavailable", message: error.localizedDescription, remedy: error.remedy)
                 }
                 snapshotInput.merge(address) { supplied, _ in supplied }
-                if snapshotInput["max_nodes"] == nil || snapshotInput["max_nodes"] == .null {
-                    snapshotInput["max_nodes"] = .int(150)
-                }
                 let readInput = snapshotInput
                 let snapshot = try await rawRead(tool, readInput, turn, .init(sense: operation, lookSource: "workspace"))
                 guard case .object(let page) = snapshot,

@@ -76,6 +76,7 @@ public struct WorkOverview: Codable, Equatable, Sendable {
     public var experiences: [Experience]? = nil
     /// Full owner counts, before the phone's bounded list is cut.
     public var needsYouCounts: [WorkOverviewReference.Kind: Int]? = nil
+    /// When the mobile overview last changed; installed phones use this to refuse older deliveries.
     public var capturedAt: String
     public var now: [WorkOverviewRow]
     public var needsYou: [WorkOverviewRow]
@@ -96,6 +97,34 @@ public struct WorkOverview: Codable, Equatable, Sendable {
         self.omittedNow = omittedNow
         self.omittedNeedsYou = omittedNeedsYou
         self.omittedRecentlyDone = omittedRecentlyDone
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case experienceRevision, experiences, needsYouCounts, capturedAt, now, needsYou, recentlyDone, unavailable
+        case omittedNow, omittedNeedsYou, omittedRecentlyDone
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(experienceRevision, forKey: .experienceRevision)
+        try container.encodeIfPresent(experiences, forKey: .experiences)
+        try container.encode(capturedAt, forKey: .capturedAt)
+        if let needsYouCounts {
+            // Enum-keyed dictionaries encode as alternating key/value arrays. Sort at this producer;
+            // JSON sortedKeys cannot order arrays. Keep the wire shape the phone already decodes.
+            var counts = container.nestedUnkeyedContainer(forKey: .needsYouCounts)
+            for (kind, count) in needsYouCounts.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
+                try counts.encode(kind)
+                try counts.encode(count)
+            }
+        }
+        try container.encode(now, forKey: .now)
+        try container.encode(needsYou, forKey: .needsYou)
+        try container.encode(recentlyDone, forKey: .recentlyDone)
+        try container.encode(unavailable, forKey: .unavailable)
+        try container.encode(omittedNow, forKey: .omittedNow)
+        try container.encode(omittedNeedsYou, forKey: .omittedNeedsYou)
+        try container.encode(omittedRecentlyDone, forKey: .omittedRecentlyDone)
     }
 
     public var needsYouCount: Int { needsYou.count + omittedNeedsYou }

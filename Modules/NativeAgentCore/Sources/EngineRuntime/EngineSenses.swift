@@ -6,22 +6,19 @@ import NativeAgentShared
 import Observation
 import PersistenceCore
 import Senses
-// Blueprint: | `EngineSenses.swift` | `LatestRead`, `write`; Checked source state and owner-driven visible refresh |
+// Blueprint: | `EngineSenses.swift` | `SensesFacade`: the work pane's sense view, current against the senses as last read, refreshed by their owners |
 
 /// Refresh from owner changes only, ending observation when both panes unmount.
 @MainActor
 @Observable
 public final class SensesFacade {
+    /// The senses as last read; the interactive view is shown only while it belongs to one of them. An unreadable registry keeps the
+    /// last records read.
     public private(set) var records: [SenseRecord] = []
-    public private(set) var surfaceNames: [SenseCorner: String] = [:]
-    public private(set) var news: [SenseNews] = []
-    public private(set) var watches: [SenseLiveWatch] = []
     public private(set) var interactiveView: SenseInteractiveView?
-    public private(set) var isWired = false
-    public private(set) var loaded = false
-    public private(set) var saving: Set<String> = []
-    public private(set) var error: String?
-    public private(set) var readError: String?
+    public private(set) var interactiveRevision: String?
+    public private(set) var presentationLoaded = false
+    public private(set) var presentationIssue: String?
     @ObservationIgnored private lazy var latest = LatestRead()
 
     public nonisolated init() {}
@@ -29,37 +26,30 @@ public final class SensesFacade {
     public func refresh() async {
         await latest.read({ await readPresentation() }, publish: { next in
             guard !Task.isCancelled else { return }
-            if isWired != next.wired { isWired = next.wired }
+            presentationLoaded = true
             switch next.registry {
-            case .success(let (sorted, names)):
+            case .success(let (sorted, _)):
                 if records != sorted { records = sorted }
-                if surfaceNames != names { surfaceNames = names }
-                readError = nil
-            case .failure(let error):
-                readError = "Senses registry unavailable: \(error.localizedDescription)"
+                presentationIssue = nil
+            case .failure(let error): presentationIssue = error.localizedDescription
             }
-            if news != next.news { news = next.news }
-            if watches != next.watches { watches = next.watches }
             let view = next.view.flatMap { $0.isCurrent(in: records) ? $0 : nil }
-            if interactiveView != view { interactiveView = view }
-            loaded = true
+            if interactiveView != view {
+                interactiveView = view
+                interactiveRevision = view.map { _ in UUID().uuidString }
+            }
         })
     }
 
-    private func readPresentation() async -> (wired: Bool, registry: Result<([SenseRecord], [SenseCorner: String]), Error>, news: [SenseNews],
-        watches: [SenseLiveWatch], view: SenseInteractiveView?) {
-        let hub = SensesHub.shared
-        let wired = hub.registry != nil
-        async let news = SenseNewsBoard.shared.latest(limit: SenseNewsBoard.capacity)
+    private func readPresentation() async -> (registry: Result<([SenseRecord], [SenseCorner: String]), Error>, view: SenseInteractiveView?) {
         async let view = SenseNewsBoard.shared.interactiveView()
-        async let watches = hub.liveWatches()
         let registry: Result<([SenseRecord], [SenseCorner: String]), Error>
         do {
-            registry = .success(try await hub.presentationRecords())
+            registry = .success(try await SensesHub.shared.presentationRecords())
         } catch {
             registry = .failure(error)
         }
-        return (wired, registry, Array((await news).prefix(12)), await watches, await view)
+        return (registry, await view)
     }
 
     public func observe(dataRoot: URL) async {
@@ -71,41 +61,4 @@ public final class SensesFacade {
         ) { await self.refresh() }
     }
 
-    public func setEnabled(_ enabled: Bool, record: SenseRecord) async {
-        guard saving.insert(record.id).inserted else { return }
-        defer { saving.remove(record.id) }
-        guard let registry = SensesHub.shared.registry else {
-            error = "Senses are not connected yet."
-            return
-        }
-        do {
-            let saved = try await registry.setStatus(id: record.id, version: record.version, status: enabled ? .on : .off,
-                                             preview: false, ownerAuthorized: true, turn: nil)
-            latest.write {
-                if let index = records.firstIndex(where: { $0.id == record.id }) {
-                    records[index] = saved
-                }
-                error = nil
-            }
-        } catch {
-            self.error = "I couldn't save this switch: \(error.localizedDescription)"
-        }
-        await refresh()
-    }
-
-    public func export(_ record: SenseRecord, destination: () -> URL?) async {
-        guard saving.insert(record.id).inserted else { return }
-        defer { saving.remove(record.id) }
-        guard let registry = SensesHub.shared.registry else {
-            error = "Senses are not connected yet."
-            return
-        }
-        guard let destination = destination() else { return }
-        do {
-            _ = try await registry.exportBundle(id: record.id, to: destination, userApproved: true)
-            error = nil
-        } catch {
-            self.error = "I couldn't share this sense: \(error.localizedDescription)"
-        }
-    }
 }

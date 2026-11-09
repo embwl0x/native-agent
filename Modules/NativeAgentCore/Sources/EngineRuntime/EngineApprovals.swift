@@ -1,5 +1,4 @@
 import Foundation
-import Observation
 import ApprovalInbox
 import NativeAgentShared
 import PersistenceCore
@@ -11,51 +10,29 @@ import Agents
 import NativeAgentCore
 import DeviceSync
 import TrustCenter
-// Blueprint: | `EngineApprovals.swift` | `ApprovalsFacade`; Checked shared inbox and gated single-flight decisions |
+import Privacy
+// Blueprint: | `EngineApprovals.swift` | `ApprovalsFacade`: actor-owned approval reads, comparisons, face values and single-flight decisions |
 
 /// Share checked approval rows and load state across surfaces; keep decisions in `ApprovalExecution`.
-@MainActor
-@Observable
-public final class ApprovalsFacade {
+public actor ApprovalsFacade {
     public nonisolated let dataRoot: URL
-
-    public private(set) var records: [ApprovalRecord] = [] {
-        didSet { recordsDidChange?() }
-    }
-    public private(set) var refreshErrorText: String?
-    public private(set) var hasLoadedSnapshot = false
-    private var readsInFlight = 0
-    public var isRefreshing: Bool { readsInFlight > 0 }
-    @ObservationIgnored private let latest = LatestRead()
-
-    public var summaryTitle: String {
-        if refreshErrorText != nil {
-            return hasLoadedSnapshot ? "Approval refresh failed" : "Approval status unavailable"
-        }
-        guard hasLoadedSnapshot else { return "Checking approvals…" }
-        let count = WorkOverviewRead.waitingApprovals(records).count
-        return count == 0 ? "No actions need approval" : "\(count) \(count == 1 ? "action needs" : "actions need") approval"
-    }
-
-    public var summaryDetail: String {
-        if refreshErrorText != nil {
-            return hasLoadedSnapshot
-                ? "Showing previously loaded approvals. Choose Refresh to check for changes."
-                : "Approvals could not be loaded. Choose Refresh to try again."
-        }
-        guard hasLoadedSnapshot else { return "Checking which actions need your permission." }
-        return """
-            Review requests to use tools, change memories, control your Mac or browser, make changes in connected apps, work on Desk tasks, or \
-            improve the agent.
-            """
-    }
-
-    @ObservationIgnored public var recordsDidChange: (@MainActor () -> Void)?
+    private let counts: CountsFeedProjection
+    private var records: [ApprovalRecord] = []
+    private var refreshErrorText: String?
+    private var hasLoadedSnapshot = false
+    private var readsInFlight: Set<UUID> = []
+    private let latest = LatestRead()
+    private var observers: [UUID: AsyncStream<Void>.Continuation] = [:]
     private var resolutionTasks: [String: Task<ApprovalRecord, Error>] = [:]
-    @ObservationIgnored private var resolutionDecisions: [String: String] = [:]
+    private var resolutionDecisions: [String: String] = [:]
 
-    public nonisolated init(dataRoot: URL) {
+    public init(dataRoot: URL, counts: CountsFeedProjection) {
         self.dataRoot = dataRoot
+        self.counts = counts
+    }
+
+    deinit {
+        for continuation in observers.values { continuation.finish() }
     }
 
     nonisolated private var inbox: SwiftNativeApprovalInbox {
@@ -64,29 +41,73 @@ public final class ApprovalsFacade {
 
     /// Return this read; only forward publication replaces shared rows.
     public func list() async throws -> [ApprovalRecord] {
-        readsInFlight += 1
-        defer { readsInFlight -= 1 }
+        let readID = UUID()
+        readsInFlight.insert(readID)
+        await publishFace()
+        var changed = false
         let result: Result<[ApprovalRecord], Error> = await latest.read({
             do { return .success(try await inbox.list(filter: .all)) }
             catch { return .failure(error) }
         }, publish: { result in
             switch result {
             case .success(let loaded):
-                if records != loaded { records = loaded }
+                let rowsChanged = records != loaded
+                changed = rowsChanged || !hasLoadedSnapshot || refreshErrorText != nil
+                if rowsChanged { records = loaded }
                 hasLoadedSnapshot = true
                 refreshErrorText = nil
             case .failure(let error):
-                refreshErrorText = ApprovalLoadFailurePresentation.banner(error: error, retainedApprovalCount: records.count)
+                let detail = ApprovalLoadFailurePresentation.banner(error: error, retainedApprovalCount: records.count)
+                changed = refreshErrorText != detail
+                refreshErrorText = detail
             }
         })
+        readsInFlight.remove(readID)
+        await publishFace()
+        if changed { signalChange() }
         return try result.get()
     }
 
-    public func refresh() async { _ = try? await list() }
+    public func refresh() async {
+        do { _ = try await list() }
+        catch { /* The checked read publishes its cause beside retained rows. */ }
+    }
 
-    /// Reader, resolver and lifetime observer must share the same file.
-    public nonisolated func requestsPath() async -> URL {
-        await inbox.approvalsPath
+    struct Snapshot: Sendable {
+        let records: [ApprovalRecord]
+        let status: String?
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(records: records,
+                 status: refreshErrorText.map(NativeAppSecretRedactor.redactText) ?? (hasLoadedSnapshot ? nil : "Checking approvals…"))
+    }
+
+    public func changes() -> AsyncStream<Void> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
+        observers[id] = continuation
+        continuation.yield()
+        continuation.onTermination = { [weak self] _ in Task { await self?.removeObserver(id) } }
+        return stream
+    }
+
+    private func removeObserver(_ id: UUID) { observers.removeValue(forKey: id) }
+
+    private func signalChange() {
+        for continuation in observers.values { continuation.yield() }
+    }
+
+    private func publishFace() async {
+        let value = ApprovalsFace(
+            rows: Dictionary(records.map {
+                ($0.id, ApprovalsFace.Row(id: $0.id, title: NativeAppSecretRedactor.redactText($0.title), status: $0.status))
+            }, uniquingKeysWith: { first, _ in first }),
+            waitingCount: hasLoadedSnapshot ? WorkOverviewRead.waitingApprovals(records).count : nil,
+            hasLoadedSnapshot: hasLoadedSnapshot, error: refreshErrorText.map(NativeAppSecretRedactor.redactText),
+            isRefreshing: !readsInFlight.isEmpty
+        )
+        await counts.updateApprovals(value)
     }
 
     public enum Resolution: Equatable, Sendable {
@@ -97,7 +118,7 @@ public final class ApprovalsFacade {
     }
 
     public func resolveOnce(
-        id: String, using operation: @MainActor (String) async throws -> ApprovalRecord
+        id: String, using operation: @MainActor @Sendable (String) async throws -> ApprovalRecord
     ) async throws -> Resolution {
         let trimmedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedID.isEmpty else {
@@ -111,18 +132,6 @@ public final class ApprovalsFacade {
             return .applied(try await operation(trimmedID))
         } catch let ApprovalInboxError.alreadyResolved(id: resolvedID, status: status) {
             return .noOpAlreadyResolved(id: resolvedID, status: status)
-        }
-    }
-
-    public func settleInlineCard(
-        id: String, decision: String, coordinator: ApprovalExecution, turn: Turn,
-        refreshHealth: @MainActor () async -> Void
-    ) async throws {
-        do {
-            _ = try await resolveApproval(id: id, decision: decision, coordinator: coordinator, turn: turn)
-            await refreshHealth()
-        } catch ApprovalInboxError.alreadyResolved {
-            _ = try await list()
         }
     }
 
@@ -150,15 +159,18 @@ public final class ApprovalsFacade {
             }
             return try await task.value
         }
-        let task = Task<ApprovalRecord, Error> { @MainActor in
+        let task = Task<ApprovalRecord, Error> {
             let resolved = try await coordinator.resolveApproval(id: trimmedID, decision: decision, turn: turn)
+            let changed = !records.contains(resolved)
             latest.write {
                 if let index = records.firstIndex(where: { $0.id == resolved.id }) {
-                    records[index] = resolved
+                    if records[index] != resolved { records[index] = resolved }
                 } else {
                     records.insert(resolved, at: 0)
                 }
             }
+            await publishFace()
+            if changed { signalChange() }
             return resolved
         }
         resolutionTasks[trimmedID] = task

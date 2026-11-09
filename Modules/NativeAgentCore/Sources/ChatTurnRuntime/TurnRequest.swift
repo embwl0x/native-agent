@@ -2,9 +2,12 @@ import Foundation
 import NativeAgentShared
 import Transcripts
 import CognitiveSubstrate
+import Experiences
 import NativeAgentCore
 import TrustCenter
 import TurnTrace
+import PersistenceCore
+import ProviderRouting
 // Blueprint: | `TurnRequest.swift` | `TurnRequest` made a `Turn`; `TurnArrival`; `TurnAdmission`: per-session order, offering waiters to the agent's open turn |
 
 /// What one ingress decides about a turn; `turn(parent:)` makes it the `Turn`. Omitted fields inherit the
@@ -350,6 +353,17 @@ public actor TurnAdmission {
     public func run<T>(dataRoot: URL, sessionID: String?, arrival: TurnArrival, runID: String? = nil, waitForCapacity: Bool = false,
                        isolation: isolated (any Actor)? = #isolation,
                        turn: Turn, operation: (Turn) async throws -> T) async throws -> Admitted<T> {
+        // An arrival in any conversation but the agent's own stream is something owed: attention wakes for it.
+        if sessionID != Attention.stream { Attention.arrived() }
+        var turn = turn
+        turn.providerRecovery = ProviderRecovery()
+        if arrival.row == .hidden {
+            turn.rows.hiddenInput = TurnCheckpoint.HiddenInput(
+                origin: try turn.origin.map { try JSONValue.fromEncodable($0) }, attachments: arrival.attachments,
+                completion: try turn.rows.codexCompletion.map { try JSONValue.fromEncodable($0) },
+                queryUserMessage: turn.queryUserMessage, threadKind: turn.rows.threadKind, ownedSessionID: turn.rows.ownedSessionID,
+                questionRunID: turn.rows.questionRunID, verifiedSessionID: turn.verifiedSessionID)
+        } else { turn.rows.hiddenInput = nil }
         let id = UUID()
         if let steered = try await admit(dataRoot: dataRoot, sessionID: sessionID, id: id, runID: runID, waitForCapacity: waitForCapacity,
                                          arrival: arrival, turn: turn) {
@@ -466,7 +480,13 @@ public actor TurnAdmission {
         try Task.checkCancellation()
         // A restored run keeps its recorded place; only a live arrival rides the agent's open turn.
         let rides = runID.map { backlog[key]?.contains($0) != true } ?? true
-        while active[key] != nil || !admissible(key, runID: runID) {
+        while true {
+            if arrival != nil, let runID, let steered = await ChatTurnSteering.shared.takeAnswer(sessionId: key, run: runID) {
+                admitted(key, runID: runID)
+                admitNext(key)
+                return steered
+            }
+            if active[key] == nil, admissible(key, runID: runID) { break }
             let hasCapacity = (waiting[key]?.count ?? 0) < 8 && waiting.values.reduce(0, { $0 + $1.count }) < 32
             guard hasCapacity || waitForCapacity else { throw Full() }
             // Registration and the capacity check share this actor. A release
@@ -483,6 +503,13 @@ public actor TurnAdmission {
                 // The steering actor alone decides read versus its own place; a slot handed to a read arrival passes on.
                 if let riding, case .taken(let steered) = await ChatTurnSteering.shared.withdraw(sessionId: key, run: riding.turn.run) {
                     if active[key] == id { release(key, id: id) } else { leaveLine(key, id: id) }
+                    return steered
+                }
+                // Restored doors do not offer their input again; the replayed turn's delivered reading still answers them.
+                if arrival != nil, let runID, let steered = await ChatTurnSteering.shared.takeAnswer(sessionId: key, run: runID) {
+                    admitted(key, runID: runID)
+                    if active[key] == id { release(key, id: id) } else { leaveLine(key, id: id) }
+                    admitNext(key)
                     return steered
                 }
                 // A handoff owns the slot even if Stop raced it; run's

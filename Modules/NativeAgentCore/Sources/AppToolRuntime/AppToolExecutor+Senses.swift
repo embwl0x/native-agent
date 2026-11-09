@@ -4,6 +4,7 @@ import ChatToolParsing
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import AgentWorkspace
 import Senses
 // Blueprint: | `AppToolExecutor+Senses.swift` | Sense corner reads, served verb discovery and gated in-turn acts |
 
@@ -480,12 +481,11 @@ private struct SiteSenseActionBoundary: Sendable {
         default: throw SenseFailure(code: "act_denied", message: "This site verb has no authorized Chrome action.")
         }
         for fields in [old, current] {
+            if let block = ChromePageText.actionBlock(fields) {
+                throw SenseFailure(code: block.code, message: block.reason + " Nothing was sent.")
+            }
             guard case .array(let actions)? = fields["actions"], actions.contains(.string(action)) else {
                 throw SenseFailure(code: "act_denied", message: "The Chrome source does not offer this action on the served control.")
-            }
-            if case .object(let states)? = fields["states"],
-               states["disabled"] == .bool(true) || states["blockedByModal"] == .bool(true) {
-                throw SenseFailure(code: "act_denied", message: "The served control is disabled or blocked by a dialog.")
             }
         }
         self.address = address; self.verb = verb; node = current

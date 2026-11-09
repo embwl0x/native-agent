@@ -78,16 +78,6 @@ public func listTools(
     }.map(\.fields)
 }
 
-// MARK: - Saved workflows
-// Listing saved workflows must not seed defaults or mutate authority.
-public func listWorkflows(dataRoot: URL) async throws -> [[String: JSONValue]] {
-    try SavedWorkflows.readProjection(dataRoot: dataRoot).map {
-        _ = try WorkflowRecord(row: $0)
-        return try JSONRow($0).fields
-    }
-}
-
-
 private func capabilityTrustMetadata(_ source: [String: JSONValue]) -> [String: JSONValue] {
     source.filter { ["provenance", "signature"].contains($0.key) }
 }
@@ -149,29 +139,6 @@ public func capabilityRecordsFull(
         rec["useCount"] = useCount.map { .int(Int64($0)) } ?? .null
         rec["lastUsedAt"] = tool["lastUsedAt"] ?? .null
         rec["updatedAt"] = tool["updatedAt"] ?? .null
-        records.append(rec)
-    }
-
-    let workflows = try await listWorkflows(dataRoot: dataRoot)
-    for workflow in workflows.prefix(100) {
-        let row = try JSONRow(.object(workflow))
-        var rec = capabilityTrustMetadata(workflow)
-        let wid = try row.string("id")
-        rec["id"] = .string("workflow:\(wid)")
-        rec["sourceId"] = .string(wid)
-        rec["name"] = workflow["name"] ?? .null
-        rec["kind"] = .string("workflow")
-        rec["status"] = try capabilityStatus(row)
-        rec["description"] = workflow["description"] ?? .null
-        rec["triggers"] = try row.optionalString("trigger").map { .array([.string($0)]) } ?? .null
-        rec["permissions"] = .array([])
-        let requirements = try row.array("steps").map { try JSONRow($0).optionalBool("requiresApproval") }
-        rec["riskClass"] = requirements.contains(true) ? .string("approval_gated")
-            : requirements.contains(nil) ? .null : .string("app_data")
-        rec["autoload"] = .bool(false)
-        rec["useCount"] = .null
-        rec["lastUsedAt"] = .null
-        rec["updatedAt"] = workflow["updatedAt"] ?? .null
         records.append(rec)
     }
 

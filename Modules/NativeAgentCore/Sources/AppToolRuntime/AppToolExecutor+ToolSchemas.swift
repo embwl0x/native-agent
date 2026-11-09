@@ -233,21 +233,26 @@ extension AppToolExecutor {
                 toolClass: .read, capabilities: ["network_read", "tool_call"],
                 description: """
                     Open/read a URL in this conversation's last tab if it is still in the NativeAgent group; otherwise open a new tab there. The owner's tabs \
-                    are never used. Chrome's completed tab and landed URL verify arrival, including internal pages and PDFs. Returns main content as numbered \
-                    rows, or the displayed picture with a no-DOM note for PDFs/pages without DOM access; PDF text remains unavailable from this picture \
-                    reader. Internal pages return one title/URL/no-reader line with read_mode none. Unsupported schemes such as javascript: and data: refuse \
-                    before any tab changes. url back/forward moves through this tab's history. fields + submit fills/sends a form in this call.
+                    are never used. Chrome's exact document and landed URL identify arrival, including internal pages and PDFs. Returns main content \
+                    as numbered rows, or the displayed picture with a no-DOM note for PDFs/pages without DOM access; PDF text remains unavailable \
+                    from this picture reader. Internal pages return one title/URL/no-reader line with read_mode none. Unsupported schemes such as \
+                    javascript: and data: refuse \
+                    before any tab changes. new_tab:true opens another inactive tab in your group, leaving the person's focus alone; omit tab_id. Reads \
+                    wait for readable main content. Stop cancels the wait. url back/forward moves through this tab's history. \
+                    fields + submit fills/sends a form in this call.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
                         ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("url", ToolSchema.strSchema("HTTP(S) destination, or back / forward to go through this tab's history like the Back button.")),
+                        ("new_tab", ToolSchema.boolSchema("Open another background tab in your NativeAgent group. Omit tab_id; requires a destination URL.")),
+                        ("find", ToolSchema.strSchema("Start the returned read at the first element containing this text, ignoring case.")),
                         ("fields", fieldsSchema),
                         ("submit", submitSchema),
                         ("scope", ToolSchema.enumStringSchema(["main_content", "page"],
                             "Returned page: main_content (default) or page to include the site's nav.")),
-                    ],
+                    ] + ToolSchema.senseViewProperties,
                     required: ["url"]
                 )
             ),
@@ -255,7 +260,10 @@ extension AppToolExecutor {
                 name: "browser.chrome_snapshot",
                 toolClass: .read,
                 description: """
-                    Read Chrome's ready rendered document in reading order, including inline links; a read says when the tab is still loading. Internal pages \
+                    Read when main content arrives; Stop cancels the wait. Read in order, including inline links. \
+                    Main content precedes sidebars; every frame's content precedes overlays. Pagination supplies has_more and next; partial names an unread \
+                    part and its cause. Consent is never dismissed. Images/charts are named in place with size; \
+                    chrome.look shows the picture. Internal pages \
                     return one title/URL/no-reader line with read_mode none. Other pages and PDFs without DOM access return the displayed picture with \
                     read_mode picture and an explicit reason; PDF text remains unavailable from this picture reader. DOM reads carry url, title, snapshot_id, \
                     version, captured_at, bytes and has_more; act with node_id (row number as a string or label). Read folded sections with the supplied more \
@@ -265,15 +273,17 @@ extension AppToolExecutor {
                     properties: [
                         ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
                         ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional user-sequence proof from the Chrome reader."))),
-                        ("max_nodes", ToolSchema.intSchema("Maximum rows, 1 through 200. Defaults 150.")),
-                        ("max_text_chars", ToolSchema.intSchema("Maximum readable text characters, 1 through 40000. Defaults 12000.")),
+                        ("max_nodes", ToolSchema.intSchema("Maximum rows, 1 through 2000; default 400.")),
+                        ("max_text_chars", ToolSchema.intSchema(
+                            "Maximum readable text characters, 1 through 200000; default 32000. Transport stays bounded to 1000000 UTF-8 bytes.")),
+                        ("find", ToolSchema.strSchema("Start at the first element containing this text, ignoring case. Omit more; an unobserved match is limited to the rendered material walked.")),
                         ("scope", ToolSchema.enumStringSchema(["page", "main_content"], """
                             Rendered page or main_content: declared main regions, else article bodies, else the document body, excluding navigation. Reports \
                             when no main/article region was declared; scope page includes navigation.
                             """)),
                         ("more", ToolSchema.strSchema("""
-                            Structural cursor from the page's More address (the more string in next); reads the current snapshot of the same URL without \
-                            scrolling.
+                            The supplied More address (the more string in next); names its own tab and document, so tab_id need not be repeated. Continues \
+                            the rendered content without scrolling and follows an unchanged content anchor when layout moves.
                             """)),
                     ] + ToolSchema.senseViewProperties,
                     required: []
@@ -473,7 +483,8 @@ extension AppToolExecutor {
                         ("node_id", ToolSchema.strSchema("Row number or label that advertised wait for element_state.")),
                         ("state", ToolSchema.enumStringSchema(["visible", "hidden", "enabled", "disabled"], "Required element state.")),
                         ("timeout_ms", ToolSchema.intSchema("Bounded timeout from 100 through 10000 milliseconds. Defaults 5000.")),
-                        ("settle_ms", ToolSchema.intSchema("Extra navigation quiet interval from 0 through 2000 milliseconds.")),
+                        ("settle_ms", ToolSchema.intSchema(
+                            "Required content quiet interval, 0 through 2000 milliseconds (minimum 350); ad/whole-DOM churn does not reset it.")),
                     ],
                     required: ["condition"]
                 )

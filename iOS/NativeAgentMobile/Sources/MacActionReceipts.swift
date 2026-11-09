@@ -1,7 +1,7 @@
 import SwiftUI
 import Combine
 import NativeAgentShared
-// Blueprint: | `MacActionReceipts.swift` | Mac Tools receipt ledger, approval reconciliation and receipt rows |
+// Blueprint: | `MacActionReceipts.swift` | Mac Tools receipt identities, original retry values and approval reconciliation |
 
 enum RemoteActionState: String, Equatable {
     case waiting = "waiting"
@@ -12,22 +12,19 @@ enum RemoteActionState: String, Equatable {
     case failed = "failed"
     case unconfirmed = "not confirmed"
 
-    static func forError(_ error: Error) -> Self {
-        if case SyncError.approvalRequired = error {
-            return .waitingApproval
-        }
-        if case SyncError.responseUnconfirmed = error {
-            return .unconfirmed
-        }
-        return .failed
-    }
-
 }
-
 enum RemoteActionKind: Equatable {
     case notify(title: String, message: String)
     case volume(Int)
     case spotlight(String)
+
+    var privilege: PhoneMacControlAction {
+        switch self {
+        case .notify: .notification
+        case .volume: .volume
+        case .spotlight: .spotlight
+        }
+    }
 }
 
 enum RemoteActionRetryPresentation {
@@ -58,8 +55,9 @@ struct RemoteActionCard: Identifiable, Equatable {
     var createdAt: Date
     var updatedAt: Date
     var approvalID: String?
+    var operationID: UUID
 
-    init(kind: RemoteActionKind, title: String, subtitle: String, state: RemoteActionState, detail: String) {
+    init(kind: RemoteActionKind, title: String, subtitle: String, state: RemoteActionState, detail: String, operation: UUID) {
         self.id = UUID()
         self.kind = kind
         self.title = title
@@ -68,6 +66,7 @@ struct RemoteActionCard: Identifiable, Equatable {
         self.detail = detail
         self.createdAt = Date()
         self.updatedAt = Date()
+        self.operationID = operation
     }
 }
 
@@ -92,17 +91,35 @@ final class RemoteActionLedger: ObservableObject {
     }
 
     @discardableResult
-    func start(_ kind: RemoteActionKind, title: String, subtitle: String) -> UUID {
+    func start(_ kind: RemoteActionKind, title: String, subtitle: String, operation: UUID) -> UUID {
         let card = RemoteActionCard(
             kind: kind,
             title: title,
             subtitle: subtitle,
             state: .waiting,
-            detail: "Queued for Mac"
+            detail: "Queued for Mac", operation: operation
         )
         actions.insert(card, at: 0)
         trimOrdinaryActions()
         return card.id
+    }
+
+    func bind(_ id: UUID, to operation: UUID) {
+        guard let index = actions.firstIndex(where: { $0.id == id }) else { return }
+        actions[index].operationID = operation
+    }
+
+    func read(operation: UUID) async -> FaceActOutcome {
+        await iCloudSyncEngine.shared.refreshApprovalsSnapshot()
+        guard let card = actions.first(where: { $0.operationID == operation }) else {
+            return .init(words: "The original receipt is unavailable; its effect remains unconfirmed.", effects: .unknown)
+        }
+        if let id = card.approvalID, let approval = iCloudSyncEngine.shared.approvals.first(where: { $0.id == id }) {
+            var outcome = approvalOutcome(approval, card: card)
+            outcome.accepted = !outcome.unresolved
+            return outcome
+        }
+        return .init(words: card.detail, effects: card.state == .ranOnMac ? .known : .unknown, accepted: card.state == .ranOnMac)
     }
 
     func update(_ id: UUID, state: RemoteActionState, detail: String, approvalID: String? = nil) {
@@ -115,73 +132,48 @@ final class RemoteActionLedger: ObservableObject {
     }
 
     private func reconcileApprovals(_ approvals: [ApprovalRequest]) {
-        for index in actions.indices where actions[index].state == .waitingApproval {
-            guard let id = actions[index].approvalID,
-                  let approval = approvals.first(where: { $0.id == id }),
-                  ["resolved", "denied", "canceled", "orphaned"]
-                    .contains(approval.status.lowercased()) else { continue }
+        let waiting = actions.filter { $0.state == .waitingApproval }
+        for card in waiting {
+            guard let id = card.approvalID, let approval = approvals.first(where: { $0.id == id }),
+                  let index = actions.firstIndex(where: { $0.id == card.id }) else { continue }
+            let outcome = approvalOutcome(approval, card: card)
+            guard !outcome.unresolved else { continue }
             actions[index].state = .approvalResolved
-            actions[index].detail = "Approval \(approval.decision ?? approval.status). Check Activity for the action outcome."
+            actions[index].detail = outcome.failure?.localizedDescription ?? outcome.words ?? approval.decisionSummary
             actions[index].updatedAt = Date()
+            iCloudSyncEngine.shared.pageSessions.page("phone-mac-tools").settle(operation: card.operationID, outcome: outcome)
         }
         trimOrdinaryActions()
+    }
+
+    private func approvalOutcome(_ approval: ApprovalRequest, card: RemoteActionCard) -> FaceActOutcome {
+        switch approval.outcome {
+        case .denied, .expired:
+            return .interrupted(WireFailure(code: "mac_control_approval_declined", message: approval.decisionSummary,
+                cause: approval.executionSummary, effects: .none))
+        case .approved where approval.executionOutcome == "succeeded":
+            let committed: [FaceCommittedField]
+            switch card.kind {
+            case .notify: committed = [.init(id: "title", value: .string("")), .init(id: "message", value: .string(""))]
+            case .volume(let percent): committed = [.init(id: "percent", value: .int(Int64(percent)))]
+            case .spotlight(let query): committed = [.init(id: "query", value: .string(query))]
+            }
+            return .init(words: approval.executionSummary ?? "The approved Mac action completed.", effects: .known, accepted: true,
+                committed: committed)
+        case .approved where approval.executionOutcome == "refused":
+            return .interrupted(WireFailure(code: "mac_control_approval_refused", message: approval.decisionSummary,
+                cause: approval.executionSummary, effects: .none))
+        default:
+            return .init(words: approval.decisionSummary + "\n" + (approval.executionSummary ?? "The Mac has not confirmed execution."), effects: .unknown)
+        }
     }
 
     private func trimOrdinaryActions() {
         var ordinaryCount = 0
         actions = actions.sorted { $0.updatedAt > $1.updatedAt }.filter { action in
-            if action.state == .waitingApproval, action.approvalID != nil { return true }
+            if [.waiting, .running, .waitingApproval, .unconfirmed].contains(action.state) { return true }
             ordinaryCount += 1
             return ordinaryCount <= maximumOrdinaryActions
         }
-    }
-}
-
-struct RemoteActionCardView: View {
-    let action: RemoteActionCard
-    let onRetry: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(action.title)
-                        .font(.body)
-                        .foregroundStyle(AlivePalette.text)
-                    (Text("\(action.subtitle) · \(action.state.rawValue) · ")
-                        + Text(action.updatedAt, format: .relative(presentation: .named)))
-                        .font(.subheadline)
-                        .foregroundStyle(AlivePalette.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                if action.state == .failed {
-                    Button("Retry", systemImage: "arrow.clockwise", action: onRetry)
-                        .labelStyle(.titleOnly)
-                        .aliveSecondaryButton()
-                }
-            }
-            Text(action.detail)
-                .font(.footnote)
-                .foregroundStyle(AlivePalette.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if action.state == .waitingApproval {
-                Text("Review this approval in Activity.")
-                    .font(.footnote)
-                    .foregroundStyle(AlivePalette.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Button("Review Approval", systemImage: "checkmark.shield") {
-                    NativeAgentNotificationLaunchIntent.stage(screen: "approvals")
-                    NotificationCenter.default.post(
-                        name: .nativeagentOpenActivity,
-                        object: nil,
-                        userInfo: ["screen": "approvals"]
-                    )
-                }
-                .labelStyle(.titleOnly)
-                .alivePrimaryButton()
-            }
-        }
-        .aliveRow()
     }
 }

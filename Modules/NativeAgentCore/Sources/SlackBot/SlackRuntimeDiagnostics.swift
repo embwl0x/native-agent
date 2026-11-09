@@ -2,7 +2,27 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SlackRuntimeDiagnostics.swift` | `SlackRuntimeStateWriteOutcome` enum |
+import os
+// Blueprint: | `SlackRuntimeDiagnostics.swift` | Checked diagnostic storage; connection evidence reads the live socket owner without a freshness clock |
+
+enum SlackSocketConnections {
+    private static let sockets = OSAllocatedUnfairLock(initialState: [String: URLSessionWebSocketTask]())
+
+    static func retain(_ socket: URLSessionWebSocketTask, dataRoot: URL) {
+        sockets.withLock { $0[dataRoot.standardizedFileURL.path] = socket }
+    }
+
+    static func release(_ socket: URLSessionWebSocketTask, dataRoot: URL) {
+        sockets.withLock {
+            let key = dataRoot.standardizedFileURL.path
+            if $0[key] === socket { $0.removeValue(forKey: key) }
+        }
+    }
+
+    static func current(dataRoot: URL) -> URLSessionWebSocketTask? {
+        sockets.withLock { $0[dataRoot.standardizedFileURL.path] }
+    }
+}
 
 /// Unreadable diagnostic evidence must not be overwritten and misrepresented as fresh healthy state.
 enum SlackRuntimeStateWriteOutcome: Sendable, Equatable {
@@ -40,10 +60,10 @@ enum SlackRuntimeStateStore {
                     }
                     object = existing
                 }
+                guard patch.contains(where: { object[$0.key] != $0.value }) else { return .stored }
                 for (key, value) in patch {
                     object[key] = value
                 }
-                // Ping refreshes the timestamp so readers can distinguish a quiet socket from a stopped bridge.
                 object["updatedAt"] = .string(NativeTimestampFormat.fractionalZulu(now))
                 try await SwiftNativePersistenceCore.writeJSON(.object(object), to: statePath)
                 return .stored
@@ -54,9 +74,8 @@ enum SlackRuntimeStateStore {
     }
 }
 
-/// Missing, malformed and stale evidence cannot establish bridge health or a fresh disconnected state.
+/// Saved connection evidence requires its live socket owner; elapsed time cannot decide connection state.
 public enum SlackRuntimeStateFeed {
-    public static let staleAfter: TimeInterval = 90
 
     public struct Snapshot: Equatable, Sendable {
         public let connected: Bool
@@ -68,15 +87,10 @@ public enum SlackRuntimeStateFeed {
     public enum Observation: Equatable, Sendable {
         case absent
         case current(Snapshot)
-        case stale(Snapshot)
         case unavailable(String)
     }
 
-    public static func read(
-        dataRoot: URL,
-        now: Date = Date(),
-        staleAfter: TimeInterval = SlackRuntimeStateFeed.staleAfter
-    ) -> Observation {
+    public static func read(dataRoot: URL) -> Observation {
         let path = SlackRuntimeStateStore.path(dataRoot: dataRoot)
         var stateDirectoryIsDirectory = ObjCBool(false)
         let stateDirectory = path.deletingLastPathComponent()
@@ -96,13 +110,9 @@ public enum SlackRuntimeStateFeed {
                 return .unavailable("Slack runtime state has no boolean connection flag")
             }
             guard case .string(let updatedAt)? = object["updatedAt"],
-                  let date = NativeTimestampFormat.parseISO8601FractionalFirst(updatedAt) else {
+                  NativeTimestampFormat.parseISO8601FractionalFirst(updatedAt) != nil else {
                 return .unavailable("Slack runtime state has no valid update timestamp")
             }
-            guard date <= now else {
-                return .unavailable("Slack runtime state timestamp is in the future")
-            }
-
             let hasReportedError: Bool
             if let errorValue = object["lastError"] {
                 switch errorValue {
@@ -126,9 +136,12 @@ public enum SlackRuntimeStateFeed {
                     return nil
                 }()
             )
-            return now.timeIntervalSince(date) > max(0, staleAfter)
-                ? .stale(snapshot)
-                : .current(snapshot)
+            if connected {
+                guard let socket = SlackSocketConnections.current(dataRoot: dataRoot), socket.state == .running else {
+                    return .unavailable("Saved Slack connection has no running socket owner; wait for Socket Mode to connect or switch it off.")
+                }
+            }
+            return .current(snapshot)
         } catch {
             return .unavailable("Slack runtime state could not be read: \(error.localizedDescription)")
         }

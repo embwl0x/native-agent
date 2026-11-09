@@ -3,7 +3,7 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `NativeOAuthFlow.swift` | `NativeOAuthFlow`, `validateSignInDestination`, `startOAuthFlow`: checked sign-in ownership |
+// Blueprint: | `NativeOAuthFlow.swift` | Checked sign-in ownership and setup-token persistence off the UI actor; browser presentation uses its platform port |
 
 // MARK: - NativeOAuthFlow
 // Provider and connector sign-in share one callback and persistence owner.
@@ -15,17 +15,19 @@ public struct OAuthFlowResult: Sendable {
 }
 
 public enum NativeOAuthFlow {
-    /// Provider sheets and inline cards must save setup tokens in the same shape.
-    public static func saveAnthropicSetupToken(_ raw: String) -> String? {
-        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    public static func normalizedSetupToken(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "\n", with: "")
             .replacingOccurrences(of: "\t", with: "")
+    }
+    /// Provider sheets and inline cards must save setup tokens in the same shape.
+    @concurrent public nonisolated static func saveAnthropicSetupToken(_ raw: String, dataRoot: URL) async -> String? {
+        let t = normalizedSetupToken(raw)
         guard t.hasPrefix("sk-ant-oat") else {
             return "That isn't a setup token. Setup tokens start with sk-ant-oat."
         }
         do {
-            let dataRoot = PersistenceCore.defaultDataRoot()
             let providersDir = dataRoot.appendingPathComponent("providers", isDirectory: true)
             let path = providersDir.appendingPathComponent("anthropic_oauth_direct.json")
             try FileManager.default.createDirectory(at: providersDir, withIntermediateDirectories: true)
@@ -76,7 +78,7 @@ public enum NativeOAuthFlow {
     // MARK: - Public entry
 
     /// Sign-in returns only after persistence succeeds or its failure is surfaced.
-    @MainActor
+    @concurrent
     public static func startOAuthFlow(
         platform: any NativeOAuthPlatformPort.Type,
         providerId: String,

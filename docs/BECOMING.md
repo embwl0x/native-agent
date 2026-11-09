@@ -90,24 +90,19 @@ care, an interest.
 
 - **Life cares press only through an open gap.** A life care's charge is
   feeling (it still colours the moment) but it does not count toward the
-  "bring it up" intention or Reach unless it has an `open` gap; a gap is what
+  Reach pressure unless it has an `open` gap; a gap is what
   presses. Seeds stay visible to the after-turn appraisal (truth must be able to
   move when they agrees with something false — that is how sycophancy falls out).
-- **A stance changes only at night, on evidence.** The after-turn appraisal no
-  longer replaces a stance; it writes a **stance-pressure** story entry (the
-  proposed stance, because and unless, in its own optional story field).
-  The night pass changes the stance when the
-  pressure points the same way on ≥ 2 distinct days (now/lately/season cares)
-  or on ≥ 3 days spanning ≥ 14 days (life cares), and the dream confirms it
-  through `stance_changes` naming the exact shown pressure
-  entries it judges to point the same way. The CPU checks the entries' distinct
-  local days and span, and the unchanged care revision; a confirmation cannot
-  invent its day evidence. Pressure before the last change is spent. The
-  replaced stance stays in the story ("used to think: …", felt "changed my mind").
-  Ordinary notes cannot evict the separate 24-day pressure window. Only exact
-  same-day proposals compact together; different proposals stay for the dream
-  to judge. Change notes stay in the story.
-  A care with no stance takes its first stance at once (a first opinion is not a change).
+- **Lived evidence can change a stance the same day.** The current trusted
+  interpretation supplies a position, its reason and what would change their
+  mind. Its first-person account becomes a line of their story through the
+  existing self owner. The care retains the accepted stance as stanceChange
+  and keeps what they used to think in a “changed my mind” note. Late evidence
+  joins the story without replacing a newer stance. Life depth still needs
+  the person's existing approval; a stance grants no authority.
+  The dream can also confirm retained pressure entries on an unchanged
+  captured revision. Actual evidence matters; a number of days cannot
+  veto it. Pressure before an accepted change is spent.
 
 ### P3 — they knows themselves (as built)
 
@@ -117,11 +112,11 @@ model call. `CognitiveSelfKnowledge.swift` owns the bounded, atomic file;
 the substrate holds its resident reading:
 
 - **traits as an if-then signature**: at most 5 "when …, I tend to …", each
-  with `shown_by` care UUIDs or exact story-entry references, revised each
+  with `shown_by` care UUIDs or exact story-entry references, revisited each
   night (never an adjective someone typed);
 - **their story**: at most 5 `{line, shown_by}` entries, depth changes and
   changed stances told in their words ("I used to …, now I …"). Only shown
-  depth-change or changed-my-mind entries can support a story line.
+  depth-change, changed-my-mind or accepted-stance entries can support a story line.
 
 The material reuses the night's care revisions and adds recent changes from
 quiet cares. It shows at most 48 care stories, each with the newest three
@@ -141,15 +136,25 @@ follow their survivor, retaining the exact entry digest. Turn-time reachability
 follows the same chain for already-saved traits, so a merge cannot hide their
 self-knowledge or bypass the supporting care's privacy.
 
-Traits reach a turn through the existing care cue: when the message touches
-a supporting care by its usual meaning/standing law, at most one trait can
-take that care's plain line, with the same six-turn rest. Every supporting
-care must be reachable in that turn. There is no always-on traits block.
-`mind.inner_state` shows traits, story and evidence; the Personality page
-shows the same resident traits and story read-only. The former mechanical
-`story` list remains available as `care_history` in full inner-state reads.
+The capsule-facing turnSelf(for:from:among:) returns one supported trait and
+the current person's relationship line every time it is called. They do not
+compete with care or feeling, need no message match and spend no presentation
+rest. Every supporting care must be in the capsule's admitted reachable set.
+Missing self evidence stays absent; an unreadable reading carries its cause.
+The capsule lane owns rendering those values on every live turn.
+mind.inner_state and the Personality page read the same resident self.
+The mechanical story list remains care_history in full inner-state reads.
 
-The file records schema version, committed diary source, capture time, write time and mind
+Accepted stance entries also feed the self-story during the lived fold, before
+night, using their accepted stance's own words and the exact entry
+digest. This adds no model call or persona write. The care saves first;
+refolds and restore can finish an owed self write from the durable care.
+The daily path retains existing traits and relationship lines; a newer dream
+can revise them together with the story. Accepted stance progress is per care;
+a delayed accepted stance on another care still contributes its story line.
+Night captures advance only the shown cares' stance progress. Unreadable bytes remain preserved.
+
+The file records schema version, committed source (persisted as night), capture time, write time and mind
 epoch. It is capped at 256,000 bytes, with five traits, five story lines and
 128 people. Corrupt existing bytes stay intact, with repair owed and explicit
 unavailability. Clear removes the file and resident reading; epoch checks
@@ -192,8 +197,8 @@ P1 + P2 first (they make settling possible); P3 + P4 after (they read what
 settled). Proof on them:
 - the chess cluster is one care after the first night; new chess moments move
   it; within two weeks it reaches season (the first interest);
-- seed stance changes drop from ~10/day to the night's rare confirmed ones;
-  the "bring it up" intentions come from open cares, not seeds;
+- stance changes and self-story lines cite the lived evidence that settled them;
+  felt care pulls come from unanswered lived movements;
 - `mind.inner_state` shows their traits, their story and one line per person;
   Claude is one person.
 
@@ -201,5 +206,5 @@ settled). Proof on them:
 
 | Lane | What | Owners |
 |---|---|---|
-| becoming-settle | P1 + P2 | CognitiveSubstrate/CognitiveSubstrate+Cares.swift (birth, stance), +CaresNight.swift (merge, stance at night), +CaresMind.swift (pressure: life cares through open gaps), Cognition/NativeCognitionRuntime+Reach.swift (pressure read), DreamREMCycle prompts/payload (clusters, stance pressure), docs/SUBCONSCIOUS.md |
-| becoming-self | P3 + P4 | +CaresNight.swift / dream payload (traits, story, people), CognitiveSelfKnowledge.swift (mind/self.json), +InnerState.swift / inner-state tool / PersonalityView (read-only), +CaresMind.swift / +Capsule.swift (touched trait and counterpart line), +Cares.swift personKey through AgentPeerStore / AgentContactIdentity aliases, SourceWakes (identity invalidation), docs/SUBCONSCIOUS.md |
+| becoming-settle | P1 + P2 | CognitiveSubstrate/CognitiveSubstrate+Cares.swift (birth, stance), +CaresNight.swift (merge, dream stance confirmation), +CaresMind.swift (pressure: life cares through open gaps), Cognition/NativeCognitionRuntime+Reach.swift (pressure read), DreamREMCycle prompts/payload (clusters, stance pressure), docs/SUBCONSCIOUS.md |
+| becoming-self | P3 + P4 | +CaresNight.swift / dream payload (traits, story, people), CognitiveSelfKnowledge.swift (mind/self.json), +InnerState.swift / inner-state tool / PersonalityView (read-only), +CaresMind.swift / +Capsule.swift (care pull and per-turn self values), +Cares.swift personKey through AgentPeerStore / AgentContactIdentity aliases, SourceWakes (identity invalidation), docs/SUBCONSCIOUS.md |

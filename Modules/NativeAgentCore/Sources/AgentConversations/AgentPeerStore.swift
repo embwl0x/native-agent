@@ -263,6 +263,8 @@ public enum AgentPeerStoreError: String, Error, LocalizedError, Sendable {
 /// Unreadable or invalid peer rows fail closed instead of being erased by mutation. All mutations use the canonical sidecar lock and preserve the store’s
 /// documented privacy boundaries.
 public struct AgentPeerStore: Sendable {
+    /// A contact's identity, grant or credential binding changed; traffic timestamps do not change memory attribution.
+    public static let trustDidChange = Notification.Name("AgentPeerStore.trustDidChange")
     public static let maximumContacts = 128
     public static let maximumNameLength = 120
     public static let maximumEndpointLength = 2048
@@ -277,6 +279,15 @@ public struct AgentPeerStore: Sendable {
     public func list() throws -> [AgentPeerContact] {
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) { try read() }
+    }
+
+    /// Contact names and handles resolve through the saved address book, independently of reachability.
+    public func references(named name: String) throws -> Set<String> {
+        Set(try list().filter {
+            name.caseInsensitiveCompare("peer:" + $0.id) == .orderedSame || $0.id == name.lowercased()
+                || $0.name.caseInsensitiveCompare(name) == .orderedSame
+                || ($0.handles ?? []).contains { $0.caseInsensitiveCompare(name) == .orderedSame }
+        }.map { peer in peer.handles?.first { $0.caseInsensitiveCompare(name) == .orderedSame } ?? "peer:" + peer.id })
     }
 
     /// Saved contacts for turn orientation; reachability never removes a contact.
@@ -294,6 +305,8 @@ public struct AgentPeerStore: Sendable {
             return try result.get()
         }
         let summaries = peers.map { peer in
+            let waits = AgentContactHealth.checkIn(peer) == nil ? ""
+                : "; messages wait for their next check-in, so sending does not interrupt them"
             let observed = health["peer:" + peer.id]
             let available: Bool
             switch AgentPeerCredentials.availability(peer, peers: peers, readCredential: credential) {
@@ -301,14 +314,14 @@ public struct AgentPeerStore: Sendable {
             case .failure(let failure):
                 return """
                     \(peer.name) (reachability: unavailable; credential error: \(failure.localizedDescription); trusted: \
-                    \(peer.elevationAllowed ? "on" : "off"))
+                    \(peer.elevationAllowed ? "on" : "off")\(waits))
                     """
             }
             let unavailable = peer.grokSetup == "disconnected" || peer.unavailableAt != nil
                 || !available
             let reachability = unavailable ? "unavailable"
                 : observed?.current == true ? observed!.replyStatus.replacingOccurrences(of: "_", with: " ") : "not checked"
-            return "\(peer.name) (reachability: \(reachability); trusted: \(peer.elevationAllowed ? "on" : "off"))"
+            return "\(peer.name) (reachability: \(reachability); trusted: \(peer.elevationAllowed ? "on" : "off")\(waits))"
         }.sorted()
         TurnTraceBus.fireFromContext(kind: "context.contacts.summary", payload: .object([
             "elapsedMs": .int(Int64((DispatchTime.now().uptimeNanoseconds &- start) / 1_000_000)),
@@ -745,11 +758,32 @@ public struct AgentPeerStore: Sendable {
     }
 
     private func write(_ peers: [AgentPeerContact]) throws {
+        let previous = try read()
+        guard peers != previous else { return }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(peers)
         guard data.count <= Self.maximumConfigurationBytes else { throw AgentPeerStoreError.configurationTooLarge.failure(file: fileURL) }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
+        if Self.trustIdentity(peers) != Self.trustIdentity(previous) {
+            NotificationCenter.default.post(name: Self.trustDidChange, object: fileURL)
+            let locator = fileURL.standardizedFileURL.path
+            Task {
+                await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
+                    namespace: "agent-trust", stableID: "contacts", operation: .changed,
+                    canonicalLocator: locator, reason: "contact_trust_changed"))
+            }
+        }
+    }
+
+    /// Compare the canonical fields read by principal/name resolution and credential-backed grants, without persisting another truth.
+    private static func trustIdentity(_ peers: [AgentPeerContact]) -> JSONValue {
+        .array(peers.sorted { $0.id < $1.id }.map { peer in
+            .object(["id": .string(peer.id), "name": .string(peer.name), "who": peer.who.map(JSONValue.string) ?? .null,
+                     "handles": .array((peer.handles ?? []).sorted().map(JSONValue.string)),
+                     "transport": .string(peer.transport.rawValue), "credentialKey": peer.credentialKey.map(JSONValue.string) ?? .null,
+                     "allowed": .bool(peer.elevationAllowed)])
+        })
     }
 }
 

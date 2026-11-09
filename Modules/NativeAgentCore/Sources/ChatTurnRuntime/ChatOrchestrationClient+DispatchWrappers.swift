@@ -23,11 +23,11 @@ import MacIntegration
 import StandingBots
 // Blueprint: | `ChatOrchestrationClient+DispatchWrappers.swift` | File-access gates; exact-call consent carried to dispatch; audit failures owe repairs |
 
-/// TrustCenter judges posture and declared class once. This wrapper carries file access and refuses unknown modes or pathful reads under `none`.
-final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValidating, Sendable {
-    private let inner: any ToolDispatchClient
-    private let mode: Mode
+/// Carry request ceilings to Trust's canonical refusal before any inner work.
+final class FileAccessGatedDispatcher: ExpansionToolDispatchClient, PreApprovalToolValidating, Sendable {
+    private let inner: any ExpansionToolDispatchClient
     private let fileAccess: String
+    private let dataRoot: URL
 
     /// Refuse through the same file-access gate before any inner preview
     /// inspects a target, then carry the inner dispatcher's checks through.
@@ -35,9 +35,12 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         turn: Turn, invocation: ChatToolInvocation,
         tool: String, input: [String: JSONValue], surface: String
     ) async -> JSONValue? {
-        if let error = fileAccessRefusal(tool: tool, input: input) {
-            return ChatToolOutcome.failure(error: error, tool: tool)
-        }
+        let turn = turn.with(\.fileAccess, fileAccess)
+        do {
+            if let error = try PermissionLaw.requestFileAccessRefusal(tool: tool, input: input, turn: turn) {
+                return ChatToolOutcome.failure(error: error, tool: tool)
+            }
+        } catch { return ChatToolOutcome.failure(error: error, tool: tool) }
         if let validating = inner as? any PreApprovalToolValidating {
             return await validating.preApprovalRefusal(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
         }
@@ -67,8 +70,7 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         }
     }
 
-    /// Read the user's saved posture for every turn; a request can only restrict it.
-    /// Synced read-only already participates in Trust's law; a caller's own read-only restriction still fences its chain.
+    /// Scalar presentation of the saved posture. The turn intersects this with the original request; the label alone is never its authority.
     static func sharedFileAccess(_ requested: String) -> String {
         let saved = UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto"
         let savedMode = Mode(saved), requestedMode = Mode(requested)
@@ -79,40 +81,31 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         return savedMode == .readOnly ? "auto" : saved
     }
 
-    init(inner: any ToolDispatchClient, fileAccess: String) {
+    init(inner: any ExpansionToolDispatchClient, fileAccess: String, dataRoot: URL) {
         self.inner = inner
-        self.mode = Mode(fileAccess)
         self.fileAccess = fileAccess
-    }
-
-    /// Under `none`, a pathful Mac read opens a file and must be refused.
-    private func isPathfulReadUnderNoFileAccess(
-        tool: String, input: [String: JSONValue]
-    ) -> Bool {
-        guard mode == .none, tool.lowercased() == "read" else { return false }
-        guard case .string(let path)? = input["path"] else { return false }
-        return !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private func fileAccessRefusal(tool: String, input: [String: JSONValue]) -> ToolFailureError? {
-        let source = "effective request fileAccess=\(fileAccess); saved chatFileAccess=\(UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto")"
-        if mode == .invalid {
-            return ToolFailureError("\(source) is unrecognized; no file access was inferred.", argumentPath: "request.fileAccess",
-                accepted: ICloudChatFileAccessPolicy.acceptedIDs.sorted().joined(separator: ", "), effects: .none)
-        }
-        if isPathfulReadUnderNoFileAccess(tool: tool, input: input) {
-            return ToolFailureError("""
-                \(source) blocks \(tool) with an explicit path. The request issuer must resubmit with file access; changing the requested operation \
-                to a screen read would not repair this file read.
-                """, effects: .none)
-        }
-        return nil
+        self.dataRoot = dataRoot
     }
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
-        if let error = fileAccessRefusal(tool: tool, input: input) { throw error }
-        return try await holding(turn.with(\.fileAccess, fileAccess)) { turn in
-            try await inner.dispatch(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
+        let turn = turn.with(\.fileAccess, fileAccess)
+        do {
+            if let error = try PermissionLaw.requestFileAccessRefusal(tool: tool, input: input, turn: turn) { throw error }
+            return try await holding(turn) { turn in
+                try await inner.dispatch(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
+            }
+        } catch {
+            guard ChatToolDispatchTracer.abilityName(tool: tool, input: input) != nil else { throw error }
+            var refusal = ChatToolOutcome.failure(error: error, tool: tool).objectValue ?? [:]
+            refusal["checker"] = .string("request_file_access")
+            return await ChatToolDispatchTracer.traceUndispatched(turn: turn, tool: tool, input: input, surface: surface,
+                result: .object(refusal), dataRoot: dataRoot)
+        }
+    }
+
+    func readAhead(surface: String, session: String?, turn: Turn, work: ChatTurnWork) async -> JSONValue? {
+        await holding(turn.with(\.fileAccess, fileAccess)) { turn in
+            await inner.readAhead(surface: surface, session: session, turn: turn, work: work)
         }
     }
 
@@ -226,13 +219,17 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                       let session = verifiedSessionId else { return result }
                 let arguments = try JSONValue.object(input).serialize(pretty: false)
                 let blocked = ToolNameAliases.ranTool(tool, input: input) != InlineInteractionWire.toolName
-                let retained = try await SwiftNativeChatOrchestrationClient.fileInlineInteraction(
+                let filed = try await SwiftNativeChatOrchestrationClient.fileInlineInteraction(
                     need, sessionID: session, toolName: blocked ? tool : nil,
                     toolArgumentsJSON: blocked && SwiftNativeChatOrchestrationClient.redactedPersistedToolInput(tool: tool, json: arguments,
                         turn: turn) == arguments
                         ? arguments : nil,
                     requestingTool: tool, origin: TurnEnvelope.current(turn: turn, surface: surface), dataRoot: securityCenter.dataRoot,turn: turn)
-                NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: session)
+                let retained = filed.card
+                if blocked, PermissionLaw.personDecided(tool: tool, input: input, turn: turn) {
+                    PersonParkedCalls.park(retained.id, tool: tool, input: input)
+                }
+                if filed.changed { NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: session) }
                 guard case .object(var fields) = result,
                       let encoded = InlineInteractionNeed.encode(retained) else {
                     throw ToolFailureError("The retained card could not be returned.", effects: .none, code: "card_encoding_failed")
@@ -311,6 +308,8 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
     }
 
     private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String, turn: Turn, work: ChatTurnWork) async throws -> JSONValue {
+        // The person's act admits its own call once per form in one run; every other call here is judged as the agent's.
+        let turn = PermissionLaw.admitting(tool: tool, input: input, turn: turn)
         if let refusal = await inner.unrecognizedAppActionRefusal(tool: tool, input: input, surface: surface,
             turn: turn, invocation: work.invocation) { return refusal }
         // SecurityCenter persists evaluated arguments: pass injection count/digest
@@ -526,6 +525,9 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             }
         }
         try Task.checkCancellation()
+        // An owner that needs the person's yes for this exact call says so in its reply (`needs_person`, with its words): the call then asks
+        // as a gate's ask does, and the person's Approve replays it as their own act. The person's own act, or its replay, never asks again.
+        while true {
         switch decision {
         case .allow:
             if work.admissionOnly {
@@ -545,11 +547,23 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 injectionApprovalID: injectionReplayApprovalID ?? (approvedReplayAuthorizes ? approvedReplay?.approvalID : nil),
                 // Reaching .allow IS the person's go-ahead: their approval, or Full Mac.
                 personApprovedHost: namedConnect,
-                 turn: turn, work: work)
+                // A verified replay of the person's approved card runs as their decision of this exact call, levers included.
+                turn: approvedReplay.flatMap { replay in approvedReplayAuthorizes
+                    ? turn.with(\.personAct, PersonAct(by: .card(id: replay.approvalID), tool: tool, input: input, spent: [.call])) : nil }
+                    ?? turn,
+                work: work)
             let reply = ToolResult(result)
+            // Only the stem's own verbs ask this way (an app action that is no part's, connector's or folded tool's), so no reply a part,
+            // a peer or a remote tool writes can word the person's card.
+            if reply.said("needs_person"), !approvedReplayAuthorizes, turn.personAct == nil, input["preview"] != .bool(true), tool == "app",
+               let asking = input["action"]?.stringValue, AppActionBinding.declaredBinding(asking)?.folded == false,
+               let words = result.objectValue?["detail"]?.stringValue, !words.isEmpty {
+                decision = .requireApproval(reason: words)
+                continue
+            }
             if let decidedRequester, !trustedBridge, tool != "app",
                reply.outcome == .succeeded {
-                HarnessDecidedRow.post(turn: turn, requester: decidedRequester, tool: tool, sessionID: verifiedSessionId,
+                BodyDecidedRow.post(turn: turn, requester: decidedRequester, tool: tool, sessionID: verifiedSessionId,
                                       dataRoot: peerDirectoryDataRoot ?? defaultDataRoot(), ran: true)
             }
             return result
@@ -563,7 +577,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 return ChatToolOutcome.refusedBeforeRunning(.object(refusal.fields))
             }
             // A switch the user turned off refuses before any card, regardless of posture.
-            if let gate = SwiftToolDispatcher.macIntegrationAccess(forTool: tool) {
+            if let gate = try SwiftToolDispatcher.integrationGate(tool: tool, input: input, turn: turn) {
                 let root = peerDirectoryDataRoot ?? defaultDataRoot()
                 let store = root == defaultDataRoot() ? MacIntegrationPermissionStore.shared : MacIntegrationPermissionStore(dataRoot: root)
                 if let refusal = try await SwiftToolDispatcher.switchRefusal(integration: gate.integration, mode: gate.mode, store: store) {
@@ -617,12 +631,15 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             guard approvalFiler != nil, !work.admissionOnly || approvalFiler is any NonBlockingApprovalFiler else {
                 await audit(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
                 // Missing filers fail closed. User-chat profiles wire the canonical inbox; policy edits must never bypass TrustCenter.
-                throw AutonomyGateError.notRun(.approvalUnavailable)
+                return ToolNotRunStatus.approvalUnavailable.reporting(.object([
+                    "status": .string("refused"), "reason": .string("approval_unavailable"), "checker": .string("approval_admission"),
+                    "effects": .string("none"), "remedy": Repair.why(owner: "approval for this call", tap: "NativeAgent chat on Mac, phone or Telegram",
+                        instruction: "Make this request in a conversation with an approval inbox; no card was filed here and policy edits cannot grant it.")]))
             }
             // Persist and display injection arguments as count + digest;
             // execution characters stay only in this process's memory.
             let approvalPayloadInput = MacInjectionArgRedaction.redacted(tool: tool, input: input, turn: turn)
-            let injectionSecrets = MacInjectionArgRedaction.extractSecrets(tool: tool, input: input)
+            let injectionSecrets = try MacInjectionArgRedaction.extractSecrets(tool: tool, input: input, turn: turn)
             if let nonBlocking = approvalFiler as? (any NonBlockingApprovalFiler) {
                 let payload = JSONValue.object(approvalPayloadInput)
                 let approvalId = try await withFilingSession(turn: turn) { turn in
@@ -715,14 +732,25 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                     surface: surface,
                     injectionApprovalID: mintApprovalID,
                     personApprovedHost: namedConnect,
-                 turn: turn, work: work)
+                    // The person approved this exact call on its card: it runs as their decision, levers included.
+                    turn: resolved.approvalID.map { id in
+                        turn.with(\.personAct, PersonAct(by: .card(id: id), tool: tool, input: input, spent: [.call])) } ?? turn,
+                    work: work)
             case .deny(let r):
                 await audit(Self.securityEnvelope(envelope, decision: .block, reason: r))
-                throw AutonomyGateError.notRun(resolved.notRunStatus ?? .blocked)
+                var refused: [String: JSONValue] = ["status": .string("refused"), "reason": .string(r), "gate_reason": .string(r),
+                    "checker": .string("approval_admission"), "effects": .string("none"),
+                    "remedy": Repair.terminal(instruction: "Respect the reported approval outcome. Inspect the retained card before another request; "
+                        + "do not repeat prior effects to answer an unresolved outcome.")]
+                refused["approvalId"] = resolved.approvalID.map(JSONValue.string)
+                if let status = resolved.notRunStatus { return status.reporting(.object(refused), tool: tool) }
+                return .object(refused)
             case .requireApproval(let r):
                 await audit(Self.securityEnvelope(envelope, decision: .ask, reason: r))
-                throw AutonomyGateError.toolDenied(reason: r)
+                throw AutonomyGateError.toolDenied(reason: r, remedy: Repair.why(owner: "approval for this call",
+                    tap: "NativeAgent chat on Mac, phone or Telegram", instruction: "Inspect the existing approval request before asking again."))
             }
+        }
         }
     }
 

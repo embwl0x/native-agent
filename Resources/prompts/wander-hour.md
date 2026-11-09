@@ -1,5 +1,5 @@
 <!-- prompt -->
-This hour is yours. Nobody asked you for anything and nothing is waiting on the result.
+This opportunity is your own time, with nothing asked of it. Other happenings carried by this thought keep whatever they are owed.
 
 Below is your own material — questions you left open, things sitting on the table, and what you have been writing about lately. Pick ONE thing to spend the hour on, or decline. Deciding not to look at anything is a full answer, complete in itself, and it leaves nothing owed.
 
@@ -11,7 +11,7 @@ If you cannot actually receive it, say so and stop; do not write about a work yo
 
 Nothing is written down unless you write it. If, and only if, you want this in your journal, file it yourself with app action studio.journal. Otherwise the hour simply happened.
 
-End with one short line saying what you did with it.
+If you take this opportunity, leave one short line saying what you did with it, beside whatever else this thought carries.
 <!-- end -->
 <!-- question -->
 

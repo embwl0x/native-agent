@@ -39,7 +39,7 @@ struct CoalescingDeadline {
         task = Task {
             if delay > 0 {
                 let nanos = UInt64(min(delay, clampSeconds) * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: nanos)
+                do { try await Task.sleep(nanoseconds: nanos) } catch { return }
             }
             guard !Task.isCancelled else { return }
             await fire()
@@ -54,10 +54,6 @@ struct CoalescingDeadline {
 }
 
 extension NativeCognitionRuntime {
-    private static let cognitionMaintenanceRetryDelay: TimeInterval = 60 * 60
-    /// Bound retries during commit contention so an already-due maintenance deadline cannot spin against a slow SQLite write.
-    private static let cognitionMaintenanceContentionRetryDelay: TimeInterval = 30
-
     /// The microcycle beats each settled pass and each failure under the judge's news window. A wake whose dirt an earlier pass already settled
     /// decides nothing and writes no beat.
     @discardableResult
@@ -93,20 +89,32 @@ extension NativeCognitionRuntime {
         // After terminal snapshot, late replay or organism arrivals cannot arm new microcycles.
         guard !isFlushedForTermination else { return }
         microcycleTelemetry.scheduledSignalCount &+= 1
-        if microcycleTimer.isPending {
+        if microcycleTask != nil {
             microcycleTelemetry.coalescedReplacementCount &+= 1
         }
         microcycleTelemetry.lastScheduledAt = now()
         microcycleTelemetry.lastReason = String(reason.prefix(160))
-        microcycleTimer.schedule(delay: .seconds(Self.microcycleCoalescingDelay)) { [weak self] generation in
-            await self?.runScheduledMicrocycle(generation: generation, reason: reason)
+        microcycleDirty = true
+        guard microcycleTask == nil else { return }
+        microcycleTask = Task { [weak self] in
+            await self?.drainMicrocycles()
         }
     }
 
-    private func runScheduledMicrocycle(generation: UInt64, reason: String) async {
-        guard !isFlushedForTermination,
-              microcycleTimer.take(generation) else { return }
-        // Move this generation in flight before awaiting persistence so reentrant events start distinct pending work.
+    private func drainMicrocycles() async {
+        while microcycleDirty, !isFlushedForTermination, !Task.isCancelled {
+            microcycleDirty = false
+            guard let reason = microcycleTelemetry.lastReason else {
+                let failure = "The dirty microcycle has no source reason."
+                OrganJudge.beat("microcycle", .failed, note: failure)
+                break
+            }
+            await runScheduledMicrocycle(reason: reason)
+        }
+        microcycleTask = nil
+    }
+
+    private func runScheduledMicrocycle(reason: String) async {
         let startedAt = now()
         let monotonicStartedAt = monotonicNowNanoseconds()
         microcycleTelemetry.executedCount &+= 1
@@ -162,17 +170,14 @@ extension NativeCognitionRuntime {
             let configuration = await substrate.configurationSnapshot()
             let persistenceEnabled = configuration.persistenceEnabled
             switch try await substrate.runMaintenanceChecked(reason: reason, satisfyWait: runNow) {
-            case .ran: break
+            case .ran: maintenanceFailure = nil
             case .disabled:
                 return .skipped(reason: LoopTickOutcome.offPrefix + "cognition disabled")
             case .notDue:
                 await rescheduleCognitionMaintenanceDeadline()
                 return .notNeeded("cognitive maintenance not due yet")
             case .busy:
-                // A pass already holds maintenance: retry after the bounded contention delay.
-                await rescheduleCognitionMaintenanceDeadline(
-                    notBefore: now().addingTimeInterval(Self.cognitionMaintenanceContentionRetryDelay)
-                )
+                // The admitted pass reprojects its next occurrence on settlement.
                 return .skipped(reason: "cognitive maintenance busy with another pass")
             }
             await rescheduleCognitionMaintenanceDeadline()
@@ -181,9 +186,8 @@ extension NativeCognitionRuntime {
                 ? "cognitive maintenance checkpoint and receipt are durable"
                 : "cognitive maintenance completed in memory-only mode")
         } catch {
-            await rescheduleCognitionMaintenanceDeadline(
-                notBefore: now().addingTimeInterval(Self.cognitionMaintenanceRetryDelay)
-            )
+            maintenanceFailure = error.localizedDescription
+            cognitionDeadline.invalidate()
             publishRuntimeChange(reason: "maintenance:failed")
             return .failed(error: "cognitive maintenance failed: \(error.localizedDescription)")
         }
@@ -195,11 +199,6 @@ extension NativeCognitionRuntime {
     func rescheduleResidualRepairDeadline() async {
         // Termination prevents every path from rearming this deadline.
         guard !isFlushedForTermination else { return }
-        if let due = sourceWakes.pursuitNextAt, due <= now() {
-            sourceWakes.pursuitNextAt = nil
-            await startPursuitRefresh()
-            guard !isFlushedForTermination else { return }
-        }
         let generation = residualDeadline.invalidate()
         let opportunity = await organismKernel.residualRepairOpportunity()
         guard generation == residualDeadline.generation else { return }
@@ -208,16 +207,8 @@ extension NativeCognitionRuntime {
         // Use source dirtiness and real horizon boundaries to gate forward-register reads.
         considerHorizonExpectations()
         considerRhythm()
-        // Disabled Studio hours perform no reads or writes.
-        considerStudioWander()
-        // Reach invalidation, quiet, expiry and cooldown share this deadline.
-        considerReach()
-        let carried = await considerCarried()
-        beat(.carried, carried.result)
-        let carriedDeadline = carried.next
-        guard generation == residualDeadline.generation else { return }
         // Prediction expiry only rederives pressure and quiet-repair scheduling; it cannot run cognition or call a provider.
-        guard let deadline = [opportunity.nextWakeAt ?? opportunity.nextRepairAt, carriedDeadline, nextCognitiveSourceWake(at: now())]
+        guard let deadline = [opportunity.nextWakeAt ?? opportunity.nextRepairAt, nextCognitiveSourceWake(at: now())]
             .compactMap({ $0 }).min() else {
             return
         }
@@ -268,23 +259,14 @@ extension NativeCognitionRuntime {
 
     /// Project one wake from canonical substrate deadlines; cognition remains the sole scheduling owner.
     func rescheduleCognitionMaintenanceDeadline(
-        notBefore: Date? = nil,
         force: Bool = false
     ) async {
         // Termination prevents every path from rearming this deadline.
-        guard !isFlushedForTermination else { return }
+        guard !isFlushedForTermination, maintenanceFailure == nil else { return }
         let currentGeneration = cognitionDeadline.generation
         let opportunity = await substrate.maintenanceOpportunity()
         guard !isFlushedForTermination, cognitionDeadline.generation == currentGeneration else { return }
-        let projectedDeadline = opportunity.nextMaintenanceAt
-        let deadline: Date
-        if let projectedDeadline,
-           let notBefore,
-           notBefore > projectedDeadline {
-            deadline = notBefore
-        } else if let projectedDeadline {
-            deadline = projectedDeadline
-        } else {
+        guard let deadline = opportunity.nextMaintenanceAt else {
             cognitionDeadline.invalidate()
             return
         }
@@ -345,7 +327,6 @@ extension NativeCognitionRuntime {
         guard bootstrapTask != nil, !isFlushedForTermination else { return }
         sourceWakes.canonDirty = true
         sourceWakes.horizonDirty = true
-        sourceWakes.reachDirty = true
         sourceWakes.clockDirty = true
         await rescheduleCognitionMaintenanceDeadline(force: true)
         await rescheduleResidualRepairDeadline()

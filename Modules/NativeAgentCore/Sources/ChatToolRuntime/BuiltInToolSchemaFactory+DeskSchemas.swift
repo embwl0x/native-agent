@@ -266,9 +266,10 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(name: "desk_close", toolClass: .write, capabilities: ["ledger_write", "tool_call"],
                 description: """
-                    Close an exact Desk item when the owner explicitly asks to close or mark it done, or fresh canonical evidence proves its \
-                    tracked outcome. The owner's explicit instruction is sufficient even if earlier notes say work remains; record that instruction \
-                    in reason without claiming the underlying work happened. Otherwise put the specific commit/receipt/observed result in reason; \
+                    Close an exact Desk item with reason: the owner's explicit instruction to close or mark it done, or a fresh canonical \
+                    commit/receipt/observed result proving its tracked outcome. The owner's explicit instruction is sufficient even if earlier \
+                    notes say work remains; put that instruction in reason without claiming the underlying work happened. Otherwise reason must \
+                    name the specific commit/receipt/observed result; \
                     never use fuzzy title matches, execution completion alone or unattributed commits. Sets done (cancelled if canceled=true); \
                     stays visible briefly, then becomes archive-eligible.
                     """,

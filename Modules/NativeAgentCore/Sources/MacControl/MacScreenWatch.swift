@@ -141,6 +141,9 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     static func start(app: String, dataRoot: URL, pid: Int32, window frame: MacAXFrame, sighting: MacFourVerbs.Sighting, request: Request,
                       verbs: (@Sendable () async throws -> MacFourVerbs)?,
                       turn: Turn, context: MacOperationContext, authority: @escaping @Sendable () async throws -> Bool) async throws -> MacScreenWatch {
+        guard !PersonOnlyWindows.isOwnProcess(pid) else {
+            throw SenseFailure(code: "person_only_window", message: "NativeAgent's own window is person-only; use app pages to read its state.")
+        }
         guard CGPreflightScreenCaptureAccess() else {
             throw SenseFailure(code: "screen_recording_not_trusted",
                 message: "Screen Recording is off for NativeAgent. System Settings > Privacy & Security > Screen Recording > NativeAgent switch on.",

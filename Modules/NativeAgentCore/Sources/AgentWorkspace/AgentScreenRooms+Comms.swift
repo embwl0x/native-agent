@@ -10,21 +10,21 @@ extension AgentScreen {
 
     static let commsDestinations: [AgentWorkspaceDestination] = [
         .init(id: "notes", title: "Notes", summary: "Apple Notes: recent notes, find, read, add.",
-              tool: "notes_search", input: ["limit": .int(12)], tools: ["notes_create"]),
+              tool: "notes.search", input: ["limit": .int(12)], tools: ["notes.create"]),
         .init(id: "contacts", title: "Contacts", summary: "Mac Contacts: someone's number or email.",
               tool: "contacts_search", searchField: "query", tools: ["contacts_create_or_update"]),
     ]
     static let commsFamily: [String: String] = [
-        "mail_list_recent": "mail", "mail_search": "mail", "messages_recent_threads": "messages",
-        "notes_search": "notes", "contacts_search": "contacts",
+        "mail.recent": "mail", "mail.search": "mail", "messages.recent": "messages",
+        "notes.search": "notes", "contacts_search": "contacts",
     ]
-    static let commsReadTools: Set<String> = ["notes_search", "contacts_search"]
+    static let commsReadTools: Set<String> = ["notes.search", "contacts_search"]
 
     static let commsItemVerbs: [String: [(name: String, about: String, tool: String)]] = [
-        "mail": [("mail.N.draft", "saves an unsent reply in Mail → Drafts (text)", "mail_draft"), (
-            "mail.N.reply", "sends a reply now (text)", "mail_reply"), (
-            "mail.N.archive", "archive it", "mail_archive"), ("mail.N.mark-read", "mark it read", "mail_mark_read")],
-        "notes": [("notes.N.append", "add to it (text)", "notes_update")],
+        "mail": [("mail.N.draft", "saves an unsent reply in Mail → Drafts (text)", "mail.draft"), (
+            "mail.N.reply", "sends a reply now (text)", "mail.reply"), (
+            "mail.N.archive", "archive it", "mail.archive"), ("mail.N.mark-read", "mark it read", "mail.mark_read")],
+        "notes": [("notes.N.append", "add to it (text)", "notes.update")],
     ]
     /// Bind numbers to message/contact identity, never row position; references from prior reads must still select the same item.
     static let numbersNote = "numbers stay with each item, gaps are normal"
@@ -103,7 +103,7 @@ extension AgentScreen {
             .object(root.filter { !["messages", "notes", "contacts"].contains($0.key) })
         } else { result }
         switch tool {
-        case "notes_search":
+        case "notes.search":
             // The header carries complete counts; partial reads retain their repair notice.
             let noteContent: JSONValue = if case .object(let root) = content {
                 .object(root.filter { $0.key != "message" || root["status"] == .string("partial") })
@@ -116,7 +116,7 @@ extension AgentScreen {
                         "status": .string("unavailable"), "reason": .string("note_identity_unavailable"),
                         "detail": .string("This Notes row has no recorded ID; it cannot be opened by title."),
                         "source": .object(row), "effects": .string("none"),
-                        "remedy": Repair.remedy(owner: "notes_search", nextCall: nil, tap: nil,
+                        "remedy": Repair.remedy(owner: "notes.search", nextCall: nil, tap: nil,
                             instruction: "Repair the Notes source's missing identifier, then refresh Notes.")
                     ]), actions: [])
                 }
@@ -124,11 +124,11 @@ extension AgentScreen {
                 let about: [String: JSONValue] = ["kind": row["folder"] ?? .null, "date": row["modified_at"] ?? .null,
                                                   "snippet": row["body_preview"] ?? row["body"] ?? .null]
                 return .init(title: name, content: .object(about),
-                    actions: [.init(label: "Read", action: .open(.record(tool: "notes_search", input: by, title: name)))])
+                    actions: [.init(label: "Read", action: .open(.record(tool: "notes.search", input: by, title: name)))])
             }, actions: [
-                .init(label: "Find a note", action: .perform(tool: "notes_search", input: [:], title: "Find a note", textField: "query", isEffect: false),
+                .init(label: "Find a note", action: .perform(tool: "notes.search", input: [:], title: "Find a note", textField: "query", isEffect: false),
                     needsText: true),
-                .init(label: "New note", action: .configure(tool: "notes_create", input: [:], title: "New note")),
+                .init(label: "New note", action: .configure(tool: "notes.create", input: [:], title: "New note")),
             ])
         case "contacts_search":
             return .init(title: "Contacts", content: content, items: rows("contacts").compactMap { row in
@@ -150,7 +150,7 @@ extension AgentScreen {
     // MARK: Rooms
 
     static func noteAppend(id: String, title: String) -> AgentWorkspaceAction {
-        .perform(tool: "notes_update", input: ["id": .string(id)], title: "Add to " + title, textField: "append", isEffect: true)
+        .perform(tool: "notes.update", input: ["id": .string(id)], title: "Add to " + title, textField: "append", isEffect: true)
     }
 
     /// Preserve list and item room names; leave the current frame when no room applies.
@@ -164,9 +164,9 @@ extension AgentScreen {
             guard let family = commsFamily[tool] else { return nil }
             let object: [String: JSONValue] = if case .object(let row) = value { row } else { [:] }
             let single: Bool = switch tool {
-            case "mail_list_recent": input["message_id"] != nil
-            case "messages_recent_threads": input["thread_id"] != nil
-            case "notes_search": input["title"] != nil || input["id"] != nil
+            case "mail.recent": input["message_id"] != nil
+            case "messages.recent": input["thread_id"] != nil
+            case "notes.search": input["title"] != nil || input["id"] != nil
             case "contacts_search": input["identifier"] != nil
             default: false
             }
@@ -197,7 +197,7 @@ extension AgentScreen {
             }
             var header: [String] = [name], sections: [[String]] = []
             switch tool {
-            case "mail_list_recent":
+            case "mail.recent":
                 guard let row = rowsOf("messages").first else { return nil }
                 let bound = input.filter { MailReadLocator.fields.union(["mailbox"]).contains($0.key) }
                 header += [who(text(row["sender"])), when(text(row["date"]), now: now)] + (row["unread"] == .bool(true) ? ["unread"] : [])
@@ -209,7 +209,7 @@ extension AgentScreen {
                 if !attachments.isEmpty { sections.append(section("ATTACHMENTS", attachments)) }
                 if start + used < total {
                     sections.append(["+\(total - start - used) more characters · \(name).more"])
-                    keep[name + ".more"] = .open(.record(tool: "mail_list_recent", input: bound.merging(["body_offset": .int(Int64(start + used))]) { _,
+                    keep[name + ".more"] = .open(.record(tool: "mail.recent", input: bound.merging(["body_offset": .int(Int64(start + used))]) { _,
                         new in new }, title: title))
                 }
                 let actions = AgentWorkspaceMail.itemActions(input: bound, title: title)
@@ -218,7 +218,7 @@ extension AgentScreen {
                         "move it to Trash")] {
                     if let action = actions[word] { verb(word, about, action) }
                 }
-            case "messages_recent_threads":
+            case "messages.recent":
                 guard let thread = rowsOf("threads").first else { return nil }
                 let people: [[String: JSONValue]] = if case .array(let list)? = thread["participants"] {
                     list.compactMap { if case .object(let row) = $0 { row } else { nil } }
@@ -239,14 +239,14 @@ extension AgentScreen {
                 }
                 sections = [section("TALK", talk.isEmpty ? [clip(text(object["history_note"]) ?? "no messages to show", 110)] : talk)]
                 if let older = object["older_before_message_id"], let id = text(thread["thread_id"]) {
-                    keep[name + ".older"] = .open(.record(tool: "messages_recent_threads", input: ["thread_id": .string(id), "before_message_id": older],
+                    keep[name + ".older"] = .open(.record(tool: "messages.recent", input: ["thread_id": .string(id), "before_message_id": older],
                         title: title))
                     sections.append(["earlier messages · \(name).older"])
                 }
                 if let reply = AgentWorkspaceMessages.replyAction(thread, requested: text(input["thread_id"]), title: title) {
                     verb("reply", "sends a reply now in this thread (text)", reply)
                 }
-            case "notes_search":
+            case "notes.search":
                 guard let note = rowsOf("notes").first else { return nil }
                 header += [text(note["folder"]), when(text(note["modified_at"]), now: now)].compactMap { $0 }.filter { !$0.isEmpty }
                 // The Notes reader already elides the stored title line and returns raw offsets.
@@ -262,7 +262,7 @@ extension AgentScreen {
                     let next = start + body.prefix(used).utf16.count
                     if let total = int(note["body_total"]), next < total {
                         sections.append(["more text · \(name).more"])
-                        keep[name + ".more"] = .open(.record(tool: "notes_search", input: ["id": .string(id), "body_offset": .int(Int64(next))], title: title))
+                        keep[name + ".more"] = .open(.record(tool: "notes.search", input: ["id": .string(id), "body_offset": .int(Int64(next))], title: title))
                     }
                     verb("append", "add a line to it (text)", noteAppend(id: id, title: title))
                 }
@@ -273,12 +273,12 @@ extension AgentScreen {
                 sections = [section("PHONES", phones.isEmpty ? ["none"] : phones.prefix(4).map { clip($0, 40) }),
                             section("EMAILS", emails.isEmpty ? ["none"] : emails.prefix(4).map { clip($0, 60) })]
                 if let phone = values(card["phones"], labels: false).first {
-                    verb("text", "sends a text now to \(phones.count > 1 ? "the first number" : "them") (text)", .perform(tool: "messages_send", input: ["to"
+                    verb("text", "sends a text now to \(phones.count > 1 ? "the first number" : "them") (text)", .perform(tool: "messages.send", input: ["to"
                         : .string(phone)],
                         title: "Text " + title, textField: "body", isEffect: true))
                 }
                 if let email = values(card["emails"], labels: false).first {
-                    verb("email", "sends an email now (form)", .configure(tool: "mail_send", input: ["to": .string(email)], title: "Email " + title))
+                    verb("email", "sends an email now (form)", .configure(tool: "mail.send", input: ["to": .string(email)], title: "Email " + title))
                 }
                 if let id = text(card["identifier"]) {
                     verb("edit", "add a number or email (form)", .configure(tool: "contacts_create_or_update", input: ["identifier": .string(id)],
@@ -312,17 +312,17 @@ extension AgentScreen {
                     return .object(row)
                 }
                 let input: [String: JSONValue] = ["items": .array(items)]
-                if verb == "mail.read-batch" { return .action(.open(.record(tool: "mail_read_batch", input: input, title: "Selected email"))) }
-                return .action(.perform(tool: "mail_triage_batch", input: input, title: "Triage selected email", textField: nil, isEffect: true))
+                if verb == "mail.read-batch" { return .action(.open(.record(tool: "mail.read", input: input, title: "Selected email"))) }
+                return .action(.perform(tool: "mail.triage", input: input, title: "Triage selected email", textField: nil, isEffect: true))
             }
             let parts = raw.split(separator: ".").map(String.init)
             guard parts.count == 3, let n = Int(parts[1]), commsItemVerbs.keys.contains(parts[0]) || parts[0] == "messages",
                   let place = try itemPlace(workspace: workspace, parts[0], n, dataRoot: dataRoot), case .record(let tool, let input,
                       let title) = place else { return nil }
-            if tool == "mail_list_recent", let action = AgentWorkspaceMail.itemActions(input: input, title: title)[parts[2]] {
+            if tool == "mail.recent", let action = AgentWorkspaceMail.itemActions(input: input, title: title)[parts[2]] {
                 return .action(action)
             }
-            if tool == "notes_search", parts[2] == "append", case .string(let id)? = input["id"] {
+            if tool == "notes.search", parts[2] == "append", case .string(let id)? = input["id"] {
                 return .action(noteAppend(id: id, title: title))
             }
             return .action(.window(AgentWorkspaceNavigation.windowAction(place)))
@@ -339,7 +339,7 @@ extension AgentScreen {
         case .receipt(let name, _, let receipt, _): tool = name; result = receipt
         default: return nil
         }
-        guard ["mail_read_batch", "mail_triage_batch"].contains(tool), case .object(let root) = result,
+        guard ["mail.read", "mail.triage"].contains(tool), case .object(let root) = result,
               case .array(let items)? = root["items"] else { return nil }
         var keep: [String: AgentWorkspaceAction] = [:], verbs: [(String, String)] = []
         let sections: [[String]] = items.compactMap { item in
@@ -361,12 +361,12 @@ extension AgentScreen {
             }
             if let body = text(row["body"]) { lines += tabled(wrap(body, width: 100), row["body_tables"]) }
             lines += mailAttachmentLines(row)
-            if row["truncated"] == .bool(true), let end = row["body_end"], AgentWorkspaceReadiness.allows(workspace: workspace, tool: "mail_list_recent") {
+            if row["truncated"] == .bool(true), let end = row["body_end"], AgentWorkspaceReadiness.allows(workspace: workspace, tool: "mail.recent") {
                 lines.append("Body continues at " + (text(end) ?? "?"))
                 let bound = row.filter { MailReadLocator.fields.contains($0.key) }
                     .merging(["body_offset": end]) { _, new in new }
                 let more = name + ".more"
-                keep[more] = .open(.record(tool: "mail_list_recent", input: bound, title: text(row["subject"]) ?? "Email"))
+                keep[more] = .open(.record(tool: "mail.recent", input: bound, title: text(row["subject"]) ?? "Email"))
                 verbs.append((more, "read next body part"))
             }
             return lines.map { UntrustedText.neutralized($0) }
@@ -386,9 +386,6 @@ extension AgentScreen {
                 + (text(part["size"]).map { $0 + " bytes" } ?? "not downloaded")
         }
     }
-
-    /// Home uses the latest inbox-read badge without triggering an integration read.
-    static func mailPulse(dataRoot: URL, now: Date) -> String { AgentReadBadges.shared.pulse(dataRoot: dataRoot, now: now) }
 
     // MARK: Pieces
 
@@ -515,7 +512,7 @@ package final class AgentReadBadges: @unchecked Sendable {
     }
 
     func notable(workspace: WorkspaceOperation, dataRoot: URL, now: Date) -> String? {
-        guard AgentWorkspaceReadiness.allows(workspace: workspace, tool: "mail_search"),
+        guard AgentWorkspaceReadiness.allows(workspace: workspace, tool: "mail.search"),
               let previews = latest("mail.previews", dataRoot: dataRoot), !previews.words.isEmpty else { return nil }
         return "Last Mail read (\(AgentScreen.age(now.timeIntervalSince(previews.at))) ago); up to 4 previews, not a current inbox scan: " + previews.words
     }

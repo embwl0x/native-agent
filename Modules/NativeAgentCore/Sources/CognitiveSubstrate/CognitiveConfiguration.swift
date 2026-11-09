@@ -3,6 +3,9 @@ import Foundation
 // Blueprint: | `CognitiveConfiguration.swift` | `CognitiveConfiguration`: cognition settings, Observatory availability and reflection spend ceilings |
 
 public struct CognitiveConfiguration: Sendable, Equatable {
+    /// A turn's half-life in the agent's field; a conversation quiet longer than this has rested.
+    public static let turnHalfLife: TimeInterval = 60 * 60
+
     public var enabled: Bool
     public var persistenceEnabled: Bool
     public var capsuleInjectionEnabled: Bool
@@ -15,10 +18,8 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     public var maximumSummaryCharacters: Int
     public var maximumCapsuleCharacters: Int
     public var maximumWorkspaceItems: Int
-    /// Rolling 24h spend ceiling, independent of unresolved-load admission; quiet hours can leave room for a harder part of the day.
+    /// Rolling 24h spend ceiling; quiet hours can leave room for a harder part of the day.
     public var dailyReflectionCallBudget: Int
-    /// Only unattended reflection needs unresolved care pressure; a person's request is gated solely by the spend ceiling.
-    public var reflectionLoadThreshold: Double
     public var reflectionSurface: String
 
     public init(
@@ -28,14 +29,13 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         backgroundMicrocyclesEnabled: Bool = false,
         reflectiveCallsEnabled: Bool = false,
         maximumActiveNodes: Int = 256,
-        defaultDecayHalfLife: TimeInterval = 60 * 60,
+        defaultDecayHalfLife: TimeInterval = CognitiveConfiguration.turnHalfLife,
         maximumMetadataKeys: Int = 12,
         maximumMetadataStringCharacters: Int = 500,
         maximumSummaryCharacters: Int = 500,
         maximumCapsuleCharacters: Int = 1800,
         maximumWorkspaceItems: Int = 12,
         dailyReflectionCallBudget: Int = 0,
-        reflectionLoadThreshold: Double = 0.35,
         reflectionSurface: String = "cognition_reflection"
     ) {
         self.enabled = enabled
@@ -51,7 +51,6 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         self.maximumCapsuleCharacters = max(0, maximumCapsuleCharacters)
         self.maximumWorkspaceItems = max(1, maximumWorkspaceItems)
         self.dailyReflectionCallBudget = max(0, dailyReflectionCallBudget)
-        self.reflectionLoadThreshold = reflectionLoadThreshold.clamped01()
         self.reflectionSurface = Self.cleaned(reflectionSurface, fallback: "cognition_reflection")
     }
 

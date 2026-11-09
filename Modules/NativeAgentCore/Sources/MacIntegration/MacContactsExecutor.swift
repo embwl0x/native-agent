@@ -305,48 +305,6 @@ public enum MacContactsExecutor {
         }
     }
 
-    // MARK: - Numbers for handles (Messages)
-
-    /// Emails and explicit international numbers retain their whole identity. A local number has no region evidence here, so cannot name a person.
-    private static func handleKey(_ raw: String) -> String {
-        if raw.contains("@") { return raw.lowercased().trimmingCharacters(in: .whitespaces) }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("+"), trimmed.dropFirst().allSatisfy({ "0123456789 ()-.".contains($0) }) else { return "" }
-        let digits = trimmed.filter { "0123456789".contains($0) }
-        guard (7...15).contains(digits.count), digits.first != "0" else { return "" }
-        return "+" + digits
-    }
-
-    /// Use formatted numbers as participant and sender names so a reply retains the handle identity instead of selecting a namesake.
-    public static func naming(_ result: [String: JSONValue]) async -> [String: JSONValue] {
-        func name(_ handle: JSONValue?) -> String? {
-            guard case .string(let raw)? = handle else { return nil }
-            let key = handleKey(raw)
-            if key.isEmpty { return nil }
-            let digits = raw.filter(\.isNumber)
-            guard key.hasPrefix("+1"), digits.count == 11 else { return nil }
-            let d = Array(digits.suffix(10))
-            return "(\(String(d[0..<3]))) \(String(d[3..<6]))-\(String(d[6..<10]))"
-        }
-        var out = result
-        for key in ["threads", "messages"] {
-            guard case .array(let rows)? = result[key] else { continue }
-            out[key] = .array(rows.map { value in
-                guard case .object(var row) = value else { return value }
-                if case .array(let people)? = row["participants"] {
-                    row["participants"] = .array(people.map { person in
-                        guard case .object(var p) = person, let found = name(p["handle"]) else { return person }
-                        p["name"] = .string(found)
-                        return .object(p)
-                    })
-                }
-                if let found = name(row["sender"]) { row["sender_name"] = .string(found) }
-                return .object(row)
-            })
-        }
-        return out
-    }
-
     // MARK: - Finding one contact
 
     private static func exactNameMatches(store: CNContactStore, name: String, keys: [CNKeyDescriptor]) throws -> [CNContact] {

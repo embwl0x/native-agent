@@ -5,6 +5,7 @@ import TriggerScheduler
 import DeviceSync
 import NativeAgentShared
 import NativeAgentCore
+import Experiences
 // Blueprint: | `TriggerNotificationDelivery.swift` | Deliver the trigger's already-filed obligations; no second tell or separate occurrence |
 
 public enum TriggerNotificationDelivery {
@@ -21,9 +22,13 @@ public enum TriggerNotificationDelivery {
         await delivery.writeSnapshots()
         guard notify else { return .object(["delivered": .bool(false), "mirrored": .bool(true)]) }
         do {
-            _ = try await AttentionRouter.release(dataRoot: root, router: attention)
-            let outcome = try await attention.outcome(note.itemId,
-                held: AttentionRouter.inQuietHours(at: Date(), dataRoot: root))
+            guard let matter = try await ForPerson.at(root).matter(note.itemId) else { throw CocoaError(.fileReadNoSuchFile) }
+            let outcome: AttentionOutcome
+            if matter.face?.row?.tone != .failed, let end = try AttentionRouter.quietHoursEnd(at: Date(), dataRoot: root) {
+                outcome = try await attention.outcome(note.itemId, deferredUntil: end)
+            } else {
+                outcome = try await attention.deliver(note.itemId)
+            }
             let projection = outcome.deliveryProjection
             if projection != .accepted {
                 nativeLog("trigger_notify: %@ mirrored; destination acceptance remains incomplete (%@)", note.triggerName, projection.rawValue)
@@ -34,6 +39,7 @@ public enum TriggerNotificationDelivery {
             fields["mirrored"] = .bool(true)
             fields["destinations"] = .object(outcome.destinationFields)
             fields["suppressed"] = .bool(outcome.suppressed)
+            if let held = outcome.deferredFields { fields.merge(held) { _, new in new } }
             if projection == .failed {
                 fields["error"] = .string("At least one destination refused the knock; the card and remaining delivery stay in their owners.")
             }

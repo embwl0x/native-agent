@@ -6,8 +6,7 @@ import PersistenceCore
 import ProviderRouting
 import NativeAgentShared
 import Darwin
-import os
-// Blueprint: | `TelegramVoiceTranscription.swift` | Convert declared containers once; join recognition and temp cleanup on Stop and deadline |
+// Blueprint: | `TelegramVoiceTranscription.swift` | Speech final/error and cancellation own recognition; process exit owns conversion |
 
 // MARK: - Telegram voice transcription
 
@@ -57,52 +56,57 @@ public enum TelegramVoiceTranscriptionError: Error, Equatable, LocalizedError, S
     }
 }
 
-private final class TelegramSpeechRecognitionTaskBox: @unchecked Sendable {
-    private let lock = NSLock()
+private actor TelegramSpeechRecognition {
     private var task: SFSpeechRecognitionTask?
+    private var recognizer: SFSpeechRecognizer?
     private var continuation: CheckedContinuation<SpeechUtterance, Error>?
-    // Completion and cancellation can both precede recognitionTask returning. Keep the winning result until the continuation has been registered.
-    private var result: Result<SpeechUtterance, Error>?
     private var wasCancelled = false
 
-    func set(_ task: SFSpeechRecognitionTask, continuation: CheckedContinuation<SpeechUtterance, Error>) {
-        let (completed, cancelled) = lock.withLock {
-            if result == nil {
-                self.task = task
-                self.continuation = continuation
-            }
-            return (result, wasCancelled)
+    func recognize(url: URL, localeIdentifier: String, contextualStrings: [String]) async throws -> SpeechUtterance {
+        guard !wasCancelled else { throw CancellationError() }
+        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier)) else {
+            throw TelegramVoiceTranscriptionError.speechUnavailable("locale \(localeIdentifier) is not supported")
         }
-        if cancelled { task.cancel() }
-        if let completed { continuation.resume(with: completed) }
+        guard recognizer.isAvailable else {
+            throw TelegramVoiceTranscriptionError.speechUnavailable("recognizer is not currently available")
+        }
+        self.recognizer = recognizer
+        let request = SFSpeechURLRecognitionRequest(url: url)
+        request.shouldReportPartialResults = false
+        request.contextualStrings = contextualStrings
+        request.addsPunctuation = true
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            task = Self.start(recognizer: recognizer, request: request) { result in
+                Task { await self.complete(result) }
+            }
+        }
     }
 
     func cancel() {
-        let task = lock.withLock {
-            wasCancelled = true
-            return self.task
-        }
-        // The terminal recognition callback owns continuation settlement; cancellation requests exit without releasing the audio underneath it.
+        wasCancelled = true
+        // The recognition callback settles before its audio can be released.
         task?.cancel()
     }
 
-    func resume(with result: Result<SpeechUtterance, Error>) {
-        let completed = lock.withLock { () -> (CheckedContinuation<SpeechUtterance, Error>?, SFSpeechRecognitionTask?)? in
-            guard self.result == nil else { return nil }
-            self.result = wasCancelled ? .failure(CancellationError()) : result
-            let continuation = self.continuation
-            let task = self.task
-            self.continuation = nil
-            self.task = nil
-            return (continuation, task)
-        }
-        guard let (continuation, _) = completed else { return }
-        let settled = lock.withLock { self.result }
-        if let settled { continuation?.resume(with: settled) }
+    private func complete(_ result: Result<SpeechUtterance, Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        task = nil
+        recognizer = nil
+        continuation.resume(with: wasCancelled ? .failure(CancellationError()) : result)
     }
 
-    deinit {
-        task?.cancel()
+    private nonisolated static func start(
+        recognizer: SFSpeechRecognizer, request: SFSpeechURLRecognitionRequest,
+        completion: @escaping @Sendable (Result<SpeechUtterance, Error>) -> Void
+    ) -> SFSpeechRecognitionTask {
+        recognizer.recognitionTask(with: request) { result, error in
+            if let result, result.isFinal { completion(.success(SpeechUtterance(result))) }
+            else if let error {
+                completion(.failure(TelegramVoiceTranscriptionError.speechRecognitionFailed(error.localizedDescription)))
+            }
+        }
     }
 }
 
@@ -112,7 +116,9 @@ struct TelegramPreparedVoiceAudio: Sendable {
 
     func cleanup() {
         for url in cleanupURLs {
-            try? FileManager.default.removeItem(at: url)
+            do { try FileManager.default.removeItem(at: url) }
+            catch CocoaError.fileNoSuchFile { continue }
+            catch { nativeLog("Telegram voice cleanup failed at %@: %@", url.path, error.localizedDescription) }
         }
     }
 }
@@ -157,8 +163,7 @@ enum TelegramVoiceAudioPreparer {
             return TelegramPreparedVoiceAudio(url: output, cleanupURLs: [input, output])
         } catch {
             // Preparation failure bypasses caller cleanup; remove downloaded bytes here to prevent a private-data leak.
-            try? FileManager.default.removeItem(at: input)
-            try? FileManager.default.removeItem(at: output)
+            TelegramPreparedVoiceAudio(url: input, cleanupURLs: [input, output]).cleanup()
             throw error
         }
     }
@@ -213,7 +218,7 @@ enum TelegramVoiceAudioPreparer {
                     "-i", input.path, "-vn", "-acodec", "aac", "-b:a", "96k", output.path,
                 ],
                 currentDirectory: nil, environment: nil, standardInput: nil,
-                timeoutSeconds: 30, outputByteLimit: 64 * 1024,
+                timeoutSeconds: nil, outputByteLimit: 64 * 1024,
                 launchFailure: { TelegramVoiceTranscriptionError.conversionFailed("ffmpeg failed to start: \($0.localizedDescription)") }
             )
         } catch {
@@ -222,9 +227,6 @@ enum TelegramVoiceAudioPreparer {
                 ?? TelegramVoiceTranscriptionError.conversionFailed(error.localizedDescription)
         }
         try Task.checkCancellation()
-        if result.timedOut {
-            throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg timed out")
-        }
         guard result.exitCode == 0 else {
             let message = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             throw TelegramVoiceTranscriptionError.conversionFailed(
@@ -241,16 +243,13 @@ enum TelegramVoiceAudioPreparer {
 public final class SwiftAppleSpeechTranscriber: Sendable {
     public var hasSpeechPermission: Bool { SFSpeechRecognizer.authorizationStatus() == .authorized }
     private let localeIdentifier: String
-    private let timeoutNanoseconds: UInt64
     private let contextualStrings: @Sendable () -> [String]
 
     public init(
         localeIdentifier: String = Locale.current.identifier,
-        timeoutSeconds: TimeInterval = 45,
         contextualStrings: @escaping @Sendable () -> [String] = { [] }
     ) {
         self.localeIdentifier = localeIdentifier
-        self.timeoutNanoseconds = UInt64(max(1, timeoutSeconds) * 1_000_000_000)
         self.contextualStrings = contextualStrings
     }
 
@@ -258,24 +257,12 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
         // Check permission before creating audio so headless failures remain immediate and never invoke a prompting API.
         try validateSpeechAuthorization()
         let started = Date()
-        // Deadline and Stop cancel the owned body, then join its conversion, recognition and temporary-file cleanup before releasing the turn.
-        let utterance = try await withThrowingTaskGroup(of: SpeechUtterance.self) { group in
-            group.addTask { [self] in
-                let prepared = try await TelegramVoiceAudioPreparer.prepareSpeechURL(attachment)
-                defer { prepared.cleanup() }
-                try Task.checkCancellation()
-                return try await self.recognizeOnce(url: prepared.url)
-            }
-            group.addTask { [timeoutNanoseconds] in
-                try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                throw TelegramVoiceTranscriptionError.speechRecognitionFailed("timed out")
-            }
-            defer { group.cancelAll() }
-            guard let utterance = try await group.next() else { throw CancellationError() }
-            try Task.checkCancellation()
-            return utterance
-        }
-        let elapsed = max(0, Int(Date().timeIntervalSince(started) * 1000))
+        let prepared = try await TelegramVoiceAudioPreparer.prepareSpeechURL(attachment)
+        defer { prepared.cleanup() }
+        try Task.checkCancellation()
+        let utterance = try await recognizeOnce(url: prepared.url)
+        try Task.checkCancellation()
+        let elapsed = Int(exactly: max(0, Date().timeIntervalSince(started) * 1000).rounded(.towardZero))
         return TelegramVoiceTranscription(
             utterance: utterance,
             backend: TelegramVoiceTranscriptionBackends.appleSpeech,
@@ -288,37 +275,11 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
         try Task.checkCancellation()
         // Headless work cannot safely prompt: read authorization here; MainActor permission preflight owns requests.
         try validateSpeechAuthorization()
-        let locale = Locale(identifier: localeIdentifier)
-        guard let recognizer = SFSpeechRecognizer(locale: locale) else {
-            throw TelegramVoiceTranscriptionError.speechUnavailable("locale \(localeIdentifier) is not supported")
-        }
-        guard recognizer.isAvailable else {
-            throw TelegramVoiceTranscriptionError.speechUnavailable("recognizer is not currently available")
-        }
-
-        let request = SFSpeechURLRecognitionRequest(url: url)
-        request.shouldReportPartialResults = false
-        request.contextualStrings = contextualStrings()
-        request.addsPunctuation = true
-
-        let taskBox = TelegramSpeechRecognitionTaskBox()
+        let recognition = TelegramSpeechRecognition()
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                let task = recognizer.recognitionTask(with: request) { result, error in
-                    if let result, result.isFinal {
-                        taskBox.resume(with: .success(SpeechUtterance(result)))
-                        return
-                    }
-                    if let error {
-                        taskBox.resume(
-                            with: .failure(TelegramVoiceTranscriptionError.speechRecognitionFailed(error.localizedDescription))
-                        )
-                    }
-                }
-                taskBox.set(task, continuation: continuation)
-            }
+            try await recognition.recognize(url: url, localeIdentifier: localeIdentifier, contextualStrings: contextualStrings())
         } onCancel: {
-            taskBox.cancel()
+            Task { await recognition.cancel() }
         }
     }
 

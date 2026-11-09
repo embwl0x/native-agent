@@ -1,3 +1,4 @@
+import ActivityWatch
 import AppToolRuntime
 import Cognition
 import Context
@@ -18,15 +19,16 @@ import EngineRuntime
 @MainActor
 class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     let appModel: AppModel
+    let presentation: BodyFacePresentation?
 
-    init(_ appModel: AppModel) { self.appModel = appModel }
+    init(_ appModel: AppModel) { self.appModel = appModel; presentation = nil }
+    init(_ appModel: AppModel, presentation: BodyFacePresentation?) { self.appModel = appModel; self.presentation = presentation }
 
     var dataRootOverride: URL? { appModel.engine.dataRoot }
     var trustPolicy: TrustPolicy? { appModel.engine.trust.policy }
     var personality: PersonalityProfile? { appModel.engine.persona.profile }
     var personalityError: String? { appModel.engine.persona.profileError }
     var dreamError: String? { appModel.dreamError }
-    var makeShelfFault: String? { appModel.engine.make.fault }
     var chatModel: String {
         get { appModel.chatModel }
         set { appModel.chatModel = newValue }
@@ -92,22 +94,11 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                     true enables the on-device semantic model; false selects word matching. Re-indexes saved memories, just as the Settings control does. A \
                     saved request does not prove the model loaded.
                     """,
-                read: { _ in
-                    if model.engine.memory.embeddingSnapshot == nil { await model.engine.memory.loadEmbeddings() }
-                    guard let snapshot = model.engine.memory.embeddingSnapshot else {
-                        throw QuietSettingError.unavailable((model.engine.memory.embeddingsError ?? "The embedding runtime has not loaded.")
-                            + " Open Memories and repair its reported storage problem before reading this setting.")
-                    }
-                    guard snapshot.requestedBackend != ManagedEmbeddingProvider.failClosedBackend else {
-                        throw QuietSettingError.unavailable((snapshot.lastLoadError ?? "The saved embeddings configuration could not be read.")
-                            + " Repair config/embeddings.json in the app data folder before reading or changing meaning-based memory.")
-                    }
-                    return .bool(snapshot.requestedBackend != ManagedEmbeddingProvider.mockBackend)
-                },
+                read: .meaningBasedMemory,
                 write: { _, value, context in
                     let enabled = try QuietSettings.boolValue(value, "Meaning-based memory")
                     try await model.engine.memory.toggleEmbeddings(enabled)
-                    guard let snapshot = model.engine.memory.embeddingSnapshot else {
+                    guard let snapshot = await model.engine.memory.readEmbeddingSnapshot() else {
                         throw QuietSettingError.unavailable("Memory's embedding runtime became unavailable after saving. Inspect Memory before another change.")
                     }
                     context.detail.record("effective_backend", .string(snapshot.effectiveBackend))
@@ -126,7 +117,10 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                 write: { _, value, _ in
                     let enabled = try QuietSettings.boolValue(value, "Show the tour")
                     UserDefaults.standard.set(enabled, forKey: "nativeagent.showTour")
-                    if enabled { OnboardingTourReplay.shared.requestReplay() }
+                    if enabled {
+                        if let presentation = self.presentation { try await presentation.present(.replayTour) }
+                        else { OnboardingTourReplay.shared.requestReplay() }
+                    }
                 }
             ).watchingDefaults("nativeagent.showTour"),
             QuietSetting(
@@ -134,8 +128,8 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                 note: "Credentials never go through chat. Use the account's secure setup control.",
                 read: { _ in
                     .string("""
-                        Mac: Providers → Accounts → Add key or Sign in opens the protected connection card in your conversation. \
-                        iPhone: Settings → Providers → account. Enter credentials only in the protected setup control.
+                        On the Mac, Providers → Accounts → Add key or Sign in opens protected entry directly. \
+                        Enter keys and sign in only there; the phone and Telegram carry no credential entry.
                         """)
                 }
             ),
@@ -416,7 +410,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
         }
     }
 
-    // Share InboxSettingsView's reads and writes so notification controls keep one owner.
+    // The Settings face and this door read and switch triggers through the one inbox owner.
     func inboxTriggers() async throws -> [QuietInboxTrigger] {
         try await appModel.engine.inbox.triggers().map {
             QuietInboxTrigger(
@@ -425,5 +419,49 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     }
     func setInboxTrigger(_ name: String, enabled: Bool) async throws {
         try await appModel.engine.inbox.setTrigger(name, enabled: enabled)
+    }
+
+    // Activity capture's breadth and keeping, read and saved through the one activity owner; each save is read back.
+    var activityTitleCapture: String {
+        get async throws {
+            let policy = try await appModel.engine.activityWatch.checkedPolicy()
+            switch ActivityPolicy.TitleCapture(policy: policy) {
+            case .appNamesOnly: return "apps"
+            case .windowTitles: return "windows"
+            case .windowAndBrowserTitles: return "browsers"
+            }
+        }
+    }
+    func setActivityTitleCapture(_ choice: String) async throws {
+        let controller = appModel.engine.activityWatch
+        let titles: ActivityPolicy.TitleCapture
+        switch choice {
+        case "apps": titles = .appNamesOnly
+        case "windows": titles = .windowTitles
+        case "browsers": titles = .windowAndBrowserTitles
+        default: throw QuietSettingError.badValue("Choose apps, windows or browsers.")
+        }
+        guard await controller.apply({ $0 = titles.applied(to: $0) }) else {
+            throw QuietSettingError.unavailable(controller.lastError ?? "Activity settings were not saved.")
+        }
+    }
+    var activityRetentionDays: Int { get async throws { try await appModel.engine.activityWatch.checkedPolicy().retentionDays } }
+    func setActivityRetentionDays(_ days: Int) async throws {
+        let controller = appModel.engine.activityWatch
+        await controller.setRetentionDays(days)
+        guard try await controller.checkedPolicy().retentionDays == days else {
+            throw QuietSettingError.unavailable(controller.lastError ?? "The retention choice was not saved.")
+        }
+    }
+    var activityExclusions: [String] { appModel.engine.activityWatch.removableExclusions }
+    func removeActivityExclusion(_ bundleID: String) async throws {
+        let controller = appModel.engine.activityWatch
+        guard controller.removableExclusions.contains(bundleID) else {
+            throw QuietSettingError.unavailable("That exclusion cannot be changed here.")
+        }
+        await controller.removeExclusion(bundleID: bundleID)
+        guard !(try await controller.checkedPolicy().excludedBundleIDs.contains(bundleID)) else {
+            throw QuietSettingError.unavailable(controller.lastError ?? "The exclusion was not removed.")
+        }
     }
 }

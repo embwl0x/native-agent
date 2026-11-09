@@ -188,61 +188,6 @@ extension SwiftNativeChatOrchestrationClient {
                                 answerFor: deliveryID, turn: turn)
     }
 
-    /// Import contact history by time without reordering existing rows; send/reply identities deduplicate it.
-    public func importAgentConversationHistory(sessionID: String, rows imported: [JSONValue], turn: Turn) async throws -> Int {
-        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
-            throw ChatOrchestrationError.underlying("invalid chat session id")
-        }
-        let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
-        try await SessionConversation.declare(safeSessionId, kind: .agent, title: "Agent conversation", source: "agent-bridge", dataRoot: dataRoot,
-            createIfMissing: false)
-        _ = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
-        let path = dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl")
-        @Sendable func key(_ row: JSONValue) -> String? {
-            guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { return nil }
-            if case .string(let id)? = metadata["dotClientUserMessageID"] { return "send:" + id }
-            if case .object(let origin)? = metadata["origin"], case .string(let id)? = origin["replyTo"] { return "reply:" + id }
-            return nil
-        }
-        @Sendable func date(_ row: JSONValue) -> Date? {
-            guard case .object(let object) = row, case .string(let raw)? = object["createdAt"] else { return nil }
-            return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
-        }
-        ChatSessionIndexFile.beginTranscriptIndexSync(at: path)
-        defer { ChatSessionIndexFile.endTranscriptIndexSync(at: path) }
-        let changed: (count: Int, last: JSONValue?) = try await SwiftNativePersistenceCore.withFileLock(path) {
-            var rows: [JSONValue] = []
-            if FileManager.default.fileExists(atPath: path.path) {
-                let (read, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
-                // A row it could not read would be lost in the rewrite.
-                guard report.isClean else { throw ChatOrchestrationError.underlying("transcript has unreadable rows") }
-                rows = read
-            }
-            var count = 0
-            var present = Set(rows.compactMap(key))
-            for row in imported.sorted(by: { (date($0) ?? .distantPast) < (date($1) ?? .distantPast) }) {
-                guard let rowKey = key(row), present.insert(rowKey).inserted, let at = date(row) else { continue }
-                let index = rows.firstIndex { (date($0) ?? .distantPast) > at } ?? rows.count
-                rows.insert(row, at: index)
-                count += 1
-            }
-            guard count > 0 else { return (0, nil) }
-            try ContactThread.replace(rows, to: path)
-            ChatTranscriptLineCountCache.shared.record(count: rows.count, at: path)
-            return (count, rows.last)
-        }
-        guard changed.count > 0, case .object(let last)? = changed.last, case .string(let content)? = last["content"],
-              case .string(let at)? = last["createdAt"] else { return changed.count }
-        let role: String = if case .string(let value)? = last["role"] { value } else { "assistant" }
-        let lastID: String = if case .string(let id)? = last["id"] { id } else { "" }
-        let lastMetadata: [String: JSONValue] = if case .object(let metadata)? = last["metadata"] { metadata } else { [:] }
-        let stamp = TranscriptRowStamp.of(id: lastID, role: role, metadata: lastMetadata, rowSource: "agent-bridge")
-        try await syncSessionIndex(sessionId: safeSessionId, role: role, content: content, timestamp: at,
-                                   messagesPath: path, source: "agent-bridge", metadata: nil, stamp: stamp, turn: turn)
-        NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: safeSessionId)
-        return changed.count
-    }
-
     public func enqueueUserMessage(
         message: String,
         sessionId: String?,
@@ -677,20 +622,22 @@ extension SwiftNativeChatOrchestrationClient {
                     return (false, nil, origin)
                 }
             }
-            let bytes = try (expectedLastMessageID != nil || (answerFor != nil && FileManager.default.fileExists(atPath: path.path)))
-                ? Data(contentsOf: path) : nil
-            if let answerFor, let bytes {
+            if let answerFor, FileManager.default.fileExists(atPath: path.path) {
+                let bytes = try Data(contentsOf: path)
                 let rows = SwiftNativePersistenceCore.decodeJSONL(bytes) { value, _ in value }.rows
                 if rows.contains(where: { row in
                     guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { return false }
                     return metadata["answerFor"] == .string(answerFor)
                 }) { return (false, nil, nil) }
             }
-            if let expectedLastMessageID, let bytes {
-                guard bytes.count <= 8 * 1024 * 1024,
-                      let text = String(data: bytes, encoding: .utf8),
-                      let tail = text.split(separator: "\n", omittingEmptySubsequences: true).last,
-                      let last = try? JSONValue.parse(Data(tail.utf8)),
+            if let expectedLastMessageID {
+                // Match the recent conversation window under the append lock; a leading fragment cannot prove the last row's identity.
+                guard let tail = try SwiftNativePersistenceCore.tailPhysicalLines(path, limit: 2048, maxBytes: 1024 * 1024),
+                      let line = tail.lines.dropFirst(tail.leadingFragment ? 1 : 0).last(where: {
+                          String(data: $0, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != true
+                      }),
+                      String(data: line, encoding: .utf8) != nil,
+                      let last = try? JSONValue.parse(line),
                       Self.messageID(in: last) == expectedLastMessageID else {
                     throw ChatOrchestrationError.underlying("The conversation changed before the reply could be saved. Reopen it before replying.")
                 }

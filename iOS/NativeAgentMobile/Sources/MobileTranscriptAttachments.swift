@@ -5,9 +5,7 @@ import UIKit
 
 // Blueprint: | `MobileTranscriptAttachments.swift` | Phone document attachments: one hosted view per block id, fed from the model, sized to fit |
 
-/// Every card, approval, table, image, voice note, file chip and other-room row in the document. One block id owns one attachment
-/// and one hosted view for as long as the block lives; the controller places the view over the attachment's laid-out frame.
-/// What a view shows is pushed into its box by block id, never kept in the view.
+/// One retained host per block; the controller supplies its data and attachment frame.
 @MainActor final class TranscriptAttachments {
     /// Set by the controller. Called when a hosted view's height changes; the controller re-lays that block's paragraph.
     var heightChanged: (_ blockID: String) -> Void = { _ in }
@@ -29,12 +27,12 @@ import UIKit
             // A growing reply can change what its block shows (a table gains rows) under the same id.
             if entry.ref != ref {
                 entry.ref = ref
-                entry.box.model = data.map { TranscriptAttachmentModel(ref, in: $0) } ?? .missing
+                entry.box.model = data.map { TranscriptAttachmentModel(ref, in: $0) } ?? .unavailable("Waiting on transcript data")
                 remeasure(blockID)
             }
             return entry.attachment
         }
-        let box = TranscriptAttachmentBox(model: data.map { TranscriptAttachmentModel(ref, in: $0) } ?? .missing,
+        let box = TranscriptAttachmentBox(model: data.map { TranscriptAttachmentModel(ref, in: $0) } ?? .unavailable("Waiting on transcript data"),
                                           environment: environment, actions: actions)
         box.resized = { [weak self] in self?.remeasure(blockID) }
         let host = UIHostingController(rootView: TranscriptAttachmentRoot(box: box))
@@ -86,13 +84,10 @@ import UIKit
         return entries.values.contains { view.isDescendant(of: $0.host.view) }
     }
 
-    /// Puts each block's hosted view over its attachment's laid-out frame (text view coordinates) and hides the rest, so a view
-    /// shows exactly where its paragraph is laid out and nowhere else. One view per block for its whole life: what the reader did
-    /// inside it (an opened disclosure, a playing note, a typed key) stays. Each host is a child of the screen's view controller, so
-    /// what it presents (a sheet, a picker) has a presenter.
+    /// Retain hosts at their attachment frames; child-controller ownership supplies sheet presentation.
     func place(_ frames: [String: CGRect], in textView: UIView) {
         for (blockID, entry) in entries {
-            let view = entry.host.view!
+            guard let view = entry.host.view else { continue }
             guard let frame = frames[blockID] else {
                 if view.superview != nil, !view.isHidden { view.isHidden = true }
                 continue
@@ -168,11 +163,14 @@ import UIKit
 }
 
 /// What the attachment side reads when it builds or refreshes a hosted view, keyed as the references name them.
-struct TranscriptAttachmentData {
+struct TranscriptAttachmentData: Sendable {
     /// By `ChatMessage.id.uuidString`.
     var messages: [String: ChatMessage]
-    var approvals: [String: ApprovalRequest]
-    var inboxCards: [String: InboxItemRecord]
+    var rowContent: [String: String] = [:]
+    /// The matter each asking block shows, seated by the press's input preparation.
+    var asked: [String: String]
+    /// The Inbox face's rows by matter id.
+    var inbox: [String: PartFace.Row]
 }
 
 /// What one live hosted view shows. The owner writes it on every update; the view reads it, so an answered card or a loaded image
@@ -194,44 +192,46 @@ final class TranscriptAttachmentBox {
 
 /// An attachment's inputs, read from the document's data by its reference: exactly what the phone's view for that kind takes.
 enum TranscriptAttachmentModel: Equatable {
-    case interaction(InlineInteraction, InlineInteractionDescriptor, sessionID: String)
-    case inboxCard(InboxItemRecord)
-    case approval(ApprovalRequest)
+    /// A card or an ask: its matter's row of the Inbox face.
+    case matter(PartFace.Row)
     case table(ChatMarkdownTable)
     case image(ChatAttachmentSummary)
     case voice(ChatAttachmentSummary, transcript: String, isOwn: Bool)
     case file(ChatAttachmentSummary)
     case otherRoom(OtherRoomExchange)
-    /// The row, card or attachment is not in the latest data, or the reference is one the phone never draws: no room until it is.
-    case missing
+    case envelope(String)
+    case unavailable(String)
 
     init(_ ref: TranscriptAttachmentRef, in data: TranscriptAttachmentData) {
         switch ref {
-        case .card(let rowID, let cardID):
-            if let message = data.messages[rowID], let card = message.interaction, card.id == cardID,
-               let descriptor = message.interactionDescriptor, let session = message.interactionSessionID {
-                self = .interaction(card, descriptor, sessionID: session)
-            } else {
-                self = data.inboxCards[cardID].map { Self.inboxCard($0) } ?? .missing
-            }
+        // A card names its matter; an ask names it through the block it sits in. Either draws that matter's Inbox row.
+        case .card(_, let matter):
+            self = data.inbox[matter].map { Self.matter($0) }
+                ?? .unavailable("Inbox matter \(matter) has not arrived. Open Inbox to inspect its sync status.")
         case .approval(let id):
-            self = data.approvals[id].map { Self.approval($0) } ?? .missing
+            self = data.asked[id].flatMap { data.inbox[$0] }.map { Self.matter($0) }
+                ?? .unavailable("Approval \(id) has no available Inbox row. Open Inbox to inspect its sync status.")
         case .table(let table):
             self = .table(table)
         case .image(let messageID, let index):
-            self = Self.attachment(messageID, index, in: data).map { Self.image($0.attachment) } ?? .missing
+            self = Self.attachment(messageID, index, in: data).map { Self.image($0.attachment) }
+                ?? .unavailable("Image \(index) is unavailable on message \(messageID). Load the whole message to inspect its attachments.")
         case .voice(let messageID, let index):
             self = Self.attachment(messageID, index, in: data).map { found in
                 let utterance = found.attachment.utterance
                 return Self.voice(found.attachment, transcript: utterance?.correctedText ?? utterance?.text ?? found.message.text,
                                   isOwn: found.message.role == .user)
-            } ?? .missing
+            } ?? .unavailable("Voice note \(index) is unavailable on message \(messageID). Load the whole message to inspect its attachments.")
         case .file(let messageID, let index):
-            self = Self.attachment(messageID, index, in: data).map { Self.file($0.attachment) } ?? .missing
+            self = Self.attachment(messageID, index, in: data).map { Self.file($0.attachment) }
+                ?? .unavailable("File \(index) is unavailable on message \(messageID). Load the whole message to inspect its attachments.")
         case .otherRoom(let exchange):
             self = .otherRoom(exchange)
-        case .envelope, .trouble:
-            self = .missing
+        case .envelope(let messageID):
+            self = data.rowContent[messageID].map { Self.envelope($0) }
+                ?? .unavailable("Envelope \(messageID) has no available transcript row. Reopen the conversation to inspect its sync status.")
+        case .trouble:
+            self = .unavailable("Reply needs attention. Open the conversation's status to inspect the reported cause.")
         }
     }
 
@@ -295,13 +295,8 @@ private struct TranscriptAttachmentBody: View {
 
     @ViewBuilder private var content: some View {
         switch box.model {
-        case .interaction(let card, let descriptor, let sessionID):
-            MobileInteractionCard(card: card, descriptor: descriptor, sessionID: sessionID)
-        case .inboxCard(let item):
-            InboxCardRow(item: item, onAction: { action in box.actions.inboxAction(item.id, action) },
-                         onView: { box.actions.openInboxItem(item.id) })
-        case .approval(let approval):
-            InlineChatApprovalCard(approval: approval)
+        case .matter(let row):
+            MobileFaceRow(page: "inbox", row: row)
         case .table(let table):
             TranscriptTableView(table: table)
         case .image(let attachment):
@@ -315,8 +310,15 @@ private struct TranscriptAttachmentBody: View {
                 OtherRoomExchangePreview(exchange: exchange).foregroundStyle(AlivePalette.text)
             }
             .buttonStyle(.plain)
-        case .missing:
-            EmptyView()
+        case .envelope(let content):
+            DisclosureGroup("Delegated reply") {
+                Text(content).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .font(.footnote)
+        case .unavailable(let cause):
+            Label(cause, systemImage: "exclamationmark.triangle")
+                .font(.footnote).foregroundStyle(NativeAgentMobileTheme.Colors.trouble)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

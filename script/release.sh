@@ -829,6 +829,14 @@ echo "==> Codesigning..."
 sign_nested_plain() {
   local identity="$1"
   local timestamp_arg="${2:---timestamp}"
+  [[ -d "$BUNDLE/Contents/Helpers/NativeAgentFace.app" ]] \
+    || { echo 'ERROR: Missing NativeAgentFace renderer' >&2; return 1; }
+  local face_sparkle="$BUNDLE/Contents/Helpers/NativeAgentFace.app/Contents/Frameworks/Sparkle.framework"
+  [[ -d "$face_sparkle" ]] \
+    || { echo 'ERROR: Missing NativeAgentFace Sparkle framework' >&2; return 1; }
+  codesign --force --deep --sign "$identity" --options runtime "$timestamp_arg" "$face_sparkle"
+  codesign --force --sign "$identity" --options runtime "$timestamp_arg" \
+    "$BUNDLE/Contents/Helpers/NativeAgentFace.app"
   if [[ -d "$BUNDLE/Contents/PlugIns/NativeAgentWidget.appex" ]]; then
     codesign --force --sign "$identity" --options runtime "$timestamp_arg" \
       --generate-entitlement-der --entitlements "$RELEASE_WIDGET_WORK/widget.entitlements" \

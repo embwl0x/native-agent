@@ -21,6 +21,11 @@ extension EngineDoctorRuntime {
     }
 
     public func doctorLiveRepair(for check: CheckResult, scope: DoctorRepairScope) async -> DoctorExecutableRepair? {
+        do { return try await checkedDoctorRepair(for: check, scope: scope) }
+        catch { return DoctorExecutableRepair(checkID: check.id) { throw error } }
+    }
+
+    private func checkedDoctorRepair(for check: CheckResult, scope: DoctorRepairScope) async throws -> DoctorExecutableRepair? {
         guard check.ask == nil else { return nil }
         let requestedRoot = dataRoot
         guard requestedRoot.resolvingSymlinksInPath().standardizedFileURL
@@ -41,15 +46,14 @@ extension EngineDoctorRuntime {
             let pendingPath = requestedRoot.appendingPathComponent("providers/pending-surface-configuration.json")
             let pendingSelection = FileManager.default.fileExists(atPath: pendingPath.path)
             let needsProbe: Bool
-            switch try? await DoctorProviderPathReading.read(dataRoot: requestedRoot, turn: turn).runtime {
-            case .some(.healthy(.stale)), .some(.healthy(.failed)): needsProbe = true
+            switch try await DoctorProviderPathReading.read(dataRoot: requestedRoot, turn: turn).runtime {
+            case .healthy(.stale), .healthy(.failed): needsProbe = true
             default: needsProbe = false
             }
             guard pendingSelection || needsProbe else { return nil }
             if !pendingSelection {
-                guard let snapshot = try? await SwiftNativeProviderRouting(dataRoot: requestedRoot)
-                    .checkedRoutingSnapshotReadOnly(),
-                    ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, "chat") != nil else { return nil }
+                let snapshot = try await SwiftNativeProviderRouting(dataRoot: requestedRoot).checkedRoutingSnapshotReadOnly()
+                guard ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, "chat") != nil else { return nil }
             }
             return DoctorExecutableRepair(checkID: check.id) {
                 do {
@@ -109,35 +113,20 @@ extension EngineDoctorRuntime {
                 catch {
                     return .unverified("Web search is down: nothing answers at \(base). \(error.localizedDescription)")
                 }
-                let deadline = ContinuousClock.now.advanced(by: .seconds(30))
-                var lastFailure = "Connection refused."
-                repeat {
-                    try await Task.sleep(for: .seconds(2))
-                    guard try await doctorSearchURL() == base else {
-                        return .unverified("Started container \(container.prefix(12)) for \(base), but the search setting changed; its new address was kept.")
-                    }
-                    let remaining = ContinuousClock.now.duration(to: deadline).components
-                    let timeout = min(16, Double(remaining.seconds) + Double(remaining.attoseconds) / 1e18)
-                    guard timeout > 0 else { break }
-                    do {
-                        if try await research.checkSearXNG(base: base, answering: true, timeout: timeout) {
-                            guard try await doctorSearchURL() == base else {
-                                return .unverified(
-                                    "Started container \(container.prefix(12)) for \(base), but the search setting changed; its new address was kept.")
-                            }
-                            return .completed(
-                                "Completed: started the local SearXNG container \(container.prefix(12)); search answers at its configured address \(base).")
-                        }
-                        lastFailure = "Connection refused."
-                    } catch where Task.isCancelled || error is CancellationError { throw CancellationError() }
-                    catch { lastFailure = error.localizedDescription }
-                } while ContinuousClock.now < deadline
-                return .unverified(
-                    "Started the local SearXNG container \(container.prefix(12)), but \(base) did not answer within the readiness window: \(lastFailure)")
+                guard try await doctorSearchURL() == base else {
+                    return .unverified("Started container \(container.prefix(12)) for \(base), but the search setting changed.")
+                }
+                guard try await research.checkSearXNG(base: base, answering: true) else {
+                    return .unverified("Started container \(container.prefix(12)); \(base) refused the readiness request. Check the container's logs.")
+                }
+                guard try await doctorSearchURL() == base else {
+                    return .unverified("Started container \(container.prefix(12)) for \(base), but the search setting changed.")
+                }
+                return .completed("Completed: started container \(container.prefix(12)); search answers at its configured address \(base).")
             }
         case "live.telegram":
-            guard let state = try? await doctorTelegramSnapshot(), state.enabled,
-                  state.tokenConfigured, !state.pollerEnabled else { return nil }
+            let state = try await doctorTelegramSnapshot()
+            guard state.enabled, state.tokenConfigured, !state.pollerEnabled else { return nil }
             return DoctorExecutableRepair(checkID: check.id) {
                 let facade = TelegramFacade(dataRoot: dataRoot)
                 let manager = port.doctorManager
@@ -161,24 +150,21 @@ extension EngineDoctorRuntime {
                 }
                 _ = await manager.start()
                 try Task.checkCancellation()
-                // Observe the ordinary bounded poll; never issue a duplicate getUpdates request or tick.
-                let result = await raceAgainstTimeout(seconds: 35) {
-                    var iterator = events.makeAsyncIterator()
-                    repeat {
-                        try Task.checkCancellation()
-                        let after = try await facade.loadStatus(manager: manager)
-                        try Task.checkCancellation()
-                        if after.lastPollAt != nil, after.lastPollAt != before.lastPollAt,
-                           after.pollerEnabled, after.actionableError == nil { return true }
-                    } while await iterator.next() != nil
-                    return false
-                }
-                if case .value(true) = result {
-                    return .completed("Completed: restarted Telegram's poller and confirmed a successful poll.")
-                }
-                if case .failure(let detail) = result { throw TelegramBotError.underlying(detail) }
-                if case .cancelled = result { throw CancellationError() }
-                return .unverified("Repair attempted: Telegram's poller was started, but no successful poll was confirmed within 35 seconds.")
+                // Observe the admitted poll instead of issuing a duplicate getUpdates request.
+                var iterator = events.makeAsyncIterator()
+                repeat {
+                    try Task.checkCancellation()
+                    let after = try await facade.loadStatus(manager: manager)
+                    try Task.checkCancellation()
+                    if let error = after.credentialIssue { throw TelegramBotError.underlying(error) }
+                    if let error = after.routingIssue { throw TelegramBotError.underlying(error) }
+                    if let error = after.actionableError { throw TelegramBotError.underlying(error) }
+                    if after.lastPollAt != nil, after.lastPollAt != before.lastPollAt, after.pollerEnabled {
+                        return .completed("Completed: restarted Telegram's poller and confirmed a successful poll.")
+                    }
+                } while await iterator.next() != nil
+                try Task.checkCancellation()
+                throw TelegramBotError.underlying("Telegram poll observation ended before a successful poll was confirmed.")
             }
         case "live.bridges":
             let names = await doctorBridgeSnapshots().filter {
@@ -192,7 +178,9 @@ extension EngineDoctorRuntime {
                     dataRoot.appendingPathComponent("browser_ipc.json"),
                 ])
                 defer { changes.cancel() }
-                await changes.waitUntilArmed()
+                guard await changes.waitUntilArmed() else {
+                    throw ToolFailureError("Bridge descriptor changes could not be observed. Repair remains unconfirmed.", effects: .none)
+                }
                 try Task.checkCancellation()
                 // Start methods retain their own gates, callbacks and tokens.
                 for name in names {
@@ -200,21 +188,20 @@ extension EngineDoctorRuntime {
                     await port.doctorStartBridge(name: name)
                 }
                 try Task.checkCancellation()
-                let result = await raceAgainstTimeout(seconds: 3) {
-                    var iterator = changes.stream.makeAsyncIterator()
-                    repeat {
-                        try Task.checkCancellation()
-                        let rows = await doctorBridgeSnapshots().filter { names.contains($0.name) }
-                        try Task.checkCancellation()
-                        if rows.allSatisfy({ $0.health.boundPort != nil }) { return true }
-                    } while await iterator.next() != nil
-                    return false
-                }
-                if case .value(true) = result {
-                    return .completed("Completed: rebound \(names.joined(separator: ", ")) and verified the listening ports.")
-                }
-                if case .cancelled = result { throw CancellationError() }
-                return .unverified("Repair attempted: \(names.joined(separator: ", ")) did not confirm a bound port within 3 seconds.")
+                var iterator = changes.stream.makeAsyncIterator()
+                repeat {
+                    try Task.checkCancellation()
+                    let rows = await doctorBridgeSnapshots().filter { names.contains($0.name) }
+                    try Task.checkCancellation()
+                    for row in rows {
+                        if let failure = row.health.failure { throw ToolFailureError("\(row.name): \(failure)", effects: .unknown) }
+                    }
+                    if Set(rows.map(\.name)) == Set(names), rows.allSatisfy({ $0.health.boundPort != nil }) {
+                        return .completed("Completed: rebound \(names.joined(separator: ", ")) and verified the listening ports.")
+                    }
+                } while await iterator.next() != nil
+                try Task.checkCancellation()
+                throw ToolFailureError("Bridge descriptor observation ended before listening ports were confirmed.", effects: .unknown)
             }
         case DoctorLoopHealth.doctorCheckID:
             return await DoctorLoopHealth.safeRepair(manager: port.doctorManager)

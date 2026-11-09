@@ -50,28 +50,22 @@ public struct AgentConversationLiveTarget: Sendable, Hashable {
     static func messageKey(agent: String, messageID: String) -> String { agent + ":" + messageID.lowercased() }
 }
 
-/// Coalesce partials per interval; publish state changes immediately.
+/// Publish accepted progress through one actor-owned writer.
 public actor AgentConversationLiveHub {
     public static let shared = AgentConversationLiveHub()
-    static let interval: Duration = .milliseconds(400)
     static let partialLimit = 16 * 1024
 
     private var entries: [String: (live: AgentConversationLive, root: URL)] = [:]
     private var dirty: Set<String> = []
-    private var pendingFlush: Task<Void, Never>?
     private var pendingFlushID: UUID?
-    private var coalescing = true
     private var publisher: (@Sendable (AgentConversationLive) -> Void)?
 
     public func setPublisher(_ publisher: @escaping @Sendable (AgentConversationLive) -> Void) {
         self.publisher = publisher
     }
 
-    public func start() { if !Task.isCancelled { coalescing = true } }
-
-    /// Accepted sends may still finish after resident admission closes. Flush their current words now and publish later words without arming a timer.
+    /// Accepted sends may finish after resident admission closes; their progress stays writable until settlement.
     public func shutdown() {
-        coalescing = false
         flush()
     }
 
@@ -148,15 +142,11 @@ public actor AgentConversationLiveHub {
 
     private func schedule(_ key: String, now: Bool) {
         dirty.insert(key)
-        if now || !coalescing { flush(); return }
-        guard pendingFlush == nil else { return }
+        if now { flush(); return }
+        guard pendingFlushID == nil else { return }
         let id = UUID()
         pendingFlushID = id
-        pendingFlush = Task { [weak self] in
-            // Cancelled means a flush already ran; flushing again here could cancel the one scheduled after it.
-            do { try await Task.sleep(for: Self.interval) } catch { return }
-            await self?.flush(ifCurrent: id)
-        }
+        Task { flush(ifCurrent: id) }
     }
 
     private func flush(ifCurrent id: UUID) {
@@ -165,8 +155,6 @@ public actor AgentConversationLiveHub {
     }
 
     private func flush() {
-        pendingFlush?.cancel()
-        pendingFlush = nil
         pendingFlushID = nil
         let keys = dirty
         dirty.removeAll()
@@ -250,8 +238,7 @@ public struct AgentConversationLiveStore: Sendable {
             let store = AgentConversationStore(dataRoot: dataRoot)
             let records: [AgentConversationRecord]
             if let checkedRecords {
-                let peers = try AgentPeerStore(dataRoot: dataRoot).list()
-                records = try store.reconcilingExpiredReplies(checkedRecords, peers: peers)
+                records = checkedRecords
             } else {
                 records = try store.recordsUnlocked()
             }
@@ -277,10 +264,11 @@ public struct AgentConversationLiveStore: Sendable {
                 }
             }
             let now = Date()
-            rows = rows.filter { now.timeIntervalSince($0.value.lastActivityAt) < 24 * 60 * 60 }
+            rows = rows.filter { $0.value.finishedAt.map { now.timeIntervalSince($0) < 24 * 60 * 60 } ?? true }
             if rows.count > 64 {
-                let keep = rows.values.sorted { $0.lastActivityAt > $1.lastActivityAt }.prefix(64).map(\.key)
-                rows = rows.filter { keep.contains($0.key) }
+                let keep = Set(rows.values.filter { $0.finishedAt != nil }
+                    .sorted { $0.lastActivityAt > $1.lastActivityAt }.prefix(64).map(\.key))
+                rows = rows.filter { $0.value.finishedAt == nil || keep.contains($0.key) }
             }
             if rows != before {
                 let encoder = JSONEncoder()

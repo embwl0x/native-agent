@@ -97,27 +97,26 @@ public struct AttentionOrigin: Sendable, Equatable, Codable {
 }
 
 public struct AttentionOutcome: Sendable {
+    public let matterID: String
     public let receipt: MobileNotificationDeliveryReceipt?
+    let macPost: NativeAgentNotificationPostResult?
     public let destinationOutcomes: [String: NotificationDeliveryOutcome]
     public var suppressed: Bool {
         !destinationOutcomes.isEmpty && destinationOutcomes.values.allSatisfy {
             if case .suppressed = $0 { return true }; return false
         }
     }
-    /// Quiet hours retain the immutable intent without admitting its effect.
-    public let deferredForQuietHours: Bool
-
     init(
+        matterID: String,
         receipt: MobileNotificationDeliveryReceipt?,
-        deferredForQuietHours: Bool = false,
-        destinationOutcomes: [String: NotificationDeliveryOutcome] = [:]
+        destinationOutcomes: [String: NotificationDeliveryOutcome] = [:],
+        macPost: NativeAgentNotificationPostResult? = nil
     ) {
+        self.matterID = matterID
         self.receipt = receipt
-        self.deferredForQuietHours = deferredForQuietHours
+        self.macPost = macPost
         self.destinationOutcomes = destinationOutcomes
     }
-
-    static let routineSuccess = AttentionOutcome(receipt: nil)
 
     /// One projection of the transport outcome; saving the card is a separate fact.
     public enum Delivery: String, Sendable, Equatable {
@@ -137,7 +136,8 @@ public struct AttentionOutcome: Sendable {
             switch outcome {
             case .delivered: .accepted
             case .suppressed: .noChannel
-            case .notDelivered: deferredForQuietHours ? .deferred : .failed
+            case .deferred: .deferred
+            case .notDelivered: .failed
             case .unknown: .queued
             }
         }
@@ -157,8 +157,24 @@ public struct AttentionOutcome: Sendable {
         destinationProjections.mapValues { JSONValue.string($0.rawValue) }
     }
 
+    /// The same recorded hold is projected by Mac, phone, scheduled notices and Desk readouts.
+    public var deferredFields: [String: JSONValue]? {
+        guard var fields = destinationOutcomes.values.compactMap(\.deferredFields).first else { return nil }
+        // A held sibling supplies its instructions, never the verdict or effects of an unconfirmed or refused door.
+        if deliveryProjection != .deferred {
+            fields = fields.filter { ["deferredUntil", "message", "recorded"].contains($0.key) }
+        }
+        fields["notificationId"] = .string(matterID)
+        return fields
+    }
+
+    public func phoneDeliveryFields() throws -> [String: JSONValue] {
+        if deliveryProjection == .deferred, let fields = deferredFields { return fields }
+        return try requireReceipt().deliveryFields()
+    }
+
     /// A phone-pinned call requires its phone publication receipt; other doors cannot supply one or prove phone display.
-    public func requireReceipt() throws -> MobileNotificationDeliveryReceipt {
+    private func requireReceipt() throws -> MobileNotificationDeliveryReceipt {
         if case .suppressed(let preference)? = destinationOutcomes["phone"] {
             throw ToolFailureError("Not sent: this notification channel is off (" + preference + ").", effects: .none,
                 owner: preference, code: "notification_suppressed")
@@ -167,10 +183,6 @@ public struct AttentionOutcome: Sendable {
             throw ToolFailureError("Phone notification outcome is unknown: " + reason, effects: .unknown,
                 owner: "experiences", code: "notification_unconfirmed",
                 instruction: "Wait for the phone's receipt before requesting another notification.", recovery: .reconcile)
-        }
-        if deferredForQuietHours {
-            throw NSError(domain: "AttentionRouter", code: -503, userInfo: [NSLocalizedDescriptionKey:
-                "Held, not sent: the person's quiet hours are on. It goes to the person's doors when they end."])
         }
         if case .notDelivered(let reason)? = destinationOutcomes["phone"] {
             throw ToolFailureError("Phone notification was not delivered: " + reason, effects: .none,

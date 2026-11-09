@@ -15,7 +15,7 @@ import Senses
 import NativeAgentShared
 import Transcripts
 import TurnTrace
-// Blueprint: | `AgentWorld.swift` | Retained owner projections; asks read ForPerson's in-memory inbox without a second cache |
+// Blueprint: | `AgentWorld.swift` | Retained owner projections; asks read ForPerson's inbox, thoughts and owed happenings the record, no second cache |
 // Room acknowledgements preserve stale parts; turn pins apply to Home changes, while part owners are read separately.
 
 /// Home, rooms and the glance draw the same retained owner projections. Owner invalidations refresh each part independently, outside page assembly.
@@ -30,6 +30,7 @@ struct AgentWorld: @unchecked Sendable {
     var jobs: [DelegationReadout] = []
     var doors: [AgentScreen.DoorLine] = []
     var senses: [String] = []
+    var abilityRuns: [String: JSONValue] = [:]
     var senseFailures: [String] = []
     var identity = AgentContactIdentity(peers: [])
     var answered: [String: Date] = [:]
@@ -41,17 +42,18 @@ struct AgentWorld: @unchecked Sendable {
     var latest: [UUID: ShelfEntry] = [:]
     var running: Set<UUID> = []
     var approvals: [ApprovalRecord] = []
+    /// Each part of the agent's with an open trial, or whose latest trial closed: the night's rows on Home.
+    var trials: [TrialLevers.Line] = []
     /// Memory proposals need the agent's review, not the owner's.
     var reviews: (count: Int, capped: Bool) = (0, false)
     /// Count an approval's inbox card only once under OwnerAttentionPolicy.
     var asks = 0
     var newestAsk: String?
     var phonePlaces: [PhonePlaceEvent] = []
-    /// Show only arrivals absent from other Home lines.
-    var arrivals: [ResidentWake.Item] = []
-    /// Arrivals the agent was shown and has not accepted: MY QUEUE, never a repair.
-    var arrivalsToAccept = 0
-    var acceptableArrivals: Set<String> = []
+    /// The agent's latest thoughts, newest first, each with the happenings it attended that the record holds.
+    var thoughts: [MindLine] = []
+    /// Happenings still owed, newest first: to the agent's mind stream and to the conversations work returns to.
+    var owedToMe: [Experience] = []
     /// Unanswered discovery offers remain visible in PEOPLE.
     var found: [String: AgentDiscoveryOffer] = [:]
     /// Distinguish never-read parts from failed source reads.
@@ -59,6 +61,8 @@ struct AgentWorld: @unchecked Sendable {
     var pending: [String] = []
     /// A completed source read failed; never described as still pending.
     var failures: [String: String] = [:]
+    /// Identity of each retained source result, including a failure. Home reuses only derivations of these exact owner readings.
+    var readings: [String: UUID] = [:]
     var oldest: Date?
     var profile: PersonalityProfile?
     var work: [AgentScreen.JobGlance] = []
@@ -67,6 +71,12 @@ struct AgentWorld: @unchecked Sendable {
     var asksToOpen: [InboxItemRecord] = []
     var touched: [AgentScreen.Touched] = []
     var mailPreviewAllowed: Bool?
+
+    /// One thought of the agent's and the happenings it attended (the first three its record names).
+    struct MindLine: Sendable {
+        let thought: Experience
+        let attended: [Experience]
+    }
 
     func sourceFailure(_ keys: String...) -> String? {
         let lines = keys.compactMap { failures[$0] }
@@ -127,7 +137,8 @@ extension AgentScreen {
         func part<T>(_ key: String, _ paths: @autoclosure @escaping @Sendable () -> [URL], notifications: [Notification.Name] = [],
                      _ compute: @escaping @Sendable () async throws -> T) -> T? {
             if observing { memo.observe(root + key, paths: paths, notifications: notifications, compute: compute) }
-            let kept: (value: Result<T, Error>, current: Bool, at: Date)? = memo.peek(root + key)
+            let kept: (value: Result<T, Error>, current: Bool, at: Date, identity: UUID)? = memo.peek(root + key)
+            world.readings[key] = kept?.identity
             if let at = kept?.at { world.oldest = min(world.oldest ?? at, at) }
             if kept?.current != true { world.pending.append(key) }
             if kept == nil { world.unread.append(key) }
@@ -145,12 +156,6 @@ extension AgentScreen {
         if let events: [PhonePlaceEvent] = part("phone places", [PhonePlaceHistory.url(dataRoot)], {
             try PhonePlaceHistory.read(dataRoot)
         }) { world.phonePlaces = events }
-        if let arrivals: (items: [ResidentWake.Item], acceptable: Set<String>) = part("arrivals", [ResidentWake.url(dataRoot)], {
-            try ResidentWake.homeItems(dataRoot)
-        }) {
-            world.arrivals = arrivals.items; world.acceptableArrivals = arrivals.acceptable
-            world.arrivalsToAccept = arrivals.acceptable.count
-        }
         if let found: [String: AgentDiscoveryOffer] = part("found", [AgentDiscoveryOffer.url(dataRoot)], {
             try AgentDiscoveryOffer.checkedRead(dataRoot).filter(\.value.open)
         }) { world.found = found }
@@ -251,6 +256,9 @@ extension AgentScreen {
             return rows.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }
                 .sorted { ($0.lastRequestedAt ?? $0.createdAt) > ($1.lastRequestedAt ?? $1.createdAt) }
         } ?? []
+        // The stem's trial record: one row per part with an open trial or a closed one; when a closed one still shows is the page's to judge.
+        world.trials = part("trials", [at("abilities/state.json")]) { try TrialLevers.read(dataRoot: dataRoot) } ?? []
+        world.abilityRuns = part("ability runs", [at("abilities/state.json")]) { try AbilityStore(dataRoot: dataRoot).states() } ?? [:]
         // Memory proposals for the owner's review, the Today page's rule, from the shared store only; kept until the memory database changes.
         if let reviews: (count: Int, capped: Bool) = part("reviews",
                 [at("memory/memory.sqlite"), at("memory/memory.sqlite-wal")], {
@@ -291,6 +299,22 @@ extension AgentScreen {
         world.touched = part("touched", [AgentTouched.path(dataRoot)]) { try touched(dataRoot: dataRoot, now: Date()) } ?? []
         world.repairs = part("owed", [], notifications: [HomeFace.experiencesChanged]) {
             try await ExperienceStore.at(dataRoot).projection()
+        } ?? []
+        // The mind stream and what is owed are readings of the record, so they refresh with it like the owed rows.
+        world.thoughts = part("thoughts", [], notifications: [HomeFace.experiencesChanged]) {
+            let store = ExperienceStore.at(dataRoot)
+            var lines: [AgentWorld.MindLine] = []
+            for thought in try await Attention.thoughts(dataRoot: dataRoot).suffix(6).reversed() {
+                var attended: [Experience] = []
+                for id in thought.thought?.happenings.prefix(3) ?? [] {
+                    if let happening = try await store.experience(id) { attended.append(happening) }
+                }
+                lines.append(.init(thought: thought, attended: attended))
+            }
+            return lines
+        } ?? []
+        world.owedToMe = part("owed to me", [], notifications: [HomeFace.experiencesChanged]) {
+            try await Attention.owed(dataRoot: dataRoot).sorted { $0.at > $1.at }
         } ?? []
         world.queueEvidence = part("queue evidence", [at("desk/desk_ops.jsonl"), at("desk/desk_ops_base.json"),
             at("workflows/approvals/requests.json"), at("chat/sessions.json"), at("chat/messages"),
@@ -394,7 +418,7 @@ extension AgentScreen {
         }
         for approval in world.approvals where current("approvals") {
             marks["approval:" + approval.id] = Mark(fp: "pending", line: "",
-                new: "approval: " + clip(ApprovalWords.title(action: approval.action, title: approval.title, reason: approval.reason), 40),
+                new: "approval: " + clip(approval.title, 40),
                 at: (date(approval.lastRequestedAt ?? approval.createdAt) ?? now).timeIntervalSince1970)
         }
         let placeClock = DateFormatter()
@@ -408,9 +432,6 @@ extension AgentScreen {
             let line = prefix + place + when
             marks["phone-place:" + event.id] = Mark(fp: event.id, line: line, new: line,
                 at: event.timestamp.timeIntervalSince1970)
-        }
-        for item in world.arrivals where current("arrivals") {
-            marks["arrival:" + item.id] = Mark(fp: item.id, line: "", new: item.renderedLine, at: item.at.timeIntervalSince1970)
         }
         return marks
     }
@@ -590,7 +611,7 @@ extension AgentScreen {
             // The person's to decide first, then the agent's: the same split as home.
             var waits: [String] = [], mine: [String] = []
             if let first = world.approvals.first {
-                waits.append("approval \"" + clip(ApprovalWords.title(action: first.action, title: first.title, reason: first.reason), 28) + "\""
+                waits.append("approval \"" + clip(first.title, 28) + "\""
                     + (world.approvals.count > 1 ? " +\(world.approvals.count - 1)" : ""))
             }
             if let desk = world.desk {
@@ -612,7 +633,7 @@ extension AgentScreen {
             guard !changed.isEmpty || !waits.isEmpty || !mine.isEmpty || !unread.isEmpty else { return nil }
             var parts = ["""
                 Home glance — snapshot as of \(now.formatted(.iso8601)). \(freshness(world, now: now)). Desk, inbox, approvals, exchanges, helper \
-                status, phone-place/wake records and reviews; no live calendar, reminders, mail, front app, full Doctor check or complete activity log.
+                status, phone-place records and reviews; no live calendar, reminders, mail, front app, full Doctor check or complete activity log.
                 """]
             if let seen, !changed.isEmpty {
                 let shown = changed.prefix(3).map { clip($0.line, 44) }

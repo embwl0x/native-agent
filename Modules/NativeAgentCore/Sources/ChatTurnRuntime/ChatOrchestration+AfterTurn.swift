@@ -36,7 +36,8 @@ extension SwiftNativeTurnEngine {
     work: ChatTurnWork) -> AfterReply {
         var origin = turn.afterTurnOrigin
         origin?.took = took
-        if sessionId == ResidentWake.session, !turn.careWakes.isEmpty {
+        // A thought about a care is judged for that care: its movement is how the thought mattered.
+        if sessionId == Happening.stream, !turn.careWakes.isEmpty {
             origin?.careWakes = turn.careWakes
         }
         let pending = PendingMemoryPromotion(

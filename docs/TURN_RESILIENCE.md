@@ -3,6 +3,10 @@
 How a turn keeps working, stops, and leaves evidence. One brain, many doors:
 `EngineRuntime/EngineTurns.swift` holds Mac turn state through
 `MacChatTurnRuntime`; `ChatTurnRuntime` owns the shared turn engine.
+Mac views draw shared `TurnFace` values through their session-keyed face slots,
+projected off main by `TurnFaceProjection`. Lifecycle state remains operational
+authority. Time since movement is descriptive; it never changes phase or
+expires a streaming marker. See the [face feed](designs/separate-face.md#stage-one-turn-status).
 Source paths below are relative to `Modules/NativeAgentCore/Sources/`.
 
 The agent's one always-on tool is `app`. `app {}` returns home, where they left
@@ -24,6 +28,9 @@ contract is in [Tool loading](TOOL_LOADING.md).
   receipt and current state before repeating it.
 - Keep cancellation distinct from failure. Recovery does not grant permission
   to replay a whole turn.
+- Withhold unavailable recall and name its cause in the turn's context; follow
+  the [recall-unavailability law](ANATOMY_OF_A_TURN.md#recall-unavailability)
+  without retrying or extending its wait.
 
 ## The pieces
 
@@ -138,57 +145,68 @@ The resident loop refuses a part's out-of-round call index before dispatch.
 A restored negative commentary length contributes no commentary, and a helper
 round with missing tool results is refused before formatting its feedback.
 
-### 4. Provider timeouts
+### 4. Provider liveness
 
-`ProviderRouting/ProviderStreamGuard.swift` defaults to a 90-second idle
-timeout and 600-second wall timeout. Environment settings
-`NATIVE_AGENT_PROVIDER_STREAM_IDLE_TIMEOUT_SEC` and
-`NATIVE_AGENT_PROVIDER_STREAM_WALL_TIMEOUT_SEC` override them; values are
-required to be finite in 0–86,400 seconds, with zero disabling that timeout.
-Only an absent override uses the default. An empty, malformed, negative,
-nonfinite or out-of-range override refuses execution before transport; only
-the `_SEC` names are supported. Background
-calls use the same settings. Idle time is wire activity (headers, SSE
-comments, events); a cut is the typed `ProviderFailure.noReply`, and every
-stream failure's `Diagnostic` records whether the provider admitted the request.
-An HTTP request awaiting its response head uses the same idle, wall and
-learned first-output bounds as the answer. There is no separate fixed
-response-head timer: a provider can withhold headers during prefill or thought,
-so cutting that wire early can repeatedly restart real work. Before any wire
-activity, the learned first-output deadline applies: the slowest retained adapter `ttftMs` on that model and
-stream kind (`ProviderVitalsSensor`, from trace `llm.call` rows at launch and
-live calls). Under 100 calls it is unmeasured. Whole-reply callers collect
-the same incremental stream and retain its first-output measurement.
-A live wire is bounded by idle and wall; between attempts only the wall and
-the shared offline deadline run. One process-wide `NetworkSense` replaces
-private provider, iCloud and Dot path monitors. Online, dial admission reads
-its Bool. Offline, a dial waits at most 30 seconds for the path to return,
-then fails typed `ProviderFailure.offline`. Offline describes the connection,
-not whether anything ran: its diagnostic retains the current dial's send,
-response-admission and event evidence; the turn owns work progress. Without
-that work evidence the report says outcome unknown.
-The guard also observes path loss during an in-flight stream, so an already
-running wake ends typed after 30 seconds offline instead of waiting for its
-wall to be cancelled. The delegation tick budget derives from this guard's
-configured wall plus 60 seconds (normally 660 seconds).
-The cut text says the seconds waited, what arrived, and that evidence.
-The request's progress writer wakes deadline evaluation, registered before the
-state read; no interval samples it. Termination closes activity admission and
-cancels the request's forwarding and deadline tasks. The owner retains their
-handles through actual exit without joining a noncooperative producer.
-Wall-off streams retain transport-driven completion while online; the deadline
-worker parks on events with no timer until a network loss needs its offline bound.
-Error-body diagnostics use their byte writer's wake with the same idle threshold
-and absolute cap, return partial bytes on read timeout, and preserve user cancellation.
+A provider request's stream terminal, transport completion/error, network-path
+loss or explicit cancellation settles the request; elapsed
+silence and historical first-output latency decide nothing. Provider vitals
+retain their passive health EMAs; there is no first-output deadline interface,
+sample history or startup trace replay for computing request cutoffs. `ProviderHTTP`
+supplies sessions without request or resource clock limits. An unanswered
+request stays waiting with Stop as its cancellation lever; `provider.waiting`
+names the network path or provider response, the provider and the start time in
+its trace and the turn's existing progress notices. Mac chat reduces those notices
+into its working card; the other-door lifecycle intake consumes the same trace
+descriptions for turns opened through another surface. Waiting names its start
+time, reconnecting names the event and next action, and Stop remains available.
+`ProviderHTTPBytes` receives headers, body chunks and task completion from one
+task-specific `URLSessionDataDelegate`. Completion closes its body stream
+directly; no `URLSession.AsyncBytes` iterator must rediscover that terminal.
+`provider.httpRequestStarted` and `provider.httpRequestEnded` share a request id.
+A system cancellation of an active request is a network failure; explicit Stop
+stays cancellation.
+Socket completion errors retain their original transport shape. Chat Completions
+finalizes interrupted network/offline reads, preserving complete accumulated
+calls in wire order and withholding incomplete argument tails. Provider verdicts
+and Stop remain errors rather than permission to execute retained calls.
+
+`NetworkSense` owns one process-wide path monitor. A new HTTP send subscribes
+to its current path and waits for satisfaction or cancellation. An unobserved
+path stays unknown; satisfaction proves local reachability, never provider
+health. Path changes publish directly to body consumers without a quiet timer.
+Each open HTTP task subscribes to those same edges; an unsatisfied path cancels
+that task and closes its wait with the network cause. Subscriptions retain every
+edge, including a loss followed immediately by a return.
+`URLSession.waitsForConnectivity` is off: the path owner holds network waits,
+while a connection that cannot be established returns its transport error
+instead of becoming an unsent task held by URLSession.
+
+Error-body diagnostics wait for EOF, read error, the declared byte cap or
+cancellation. A failed read retains its partial diagnostic bytes, HTTP status
+and Retry-After when observed, and original read cause; its diagnostic includes
+the redacted partial body. It cannot manufacture an empty body.
+
+The external delegation envelope and dream-preview
+admission still consume `ProviderStreamGuardConfig`; those caller-owned clocks
+are separate from provider transport and require removal in their owning lanes.
 
 Anthropic-compatible message streams, including tool-free API and Kimi Code
 calls, use SSE. Codex stdout supplies real progress; synthetic keep-alives
-prove neither provider progress nor first output. Both Codex runners use one
-strict incremental UTF-8 decoder per pipe. Split scalars wait for their remaining
-bytes; invalid or unfinished scalars fail after process settlement, retaining
+prove neither provider progress nor first output. Every Codex call uses the same
+stdout producer and one strict incremental UTF-8 decoder per pipe. Split scalars
+wait for their remaining bytes; invalid or unfinished scalars fail after process settlement, retaining
 valid prefixes and exact undecodable suffix bytes on the encoding error. Raw
 bytes are not written to diagnostics. Exit zero cannot make invalid encoding
 a successful reply.
+prove neither provider progress nor first output. Buffered Codex completion
+collects the same stdout stream as incremental completion. A strict UTF-8 decoder
+retains valid prefixes and exact undecodable suffix bytes; stdout EOF or a pipe
+read failure settles the model wait without awaiting process exit or stderr.
+Invalid or unfinished stdout scalars fail that wait. Raw bytes are not written
+to diagnostics. The invocation retains its process and both drains until actual
+exit; `codex.process.exited` records its status and capture/encoding failures
+independently, including when stdout closed before exit. A late exit cannot
+change the already settled reply.
 Anthropic's event consumer owns frame validation, timing, text/thinking liveness,
 usage and terminal receipts for both native-tool and OAuth text-marker streams;
 native signed-thinking replay and tool commitment remain payload handling.
@@ -196,20 +214,82 @@ A call's input as it streams is movement the person sees, never a cut or a
 deadline; [the anatomy](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool)
 owns how it reaches the working card.
 
-`ProviderRouting/LLMClient+Real.swift` wraps streams with the configured
-per-call guard. Its whole-reply completion uses that same guarded operation
-and checked collector, with or without a turn token budget. There is no
-independent buffered HTTP completion or completion-wall timer. A guard cut
-is input to recovery, never a whole-turn deadline. Before any answer arrives,
-sent HTTP calls can redial for lost wires, overload or retryable rate limits,
-up to ten total attempts within the call's wall. Separately, their turn part asks
-again once only when `retry_now` permits it, the wire has not redialed, nothing
-ran or was sent, and no repair is owed. Otherwise it says the failure.
+`ProviderRouting/LLMClient+Real.swift` forwards the selected adapter through its
+cancellation and admission boundary. Whole-reply completion uses that same
+operation and checked collector, with or without a turn token budget. Its one
+reply owner releases the caller's wait at Stop while collection and forwarding
+settle independently. The HTTP request observes cancellation; Codex runs to its
+own exit and pipe EOF and retains its produced output, even after cancellation
+has returned to a buffered or streaming caller.
+The provider path performs no automatic redelivery or HTTP 401 replay.
+Provider failures give the turn part the cause and remedy; they authorize no
+automatic re-request. A retry chosen by the agent may be paced only by the
+server's explicit `retry_after`, never by a computed backoff or an assumed
+rate-limit wait.
+operation and checked collector, with or without a turn token budget. Stop
+leaves forwarding alive: the HTTP request observes cancellation, while Codex
+runs to stdout EOF while process settlement owns its later exit. Whole-reply
+settlement retains all produced output before returning cancellation.
+`TurnAdmission` gives the turn one `ProviderRecovery` part; a direct turn-engine
+entry creates it when no admission supplied one. The routed client's stream
+boundary reads that same owner on every model round. A standalone request owns
+its own allowance. Each interrupted sequence permits one reconnect, shared
+across pre-output replays and partial-output continuations. A successfully
+completed provider stream clears that sequence; partial rounds never renew it.
+Before reply text or a complete tool call has been forwarded, the boundary
+re-sends through the same adapter and admitted route. Streaming argument
+fragments, liveness and presentation markers are not answers and do not prevent
+reconnect; the replacement invocation starts fresh argument assembly.
+
+After output, the turn retains prose and dispatches complete calls once; its
+next request consumes the same pending recovery gate before opening a transport.
+Chat Completions forwards its original interrupted-read error after yielding
+the surviving calls and boundary, so finalization cannot hide a connection loss.
+The owner retains the typed cause and Retry-After across the round boundary.
+Headers also publish their Retry-After to that request's recovery owner, so a
+mid-stream error retains a server-prescribed delay from an HTTP 200 response.
+Lifecycle repair wrapping preserves both that delay and the terminal stop type.
+
+Network failures wait for path satisfaction and any supplied Retry-After;
+overloads and 5xx use Retry-After when supplied, otherwise the one reconnect has
+no invented delay. A rate limit reconnects only with its explicit delay. Seconds
+and HTTP-date values are not shortened by an application cap. One pending wait
+owns the re-request; `provider.reconnecting` records its cause and next attempt.
+Stop cancels and joins that wait. A second failure stops with its cause
+and closes admission to further model requests in that turn. Retained prose and
+complete calls survive that failure; a subsequent model effect receives the
+terminal cause without sending. Auth, quota, malformed responses and request/
+refusal errors do not admit reconnects; there is no HTTP 401 replay. Output-limit
+continuations belong to their declared output budget, not connection recovery.
+Direct adapter consumers receive terminal errors; the recovery owner belongs to
+the routed client.
+
+OpenAI's [streaming guide](https://developers.openai.com/api/docs/guides/streaming-responses)
+specifies no heartbeat cadence. Anthropic's
+[streaming contract](https://platform.claude.com/docs/en/build-with-claude/streaming#ping-events)
+permits ping events without a required cadence. Neither contract supplies a
+silence deadline: an open, silent stream remains waiting with Stop available.
 
 Malformed nonempty JSON data fails Responses, Chat Completions and Anthropic
 SSE decoding even before first output. Empty SSE data and protocol control
 frames remain explicit; the shared framer consumes comments as keep-alives.
 A malformed frame is not a network outage and does not admit a redial.
+`LLMCall.allowsSilentCompletion` declares whether a clean provider terminal
+without answer text or calls is a complete answer. The stem declares it for a
+thought from its native opening message's `attended` object, including checkpoint
+replay; other requests require output unless their caller explicitly declares
+silence valid. All adapters and the stem read that same declaration. Anthropic
+requires `end_turn` with every block closed, Responses requires a completed
+response, Chat Completions requires `stop` and `[DONE]`, and Codex requires EOF
+and successful process exit. Refusal, output limits, incomplete calls and missing
+terminal evidence retain their failure or incomplete boundary. An open stream
+without a terminal remains waiting with Stop available.
+
+Without the declaration, a completed terminal with no answer text or calls,
+including a clean empty CLI exit, is malformed output. It supplies no evidence
+of a broken connection and does not admit a reconnect. A declared silent thought
+reaches its turn program as an empty `model` event and settles through the
+ordinary silence path ([turn anatomy](ANATOMY_OF_A_TURN.md#6-the-answer-settles-once)).
 
 Quota and billing exhaustion retain `quotaExceeded(retryAfter:)`. An omitted
 Retry-After is an unknown reset time, never an invented hour or a short-rate-limit
@@ -219,29 +299,34 @@ redial. Recovery directs the caller to account allowance and billing evidence.
 HTTP(S) loopback URL without credentials or a fragment. Invalid configuration
 refuses both OpenAI request shapes before credentials are read or transport opens.
 
-All cutoff diagnostics share `RunawayOutputDetector.writeDiagnostic`. Preview
+Provider output reaches the turn unchanged; there is no instance detector,
+buffered scan or output override. Read-only app-call classification belongs to
+`AppActionBinding` and uses the app executor's checked registry reader.
+All cutoff diagnostics share `ProviderOutputDiagnostics.writeDiagnostic`. Preview
 returns no file before directory creation, writing or pruning. Outside preview,
 the request's trace-root override wins; otherwise the adapter's telemetry root
 owns its output. Reason and content pass through `ContextSecretContentPolicy`
-before persistence. Existing retained files are not rewritten by this change.
+before persistence. A turnless diagnostic uses a UUID filename; retention
+keeps the newest 100 text files and reports directory, metadata or deletion
+failures. Existing retained files keep their names and contents.
 
 ### 5. In-loop provider recovery
 
 `ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` owns the loop,
 including native-tool and text-marker protocols. One `TurnObservation` owns
 the model's next-round feedback for a limit, stream cut, correctness boundary,
-malformed call, empty reply, refusal or full context.
+malformed call, undeclared empty reply, refusal or full context.
 No vocabulary of sentences decides that a reply is unfinished. It preserves kept prose and appends a user text block alongside the
 round's tool results, or a standalone user message when there were no results.
 `turn.observation` records the same feedback on both protocols.
 
-The learned first-output deadline bounds only a wire with nothing on it; a
-live wire is bounded by idle silence and the wall. A recoverable cut after they
+An actual stream interruption after they
 said something or called a tool is the round's `interrupted` boundary: complete
 calls run, their words stay, and they continues after them. A cut where nothing
 ran or nothing was sent, with no repair owed, reaches their turn part as
-`provider_failure`; only `retry_now` with no wire redial permits one more
-model call. Otherwise the failure becomes their words to the person.
+`provider_failure` after the pre-output reconnect described above. The shipped
+turn part ends with that failure's words; that failure event requests no
+further model call.
 
 Streaming adapters report max-token limits as `toolBoundary(.outputLimit)`.
 Whole-reply collection returns a complete reply or rethrows the original error
@@ -257,22 +342,43 @@ An output-limit partial withholds that reply's calls and carries
 prose, or that prefix if nothing was yielded,
 discards that reply's calls and continues. Retained answer text stays outside
 the pre-tool commentary prefix, so every surface delivers it as answer text.
-Repeated blocks/actions, invented results and prose after a call are
-correctness boundaries: complete
-calls before the cut run and their results carry the observation. The third
-identical read in one reply is a boundary even when other reads intervene.
+Provider decoders forward text deltas unchanged; repeated blocks, invented-result
+headings and post-call prose do not cut the provider stream. Tool parsing and
+effect admission remain with the turn and dispatcher owners.
 
 Authentication, missing configuration/routing and unavailable-model errors
 still name the needed repair; a thrown turn ends failed rather than persisting
-a wait with no waiter. Standalone `complete()` overload retries retain their
-own ten-attempt bound and deadlines.
+a wait with no waiter. Standalone `complete()` overloads collect the same single
+adapter invocation.
 
 ### 6. Surface ownership
 
 Telegram invokes the shared chat engine once. Provider recovery lives inside
 the same turn; no surface automatically re-runs its completed tools.
-The person's explicit `/retry` and Telegram delivery retries retain their
-existing meaning. Streaming surfaces keep editing the same reply after cuts.
+Slack journal retention reads completion-lifecycle references only when terminal
+records exceed its retention cap; admission and settlement below that cap need only the journal.
+An orphaned Slack generation without a saved answer settles as interrupted and
+releases pending capacity. Its notice offers `/retry`, which pins the original
+input and conversation to the command's own run; `/retry resend` only sends saved output.
+The interrupted run keeps its identity, and a late saved answer can still be delivered.
+Every advertised Slack file reaches attachment preparation, including files with
+missing MIME/download metadata; any preparation failure is shown before chat admission.
+Telegram speech-permission denial retains both ordinary intake and `/retry` as
+`awaiting_speech_permission` and asks the Mac for authorization. A retry's resolved
+input and session are durable before preparation, so approval recovery uses that same request.
+Telegram's stopped turn retains and joins its settlement task without a timeout.
+Stop-button polling requests that task without awaiting its result; slash commands
+await confirmation in their command task after releasing polling admission.
+The person's explicit `/retry` retains its meaning. A Telegram API rejection
+returns to the caller without an automatic retry; a server's `retry_after`
+paces later admitted sends. Streaming surfaces keep editing the same reply after cuts.
+Telegram and Slack previews coalesce while the admitted send is in flight;
+producer progress and send completion drive publication, without a spacing clock.
+Reply producers own secret masking. Slack retains and sends their canonical reply
+and fingerprint without another output check at the wire.
+Slack's saved connected flag also requires its running socket owner; age alone
+does not establish disconnection. Telegram progress retains its owner's phase;
+elapsed time is presentation data and cannot replace that phase.
 
 ### 7. Cancellation trace
 
@@ -290,10 +396,16 @@ A late tool result cannot replace the dispatch race's first terminal outcome.
 ### 8. Conversation tail and result pointers
 
 The [conversation context contract](conversation-context-history.md) owns the
-verbatim tail, model-default window, stateless whole-turn half-budget jumps and oldest
-result-body pointers. The transcript is never replaced with generated text.
+held conversation, stateless whole-turn half-budget jumps and oldest
+result-body pointers. Quiet never ends what they holds. A conversation is held
+whole until the request reaches the input budget; then the oldest whole turns
+go in half-budget jumps. The input budget is min(model window minus response
+allowance, 200,000 tokens). History fitting uses the input budget; refusal and
+result pointers use model window minus response allowance, the physical limit.
+The transcript is never replaced with generated text.
 Before every resident or helper round, `context.request.fit` records measured
-input, output allowance and the model window. A request that remains too large
+input, history input budget, physical input limit, output allowance and the model
+window. A request that remains above the physical limit
 is refused as `context_window_exceeded`; a provider's later overflow refusal
 reports its cause without an alternate summary pass.
 
@@ -394,8 +506,9 @@ Live terminal deduplication matches decoded rows by turn and status; unrelated
 malformed or torn rows do not prevent the known terminal from landing. The
 canonical JSONL writer closes a torn tail before appending the new row. Recovery
 still requires clean trace coverage before concluding that a turn is settled.
-An existing Desk journal stays attached to its original item; its scheduler
-does not compete with checkpoint recovery. Ordinary turns acquire no Desk item.
+An existing Desk journal stays attached to its original item; an interrupted
+Desk wait whose run has a checkpoint is resumed by checkpoint recovery, never
+returned (`EngineTurnContinuation.swift`). Ordinary turns acquire no Desk item.
 There is no process-resume count limit or new timer.
 
 Resuming a current checkpoint requires the tool receipt's recorded `ranCall`
@@ -422,19 +535,16 @@ Its five-minute gate applies before the shared sweep, including checkpoint
 discovery. The legacy trace date window does not bound checkpoint discovery,
 and this sweep cadence imposes no clock limit on a running turn.
 
-### 10. Bridge deadlines
+### 10. Bridge ownership
 
-Bridge deadlines: connection 30s; enqueue acknowledgement 30s; message wait
-600s; direct tool call 300s (bridge `/tool` endpoint only); reads 60s.
-Direct tool ingress passes the 300-second active-work chain to its
-operation-aware dispatcher, so nested human waits and part progress act on
-that same ceiling rather than an empty chain.
-`Agents/ClaudeBridgeMessageRuntime.swift` releases either enqueue or message wait
-with HTTP 202 `still_working`, retaining `task_id` without cancelling admission
-or execution. A late durable enqueue continues under that same task/run identity.
+Connection reads settle from request bytes, EOF, close or cancellation. Enqueue,
+message, read and direct tool operations have no internal clock cutoff; their
+admission, dispatch and retained receipt owners supply the actual result.
+Closing a response connection cannot manufacture a terminal execution outcome.
 `AgentContactTasks` owns its worker, produced output and terminal receipt. Recover its receipt
 using the original request ID (and session ID for `/agent/reply`); do not
-resend merely because the response is pending.
+resend merely because the response is pending. An explicitly requested MCP
+retrieval duration limits that caller's observation, leaving accepted work owned.
 
 ### 11. Mobile action uncertainty
 
@@ -481,8 +591,10 @@ propagate their own errors to their caller.
 
 | Evidence | What to inspect |
 |---|---|
-| `llm.call` | Call status and retained error detail. Exhausted wire recovery includes the aggregate diagnostic's tries and elapsed time; no per-attempt delay history is emitted. Missing call evidence does not prove no retry occurred. |
-| `context.tail.cut` / `context.tool_result.pointer` | Whole-turn cut or retained result-body pointers, with measured before/after size. |
+| `llm.call` | Call status and retained error detail. Missing call evidence does not prove no reconnect occurred. |
+| `provider.httpRequestStarted` / `provider.httpRequestEnded` | One request id joins a send to its task completion, network loss or cancellation. |
+| `provider.waiting` / `provider.reconnecting` | Working-card wait reason, time and Stop; or reconnect cause and attempt, also retained in the trace. |
+| `context.tail.cut` / `context.tool_result.pointer` | Observed replay-head movement or retained result-body pointers, with measured before/after size. |
 | `turn.cancelled` | The `where` field and any interrupted action's effects. |
 | `turn.failed` or `turn.terminal` | The recorded outcome and reason. |
 | Historical terminal from `terminal_reconciliation` | An older build recorded that a previous process left the turn unfinished; current reconciliation records recovery obligations. |

@@ -87,7 +87,7 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
     public let targets: [MacFourVerbsSupplementalTarget]
     /// Occluding windows bound where physical acts may land or pass, regardless of the pixels’ source.
     public let obstructions: [MacAXFrame]
-    /// Fusion telemetry never becomes screen prose or action authority.
+    /// Capture omissions remain visible; fusion telemetry supplies no action authority.
     public let diagnostics: [String: JSONValue]
 
     public init(

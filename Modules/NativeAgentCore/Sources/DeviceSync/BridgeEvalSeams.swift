@@ -47,10 +47,6 @@ enum ICloudIncomingMessageDisposition: Equatable, Sendable {
     }
 }
 
-enum ICloudDeliveryNudgePlan {
-    static let delaysNanoseconds: [UInt64] = [1_000_000_000, 3_000_000_000]
-}
-
 /// KVS stops at 1,024 keys; reserve room for pairing, snapshots and inbox nudges before admitting progress.
 struct ICloudKVSKeyspaceSnapshot: Equatable, Sendable {
     let totalKeyCount: Int
@@ -111,37 +107,10 @@ enum ICloudKVSProgressWriteAdmission: Equatable, Sendable {
 }
 
 enum ICloudKVSProgressDeliveryResult: Equatable, Sendable {
+    case unchanged
     case synchronized
     case synchronizeFailed
     case blocked(ICloudKVSProgressWriteAdmission)
-    case timedOut
-}
-
-struct MacSyncChatSnapshotCoalescerState: Equatable {
-    private(set) var activeGeneration: UInt64?
-    private(set) var needsTranscripts = false
-
-    /// True only for the caller that must start the one deferred task.
-    mutating func enqueue(includeTranscripts: Bool, generation: UInt64) -> Bool {
-        needsTranscripts = needsTranscripts || includeTranscripts
-        guard activeGeneration == nil else { return false }
-        activeGeneration = generation
-        return true
-    }
-
-    /// Match lifecycle and generation so a stale task cannot erase newer work or strand its own latch.
-    mutating func resolve(generation: UInt64, currentGeneration: UInt64, isActive: Bool) -> Bool? {
-        guard activeGeneration == generation else { return nil }
-        activeGeneration = nil
-        defer { needsTranscripts = false }
-        guard generation == currentGeneration, isActive else { return nil }
-        return needsTranscripts
-    }
-
-    mutating func reset() {
-        activeGeneration = nil
-        needsTranscripts = false
-    }
 }
 
 enum MacSyncArchiveRetentionWatchPaths {
@@ -150,27 +119,20 @@ enum MacSyncArchiveRetentionWatchPaths {
         responsesDirectory: URL?,
         transactionDirectory: URL?,
         dataRoot: URL,
-        fileManager: FileManager = .default) -> [URL] {
-        guard let responsesDirectory, let transactionDirectory else { return [] }
+        fileManager: FileManager = .default) throws -> [URL] {
+        guard let responsesDirectory, let transactionDirectory else { throw DeviceSyncError.notConfigured }
         let rejected = inboxDirectory?.appendingPathComponent("_rejected", isDirectory: true)
         let paths = [inboxDirectory, responsesDirectory, rejected, transactionDirectory,
                      ICloudSyncStatePaths.completedUnarchivedDirectory(dataRoot: dataRoot),
                      dataRoot.appendingPathComponent("icloud/chat_transactions", isDirectory: true)].compactMap { $0 }
         for path in paths {
-            var isDirectory: ObjCBool = false
-            if fileManager.fileExists(atPath: path.path, isDirectory: &isDirectory) {
-                guard isDirectory.boolValue else { return [] }
-                continue
-            }
             do {
-                try fileManager.createDirectory(at: path, withIntermediateDirectories: true)
+                guard try path.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+                    throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: path.path])
+                }
             } catch {
-                return []
-            }
-            guard fileManager.fileExists(atPath: path.path, isDirectory: &isDirectory),
-                  isDirectory.boolValue
-            else {
-                return []
+                guard MacSyncEngine.isNoSuchFileError(error) else { throw error }
+                try fileManager.createDirectory(at: path, withIntermediateDirectories: true)
             }
         }
         return paths

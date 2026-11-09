@@ -32,7 +32,6 @@ public final class ActivityWatcher: @unchecked Sendable {
     let store: ActivitySpanStore
     let clock = SystemActivityClock()
     let idleThreshold = ActivityWatcher.defaultIdleThreshold
-    let ownProcessID = ProcessInfo.processInfo.processIdentifier
     let lifecycleChanged: (@Sendable (LifecycleState) -> Void)?
     let observationIssue: (@Sendable (String) -> Void)?
 

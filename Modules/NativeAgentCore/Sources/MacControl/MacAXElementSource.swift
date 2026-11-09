@@ -41,6 +41,8 @@ public protocol MacAXElementSource: Sendable {
     func transientMenuRoots(pid: Int32, context: MacOperationContext) -> [MacAXElementRef]
     func attributes(of ref: MacAXElementRef, context: MacOperationContext) -> MacAXAttributes?
     func checkedAttributes(of ref: MacAXElementRef, context: MacOperationContext) throws -> MacAXAttributes
+    /// A control or row wholly outside the bounds, which cannot appear in a picture of them.
+    func liesWhollyOutside(_ ref: MacAXElementRef, bounds: MacAXFrame, context: MacOperationContext) -> Bool
     /// Secret-mask reads need role, subrole, title, value, frame and actions; display-only reads add no masking evidence.
     func maskingAttributes(of ref: MacAXElementRef, context: MacOperationContext) -> MacAXAttributes?
     func checkedMaskingAttributes(of ref: MacAXElementRef, context: MacOperationContext) throws -> MacAXAttributes
@@ -85,6 +87,7 @@ public extension MacAXElementSource {
         return value
     }
     func maskingAttributes(of ref: MacAXElementRef, context: MacOperationContext) -> MacAXAttributes? { attributes(of: ref, context: context) }
+    func liesWhollyOutside(_ ref: MacAXElementRef, bounds: MacAXFrame, context: MacOperationContext) -> Bool { false }
     func settableAttributes(of ref: MacAXElementRef, context: MacOperationContext) -> [String] { [] }
     func elementHash(_ ref: MacAXElementRef) -> Int? { nil }
     func sameElement(_ lhs: MacAXElementRef, _ rhs: MacAXElementRef) -> Bool { lhs == rhs }

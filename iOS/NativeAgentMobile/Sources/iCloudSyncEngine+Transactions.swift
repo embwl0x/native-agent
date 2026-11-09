@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `iCloudSyncEngine+Transactions.swift` | Signed envelope retention, pairing reconciliation, mailbox recovery and bounded locked persistence |
+// Blueprint: | `iCloudSyncEngine+Transactions.swift` | Signed envelope retention, pairing reconciliation, mailbox recovery and completion-held persistence |
 
 extension iCloudSyncEngine {
     /// Only actual missing files are optional for response/envelope owners; unreadable bytes must throw.
@@ -15,14 +15,11 @@ extension iCloudSyncEngine {
                failure.code == NSFileNoSuchFileError || failure.code == NSFileReadNoSuchFileError { return nil }
             throw error
         }
-        if FileManager.default.isUbiquitousItem(at: file) {
-            try FileManager.default.startDownloadingUbiquitousItem(at: file)
-        }
         return try coordinatedRead(file, options: [.withoutChanges])
     }
 
     nonisolated static func reconcileActionsForConnectionRepair(
-        transactions: URL?, responses: URL?, inbox: URL?, currentSecret: Data? = nil
+        transactions: URL?, responses: URL?, currentSecret: Data? = nil
     ) async throws {
         try await VolumeIO.run {
             let manager = FileManager.default
@@ -73,7 +70,6 @@ extension iCloudSyncEngine {
             for messageID in staleMessageIDs {
                 guard UUID(uuidString: messageID) != nil else { continue }
                 try removeIfPresent(responses?.appendingPathComponent("\(messageID).json"))
-                try removeIfPresent(inbox?.appendingPathComponent("\(messageID).json"))
             }
         }
     }
@@ -91,12 +87,14 @@ extension iCloudSyncEngine {
         }
         let url = responsesDir.appendingPathComponent("\(actionID).json")
         do {
-            let response = try JSONDecoder().decode([String: String].self, from: data)
-            guard let action = response["action"], !action.isEmpty else {
-                throw SyncError.persistence("CloudKit action response omitted its action identity.")
-            }
-            try await VolumeIO.run {
+            let action = try await VolumeIO.run {
+                let response = try JSONDecoder().decode([String: String].self, from: data)
+                guard let action = response["action"], !action.isEmpty else {
+                    throw SyncError.persistence("CloudKit action response omitted its action identity.")
+                }
+                if try Self.readActionMailboxFile(at: url) == data { return action }
                 try data.write(to: url, options: .atomic)
+                return action
             }
             // Wake response waiters only after the bytes are durable.
             ActionResponseWaiters.shared.signal(actionID)
@@ -109,16 +107,9 @@ extension iCloudSyncEngine {
         }
     }
 
-    /// Retained sends outlive UI waits; on launch every unsettled one is polled by exact identity within the budget. Settled records are
-    /// the retention sweep's, never a recovery gap; a send left unpolled when the budget ends stays retained and settles on its arrival.
+    /// Launch reconciles retained requests by exact response identity without sending them again.
     func settleUnobservedActionResponses(budget: OperationWaitBudget = .init()) async {
-        do {
-            try await OperationWaitBudget.withDeadline(seconds: 5, budget: budget) { @MainActor budget in
-                await self.recoverUnobservedActionResponses(budget: budget)
-            }
-        } catch {
-            syncError = "Action mailbox recovery did not finish: \(error.localizedDescription). Unsettled responses remain retained."
-        }
+        await recoverUnobservedActionResponses(budget: budget)
     }
 
     private func recoverUnobservedActionResponses(budget: OperationWaitBudget) async {
@@ -269,8 +260,6 @@ extension iCloudSyncEngine {
         }
         let capturedTransactionDir = transactionDir
         guard !budget.expired else { throw budget.cancellationError }
-        let timeoutSeconds = min(max(0.05, transactionWriteTimeoutSeconds),
-            budget.wallDate?.timeIntervalSinceNow ?? .infinity)
         let result: Result<Void, Error> = await withCheckedContinuation { continuation in
             let resumeBox = ContinuationOnce<Result<Void, Error>>()
             resumeBox.install(continuation)
@@ -315,13 +304,13 @@ extension iCloudSyncEngine {
                         resumeBox.resume(.success(()))
                         return
                     }
-                    let record = ICloudTransactionRecord(
+                    var record = ICloudTransactionRecord(
                         id: id,
                         direction: "ios_to_mac",
                         action: action,
                         state: state,
                         createdAt: existing?.createdAt ?? now,
-                        updatedAt: now,
+                        updatedAt: existing?.updatedAt ?? now,
                         attempts: max(attempts, existing?.attempts ?? 0),
                         lastError: error ?? existing?.lastError,
                         response: response ?? existing?.response,
@@ -330,6 +319,11 @@ extension iCloudSyncEngine {
                     )
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+                    if let existingData, try encoder.encode(record) == existingData {
+                        resumeBox.resume(.success(()))
+                        return
+                    }
+                    record.updatedAt = now
                     let data = try encoder.encode(record)
                     try Self.writeAndVerifyTransaction(data, expected: record, to: url)
                     resumeBox.resume(.success(()))
@@ -338,11 +332,6 @@ extension iCloudSyncEngine {
                         "iCloud transaction \(id) state \(state) was not persisted: \(error.localizedDescription)"
                     )))
                 }
-            }
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds) {
-                resumeBox.resume(.failure(SyncError.timeout(
-                    "iCloud transaction \(id) state \(state) timed out after \(Self.timeoutLabel(timeoutSeconds))s"
-                )))
             }
         }
         try result.get()
@@ -401,7 +390,4 @@ extension iCloudSyncEngine {
         }
     }
 
-    nonisolated static func timeoutLabel(_ seconds: TimeInterval) -> String {
-        Int(exactly: seconds).map(String.init) ?? String(format: "%.2f", seconds)
-    }
 }

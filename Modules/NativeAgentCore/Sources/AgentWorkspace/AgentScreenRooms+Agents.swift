@@ -49,7 +49,6 @@ extension AgentScreen {
         }
         if let delivery = job.deliveryOutcome { parts.append("delivery: " + delivery) }
         if job.completedAt == nil { parts.append("completion time not recorded") }
-        if job.stalled(at: now) { parts.append("stalled") }
         if let at = (job.completedAt ?? job.startedAt ?? job.claimedAt ?? job.createdAt).flatMap(date) {
             parts.append(age(now.timeIntervalSince(at)))
         }
@@ -74,10 +73,9 @@ extension AgentScreen {
                     return pad("job.\(n)", 8) + pad(job.agent, 9) + clip(jobTitle(job), 44) + " · " + jobState(job, now: now)
                 }
             }
-            let stalled = list.filter(\.stalled).count
             let complete = snapshot.sources.allSatisfy { ["available", "absent"].contains($0.status) }
-            return screen(["DELEGATIONS", complete ? "available sources" : "partial sources"] + (stalled > 0 ? ["\(stalled) stalled"] : [])
-                + ["\(list.count) newest of \(snapshot.matchedCount) observed"],
+            return screen(["DELEGATIONS", complete ? "available sources" : "partial sources",
+                           "\(list.count) newest of \(snapshot.matchedCount) observed"],
                 [lines.isEmpty ? [complete ? "no jobs found in the available sources" : "job census unavailable; no empty verdict"] : lines,
                  section("SOURCES", sourceRows(snapshot)),
                  ["Replies come back to you by themselves; there is nothing to poll."]],

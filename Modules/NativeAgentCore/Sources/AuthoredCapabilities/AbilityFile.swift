@@ -14,8 +14,10 @@ extension AbilityStore {
     public static let didChange = Notification.Name("NativeAgent.abilityDidChange")
     /// Wake delivery selects declared source names and optional target parts; peer-word payloads retain their agent provenance.
     public static let signalled = Notification.Name("NativeAgent.partSignalled")
-    public static let partKeys: Set<String> = ["reach", "wake", "face", "resident", "learned", "choices"]
-    private static let partActionPattern = "^[a-z][a-z0-9_]*[.][a-z][a-z0-9_.]*$"
+    public static let partKeys: Set<String> = ["reach", "wake", "face", "resident", "learned", "choices", "answers"]
+    public static let partActionPattern = "^[a-z][a-z0-9_]*[.][a-z][a-z0-9_.]*$"
+    /// The effect classes a verb a part answers may declare; read verbs run read-confined.
+    public static let answerClasses = ["read", "write", "send", "destructive"]
     /// Header shapes live with the normalizer and are shared by both authoring doors.
     public static let partArgumentSchemas: [String: JSONValue] = {
         let strings: JSONValue = .object(["type": .string("array"), "items": .object(["type": .string("string"), "minLength": .int(1)])])
@@ -24,22 +26,46 @@ extension AbilityStore {
                 "capabilities": strings, "readPaths": strings, "hosts": strings, "apps": strings]),
                 "required": .array([]), "additionalProperties": .bool(false)]),
             "face": .object(["type": .string("object"), "properties": .object([
-                "page": .object(["type": .string("string"), "enum": .array(AppDoorNames.partPages.sorted().map(JSONValue.string))]),
+                "page": .object(["type": .string("string"), "description": .string("""
+                    The page where the part is placed, one of \(AppDoorNames.partPages.sorted().joined(separator: ", ")); with projection true, \
+                    any other id makes this part a page of the agent's own by that id, drawn from its notebook.
+                    """)]),
                 "action": .object(["type": .string("string"), "pattern": .string(partActionPattern)]),
                 "projection": .object(["type": .string("boolean")])]), "required": .array([]), "additionalProperties": .bool(false)]),
             "wake": .object(["type": .string("array"), "items": .object(["type": .string("string")]),
                 "description": .string("""
                     Posted signals: schedule:<cron>, app.installed, file.changed:<path>, turn.ended, message.arrived:slack, message.arrived:telegram, held, \
-                    resumed, person.away, person.here, network.down, network.up. Omit to inherit; [] clears.
+                    resumed, person.away, person.here, network.down, network.up, chrome.tab_taken. Omit to inherit; [] clears.
                     """)]),
             "resident": .object(["type": .string("boolean"), "description": .string(
                 "Retain JS and held resources across successful runs; default false, inherited on revision.")]),
             "learned": .object(["description": .string("""
                 Any JSON retained as declared learned metadata; no shape is enforced and it earns no competence. Omit to inherit.
                 """)]),
-            "choices": .object(["description": .string("Any JSON retained as reserved choices metadata; no shape is enforced. Omit to inherit.")])
+            "choices": .object(["description": .string("Any JSON retained as reserved choices metadata; no shape is enforced. Omit to inherit.")]),
+            "answers": .object(["type": .string("object"), "propertyNames": .object(["pattern": .string(partActionPattern)]),
+                "additionalProperties": answerSchema, "description": .string("""
+                    Door verbs this part answers, by action id: each with its description, class (read runs read-confined), optional irreversible, \
+                    screen, summary and warn, and its args JSON Schema. The part's run(input) receives {verb, ...args}. Omit to inherit; {} clears.
+                    """)])
         ]
     }()
+    static let answerSchema: JSONValue = .object(["type": .string("object"), "properties": .object([
+        "summary": .object(["type": .string("string")]), "warn": .object(["type": .string("string")]),
+        "description": .object(["type": .string("string"), "minLength": .int(1)]),
+        "class": .object(["type": .string("string"), "enum": .array(answerClasses.map(JSONValue.string))]),
+        "irreversible": .object(["type": .string("boolean")]), "screen": .object(["type": .string("boolean")]),
+        "args": .object(["type": .string("object"), "additionalProperties": .bool(true),
+            "description": .string("The verb's JSON Schema; type object. No argument is named verb.")])]),
+        "required": .array(["description", "class", "args"].map(JSONValue.string)), "additionalProperties": .bool(false)])
+
+    /// A part that answers verbs takes `{verb, ...args}`; each verb's own args are checked at the door against its declared schema.
+    public static func answeredInputSchema(_ answers: JSONValue?) -> JSONValue? {
+        guard case .object(let verbs)? = answers, !verbs.isEmpty else { return nil }
+        return .object(["type": .string("object"), "properties": .object(["verb": .object(["type": .string("string"),
+            "enum": .array(verbs.keys.sorted().map(JSONValue.string))])]), "required": .array([.string("verb")]),
+            "additionalProperties": .bool(true)])
+    }
     /// Identity normalization is shared below Parts.
     public static func normalizedID(_ given: String) -> String {
         given.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -94,14 +120,14 @@ extension AbilityStore {
         guard case .array(let signals) = wake else { throw headerFailure("wake", accepted: "an array of signal-name strings") }
         for signal in signals {
             guard case .string(let name) = signal else { throw headerFailure("wake", accepted: "an array of signal-name strings") }
-            let valid = ["app.installed", "turn.ended", "held", "resumed", "person.away", "person.here", "network.down", "network.up"].contains(name)
+            let valid = ["app.installed", "turn.ended", "held", "resumed", "person.away", "person.here", "network.down", "network.up", "chrome.tab_taken"].contains(name)
                 || ["message.arrived:slack", "message.arrived:telegram"].contains(name)
                 || ["schedule:", "file.changed:"].contains { prefix in
                     name.hasPrefix(prefix) && !name.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
             guard valid else { throw headerFailure("wake", accepted: """
                 schedule:<cron>, app.installed, file.changed:<path>, turn.ended, message.arrived:slack, message.arrived:telegram, held, resumed, person.away, \
-                person.here, network.down or network.up
+                person.here, network.down, network.up or chrome.tab_taken
                 """, detail: "Unknown wake name: \(name). Replace it with an accepted signal.") }
         }
         header["wake"] = wake
@@ -116,17 +142,69 @@ extension AbilityStore {
         if let action = face["action"], action.stringValue?.range(of: partActionPattern, options: .regularExpression) == nil {
             throw headerFailure("face.action", accepted: "a lowercase app action id, such as weather.forecast")
         }
+        // An app page names where the part is placed; with projection, any other id makes the part that page, a page of the agent's own.
         if let page = face["page"] {
-            guard case .string(let name) = page, AppDoorNames.partPages.contains(name) else {
-                throw headerFailure("face.page", accepted: AppDoorNames.partPages.sorted().joined(separator: ", "),
-                    detail: "Unknown face.page \(page). Select an accepted page.")
+            guard case .string(let name) = page else {
+                throw headerFailure("face.page", accepted: "an app page, or with projection a page id of the agent's own")
+            }
+            if !AppDoorNames.partPages.contains(name) {
+                guard face["projection"] == .bool(true) else {
+                    throw headerFailure("face.page", accepted: AppDoorNames.partPages.sorted().joined(separator: ", "),
+                        detail: "Unknown face.page \(name). Select an accepted page, or declare projection:true to make the part a page of its own.")
+                }
+                if let refusal = PartFaces.ownPageRefusal(name) {
+                    throw headerFailure("face.page", accepted: "a page id of the agent's own, such as week or garden", detail: refusal)
+                }
             }
         }
         header["face"] = .object(face)
+        // An empty answers is no answers, so a header without verbs keeps its shape.
+        if case .object(let verbs) = try checkedAnswers(header["answers"] ?? .object([:]), face: face), !verbs.isEmpty {
+            header["answers"] = .object(verbs)
+        } else { header.removeValue(forKey: "answers") }
         // Abilities use resident; sense helper retention uses SenseRecord.mode.
         guard case .bool = header["resident"] ?? .bool(false) else { throw headerFailure("resident", accepted: "a Boolean") }
         header["resident"] = header["resident"] ?? .bool(false)
         return header
+    }
+    /// A verb answered here is the part's door: one declaration per verb, never beside face.action, its args an object schema without `verb`.
+    static func checkedAnswers(_ value: JSONValue, face: [String: JSONValue]) throws -> JSONValue {
+        guard case .object(let verbs) = value else {
+            throw headerFailure("answers", accepted: "an object of verb id → {description, class, args, irreversible?, screen?, summary?}")
+        }
+        if !verbs.isEmpty, face["action"] != nil {
+            throw headerFailure("face.action", accepted: "no face.action beside answers", detail: "answers declares this part's verbs; remove face.action.")
+        }
+        let keys = Set(answerSchema.objectValue?["properties"]?.objectValue?.keys.map { $0 } ?? [])
+        for (verb, entry) in verbs {
+            let field = "answers." + verb
+            guard verb.range(of: partActionPattern, options: .regularExpression) != nil else {
+                throw headerFailure(field, accepted: "a lowercase app action id, such as mail.search")
+            }
+            guard case .object(let declared) = entry else { throw headerFailure(field, accepted: "{description, class, args}") }
+            if let key = declared.keys.sorted().first(where: { !keys.contains($0) }) {
+                throw headerFailure(field + "." + key, accepted: keys.sorted().joined(separator: ", "), detail: "Unknown answer key: \(key).")
+            }
+            guard case .string(let description)? = declared["description"], !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw headerFailure(field + ".description", accepted: "a nonempty string")
+            }
+            guard case .string(let effect)? = declared["class"], answerClasses.contains(effect) else {
+                throw headerFailure(field + ".class", accepted: answerClasses.joined(separator: ", "))
+            }
+            for flag in ["irreversible", "screen"] {
+                if let given = declared[flag], given != .bool(true), given != .bool(false) { throw headerFailure(field + "." + flag, accepted: "a Boolean") }
+            }
+            for words in ["summary", "warn"] {
+                if let given = declared[words], given.stringValue?.isEmpty != false { throw headerFailure(field + "." + words, accepted: "a nonempty string") }
+            }
+            guard case .object(let args)? = declared["args"], args["type"] == .string("object") else {
+                throw headerFailure(field + ".args", accepted: "a JSON Schema with type object")
+            }
+            if args["properties"]?.objectValue?["verb"] != nil {
+                throw headerFailure(field + ".args", accepted: "arguments other than verb", detail: "verb names the answered verb in the part's input.")
+            }
+        }
+        return value
     }
     static func headerFailure(_ field: String, accepted: String, detail: String? = nil, code: String? = nil) -> ToolFailureError {
         ToolFailureError(detail ?? "\(field) must be \(accepted).", argumentPath: field, accepted: accepted, effects: .none,

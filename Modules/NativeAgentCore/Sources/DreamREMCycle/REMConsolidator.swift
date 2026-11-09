@@ -77,13 +77,13 @@ public actor REMConsolidator {
         let now = clock()
 
         // Keep concurrent passes excluded even when force bypasses weekly freshness.
-        let harnessDir = dataRoot.appendingPathComponent("harness", isDirectory: true)
+        let bodyDir = dataRoot.appendingPathComponent("body", isDirectory: true)
         try? FileManager.default.createDirectory(
-            at: harnessDir, withIntermediateDirectories: true)
+            at: bodyDir, withIntermediateDirectories: true)
         let runReservation: DreamRunReservation?
         do {
             runReservation = try DreamRunReservation.acquire(
-                at: harnessDir.appendingPathComponent(".rem_run.lock"))
+                at: bodyDir.appendingPathComponent(".rem_run.lock"))
         } catch {
             await persistRunReport(
                 outcome: .failed,
@@ -130,7 +130,7 @@ public actor REMConsolidator {
         // Claim weekly exclusion before distillation; it is not completion proof.
         // Release failed claims only before durable proposals; later work retains IDs and terminal evidence in the run ledger.
             let markerURL = dataRoot
-                .appendingPathComponent("harness", isDirectory: true)
+                .appendingPathComponent("body", isDirectory: true)
                 .appendingPathComponent("last_weekly_rem_run")
         // Claims can restore only their locked predecessor; failed exclusion forbids work.
             let claimToken = "\(ISO8601DateFormatter().string(from: now)) \(UUID().uuidString)"
@@ -451,7 +451,7 @@ public actor REMConsolidator {
         guard gate.remEnabled else {
             throw DreamREMCycleError.cycleDisabled(error: "rem_cycle_disabled", detail: DreamREMGatePolicy.remDisabledDetail)
         }
-        let directory = dataRoot.appendingPathComponent("harness", isDirectory: true)
+        let directory = dataRoot.appendingPathComponent("body", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         guard let reservation = try DreamRunReservation.acquire(at: directory.appendingPathComponent(".rem_run.lock")) else {
             throw ToolFailureError("REM is still running; its repair remains owed until the current pass ends.", effects: .none)

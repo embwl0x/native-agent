@@ -1,4 +1,3 @@
-import TurnTrace
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -147,15 +146,6 @@ public actor ProviderVitalsSensor {
     private var openCallOrder: [String] = []
     private static let maxOpenCalls = 512
 
-    /// Seed first-output samples once from retained traces, then join live receipts under the same request-to-output definition; never write another
-    /// ledger.
-    private struct FirstOutputKey: Hashable { let provider, model: String; let streamKind: String? }
-    private var firstOutputs: [FirstOutputKey: [(seconds: Double, bytes: Int?)]] = [:]
-    /// Unreadable retained rows stay a named evidence gap in Diagnostics.
-    private var unreadableTraceRows = 0
-    /// Guard cuts are failures beside first outputs, never timing samples.
-    private var noReplyCuts: [String: Int] = [:]
-
     public init() {}
 
     // MARK: Lifecycle
@@ -174,11 +164,6 @@ public actor ProviderVitalsSensor {
             let started = takeStart(id: event.id)
             let duration = started.map { max(0, event.occurredAt.timeIntervalSince($0) * 1000) }
             let ttft = event.firstOutputMs.map(Double.init)
-            if event.streaming, let ttft {
-                joinFirstOutput(firstOutputKey(event.providerId, event.model, event.streamKind), seconds: ttft / 1000,
-                                bytes: event.requestBytes)
-            }
-            if event.noReply { noReplyCuts[normalizedProviderId(event.providerId), default: 0] += 1 }
             let sample = ProviderVitalsSample(
                 providerId: event.providerId,
                 occurredAt: event.occurredAt,
@@ -256,84 +241,6 @@ public actor ProviderVitalsSensor {
             emaErrorRate: state.emaErrorRate,
             consecutiveFailures: state.consecutiveFailures
         )
-    }
-
-    // MARK: First outputs
-
-    /// Join launch traces through the cutoff ahead of live samples so neither source is double-counted.
-    public func readFirstOutputs(
-        dataRoot: URL, before cutoff: Date
-    ) async throws {
-        let read = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
-            .traceEvidence(now: cutoff, since: .distantPast, kinds: ["llm.call", "provider.noReply"])
-        unreadableTraceRows = read.turns.unreadable
-        // Retained record order, not current wall time, owns the sample window.
-        var rows = read.rows[...]
-        while case .object(let last)? = rows.last, case .string(let raw)? = last["createdAt"],
-              let at = TurnTraceEvent.parseISO8601(raw), at > cutoff {
-            rows.removeLast()
-        }
-        let live = firstOutputs
-        firstOutputs = [:]
-        for case .object(let row) in rows {
-            guard case .object(let payload)? = row["payload"], case .string(let provider)? = payload["provider"]
-            else { continue }
-            if row["kind"] == .string("provider.noReply") {
-                noReplyCuts[normalizedProviderId(provider), default: 0] += 1
-            } else if row["kind"] == .string("llm.call"), payload["streaming"] == .bool(true),
-                      case .int(let ms)? = payload["ttftMs"], case .string(let model)? = payload["model"] {
-                let kind: String? = if case .string(let kind)? = payload["streamKind"] { kind } else { nil }
-                let bytes: Int? = if case .int(let bytes)? = payload["requestBytes"] { Int(exactly: bytes) } else { nil }
-                joinFirstOutput(firstOutputKey(provider, model, kind), seconds: Double(ms) / 1000, bytes: bytes)
-            }
-        }
-        for (key, samples) in live { samples.forEach { joinFirstOutput(key, seconds: $0.seconds, bytes: $0.bytes) } }
-    }
-
-    /// First-output admission uses the actual encoded request size.
-    public func firstOutputDeadline(provider: String, model: String, streamKind: String?, requestBytes: Int) -> FirstOutputDeadline {
-        let samples = firstOutputs[firstOutputKey(provider, model, streamKind)] ?? []
-        let perByte = samples.compactMap { sample in sample.bytes.flatMap { $0 > 0 ? sample.seconds / Double($0) : nil } }.max()
-        return FirstOutputDeadline(calls: samples.count, slowest: samples.map(\.seconds).max(),
-                                   slowestPerByte: perByte, requestBytes: requestBytes)
-    }
-
-    public func firstOutputReport() -> String {
-        "Retained traces at launch: \(unreadableTraceRows) rows unreadable\n"
-        + Set(firstOutputs.keys.map(\.provider)).union(noReplyCuts.keys).sorted().map { provider in
-            "\(provider): \(noReplyCuts[provider] ?? 0) no-reply cuts" + firstOutputs.keys
-                .filter { $0.provider == provider }
-                .sorted { ($0.model, $0.streamKind ?? "") < ($1.model, $1.streamKind ?? "") }
-                .map { key in
-                    let sorted = (firstOutputs[key] ?? []).map(\.seconds).sorted()
-                    func rank(_ q: Double) -> String {
-                        sorted.isEmpty ? "-" : String(format: "%.1f s", sorted[Int((q * Double(sorted.count)).rounded(.up)) - 1])
-                    }
-                    let deadline = FirstOutputDeadline(calls: sorted.count, slowest: sorted.last).seconds
-                        .map { String(format: "%.1f s", $0) }
-                        ?? "unmeasured (\(sorted.count) of \(FirstOutputDeadline.callsNeeded) calls)"
-                    return "\n  \(key.model) \(key.streamKind ?? "stream"): first output p50 \(rank(0.5)), "
-                        + "p99 \(rank(0.99)), slowest \(rank(1)) over \(sorted.count) calls"
-                        + (unreadableTraceRows == 0 ? "" : " (\(unreadableTraceRows) trace rows unreadable)")
-                        + "; deadline \(deadline)"
-                }.joined()
-        }.joined(separator: "\n")
-    }
-
-    private func firstOutputKey(_ provider: String, _ model: String, _ streamKind: String?) -> FirstOutputKey {
-        FirstOutputKey(provider: normalizedProviderId(provider), model: model.lowercased(), streamKind: streamKind)
-    }
-
-    /// Trace retention bounds first-output history; shared trace rows may leave fewer samples after relaunch.
-    private func joinFirstOutput(_ key: FirstOutputKey, seconds: Double, bytes: Int?) {
-        guard seconds >= 0, UInt64(exactly: (seconds * 1_000_000_000).rounded(.up)) != nil,
-              bytes.map({ $0 >= 0 }) ?? true else {
-            unreadableTraceRows += 1
-            return
-        }
-        firstOutputs[key, default: []].append((seconds, bytes))
-        let over = firstOutputs[key, default: []].count - JSONLLineCaps.traceEvents
-        if over > 0 { firstOutputs[key]?.removeFirst(over) }
     }
 
     // MARK: Read-only introspection / snapshot

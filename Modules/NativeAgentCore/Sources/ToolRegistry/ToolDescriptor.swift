@@ -77,11 +77,21 @@ public struct AppActionBinding: Sendable {
     public let rename: [String: String]
     public let folded: Bool
     public let descriptor: ToolDescriptor?
-    public let isPersonOwned: Bool
+    /// The person's authority over the agent this action is (Trust, consent, models, keys, approvals, forgetting, reset): `why` it is
+    /// theirs, and whether a card can carry the agent's ask for it (`asks`). Only the person's own act decides a lever.
+    public struct Lever: Sendable, Equatable {
+        public let why: String
+        public let asks: Bool
+        public init(why: String, asks: Bool) { self.why = why; self.asks = asks }
+    }
+    public let lever: Lever?
+    public var isPersonOwned: Bool { lever != nil }
     public let irreversible: Bool
     public var read: Bool
     public let readWhen: [String: JSONValue]
     public let secretArgs: [String]
+    /// Evidence binds through the execution owner's argument contract before applying content redaction.
+    public let boundArguments: @Sendable ([String: JSONValue]) throws -> [String: JSONValue]
     public let lifecycle: CapabilityLifecycle.Action?
     /// Read predicates refine when the declared effect class applies.
     public let toolClass: ToolClass
@@ -90,14 +100,16 @@ public struct AppActionBinding: Sendable {
     /// Subject arguments distinguish debts so success settles only its own target.
     public let subject: [String]
 
-    public init(isPersonOwned: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:],
+    public init(lever: Lever?, irreversible: Bool, read: Bool, secretArgs: [String],
+                boundArguments: @escaping @Sendable ([String: JSONValue]) throws -> [String: JSONValue], readWhen: [String: JSONValue] = [:],
                 lifecycle: CapabilityLifecycle.Action? = nil, subject: [String] = [],
                 tool: String = "", fixedInput: [String: JSONValue] = [:], rename: [String: String] = [:],
                 folded: Bool = false, descriptor: ToolDescriptor? = nil, toolClass: ToolClass = .write,
                 reach: ToolReach = .agent, capabilities: Set<String>? = nil) {
         self.tool = tool; self.fixedInput = fixedInput; self.rename = rename; self.folded = folded; self.descriptor = descriptor
-        self.isPersonOwned = isPersonOwned; self.irreversible = irreversible; self.read = read
+        self.lever = lever; self.irreversible = irreversible; self.read = read
         self.secretArgs = secretArgs; self.readWhen = readWhen
+        self.boundArguments = boundArguments
         self.lifecycle = lifecycle
         self.subject = subject
         self.toolClass = toolClass
@@ -122,25 +134,35 @@ public struct AppActionBinding: Sendable {
         let authorableToolName: @Sendable (String) -> Bool
         let part: @Sendable (String, Turn?) throws -> AppActionBinding?
         let catalog: @Sendable (Turn?) throws -> [String: AppActionBinding]
+        let appReadOnly: @Sendable ([String: JSONValue], Turn?) throws -> Bool
         init(authorableToolName: @escaping @Sendable (String) -> Bool, part: @escaping @Sendable (String, Turn?) throws -> AppActionBinding?,
-             catalog: @escaping @Sendable (Turn?) throws -> [String: AppActionBinding]) {
+             catalog: @escaping @Sendable (Turn?) throws -> [String: AppActionBinding],
+             appReadOnly: @escaping @Sendable ([String: JSONValue], Turn?) throws -> Bool) {
             self.authorableToolName = authorableToolName
             self.part = part
             self.catalog = catalog
+            self.appReadOnly = appReadOnly
         }
     }
 
     // Installed from AppActions at executor assembly, before any app call or receipt. No static initializer here reaches back into the app schemas.
     private static let registry = OSAllocatedUnfairLock(initialState: (
         actions: [String: AppActionBinding](), tools: [String: ToolDescriptor](),
-        resolvers: Resolvers(authorableToolName: { _ in false }, part: { _, _ in nil }, catalog: { _ in [:] })))
+        resolvers: Resolvers(authorableToolName: { _ in false }, part: { _, _ in nil }, catalog: { _ in [:] },
+            appReadOnly: { _, _ in throw ToolFailureError("The app read-only classifier is not registered.", effects: .none) })))
 
     public static func register(_ actions: [String: AppActionBinding], tools: [ToolDescriptor], authorableToolName: @escaping @Sendable (String) -> Bool,
         partPolicy: @escaping @Sendable (String, Turn?) throws -> AppActionBinding?,
-                                policyCatalog: @escaping @Sendable (Turn?) throws -> [String: AppActionBinding] = { _ in [:] }) {
+                                policyCatalog: @escaping @Sendable (Turn?) throws -> [String: AppActionBinding] = { _ in [:] },
+                                appReadOnly: @escaping @Sendable ([String: JSONValue], Turn?) throws -> Bool) {
         registerTools(tools)
-        let resolvers = Resolvers(authorableToolName: authorableToolName, part: partPolicy, catalog: policyCatalog)
+        let resolvers = Resolvers(authorableToolName: authorableToolName, part: partPolicy, catalog: policyCatalog, appReadOnly: appReadOnly)
         registry.withLock { $0 = (actions, $0.tools, resolvers) }
+    }
+
+    /// The app executor classifies the complete door call against its current action registry.
+    public static func isAppReadOnly(_ input: [String: JSONValue], turn: Turn?) throws -> Bool {
+        try registry.withLock { $0.resolvers }.appReadOnly(input, turn)
     }
 
     /// A projection holds one catalog and passes it to each lookup, including misses.
@@ -194,12 +216,20 @@ public struct AppActionBinding: Sendable {
         let id: String
         if tool == "app", case .string(let action)? = input["action"] { id = action }
         else if let action = ToolNameAliases.appAction(tool, input: input) { id = action }
+        else if let verb = try answeredVerb(tool: tool, input: input, turn: turn, catalog: catalog) { id = verb }
         else { return nil }
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard var policy = try binding(key, turn: turn, catalog: catalog) else { return nil }
         let args: [String: JSONValue] = if tool == "app", case .object(let args)? = input["args"] { args } else { input }
         policy.read = policy.readOnly(args: args)
         return policy
+    }
+
+    /// A part runs a verb its header answers under the part's own tool with the verb in its input; that verb's binding judges the call.
+    public static func answeredVerb(tool: String, input: [String: JSONValue], turn: Turn?, catalog: [String: AppActionBinding]? = nil) throws -> String? {
+        guard case .string(let verb)? = input["verb"], let answered = try binding(verb, turn: turn, catalog: catalog),
+              answered.tool == tool, answered.fixedInput["verb"] == .string(verb) else { return nil }
+        return verb
     }
 
     /// Every action maps door names to its host's through `rename` alone; a folded action's rename already carries its tool's door names.

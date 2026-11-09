@@ -251,50 +251,44 @@ extension SwiftNativeMacControl {
                 }
             }
         }
-        func coverageUnavailable(_ reason: String) -> (MacControlResult, MacScreenViewSnapshot?) {
-            (MacControlResult(ok: false, action: "view", output: .object([
-                "view": .null, "view_current": .bool(false), "image": .null,
-                "message": .string(
-                    """
-                        Complete capture-time secret coverage could not be established. \(reason) No image was released; inspect the affected app before \
-                        continuing.
-                        """),
-            ]), error: "redaction_coverage_unavailable", durationMs: Int(now().timeIntervalSince(started) * 1000)), nil)
-        }
+        var coverageFailure: String?
         if pictured {
             do { redactionNodes = try inspectPixelOwner() }
-            catch { return coverageUnavailable(error.localizedDescription) }
+            catch { coverageFailure = (error as? SenseFailure)?.message ?? error.localizedDescription }
         }
         let capturedAt = now()
         let screenCaptureStartedNs = DispatchTime.now().uptimeNanoseconds
         var shot: MacScreenShot?
         var imageFailure: MacScreenCaptureFailure?
-        if pictured || recognizesText {
-            let capture: Result<MacScreenShot, MacScreenCaptureFailure>
+        if pictured || recognizesText, coverageFailure == nil {
             if let windowIdentity {
-                capture = await screenCaptureSource.capture(window: windowIdentity, context: context)
+                let capture = await screenCaptureSource.capture(window: windowIdentity, context: context)
+                switch capture {
+                case .success(let value): shot = value
+                case .failure(let failure): imageFailure = failure
+                }
             } else {
-                return coverageUnavailable("No anchored window is available for capture.")
-            }
-            switch capture {
-            case .success(let value): shot = value
-            case .failure(let failure): imageFailure = failure
+                coverageFailure = "No anchored window is available for capture."
             }
         }
         guard !Task.isCancelled else { return cancelledResult() }
-        if pictured, let shot {
-            do { postRedactionNodes = try inspectPixelOwner() }
-            catch { return coverageUnavailable(error.localizedDescription) }
-            guard now() < disclosureDeadline, MacAXWindowIdentity.rectsMatch(shot.bounds, windowRect),
+        if pictured, coverageFailure == nil, let shot {
+            do {
+                postRedactionNodes = try inspectPixelOwner()
+                guard now() < disclosureDeadline, MacAXWindowIdentity.rectsMatch(shot.bounds, windowRect),
                   let provenance = shot.capture, provenance.capturedAt >= capturedAt,
                   provenance.capturedAt <= now(), provenance.windows.count == 1,
                   let capturedWindow = provenance.windows.first,
                   capturedWindow.pid == app?.processIdentifier,
                   MacAXWindowIdentity.rectsMatch(capturedWindow.frame, windowRect) else {
-                return coverageUnavailable("The capture cannot be bound to the inspected window and lifetime.")
+                    throw SenseFailure(code: "redaction_coverage_unavailable",
+                        message: "The capture cannot be bound to the inspected window and lifetime.")
+                }
+                imageTargets = MacImageCapture.pointTargets(nodes: postRedactionNodes,
+                    pid: capturedWindow.pid, deadline: disclosureDeadline, source: accessibilityActSource(context: context), context: context)
+            } catch {
+                coverageFailure = (error as? SenseFailure)?.message ?? error.localizedDescription
             }
-            imageTargets = MacImageCapture.pointTargets(nodes: postRedactionNodes,
-                pid: capturedWindow.pid, deadline: disclosureDeadline, source: accessibilityActSource(context: context), context: context)
         }
         let screenCaptureFinishedNs = DispatchTime.now().uptimeNanoseconds
         let observedPointer = isolatedWindow ? nil : pointerPositionSource.currentPosition()
@@ -337,19 +331,33 @@ extension SwiftNativeMacControl {
         let geometry = shot.map { MacScreenViewGeometry(shot: $0) } ?? axGeometry
         if !semanticRawFrame { select(in: geometry) }
         guard !Task.isCancelled else { return cancelledResult() }
-        // Recognize and redact the whole window before cropping, scaling or masking can remove a caption that protects its value.
-        if recognizesText, let bundle = app?.bundleIdentifier, let retained = context.appCapture {
+        // A released picture walks the whole window twice; recognized text alone runs on every look, under caption redaction, and never pays for that walk.
+        var secrets: [MacAXFrame] = []
+        if pictured, coverageFailure == nil, let shot {
+            let renderGeometry = MacScreenViewGeometry(shot: shot)
+            if let beforeMasks = MacScreenViewTextRedaction.secretFrames(
+                nodes: redactionNodes, geometry: renderGeometry, deadline: disclosureDeadline, context: context),
+               let afterMasks = MacScreenViewTextRedaction.secretFrames(
+                nodes: postRedactionNodes, geometry: renderGeometry, deadline: disclosureDeadline, context: context) {
+                secrets = beforeMasks + afterMasks.filter { !beforeMasks.contains($0) }
+            } else {
+                coverageFailure = "Secret mask compilation exceeded its deadline."
+            }
+        }
+        // Whole-window caption redaction precedes mask filtering; nothing is retained before final coverage and owner checks.
+        var recognizedWindowText: (rows: JSONValue, text: String)?
+        var windowTextFailure: String?
+        if recognizesText {
             do {
+                if let coverageFailure {
+                    throw SenseFailure(code: "redaction_coverage_unavailable", message: coverageFailure)
+                }
                 guard let shot else {
                     throw SenseFailure(code: "source_unavailable", message: "The app read has no window capture for redacted text recognition.")
                 }
-                let recognized = try await MacAppWindowText.readCaptured(shot)
-                retained.augment(bundleID: bundle, fields: ["recognized_text": recognized.rows,
-                    "recognized_text_body": .string(recognized.text), "window_text_unavailable_reason": .null])
+                recognizedWindowText = try await MacAppWindowText.readCaptured(shot, excluding: secrets)
             } catch {
-                let reason = (error as? SenseFailure)?.message ?? error.localizedDescription
-                retained.augment(bundleID: bundle, fields: ["recognized_text": .null, "recognized_text_body": .null,
-                    "window_text_unavailable_reason": .string(reason)])
+                windowTextFailure = (error as? SenseFailure)?.message ?? error.localizedDescription
             }
             guard !Task.isCancelled else { return cancelledResult() }
         }
@@ -357,61 +365,61 @@ extension SwiftNativeMacControl {
         var imageDownscale: Double?
         var imageBytes: Int?
         let imageRenderStartedNs = DispatchTime.now().uptimeNanoseconds
-        if pictured, let shot {
-            let renderGeometry = MacScreenViewGeometry(shot: shot)
-            guard let beforeMasks = MacScreenViewTextRedaction.secretFrames(
-                nodes: redactionNodes, geometry: renderGeometry, deadline: disclosureDeadline, context: context),
-                  let afterMasks = MacScreenViewTextRedaction.secretFrames(
-                nodes: postRedactionNodes, geometry: renderGeometry, deadline: disclosureDeadline, context: context)
-            else { return coverageUnavailable("Secret mask compilation exceeded its deadline.") }
-            let secrets = beforeMasks + afterMasks.filter { !beforeMasks.contains($0) }
-            let placements = semanticRawFrame
-                ? []
-                : selection.marks.compactMap {
-                    renderGeometry.placement(mark: $0.mark, frame: $0.frame)
+        if pictured, coverageFailure == nil, let shot {
+            do {
+                let renderGeometry = MacScreenViewGeometry(shot: shot)
+                let placements = semanticRawFrame
+                    ? []
+                    : selection.marks.compactMap {
+                        renderGeometry.placement(mark: $0.mark, frame: $0.frame)
+                    }
+                let encode: (Double) -> Data? = { rung in
+                    guard !Task.isCancelled else { return nil }
+                    return self.screenImageRenderer.renderPNG(shot: shot, placements: placements, secretFrames: secrets, downscale: rung)
                 }
-            let encode: (Double) -> Data? = { rung in
-                guard !Task.isCancelled else { return nil }
-                return self.screenImageRenderer.renderPNG(shot: shot, placements: placements, secretFrames: secrets, downscale: rung)
-            }
-            let fitted = semanticRawFrame
-                ? encode(1).map { (data: $0, downscale: 1.0) }
-                : MacScreenViewBuilder.fitImage(maxBytes: maxImageBytes, encode: encode)
-            guard !Task.isCancelled else { return cancelledResult() }
-            if let fitted {
-                guard now() < disclosureDeadline else { return coverageUnavailable("The disclosure deadline expired before image release.") }
-                output["pixel_coverage"] = .object([
-                    "status": .string("complete"),
-                    "before_nodes": .int(Int64(redactionNodes.count)),
-                    "after_nodes": .int(Int64(postRedactionNodes.count)),
-                    "masked_regions": .int(Int64(secrets.count)),
-                ])
-                output["image"] = .string(fitted.data.base64EncodedString())
-                output["image_capture"] = shot.capture?.recordingTargets(imageTargets).json
-                output["image_format"] = .string("png")
-                output["image_annotations"] = .bool(!semanticRawFrame)
-                imageDownscale = fitted.downscale
-                imageBytes = fitted.data.count
-                output["image_origin"] = .object([
-                    "x": .double(renderGeometry.bounds.x),
-                    "y": .double(renderGeometry.bounds.y),
-                ])
-                output["image_logical_size"] = .object([
-                    "w": .double(renderGeometry.bounds.w),
-                    "h": .double(renderGeometry.bounds.h),
-                ])
-                output["image_pixel_size"] = .object([
-                    "w": .int(Int64(renderGeometry.pixelWidth)),
-                    "h": .int(Int64(renderGeometry.pixelHeight)),
-                ])
-                output["semantic_focus_frame"] = semanticFocusFrame.map { frame in
-                    .object([
-                        "x": .double(frame.x), "y": .double(frame.y),
-                        "w": .double(frame.w), "h": .double(frame.h),
+                let fitted = semanticRawFrame
+                    ? encode(1).map { (data: $0, downscale: 1.0) }
+                    : MacScreenViewBuilder.fitImage(maxBytes: maxImageBytes, encode: encode)
+                guard !Task.isCancelled else { return cancelledResult() }
+                if let fitted {
+                    guard now() < disclosureDeadline else {
+                        throw SenseFailure(code: "redaction_coverage_unavailable", message: "The disclosure deadline expired before image release.")
+                    }
+                    output["pixel_coverage"] = .object([
+                        "status": .string("complete"),
+                        "before_nodes": .int(Int64(redactionNodes.count)),
+                        "after_nodes": .int(Int64(postRedactionNodes.count)),
+                        "masked_regions": .int(Int64(secrets.count)),
                     ])
-                } ?? .null
-            } else {
-                imageFailure = semanticRawFrame ? .encodeFailed : .exceedsByteCap
+                    output["image"] = .string(fitted.data.base64EncodedString())
+                    output["image_capture"] = shot.capture?.recordingTargets(imageTargets).json
+                    output["image_format"] = .string("png")
+                    output["image_annotations"] = .bool(!semanticRawFrame)
+                    imageDownscale = fitted.downscale
+                    imageBytes = fitted.data.count
+                    output["image_origin"] = .object([
+                        "x": .double(renderGeometry.bounds.x),
+                        "y": .double(renderGeometry.bounds.y),
+                    ])
+                    output["image_logical_size"] = .object([
+                        "w": .double(renderGeometry.bounds.w),
+                        "h": .double(renderGeometry.bounds.h),
+                    ])
+                    output["image_pixel_size"] = .object([
+                        "w": .int(Int64(renderGeometry.pixelWidth)),
+                        "h": .int(Int64(renderGeometry.pixelHeight)),
+                    ])
+                    output["semantic_focus_frame"] = semanticFocusFrame.map { frame in
+                        .object([
+                            "x": .double(frame.x), "y": .double(frame.y),
+                            "w": .double(frame.w), "h": .double(frame.h),
+                        ])
+                    } ?? .null
+                } else {
+                    imageFailure = semanticRawFrame ? .encodeFailed : .exceedsByteCap
+                }
+            } catch {
+                coverageFailure = (error as? SenseFailure)?.message ?? error.localizedDescription
             }
         }
         let imageRenderFinishedNs = DispatchTime.now().uptimeNanoseconds
@@ -420,7 +428,7 @@ extension SwiftNativeMacControl {
         ))
         if output["image"] == nil {
             output["image"] = .null
-            if pictured {
+            if pictured, coverageFailure == nil {
                 let failure = imageFailure ?? .captureFailed
                 output["image_unavailable_reason"] = .string(failure.rawValue)
                 output["message"] = .string(failure.localizedDescription)
@@ -476,8 +484,31 @@ extension SwiftNativeMacControl {
         guard let app, accessibilitySource(context: context).appInfo(pid: app.processIdentifier) == app else {
             return await discardUnboundCapture()
         }
-        if pictured, shot != nil, now() >= disclosureDeadline {
-            return coverageUnavailable("The disclosure deadline expired before publication.")
+        if pictured, coverageFailure == nil, shot != nil, now() >= disclosureDeadline {
+            coverageFailure = "The disclosure deadline expired before publication."
+        }
+        if let coverageFailure {
+            output["image"] = .null
+            output["image_capture"] = .null
+            output["image_bytes"] = .null
+            output["image_downscale"] = .null
+            output["recognize_pixels"] = .bool(false)
+            output["image_unavailable_reason"] = .string("redaction_coverage_unavailable")
+            output["image_withheld_reason"] = .string(coverageFailure)
+            output["message"] = .string("Pixels withheld: \(coverageFailure) The text observation retains its reported coverage.")
+            output["pixel_coverage"] = .object([
+                "status": .string("withheld"), "reason": .string(coverageFailure),
+            ])
+        }
+        if recognizesText, let bundle = app.bundleIdentifier, let retained = context.appCapture {
+            if coverageFailure == nil, let recognizedWindowText {
+                retained.augment(bundleID: bundle, fields: ["recognized_text": recognizedWindowText.rows,
+                    "recognized_text_body": .string(recognizedWindowText.text), "window_text_unavailable_reason": .null])
+            } else {
+                retained.augment(bundleID: bundle, fields: ["recognized_text": .null, "recognized_text_body": .null,
+                    "window_text_unavailable_reason": .string(coverageFailure ?? windowTextFailure
+                        ?? "The app capture has no proven recognized text.")])
+            }
         }
         output["view"] = .string(viewId)
         output["frame_id"] = .string(binding?.frameID ?? viewId)
@@ -535,7 +566,7 @@ extension SwiftNativeMacControl {
         output["view_total_ms"] = .int(elapsedMilliseconds(
             from: viewStartedNs, to: viewFinishedNs
         ))
-        let ok = pictured ? output["image"] != .null : accessibilityTrusted
+        let ok = coverageFailure != nil ? snapshot != nil : pictured ? output["image"] != .null : accessibilityTrusted
         return (MacControlResult(
             ok: ok,
             action: "view",

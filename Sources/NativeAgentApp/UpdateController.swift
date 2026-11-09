@@ -3,8 +3,9 @@ import SwiftUI
 import Sparkle
 import SystemOps
 import NativeAgentCore
+import NativeAgentShared
 
-// Blueprint: | `UpdateController.swift` | `UpdateController`: configured Sparkle lifecycle, version probes and explicit unavailable/update presentation |
+// Blueprint: | `UpdateController.swift` | Body Sparkle lifecycle, probes and update requests |
 
 // Start Sparkle on MainActor only for configured bundles with a published feed.
 
@@ -41,66 +42,98 @@ final class UpdateController: NSObject {
 
     let status = Status()
 
-    private var updaterController: SPUStandardUpdaterController?
+    private var updater: SPUUpdater?
+    private var userDriver: BodyUpdateUserDriver?
+    private var startupFailure: String?
+    private var updaterOwner: UUID?
     private final class Probe {
         let done = ScopedWaiter()
         var failure: String?
     }
     /// Record the probe outcome on the actor before waking its caller.
     private var probe: Probe?
-    private var probeGeneration = 0
     private var canCheckObservation: NSKeyValueObservation?
     private var automaticChecksObservation: NSKeyValueObservation?
     private let unavailability: Unavailability?
     private let info: [String: Any]
-    private let preferences: UserDefaults
+    private let preferencesSuiteName: String?
+    private var initialization: Task<Void, Never>?
+    private var noticeWrite: Task<Void, Never>?
 
     override convenience init() {
         self.init(
             info: Bundle.main.infoDictionary ?? [:],
-            preferences: .standard
+            preferencesSuiteName: nil
         )
     }
 
     init(
         info: [String: Any],
-        preferences: UserDefaults
+        preferencesSuiteName: String?
     ) {
         let unavailability = SoftwareUpdateState.resolveUnavailability(info: info)
         self.unavailability = unavailability
         self.info = info
-        self.preferences = preferences
-        self.updaterController = nil
+        self.preferencesSuiteName = preferencesSuiteName
+        self.updater = nil
         super.init()
-        applyNotice(SoftwareUpdateState.restoreNotice(
-            info: info, preferences: preferences, isNewer: Self.isVersion))
-        // Create after super.init so self can serve as the updater delegate.
+        initialization = Task { [weak self] in
+            guard let self else { return }
+            let notice = await SoftwareUpdateState.restoreNotice(
+                info: self.info, preferencesSuiteName: self.preferencesSuiteName, isNewer: Self.isVersion)
+            self.applyNotice(notice)
+            self.startUpdater()
+        }
+    }
+
+    private func startUpdater() {
+        // Restore the saved notice before Sparkle can publish a newer result.
         if unavailability == nil {
-            updaterController = SPUStandardUpdaterController(
-                startingUpdater: true,
-                updaterDelegate: self,
-                userDriverDelegate: nil
-            )
-            canCheckObservation = updaterController?.updater.observe(
+            let owner = UUID()
+            updaterOwner = owner
+            let driver = BodyUpdateUserDriver { [weak self] failure, shutdown in
+                guard let self, self.updaterOwner == owner else { return }
+                if shutdown { self.stopUpdater(failure: failure) }
+                else { self.status.noticeFailure = failure }
+            }
+            let updater = SPUUpdater(hostBundle: .main, applicationBundle: .main, userDriver: driver, delegate: self)
+            userDriver = driver
+            self.updater = updater
+            do { try updater.start() }
+            catch { stopUpdater(failure: error.localizedDescription); return }
+            canCheckObservation = updater.observe(
                 \.canCheckForUpdates, options: [.initial, .new]
             ) { [weak self] _, _ in
                 Task { @MainActor [weak self] in
                     // Read on the owner actor so a queued callback cannot apply stale state.
                     guard let self else { return }
-                    self.status.canCheckForUpdates = self.updaterController?.updater.canCheckForUpdates ?? false
+                    self.status.canCheckForUpdates = self.updater?.canCheckForUpdates == true
                 }
             }
-            status.canCheckForUpdates = updaterController?.updater.canCheckForUpdates ?? false
-            automaticChecksObservation = updaterController?.updater.observe(
+            status.canCheckForUpdates = updater.canCheckForUpdates
+            automaticChecksObservation = updater.observe(
                 \.automaticallyChecksForUpdates, options: [.initial, .new]
             ) { [weak self] _, _ in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.status.automaticChecksEnabled = self.updaterController?.updater.automaticallyChecksForUpdates ?? false
+                    self.status.automaticChecksEnabled = self.updater?.automaticallyChecksForUpdates == true
                 }
             }
-            status.automaticChecksEnabled = updaterController?.updater.automaticallyChecksForUpdates ?? false
+            status.automaticChecksEnabled = updater.automaticallyChecksForUpdates
         }
+    }
+
+    private func stopUpdater(failure: String) {
+        startupFailure = failure
+        status.noticeFailure = failure
+        status.canCheckForUpdates = false
+        canCheckObservation?.invalidate()
+        automaticChecksObservation?.invalidate()
+        canCheckObservation = nil
+        automaticChecksObservation = nil
+        updater = nil
+        userDriver = nil
+        updaterOwner = nil
     }
 
     /// Feed availability is fixed at launch; canCheckForUpdates also goes false mid-check and would mislabel the build.
@@ -112,6 +145,17 @@ final class UpdateController: NSObject {
     }
 
     var automaticChecksEnabled: Bool { updatesAreAvailable && status.automaticChecksEnabled }
+
+    var settingsFeedSource: SoftwareUpdateSettingsFace.Source {
+        let unavailable: SoftwareUpdateSettingsFace.Unavailability?
+        switch unavailability {
+        case .feedNotPublished: unavailable = .feedNotPublished
+        case .notConfigured: unavailable = .notConfigured
+        case nil: unavailable = nil
+        }
+        return .init(availableVersion: status.availableVersion, canCheck: status.canCheckForUpdates,
+                     automaticChecks: status.automaticChecksEnabled, failure: status.noticeFailure, unavailable: unavailable)
+    }
 
     /// Offer Check for Updates only when a check can run; name a known update directly.
     var menuTitle: String {
@@ -140,38 +184,48 @@ final class UpdateController: NSObject {
 
     /// Without a published feed, explain immediately instead of starting a check known to fail.
     func checkForUpdates() {
-        guard updatesAreAvailable, let updaterController else {
+        Task {
+            await initialization?.value
+            restartReleasedUpdater()
+            showUpdateControl()
+        }
+    }
+
+    private func restartReleasedUpdater() {
+        guard updatesAreAvailable, updater == nil else { return }
+        startupFailure = nil
+        startUpdater()
+    }
+
+    private func showUpdateControl() {
+        guard updatesAreAvailable, let updater else {
             presentUnavailableExplanation()
             return
         }
         // Sparkle owns the "a check is already running" case and surfaces it itself.
-        updaterController.checkForUpdates(nil)
+        updater.checkForUpdates()
     }
 
     /// Use Sparkle's information-only probe; it shows and installs nothing, leaving installation to the person.
     func probeForUpdate() async -> (detail: String, refusal: (reason: String, detail: String)?) {
-        guard updatesAreAvailable, let updater = updaterController?.updater else {
+        await initialization?.value
+        if let startupFailure { return ("", ("updater_unavailable", startupFailure)) }
+        guard updatesAreAvailable, let updater else {
             let reason = unavailability ?? .notConfigured
             return ("", ("updates_unavailable", reason.message + " " + reason.detail))
         }
         guard probe == nil, !updater.sessionInProgress, updater.canCheckForUpdates else {
             return ("", ("check_running", "An update check is already running. Ask again in a minute."))
         }
-        probeGeneration &+= 1
-        let generation = probeGeneration
         let response = Probe()
         probe = response
         updater.checkForUpdateInformation()
-        // A probe Sparkle never finishes must not hold `probe` forever.
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(45))
-            guard let self, self.probeGeneration == generation, let probe = self.probe else { return }
-            self.probe = nil
-            probe.failure = "No answer from the update feed within 45 seconds."
-            probe.done.resume()
-        }
         let done = response.done
-        await Task { await done.park() }.value
+        await done.park()
+        await noticeWrite?.value
+        if Task.isCancelled {
+            return ("", ("check_cancelled", "Stopped waiting for the update check; Sparkle still owns its result."))
+        }
         let failure = response.failure
         if let failure {
             return ("", ("check_failed", "The update check failed: \(failure) Try again later."))
@@ -186,7 +240,61 @@ final class UpdateController: NSObject {
         return ("NativeAgent \(version) is available. Installing it is the owner's: \"\(menuTitle)\" in the app menu.", nil)
     }
 
+    func request(_ command: UpdateCommand, presentation: BodyFacePresentation? = nil) async throws -> FaceActReply {
+        await initialization?.value
+        try Task.checkCancellation()
+        if command == .check || command == .showAvailableUpdate { restartReleasedUpdater() }
+        switch command {
+        case .check, .showAvailableUpdate:
+            if let presentation {
+                if let startupFailure { throw PartCallError(code: "updater_start_failed", message: startupFailure) }
+                guard updatesAreAvailable, let updater, let userDriver else {
+                    throw PartCallError(code: "updates_unavailable", message: settingsDetail)
+                }
+                if try userDriver.bind(presentation, sessionInProgress: updater.sessionInProgress) {
+                    try await userDriver.focus()
+                } else {
+                    updater.checkForUpdates()
+                    try await userDriver.confirmPresentation()
+                }
+                return .acknowledged
+            }
+            showUpdateControl()
+            return .acknowledged
+        case .probe:
+            let result = await probeForUpdate()
+            if let refusal = result.refusal {
+                return .refused(.init(code: refusal.reason, message: refusal.detail, cause: nil, effects: .none))
+            }
+            return .result(.string(result.detail))
+        case .setAutomaticChecksOn, .setAutomaticChecksOff:
+            guard let updater else {
+                throw PartCallError(code: "updates_unavailable", message: settingsDetail)
+            }
+            let enabled = command == .setAutomaticChecksOn
+            if updater.automaticallyChecksForUpdates != enabled { updater.automaticallyChecksForUpdates = enabled }
+            return .committed(.init(identities: ["updates"], value: .bool(updater.automaticallyChecksForUpdates),
+                revision: nil, effects: .known, publicationFailure: nil))
+        }
+    }
+
+    func interaction(operation: UUID, action: UpdateInteraction, renderer: UUID) throws -> FaceActReply {
+        guard let userDriver else { throw PartCallError(code: "updates_unavailable", message: settingsDetail) }
+        try userDriver.interact(operation: operation, action: action, renderer: renderer)
+        return .acknowledged
+    }
+
+    func disconnect(renderer: UUID?) { userDriver?.disconnect(renderer: renderer) }
+
     private func presentUnavailableExplanation() {
+        if let startupFailure {
+            let alert = NSAlert()
+            alert.messageText = "Software updates could not start"
+            alert.informativeText = startupFailure
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
         let reason = unavailability ?? .notConfigured
         let rawVersion = (info["CFBundleShortVersionString"] as? String ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -213,13 +321,21 @@ final class UpdateController: NSObject {
     }
 
     func handleFoundUpdate(displayVersion: String) {
-        applyNotice(SoftwareUpdateState.storeNotice(
-            displayVersion, info: info, preferences: preferences, isNewer: Self.isVersion))
+        storeNotice(displayVersion)
     }
 
     func handleNoUpdate() {
-        applyNotice(SoftwareUpdateState.storeNotice(
-            nil, info: info, preferences: preferences, isNewer: Self.isVersion))
+        storeNotice(nil)
+    }
+
+    private func storeNotice(_ version: String?) {
+        let previous = noticeWrite
+        noticeWrite = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            self.applyNotice(await SoftwareUpdateState.storeNotice(
+                version, info: self.info, preferencesSuiteName: self.preferencesSuiteName, isNewer: Self.isVersion))
+        }
     }
 
     private func applyNotice(_ notice: SoftwareUpdateState.NoticeState) {
@@ -234,6 +350,7 @@ final class UpdateController: NSObject {
             status.availableVersion = nil
             status.noticeFailure = failure
         }
+        if let startupFailure { status.noticeFailure = startupFailure }
     }
 
 }

@@ -1,49 +1,27 @@
 import Foundation
-import NativeAgentCore
-import PersistenceCore
-import TurnTrace
 // Blueprint: | `CognitiveSubstrate+CapsuleCadence.swift` | `CognitiveSubstrate`: fingerprint cadence and the Since gap cue |
 
 extension CognitiveSubstrate {
     /// The agent's reflection preview keeps every cue that passed its own gate.
     static let cadenceExemptCapsuleSurface = "reflection"
 
-    // MARK: - Fingerprint cadence
-
-    struct FingerprintCadenceVerdict: Sendable, Equatable {
-        var speak: Bool
-        /// Pre-reset count of consecutive readings of this family.
-        var run: Int
-    }
-
-    /// Cadence eligibility; live assembly also requires `run == 1`. Reflection uses `speak` alone. A timed same-family verdict retains its pre-reset run, so it
-    /// does not itself deliver another live fingerprint.
-    func fingerprintCadenceVerdict(
-        family: String,
-        at now: Date,
-        dynamics dyn: PersonalityDynamicsConfiguration,
+    /// Stage the next reference in the copied state; only completed-reply settlement can publish it.
+    func feelingShift(
+        for words: [(axis: String, word: String)],
         presentationState: inout CognitiveCapsulePresentationState
-    ) -> FingerprintCadenceVerdict {
-        let sameFamily = presentationState.fingerprintFamily == family
-        let run = sameFamily ? min(presentationState.fingerprintCount, Int.max - 1) + 1 : 1
-
-        var speak = true
-        if sameFamily, dyn.fingerprintFamilyRepeatLimit > 0,
-           run > dyn.fingerprintFamilyRepeatLimit {
-            let sinceSurfaced = presentationState.fingerprintLastSurfacedAt
-                .map { now.timeIntervalSince($0) } ?? 0
-            // Expiry permits a cadence verdict; assembly still gates delivery.
-            speak = sinceSurfaced >= dyn.fingerprintSuppressionWindow
+    ) -> String? {
+        var changed: [String] = []
+        if let previous = presentationState.fingerprintFamily {
+            let old = previous.split(separator: "|").compactMap { value -> (String, String)? in
+                let pair = value.split(separator: ":", maxSplits: 1)
+                guard let axis = pair.first, let word = pair.dropFirst().first else { return nil }
+                return (String(axis), String(word))
+            }
+            let prior = Dictionary(old, uniquingKeysWith: { first, _ in first })
+            changed = words.filter { value in prior[value.axis].map { $0 != value.word } == true }.map(\.word)
         }
-
-        presentationState.fingerprintFamily = family
-        // Reset the stored count after an eligible over-limit reading, retaining the verdict's run.
-        presentationState.fingerprintCount =
-            speak && sameFamily && run > dyn.fingerprintFamilyRepeatLimit ? 1 : run
-        presentationState.fingerprintLastSurfacedAt = speak
-            ? now
-            : (presentationState.fingerprintLastSurfacedAt ?? now)
-        return FingerprintCadenceVerdict(speak: speak, run: run)
+        presentationState.fingerprintFamily = words.isEmpty ? nil : words.map { $0.axis + ":" + $0.word }.joined(separator: "|")
+        return changed.isEmpty ? nil : "My feeling has shifted: \(changed.joined(separator: ", "))."
     }
 
     // MARK: - W4/P7 — the session bridge ("since we last talked")

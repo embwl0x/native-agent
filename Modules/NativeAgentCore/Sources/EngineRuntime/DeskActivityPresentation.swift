@@ -1,12 +1,8 @@
 import AgentConversations
 import Foundation
-import Cognition
-import OSLog
 import PersistenceCore
-import StandingBots
 import NativeAgentShared
 import Desk
-import TriggerScheduler
 // Blueprint: | `DeskActivityPresentation.swift` | Desk availability, movement and expiry; a job carrying an item is its movement |
 public enum DeskLaneState<Row: Sendable>: Sendable {
     case unavailable(String)
@@ -51,38 +47,14 @@ public enum DeskMovementPresentation {
             deferred: DeskSequencing.isDeferred(item, now: now), updatedAt: item.updatedAt, evidence: evidence, now: now)
     }
 }
+/// Whether any Desk item is moving right now, whether the board reading behind it is stale, and when either changes.
 public enum DeskLiveActivityPresentation {
     public static let defaultActiveWindow: TimeInterval = DeskActivityState.movementWindow
     public static let staleAfter: TimeInterval = 5 * 60
-    public static let visibleRowCap = 4
     private static let boundaryEpsilon: TimeInterval = 0.001
-    public struct Row: Identifiable, Sendable, Equatable {
-        public let item: DeskItem
-        public let updatedAt: Date
-        public let now: Date
-        public var id: String { item.handle }
-        public var summary: String {
-            let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let summary, !summary.isEmpty { return summary }
-            let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            return title.isEmpty ? "Untitled desk item" : title
-        }
-        public var assignee: String {
-            let trimmed = item.assignee?.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let trimmed, !trimmed.isEmpty else { return "Unassigned" }
-            return trimmed
-        }
-        public var lastUpdateText: String { "last update \(DeskRelativeTimePresentation.text(for: updatedAt, now: now))" }
-        public var progress: DeskProgress? { item.progress }
-    }
     public struct Content: Sendable, Equatable {
-        public let rows: [Row]
-        public let overflowCount: Int
-        public let generatedAt: Date
-        public let now: Date
         public let isStale: Bool
-        public var asOfText: String { "as of \(DeskRelativeTimePresentation.text(for: generatedAt, now: now))" }
-        /// Sleep to the next stale-snapshot or expired-row boundary instead of polling.
+        /// Sleep to the next stale-snapshot or expired-movement boundary instead of polling.
         public let nextRefreshAt: Date?
     }
     public enum State: Sendable, Equatable {
@@ -101,7 +73,6 @@ public enum DeskLiveActivityPresentation {
         generatedTs: String?,
         now: Date,
         activeWindow: TimeInterval = defaultActiveWindow,
-        rowCap: Int = visibleRowCap,
         staleLimit: TimeInterval = staleAfter
     ) -> State {
         if let reason = deskItems.unavailableReason {
@@ -111,34 +82,22 @@ public enum DeskLiveActivityPresentation {
             return .unavailable(reason)
         }
         let window = max(0, activeWindow)
-        let candidates = deskItems.items.compactMap { item -> (DeskItem, Date)? in
+        let moving = deskItems.items.compactMap { item -> Date? in
             guard !item.requiresOwnerInput,
                   DeskMovementPresentation.activity(item, evidence: evidence[item.handle], now: now) == .working,
                   let updated = DeskActivityState.movementDate(evidence[item.handle]?.lastMovementAt)
             else { return nil }
-            guard max(0, now.timeIntervalSince(updated)) <= window else { return nil }
-            return (item, updated)
-        }.sorted { left, right in
-            if left.1 != right.1 { return left.1 > right.1 }
-            if left.0.updatedAt != right.0.updatedAt {
-                return left.0.updatedAt > right.0.updatedAt
-            }
-            return left.0.handle < right.0.handle
+            return max(0, now.timeIntervalSince(updated)) <= window ? updated : nil
         }
-        guard !candidates.isEmpty else { return .quiet }
+        guard !moving.isEmpty else { return .quiet }
         guard let generatedTs,
               let generatedAt = DeskPage.parseTimestamp(generatedTs)
         else {
             return .unavailable("The Desk snapshot has no readable generated timestamp.")
         }
         let limit = max(0, staleLimit)
-        let snapshotAge = max(0, now.timeIntervalSince(generatedAt))
-        let stale = snapshotAge > limit
-        let cap = max(0, rowCap)
-        let visible = candidates.prefix(cap).map { item, updated in
-            Row(item: item, updatedAt: updated, now: now)
-        }
-        var boundaries = candidates.compactMap { _, updated -> Date? in
+        let stale = max(0, now.timeIntervalSince(generatedAt)) > limit
+        var boundaries = moving.compactMap { updated -> Date? in
             let expiry = updated.addingTimeInterval(window + boundaryEpsilon)
             return expiry > now ? expiry : nil
         }
@@ -146,38 +105,6 @@ public enum DeskLiveActivityPresentation {
             let staleBoundary = generatedAt.addingTimeInterval(limit + boundaryEpsilon)
             if staleBoundary > now { boundaries.append(staleBoundary) }
         }
-        return .rows(Content(
-            rows: visible,
-            overflowCount: max(0, candidates.count - visible.count),
-            generatedAt: generatedAt,
-            now: now,
-            isStale: stale,
-            nextRefreshAt: boundaries.min()
-        ))
-    }
-}
-public enum DeskProgramFamilyPresentation {
-    public static func workingParentIDs(from items: [DeskItem], evidence: [String: DeskExecutionEvidence], now: Date) -> Set<String> {
-        // Duplicate durable handles retain their first row.
-        let byHandle = items.reduce(into: [String: DeskItem]()) { result, item in
-            if result[item.handle] == nil { result[item.handle] = item }
-        }
-        var lanesByParent: [String: [DeskItem]] = [:]
-        for item in items {
-            guard let raw = item.laneOf?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !raw.isEmpty,
-                  raw != item.handle,
-                  byHandle[raw] != nil
-            else { continue }
-            lanesByParent[raw, default: []].append(item)
-        }
-        return Set(items.compactMap { parent -> String? in
-            guard let lanes = lanesByParent[parent.handle], !lanes.isEmpty,
-                  ([parent] + lanes).contains(where: {
-                      !$0.requiresOwnerInput && DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .working
-                  })
-            else { return nil }
-            return parent.handle
-        })
+        return .rows(Content(isStale: stale, nextRefreshAt: boundaries.min()))
     }
 }

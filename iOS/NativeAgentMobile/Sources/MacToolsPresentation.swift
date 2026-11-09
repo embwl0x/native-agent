@@ -1,6 +1,6 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `MacToolsPresentation.swift` | Shared Mac action policy hints, requested volume, notification feedback and Spotlight results |
+// Blueprint: | `MacToolsPresentation.swift` | Mac policy remedies, requested volume and off-main Spotlight result decoding |
 
 /// A missing trust projection requires publication, while disabled Mac Control requires a policy change; do not conflate the two.
 enum MacToolsPolicyGatePresentation {
@@ -53,15 +53,9 @@ enum MacToolsPrivilegePresentation {
     }
 }
 
-/// Volume is a requested target; never imply the slider monitors live Mac volume.
+/// Volume is a requested target, never a live Mac gauge.
 enum MacVolumeControlPresentation {
-    static let defaultTargetFraction = 0.5
-    static let currentVolumeDisclosure = "Pick a volume target to send to your Mac. The slider doesn’t track later changes on the Mac."
-
-    static func targetPercent(for fraction: Double) -> Int {
-        guard fraction.isFinite else { return 50 }
-        return Int((min(max(fraction, 0), 1) * 100).rounded())
-    }
+    static let currentVolumeDisclosure = "Pick a volume target to send to your Mac. This field doesn’t track later changes on the Mac."
 
     static func isValid(percent: Int) -> Bool {
         (0...100).contains(percent)
@@ -72,46 +66,21 @@ enum MacVolumeControlPresentation {
     }
 }
 
-/// Name notification operation and outcome so feedback cannot look like an unlabeled disabled control.
-enum MacNotificationSendPresentation {
-    enum Feedback: Equatable {
-        case sent
-        case failed(String)
-        case unconfirmed(String)
-
-        var text: String {
-            switch self {
-            case .sent: "Notification sent to the Mac."
-            case .failed(let detail): "Couldn’t send notification: \(detail)"
-            case .unconfirmed(let detail): "Notification outcome is not confirmed: \(detail)"
-            }
-        }
-    }
-}
-
-/// Empty Spotlight response means unavailable; a nonempty response without usable rows proves a completed zero-result search.
+/// Only a decoded result array can prove a zero-result search.
 enum MacToolsSpotlightPresentation {
-    static let collapsedResultLimit = 8
-
-    enum Outcome: Equatable {
-        case emptyResponse
-        case invalidResponse
+    enum Outcome: Equatable, Sendable {
         case noResults
         case results([String])
 
         var rows: [String] {
             switch self {
             case .results(let results): results
-            case .emptyResponse, .invalidResponse, .noResults: []
+            case .noResults: []
             }
         }
 
         var statusText: String {
             switch self {
-            case .emptyResponse:
-                "Mac returned an empty Spotlight response; results are unavailable."
-            case .invalidResponse:
-                "Mac returned an unreadable Spotlight response; results are unavailable."
             case .noResults:
                 "No Spotlight results."
             case .results(let results):
@@ -119,34 +88,17 @@ enum MacToolsSpotlightPresentation {
             }
         }
 
-        var resultCount: Int { rows.count }
-
-        func visibleRows(showingAll: Bool) -> [String] {
-            guard !showingAll else { return rows }
-            return Array(rows.prefix(MacToolsSpotlightPresentation.collapsedResultLimit))
-        }
-
-        var hiddenResultCount: Int {
-            max(0, resultCount - MacToolsSpotlightPresentation.collapsedResultLimit)
-        }
-
-        func truncationText(showingAll: Bool) -> String? {
-            guard hiddenResultCount > 0 else { return nil }
-            return showingAll
-                ? "Showing all \(resultCount) Spotlight results."
-                : "Showing \(MacToolsSpotlightPresentation.collapsedResultLimit) of \(resultCount) Spotlight results."
-        }
     }
 
-    static func outcome(from rawResponse: String) -> Outcome {
-        guard !rawResponse.isEmpty else { return .emptyResponse }
+    @concurrent nonisolated static func outcome(from rawResponse: String) async throws -> Outcome {
+        guard !rawResponse.isEmpty else {
+            throw PartCallError(code: "spotlight_empty_response", message: "Mac returned an empty Spotlight response; results are unavailable.")
+        }
 
         struct SearchResponse: Decodable {
             let results: [String]
         }
-        guard let response = try? JSONDecoder().decode(SearchResponse.self, from: Data(rawResponse.utf8)) else {
-            return .invalidResponse
-        }
+        let response = try JSONDecoder().decode(SearchResponse.self, from: Data(rawResponse.utf8))
         let results = response.results
 
         return results.isEmpty ? .noResults : .results(results)

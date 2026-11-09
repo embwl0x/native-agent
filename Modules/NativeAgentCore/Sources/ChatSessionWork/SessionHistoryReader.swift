@@ -146,9 +146,15 @@ private struct SessionHistoryLineReadResult: Sendable {
 
 public actor SessionHistoryReader {
     // Memoize pure transforms by exact UTF-8 input, never file state; every call selects from its supplied read.
-    private static let promptRowMemo = Mutex<[Data: DecodedRow]>([:])
-    private static let promptRowMemoMaximumBytes = 8 * 1024 * 1024
-    private static let promptRowMemoMaximumRows = 2_048
+    // One memo serves every conversation: a read adds the lines it used, and only the least recently read lines go
+    // once their bytes pass the cap (about three times every transcript the agent keeps today).
+    private struct PromptRowMemo: Sendable {
+        var rows: [Data: (row: DecodedRow, read: UInt64)] = [:]
+        var bytes = 0
+        var reads: UInt64 = 0
+    }
+    private static let promptRowMemo = Mutex(PromptRowMemo())
+    private static let promptRowMemoMaximumBytes = 48 * 1024 * 1024
     private static let relevanceFullReadMaximumBytes = 128 * 1024
     private static let relevanceSampleMaximumBytes = 96 * 1024
     private static let relevanceSampleWindowCount = 8
@@ -212,9 +218,10 @@ public actor SessionHistoryReader {
             defer { try? handle.close() }
             let size = try handle.seekToEnd()
             var readFailure: (any Error)?
+            let selectionLines = limit > Int.max / 3 ? Int.max : limit * 3
             let result = Self.tailLinesResult(
                 size: Int(size),
-                minimumLineCount: max(64, limit * 3),
+                minimumLineCount: max(64, selectionLines),
                 maximumBytes: maximumBytes
             ) { offset, count in
                 do {
@@ -380,24 +387,17 @@ public actor SessionHistoryReader {
         let excludedRunId = excludingRunId?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let shouldExcludeRun = excludedRunId?.isEmpty == false
-        let previousRows = Self.promptRowMemo.withLock { $0 }
+        let previousRows = Self.promptRowMemo.withLock { $0.rows }
         var rows: [Data: DecodedRow] = [:]
-        var retainedRows: [Data: DecodedRow] = [:]
-        var retainedBytes = 0
         var cacheHits = 0
         var cacheMisses = 0
         func decode(_ line: String) -> DecodedRow {
             let key = Data(line.utf8)
             if let row = rows[key] { return row }
             let row: DecodedRow
-            if let kept = previousRows[key] { row = kept; cacheHits += 1 }
+            if let kept = previousRows[key]?.row { row = kept; cacheHits += 1 }
             else { row = Self.decodeRow(line); cacheMisses += 1 }
             rows[key] = row
-            if retainedRows.count < Self.promptRowMemoMaximumRows,
-               key.count <= Self.promptRowMemoMaximumBytes - retainedBytes {
-                retainedRows[key] = row
-                retainedBytes += key.count
-            }
             return row
         }
         // Split JSONL on byte LF without walking every grapheme; preserve String's CR/CRLF segmentation when CR is present.
@@ -420,7 +420,19 @@ public actor SessionHistoryReader {
             size: transcript.count, excludingRunId: excludingRunId, decode: decode
         ) { transcript.subdata(in: (transcript.startIndex + $0)..<(transcript.startIndex + $0 + $1)) } : nil
         // Late memo updates affect only cache misses; they cannot publish stale transcript state.
-        Self.promptRowMemo.withLock { $0 = retainedRows }
+        // A read adds every line it used as the most recent; past the cap the least recently read lines go first.
+        Self.promptRowMemo.withLock { memo in
+            memo.reads += 1
+            for (key, row) in rows {
+                if memo.rows.updateValue((row, memo.reads), forKey: key) == nil { memo.bytes += key.count }
+            }
+            guard memo.bytes > Self.promptRowMemoMaximumBytes else { return }
+            for key in memo.rows.sorted(by: { $0.value.read < $1.value.read }).map(\.key) {
+                guard memo.bytes > Self.promptRowMemoMaximumBytes else { break }
+                memo.rows[key] = nil
+                memo.bytes -= key.count
+            }
+        }
         let stats = prompt.stats
         let measured = SessionHistoryReadResult(messages: prompt.messages, stats: SessionHistoryReadStats(
             mode: stats.mode, sourceBytes: stats.sourceBytes, bytesRead: stats.bytesRead,
@@ -647,7 +659,7 @@ public actor SessionHistoryReader {
         package let content: String?
         package let timestamp: String?
         package let contextStatistics: (totalChars: Int, messageCount: Int)
-        fileprivate let message: ChatMessage?
+        package let message: ChatMessage?
 
         init(_ value: JSONValue?, _ role: String?, _ content: String?, _ timestamp: String?,
              _ statistics: (totalChars: Int, messageCount: Int)) {

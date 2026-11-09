@@ -5,31 +5,26 @@ import ChatTurnRuntime
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-import Observation
 import PersistenceCore
 import Senses
 import ToolExecution
-// Blueprint: | `PresentationFaces.swift` | Root-scoped PresentationFaces feeds L0's pure presentation-copy.js cache from frozen inputs outside rendering |
+// Blueprint: | `PresentationFaces.swift` | Root-scoped authored copy from frozen inputs; each copy key posts its finished snapshot to the face feed |
 
-/// Root-scoped authored copy: owners and view tasks feed frozen inputs; rendering reads L0 snapshots, including unavailable status.
-@MainActor @Observable
+/// Root-scoped authored copy: owners and view tasks feed frozen inputs; rendering reads only the face feed.
+@MainActor
 public final class PresentationFaces {
     private let dataRoot: URL
-    private var faces: [String:PartFaces] = [:]
-    @ObservationIgnored private var inputs: [String:JSONValue] = [:]
-    @ObservationIgnored private var epochs: [String:UInt64] = [:]
-    public nonisolated init(dataRoot: URL) { self.dataRoot=dataRoot }
+    private let feed: FaceFeedSource
+    private var faces: [String: PartFaces] = [:]
+    private var inputs: [String:JSONValue] = [:]
+    private var epochs: [String:UInt64] = [:]
+    public nonisolated init(dataRoot: URL, feed: FaceFeedSource) { self.dataRoot=dataRoot; self.feed=feed }
 
-    public func words(_ key: String) -> String? { words(key, readyOnly: false) }
+    public func words(_ key: String) async -> String? { await words(key, readyOnly: false) }
 
-    /// A transport carries only ready authored words; local readers may also show the owner's failure diagnostic.
-    public func words(_ key: String, readyOnly: Bool) -> String? {
-        if let snapshot=faces[key]?.snapshots["presentation-copy"] {
-            if snapshot.status == .ready { return snapshot.face?.sections.first?.rows.first?.title }
-            if readyOnly { return nil }
-            return "Readout "+snapshot.status.rawValue+": "+(snapshot.error?.message ?? snapshot.status.rawValue)
-        }
-        return nil
+    /// Readiness checks can omit diagnostics; displayed words carry the owner's preparation failure on every door.
+    public func words(_ key: String, readyOnly: Bool) async -> String? {
+        await faces[key]?.snapshots["presentation-copy"]?.copyWords(readyOnly: readyOnly)
     }
 
     @discardableResult
@@ -44,13 +39,8 @@ public final class PresentationFaces {
         let face: PartFaces
         if let existing = faces[key] { face = existing } else {
             let root=dataRoot
-            face=PartFaces(dataRoot:root) { id,input,version in
-                let invocation = ChatToolInvocation()
-                let work = ChatTurnWork(toolInvocation: invocation)
-                let execution = AppActionExecution(invocation: invocation, deadlines: work.deadlines, turnWork: work)
-                let host=AppToolExecutor.authoredProgramHost(dataRoot:root, turn: nil, execution: execution) { _,_,_,_ in nil }
-                return await Parts(root: root).face(id: id, input: input, version: version,
-                    invocation: .init(host: host, execution: .init(turn: nil, surface: "presentation", deadlines: execution.deadlines)))
+            face=PartFaces(dataRoot:root, feed: feed, key: { _ in PageFaceKey.copy(key) }) { id,input,version in
+                await NativeAgentEngine.forRoot(root).tools.face(id: id, input: input, version: version)
             }
             faces[key] = face
         }

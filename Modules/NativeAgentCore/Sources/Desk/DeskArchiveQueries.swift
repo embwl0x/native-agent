@@ -21,9 +21,6 @@ extension SwiftNativeDeskStore {
             }
             // Validate the whole subtree so archiving cannot orphan a live descendant.
             let subtree = Self.descendants(of: handle, in: state)
-            if let pending = ([item] + subtree).first(where: { node in
-                node.step.map { !MyQueue.migrationReady($0, dataRoot: dataRoot) } ?? false
-            }) { throw DeskError.archiveRefusedPendingMigration(handle: pending.handle) }
             if let standing = subtree.first(where: { $0.kind == .standing }) {
                 throw DeskError.archiveRefusedStanding(handle: standing.handle)
             }
@@ -344,7 +341,10 @@ extension SwiftNativeDeskStore {
         return nil
     }
     static func makeArchiveRecord(_ item: DeskItem, now: String) -> ArchiveRecord {
-        ArchiveRecord(
+        var refs = item.liveRefs(limit: 3)
+        if let captured = item.refs.last(where: { if case .step(let step) = $0.kind { return !step.promiseCaptures.isEmpty }; return false }),
+           !refs.contains(where: { $0.refId == captured.refId }) { refs.append(captured) }
+        return ArchiveRecord(
             handle: item.handle,
             title: item.title,
             project: item.project,
@@ -352,7 +352,7 @@ extension SwiftNativeDeskStore {
             openedAt: item.openedAt,
             closedAt: item.closedAt ?? now,
             summary: item.summary ?? "",
-            refs: item.liveRefs(limit: 3),
+            refs: refs,
             decisions: [],
             artifacts: [],
             findingKey: item.findingKey

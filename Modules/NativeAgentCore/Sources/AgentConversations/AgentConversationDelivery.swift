@@ -16,27 +16,21 @@ extension AgentConversationRecord {
     public var awaitsReply: Bool { expectsReply != false }
 }
 
-/// Waiting retains an owed answer until its recorded deadline; terminal unknowns cannot claim non-delivery.
+/// Delivery consumes owner evidence; an owed answer stays waiting through silence.
 public enum AgentConversationDelivery: String, Sendable {
     case sending, waiting, delivered, read, answered, failed, notDelivered
-    /// A reply deadline says nothing about delivery.
+    /// An explicit observation can report an unanswered exchange without proving non-delivery.
     case unanswered
 
     public static func of(_ row: AgentConversationRecord, read: Bool) -> Self {
         if row.phase == "sending" { return .sending }
         if row.sendFailed { return .failed }
         if row.sendStatus == "held" { return .waiting }
-        if row.phase != "sending", case .object(let receipt)? = row.receipt, receipt["reply_state"] == .string("no_reply_expired") {
-            return receipt["sent"] == .bool(false) ? .notDelivered : .unanswered
-        }
         if case .object(let receipt)? = row.receipt, receipt["sent"] == .bool(false) { return .notDelivered }
         if row.phase == "ready", row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return .answered }
         switch row.phase {
         case "attention":
-            if case .object(let receipt)? = row.receipt, receipt["status"] == .string(
-                "outcome_unknown") { return AgentConversationSession.unsettledAttention(row) ? .waiting : .failed }
-            if case .object(let receipt)? = row.receipt, receipt["error"] != nil { return .notDelivered }
-            return row.awaitsReply ? .failed : (accepted(row, read: read) ? .delivered : .waiting)
+            return accepted(row, read: read) ? .delivered : .waiting
         case "waiting": return .waiting
         default: return accepted(row, read: read) ? (read ? .read : .delivered) : .waiting
         }
@@ -68,6 +62,8 @@ public enum AgentConversationDelivery: String, Sendable {
 public struct AgentConversationContext: Sendable {
     public var isInternalRead = false
     public var returnsHistory = true
+    /// A read that returns a routine's saved answer to the asking chat consumes it; a wait's own reads leave that to the wait.
+    public var consumesAnswer = true
     public var dryRun = false
     public var liveTarget: AgentConversationLiveTarget?
     package var helperDoor: HelperContact.Door?
@@ -83,6 +79,12 @@ public struct AgentConversationContext: Sendable {
     public var withoutHistory: Self {
         var operation = self
         operation.returnsHistory = false
+        return operation
+    }
+
+    public var withoutConsuming: Self {
+        var operation = self
+        operation.consumesAnswer = false
         return operation
     }
 

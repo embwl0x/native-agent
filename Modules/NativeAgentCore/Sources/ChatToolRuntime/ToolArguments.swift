@@ -27,6 +27,20 @@ import NativeAgentShared
 // Normalize optional nulls from the native schema before gates; preserve required nulls and false.
 public enum ToolArguments {
 
+    /// The door's three item-address words name one schema-declared field; bind it before validation, Trust and receipts read the call.
+    public static func itemAddress<Value>(_ input: [String: Value], schema: JSONValue)
+        -> (args: [String: Value], understood: [String]) {
+        guard case .object(let properties)? = schema.objectValue?["properties"] else { return (input, []) }
+        let words = ["id", "item", "handle"]
+        let declared = words.filter { properties[$0] != nil }
+        guard declared.count == 1, let target = declared.first, input[target] == nil else { return (input, []) }
+        let supplied = words.filter { $0 != target && input[$0] != nil }
+        guard supplied.count == 1, let source = supplied.first else { return (input, []) }
+        var args = input
+        args[target] = args.removeValue(forKey: source)
+        return (args, ["understood \(source) as \(target)"])
+    }
+
     /// Both doors judge the normalized call against its owner's current schema. Only the native transport carries private metadata beside public arguments.
     public static func admit(_ input: [String: JSONValue], schema: JSONValue, path: String = "$",
                              transportMetadata: Bool = false, declaredKeysOnly: Bool = false) throws {
@@ -83,6 +97,7 @@ public enum ToolArguments {
                     effects: .none, owner: "Tool catalog", code: "tool_schema_unavailable",
                     instruction: "Repair the registered input schema for \(canonical).", recovery: .repair)
             }
+            let input = itemAddress(input, schema: parameters).args
             normalized = MacContactsExecutor.parameters(for: canonical) != nil ? input
                 : ToolArguments.normalized(input, schema: parameters, preserving: authoring ? ["learned", "choices"] : [], recordShims: recordShims)
             // A wake supplies input.wake, not the authored call's parameters. Native actions reached during that wake still admit their own args.
@@ -202,6 +217,7 @@ private enum DryRunInvocationPart: ToolInvocationPart { static let unset: Bool =
 private enum LiveTargetInvocationPart: ToolInvocationPart { static let unset: AgentConversationLiveTarget? = nil }
 private enum HelperDoorInvocationPart: ToolInvocationPart { static let unset: HelperContact.Door? = nil }
 private enum ReturnsHistoryInvocationPart: ToolInvocationPart { static let unset: Bool = true }
+private enum ConsumesAnswerInvocationPart: ToolInvocationPart { static let unset: Bool = true }
 private enum HandsBackInvocationPart: ToolInvocationPart { static let unset: Bool = false }
 private enum WroteInvocationPart: ToolInvocationPart { static let unset: (@Sendable (URL) -> Void)? = nil }
 private enum ImageSinkInvocationPart: ToolInvocationPart { static let unset: LocalToolImage.Sink? = nil }
@@ -216,6 +232,7 @@ private enum ReadContentInvocationPart: ToolInvocationPart { static let unset: O
 private enum WakeInvocationPart: ToolInvocationPart { static let unset: JSONValue? = nil }
 private enum ProgramHostInvocationPart: ToolInvocationPart { static let unset: (any OwnedProgramToolHost)? = nil }
 private enum ValueCallInvocationPart: ToolInvocationPart { static let unset: (id: String, version: String)? = nil }
+private enum ValueReachInvocationPart: ToolInvocationPart { static let unset: OwnedProgramExecution.ValueReach? = nil }
 private enum BotAncestryInvocationPart: ToolInvocationPart { static let unset: Set<UUID> = [] }
 private enum DeskContinuationInvocationPart: ToolInvocationPart { static let unset: DeskContinuationTurn? = nil }
 private enum AuthoredCallInvocationPart: ToolInvocationPart {
@@ -267,6 +284,10 @@ extension ChatToolInvocation {
     package var returnsHistory: Bool {
         get { self[ReturnsHistoryInvocationPart.self] }
         set { self[ReturnsHistoryInvocationPart.self] = newValue }
+    }
+    package var consumesAnswer: Bool {
+        get { self[ConsumesAnswerInvocationPart.self] }
+        set { self[ConsumesAnswerInvocationPart.self] = newValue }
     }
     package var handsBack: Bool {
         get { self[HandsBackInvocationPart.self] }
@@ -323,6 +344,10 @@ extension ChatToolInvocation {
     package var valueCall: (id: String, version: String)? {
         get { self[ValueCallInvocationPart.self] }
         set { self[ValueCallInvocationPart.self] = newValue }
+    }
+    package var valueReach: OwnedProgramExecution.ValueReach? {
+        get { self[ValueReachInvocationPart.self] }
+        set { self[ValueReachInvocationPart.self] = newValue }
     }
     package var botAncestry: Set<UUID> {
         get { self[BotAncestryInvocationPart.self] }
@@ -389,13 +414,14 @@ extension ChatToolInvocation {
         context.liveTarget = liveTarget
         context.helperDoor = helperDoor
         context.returnsHistory = returnsHistory
+        context.consumesAnswer = consumesAnswer
         return context
     }
 
     package func serving(conversation: AgentConversationContext) -> Self {
         with(\.internalRead, conversation.isInternalRead).with(\.dryRun, conversation.dryRun)
             .with(\.liveTarget, conversation.liveTarget).with(\.helperDoor, conversation.helperDoor)
-            .with(\.returnsHistory, conversation.returnsHistory)
+            .with(\.returnsHistory, conversation.returnsHistory).with(\.consumesAnswer, conversation.consumesAnswer)
     }
 
     package func senseOperation(turn: Turn) -> SenseReadOperation {
@@ -417,7 +443,7 @@ extension ChatToolInvocation {
 
     package func partInvocation(turn: Turn?, surface: String) -> Parts.Invocation {
         .init(host: programHost, execution: .init(turn: turn, surface: surface, deadlines: deadlines, wake: wake,
-            options: .init(handsBack: handsBack), readContent: readContent, valueIdentity: valueCall, deadline: waitDeadline,
+            options: .init(handsBack: handsBack), readContent: readContent, valueIdentity: valueCall, valueReach: valueReach, deadline: waitDeadline,
             onActivity: { deadlines.progressed() }), progressed: { deadlines.progressed() })
     }
 }

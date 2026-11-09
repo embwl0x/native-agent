@@ -34,7 +34,7 @@ extension ChatStore {
     }
 
     func resolvePendingReplyFromMac(_ repliesByRun: [String: ChatMessage]) {
-        let matches = pendingICloudPlaceholders.merging(timedOutPendingIds) { current, _ in current }
+        let matches = pendingICloudPlaceholders.merging(retiredPendingPlaceholders) { current, _ in current }
             .sorted { $0.key < $1.key }.compactMap { pendingId, placeholderId in
                 repliesByRun[pendingId].map { (pendingId, placeholderId, $0) }
             }

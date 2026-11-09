@@ -28,7 +28,7 @@ extension ChatToolOutcome {
         let reply = ToolResult(output)
         guard !outputLooksSuccessful(reply.payload, verdict: reply.outcome),
               !isWaitingApproval(reply.payload), !reply.isWaitingInteraction,
-              reply.outcome != .cancelled, !InlineInteractionNeed.isWaiting(reply.payload),
+              !InlineInteractionNeed.isWaiting(reply.payload),
               case .object(var object) = output else { return output }
         func text(_ key: String) -> String? {
             guard case .string(let raw)? = object[key] else { return nil }
@@ -90,6 +90,10 @@ extension ChatToolOutcome {
         if object["argument_path"] == nil { object["argument_path"] = .null }
         if object["accepted"] == nil { object["accepted"] = .null }
         if object["effects"] == nil { object["effects"] = .string(effects) }
+        // Folded failures name their known outcome only when the owner has not named a status itself.
+        if effects == "none", reply.outcome == .failed, object["status"] == nil, object["state"] == nil {
+            object["status"] = .string("failed")
+        }
         if object["remedy"] == nil || object["remedy"] == .null {
             // Project the owner's lever; naming an action makes no lookup or replay a repair.
             object["remedy"] = nil
@@ -175,9 +179,17 @@ extension ChatToolOutcome {
             object["hint"] = .string(ChatSecretRedactor.redactText(recovery))
         }
         if let gate = error as? AutonomyGateError {
+            object["checker"] = .string("autonomy_gate")
             if case .toolDenied(let reason, let remedy) = gate {
                 if let remedy { object["remedy"] = remedy }
                 object["gate_reason"] = .string(ChatSecretRedactor.redactText(reason))
+            }
+            if case .approvalFilingFailed(let cause) = gate {
+                object["reason"] = .string(ToolNotRunStatus.approvalFilingFailed.rawValue)
+                object["gate_reason"] = .string(ChatSecretRedactor.redactText(cause))
+                object["remedy"] = Repair.remedy(owner: "approval inbox", nextCall: .object([
+                    "tool": .string("app"), "input": .object(["page": .string("inbox")])]), tap: nil,
+                    instruction: "Inspect retained cards and repair the reported save failure before another request; do not repeat completed effects.")
             }
             return normalizedFailure(gate.notRunStatus.reporting(.object(object), tool: tool), tool: tool)
         }

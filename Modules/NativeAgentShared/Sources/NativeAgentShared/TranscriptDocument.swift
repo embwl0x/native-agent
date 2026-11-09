@@ -39,10 +39,8 @@ public struct TranscriptDocumentEdit: Equatable, Sendable {
     }
 }
 
-public struct TranscriptBlock: Equatable, Sendable, Identifiable {
-    /// "<messageID>#<n>" for a message's nth block of words; "fold-<groupID>" for a tool run's headline, "tool-<rowID>" for its detail
-    /// lines, "gap-<groupID>", "card-<cardID>", "approval-<id>", "room-<exchangeID>" and "trouble" for the rest. A platform may add
-    /// its own ids for a message's other blocks, never in the "<messageID>#" form, which belongs to the words a live reply replaces.
+public struct TranscriptBlock: Equatable, Sendable, Codable, Identifiable {
+    /// "<messageID>#" is reserved for word blocks replaced by live replies; attachments use distinct identities.
     public let id: String
     /// The row whose menu, hover bar and first-render receipt this block answers to; a tool run's headline answers to its group id.
     public let messageID: String
@@ -65,7 +63,7 @@ public struct TranscriptBlock: Equatable, Sendable, Identifiable {
         self.foldGroup = foldGroup
     }
 
-    public enum Kind: Equatable, Sendable {
+    public enum Kind: Equatable, Sendable, Codable {
         /// Right-seated bubble. The tag is the provenance or bridge line drawn above it.
         case user(runs: [TranscriptRun], tag: Tag?)
         case reply(runs: [TranscriptRun], ink: Ink)
@@ -82,9 +80,9 @@ public struct TranscriptBlock: Equatable, Sendable, Identifiable {
     }
 
     /// Quiet ink is a peer bridge, a system row or a status line: secondary colour, label size.
-    public enum Ink: Equatable, Sendable { case primary, quiet }
+    public enum Ink: Equatable, Sendable, Codable { case primary, quiet }
 
-    public struct Tag: Equatable, Sendable {
+    public struct Tag: Equatable, Sendable, Codable {
         public var symbol: String
         public var label: String
         /// Automated provenance draws in the trouble colour.
@@ -97,12 +95,12 @@ public struct TranscriptBlock: Equatable, Sendable, Identifiable {
         }
     }
 
-    public enum Lead: Equatable, Sendable { case none, message, paragraph, listItem, detail, gap }
+    public enum Lead: Equatable, Sendable, Codable { case none, message, paragraph, listItem, detail, gap }
 }
 
 /// One inline run of rendered markdown. Markdown keeps only http, https and mailto links; a platform's own action link (a row's
 /// button as words in the document) is the only other scheme a run carries.
-public struct TranscriptRun: Equatable, Sendable {
+public struct TranscriptRun: Equatable, Sendable, Codable {
     public var text: String
     public var bold: Bool
     public var italic: Bool
@@ -122,7 +120,7 @@ public struct TranscriptRun: Equatable, Sendable {
 
 /// What an attachment block shows, as ids and values both platforms carry. Live state (an answered card, a playing note) lives in
 /// the platform's model keyed by the block id, never in the view.
-public enum TranscriptAttachmentRef: Equatable, Sendable {
+public enum TranscriptAttachmentRef: Equatable, Sendable, Codable {
     /// A card on a row: the Mac's mounted card, the iPhone's inline interaction or mirrored inbox card.
     case card(rowID: String, cardID: String)
     /// The Mac's pending-approval row, or the iPhone's approval request by its id.

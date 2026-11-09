@@ -12,12 +12,10 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
     case catalog
     case chat
     case desk
-    case scheduler
     case activity
     case advanced
     case work
-    /// Every page's face (`faces.json`: page id → PartFaceSnapshot). Never named in the snapshot ping: phones before it refuse a ping
-    /// naming a group they do not know (a faces-only change names core instead), so phones that know it fetch it with every ping.
+    /// Every page's face (`faces.json`: page id → PartFaceSnapshot), named as its own publication group.
     case faces
 
     public var statusKey: String {
@@ -62,8 +60,6 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
             // rides with the board too: the reading copies are only trustworthy beside the rows they belong to. The overview rides here only: it is built
             // from the same Desk read as desk.json.
             ["desk.json", "desk_bounds.json", "desk_details.json", "work_overview.json"]
-        case .scheduler:
-            ["scheduler.json"]
         case .work:
             ["work_activity.json"]
         case .faces:
@@ -98,7 +94,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
         let group = filename.replacingOccurrences(of: ".json", with: "")
         let known = [
             "desk": "Desk", "desk_bounds": "Desk", "desk_details": "Desk", "work_overview": "Desk",
-            "scheduler": "Scheduler", "memories": "Memories", "inbox": "Inbox",
+            "memories": "Memories", "inbox": "Inbox",
             "approvals": "Approvals", "work_activity": "Activity",
             "providers": "Providers", "connectors": "Connectors", "health": "Health", "trust_policy": "Trust",
             "sessions": "Chat", "chat_sessions": "Chat", "chat_transcripts": "Chat",

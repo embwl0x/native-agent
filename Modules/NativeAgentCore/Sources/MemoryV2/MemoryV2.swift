@@ -302,7 +302,7 @@ public actor SwiftNativeMemoryV2 {
     internal var storage: MemoryStorage?
     internal var canonicalDataRoot: URL?
     internal var canonicalAttachmentReady: Task<Void, Never>?
-    internal var userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?
+    internal var userProjectionBinding: (dataRoot: URL, personaRoot: URL?)?
     internal var memoryProjectionsStopped = false
     var actionIndexSource: (@Sendable () async throws -> [String])?
     var actionIndexWatcher: FileChangeWatcher?
@@ -377,7 +377,9 @@ public actor SwiftNativeMemoryV2 {
     }
 
 
-    public func updateMemory(id: String, update: JSONValue, context: MemoryWriteContext) async throws -> MemoryRecord {
+    /// `changed` is false when the memory already read this way and nothing was written.
+    public func updateMemory(id: String, update: JSONValue, restating: [MemoryRoot.Telling]? = nil,
+                             context: MemoryWriteContext) async throws -> (record: MemoryRecord, changed: Bool) {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         var existing: MemoryRecord?
@@ -398,11 +400,26 @@ public actor SwiftNativeMemoryV2 {
             throw MemoryStorageError.searchFailure("Memory unchanged: the memory search model is not loaded to check new wording against forgotten content.",
                 code: "memory_search_model_not_loaded", instruction: "Read Doctor and repair any reported model load error before rewriting.")
         }
-        guard let updated = try await storage.updateMemory(
-            id: id,
-            patch: MemoryPatch(update: update, embedding: newEmbedding?.vector, epoch: newEmbedding?.epoch), context: context
-        ) else { throw MemoryV2Error.recordNotFound }
-        return MemoryRecord(stored: updated)
+        var patch = MemoryPatch(update: update, embedding: newEmbedding?.vector, epoch: newEmbedding?.epoch)
+        patch.restating = restating
+        guard let updated = try await storage.updateMemory(id: id, patch: patch, context: context) else { throw MemoryV2Error.recordNotFound }
+        return (MemoryRecord(stored: updated.memory), updated.changed)
+    }
+
+    /// Graduate only the exact source words the person reviewed, checked with lifecycle eligibility in the canonical write transaction.
+    public func graduateMemory(id: String, reviewedContent: String, context: MemoryWriteContext) async throws {
+        try await ensureCanonicalAttachment()
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        let patch = MemoryPatch(update: .object(["lifecycle": .string(MemoryLifecycle.graduated)]), embedding: nil, epoch: nil)
+        guard try await storage.updateMemory(id: id, patch: patch, expectedContent: reviewedContent, onlyIf: {
+            $0.status == "active" && (MemoryLifecycle.isRecallEligible($0.lifecycle) || $0.lifecycle == MemoryLifecycle.graduated)
+        }, context: context) != nil else {
+            throw ToolFailureError("""
+                The lesson landed in GROWTH, but source memory \(id) changed or became ineligible. Its graduation remains owed; preserve the lesson.
+                """,
+                effects: .occurred, code: "memory_graduation_changed", status: .failed,
+                instruction: "Review the changed source and repair its graduation before settling the lesson approval.", recovery: .terminal)
+        }
     }
 
     /// Foreground callers that distinguish a missing row use the atomic deletion result. Derived indexes catch up on their own; a turn leaves a retired memory

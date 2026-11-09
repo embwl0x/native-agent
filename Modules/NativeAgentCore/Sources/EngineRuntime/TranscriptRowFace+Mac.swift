@@ -4,9 +4,10 @@ import ChatToolParsing
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Privacy
 import ToolRegistry
 import Transcripts
-// Blueprint: | `TranscriptRowFace+Mac.swift` | The Mac's one reading of a transcript row into its face (seat, tag, bridge line, tool line and outcome, persona receipt, owed decision), for its own chat and for the phone's |
+// Blueprint: | `TranscriptRowFace+Mac.swift` | Mac and phone transcript row faces; unreadable tool input names its cause. |
 
 extension ChatMessage: TranscriptRow {}
 
@@ -58,9 +59,20 @@ extension TranscriptRowFace {
 
     /// A tool row's line before the agent's words for it are prepared: the tool's title, then its target.
     public static func toolLine(_ metadata: ChatMessageMetadata?) -> String {
-        let call = ToolNameAliases.shown(metadata?.toolName ?? "tool", inputJSON: metadata?.inputJSON)
+        let name = metadata?.toolName ?? "tool"
+        guard let json = metadata?.inputJSON else { return ToolActivityPresentation.title(name) }
+        let input: JSONValue
+        do { input = try JSONValue.parse(Data(json.utf8)) }
+        catch {
+            return ToolActivityPresentation.title(name) + " · Tool input unreadable: "
+                + boundedLine(NativeAppSecretRedactor.redactText(error.localizedDescription), limit: 180)
+        }
+        let call = ToolNameAliases.shown(name, input: input)
         let title = ToolActivityPresentation.title(call.name)
-        let target = boundedLine(toolTarget(call.inputJSON.flatMap { try? JSONValue.parse(Data($0.utf8)) }), limit: 180)
+        guard case .object = call.input else {
+            return title + " · Tool input unreadable: expected an object."
+        }
+        let target = boundedLine(toolTarget(call.input), limit: 180)
         return target.isEmpty ? title : title + " · " + target
     }
 

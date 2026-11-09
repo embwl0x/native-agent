@@ -10,10 +10,16 @@ were archived on 2026-10-28; they are historical design, not current status.
 
 ## One form: an experience
 
+Store projections carry `sequence`: the last committed SQLite event sequence,
+or zero for a birth without events. It is derived while folding or publishing
+the committed write, never saved as a second counter in the birth. Phone work
+content uses this sequence to order snapshots and reconciliation responses.
+
 An experience is one happening in their life, written once by the owner of that happening:
 
 - **id**: stable, minted where the happening starts.
-- **kind**: a message heard, an answer given, an act, a run, a decision, a wake, a dream, a growth.
+- **kind**: a message heard, an answer given, an act, a run, a decision, a message, a happening, a thought (`heard`, `answer`, `act`,
+  `run`, `decision`, `message`, `happening`, `thought` in `NativeAgentShared/Experience.swift`).
 - **cause**: the experiences that brought it about (the person's message, a signal, the turn it ran in). Their autobiography is this graph.
 - **evidence**: references to the raw record (trace rows, receipts, frames, audio, files). Never copies.
 - **outcome**: one typed outcome, owned by the domain that produced it. MacControl stays authoritative for what its acts did, and the browser for what it loaded. Effects are none, occurred or unknown, from that domain's own count.
@@ -26,7 +32,111 @@ An experience is one happening in their life, written once by the owner of that 
 
 **An experience is written once by its owner and only ever appended to.** Its outcome may be present at birth or appended later; a different second outcome is refused. Evidence attaches, claims accrue and obligations settle. Each obligation is settled by its destination accepting it durably, never by a transport handing it off. The only other settlement is a let-go: the owner releases it with a reason (cancelled, failed, expired, abandoned), so nothing stays owed forever by accident. Everything else is a view of experiences by id, and no surface, organ or page keeps a second truth.
 
+A detail's `once` key is checked in its write transaction before insertion. Repeating
+that key writes no row and does not advance SQLite's detail sequence.
+
+## Reading their own record
+
+Each conversation turn receives up to four recent acts, decisions or runs in
+its changing context, newest change first since their last delivered reply in
+this conversation. The answer owner records `deliver:conversation` acceptance
+at birth after the local destination has saved its row, with that row as its
+evidence; other doors settle their own delivery obligations. The boundary
+requires nonempty, accepted delivery obligations and uses their acceptance
+times, from the birth or subsequent events. Saved answers without that
+evidence, unresolved or let-go delivery, later non-delivery updates and replies
+in other conversations cannot move it. Older records lacking accepted delivery
+evidence leave this boundary unknown; they are not rewritten or guessed delivered.
+The boundary reads through the public `ExperienceStore.lastSpoken` owner API;
+the context reader does not inspect history renderer internals or load a second
+transcript snapshot. `TurnEpisodicContext` reads the existing store and closing dispatch
+receipts; authored purpose words and the dispatch's retained result accompany
+the owner's status and effects. The result's own fields supply what happened,
+including a send's recipient, subject and recorded action, without an action-name
+template or a whitelist of generic detail words. Up to eight facts per act and
+80 characters per fact are shown, with omissions and shortening named.
+A successful call is not renamed sent or delivered.
+Successful reads, nested dispatches and previews do not occupy these lines.
+An act with missing closing dispatch evidence still carries its known domain,
+authored words, status and effects, including failures and unknown effects.
+The same renderer names missing, unreadable or bounded result wording as a gap
+beside those facts and in `context.episodic`; it never invents an invocation or
+success, substitutes another result, or drops an act for lacking that evidence.
+The read joins queued experience writes, then selects at most 96 experiences
+and 192 trace details. Bounds and unreadable items are named; selecting no acts
+does not mean they did nothing. A missing prior reply leaves the boundary
+unknown and selects the newest retained slice. Later settlement of an older
+experience is selected by its `updated_at`, rather than its birth time.
+Every selected act is checked against its trace, destinations and all experience
+causes. Work belonging to another conversation stays there, including another
+conversation with the same person or project. Enabled cross-session recall,
+the recorded `local_operator` participant and an unsteered turn additionally
+admit non-conversation work explicitly addressed to `person`; unreadable causes
+are named evidence gaps. Other turns receive only their conversation's acts.
+Unbound ephemeral work has no conversation boundary.
+No summary store, provider summarization call or feeling-frame slot is added.
+`context.episodic` records selected experience ids, the boundary, disclosure
+scope, gap count and private-slot character count, without private-slot words.
+
+`app {action:"record.read", args:{of:"experiences", id_prefix:"happening:person."}}`
+reads their presence history through `ExperienceStore`. The same action reads either
+grain of their committed record; it does not wait for queued or future writes.
+
+- `of:"experiences"` accepts `id`, `id_prefix`, `kind` and `open_only` (default
+  false, including open and closed experiences). Filters combine. Births return
+  newest first by `at`, then insertion order, with the owner's events folded into
+  each experience. Items include `id`, `kind`, `at`, `open`, `face` (including its
+  words), `outcome`, `owes` (including each phase), `claims` and `happening`, plus
+  the other experience fields. An absent face, outcome or happening is null.
+- `of:"details"` accepts `subject`, `subject_prefix`, `kind`, `source` and `since`
+  (an inclusive ISO 8601 time with a timezone). Filters combine. Details return
+  newest recorded sequence first, with `seq`, `at`, `source`, `kind`, `subject`,
+  `once` (null when absent) and `row` as whole parsed JSON. For attention history,
+  use `source:"attention"`, `kind:"attention.ignite"` or `kind:"attention.restore"`;
+  the row retains `earlierDrive` when its writer supplied it.
+
+Prefixes are literal and case-sensitive, including `%` and `_`. Exact empty
+strings match empty fields; an empty prefix leaves that field unrestricted.
+Omitted filters leave their fields unrestricted. Filters belonging to the other
+grain are refused. Both grains accept a positive integer `limit`, default 20;
+raise it to read more. `matched_total` counts all matches before the limit in the
+same snapshot as the returned page; `returned` counts items and `has_more` says
+whether further matching records fall outside the selected page. Detail receipts
+also give `selected` and `gaps`: an invalid or over-cap row names its sequence,
+cause and the store's Doctor remedy while readable siblings return, with status `partial`. Valid detail rows
+are never shortened, up to `ExperienceStore.maxRowBytes` (8 MiB per row).
+
+This action uses the store's read-only connection and existing readers. It never
+opens the initializer, writes a record, prunes details or changes saved state.
+Missing or unreadable storage fails with its cause and Doctor remedy, rather than
+creating a store or returning an empty history. A readable query with no matches
+returns zero counts; it establishes only that no committed row matches those
+filters in that snapshot. Missing attention provenance remains unknown.
+
 ## Implemented boundaries
+
+- **A happening is written once under its key.** Every change attention takes in is an experience of kind `happening`
+  (`Experiences/Attention.swift`, `Attention.post`), id `happening:<once>`, its cause the door it came through and its
+  `happening` field the line itself. A second post under the same key writes nothing. An owed happening (`returned`,
+  `moment`, `body`) is addressed to and owes `conversation:<route>` or `conversation:mind`; it settles `accepted` when a
+  thought (evidence `thought:<run>`) or that conversation's own turn attends it, and a thought that fails leaves it owed.
+  `world` and `self` happenings owe nothing; what attention made of them is a detail of source `attention`
+  (`attention.weigh`, `attention.ignite`, `attention.restore`, `attention.wake`) about the happening; their sequence owns which
+  happenings each admitted batch consumed or returned. Each ignition requires an `accounted: true` boundary naming its consumed happenings,
+  including any `earlierDrive` references; an explicit `fromBeforeRecord` gap stays recorded as unknown history. The boundary closes that
+  consumed membership. A failed thought's return carries its named happenings and explicit earlier drive into the next claim; missing provenance
+  is never inferred from absent rows. Missing current membership refuses that node's claim with repair owed, leaving drive unconsumed
+  ([Subconscious](SUBCONSCIOUS.md#attention)). The waiting read selects all unweighed `world`/`self` births without an age or row-count limit.
+  Presence occurrence keys come from the settled here/away transition and its time. Its words describe that transition alone; source evidence
+  belongs to the parts' signal payload. Every posted occurrence reaches `ExperienceStore.begin`: an identical repeat writes nothing, and
+  conflicting content is refused.
+- **A thought is one experience.** `thought:<run>`, kind `thought`, addressed to `conversation:mind`, caused by the
+  happenings it attended; its outcome (domain `attention`) is `hit` (an act with effects occurred), `empty`, `failed` or `withheld`,
+  and a care's movement adds the claim `care.moved` only to thoughts settled after the preceding story entry and by the
+  movement's event time, so a delayed interpretation cannot credit a later thought. Its `thought` field names the node and drive that ignited it,
+  the happenings, their doors and its no-op class. A clean silent model completion declared valid by the thought's request settles as `empty`
+  when no act occurred, accepts its owed happenings and teaches that class's no-op record. `withheld` is a thought ended on CPU by the no-op
+  record itself; it supplies no new no-op evidence. The [provider contract](TURN_RESILIENCE.md) preserves failed and incomplete outcomes.
 
 The experience store opens the current `experience`/`event` schema directly.
 Existing stores must have the current projection columns; unreadable or older
@@ -84,7 +194,15 @@ explicit common-home location.
 
 ### Delivery and face
 
+- **Unchanged is no change.** Repeating an experience's current progress writes
+  nothing. The experience write stream carries the committed `updatedAt`, the
+  same value a store read returns. `ForPerson` feeds both that stream and its
+  own write readbacks through one comparison against the matter it holds;
+  identical matters emit no change. Repeating an unchanged Desk question cannot
+  wake its own overview, notification evaluation or their run accounting.
 - **An answer with content owes its door.** A run's answer is `answer:<run>`.
+  A local destination's saved transcript row is its acceptance evidence; the
+  answer is born with accepted `deliver:conversation`, in the same store write.
   A turn's checkpoint can keep its reply for redelivery on Telegram, Slack or the
   phone. For a door with durable acceptance (currently Telegram and Slack), the
   answer is also addressed to that door and owes `deliver:<surface>`. The shared
@@ -99,12 +217,23 @@ explicit common-home location.
   [silent settlement law](ANATOMY_OF_A_TURN.md#6-the-answer-settles-once).
   Missing or unreadable silence evidence cannot prove completion.
   Synchronous task recovery reads committed experiences through the same store's
-  fold with a read-only connection and a two-second SQLite busy limit; it creates
+  fold with a read-only connection and immediate SQLite busy errors; it creates
   no store, cache or projection and propagates unreadable storage.
+- **Own work has no human delivery debt.** Without an explicit reply route or mounted recipient, a declared `builder`, `agent` or `ephemeral`
+  conversation needs no human recipient. Missing ownership, unreadable destinations and unavailable human recipients remain unavailable,
+  with exact-run repair owed; a missing route alone never proves own work. The session's trace records whether delivery is required
+  ([turn delivery](ANATOMY_OF_A_TURN.md#6-the-answer-settles-once)).
 - **A delayed answer keeps its route.** Grok's request keeps the asking turn's door from the moment it is sent; the answer runs through the contacts' one answer owner (claim, turn, cache, delivery) and goes back to that door. A request with no kept door says so on its hand-over.
 - **A send's record closes when its exchange ends.** The conversation owner's recording pass reads every open experience whose evidence names that row (`agents/conversations`), not only its current operation. A send that is neither current nor still queued accepts all its unsettled keys when its retained exchange has a reply, or is delivered and the row explicitly requires no reply; otherwise those keys are let go as abandoned. A failed/not-delivered current send lets go every unsettled key as failed, including `accept`, `answer` and any queued `deliver`. A current send requiring no reply accepts its answer obligation at confirmed delivery. Queued promotion keeps the message's original id as its operation id, so that same experience follows the send through delivery and answer. Dropped/restored rows and rows for removed contacts seen by this pass abandon their remaining obligations; experiences whose row is absent are untouched. Prior settlements never change. The next normal write (or startup projection) applies this law to existing open records; there is no separate cleanup or migration.
+
+  A queued send with a saved refusal also lets go every outstanding `deliver`,
+  `accept` and `answer` key as failed. Its face retains the not-sent reason;
+  only a pre-Return Mac hold marked `waitingForMac: true` stays pending.
+  Startup projection applies this interpretation to existing saved refusals
+  without rewriting their conversation history. The [conversation owner](agent-communication.md)
+  owns admission, event-driven release and terminal not-sent receipts.
 - **The face is one.** The transcript row is the face's durable copy: their words, every image their generation made in the turn, and every image they attached to it with `reply.attach` (by path, behind the read fence), chosen straight into the turn it runs in, from a direct call, a batch or a script alike; with no turn answering, it attaches nothing and says so. Nothing is inferred from their text. Mac chat and Telegram (live, recovered and delayed) render it; the experience's face is that row's, redacted.
-- **A message sent while they works joins their working turn** (User 10-18; every door since 11-04). Their turn reads it at its next step and that turn's reply answers it, so the door it came from posts nothing of its own. One their turn never reads runs as its own turn through its own door. A peer's words ride only into a turn from that same door; a card's continuation stays hidden.
+- **A message sent while they works joins their working turn** (User 10-18; every door since 11-04). Their generating round finishes its words first, then reads the arrival at its next step boundary; no arrival cancels the stream. Stop still cancels at once. That turn's one reply keeps the completed prose and answers the arrival in streamed order, including prose before later tool calls, so the door it came from posts nothing of its own. One their turn never reads runs as its own turn through its own door. A peer's words ride only into a turn from that same door; a card's continuation stays hidden.
 
 ### Phone projection
 
@@ -172,8 +301,16 @@ Background failures owe repair through their existing owners: recollection never
 substitutes mechanical notes, unreadable arrivals keep their bytes, and missed
 dreams and triggers remain owed. Interrupted turns retain checkpoints for
 reconciliation, never blind replay. REM staging owns its debt once and leaves
-independent eviction and pin publication able to finish. Resident wakes remain
+independent eviction and pin publication able to finish. The agent's thoughts remain
 excluded from automatic memory promotion because their input is app-authored.
+Delivery-watch failures have a failed row addressed to the person and themselves,
+with redacted cause, unknown effects and a `repair` obligation. Inbox and their
+repairs read that same experience. The failed attempt is its face and claim;
+the message has no terminal outcome until the person puts it away, so an owed
+repair remains in Went wrong rather than folded history. Repeated failures update
+its face while repair is open. A successful release settles release repair; a
+successful configuration read settles configuration repair. Repair settlement
+never stands in for the doors' own delivery evidence.
 Experience writes never gate a reply. Projections report write gaps for the
 owner's lifetime; unrelated success does not erase them. Failure accounting
 joins its writes, without retry closures. SQLite repair belongs to Doctor.
@@ -189,7 +326,10 @@ off part owes nothing). Unknown readings, registration
 restarts, delivery of a repair request and archived Desk identities do not; while
 the current reading is unknown, Doctor shows the debt dated under that status.
 One failure is one experience: meeting it again while it is owed adds evidence to
-the open one, so no reader can feed the projection that runs it.
+the open one, so no reader can feed the projection that runs it. `RepairOwed`
+mints a fresh occurrence id beneath the caller's failure key; operation and owner
+deduplicate open debt. A failure after settlement creates a new experience,
+without reopening or rewriting the settled birth.
 Home, the agent's Desk, Doctor and the health pill project the experience face.
 Doctor no longer files a parallel Desk item or keeps a deferred retry timer.
 Phone pairing is checked independently of optional APNS configuration. Body
@@ -197,13 +337,10 @@ resource observations and felt-word concentration do not establish damage.
 DoctorChecks and BackgroundWork depend on Experiences solely for this existing
 obligation form; there is no new health store or lifecycle.
 
-Wake/health decode failures preserve their files; nothing is written over them.
-Pending arrivals are not truncated, and claimed arrivals remain retained until
-their owner clears them. Retention alone does not prove arrival acceptance.
-A claimed arrival waiting for their acceptance is not a fault and owes no repair:
-the wake ledger alone holds it, and their home's MY QUEUE counts it with
-`home.accept`. Acceptance has no historical repair-debt conversion; it changes
-only the wake ledger's acceptance record.
+Health decode failures preserve their files; nothing is written over them.
+An owed happening waiting for a thought is not a fault and owes no repair: the
+record holds it until a thought or its conversation's turn accepts it, and Home
+shows what is owed.
 
 ## Their flows are one owned operation (pick 2, 10-19)
 
@@ -212,7 +349,12 @@ The evidence: in Resolve they ran one seven-step render flow four times because 
 - **A flow that stopped unfinished is an experience that owes `finish` to them** (`Experiences/Flow.swift`, RepairOwed's shape). Its claims are the steps that landed, in order, as digests; its evidence is the owner's raw record. Asking for it again continues it: what landed, or may have, is answered from that record and never done again (an effect that stopped unknown gets its recorded outcome again, never a blind resend), and only what did nothing runs, on a fresh read, or what its owner keeps progress for itself. A flow that finished, asked again, is a new flow. `again: true` is their "start over". Nothing landed means nothing is born.
 - **Current owners:** `mac.act` owns stopped screen batches. `OwnedProgram.isStrict` selects journaled part runs; `AppToolExecutor+PartRun.swift` saves their stops and atomically claims a run for resume. Resume rechecks admission, code, dependencies and reads, and returns saved receipts for landed writes. The [manifest spec](skill_manifest_spec.md#execution-and-ownership) owns the full contract and the outside-world restriction. **History, 10-19:** an earlier strict-flow implementation was cut after review found resume and hand-back holes; that is not the current execution contract.
 - **Mac identities:** each batch step hashes one canonical object containing the app, verb, target, text, mode, destination, image place, held keys, mouse button, handle and frame id, including null optional values. Landed receipts match only that current representation. Before changing it, reconcile any unfinished `mac.act/<session>` flows; an unmatched old digest cannot establish that its effect did not happen. Mac operation rows separately require their canonical request digest: a missing or invalid digest makes `mac_control/operations.json` unreadable, preserving the bytes and refusing journaled work for reconciliation. Every in-memory screen frame carries its producer's compile caps, and effect comparison requires both cap records; there is no pre-cap frame representation.
-- **A wait names its condition** (`desk.wait {handle, on, note?}`; [Desk contract](DESK.md)): a person's name, a Desk item, or any experience they was shown (a card, a message they sent an agent, a repair debt, an answer). A person wait uses the existing `waitingOn` field and reads as `waiting on <person>`; owner waits contribute to the Desk's owner count. A dependency wait keeps Desk handles or `exp:` experience blockers. When the experience store changes, a settled condition (one that no longer owes anything) is written off the items that waited on it, with a `Released:` note, so every reader of the Desk sees the same wait. Carried work is offered only when it changed since they was last offered it: its condition released, someone other than their wrote on it, or its material state moved. Their own notes never re-arm it, and the 30-minute re-offer after their last note is gone. The wake line says what was released.
+- **A wait names its condition** (`desk.wait {handle, on, note?}`; [Desk contract](DESK.md)): a person's name, a Desk item, or any experience the agent was
+  shown (a card, a message the agent sent another agent, a repair debt, an answer). A person wait uses the existing `waitingOn` field and reads as `waiting
+  on <person>`; owner waits contribute to the Desk's owner count. A dependency wait keeps Desk handles or `exp:` experience blockers. When the experience
+  store changes, a settled condition (one that no longer owes anything) is written off the items that waited on it, with a `Released:` note, so every
+  reader of the Desk sees the same wait. Carried work is a new moment only when it changed since it was last one: its condition released, someone other
+  than the agent wrote on it, or its deferral ended (`MyQueueReady.due`); the agent's own notes never re-arm it. The moment's line says what was released.
 - **Discovery reads a durable index**: action vectors in memory's database, keyed by embedding epoch and the exact action text, filled at launch and when the inventory changes, never rebuilt on a query. A just-added action is embedded on its first find through the same writer. An exact action ID returns its contract directly; for other searches the best match carries its whole contract (args_schema and example), so one find is enough to call it.
 
 ## Everything owed is one experience (10-19)
@@ -222,13 +364,27 @@ On a fresh install they was told a reply to Claude Code was owed and could do no
 - **Whatever they owes or is owed is an experience under the id they are shown** (`Experiences/Owed.swift`). The completion lifecycle projects every write of a reply's state into one under its delivery id (owes `deliver` to the who; accepted when delivered, let go when let go). Inline cards do the same under `interaction:<id>` (owes `decide` to the person). Messages, approval cards and repair debts already were. `desk.wait` reads any of them with one primary-key lookup.
 - **An inline answer settles where it is saved.** `InlineInteractionResolver` accepts `decide` after a verified answer, or lets it go as cancelled on
   decline, before publishing the saved transcript change or resuming work. It records the experience if delivery has not filed it yet. Refresh files
-  unanswered asks and reconciles existing debts from saved decisions, never from a live projection or a missing card. It cannot answer a card.
-  Inbox archive/dismiss uses the same decline on Mac, signed phone
-  `inboxAction` and agent inbox actions, including work requested on Telegram. An agent's disposition retires continuation, as its Not now does; a person's
+  unanswered asks and reconciles existing debts from saved decisions, never from a live projection or a missing card. For an open setup,
+  refresh asks the resolver to verify and commit completion, including its continuation, before filing committed readback; it never invents an answer.
+  History leads with the saved outcome, then the request, under the
+  [card history contract](approval-schema.md); it preserves a saved decline even when setup later becomes ready.
+  Inbox archive/dismiss uses the same decline on Mac, the phone and Telegram (each a tap on the matter's Inbox row, its call through the person's door)
+  and agent inbox actions. An agent's disposition retires continuation, as its Not now does; a person's
   disposition resumes it; a decision already settled or failed has nothing to decline, and its card is simply put away. Archive/dismiss then saves its
-  inbox status; refresh preserves dismissed history. Telegram card buttons keep `na_approval` (buttons already delivered carry it): an id the approval
-  inbox does not hold is a card's, answered on its original. Phone action names, payloads, snapshots and experience enums keep their existing shape.
-- **A reply no door can carry is an owned no with its lever**: it stays owed with its reason, the Desk line names the contact (by the name agent.contacts shows) and both levers, and `repair.let_go {id, reason}` lets it go through its owner, so the delivery and the experience agree. A card's decision is the person's and is never theirs to let go.
+  inbox status; refresh preserves dismissed history. A card on the phone or Telegram is its matter's Inbox row: the phone draws that row in the
+  conversation and answers through `faceAction`; a Telegram button carries `na_card:<action id>`, its matter being the one whose Telegram door accepted
+  that message. Snapshots and experience enums keep their existing shape.
+- **A reply no door can carry is an owned no with its lever**: it stays owed with its reason, the Desk line names the contact (by the name agent.contacts shows) and both levers, and `repair.let_go {id, reason}` lets it go through its owner, so the delivery and the experience agree.
+  Completion delivery lifecycle records supply Desk's owed count and release
+  admission through `CodexCompletionReadout.replyIsOwed`; the experience is an
+  advisory projection, never a prerequisite for release. Release reports success
+  only after the owner commits that exact id as `let_go`; a missing or unreadable
+  record cannot prove a release. The same owner projects its settlement into the
+  experience. A card's decision is the person's and is never theirs to let go.
+  A prefix release checks Stop between ids and each one-id admission checks
+  cancellation before starting or proceeding from its reads to settlement.
+  A started settlement completes; a cancelled batch reports its completed,
+  refused and unattempted counts without releasing another id.
 - **Cut on 10-19, after three Sol rounds:** sending such a reply through the who's current door by handing it to their conversation's queue. Still open when cut: the hand-off's acceptance lost its pointer to the queued message; a queued message promoted to a send got a new operation id, so its own experience never settled; a wait saved on the delivery released at hand-off; and a queued send with no return route wrote over the thread's route, so the answer to it could become another owed reply. Ordinary queued sends now keep their id through promotion under the send law above. The broader completion hand-off remains cut; carrying its own local completion on the exchange while preserving the thread's route remains unimplemented.
 
 ## Storage
@@ -236,9 +392,18 @@ On a fresh install they was told a reply to Claude Code was owed and could do no
 One SQLite database per root (`experiences/experiences.sqlite`), on the GRDB the app already uses for memory, context, cognition, the knowledge graph and activity. It holds the record's two grains:
 
 - **Experiences**: an `experience` row per birth and an `event` row per append, each birth or append one transaction. Reads by id, open/recent collections and `born(kinds:after:)` join births with ordered events in one snapshot and fold through the same transition law. Experiences have no retention horizon; how long they keeps their life is theirs to decide once they can see it.
-- **Details**: what the body noticed while a happening ran (a turn's steps, model calls and tool dispatch, standalone receipts), one `detail` row each in one ordered sequence (`Experiences/Detail.swift`). A detail names the experience it is about (`subject`: a turn's id is its heard experience's id, or empty for none), its `kind`, its time and its row; a `once` key writes it at most once. Details are never folded and never copy substance. The store forgets details older than two weeks itself, after a write, at most every six hours; nothing else trims them. Trace writes are batched, one transaction per flush (`TurnTracePersistLane.appendBatch`), and every commit syncs to disk.
+- **Details**: what the body noticed while a happening ran, one ordered `detail` row each (`Experiences/Detail.swift`). Each names its subject, kind, time and row; `once` prevents duplicate writes. Details never fold or copy substance. The store forgets ordinary details after two weeks, at most every six hours after a write. Attention weigh, ignition and return records remain retained as consumed/outstanding membership. Trace writes batch one transaction per flush and sync to disk.
 
 Domain stores stay where they are, and the experience references them.
+
+Inspector retains its existing grouped display and the last detail sequence
+read. After the initial today/yesterday read, record notifications query only
+new sequences and regroup only touched turns or rows crossing the day boundary.
+Mac cards and phone summaries use that same feed. Corrupt or failed reads keep
+the cursor and last display, with the read issue; an empty read proves no new
+detail, never that a turn ended. Future-dated details stay in the grouped feed
+behind the cursor but are hidden until their recorded time, so clock skew
+neither shows them early nor loses them when later rows arrive.
 
 ## Remaining gaps and open questions
 
@@ -248,5 +413,5 @@ Domain stores stay where they are, and the experience references them.
 - The archived E4/E5 proposals describe broader mind integration and competence
   claims. The implemented owner boundaries above do not establish that full
   design's coverage.
-- Retention: how long experiences stay whole, and what they keeps, is theirs to decide once they can see them. Details have the body's two-week horizon (Storage).
+- Retention: how long experiences stay whole, and what they keeps, is theirs to decide once they can see them. Ordinary details have the body's two-week horizon; attention membership records remain retained (Storage).
 - Peers' experiences: whether another agent's addressed outcome is an experience of theirs, or a reference to theirs.

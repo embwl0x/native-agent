@@ -45,7 +45,7 @@ public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
             if flight.queued.contains(where: { $0.state == .sending }) { return "Sending…" }
             if !flight.inFlight {
                 if flight.queued.contains(where: { $0.state == .queued }) { return "Queued" }
-                if flight.queued.contains(where: { if case .held = $0.state { true } else { false } }) { return "Not sent" }
+                if flight.queued.contains(where: { if case .notSent = $0.state { true } else { false } }) { return "Not sent" }
             }
         }
         if waiting { return "Waiting for reply" }
@@ -97,19 +97,21 @@ public struct AgentContactFlight: Equatable, Sendable {
     public var stop: AgentConversationStop?
 
     public struct Queued: Identifiable, Equatable, Sendable {
-        public enum State: Equatable, Sendable { case queued, sending, held(String) }
+        public enum State: Equatable, Sendable { case queued, sending, held(String), notSent(String) }
         public let id: String
         public let text: String
         public let at: Date
         public let byPerson: Bool
         public let state: State
         public var waitingForMac = false
+        public var isPending: Bool { if case .notSent = state { false } else { true } }
     }
 
     public init?(_ record: AgentConversationRecord, live: AgentConversationLive?) {
         let queued = (record.queued ?? []).map { item in
             Queued(id: item.id, text: item.text, at: item.queuedAt, byPerson: item.byPerson == true,
-                   state: item.held.map { .held($0) } ?? (item.id == record.queueReservation ? .sending : .queued),
+                   state: item.notSentReason.map { .notSent($0) }
+                       ?? item.held.map { .held($0) } ?? (item.id == record.queueReservation ? .sending : .queued),
                    waitingForMac: item.waitingForMac == true)
         }
         let stop = record.stop?.operationID == record.operationID ? record.stop : nil
@@ -266,9 +268,11 @@ public enum AgentContactThreads {
             row.lastActivityAt = [contact.lastActivityAt, last?.at].compactMap { $0 }.max()?.timeIntervalSince1970
             let flight = snapshot.flights[contact.id]
             let delivery = snapshot.status[contact.id]
-            if flight?.inFlight == true || flight?.queued.isEmpty == false
+            if flight?.inFlight == true || flight?.queued.contains(where: \.isPending) == true
                 || snapshot.waiting.contains(contact.id) || !contact.owedExperiences.isEmpty {
                 row.stateLine = "Waiting"
+            } else if flight?.queued.contains(where: { !$0.isPending }) == true {
+                row.stateLine = "Not sent"
             } else if contact.health?.problem != nil {
                 row.stateLine = "Connection needs attention"
             } else {

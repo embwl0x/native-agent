@@ -13,7 +13,7 @@ import TrustCenter
 import Dispatcher
 import MacControl
 import SwarmRuns
-// Blueprint: | `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`, `cappedRecallK`, `recallHitsJSON`, `provenanceMetadata`; bounded recall |
+// Blueprint: | `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`, `cappedRecallK`, `recallHitsJSON`, `telling`; bounded recall |
 
 // MARK: - Memory tools
 
@@ -47,6 +47,7 @@ extension SwiftToolDispatcher {
 
     /// Spend content budget in rank order; once a row does not fit, all later rows remain preview-only.
     static func recallHitsJSON(_ hits: [MemoryRecallHit], dataRoot: URL) -> [JSONValue] {
+        let trust = MemoryDataProvenance.reading(hits.map(\.extras))
         var remainingBudget = recallContentBudgetChars
         var budgetSpent = false
         return hits.map { hit in
@@ -54,7 +55,7 @@ extension SwiftToolDispatcher {
                 "preview": .string(hit.preview),
                 "score": .double(hit.score),
             ]
-            d.merge(MemoryDataProvenance.fields(in: hit.extras, dataRoot: dataRoot)) { _, value in value }
+            d.merge(MemoryDataProvenance.fields(in: hit.extras, trust: trust)) { _, value in value }
             if let id = memoryHitId(hit) {
                 d["id"] = .string(id)
             }
@@ -64,9 +65,7 @@ extension SwiftToolDispatcher {
                 d["temporal_note"] = .string(
                     "Recorded validity dates are not a current-status check; observed_at is when evidence was observed.")
             }
-            if let provenance = memoryProvenanceDisplay(hit.extras) {
-                d["provenance"] = .string(provenance)
-            }
+            d["provenance"] = .string(MemoryDataProvenance.lead(hit.extras, trust: trust))
             if case .object(let extras)? = hit.extras {
                 for key in ["sense_versions", "sense_warning", "origin"] {
                     if let value = extras[key] { d[key] = value }
@@ -144,31 +143,54 @@ extension SwiftToolDispatcher {
         return temporal
     }
 
-    /// Unknown provenance is absent; an invalid display name is dropped without rejecting the memory. Bounded display names prevent delimiters or control
-    /// characters from forging provenance claims.
-    static func provenanceMetadata(_ input: [String: JSONValue]) -> [String: JSONValue] {
-        func text(_ key: String) -> String? {
-            guard case .string(let raw)? = input[key] else { return nil }
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+    /// One telling as the agent states it: how (one of the stated ways), by (a name of at most 40 letters, digits, spaces and . - ') and since (an
+    /// ISO-8601 date-time, not after now). Nothing stated is nil; a time with no how is kept from then, since nothing says how. Names enter
+    /// model-facing lines, so a name that could forge a delimiter is refused, never trimmed into another.
+    static func telling(how rawHow: JSONValue?, by rawBy: JSONValue?, since rawSince: JSONValue?,
+                        names: (how: String, by: String, since: String)) throws -> MemoryRoot.Telling? {
+        func text(_ value: JSONValue?, _ name: String) throws -> String? {
+            switch value {
+            case nil, .null?: return nil
+            case .string(let raw)?:
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            default: throw ToolFailureError("\(name) must be text.", argumentPath: name, effects: .none, status: .refused, recovery: .correctArguments)
+            }
         }
-        guard let raw = text("provenance")?.lowercased(),
-              let kind = ContextMemoryProvenance.Kind(rawValue: raw) else { return [:] }
-        var out: [String: JSONValue] = ["provenance": .string(kind.rawValue)]
-        if let by = (text("provenance_by") ?? text("source")).flatMap(ContextMemoryLead.validDisplayName) {
-            out["provenance_by"] = .string(by)
+        let ways = MemoryRoot.How.stated.map(\.rawValue).joined(separator: ", ")
+        let by = try text(rawBy, names.by)
+        let since = try text(rawSince, names.since)
+        let stated = try text(rawHow, names.how)
+        if stated == nil, by != nil {
+            throw ToolFailureError("\(names.by) goes with \(names.how).", argumentPath: names.how, accepted: ways, effects: .none,
+                code: "memory_provenance_required", status: .refused, instruction: "Name how you know it in \(names.how), with \(names.by).",
+                recovery: .correctArguments)
         }
-        return out
-    }
-
-    /// Recall and context share one provenance vocabulary; unstamped rows remain absent.
-    static func memoryProvenanceDisplay(_ extras: JSONValue?) -> String? {
-        guard case .object(let object)? = extras,
-              case .string(let raw)? = object["provenance"],
-              let kind = ContextMemoryProvenance.Kind(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else { return nil }
-        // Revalidate stored names so recall cannot carry a forged provenance claim.
-        let by = object["provenance_by"]?.stringValue.flatMap(ContextMemoryLead.validDisplayName)
-        return ContextMemoryProvenance(kind: kind, by: by).text
+        guard stated != nil || since != nil else { return nil }
+        // No how stated is the stem's kept, never a guess at how.
+        var how = MemoryRoot.How.kept
+        if let stated {
+            guard let parsed = MemoryRoot.How(rawValue: stated.lowercased()), MemoryRoot.How.stated.contains(parsed) else {
+                throw ToolFailureError("\(names.how) must be one of \(ways).", argumentPath: names.how, accepted: ways, effects: .none,
+                    code: "memory_provenance_invalid", status: .refused, instruction: "Correct \(names.how).", recovery: .correctArguments)
+            }
+            how = parsed
+        }
+        if let by, MemoryRoot.validName(by) == nil {
+            throw ToolFailureError("\(names.by) must be a name of at most \(MemoryRoot.nameLimit) letters, digits, spaces and . - '.",
+                argumentPath: names.by, accepted: "a short name, e.g. my backup", effects: .none, code: "memory_provenance_by_invalid",
+                status: .refused, instruction: "Correct \(names.by).", recovery: .correctArguments)
+        }
+        var date: Date?
+        if let since {
+            guard let parsed = MemoryRecallScoring.parseTimestamp(since), parsed <= Date() else {
+                throw ToolFailureError("\(names.since) must be an ISO-8601 date-time such as 2026-10-20T00:16:38Z, not after now.",
+                    argumentPath: names.since, accepted: "an ISO-8601 date-time, not after now", effects: .none, code: "memory_since_invalid",
+                    status: .refused, instruction: "Correct \(names.since), or omit it for what you learn now.", recovery: .correctArguments)
+            }
+            date = parsed
+        }
+        return MemoryRoot.Telling(how: how, by: by, since: date)
     }
 
 
@@ -221,7 +243,7 @@ extension SwiftToolDispatcher {
                 surface: surface,
                 requiresRelevance: true,
                 offset: offset
-            ))
+            ), turn: turn)
             hits = response.hits
             disclosureFilteredCount = response.disclosureFilteredCount
             TurnTraceBus.fireFromContext(kind: "memory.recall", surface: surface,
@@ -334,10 +356,10 @@ extension SwiftToolDispatcher {
                 keep subsequent pages bound to this version.
                 """)
         }
-        if let provenance = Self.memoryProvenanceDisplay(record.extras) {
-            result["provenance"] = .string(provenance)
-        }
-        result.merge(MemoryDataProvenance.fields(in: record.extras, dataRoot: dataRoot)) { _, value in value }
+        let trust = MemoryDataProvenance.reading([record.extras])
+        result["provenance"] = .string(MemoryDataProvenance.lead(record.extras, trust: trust))
+        result["roots"] = MemoryDataProvenance.rootsJSON(record.extras, trust: trust)
+        result.merge(MemoryDataProvenance.fields(in: record.extras, trust: trust)) { _, value in value }
         if let origin = MemoryMoments.recallOrigin(source: record.sourceRunId, metadata: record.extras, dataRoot: dataRoot) {
             result["origin"] = origin
         }
@@ -465,6 +487,13 @@ extension SwiftToolDispatcher {
         }
         let confidence = numeric("confidence", omitted: 0.8)
         let importance = numeric("importance", omitted: 0.5)
+        // How the agent knows it is this telling's root; its since is when the agent first knew it, and the write itself stays evidence.
+        var telling: MemoryRoot.Telling?
+        do {
+            telling = try Self.telling(how: input["provenance"], by: input["provenance_by"], since: input["since"],
+                                       names: ("provenance", "provenance_by", "since"))
+        } catch { problems.append(error.localizedDescription) }
+        let since = telling?.since
 
         guard problems.isEmpty else {
             throw AutonomyGateError.toolDenied(
@@ -484,16 +513,12 @@ extension SwiftToolDispatcher {
         if !tags.isEmpty {
             meta["tags"] = .array(tags.map { .string($0) })
         }
-        // Flat provenance serves recall and context; absence stays absent.
-        for (key, value) in Self.provenanceMetadata(input) {
-            meta[key] = value
-        }
         // Keep the saving turn’s exchange identity so the miss ledger can link corrections.
         meta.merge(MemoryDataProvenance.turnMetadata(turnId: turn.id, origin: turn.afterTurnOrigin)) { current, _ in current }
-        // The agent's own save: the turn that saved it is its source, and its time.
+        // The agent's own save: the turn that saved it is its source; its time is when the agent first knew it.
         let origin = turn.afterTurnOrigin
         meta.merge(MemoryDataProvenance.sourceMetadata(sessionId: origin?.sessionId, messageId: origin?.messageId,
-            turnId: turn.id, at: origin?.occurredAt ?? Date(), speaker: "self", words: nil)) { current, _ in current }
+            turnId: turn.id, at: since ?? origin?.occurredAt ?? Date(), speaker: "self", words: nil)) { current, _ in current }
         if let validatedTopics {
             meta["context_topics"] = .array(validatedTopics)
         }
@@ -514,7 +539,9 @@ extension SwiftToolDispatcher {
                 supersedes: supersedes,
                 corrects: corrects,
                 correctionReason: correctionReason,
-                context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads)
+                // Nothing stated is kept: nothing says how the agent knows it.
+                context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads,
+                               telling: telling ?? MemoryRoot.Telling(how: .kept))
             )
         } catch {
             // Keep the owner's refusal, cancellation or failure and its recovery.
@@ -549,7 +576,7 @@ extension SwiftToolDispatcher {
                 ])
             } else {
                 do {
-                    let pending = MemoryStorage.owedSupersessions(record.extras).contains { $0.targetId == corrects }
+                    let pending = try MemoryStorage.owedSupersessions(record.extras).contains { $0.targetId == corrects }
                     let target = try await memoryV2.authorityRecord(id: corrects)
                     let marked = target.map { Self.memoryMetadataValue($0.extras, key: "corrected_by") == .string(record.id) } ?? false
                     if marked {
@@ -581,13 +608,27 @@ extension SwiftToolDispatcher {
             }
         }
 
+        let trust = MemoryDataProvenance.reading([record.extras])
+        let firstKnown = MemoryDataProvenance.firstKnown(record.extras, trust: trust)
         var payload: [String: JSONValue] = [
             "status": .string("ok"),
             "id": .string(record.id),
             "layer": .string(record.layer ?? "semantic"),
             // Report the stored kind independently of its storage layer.
             "kind": .string(record.memoryKind ?? kind ?? MemoryKindStamp.defaultKind),
+            // What was kept, as the store holds it: when it was first known, how it is known, and any steer its words carry.
+            "since": firstKnown.map(JSONValue.string) ?? .null,
+            "provenance": .string(MemoryDataProvenance.lead(record.extras, trust: trust)),
+            "roots": MemoryDataProvenance.rootsJSON(record.extras, trust: trust),
         ]
+        payload.merge(MemoryDataProvenance.fields(in: record.extras, trust: trust)) { current, _ in current }
+        let first = firstKnown.flatMap(MemoryRecallScoring.parseTimestamp)
+        if let since, first.map({ abs($0.timeIntervalSince(since)) >= 1 }) != false {
+            payload["since_note"] = .string("""
+                These words were already kept, so they keep that memory's first time (\(firstKnown ?? "unreadable")); a time moves back only \
+                for words no untrusted agent steered.
+                """)
+        }
         if case .object = correctionField { payload["correction"] = correctionField }
         if !supersedes.isEmpty {
             payload[admitted ? "superseded" : "supersedes_once_admitted"] = .array(supersedes.map(JSONValue.string))
@@ -612,13 +653,14 @@ extension SwiftToolDispatcher {
                     return left == right ? $0.id < $1.id : left > right
                 }
                 var remaining = Self.recallContentBudgetChars
+                let agreementTrust = MemoryDataProvenance.reading(Array(existing.prefix(8)).map(\.extras))
                 payload["existing_agreements"] = .array(existing.prefix(8).map { row in
                     var fields: [String: JSONValue] = ["id": .string(row.id), "recorded_at": .string(row.createdAt)]
-                    if let provenance = Self.memoryProvenanceDisplay(row.extras) { fields["provenance"] = .string(provenance) }
+                    fields["provenance"] = .string(MemoryDataProvenance.lead(row.extras, trust: agreementTrust))
                     if let origin = MemoryMoments.recallOrigin(source: row.sourceRunId, metadata: row.extras, dataRoot: dataRoot) { fields["origin"] = origin }
                     if row.text.count <= remaining {
                         fields["text"] = .string(row.text)
-                        fields.merge(MemoryDataProvenance.fields(in: row.extras)) { _, value in value }
+                        fields.merge(MemoryDataProvenance.fields(in: row.extras, trust: agreementTrust)) { _, value in value }
                         remaining -= row.text.count
                     } else {
                         fields["content_omitted"] = .bool(true)

@@ -7,49 +7,6 @@ import UIKit
 // Blueprint: | `MacBridgeClient.swift` | Signed iCloud chat transport, pairing and connection observation |
 
 @MainActor
-enum MacBridgeReconnectPolicy {
-    static func delayNanoseconds(afterAttempt attempt: Int) -> UInt64 {
-        attempt < 60 ? 500_000_000 : 5_000_000_000
-    }
-}
-
-/// Refresh only while an age can change the connection or its displayed recency.
-enum MacConnectionRefreshPolicy {
-    static let activeInterval: TimeInterval = 5
-    /// Foreground presence rereads are at most once a minute.
-    static let presenceRefreshInterval: TimeInterval = 60
-
-    /// Stop ticking when no age-dependent facts remain; availability events and Mac confirmations rearm the clock.
-    static func refreshInterval(
-        now: Date,
-        lastSeenAt: Date?,
-        connectingStartedAt: Date?,
-        bridgeUnavailableSince: Date?,
-        isPaired: Bool,
-        recentLastSeenInterval: TimeInterval,
-        initialConnectingInterval: TimeInterval,
-        macUnreachableThreshold: TimeInterval
-    ) -> TimeInterval? {
-        if let connectingStartedAt,
-           now.timeIntervalSince(connectingStartedAt) <= initialConnectingInterval {
-            return activeInterval
-        }
-        // Paired unavailability still needs a clock until transport diagnosis becomes due.
-        if isPaired, let bridgeUnavailableSince,
-           now.timeIntervalSince(bridgeUnavailableSince) < macUnreachableThreshold {
-            return activeInterval
-        }
-        if let lastSeenAt {
-            let age = now.timeIntervalSince(lastSeenAt)
-            if age <= recentLastSeenInterval { return max(activeInterval, recentLastSeenInterval - age) }
-            return age < 3600 ? presenceRefreshInterval : 3600
-        }
-        // Without presence or connecting state, stop ticking after the unreachable threshold until an input changes.
-        return nil
-    }
-}
-
-@MainActor
 final class MacBridgeClient: ObservableObject {
     private let bridge: iCloudBridge
     @Published private(set) var connection = NAPhoneConnection(
@@ -57,18 +14,15 @@ final class MacBridgeClient: ObservableObject {
         transport: .init(.waiting, "Not connected yet; pairing starts it"),
         exchange: .init(.waiting, "Not heard from your Mac yet")
     )
-    @Published var lastSeenAt: Date? {
-        didSet { refreshConnection() }
-    }
+    var lastSeenAt: Date? { bridge.lastMacConfirmationAt }
+    private var presenceExpiryTask: Task<Void, Never>?
 
-    private var reconnectTask: Task<Void, Never>?
-    private var reconnectGeneration = 0
+    private var connectionGeneration = 0
     private var bridgeAvailabilityCancellable: AnyCancellable?
     private var macKeyCancellable: AnyCancellable?
     private var pairingCancellable: AnyCancellable?
     @Published private(set) var macPairingKey: iCloudBridge.MacPairingKeyReading?
     private var networkPathCancellable: AnyCancellable?
-    private var statusRefreshTask: Task<Void, Never>?
     private let pathObserver: NetworkPathObserver = .shared
     /// Replay a missed network-restoration event when the queue callback attaches.
     var onNetworkPathRestored: (() -> Void)? {
@@ -79,15 +33,12 @@ final class MacBridgeClient: ObservableObject {
         }
     }
     private var missedPathRestore = false
-    private var presenceRereadAt: Date?
     /// Nil means NWPathMonitor has not reported, so it cannot establish an outage; republish changes for client-observing views.
     @Published private(set) var deviceIsOffline: Bool?
     var offlineBannerMessage: String? {
         NetworkPathObserver.offlineBannerMessage(isOffline: deviceIsOffline)
     }
-    var connectingStartedAt: Date?
-    private var bridgeUnavailableSince: Date?
-    /// Wait 30 seconds of bridge unavailability before classifying a paired Mac as unreachable.
+    var isConnecting = false
     weak var pairingStore: PairingStore? {
         didSet {
             pairingCancellable = pairingStore?.objectWillChange.sink { [weak self] _ in
@@ -97,19 +48,13 @@ final class MacBridgeClient: ObservableObject {
         }
     }
 
-    /// Use NAMacPresence's window for the Mac's two-minute idle heartbeat.
-    private static let recentLastSeenInterval = NAMacPresence.phoneWindow
-    private static let initialConnectingInterval: TimeInterval = 30
-    private static let macUnreachableThreshold: TimeInterval = 30
-
     init(bridge: iCloudBridge = .shared) {
         self.bridge = bridge
         bridgeAvailabilityCancellable = bridge.$available.combineLatest(bridge.$accountFailure, bridge.$lastMacConfirmationAt)
             .sink { [weak self] _, _, _ in
                 Task { @MainActor in
-                    if let timestamp = self?.bridge.lastMacConfirmationAt {
-                        self?.recordMacConfirmation(at: timestamp)
-                    }
+                    self?.objectWillChange.send()
+                    if self?.bridge.lastMacConfirmationAt != nil { self?.isConnecting = false }
                     self?.refreshConnection()
                 }
             }
@@ -129,6 +74,9 @@ final class MacBridgeClient: ObservableObject {
                     self.refreshConnection()
                     // Cold launch must resume retained sends even when the network was already online.
                     if wasOffline != false, offline == false {
+                        self.bridge.setup()
+                        self.bridge.startForegroundReceiving()
+                        Task { await self.bridge.catchUpCloudKit() }
                         if let handler = self.onNetworkPathRestored { handler() }
                         else { self.missedPathRestore = true }
                     }
@@ -146,10 +94,17 @@ final class MacBridgeClient: ObservableObject {
         if pairingStore.isRepairingConnection {
             return .init(.waiting, "Repairing the connection\u{2026}")
         }
-        if let reading = macPairingKey, reading.phoneKey == pairingStore.iCloudPairingSecret,
-           reading.recordKey != reading.phoneKey {
+        guard let reading = macPairingKey, reading.phoneKey == pairingStore.iCloudPairingSecret else {
+            return .init(.waiting, "Waiting to read your Mac's pairing key", owner: .network,
+                         lever: "Refresh the connection to read your Mac's current key.")
+        }
+        if let recordKey = reading.recordKey, recordKey != reading.phoneKey {
             return .init(.broken, "My key isn\u{2019}t your Mac\u{2019}s anymore", owner: .personOnPhone,
                          lever: "Your Mac holds a newer pairing key, or another Mac took the pairing. Tap Pair with Mac to take your Mac\u{2019}s current key.")
+        }
+        if let failure = reading.failure {
+            return .init(.waiting, failure, owner: .network,
+                         lever: "Refresh the connection when iCloud is available to read your Mac's current key.")
         }
         guard pairingStore.isICloudPaired else {
             return .init(.waiting, "Waiting for you to pair on your Mac", owner: .personOnMac,
@@ -159,28 +114,27 @@ final class MacBridgeClient: ObservableObject {
     }
 
     /// Derive connection facts only from this phone's pairing, transport and Mac evidence.
-    private func assessedConnection(now: Date) -> NAPhoneConnection {
+    private func assessedConnection() -> NAPhoneConnection {
         var transport = NAPhoneConnection.Fact(.holds, "iCloud is carrying our messages")
         var exchange = NAPhoneConnection.Fact(.waiting, "Not heard from your Mac yet")
-        let connecting = connectingStartedAt.map { now.timeIntervalSince($0) <= Self.initialConnectingInterval } ?? false
         if deviceIsOffline == true {
             transport = .init(.broken, "You\u{2019}re offline. I\u{2019}ll send when you\u{2019}re back", owner: .network,
                          lever: "Reconnect this iPhone to Wi-Fi or cellular data.")
         } else if bridge.accountFailure != nil {
             transport = .init(.broken, DeviceSyncAccountFailure.phoneMessage, owner: .iCloudAccount,
                          lever: "Open Settings \u{203A} Apple Account on this iPhone and finish signing in to iCloud.")
-        } else if bridge.available, let lastSeenAt, now.timeIntervalSince(lastSeenAt) <= Self.recentLastSeenInterval {
+        } else if bridge.available, let lastSeenAt,
+                  case .current = StatusConnectionPresentation.syncState(lastSyncedAt: lastSeenAt, staleAfter: NAMacPresence.phoneWindow) {
             exchange = .init(.holds, "Heard from your Mac \(lastSeenAt.formatted(date: .omitted, time: .shortened))")
-        } else if connecting {
+        } else if isConnecting {
             transport = .init(.waiting, "Finding your Mac\u{2026}")
-        } else if bridge.available || (pairingStore?.isPaired == true
-                    && bridgeUnavailableSince.map { now.timeIntervalSince($0) >= Self.macUnreachableThreshold } == true) {
+        } else if bridge.available || pairingStore?.isPaired == true {
             let heard = lastSeenAt.map { " Last heard \($0.formatted(date: .abbreviated, time: .shortened))." } ?? ""
-            exchange = .init(.waiting, AliveConnection.unreachable, owner: .personOnMac,
+            exchange = .init(.waiting, "Waiting to hear from your Mac", owner: .personOnMac,
                          lever: "Open NativeAgent on your Mac and keep it awake." + heard)
             if !bridge.available {
                 transport = .init(.waiting, "iCloud isn\u{2019}t connecting", owner: .network,
-                                 lever: "Check this iPhone\u{2019}s connection; I keep trying.")
+                                 lever: "Check this iPhone\u{2019}s connection, then refresh.")
             }
         } else if pairingStore?.isICloudSigned == true {
             transport = .init(.broken, AliveConnection.noICloud, owner: .iCloudAccount,
@@ -192,34 +146,14 @@ final class MacBridgeClient: ObservableObject {
     }
 
     func configureICloud() {
-        connectingStartedAt = Date()
+        isConnecting = true
         bridge.setup()
         refreshConnection()
-        reconnectGeneration += 1
-        let generation = reconnectGeneration
-        reconnectTask?.cancel()
-        reconnectTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            var attempts = 0
-            while !Task.isCancelled, generation == self.reconnectGeneration {
-                self.bridge.setup()
-                self.refreshConnection()
-                if self.bridge.available { break }
-                attempts += 1
-                try? await Task.sleep(
-                    nanoseconds: MacBridgeReconnectPolicy.delayNanoseconds(afterAttempt: attempts)
-                )
-            }
-            guard generation == self.reconnectGeneration else { return }
-            self.reconnectTask = nil
-        }
     }
 
     func disconnect() {
-        reconnectGeneration += 1
-        reconnectTask?.cancel()
-        reconnectTask = nil
-        connectingStartedAt = nil
+        connectionGeneration += 1
+        isConnecting = false
         bridge.tearDown()
         refreshConnection()
     }
@@ -236,18 +170,13 @@ final class MacBridgeClient: ObservableObject {
         defer { pairingStore.isRepairingConnection = false }
         let mailboxes = sync.connectionRepairMailboxes()
         try await iCloudSyncEngine.reconcileActionsForConnectionRepair(
-            transactions: mailboxes.transactions, responses: mailboxes.responses, inbox: mailboxes.inbox
+            transactions: mailboxes.transactions, responses: mailboxes.responses
         )
         try bridge.requireIdleSendForConnectionRepair()
         try sync.requireIdleActionForConnectionRepair()
         try pairingStore.clearPairingForConnectionRepair()
-        reconnectGeneration += 1
-        reconnectTask?.cancel()
-        reconnectTask = nil
-        statusRefreshTask?.cancel()
-        connectingStartedAt = nil
-        bridgeUnavailableSince = nil
-        lastSeenAt = nil
+        connectionGeneration += 1
+        isConnecting = false
         bridge.clearMacConfirmationForConnectionRepair()
         bridge.tearDown(preservingConsumers: true)
         sync.clearConnectionDeliveryHistory()
@@ -336,9 +265,9 @@ final class MacBridgeClient: ObservableObject {
     @discardableResult
     func observeICloudReplies(onMessage: @escaping (BridgeMessage) -> Void) -> UUID? {
         return bridge.observeIncomingMessages { [weak self] msg in
-            let generation = self?.reconnectGeneration
+            let generation = self?.connectionGeneration
             Task { @MainActor in
-                guard self?.reconnectGeneration == generation else { return }
+                guard self?.connectionGeneration == generation else { return }
                 self?.recordMacConfirmation(at: msg.timestamp)
             }
             onMessage(msg)
@@ -377,55 +306,28 @@ final class MacBridgeClient: ObservableObject {
     }
 
     /// Only Mac activity or confirmed Mac actions refresh status; an accepted phone upload proves iCloud receipt only.
-    func recordMacConfirmation(at timestamp: Date = Date()) {
-        guard timestamp > (lastSeenAt ?? .distantPast) else { return }
-        connectingStartedAt = nil
-        lastSeenAt = timestamp
+    func recordMacConfirmation(at timestamp: Date) {
+        bridge.recordMacConfirmation(at: timestamp)
+        isConnecting = false
+        refreshConnection()
     }
 
-    func refreshConnection(now: Date = Date()) {
-        if bridge.available {
-            bridgeUnavailableSince = nil
-        } else if bridgeUnavailableSince == nil {
-            bridgeUnavailableSince = now
-        }
-        var next = assessedConnection(now: now)
-        // Require foreground presence read before an old sighting loses contact.
-        if next.transport.state == .holds, next.exchange.state == .waiting, lastSeenAt != nil,
-           UIApplication.shared.applicationState == .active,
-           now.timeIntervalSince(presenceRereadAt ?? .distantPast) >= MacConnectionRefreshPolicy.presenceRefreshInterval {
-            presenceRereadAt = now
-            Task { @MainActor [weak self] in
-                await self?.bridge.readMacPresence()
-                self?.refreshConnection()
-            }
-            if connection.exchange.state == .holds { next.exchange = connection.exchange }
-        }
-        if connection != next {
-            connection = next
-        }
-        rescheduleStatusRefresh(now: now)
-    }
-
-    private func rescheduleStatusRefresh(now: Date) {
-        statusRefreshTask?.cancel()
-        guard let interval = MacConnectionRefreshPolicy.refreshInterval(
-            now: now,
-            lastSeenAt: lastSeenAt,
-            connectingStartedAt: connectingStartedAt,
-            bridgeUnavailableSince: bridgeUnavailableSince,
-            isPaired: pairingStore?.isPaired == true,
-            recentLastSeenInterval: Self.recentLastSeenInterval,
-            initialConnectingInterval: Self.initialConnectingInterval,
-            macUnreachableThreshold: Self.macUnreachableThreshold
-        ) else {
-            statusRefreshTask = nil
-            return
-        }
-        statusRefreshTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-            guard !Task.isCancelled, let self else { return }
-            self.refreshConnection()
+    func refreshConnection() {
+        presenceExpiryTask?.cancel()
+        presenceExpiryTask = nil
+        let next = assessedConnection()
+        if connection != next { connection = next }
+        guard let lastSeenAt else { return }
+        let now = Date()
+        let date = lastSeenAt.timeIntervalSince(now) > 60
+            ? lastSeenAt.addingTimeInterval(-60) : lastSeenAt.addingTimeInterval(NAMacPresence.phoneWindow)
+        let delay = date.timeIntervalSince(now)
+        guard delay > 0 else { return }
+        // Contact expiry changes only the displayed evidence; it never settles a message or declares the Mac stopped.
+        presenceExpiryTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) }
+            catch { return }
+            self?.refreshConnection()
         }
     }
 

@@ -9,7 +9,7 @@ import Transcripts
 import TurnTrace
 import NativeAgentShared
 import BackgroundLoops
-// Blueprint: | `SlackSocketModeLoop+Answers.swift` | `SlackSocketModeLoop`: durable replies, live publication, reconciliation and settings settlement |
+// Blueprint: | `SlackSocketModeLoop+Answers.swift` | `SlackSocketModeLoop`: durable replies, live publication and reconciliation |
 
 /// One notice per kind per turn. Repeated progress notices share a claim; an unconfirmed post must not be repeated.
 private actor SlackTurnNoticeMemory {
@@ -20,18 +20,6 @@ private actor SlackTurnNoticeMemory {
 }
 
 extension SlackSocketModeLoop {
-    /// A settings change must not stop the handler delivering its own receipt.
-    @discardableResult
-    public static func afterCurrentHandling(_ operation: @escaping @Sendable () async -> Void,
-        deferAfterHandling: SlackAfterHandling?) async -> Bool {
-        if let deferAfterHandling {
-            await deferAfterHandling(operation)
-            return true
-        }
-        await operation()
-        return false
-    }
-
     /// The journal owns accepted turns independently of socket lifetime and utility priority; closing or recycling a socket changes only reply delivery.
     func spawnInboundHandling(_ inbound: SlackInboundMessage) async {
         await deliveryJournal.startHandler(eventId: inbound.eventId) {
@@ -86,13 +74,15 @@ extension SlackSocketModeLoop {
             throw SlackSocketModeError.api("Recovery paused: current Slack workspace or admission policy no longer matches the accepted message")
         }
         if let phase = record.settledAssistantRuns?[response.runId] {
-            guard ["delivered", "sent_unconfirmed", "failed_before_answer"].contains(phase) else { throw SlackInboundJournalError.malformed }
-            let verdict = phase == "delivered" ? "completed" : phase
+            guard ["delivered", "completed_without_post", "sent_unconfirmed", "failed_before_answer"].contains(phase) else {
+                throw SlackInboundJournalError.malformed
+            }
+            let verdict = ["delivered", "completed_without_post"].contains(phase) ? "completed" : phase
             try await SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: dataRoot, sessionId: session,
                                                                                runId: response.runId, verdict: verdict)
             return verdict
         }
-        if record.assistantRunId == response.runId, record.phase.isTerminal {
+        if record.assistantRunId == response.runId, record.phase.isTerminal, record.phase != .interrupted {
             let verdict = Self.replyVerdict(record)
             guard verdict != "owed" else { return verdict }
             try await settleCheckpoint(record, verdict: verdict)
@@ -103,13 +93,14 @@ extension SlackSocketModeLoop {
             try await deliveryJournal.prepareSuccessor(eventId: record.inbound.eventId,
                 response: Self.preparedReply(text: response.output, attachments: response.attachments ?? []), runId: response.runId, sessionId: session)
         }
-        if record.assistantRunId == response.runId, record.phase == .generating || record.phase == .claimed {
+        if record.assistantRunId == response.runId,
+           record.phase == .generating || record.phase == .claimed || record.phase == .interrupted {
             _ = try await deliveryJournal.prepare(
                 eventId: record.inbound.eventId,
                 reply: Self.preparedReply(text: response.output, attachments: response.attachments ?? [])
             )
         }
-        guard await processDurableInbound(inbound) else { return "owed" }
+        guard await handleClaimedInbound(inbound) else { return "owed" }
         guard let settled = try await deliveryJournal.record(eventId: record.inbound.eventId),
               settled.assistantRunId == response.runId else {
             throw SlackInboundJournalError.missingClaim(response.runId)
@@ -119,7 +110,7 @@ extension SlackSocketModeLoop {
 
     private static func replyVerdict(_ record: SlackInboundDeliveryRecord) -> String {
         switch record.phase {
-        case .delivered: "completed"
+        case .delivered, .completedWithoutPost: "completed"
         case .failedBeforeAnswer: "failed_before_answer"
         case .sentUnconfirmed: "sent_unconfirmed"
         default: "owed"
@@ -170,14 +161,7 @@ extension SlackSocketModeLoop {
         return delivered
     }
 
-    private func handleClaimedInbound(_ inbound: SlackInboundMessage) async -> Bool {
-        let completion = SlackHandlingCompletion()
-        let delivered = await processDurableInbound(inbound, completion: completion)
-        await completion.finish()
-        return delivered
-    }
-
-    private func processDurableInbound(_ received: SlackInboundMessage, completion: SlackHandlingCompletion? = nil) async -> Bool {
+    private func handleClaimedInbound(_ received: SlackInboundMessage) async -> Bool {
         do {
             let claim = try await deliveryJournal.claim(received)
             guard case .claimed(var record) = claim else { return true }
@@ -198,58 +182,60 @@ extension SlackSocketModeLoop {
             if try await deliveryJournal.claimBotEvent(eventId: inbound.eventId) {
                 try await botEventIntake(inbound.channelId, inbound.text, inbound.userId, inbound.eventId)
             }
+            if record.phase == .claimed, record.resolvedRetryInbound == nil,
+               inbound.text.trimmingCharacters(in: .whitespacesAndNewlines) == "/retry" {
+                if let interrupted = try await deliveryJournal.retryInterruptedGeneration(for: inbound) {
+                    record = interrupted
+                } else {
+                    record = try await deliveryJournal.prepare(eventId: inbound.eventId,
+                        reply: .make(text: "There's no interrupted message to retry. Use /retry resend for a saved answer.", uploads: []))
+                }
+            }
             if record.phase == .claimed, inbound.text.trimmingCharacters(in: .whitespacesAndNewlines) == "/retry resend" {
                 if let rejected = try await deliveryJournal.retryRejectedReply(for: inbound) {
                     return await handleDurableInbound(rejected.inbound)
                 }
                 let saved = try await deliveryJournal.savedUnconfirmedReply(for: inbound)
-                if let saved, let reply = saved.prepared, let session = saved.assistantSessionId {
-                    try await deliveryJournal.prepareSuccessor(eventId: saved.inbound.eventId,
-                        response: reply, runId: "resend:" + inbound.eventId, sessionId: session)
+                if let saved, saved.prepared != nil, saved.assistantSessionId != nil {
+                    try await deliveryJournal.resumeUnconfirmedReply(eventId: saved.inbound.eventId)
                     _ = try await deliveryJournal.markDelivered(eventId: inbound.eventId)
                     return await handleDurableInbound(saved.inbound)
                 }
                 record = try await deliveryJournal.prepare(eventId: inbound.eventId,
                     reply: .make(text: "There's no saved answer waiting to be delivered.", uploads: []))
             }
-            if record.phase == .generating {
-                if let session = record.assistantSessionId, let run = record.assistantRunId {
-                    if let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: session, runId: run) {
-                        record = try await deliveryJournal.prepare(
-                            eventId: inbound.eventId,
-                            reply: Self.preparedReply(text: response.output, attachments: response.attachments ?? [])
-                        )
-                    } else {
-                        // The checkpoint owns an unfinished turn; do not run the inbound again.
-                        if try SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run) { return false }
-                        // No checkpoint and no reply: the agent's turn never started it, so nothing it did can repeat; it runs again, under that run.
-                        record = try await deliveryJournal.reclaim(eventId: inbound.eventId)
-                    }
+            if record.phase == .generating || record.phase == .outcomeUnknown && record.prepared == nil {
+                guard let session = record.assistantSessionId, let run = record.assistantRunId else {
+                    throw SlackInboundJournalError.malformed
+                }
+                if let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: session, runId: run) {
+                    record = try await deliveryJournal.prepare(
+                        eventId: inbound.eventId,
+                        reply: Self.preparedReply(text: response.output, attachments: response.attachments ?? [])
+                    )
                 } else {
-                    record = try await deliveryJournal.reclaim(eventId: inbound.eventId)
+                    // A live turn owns its eventual answer; only an orphaned generation is interrupted.
+                    guard !ChatCancelFlag.inFlightTurns(dataRoot: dataRoot).contains(where: {
+                        $0.sessionId == session && $0.runId == run
+                    }) else { return false }
+                    await settle { [record] in
+                        do {
+                            try await settleCheckpoint(record, verdict: "let_go")
+                            let detail = "Generation interrupted without a saved answer. Check any tool effects before explicitly running /retry."
+                            _ = try await deliveryJournal.interruptGeneration(eventId: inbound.eventId, detail: detail)
+                            await recordError(context: "generation_interrupted", error: SlackSocketModeError.api(detail), inbound: inbound)
+                            let notice = noticeSink(for: inbound, preview: replyPreview(for: inbound, sessionId: session))
+                            await notice(.notice(kind: "generation_interrupted", text: detail))
+                        } catch { await recordError(context: "generation_interrupted", error: error, inbound: inbound) }
+                    }
+                    return false
                 }
-            }
-            if record.phase == .outcomeUnknown && record.prepared == nil {
-                if let session = record.assistantSessionId, let run = record.assistantRunId {
-                    if let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: session, runId: run) {
-                        record = try await deliveryJournal.prepare(
-                            eventId: inbound.eventId,
-                            reply: Self.preparedReply(text: response.output, attachments: response.attachments ?? [])
-                        )
-                    } else if try SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run) { return false }
-                }
-            }
-            if record.phase == .outcomeUnknown && record.prepared == nil {
-                // An interrupted turn without a prepared reply keeps no-replay evidence.
-                _ = try await deliveryJournal.settleUnconfirmed(eventId: inbound.eventId, failedBeforeAnswer: true)
-                return true
             }
             if record.phase == .dispatching || record.phase == .outcomeUnknown {
                 return await reconcileDurableReply(record)
             }
             if record.phase == .claimed {
-                let hydration = await hydratingAttachments(inbound)
-                guard !hydration.hasTransientFailure else { return false }
+                let hydration = await hydratingAttachments(record.resolvedRetryInbound ?? inbound)
                 let hydrated = hydration.inbound
                 guard hydration.notice != nil || !hydrated.text.isEmpty || !hydrated.attachments.isEmpty else {
                     await recordError(
@@ -267,10 +253,7 @@ extension SlackSocketModeLoop {
                 let runId = record.assistantRunId ?? UUID().uuidString
                 // Register Stop before any await so cancellation names the admitted run.
                 let turn = Turn(run: runId, session: sessionId)
-                let afterHandling: SlackAfterHandling?
-                if let completion { afterHandling = { operation in await completion.append(operation) } }
-                else { afterHandling = nil }
-                let handler = SlackHandler(turn: turn, deferAfterHandling: afterHandling)
+                let handler = SlackHandler(turn: turn)
                 let stopFlag = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: sessionId, runId: turn.run, turnId: turn.id)
                 defer { ChatCancelFlag.finish(stopFlag) }
                 record = try await deliveryJournal.beginGeneration(eventId: inbound.eventId, runId: runId, sessionId: sessionId)
@@ -297,7 +280,7 @@ extension SlackSocketModeLoop {
                     await recordReceipt(kind: "steered", inbound: inbound, reply: "")
                     return true
                 }
-                let prepared = Self.preparedReply(text: reply.text.trimmingCharacters(in: .whitespacesAndNewlines), attachments: reply.attachments)
+                let prepared = Self.preparedReply(text: reply.text, attachments: reply.attachments)
                 guard !prepared.text.isEmpty || !prepared.uploads.isEmpty else {
                     if try await settleSilentInbound(inbound, sessionId: sessionId, runId: runId) { return true }
                     await recordError(context: "empty_reply", error: SlackSocketModeError.api("chat returned empty reply"), inbound: inbound)
@@ -310,7 +293,6 @@ extension SlackSocketModeLoop {
                 )
             }
             guard let prepared = record.prepared else { throw SlackInboundJournalError.malformed }
-            guard !TurnQuietHoursWindow.holdsResidentWake(session: record.assistantSessionId, dataRoot: dataRoot) else { return false }
             guard record.lastRejection?.preparedFingerprint != prepared.fingerprint else { return false }
             guard !Task.isCancelled else { return false }
             // Missing artifacts must preserve the prepared reply, never rerun its chat/tool effects.
@@ -331,17 +313,19 @@ extension SlackSocketModeLoop {
                 }
                 return (upload, data)
             }
-            if record.confirmedText != true {
+            let parts = prepared.textParts
+            for (index, part) in parts.enumerated().dropFirst(record.confirmedTextCount) {
+                guard !Task.isCancelled else { return false }
                 if record.previewCreationUnknown == true, record.previewMessageTs == nil {
                     return await recordUnknownDelivery(inbound, detail: "Live reply creation is unconfirmed; no second reply was posted")
                 }
                 _ = try await deliveryJournal.beginDispatch(eventId: inbound.eventId)
                 var input: [String: JSONValue] = [
                     "channel": .string(inbound.channelId),
-                    "text": .string(prepared.text),
-                    "metadata": Self.deliveryMetadata(eventId: inbound.eventId, fingerprint: prepared.fingerprint),
+                    "text": .string(part),
+                    "metadata": Self.deliveryMetadata(eventId: inbound.eventId, fingerprint: prepared.partFingerprint(index)),
                 ]
-                if let run = record.assistantRunId, let id = UUID(uuidString: run) { input["client_msg_id"] = .string(id.uuidString) }
+                if index == 0, let run = record.assistantRunId, let id = UUID(uuidString: run) { input["client_msg_id"] = .string(id.uuidString) }
                 if let threadTs = inbound.replyThreadTs { input["thread_ts"] = .string(threadTs) }
                 guard try CodexCompletionReadout.permitsDelivery(sessionId: record.assistantSessionId,
                     runId: record.assistantRunId, configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
@@ -351,12 +335,12 @@ extension SlackSocketModeLoop {
                     posted = try await SlackWebAPI.postMessage(input: input, dataRoot: dataRoot,
                         tokenOverride: config.botToken,
                         // Failure notices must preserve words already delivered.
-                        updatingMessageTs: record.failedBeforeAnswer == true ? nil : record.previewMessageTs)
+                        updatingMessageTs: index == 0 && record.failedBeforeAnswer != true ? record.previewMessageTs : nil)
                 } catch {
                     return await recordUnknownDelivery(inbound, detail: "Reply dispatch outcome is unknown: \(Self.redact(String(describing: error)))")
                 }
                 guard Self.envelopeOK(posted) else {
-                    if Self.isProvenSlackRejection(posted) {
+                    if try SlackWebAPI.isProvenMessageRejection(posted) {
                         let fields = posted.objectValue
                         let reason = fields?["error"]?.stringValue ?? fields?["response"]?.objectValue?["error"]?.stringValue ?? ""
                         _ = try await deliveryJournal.retryPrepared(eventId: inbound.eventId,
@@ -366,6 +350,14 @@ extension SlackSocketModeLoop {
                         return false
                     }
                     return await recordUnknownDelivery(inbound, detail: "Slack returned an ambiguous reply failure")
+                }
+                if try SlackWebAPI.hasTruncationWarning(posted) {
+                    return await settleUnconfirmedReply(record, detail: "Slack truncated reply part \(index + 1); complete delivery is unconfirmed. "
+                        + "Inspect the post before requesting a resend.")
+                }
+                guard let timestamp = posted.objectValue?["response"]?.objectValue?["ts"]?.stringValue,
+                      !timestamp.isEmpty else {
+                    return await recordUnknownDelivery(inbound, detail: "Slack reply acceptance has no message timestamp")
                 }
                 record = try await deliveryJournal.confirmReplyPart(eventId: inbound.eventId, isText: true)
             }
@@ -428,12 +420,10 @@ extension SlackSocketModeLoop {
                   let turn = ChatCancelFlag.inFlightTurns(dataRoot: dataRoot).first(where: {
                       $0.sessionId == sessionId && $0.runId == record.assistantRunId
                   }), !ChatCancelFlag.isRaised(turn.stop),
-                  !TurnQuietHoursWindow.holdsResidentWake(session: sessionId, dataRoot: dataRoot),
                   try CodexCompletionReadout.permitsDelivery(sessionId: sessionId, runId: record.assistantRunId,
                     configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
             else { return }
-            let safe = TurnTraceRedactor.redactText(text).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !safe.isEmpty else { return }
+            guard let safe = SlackWebAPI.messageParts(text).first else { return }
             var input: [String: JSONValue] = ["channel": .string(inbound.channelId), "text": .string(safe)]
             if let thread = inbound.replyThreadTs { input["thread_ts"] = .string(thread) }
             if record.previewMessageTs == nil {
@@ -448,7 +438,7 @@ extension SlackSocketModeLoop {
             let posted = try await SlackWebAPI.postMessage(input: input, dataRoot: dataRoot,
                 tokenOverride: config.botToken, updatingMessageTs: record.previewMessageTs)
             guard Self.envelopeOK(posted) else {
-                if record.previewMessageTs == nil, Self.isProvenSlackRejection(posted) {
+                if record.previewMessageTs == nil, try SlackWebAPI.isProvenMessageRejection(posted) {
                     try await deliveryJournal.recordPreview(eventId: inbound.eventId, messageTs: nil, creationUnknown: false)
                 }
                 throw SlackSocketModeError.api("Live reply publication failed: \(posted)")
@@ -480,7 +470,7 @@ extension SlackSocketModeLoop {
             if let threadTs { input["thread_ts"] = .string(threadTs) }
             do {
                 let posted = try await SlackWebAPI.postMessage(input: input, dataRoot: dataRoot, tokenOverride: botToken)
-                if Self.isProvenSlackRejection(posted) { await memory.release(kind) }
+                if try SlackWebAPI.isProvenMessageRejection(posted) { await memory.release(kind) }
                 if !Self.envelopeOK(posted) {
                     await recordError(context: "turn_notice", error: SlackSocketModeError.api("Notice \(kind): \(posted)"), inbound: inbound)
                 }
@@ -514,6 +504,11 @@ extension SlackSocketModeLoop {
         guard let prepared = record.prepared, let botUserId = config.botUserId, !botUserId.isEmpty else {
             return await settleUnconfirmedReply(record, detail: "Cannot reconcile reply without its prepared artifact and bot identity")
         }
+        let nextPart = record.confirmedTextCount
+        guard let text = prepared.textParts.dropFirst(nextPart).first else {
+            // Text is confirmed already; an uncertain upload has no message metadata that could prove its acceptance.
+            return await settleUnconfirmedReply(record, detail: "Text reply accepted; image completion is unconfirmed")
+        }
         var params: [String: String] = [
             "channel": inbound.channelId,
             "oldest": inbound.ts,
@@ -533,23 +528,15 @@ extension SlackSocketModeLoop {
             guard Self.hasUniqueAcceptedReply(
                 response: response,
                 inbound: inbound,
-                fingerprint: prepared.fingerprint,
+                fingerprint: prepared.partFingerprint(nextPart),
                 botUserId: botUserId
             ) else {
                 return await settleUnconfirmedReply(record, detail: "Slack history does not uniquely prove acceptance")
             }
-            guard prepared.uploads.isEmpty else {
-                return await settleUnconfirmedReply(record, detail: "Text reply accepted; image completion is unconfirmed")
-            }
-            _ = try await deliveryJournal.markDelivered(eventId: inbound.eventId)
-            try await settleCheckpoint(record, verdict: "completed")
-            await recordReceipt(kind: "reply_reconciled", inbound: inbound, reply: prepared.text)
-            await writeState([
-                "lastDeliveryOutcome": .string("delivered"),
-                "lastDeliveryOutcomeEventId": .string(inbound.eventId),
-                "lastDeliveryOutcomeDetail": .string("Accepted reply reconciled from Slack history"),
-            ])
-            return true
+            _ = try await deliveryJournal.confirmReplyPart(eventId: inbound.eventId, isText: true)
+            await recordReceipt(kind: "reply_part_reconciled", inbound: inbound, reply: text)
+            // Continue the saved artifact at the next unconfirmed part, under the same handler claim.
+            return await handleClaimedInbound(inbound)
         } catch {
             return await settleUnconfirmedReply(record, detail: "Slack reply reconciliation unavailable: \(Self.redact(String(describing: error)))")
         }
@@ -597,8 +584,10 @@ extension SlackSocketModeLoop {
                   metadata["event_type"]?.stringValue == "nativeagent_reply",
                   let payload = metadata["event_payload"]?.objectValue,
                   payload["event_id"]?.stringValue == inbound.eventId else { continue }
-            guard payload["fingerprint"]?.stringValue == fingerprint,
-                  message["user"]?.stringValue == botUserId,
+            // Earlier accepted parts share this event; only this part's identity can settle this dispatch.
+            guard payload["fingerprint"]?.stringValue == fingerprint else { continue }
+            // Slack renders URLs and emoji in text; the echoed metadata owns this part's identity.
+            guard message["user"]?.stringValue == botUserId,
                   let ts = message["ts"]?.stringValue, !ts.isEmpty else { return false }
             let thread = message["thread_ts"]?.stringValue
             if let expected = inbound.replyThreadTs {
@@ -609,18 +598,6 @@ extension SlackSocketModeLoop {
             matches += 1
         }
         return matches == 1
-    }
-
-    static func isProvenSlackRejection(_ envelope: JSONValue) -> Bool {
-        guard let value = envelope.objectValue, value["ok"]?.boolValue == false,
-              let error = value["error"]?.stringValue ?? value["response"]?.objectValue?["error"]?.stringValue else { return false }
-        // Slack documents internal_error/fatal_error as potentially partially successful. Only these explicit classes prove non-acceptance.
-        return Set([
-            "invalid_auth", "not_authed", "token_expired", "token_revoked",
-            "missing_scope", "no_permission", "not_in_channel", "channel_not_found",
-            "is_archived", "no_text", "msg_too_long", "invalid_arguments",
-            "invalid_metadata", "metadata_too_large", "ratelimited", "rate_limited",
-        ]).contains(error)
     }
 
     private static func envelopeOK(_ value: JSONValue) -> Bool {

@@ -111,11 +111,18 @@ extension MemoryStorage {
         catch { throw MemoryStorageError.databaseUnavailable("""
             Memory \(memory.id) has unreadable temporal evidence: \(error.localizedDescription). Repair the saved row before recall.
             """) }
+        try requireRoots(memory.metadata, of: "Memory \(memory.id)")
         return memory
     }
 
+    /// Every stored memory and proposal holds readable roots; unreadable provenance requires repair before the store opens.
+    static func requireRoots(_ metadata: JSONValue?, of row: String) throws {
+        do { _ = try MemoryRoot.roots(in: metadata) }
+        catch { throw MemoryStorageError.databaseUnavailable("\(row) has unreadable roots: \(error.localizedDescription). Repair the saved row.") }
+    }
+
     static func decodeProposal(_ row: Row) throws -> StoredProposal {
-        try StoredProposal(
+        let proposal = try StoredProposal(
             id: row.decode(forColumn: "id"),
             content: row.decode(forColumn: "content"),
             personaId: row.decode(forColumn: "persona_id"),
@@ -128,5 +135,7 @@ extension MemoryStorage {
             embeddingEpoch: row.decode(forColumn: "embedding_epoch"),
             metadata: decodeMetadata(row.decode(forColumn: "metadata_json"))
         )
+        try requireRoots(proposal.metadata, of: "Proposal \(proposal.id)")
+        return proposal
     }
 }

@@ -89,7 +89,8 @@ extension AgentConversationStore {
         for row in rows where row.agent.hasPrefix("peer:") {
             for send in row.releasing ?? [] {
                 do {
-                    try await ContactThread.attempt(.state(owner: String(row.agent.dropFirst(5)), sendID: send.id, status: send.status),
+                    try await ContactThread.attempt(.state(owner: String(row.agent.dropFirst(5)), conversation: row.conversationID,
+                        sendID: send.id, status: send.status),
                                                     dataRoot: dataRoot)
                     written.insert(row.id + "/" + send.id)
                     releaseFailures.withLock { $0[send.id] = nil }
@@ -160,8 +161,11 @@ extension AgentConversationStore {
                         addressedTo: [destination], owes: ["deliver": .init(to: "conversation:" + row.id), "accept": .init(to: destination),
                             "answer": .init(to: destination)])
                     if try await store.experience(experience.id) == nil { try await store.begin(experience) }
-                    let words = item.text + (item.held.map { "\n\nHeld: " + $0 } ?? "")
+                    let words = item.text + (item.held.map { "\n\n" + $0 } ?? "")
                     try await store.append([.face(.init(words: TurnSecretRedactor.redactText(words), artifacts: []))], to: item.id)
+                    if item.notSentReason != nil, let current = try await store.experience(item.id) {
+                        try await Self.settleExperience(current, in: store, accepted: false, evidence: evidence, reason: .failed)
+                    }
                 }
                 let exchange = row.exchanges?.last { $0.id == row.operationID }
                 let current = try await store.experience(row.operationID)

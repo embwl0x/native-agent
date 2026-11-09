@@ -18,7 +18,7 @@ typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
 public final class iCloudBridge: ObservableObject {
     static let pushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "push")
     enum DrainTrigger: String {
-        case cloudKitPush, kvsNudge, coalesced, repair, wake, network
+        case cloudKitPush, kvsNudge, coalesced, repair, wake, network, beat, phoneOpen
     }
     unowned let sync: DeviceSync
     @Published public internal(set) var available: Bool = false
@@ -54,8 +54,11 @@ public final class iCloudBridge: ObservableObject {
     @Published public internal(set) var phoneStanding = NAPhoneStanding(connected: nil, waiting: 0, approvers: 0)
     var transportRefusal: NAPhoneConnection.Fact? { didSet { refreshPhoneConnection() } }
     var pairingKeyUnreadable = false { didSet { refreshPhoneConnection() } }
-    var lastPhoneContactAt: Date? { didSet { refreshPhoneConnection() } }
+    var lastPhoneContactAt: Date? { didSet { refreshPhoneConnection(); readWhilePhoneOpen() } }
+    var phoneOpenReadTask: Task<Void, Never>?
+    var deviceReceiveBeatTask: Task<Void, Never>?
     var phoneContactReadFailure: String? { didSet { refreshPhoneConnection() } }
+    let phoneContactRead = LatestRead()
     var lastPhoneRejectedAt: Date? { didSet { refreshPhoneConnection() } }
     var pairedPhonesSubscription: AnyCancellable?
     var phonePairingRecheckDue = false
@@ -89,10 +92,11 @@ public final class iCloudBridge: ObservableObject {
     var deviceDrainGeneration: Int?
     var deviceDrainQueued = false
     var cloudKitPushProofAt: Date?
-    var deviceDrainTriggeredByPush = false
+    let cloudKitPushProofRead = LatestRead()
+    var cloudKitPushEvidenceTask: Task<Void, Never>?
     var cloudKitPushUnavailable = false
     var deviceMetadataDrainTask: Task<Void, Never>?
-    var nextDeviceMetadataDrainAt = Date.distantPast
+    var deviceMetadataDrainQueued = false
     var deviceNetworkChanges: Task<Void, Never>?
     // Retention has its own single-flight slot beside the delivery drain.
     var deviceRetentionSweepTask: Task<Void, Never>?
@@ -116,9 +120,9 @@ public final class iCloudBridge: ObservableObject {
     var incomingObserverGeneration: UInt64 = 0
     var incomingObserverTask: Task<Void, Never>?
     /// Controls remain owned here until their signed publication and receipt land. This also retains the original envelope while ledger storage is unavailable.
-    var pendingControlPublications: [String: BridgeMessage] = [:]
+    var pendingOutcomePublications: [String: BridgeMessage] = [:]
     /// Fair selection among owed outcomes; never evidence about delivery.
-    var controlPublicationCursor = ""
+    var outcomePublicationCursor = ""
     var incomingObserverTaskID = UUID()
     var transportSetupTask: Task<Void, Never>?
     var transportSetupTaskID = UUID()
@@ -132,7 +136,6 @@ public final class iCloudBridge: ObservableObject {
     var isSetUp: Bool = false
     let incomingVerifier = ICloudIncomingVerifier()
     var deliveryNudgeQueue: ICloudDeliveryNudgeQueue?
-    var messageNudgeSender: ICloudConflatedSender?
     init(sync: DeviceSync) {
         self.sync = sync
         let url = ICloudSyncStatePaths.accountFailure(dataRoot: sync.dataRoot)
@@ -201,9 +204,7 @@ public final class iCloudBridge: ObservableObject {
         // A pairing held elsewhere is one receive-health fact, not a new send failure on every refused write.
         if case .pairedElsewhere? = error as? DeviceSyncError { return }
         doctorSendMeasured = true
-        // A transient no is its retry's to answer: unmeasured until the retry meets it too.
-        let retrying = if case .transient? = error as? DeviceSyncError { doctorSendFailures[operation] == nil } else { false }
-        doctorSendFailures[operation] = error.map { retrying ? .unmeasured : Self.transportHealth($0) }
+        doctorSendFailures[operation] = error.map(Self.transportHealth)
         if let error, case .account(let failure) = error as? DeviceSyncError {
             await recordAccountFailure(failure)
         }
@@ -270,6 +271,8 @@ public final class iCloudBridge: ObservableObject {
         }
     }
     public func tearDown() {
+        phoneOpenReadTask?.cancel()
+        deviceReceiveBeatTask?.cancel()
         // Close request admission before settling waiters or draining sends.
         isSetUp = false
         phoneRequests.stop()
@@ -291,7 +294,6 @@ public final class iCloudBridge: ObservableObject {
         deviceNetworkChanges?.cancel()
         deviceNetworkChanges = nil
         deviceMetadataDrainTask?.cancel()
-        nextDeviceMetadataDrainAt = .distantPast
         cloudKitPushProofAt = nil
         cloudKitPushUnavailable = false
         messageHandler = nil
@@ -305,15 +307,11 @@ public final class iCloudBridge: ObservableObject {
         lastPublishedMobileSnapshotStatus = [:]
         // The drain and retention handles keep exclusion until actual exit.
         deviceDrainQueued = false
+        deviceMetadataDrainQueued = false
         deviceRetentionSweepTask?.cancel()
         if let deliveryNudgeQueue {
             Task { await deliveryNudgeQueue.cancelAll() }
             self.deliveryNudgeQueue = nil
-        }
-        if let sender = messageNudgeSender {
-            sender.close()
-            Task { await sender.finish() }
-            messageNudgeSender = nil
         }
         // Clear setup ownership so teardown cannot leave all future setup calls permanently refused.
         isSetUp = false

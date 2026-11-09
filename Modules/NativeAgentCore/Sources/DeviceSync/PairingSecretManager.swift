@@ -113,7 +113,7 @@ public enum PairingSecret {
         let secretB64 = secret.base64EncodedString()
         let secretDigest = SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
         // KVS reads include local unsynchronized writes; only a post-sync checkpoint proves publication.
-        let result = await withCKTimeout("PairingSecret.publishMaterialToKVS") {
+        let result = await Task.detached(priority: .utility) {
             let kvs = NSUbiquitousKeyValueStore.default
             let defaults = UserDefaults.standard
             let existingB64 = kvs.string(forKey: "NativeAgent.pairing.hmacSecret") ?? ""
@@ -136,7 +136,7 @@ public enum PairingSecret {
                 defaults.set(["digest": secretDigest, "version": nextVersion] as [String: Any], forKey: synchronizationCheckpointKey)
             }
             return PairingKVSPublishResult.published(version: nextVersion, synced: synced)
-        }
+        }.value
 
         switch result {
         case .skippedCurrent:
@@ -151,8 +151,6 @@ public enum PairingSecret {
                 nextVersion, synced ? "ok" : "deferred"
             )
             return synced
-        case nil:
-            return false
         }
     }
 

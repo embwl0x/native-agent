@@ -17,10 +17,10 @@ public protocol InboxCardActionEffects: Sendable {
     func inboxItems(dataRoot: URL) async throws -> [InboxItemRecord]
     func cleanUpDiskHygiene(dataRoot: URL) async throws -> String
     func chatClient(dataRoot: URL) -> SwiftNativeChatOrchestrationClient
-    @MainActor func openApprovals() async
-    @MainActor func openDesk() async
-    @MainActor func openChatDraft(_ draft: String) async
-    @MainActor func openSpokenChat(_ sessionID: String) async
+    @MainActor func openApprovals() async throws
+    @MainActor func openDesk() async throws
+    @MainActor func openChatDraft(_ draft: String) async throws
+    @MainActor func openSpokenChat(_ sessionID: String) async throws
 }
 
 public enum InboxCardActions {
@@ -102,10 +102,10 @@ public enum InboxCardActions {
                 }
             case .chatDraft(let draft):
                 if quiet { break }
-                await effects.openChatDraft(draft)
+                try await effects.openChatDraft(draft)
             case .chatSpoken(let message):
                 let spokenSession = try await postSpokenInboxMessage(message: message, item: item, dataRoot: root, turn: turn, effects: effects)
-                if !quiet { await effects.openSpokenChat(spokenSession) }
+                if !quiet { try await effects.openSpokenChat(spokenSession) }
             case .diskCleanup:
                 let message = try await effects.cleanUpDiskHygiene(dataRoot: root)
                 nativeLog("[inbox] inboxAction(act) disk_hygiene: \(message)")
@@ -229,7 +229,6 @@ public enum InboxCardActions {
                     content: trimmed
                 ),
                 sessionId: sessionId,
-                initiative: .userRequested,
                 turn: turn
             )
             switch outcome {
@@ -237,12 +236,6 @@ public enum InboxCardActions {
                 return destination
             case .duplicate(let destination):
                 return destination
-            case .rateLimited(let seconds):
-                throw NSError(domain: "NativeAgentSwiftOnly", code: -423,
-                    userInfo: [NSLocalizedDescriptionKey: """
-                        Inbox delivery is rate limited for \(seconds) seconds. \
-                        The same card and message remain available; retry later.
-                        """])
             }
         } catch let error as ProactiveSpeechError {
             throw error
@@ -252,8 +245,8 @@ public enum InboxCardActions {
     }
 
     private static func openApprovalsFromInboxAction(id: String, dataRoot: URL, effects: any InboxCardActionEffects) async throws {
+        try await effects.openApprovals()
         try await setReading(id: id, action: "read", dataRoot: dataRoot)
-        await effects.openApprovals()
     }
 
     private static func setReading(id: String, action: String, dataRoot: URL) async throws {

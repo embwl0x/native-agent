@@ -3,7 +3,9 @@ import BackgroundWork
 import ApprovalTransactions
 import AppToolRuntime
 import AgentWorkspace
+import AuthoredCapabilities
 import ChatToolRuntime
+import ChatToolParsing
 import AppKit
 import ChatTurnRuntime
 import Foundation
@@ -23,368 +25,137 @@ import ToolRegistry
 import ToolExecution
 import TrustCenter
 import TrustPersistence
-// Blueprint: | `QuietSelfAdminRender.swift` | Quiet pages read engine.pages faces as text before page-specific projections; offscreen rendering |
-
-extension EnvironmentValues {
-    /// Screenshots suppress lifecycle writes while allowing read-only loads.
-    @Entry var quietOffscreenRead: Bool = false
-
-    /// A nil screenshot tab selects the page default without changing the mounted selection.
-    @Entry var quietRailTab: String? = nil
-}
-
-private struct LiveTaskModifier<ID: Equatable>: ViewModifier {
-    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    let id: ID
-    let action: @Sendable () async -> Void
-
-    func body(content: Content) -> some View {
-        content.task(id: id) {
-            guard !quietOffscreenRead else { return }
-            await action()
-        }
-    }
-}
-
-private struct LiveAppearModifier: ViewModifier {
-    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    let action: () -> Void
-
-    func body(content: Content) -> some View {
-        content.onAppear {
-            guard !quietOffscreenRead else { return }
-            action()
-        }
-    }
-}
-
-extension View {
-    /// Suppress lifecycle work and writes for offscreen screenshots.
-    func liveTask(
-        @_inheritActorContext _ action: @escaping @Sendable () async -> Void
-    ) -> some View {
-        modifier(LiveTaskModifier(id: 0, action: action))
-    }
-
-    func liveTask<ID: Equatable>(
-        id: ID,
-        @_inheritActorContext _ action: @escaping @Sendable () async -> Void
-    ) -> some View {
-        modifier(LiveTaskModifier(id: id, action: action))
-    }
-
-    /// Suppress appearance side effects for offscreen screenshots.
-    func liveOnAppear(_ action: @escaping () -> Void) -> some View {
-        modifier(LiveAppearModifier(action: action))
-    }
-
-    /// Count read-only loads so an offscreen capture can await its content.
-    /// Writes, badge clears and permission requests belong on liveTask.
-    /// Use live: false when an initial watcher event already loads the mounted page.
-    func quietReadTask(
-        live: Bool = true,
-        @_inheritActorContext _ action: @escaping @Sendable () async -> Void
-    ) -> some View {
-        modifier(QuietReadTaskModifier(id: 0, live: live, action: action))
-    }
-
-    func quietReadTask<ID: Equatable>(
-        id: ID,
-        live: Bool = true,
-        @_inheritActorContext _ action: @escaping @Sendable () async -> Void
-    ) -> some View {
-        modifier(QuietReadTaskModifier(id: id, live: live, action: action))
-    }
-}
-
-/// Count only offscreen loads; unrelated live refreshes must not hold a quiet read open.
-@MainActor
-enum QuietReadLoads {
-    private(set) static var inFlight = 0
-
-    static func begin() { inFlight += 1 }
-    static func end() { inFlight = max(0, inFlight - 1) }
-}
-
-private struct QuietReadTaskModifier<ID: Equatable>: ViewModifier {
-    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    let id: ID
-    let live: Bool
-    let action: @Sendable () async -> Void
-
-    func body(content: Content) -> some View {
-        content.task(id: id) {
-            guard quietOffscreenRead else {
-                if live { await action() }
-                return
-            }
-            QuietReadLoads.begin()
-            await action()
-            QuietReadLoads.end()
-        }
-    }
-}
+// Blueprint: | `QuietSelfAdminRender.swift` | Body page-owner text reads, card facts, catalog and renderer-bound screenshots |
 
 @MainActor
 enum QuietSelfAdminRender {
-    /// Preserve wide layouts while keeping a PNG within the eight-MiB tool-image ceiling.
-    static let defaultSize = CGSize(width: 1280, height: 860)
-
-    // MARK: - The page, built offscreen
-
-    /// A nil tab draws the page default without changing the mounted tab.
-    @ViewBuilder
-    static func pageView(for page: QuietPage, tab: String? = nil, appModel: AppModel, size: CGSize = defaultSize) -> some View {
-        // Render tab destinations inside their rail frame so screenshots match the visible page.
-        let home = SidebarItem.shellHome(for: page.item)
-        Group {
-            if QuietPages.drawOnly.contains(page) {
-                SimpleShellView()
-                    .environment(\.simpleSettingsMenuDrawnOpen, page.id == "simple_settings_menu")
-            } else if page.id == "inbox" {
-                FacePageView(page: "inbox")
-            } else {
-            switch home?.parent ?? page.item {
-            case .chat: ChatView()
-            case .activity: TodayView()
-            case .memories: FacePageView(page: "memories").modifier(MemoriesFaceNavigation())
-            case .desk: FacePageView(page: "desk").modifier(DeskFaceEditors())
-            case .inboxPolicy: ShellRailPage(title: "Notifications", alive: true) { InboxSettingsView() }
-            case .bots: FacePageView(page: "bots", isReading: appModel.panelRefreshCounts[.bots, default: 0] > 0)
-            case .personality: FacePageView(page: "personality").personalityDestinations()
-            case .providers: FacePageView(page: "providers", isReading: appModel.panelRefreshCounts[.providers, default: 0] > 0)
-            case .trust: FacePageView(page: "trust")
-            case .connectors: ConnectorsRailPage()
-            case .capabilities: CapabilitiesRailPage()
-            case .diagnostics: DiagnosticsRailPage()
-            case .settings: FacePageView(page: "settings")
-            default: EmptyView()
-            }
-            }
-        }
-        .environment(\.quietRailTab, tab ?? page.tab ?? home?.tab)
-        .environment(appModel)
-        // A screenshot is a read, so lifecycle work must not change the state being captured.
-        .environment(\.quietOffscreenRead, true)
-        .frame(width: size.width, height: size.height)
-        // Supply the same room colour as the onscreen ShellSheet.
-        .background(NativeAgentShell.room.ignoresSafeArea())
-    }
-
-    // MARK: - Giving the offscreen copy its content
-
-    /// Bound screenshot waiting; slow reads leave a partial page instead of holding the tool call.
-    static let loadBudget: TimeInterval = 4
-
-    /// Preload read-only page data; Today and Chat live sidebar loaders write shared state.
-    private static func loadPageData(for page: QuietPage, appModel: AppModel) async {
-        guard page.item != .chat, page.item != .activity, page.item.normalized != .memories, page.item != .bots else { return }
-        _ = await appModel.refreshForSidebarItem(page.item)
-    }
-
-    /// Await shared data, mount for view reads, then await those reads before drawing.
-    /// An unmounted host has never displayed and cannot provide populated page content.
-    private static func withPreparedHost<T>(
-        for page: QuietPage, tab: String? = nil, appModel: AppModel, size: CGSize = defaultSize,
-        _ body: (NSHostingView<AnyView>) -> T
-    ) async throws -> T {
-        try Task.checkCancellation()
-        await loadPageData(for: page, appModel: appModel)
-        let renderedTab = tab ?? page.tab ?? SidebarItem.shellHome(for: page.item)?.tab
-        if page.item.normalized == .memories, renderedTab == "knowledge" {
-            // Offscreen graph views suppress live loaders; capture the canonical snapshot before mounting the canvas.
-            _ = try await appModel.engine.trust.load()
-            await appModel.engine.memory.loadGraph()
-            await appModel.engine.memory.refreshDiagnostics()
-        }
-        try Task.checkCancellation()
-
-        let hosting = NSHostingView(rootView: AnyView(
-            pageView(for: page, tab: tab, appModel: appModel, size: size)
-                // A capture is one moment, so nothing is captured mid-animation.
-                .transaction { $0.animation = nil }
-                // Draw controls as active so on and off remain distinguishable in the screenshot.
-                .environment(\.appearsActive, true)
-        ))
-        hosting.frame = CGRect(origin: .zero, size: size)
-
-        // A never-ordered window gives native controls window geometry without taking focus.
-        let host = QuietCaptureWindow(
-            contentRect: CGRect(origin: .zero, size: size),
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: true
-        )
-        host.isReleasedWhenClosed = false
-        host.contentView = hosting
-        defer {
-            host.contentView = nil
-            host.close()
-        }
-
-        hosting.layoutSubtreeIfNeeded()
-        // SwiftUI starts view tasks on the first display pass; display once before waiting.
-        if let warmUp = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) {
-            hosting.cacheDisplay(in: hosting.bounds, to: warmUp)
-        }
-        try await settle(hosting)
-        try Task.checkCancellation()
-        let result = body(hosting)
-        try Task.checkCancellation()
-        return result
-    }
-
-    /// Suspend so main-actor loads can run; require several idle turns because tasks may not have started.
-    private static func settle(_ hosting: NSHostingView<AnyView>) async throws {
-        let deadline = Date().addingTimeInterval(loadBudget)
-        var idleTurns = 0
-        while Date() < deadline {
-            try await Task.sleep(nanoseconds: 20_000_000)
-            hosting.layoutSubtreeIfNeeded()
-            idleTurns = QuietReadLoads.inFlight == 0 ? idleTurns + 1 : 0
-            if idleTurns >= 6 { break }
-        }
-        // Display once after loading so the bitmap includes the resulting state.
-        hosting.layoutSubtreeIfNeeded()
-        hosting.displayIfNeeded()
-    }
-
-    /// Answer as key for control accents without ordering the window in or taking focus.
-    private final class QuietCaptureWindow: NSWindow {
-        override var isKeyWindow: Bool { true }
-        override var isMainWindow: Bool { true }
-    }
-
-    // MARK: - Picture
-
-    /// Offscreen rendering needs no screen grant and cannot capture another app.
-    static func pageImagePNG(
-        for page: QuietPage, tab: String? = nil, appModel: AppModel, size: CGSize = defaultSize
-    ) async throws -> (data: Data, width: Int, height: Int)? {
-        try Task.checkCancellation()
-        guard size.width.isFinite, size.height.isFinite,
-              let width = Int(exactly: size.width.rounded(.down)), width > 0,
-              let height = Int(exactly: size.height.rounded(.down)), height > 0 else { return nil }
-        return try await withPreparedHost(for: page, tab: tab, appModel: appModel, size: size) { hosting in
-            // 1x: a retina page doubles the bytes for detail a model does not read.
-            guard let bitmap = NSBitmapImageRep(
-                bitmapDataPlanes: nil,
-                pixelsWide: width, pixelsHigh: height,
-                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
-            ) else { return nil }
-            bitmap.size = size
-            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
-            guard let data = bitmap.representation(using: .png, properties: [:]) else { return nil }
-            return (data, bitmap.pixelsWide, bitmap.pixelsHigh)
-        }
-    }
-
-}
-
-// MARK: - The page in words, from the page's own data
-
-/// Reuse page records and formatters without creating another SwiftUI tree.
-extension QuietSelfAdminRender {
-    static func pageRead(for page: QuietPage, appModel: AppModel, turn: Turn? = nil) async -> [JSONValue] {
-        await loadPageData(for: page, appModel: appModel)
-        // Load only shared state not already supplied by rail or projection reads.
-        if page.tab == "iphone" {
-            appModel.engine.sync.observeStatus()
-            await appModel.engine.sync.loadSecret(quiet: true)
-        } else if page.item == .telegram {
-            await appModel.refreshTelegram()
-        }
-        var projection = await pageProjection(for: page, appModel: appModel, turn: turn)
+    /// Read through the page's owner.
+    static func pageRead(for page: QuietPage, appModel: AppModel, turn: Turn? = nil, face: BodyFacePresentation? = nil) async -> [JSONValue] {
+        var content = await pageProjection(for: page, appModel: appModel, turn: turn, face: face)
         if let failure = appModel.engine.layout.availability.failure {
-            projection.insert(layoutIssue(failure), at: 0)
+            content.insert(layoutIssue(failure), at: 0)
         }
-        if appModel.engine.pages.snapshots[page.id] == nil {
-            switch page.item.normalized {
-            case .trust, .personality:
-                let item=page.item.normalized
-                let caption=await appModel.engine.transcripts.presentation.prepareSnapshot("page:"+item.rawValue,
-                    input:.object(["kind":.string("page"),"page":.string(item.rawValue)]))
-                if caption.status == .ready, let text=caption.face?.sections.first?.rows.first?.title {
-                    projection.insert(section("About",[text]),at:0)
-                } else { projection.insert(section("Page caption unavailable",[caption.error?.message ?? caption.status.rawValue]),at:0) }
-            default: break
-            }
-        }
-        return await RuntimeReadouts.quietPageContext(
-            projection, pageID: page.id,
-            model: appModel.chatModel, providerID: appModel.chatProvider,
-            dataRoot: appModel.engine.dataRoot, providers: appModel.engine.providers, turn: turn)
+        return content
     }
 
-    static func pageProjection(for page: QuietPage, appModel: AppModel, turn: Turn?) async -> [JSONValue] {
-        if page.id == "today" {
-            await appModel.engine.today.refresh(appModel.engine, activeSessionID: appModel.activeChatSessionId)
+    private static func pageProjection(for page: QuietPage, appModel: AppModel, turn: Turn?, face: BodyFacePresentation?) async -> [JSONValue] {
+        if page.id == "chat" { return await chatProjection(appModel: appModel, turn: turn, face: face) }
+        guard page.item == .ownPage || QuietPages.shown(page.item)?.id == page.id else {
+            // An app whose access the person sets on Trust reads Trust's rows for it, as Trust draws them now.
+            let access: DoorPageAccess
+            if page.item == .trust { access = .trust(await appModel.engine.pages.refresh(page: "trust")) } else { access = .notOnTrust }
+            return AppToolExecutor.doorPageRead(page.value, access: access, turn: turn)
         }
-        await appModel.engine.pages.refresh(page: page.id)
-        if let snapshot = appModel.engine.pages.snapshots[page.id] {
-            guard snapshot.status == .ready, let face = snapshot.face else {
-                return [section(page.title, [snapshot.error?.message ?? (page.title + " " + snapshot.status.rawValue + ".")])]
+        // A page of the agent's own reads itself through engine.pages; the others load their shared data first.
+        if page.item != .chat, page.item != .activity, page.item != .memories, page.item != .bots, page.item != .ownPage {
+            _ = await appModel.refreshForSidebarItem(page.item)
+        }
+        guard let snapshot = await appModel.engine.pages.refresh(page: page.id) else {
+            if page.id == "today" {
+                return [.object(["heading": .string(page.title), "lines": .array([.string("Reading Today…")])])]
             }
-            return face.text(door: true).components(separatedBy: "\n\n").filter { !$0.isEmpty }.map { block in
-                var lines = block.components(separatedBy: "\n")
-                var heading = page.title
-                if let first = lines.first, first == face.title || first.hasSuffix(":") {
-                    heading = first.hasSuffix(":") ? String(first.dropLast()) : first
-                    lines.removeFirst()
-                }
-                return section(heading, lines)
+            return [issue(page.title, reason: "page_unavailable", detail: "\(page.id) has not published its required face.",
+                instruction: "Read this page again after its owner publishes; preserve the owner's failure if it remains unavailable.",
+                next: ["page": .string(page.id)])]
+        }
+        return snapshot.text(title: page.title, door: true, page: page.id).components(separatedBy: "\n\n").filter { !$0.isEmpty }.map { block in
+            var lines = block.components(separatedBy: "\n")
+            var heading = page.title
+            if let first = lines.first, first == snapshot.face?.title || first.hasSuffix(":") {
+                heading = first.hasSuffix(":") ? String(first.dropLast()) : first
+                lines.removeFirst()
             }
-        }
-        if page.id == "inbox" { return [section(page.title, ["Inbox has not published a face."])] }
-        if page.id == "today" { return [section(page.title, ["Today has not published a face."])] }
-        if page.id == "trust" { return [section(page.title, ["Trust has not published a face."])] }
-        if page.id == "personality" { return [section(page.title, ["Personality has not published a face."])] }
-        if let content = RuntimeReadouts.quietVirtualPage(
-            page.value, turn: turn) { return content }
-        if let service = RuntimeReadouts.quietServicePages[page.id] {
-            return await RuntimeReadouts.quietService(
-                page.value, service,
-                connectors: appModel.engine.connectors,
-                macIntegration: appModel.engine.macIntegration, statusText: { $0.connectionStatusText }, turn: turn)
-        }
-        switch page.item {
-        case .chat: return await chatProjection(appModel: appModel, turn: turn)
-        case .inboxPolicy: return RuntimeReadouts.quietNotifications(appModel.engine.inbox)
-        case .tools: return toolsProjection(appModel: appModel)
-        case .connectors where page.tab == "iphone": return await RuntimeReadouts.quietPairing(appModel.engine.sync, dataRoot: appModel.engine.dataRoot)
-        case .connectors where page.tab == "agents": return await RuntimeReadouts.quietAgents(appModel.engine.contacts)
-        case .telegram: return RuntimeReadouts.quietTelegram(appModel.engine.telegram)
-        case .macIntegration: return await RuntimeReadouts.quietMacIntegration(
-            connectors: appModel.engine.connectors, macIntegration: appModel.engine.macIntegration,
-            statusText: { $0.connectionStatusText }, turn: turn)
-        default: return []
+            // The face's text already bounds each row's words and keeps its reference (id, link, calls) whole; it is not cut again.
+            return .object(["heading": .string(heading), "lines": .array(lines.map(JSONValue.string))])
         }
     }
 
-    private static let section = RuntimeReadouts.quietPageSection
+    private static func layoutIssue(_ failure: SurfaceLayoutFailure) -> JSONValue {
+        issue("Layout unavailable", reason: "invalid_file", detail: failure.localizedDescription, instruction: failure.instruction)
+    }
 
-    private static let countLine = RuntimeReadouts.quietCountLine
+    // MARK: Sections
+
+    private static func bounded(_ raw: String) -> String {
+        let collapsed = raw
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard collapsed.count > 200 else { return collapsed }
+        return String(collapsed.prefix(199)) + "\u{2026}"
+    }
+
+    private static func section(_ heading: String, _ lines: [String]) -> JSONValue {
+        .object([
+            "heading": .string(heading),
+            "lines": .array(lines.map { .string(bounded($0)) }),
+        ])
+    }
+
+    /// Keep failure and recovery structured, outside the section's 200-character summary cap.
+    private static func issue(_ heading: String, reason: String, detail: String, instruction: String,
+                              next: [String: JSONValue]? = nil, error: (any Error)? = nil) -> JSONValue {
+        let remedy = Repair.remedy(owner: heading,
+            nextCall: next.map { .object(["tool": .string("app"), "input": .object($0)]) }, tap: nil, instruction: instruction)
+        var face: [String: JSONValue] = [
+            "heading": .string(heading), "lines": .array([]),
+            "status": .string("unavailable"), "reason": .string(reason), "detail": .string(detail),
+            "remedy": remedy,
+        ]
+        if let error, case .object(let evidence) = ChatToolOutcome.failure(error: error, effects: ToolFailureError.Effects.none) {
+            face.merge(evidence) { _, owned in owned }
+            if evidence["reason"] == .string("dispatch_error") {
+                face["reason"] = .string(reason)
+                face["failure_code"] = .string(reason)
+            }
+        }
+        return .object(face)
+    }
+
+    private static func countLine(_ count: Int, _ one: String, _ many: String) -> String {
+        count == 1 ? "1 \(one)" : "\(count) \(many)"
+    }
 
     // MARK: Chat
 
     /// Include transcript folds and cards that the offscreen accessibility tree cannot expose.
-    private static func chatProjection(appModel: AppModel, turn: Turn?) async -> [JSONValue] {
-        let sessionID = appModel.activeChatSessionId
-        guard !sessionID.isEmpty else {
-            return [section("Chat", ["No conversation is open.", MoodTintReadout.line()])]
+    private static func chatProjection(appModel: AppModel, turn: Turn?, face: BodyFacePresentation?) async -> [JSONValue] {
+        let composer: [String: JSONValue]
+        let sessionID: String
+        let paneRows: [String]
+        var workPane: String?
+        if let face {
+            do {
+                composer = try await BodyQuietChatCommands(face: face).composerState(sessionID: "", turn: turn)
+                guard case .string(let selected)? = composer["conversation"] else { throw FaceWireError.invalidFeedOrder }
+                sessionID = selected
+                if case .array(let rows)? = composer["pane_rows"] { paneRows = rows.compactMap(\.scalarText) }
+                else { throw FaceWireError.invalidFeedOrder }
+                if !sessionID.isEmpty { _ = try await appModel.engine.transcripts.refreshMessages(sessionId: sessionID, cached: true) }
+                // The Work pane is the window's: its state is read from the window, as shown.
+                guard case .workPane(let pane) = try await face.call(.readWorkPane) else { throw FaceWireError.invalidFeedOrder }
+                workPane = pane.isVisible ? "open" + (pane.tab.map { " on \($0)" } ?? "") : "closed"
+            } catch {
+                return [issue("Chat", reason: "chat_window_unavailable", detail: error.localizedDescription,
+                    instruction: "Open this window's conversation and resolve its read error before reading Chat.",
+                    next: ["page": .string("chat")], error: error)]
+            }
+        } else {
+            return [issue("Chat", reason: "chat_window_unavailable", detail: "No window is attached.",
+                instruction: "Open NativeAgent's window before reading its conversation.",
+                next: ["page": .string("chat")], error: FaceWireError.disconnected)]
         }
-        let messages = appModel.engine.transcripts.messages(for: sessionID)
+        guard !sessionID.isEmpty else {
+            return [section("Chat", ["No conversation is open."])]
+        }
+        let messages = appModel.engine.transcripts.displayedTranscript(for: sessionID).messages
         await appModel.engine.transcripts.prepareGroups(for: sessionID)
         let groups = appModel.engine.transcripts.groups(for: sessionID)
         var sections: [JSONValue] = [section("Chat", [
             "Conversation: \(sessionID)",
             countLine(messages.count, "message", "messages") + " loaded.",
-            MoodTintReadout.line(),
         ])]
 
-        // Read mounted state so projections agree with composer verbs.
-        let composer = await QuietComposerCommands.state(appModel: appModel, turn: turn)
         func line(_ label: String, _ key: String) -> String? {
             switch composer[key] {
             case .string(let value): return "\(label): \(value)"
@@ -393,14 +164,6 @@ extension QuietSelfAdminRender {
             default: return nil
             }
         }
-        let shell = QuietSelfAdmin.shared.composerCards
-        let paneRows: [String] = shell.map { live in
-            live.activePane != nil
-                ? [live.paneReadLine] + live.rows.map {
-                    $0.isSelected ? "\($0.label) — selected" : $0.label
-                }
-                : []
-        } ?? []
         sections.append(section("Composer", [
             line("Draft", "draft") ?? "Draft: (empty)",
             line("Model", "model_word") ?? "",
@@ -408,7 +171,8 @@ extension QuietSelfAdminRender {
             line("Trust", "trust_word") ?? "",
             line("Context used", "ring_percent").map { $0 + "%" } ?? "Context used: unknown",
             line("Context measurement", "context_measurement_source") ?? "Context measurement: unknown",
-            line("Open pane", "open_card") ?? "",
+            line("Open composer card", "open_card") ?? "",
+            workPane.map { "Work pane: " + $0 } ?? "",
             "The chat.* actions work this row in process.",
         ].filter { !$0.isEmpty } + paneRows))
 
@@ -422,9 +186,9 @@ extension QuietSelfAdminRender {
 
         do {
             let read = try await appModel.engine.transcripts.loadTranscript(sessionId: sessionID)
-            sections += RuntimeReadouts.quietChatCards(read)
+            sections += chatCards(read)
         } catch {
-            sections.append(RuntimeReadouts.quietPageIssue("Cards", reason: "chat_cards_unavailable",
+            sections.append(issue("Cards", reason: "chat_cards_unavailable",
                 detail: error.localizedDescription,
                 instruction: "Resolve the reported conversation read problem without deleting its history, then reload Chat.",
                 next: ["page": .string("chat")], error: error))
@@ -432,80 +196,115 @@ extension QuietSelfAdminRender {
         return sections
     }
 
-
-
-    private static func layoutIssue(_ failure: SurfaceLayoutFailure) -> JSONValue {
-        RuntimeReadouts.quietPageIssue("Layout unavailable", reason: "invalid_file",
-            detail: failure.localizedDescription, instruction: failure.instruction)
-    }
-
-    // MARK: The rest
-
-    private static func toolsProjection(appModel: AppModel) -> [JSONValue] {
-        let tools = appModel.engine.tools
-        let state = ChatToolCatalogPresentation.catalogState(catalog: tools.catalog,
-            authored: tools.authored,
-            loadFailed: tools.catalogLoadError != nil, loadError: tools.catalogLoadError)
+    /// The cards in the open conversation, each with its id, state and what answering it takes.
+    private static func chatCards(_ read: TranscriptReadout) -> [JSONValue] {
         var sections: [JSONValue] = []
-        switch state {
-        case .loading:
-            sections.append(section("Tools", ["Loading the tools…"]))
-        case .empty:
-            sections.append(section("Tools", ["The tool list loaded, but there were no tools in it."]))
-        case .unavailable:
-            sections.append(RuntimeReadouts.quietPageIssue("Tools", reason: "tool_catalog_unavailable",
-                detail: tools.catalogLoadError ?? "No tool catalog loaded. Use Refresh to load it.",
-                instruction: "Resolve the reported catalog read problem, then read Tools to reload it.",
-                next: ["page": .string("tools")]))
-        case let .available(catalog, buckets), let .stale(catalog, buckets, _):
-            if case .stale(_, _, let detail) = state {
-                sections.append(RuntimeReadouts.quietPageIssue("Tools", reason: "tool_catalog_stale",
-                    detail: detail ?? "The catalog could not refresh; these are the last loaded tools.",
-                    instruction: "Resolve the reported catalog read problem, then read Tools to reload it.",
-                    next: ["page": .string("tools")], status: "stale"))
-            }
-            sections += buckets.buckets.map { bucket in
-                section(bucket.title, bucket.tools.map {
-                    "\($0.name): \(catalog.status(for: $0).title) · \($0.description)"
-                })
-            }
-            sections.append(section("Mac access", [catalog.builderModeDetail]
-                + catalog.builderAvailable + catalog.macAppAvailable))
+        let pairs = read.messages.flatMap { message in
+            message.inlineCards.map { (rowID: message.id, card: $0.model) }
         }
-        do {
-            if case .object(let list) = try Parts(root: tools.dataRoot).list() {
-                sections.append(.object(list.merging(["heading": .string("Abilities")]) { _, new in new }))
-            }
-        } catch { sections.append(RuntimeReadouts.quietPageIssue("Abilities", reason: "ability_list_unavailable",
-            detail: error.localizedDescription, instruction: "Ask the person to repair the reported ability-store defect, then read Tools again.",
-            next: ["page": .string("tools")])) }
-        return sections
+        guard !pairs.isEmpty else { return sections }
+        sections.append(section(
+            "Cards",
+            [read.cardsHeading
+                + " in this conversation. card.answer answers one by its id."]
+        ))
+        return sections + pairs.map { chatCard($0.card, rowID: $0.rowID) }
     }
 
-
-
-}
-
-@MainActor
-final class QuietSelfAdmin {
-    static let shared = QuietSelfAdmin()
-
-    /// Drafts belong to AppModel by session, not to this projection.
-    private weak var cards: ComposerShellState?
-
-    private init() {}
-
-    func attach(cards: ComposerShellState) {
-        self.cards = cards
+    private static func chatCard(_ card: InlineCardModel, rowID: String) -> JSONValue {
+        // Unknown, declined and settled cards retain their receipt and interaction identity.
+        switch card.state {
+        case .superseded:
+            // Superseded asks have no remaining decision because a newer identical ask owns it.
+            return cardSection(card, [
+                "State: " + card.state.rawValue,
+                "Asked earlier — a newer copy of this ask took its place.",
+                "Interaction id: \(card.id)",
+                "On message: \(rowID)",
+            ])
+        case .unknown, .declined, .settled:
+            var receipt: [String] = ["State: \(card.state.rawValue)"]
+            if let outcome = card.outcome { receipt.append(outcome) }
+            if let meta = card.outcomeMeta { receipt.append(meta) }
+            receipt.append("Interaction id: \(card.id)")
+            receipt.append("On message: \(rowID)")
+            return cardSection(card, receipt)
+        case .pending, .running, .failed, .stopped:
+            // Failure settles nothing: retain the card’s explanation, field and retry control rather than presenting a receipt.
+            break
+        }
+        var lines: [String] = ["State: \(card.state.rawValue)"]
+        if !card.why.isEmpty { lines.append("Why: \(card.why)") }
+        if card.state == .running, let note = card.busyNote { lines.append("Working: \(note)") }
+        if let restart = card.restartNote { lines.append("Restart: \(restart) Only the person's tap on the card restarts.") }
+        lines.append(contentsOf: card.scopeLines)
+        if card.state == .failed && !card.canRetry {
+            // Never name controls this build cannot draw.
+            lines.append("There is no control for this on this build, so it can't be answered here.")
+        } else {
+            lines.append("Do: \(card.state == .stopped ? "Resume" : card.state == .failed ? "Try again" : card.primaryLabel)")
+            lines.append(
+                "Or: \(card.secondaryLabel) — "
+                    + InlineInteraction.lowercasedLead(
+                        card.consequence.trimmingCharacters(in: .whitespacesAndNewlines)
+                    )
+            )
+        }
+        if let note = card.persistenceNote { lines.append(note) }
+        if let signIn = card.signInLabel { lines.append("Offers: \(signIn)") }
+        for field in card.fields {
+            lines.append(
+                "Takes: \(field.label)\(field.isSecret ? " (secret — the person types it into the card, never into chat)" : "")"
+            )
+        }
+        for choice in card.choices {
+            lines.append("Choice \(choice.id): \(choice.title)"
+                + (choice.note.map { " — \($0)" } ?? ""))
+        }
+        if let outcome = card.outcome { lines.append("Outcome: \(outcome)") }
+        if let meta = card.outcomeMeta { lines.append(meta) }
+        lines.append("Interaction id: \(card.id)")
+        lines.append("On message: \(rowID)")
+        return cardSection(card, lines)
     }
 
-    func detachComposer(cards candidate: ComposerShellState) {
-        guard cards === candidate else { return }
-        cards = nil
+    private static func cardSection(_ card: InlineCardModel, _ lines: [String]) -> JSONValue {
+        var face: [String: JSONValue] = [
+            "heading": .string(card.title), "lines": .array(lines.map { .string(bounded($0)) }),
+            "status": .string(card.state.rawValue), "card": .string(card.id),
+        ]
+        if let outcome = card.outcome { face["outcome"] = .string(outcome) }
+        if let meta = card.outcomeMeta { face["outcome_meta"] = .string(meta) }
+        let unsupportedInstruction = """
+            Tell the person: this copy of NativeAgent has no control for card \(card.id) (\(card.title)). Preserve the card; no answer can run \
+            here.
+            """
+        let unsupported = Repair.remedy(owner: "NativeAgent card controls", nextCall: nil, tap: unsupportedInstruction,
+            instruction: unsupportedInstruction)
+        switch card.state {
+        case .stopped:
+            face["reason"] = .string(DataRootLife.stoppedReason)
+            face["remedy"] = Repair.remedy(owner: card.title, nextCall: nil,
+                tap: "Chat → \(card.title) [\(card.id)] → Resume",
+                instruction: "The person can use Resume to start this request fresh after the restore.")
+        case .unknown:
+            face["reason"] = .string("card_unsupported")
+            face["detail"] = .string(card.outcome ?? "This build has no control for this card.")
+            face["remedy"] = unsupported
+        case .failed:
+            face["reason"] = .string(card.canRetry ? "card_action_failed" : "card_unsupported")
+            face["detail"] = .string(card.outcome ?? card.why)
+            face["scope"] = .array(card.scopeLines.map(JSONValue.string))
+            face["remedy"] = card.canRetry
+                ? Repair.remedy(owner: card.title, nextCall: nil,
+                    tap: "Chat → \(card.title) [\(card.id)] → Try again",
+                    instruction: "Resolve the reported cause; the owner can then use this card's Try again control.")
+                : unsupported
+        case .pending, .running, .settled, .declined, .superseded:
+            break
+        }
+        return .object(face)
     }
-
-    var composerCards: ComposerShellState? { cards }
-
 }
 
 // MARK: - Pages
@@ -515,36 +314,25 @@ struct QuietPage: Sendable, Equatable {
     var id: String { value.id }
     var title: String { value.title }
     var summary: String { value.summary }
+    /// The rail item the window opens for this page: its own page, or for a door-only page the page where the person sees and sets it.
     var item: SidebarItem {
         switch id {
-        case "chat", "simple", "simple_settings_menu": .chat
-        case "today", "inbox": .activity
+        case "chat", "make", "simple", "simple_settings_menu": .chat
+        case "today": .activity
+        case "inbox", "notifications": .inboxPolicy
         case "memories": .memories
         case "desk": .desk
-        case "notifications": .inboxPolicy
         case "bots": .bots
         case "personality": .personality
         case "providers": .providers
-        case "trust", "files", "shell", "web", "browser", "mac": .trust
-        case "connectors", "pairing", "agents", "slack": .connectors
-        case "telegram": .telegram
-        case "mac_integration", "mail", "calendar", "reminders", "notes", "contacts", "messages", "music": .macIntegration
-        case "capabilities": .capabilities
+        case "trust", "files", "shell", "web", "browser", "mac", "mail", "calendar", "reminders", "notes", "contacts", "messages", "music": .trust
+        case "connectors", "pairing", "agents", "telegram", "slack": .connectors
+        case "capabilities", "skills", "tools": .capabilities
         case "diagnostics": .diagnostics
-        case "skills": .skills
-        case "tools": .tools
         case "settings": .settings
+        case "dreams", "knowledge", "cognition", "memory-upkeep": .ownPage
+        case _ where AppDoorNames.ownPageRefusal(id) == nil: .ownPage
         default: preconditionFailure("The page has no rail route")
-        }
-    }
-    var tab: String? {
-        switch id {
-        case "pairing": "iphone"
-        case "agents": "agents"
-        case "slack": "connectors"
-        case "skills": "skills"
-        case "tools": "tools"
-        default: nil
         }
     }
 }
@@ -558,25 +346,96 @@ enum QuietPages {
         QuietPage(value: QuietToolPage(id: "simple_settings_menu", title: "Simple view settings menu",
                   summary: "The Simple shell with the person row's settings menu drawn open.")),
     ]
-    static func page(named raw: String) -> QuietPage? {
-        if AppDoorNames.resolve(raw) == "inbox" { return QuietPage(value: .inbox) }
-        return QuietToolPage.page(named: raw).map(QuietPage.init)
+    /// An app page by name or alias, or a page of the agent's own by its id.
+    @MainActor static func page(named raw: String) -> QuietPage? {
+        let key = AppDoorNames.resolve(raw)
+        if key == "inbox" { return QuietPage(value: .inbox) }
+        if let page = QuietToolPage.page(named: raw) { return QuietPage(value: page) }
+        guard let appModel = ApplicationLifetime.shared.appModel else { return nil }
+        return own(appModel, ids: [key]).first
+    }
+
+    /// The page the window draws for a rail item, as the door names it (`ShellPageContent.doorPage`); nil for a page of the agent's own,
+    /// which the selection names by its id.
+    @MainActor static func shown(_ item: SidebarItem) -> QuietPage? {
+        ShellPageContent.doorPage(item).flatMap(page(named:))
+    }
+
+    /// Only the requested page titles are observed; the catalog supplies claim and inventory availability.
+    @MainActor static func own(_ appModel: AppModel, ids: Set<String>) -> [QuietPage] {
+        guard let catalog = appModel.face.slot(PageFaceKey.catalog).value(as: PartFaceCatalog.self) else { return [] }
+        return descriptions(catalog, ids: ids) { appModel.face.slot(.page($0)).value(as: PartFaceSnapshot.self) }
+    }
+
+    /// Agent discovery reads its owner directly, independently of the next display frame.
+    @MainActor static func ownerPages(_ appModel: AppModel) async throws -> [QuietPage] {
+        let pages = appModel.engine.pages
+        guard let catalog = await pages.catalog else {
+            throw PartCallError(code: "page_inventory_pending", message: "Waiting on the authored-page inventory; read the pages again after it arrives.")
+        }
+        if let failure = catalog.failure { throw failure }
+        let snapshots = await pages.snapshots
+        return descriptions(catalog, ids: Set(catalog.claims.keys)) { snapshots[$0] }
+    }
+
+    @MainActor static func ownerPage(named raw: String, appModel: AppModel) async -> QuietPage? {
+        let key = AppDoorNames.resolve(raw)
+        if key == "inbox" { return QuietPage(value: .inbox) }
+        if let page = QuietToolPage.page(named: raw) { return QuietPage(value: page) }
+        guard let catalog = await appModel.engine.pages.catalog else { return nil }
+        let snapshots = await appModel.engine.pages.snapshots
+        return descriptions(catalog, ids: [key]) { snapshots[$0] }.first
+    }
+
+    /// Navigation and capture resolve inventory absence at its owner, before deciding whether a page exists.
+    @MainActor static func prepareOwnPage(_ name: String, appModel: AppModel) async -> PartCallError? {
+        guard AppDoorNames.ownPageRefusal(name) == nil else { return nil }
+        let pages = appModel.engine.pages
+        if await pages.catalog == nil, case .failure(let failure) = await pages.ownPages() { return failure }
+        guard let catalog = await pages.catalog else {
+            return .init(code: "page_inventory_pending", message: "Waiting on the authored-page inventory; this page request is unconfirmed.")
+        }
+        return catalog.failure
+    }
+
+    private static func descriptions(_ catalog: PartFaceCatalog, ids: Set<String>,
+                                     snapshot: (String) -> PartFaceSnapshot?) -> [QuietPage] {
+        catalog.claims.filter { ids.contains($0.key) }.sorted { $0.key < $1.key }.map { id, claim in
+            let title = snapshot(id)?.face?.title.flatMap { $0.isEmpty ? nil : $0 } ?? id
+            let summary: String
+            if let failure = catalog.failure { summary = failure.message } else {
+                switch claim {
+                case .success(let part): summary = "A page of the agent's own, drawn by its part \(part) from that part's notebook."
+                case .failure(let failure): summary = failure.message
+                }
+            }
+            return QuietPage(value: QuietToolPage(id: id, title: title, summary: summary))
+        }
     }
 }
 
 @MainActor struct AppQuietToolPresentation: QuietToolPresentationPort {
     /// Shipped pages exist independently of their presentation in the layout.
     var pages: [QuietToolPage] {
-        get throws {
-            guard ApplicationLifetime.shared.appModel != nil else {
+        get async throws {
+            guard let appModel = ApplicationLifetime.shared.appModel else {
                 throw ToolFailureError("The app presentation has not attached.", effects: .none, code: "app_unattached")
             }
-            return RuntimeReadouts.quietPages()
+            return QuietToolPage.all + (try await QuietPages.ownerPages(appModel)).map(\.value)
         }
     }
-    var currentPage: QuietToolPage? { ApplicationLifetime.shared.currentPage.map(\.value) }
-    var visiblePageInput: [String: JSONValue]? { ApplicationLifetime.shared.visiblePageInput }
-    func page(named raw: String) -> QuietToolPage? { QuietPages.page(named: raw)?.value }
+    var currentPage: QuietToolPage? {
+        guard let appModel = ApplicationLifetime.shared.appModel else { return nil }
+        return (try? BodyFacePresentation.current(model: appModel))?.currentPage
+    }
+    var visiblePageInput: [String: JSONValue]? {
+        guard let appModel = ApplicationLifetime.shared.appModel else { return nil }
+        return (try? BodyFacePresentation.current(model: appModel))?.visiblePageInput
+    }
+    func page(named raw: String) async -> QuietToolPage? {
+        guard let appModel = ApplicationLifetime.shared.appModel else { return nil }
+        return await QuietPages.ownerPage(named: raw, appModel: appModel)?.value
+    }
     /// Read a conversation's context receipt through the popover owner without requiring it to be open.
     /// With no session, use the conversation on screen.
     @MainActor
@@ -610,65 +469,11 @@ enum QuietPages {
     @MainActor
     func pageScreenshot(input: [String: JSONValue], imageSink: LocalToolImage.Sink?) async -> JSONValue {
         guard let appModel = ApplicationLifetime.shared.appModel else { return AppToolExecutor.unattachedFailure() }
-        let requested = Self.text(input["page"])
-        let resolved = AppDoorNames.resolve(requested)
-        let target = resolved == "current" ? ApplicationLifetime.shared.currentPage
-            : QuietPages.page(named: resolved) ?? QuietPages.drawOnly.first(where: { $0.id == resolved })
-        guard let page = target else {
-            return AppToolExecutor.failure(resolved == "current" ? "app_window_unavailable" : "unknown_page",
-                resolved == "current" ? "No app window is showing a page right now; name the page instead of current." : "No page is called that.",
-                extra: ["requested": .string(requested), "pages": .array(QuietPages.ids.map(JSONValue.string)),
-                    "remedy": Repair.remedy(owner: "page.screenshot", nextCall: .object([
-                        "tool": .string("app"), "input": .object([:])]), tap: nil,
-                        instruction: "Read home, then choose a named page for page.screenshot.")])
-        }
-        // Reuse page.show tab keys so screenshots select the same rail tab.
-        let tabKey = Self.text(input["tab"]).lowercased()
-        let railPage = SidebarItem.shellHome(for: page.item)?.parent ?? page.item
-        var tab: String?
-        if !tabKey.isEmpty {
-            guard let home = QuietComposerCommands.tabs[tabKey], home.page == railPage else {
-                let keys = QuietComposerCommands.tabs.filter { $0.value.page == railPage }.keys.sorted()
-                return AppToolExecutor.failure("unknown_tab", "This page has no tab called that.",
-                    extra: ["requested": .string(tabKey), "tabs": .array(keys.map { .string($0) }),
-                        "remedy": Repair.remedy(owner: "page.screenshot", nextCall: .object([
-                            "tool": .string("app"), "input": .object(["action": .string("page.screenshot"),
-                                "args": .object(["page": .string(page.id)])])]), tap: nil,
-                            instruction: "Omit tab for the page's default tab, or choose a key from tabs.")])
-            }
-            tab = home.tab
-        }
-        var size = QuietSelfAdminRender.defaultSize
-        if let requestedHeight = input["height"] {
-            let height: Double?
-            switch requestedHeight {
-            case .int(let value): height = Double(value)
-            case .double(let value): height = value
-            case .string(let value): height = Double(value)
-            default: height = nil
-            }
-            guard let height, height.isFinite else {
-                return AppToolExecutor.failure("invalid_height", "Screenshot height must be a finite number.")
-            }
-            size.height = min(max(CGFloat(height), 400), 2400)
-        }
-        let image: (data: Data, width: Int, height: Int)?
-        do { image = try await QuietSelfAdminRender.pageImagePNG(for: page, tab: tab, appModel: appModel, size: size) }
-        catch is CancellationError {
-            return AppToolExecutor.failure("cancelled", "Page screenshot was cancelled; no image was produced.")
+        do {
+            return await (try BodyFacePresentation.current(model: appModel)).pageScreenshot(input: input, imageSink: imageSink)
         } catch {
-            return AppToolExecutor.failure("render_failed", error.localizedDescription)
+            return AppToolExecutor.failure("app_window_unavailable", error.localizedDescription)
         }
-        guard let rendered = image else {
-            return AppToolExecutor.failure("render_failed", "Offscreen bitmap allocation or PNG encoding failed.",
-                extra: ["page": .string(page.id), "tab": .string(tabKey),
-                    "remedy": Repair.remedy(owner: "page.screenshot", nextCall: .object([
-                        "tool": .string("app"), "input": .object(["page": .string(page.id)])]), tap: nil,
-                        instruction: "Inspect the page data through next_call to diagnose the render failure.")])
-        }
-        return AppToolExecutor.pageScreenshotResult(
-            page: page.value, tabKey: tabKey,
-            dataRoot: appModel.engine.dataRoot, rendered: rendered, imageSink: imageSink)
     }
 
     private static func text(_ value: JSONValue?) -> String {

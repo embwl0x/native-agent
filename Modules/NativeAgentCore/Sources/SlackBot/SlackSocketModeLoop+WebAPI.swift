@@ -24,8 +24,7 @@ extension SlackSocketModeLoop {
             req.httpBody = try JSONSerialization.data(withJSONObject: params)
         }
         let parsed = try await SlackWebAPI.response(for: req, session: session)
-        guard parsed["error"] as? String != "non_json_response",
-              case .object(let obj) = JSONValue(fromFoundation: parsed) else {
+        guard case .object(let obj) = JSONValue(fromFoundation: parsed) else {
             throw SlackSocketModeError.api("\(method) returned non-object JSON")
         }
         if let status = parsed["httpStatus"] as? Int {

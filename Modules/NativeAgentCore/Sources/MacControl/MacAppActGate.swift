@@ -212,6 +212,13 @@ public enum MacAppActGate {
         context: MacOperationContext) -> MacAppActRefusal? {
         guard !looking else { return nil }
         guard !bundleID.isEmpty else { return unavailable() }
+        #if canImport(AppKit)
+        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first(where: {
+            PersonOnlyWindows.isOwnProcess($0.processIdentifier)
+        }) {
+            return refusal(pid: app.processIdentifier, throughAppleEvents: throughAppleEvents, dataRoot: dataRoot, context: context)
+        }
+        #endif
         // System Events can relay GUI mutations to another process. Its own bundle is not evidence of the affected app; native hands resolve it.
         if throughAppleEvents, bundleID == "com.apple.systemevents" { return unavailable() }
         guard let integration = MacIntegrationID.owning(appBundleID: bundleID) else { return nil }
@@ -238,6 +245,11 @@ public enum MacAppActGate {
 
     public static func refusal(pid: Int32?, looking: Bool = false, throughAppleEvents: Bool = false, dataRoot: URL? = nil,
         context: MacOperationContext) -> MacAppActRefusal? {
+        if PersonOnlyWindows.isOwnProcess(pid) {
+            return MacAppActRefusal(code: "cannot_act_on_own_process",
+                message: "NativeAgent's own window is person-only. Use app pages and actions; inbox.approve can answer an exact card "
+                    + "on the person's own authenticated message. Otherwise ask them to tap it.", integration: nil)
+        }
         guard !looking else { return nil }
         #if canImport(AppKit)
         guard let pid, pid > 0, let app = NSRunningApplication(processIdentifier: pid),
@@ -291,23 +303,20 @@ public enum MacAppActGate {
     }
 
     static func frontRefusal(context: MacOperationContext) -> MacAppActRefusal? {
-        if context.looking { return nil }
-        return refusal(pid: NSWorkspace.shared.frontmostApplication?.processIdentifier, context: context)
+        return refusal(pid: NSWorkspace.shared.frontmostApplication?.processIdentifier, looking: context.looking, context: context)
     }
     static func pointRefusal(x: Double, y: Double, context: MacOperationContext) -> MacAppActRefusal? {
-        if context.looking { return nil }
         // The AX hit supplies a process, not a named control. Canvases need no label.
         let hit = SystemMacVisualObstructionProbe.hitPID(x: x, y: y)
         let window = SystemMacVisualObstructionProbe.topmost(in: SystemMacVisualObstructionProbe.windows(), x: x, y: y)
         // AX can hit the agent's pass-through Shotgun overlay. The window inventory excludes it, just as actual agent input passes through it.
-        let pid = hit == getpid() ? window?.ownerPID : hit ?? window?.ownerPID
-        return refusal(pid: pid, context: context)
+        let pid = PersonOnlyWindows.isOwnProcess(hit) ? window?.ownerPID : hit ?? window?.ownerPID
+        return refusal(pid: pid, looking: context.looking, context: context)
     }
     static func elementRefusal(_ element: AXUIElement, context: MacOperationContext) -> MacAppActRefusal? {
-        if context.looking { return nil }
         var pid: pid_t = 0
         guard AXUIElementGetPid(element, &pid) == .success else { return unavailable() }
-        return refusal(pid: pid, context: context)
+        return refusal(pid: pid, looking: context.looking, context: context)
     }
     #endif
 }

@@ -9,7 +9,8 @@ import ApprovalInbox
 import ChatTurnContracts
 import Experiences
 import TurnTrace
-// Blueprint: | `AgentConversationStore.swift` | `save`, `restoreProjections`, `records`, `AgentConversationDelivery.answersLive`, `offerReplyToInlineWait`, `offerBridgeReplyToInlineWait`, `outcome_unknown`, `unsettledAttention`, `recordsUnlocked`, `AgentConversationView` |
+import Transcripts
+// Blueprint: | `AgentConversationStore.swift` | Retained conversation identity, send evidence, queue reservations and checked mutations. |
 
 
 
@@ -38,14 +39,63 @@ public struct AgentConversationStore: Sendable {
     public func find(scopeSessionID: String, agent: String, label: String?, in snapshot: [AgentConversationRecord]? = nil) throws -> AgentConversationRecord? {
         let rows = try snapshot ?? records()
         return try select(rows, scope: scopeSessionID, agent: agent, label: label)
-            ?? Self.continuing(rows, agent: agent, label: label)
+            ?? (label == nil && Self.ownThread(scope: scopeSessionID, agent: agent) != nil ? nil : Self.continuing(rows, agent: agent, label: label))
+    }
+
+    /// Resolve conversation identities through their owners, including contacts whose send record has no chat/messages file of its own.
+    public func containsConversation(_ id: String) throws -> Bool {
+        try resolveConversation(id) != nil
+    }
+
+    package enum ConversationIdentity: Sendable {
+        case session([String: JSONValue])
+        case agent(AgentConversationRecord)
+    }
+
+    /// Page reads and Desk waits share the exact identity resolver used for agent.read's record, protocol and contact-session ids.
+    package func resolveConversation(_ id: String, scope: String? = nil, matchingTitle: Bool = false) throws -> ConversationIdentity? {
+        let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        let session = Result { try SessionConversation.checkedRow(id, dataRoot: root) }
+        if case .success(let row?) = session { return .session(row) }
+        if let row = Self.conversation(id, scope: scope, in: try records()) { return .agent(row) }
+        // A readable contact can establish its own identity even if the session index is unavailable; absence in both owners needs both reads.
+        _ = try session.get()
+        // Exact ids from either owner outrank a session whose title happens to be that id.
+        if matchingTitle, let row = try SessionConversation.checkedRow(id, dataRoot: root, matchingTitle: true) { return .session(row) }
+        return nil
+    }
+
+    /// The same exact IDs select an agent.read conversation and admit a Desk wait. Labels remain scoped to their named contact.
+    static func conversation(_ id: String, scope: String?, in rows: [AgentConversationRecord]) -> AgentConversationRecord? {
+        if let exact = rows.first(where: { $0.id == id }) { return exact }
+        return rows.filter { row in
+            row.conversationID == id || (row.agent.hasPrefix("peer:")
+                && ContactThread.session(owner: String(row.agent.dropFirst(5)), conversation: row.conversationID) == id)
+        }.max { ($0.scopeSessionID == scope ? 1 : 0, $0.updatedAt) < ($1.scopeSessionID == scope ? 1 : 0, $1.updatedAt) }
+    }
+
+    /// In the session of a conversation the contact opened by calling in (its own, or one caller's), that conversation: an unnamed message to the
+    /// contact there goes back to that caller there, never to another caller or another door. Nil in any other chat.
+    static func ownThread(scope: String, agent: String) -> String? {
+        guard agent.hasPrefix("peer:") else { return nil }
+        let owner = String(agent.dropFirst(5)), prefix = ContactThread.prefix(owner: owner)
+        guard scope.hasPrefix(prefix), let held = ContactCaller.held(String(scope.dropFirst(prefix.count)), peer: owner) else { return nil }
+        return ContactThread.session(owner: owner, conversation: held) == scope ? held : nil
+    }
+
+    /// A held conversation's name, the same for every send in it: a caller's names the contact and when that caller opened; the contact's own
+    /// conversation carries the contact's name.
+    static func heldName(_ conversation: String, agent: String, contact: String) -> String {
+        ContactCaller(conversation: conversation, peer: String(agent.dropFirst(5))).map { $0.name(contact: contact) } ?? contact
     }
 
     static func continuing(_ rows: [AgentConversationRecord], agent: String, label: String?) -> AgentConversationRecord? {
         rows.filter { row in
             guard row.agent == agent else { return false }
             if let label { return row.label.caseInsensitiveCompare(label) == .orderedSame }
-            return row.label == "Main" || row.selected
+            // A thread the contact opened by calling in belongs to the chat it called in; another chat continues it only by name.
+            let held = agent.hasPrefix("peer:") && ContactCaller.held(row.conversationID, peer: String(agent.dropFirst(5))) != nil
+            return !held && (row.label == "Main" || row.selected)
         }.max { $0.updatedAt < $1.updatedAt }
     }
 
@@ -73,9 +123,10 @@ public struct AgentConversationStore: Sendable {
             var rows = try load()
             if try reconcileDeniedApprovals(&rows) { try save(rows) }
             // Continue the exact record resolved by the caller.
+            let ownHeld = label == nil ? Self.ownThread(scope: scopeSessionID, agent: agent) : nil
             let old = try record.flatMap { id in rows.first { $0.id == id && $0.agent == agent } }
                 ?? select(rows, scope: scopeSessionID, agent: agent, label: label)
-                ?? (fresh ? nil : Self.continuing(rows, agent: agent, label: label))
+                ?? (fresh || ownHeld != nil ? nil : Self.continuing(rows, agent: agent, label: label))
             // An accepted ask its peer never answered (Grok Bot) may be superseded; an unsettled send never is.
             if !fresh, let old, old.phase == "sending" || (old.phase == "waiting" && !supersedeWaiting) {
                 throw Failure(
@@ -105,8 +156,11 @@ public struct AgentConversationStore: Sendable {
                 guard rows.count < 512 else { throw Failure(message: "The saved conversation limit has been reached.") }
                 let id = UUID().uuidString.lowercased()
                 row = AgentConversationRecord(id: id, scopeSessionID: scopeSessionID, agent: agent, name: name,
-                    label: label ?? (fresh ? "Conversation " + String(id.prefix(8)) : "Main"),
+                    label: label ?? (fresh ? "Conversation " + String(id.prefix(8))
+                        : ownHeld.map { Self.heldName($0, agent: agent, contact: name) } ?? "Main"),
                     phase: "ready", operationID: id, updatedAt: Date(), sourceSurface: sourceSurface)
+                // Opened in the contact's own thread, it lives on the door that thread came through.
+                if !fresh, let ownHeld { row.conversationID = ownHeld }
             }
             try Self.absorbExchange(into: &row, file: fileURL)
             // Queued promotion retains the original experience.
@@ -118,7 +172,7 @@ public struct AgentConversationStore: Sendable {
             let resumed = reservation.flatMap { id in row.exchanges?.first { $0.id == id && $0.status == "held" } }
             var exchange = resumed ?? .started(operationID: row.operationID, at: row.updatedAt, message: message, byPerson: personInitiated)
             exchange.messageID = messageID
-            exchange.phase = "sending"; exchange.status = "outcome_unknown"; exchange.settledAt = nil
+            exchange.phase = "sending"; exchange.status = "sending"; exchange.settledAt = nil
             row.exchanges = try AgentConversationExchange.bounded((row.exchanges ?? []).filter { $0.id != row.operationID } + [exchange], file: fileURL)
             if let latest = row.exchanges?.indices.last { row.exchanges?[latest].lifeID = row.lifeID }
             row.personInitiated = personInitiated ? true : nil
@@ -146,15 +200,19 @@ public struct AgentConversationStore: Sendable {
     }
 
     /// If the reply settled meanwhile, leave the send to the caller instead of queuing it.
-    public func enqueue(id: String, text: String, byPerson: Bool, arguments: [String: JSONValue]? = nil,
+    public func enqueue(id: String, scopeSessionID: String, text: String, byPerson: Bool, arguments: [String: JSONValue]? = nil,
                         stillInFlight: (AgentConversationRecord) throws -> Bool) throws -> (AgentConversationRecord, AgentConversationQueued)? {
-        try locked {
+        guard !scopeSessionID.isEmpty, scopeSessionID.utf8.count <= 256 else {
+            throw Failure(message: "The queued message needs its caller's conversation; nothing was queued.")
+        }
+        return try locked {
             var rows = try load()
             guard let i = rows.firstIndex(where: { $0.id == id }), try stillInFlight(rows[i]) else { return nil }
             guard (rows[i].queued ?? []).count < 20 else {
                 throw Failure(message: "Twenty messages are already queued on this conversation; nothing more was added.")
             }
-            var item = AgentConversationQueued(id: UUID().uuidString.lowercased(), text: text, queuedAt: Date(),
+            var item = AgentConversationQueued(id: UUID().uuidString.lowercased(), scopeSessionID: scopeSessionID,
+                                               text: text, queuedAt: Date(),
                                                byPerson: byPerson ? true : nil, arguments: arguments)
             item.lifeID = try DataRootLife.current(in: fileURL.deletingLastPathComponent().deletingLastPathComponent())
             rows[i].queued = (rows[i].queued ?? []) + [item]
@@ -189,19 +247,36 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    public func holdQueued(id: String, item: AgentConversationQueued, reason: String) throws {
-        try locked {
+    /// A refusal before begin settles this queued send; withdrawal or a begun send cannot be reinserted.
+    public func refuseQueued(id: String, item: AgentConversationQueued, reason: String, reserved: Bool = false) throws {
+        let saved: (row: AgentConversationRecord, item: AgentConversationQueued)? = try locked {
             var rows = try load()
-            guard let i = rows.firstIndex(where: { $0.id == id }) else { return }
-            var held = item
-            held.held = reason
-            held.waitingForMac = nil
-            rows[i].queued = [held] + (rows[i].queued ?? []).filter { $0.id != item.id }
+            guard let i = rows.firstIndex(where: { $0.id == id }) else {
+                throw Failure(message: "The refused message's conversation is missing; its settlement could not be saved.")
+            }
+            guard !reserved || rows[i].queueReservation == item.id,
+                  var queued = rows[i].queued,
+                  let j = queued.firstIndex(where: { $0.id == item.id }) else { return nil }
+            queued[j].held = reason
+            queued[j].waitingForMac = nil
+            rows[i].queued = queued
+            if rows[i].queueReservation == item.id { rows[i].queueReservation = nil }
             if rows[i].operationID == item.id, rows[i].sendEvidence["reason"] == .string("mac_busy") {
-                rows[i].receipt = .object(["status": .string("held"), "sent": .bool(false), "detail": .string(reason)])
+                rows[i].receipt = .object(["status": .string("not_sent"), "sent": .bool(false), "terminal": .bool(true),
+                    "detail": .string(reason)])
             }
             rows[i].updatedAt = Date()
             try save(rows)
+            return (rows[i], queued[j])
+        }
+        if let saved, saved.item.byPerson != true {
+            guard let scope = saved.item.scopeSessionID, !scope.isEmpty else {
+                throw Failure(message: "Message \(saved.item.id) was not sent, but its queued caller is missing; "
+                    + "its refusal notice could not be returned.")
+            }
+            Self.returnNews(saved.row, scope: scope, once: "not-sent:" + saved.item.id,
+                words: saved.row.name + ": " + TurnSecretRedactor.redactText(reason), peers: [saved.row.agent],
+                dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
         }
     }
 
@@ -217,7 +292,7 @@ public struct AgentConversationStore: Sendable {
             let args: [String: JSONValue] = ["expects_reply": .bool(rows[i].awaitsReply)]
             // Exact desktop requests must retain their requested chat title.
             if let conversation { rows[i].conversationID = conversation }
-            var item = AgentConversationQueued(id: operation, text: text,
+            var item = AgentConversationQueued(id: operation, scopeSessionID: rows[i].scopeSessionID, text: text,
                 queuedAt: started,
                 byPerson: rows[i].personInitiated, arguments: args,
                 held: detail + " Waiting for the Mac to be free; it will go then.")
@@ -328,6 +403,7 @@ public struct AgentConversationStore: Sendable {
         edit: (inout AgentConversationRecord) throws -> Void) throws -> AgentConversationRecord {
         try locked {
             var rows = try load()
+            let original = rows
             guard let i = rows.firstIndex(where: { $0.id == id && $0.operationID == operationID }) else {
                 throw Failure(message: "This conversation has moved on; the older result was not applied.")
             }
@@ -345,6 +421,7 @@ public struct AgentConversationStore: Sendable {
                     rows[j].selected = false
                 }
             }
+            if rows == original { return rows[i] }
             try save(rows)
             // Only the route owner can attest the reply.
             noteReplies(was: identity, now: rows[i], from: rows[i].agent)
@@ -401,8 +478,6 @@ extension AgentConversationStore {
         clock.dateFormat = Calendar.current.isDateInToday(last.at) ? "HH:mm" : "MMM d HH:mm"
         let when = clock.string(from: last.at)
         if !last.mine { return answering ? "last answered \(when)" : "last heard from them \(when)" }
-        if case .object(let fields)? = receipt, fields["reply_state"] == .string("no_reply_expired"),
-           case .string(let detail)? = fields["detail"] { return "last message \(when), no reply — " + detail }
         if case .object(let fields)? = receipt, fields["status"] == .string("waiting") { return "last message \(when), reply still coming" }
         guard let row, let current = row.exchanges?.last(where: { $0.id == row.operationID }) else {
             return "last message \(when), no reply came"

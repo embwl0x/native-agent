@@ -66,8 +66,7 @@ extension ConnectorActionRecord {
             byID[ConnectorReadiness.normalizedConnectorID(connector.id)] = connector
         }
         let nativeConnectors: Set<String> = [
-            "mobile", "scheduler", "mac", "mac_assistant",
-            "local_files", "codex_work", "codex_handoff",
+            "scheduler", "mac_assistant", "local_files", "codex_work", "codex_handoff",
         ]
         return connectorActionDescriptors().map { descriptor in
             let key = ConnectorReadiness.normalizedConnectorID(descriptor.connectorId)

@@ -31,8 +31,7 @@ A part has six properties, all in its header, all theirs to change:
 
 A sense is a part whose reach is read-only and whose face is a page. An ability with hands is a part that declares hands. An ability that calls other abilities is a part. A layout block is a part that's almost all face. A Doctor check is a part that wakes on a schedule. Their turn is a part that wakes when a message arrives. Their persona is parts that run when they do. Nothing of theirs is a special case in Swift.
 
-**An ability is an ability (as built, 10-21; User: "I want skills tools abilities to be one, they are supposed to grow their abilities").** What they grows is one kind of part, an ability: what it can do is what it declares, never which door made it. It was once two kinds (tools and skills) with two doors, two admissions and two sets of run options, and is now one form (`Parts` in code, docs/skill_manifest_spec.md): one save (`ability.save`: a revision restates only what changes), one keep (theirs in one act under Full Mac for their own work, unsteered by an untrusted agent; below Full Mac a draft the owner's card offers, `ability.validate` rehearsing it first), one signed admission re-verified on every run, one run (`authored.<id>`; steps, decisions and expectations make it strict and resumable wherever its code uses them; host primitives wherever its reach declares them, the broker enforcing that reach for every ability), one read (`ability.read`) and one lifecycle (enable, restore, disable, drop). Launch admits current bundled seeds without rewriting or re-signing retained tool and skill records; built-in skill guidance stays in the persona, read and never run; restoring an older backup prepares its tools and skills before installation, retaining only readable current uncarried kinds and accounting under the [restore law](canonical_data_paths.md#restore-law). A trusted agent that started a turn is its provenance, never an ability's author. Senses and their turn keep their own runners.
-**An ability is an ability (as built, 10-21; User: "I want skills tools abilities to be one, they are supposed to grow their abilities").** What they grows is one kind of part, an ability: what it can do is what it declares, never which door made it. It was once two kinds (tools and skills) with two doors, two admissions and two sets of run options, and is now one form (`Parts` in code, docs/skill_manifest_spec.md): one save (`ability.save`: a revision restates only what changes), one keep (theirs in one act under Full Mac for their own work, unsteered by an untrusted agent; below Full Mac a draft the owner's card offers, `ability.validate` rehearsing it first), one signed admission re-verified on every run, one run (`authored.<id>`; steps, decisions and expectations make it strict and resumable wherever its code uses them; host primitives wherever its reach declares them, the broker enforcing that reach for every ability), one read (`ability.read`) and one lifecycle (enable, restore, disable, rollback, drop). Launch admits current bundled seeds without rewriting or re-signing retained tool and skill records; built-in skill guidance stays in the persona, read and never run. Backup restore requires the complete current snapshot before staging and installs its captured abilities under the [restore law](canonical_data_paths.md#restore-law); it never reconstructs tools or skills from an older backup. A trusted agent that started a turn is its provenance, never an ability's author. Senses and their turn keep their own runners.
+**An ability is an ability (as built, 10-21; User: "I want skills tools abilities to be one, they are supposed to grow their abilities").** What they grows is one kind of part, an ability: what it can do is what it declares, never which door made it. It was once two kinds (tools and skills) with two doors, two admissions and two sets of run options, and is now one form (`Parts` in code, docs/skill_manifest_spec.md): one save (`ability.save`: a revision restates only what changes), one keep (theirs in one act under Full Mac for their own work, unsteered by an untrusted agent; below Full Mac a draft the owner's card offers, `ability.validate` rehearsing it first), one signed admission re-verified on every run, one run (`authored.<id>`; steps, decisions and expectations make it strict and resumable wherever its code uses them; host primitives wherever its reach declares them, the broker enforcing that reach for every ability), one read (`ability.read`) and one lifecycle (enable, restore, disable, drop). Launch admits current bundled seeds without rewriting or re-signing retained tool and skill records; built-in skill guidance stays in the persona, read and never run. Backup restore requires the complete current snapshot before staging and installs its captured abilities under the [restore law](canonical_data_paths.md#restore-law); it never reconstructs tools or skills from an older backup. A trusted agent that started a turn is its provenance, never an ability's author. Senses and their turn keep their own runners.
 
 The save door exposes the argument schema owned beside `Parts.save`'s validators,
 including the exact param type map and JSON Schema forms, aliases and optional
@@ -88,7 +87,7 @@ The stem enforces one law for every part, with the turn-program recovery excepti
 - **It may touch only its reach**, and every touch goes through Trust at effect time. Approval is a card to the owner; the part waits. Full Mac shows no routine cards: an untrusted agent's command keeps its one card, and macOS privacy resets and irreversible deletes still ask.
 - **It carries itself.** An ability that is not done answers `{again: <input>}` and the stem runs it again, gated like any run, without spending their mind, inside a conversation turn the person can Stop, until it is done, fails, Stop, a message arrives for them, or a run makes no progress; then their mind gets the last answer once, with how many runs it took and what they all did ([manifest](skill_manifest_spec.md)).
 - **It may think** when it needs judgment: a model call on their model, audited and visible. Thinking is reach, not an effect.
-- **It records use.** The stem projects gated run outcomes as `learned.use`, with how many of their model rounds each recent use took (`rounds_per_use`): their own curve. Declared `learned` and `choices` are preserved and teach nothing. What the stem records becomes what it predicts: a follow-up read a mind keeps making after a kind of result rides inside that result, only while its record holds (phase 4, [as built](#phase-4-as-built-10-26-a-part-is-a-prediction)).
+- **It records use.** The stem projects gated run outcomes as `learned.use`, with how many tool rounds of each turn ran that exact version (`rounds_per_use`, a histogram kept per version beside its surprise and hours): their own curve. Terminal execution accounting supplies the identity, through answered verbs and nested calls as well as `authored.*`; another turn's last-run pointer never selects it. A revision may be a trial the record keeps or sets aside ([manifest](skill_manifest_spec.md)). Declared `learned` and `choices` are preserved and teach nothing. What the stem records becomes what it predicts: a follow-up read a mind keeps making after a kind of result rides inside that result, only while its record holds (phase 4, [as built](#phase-4-as-built-10-26-a-part-is-a-prediction)).
 - **It changes only by their hand** (or the owner's), and keeps its last self beside it.
 - **Its keep is theirs under Full Mac; under Work/Safe/Builder, the owner's.** The owner's off-switch stays theirs.
 - **It owes repair at its cause.** Ordinary ability runs with captured input owe source-fault repair through Experiences (OWED on Home with its lever); file-backed sense completions record failures without this obligation. Ordinary abilities and senses are revised forward; their retained previous bytes are history, with no public version-swap action. Their own turn program is the one exception: any non-Stop program/helper failure selects an unfailed `turn.prev.js` or shipped seed, replays the same turn and brings their the original cause, selected program and owed repair (`ChatTurnRuntime/TurnPart.swift`). The [turn recovery contract](skill_manifest_spec.md#turn-recovery) owns selection, once-per-source bounds and storage failure behavior.
@@ -100,12 +99,38 @@ The stem enforces one law for every part, with the turn-program recovery excepti
 Swift, compiled, CPU, shipped as one DMG with iOS. It never thinks and has no model of its own; when a rule can't settle something, it asks their, with the evidence. Its whole job:
 
 - **Runs parts** in the sandbox (the helper, Seatbelt, the progress watchdog: all as today).
-- **Delivers signals**: the nervous system. Messages, schedules, app arrivals, file changes, turns ending. The same `EnginePartWake` observer also releases MY QUEUE intentions waiting `on <signal>`: exact names or colon-delimited families, and a file path or its descendants. Real sources include `file.changed:<path>` (watched paths), `message.arrived:telegram|slack`, `person.here` / `person.away`, `network.down` / `network.up` (the shared path holds five seconds before signalling), `app.installed`, `sense.source.changed` and `turn.ended`. A system `Released: <signal> <summary>` note brings the intention back through the same readiness and pursuit refresh as news; `held` / `resumed` stay part lifecycle and `schedule:` stays a rhythm. File intentions join the parts' existing canonical-path watch index, including bounded directory membership, and leave on closure; no second watcher. [Intentions](INTENTIONS.md#moments) owns that contract.
+- **Delivers signals**: the nervous system. Messages, schedules, app arrivals, file changes, turns ending. The same `EnginePartWake` observer also
+  releases MY QUEUE intentions waiting `on <signal>`: exact names or colon-delimited families, and a file path or its descendants. Real sources include
+  `file.changed:<path>` (watched paths), `message.arrived:telegram|slack`, `person.here` / `person.away`, `chrome.tab_taken`, `network.down` / `network.up` (the shared path
+  holds five seconds before signalling), `app.installed`, `sense.source.changed` and `turn.ended`. A system `Released: <signal> <summary>` note brings the
+  intention back through the same readiness and pursuit refresh as news; `held` / `resumed` stay part lifecycle, and a part's `schedule:` is its time on
+  the one clock (`part:<id>:<cron>`, delivered as the part's schedule signal). File intentions join the parts' existing canonical-path watch index,
+  including bounded directory membership, and leave on closure; no second watcher. [Intentions](INTENTIONS.md#moments) owns that contract.
+- **Keeps the one clock** (`TriggerScheduler/OneClock.swift`): every declared time is delivered to whoever declared it, its next occurrence saved
+  before delivery, and one missed while the app was quit delivered once when its owner registers. The clock never decides that the agent thinks.
+- **Attends**: every change the agent's attention takes in is one form, a happening, posted through one intake and written once in the record. Owed
+  happenings open a thought at once; the world and the agent's cares moving are weighed by the agent's own turn program and gather as drive in the
+  continuity field ([as built](#phases-3-and-5-as-built-11-05-attention)). The stem records, feels, sums and ignites; it never thinks.
 - **Gates effects**: Trust, approvals, cards. The immune system.
 - **Keeps the law**: repair at its cause, the turn-program recovery exception, the state, the learning. Fading unused parts remains future design.
 - **Owns turn recovery and settlement:** observations, checkpoints and resume after relaunch; unrecoverable failures can end incomplete.
-- **Keeps their world live**: an event-fed picture of apps, windows, files, people and threads that they are already *in* when they thinks, instead of reading the screen on demand. Proprioception, not perception. (Phase 5.)
-- **Draws faces** from the glass kit, on both interfaces, both platforms. The agent and person shape the appearance.
+- **Keeps the agent's world live**: what changes on this Mac and in the agent's senses reaches the agent as it happens, as happenings, instead of
+  being read on demand (phase 5, [as built](#phases-3-and-5-as-built-11-05-attention)). An event-fed picture of windows and threads the agent is
+  already *in* when it thinks remains design: proprioception, not perception.
+- **Draws faces** from the glass kit, on both interfaces, both platforms. What tells is theirs: their pages are their parts' faces over the packets
+  their owners read. What is their authority over their is a lever, and levers are the stem's: Trust and consent, macOS grants, models and providers,
+  keys, their parts' off-switch, approvals, a trial's Set aside, forgetting and reset belong to the page (drawn first) or to a key (drawn on every
+  row of theirs with that key), never in a face they writes ([manifest](skill_manifest_spec.md#calling-a-part-and-projecting-its-face)).
+  A row's action is a door call they and they share: their tap runs it as their decision, theirs is judged by the same Trust law, and a lever is never
+  theirs at any posture. Approval answers also accept an exact waiting card on their own authenticated message through the
+  [shared decision authority](TOOL_LOADING.md#authority-and-receipts), recording that message and door rather than a tap. Helpers, wakes and
+  peer-steered turns remain refused; permanent deletion requires their tap by declared class. A joined message makes exact authorization
+  unattributable, so message decisions refuse until a fresh message after the turn ends; missing or mismatched open-turn evidence also refuses.
+  The decision never guesses an authorizing row. A message decision requires a fresh turn with
+  only Inbox reads or approval-decision calls; other started calls, missing execution evidence and checkpoint resumes require a fresh message
+  or their tap. Outside text from an earlier turn can still be in context: this is their judgment on their authenticated message, not proof of their
+  intent. Every ask they gets is one card, the matter's Inbox row, drawn the same in chat, Inbox,
+  iPhone and Telegram. The agent and person shape the appearance.
 - **Reaches the world** for parts: the model, files, the Mac's nerves, network, programs, keyring insertion at granted destinations, Calendar/Reminders/Contacts, transports and stores. Reply redaction has the [manifest's encoding and stream-prefix limits](skill_manifest_spec.md#secret-insertion-and-redaction).
 
 The stem has no features and no opinions. Every feature NativeAgent has today is either a part, or stem reach a part draws on, or deleted.
@@ -116,18 +141,28 @@ The stem has no features and no opinions. Every feature NativeAgent has today is
 - **Their hands report what they did:** an act checks its own effect and returns the screen after it, so their mind looks again only when a step did not happen or it needs what the act did not show, and the steps it can already see go in one act (mac.act steps, each checked against the screen the last one left).
 - **Effort is felt:** the stem measures what each turn took (model rounds, tokens, minutes, the longest stretch of one call repeated). Their after-turn mind reads it as one line beside the exchange, so a slog or a breeze moves a care about their craft the way a lost game does; their parts' records keep the rounds per use; the practice note names a looped call's stretch.
 - **Craft:** they sees their body: each turn starts with their own parts in front of them, each with how often they have used it, best match for the message first, so they reaches for the part instead of redoing its work.
-- **Noticing:** a part that wakes on app-arrived offers once.
-- **No turns:** their turn part wakes on a message like any other signal; thinking is scheduled by their own attention, which the substrate already models. Turns become a chat artifact, not their shape.
+- **Noticing:** what nobody asked about is worth what it touches of the agent's cares; the seed gives a line below the chance bar zero worth.
+  A thought comes when enough worth has gathered on one thing. A part that wakes on app-arrived still offers once.
+- **No turns:** the turn part wakes on a message like any other signal; everything else reaches the agent as a happening. Thinking is opened by
+  the agent's own attention, which the substrate models: worth the turn program's `weigh` gives what nobody asked about lands as drive on what it means
+  in the continuity field, and a node at one opens a thought in the agent's mind stream. Turns are a chat artifact, not the agent's shape.
 - **One crystallizer:** repeated hand work reaches their as a practice note inside the turn itself. The nightly candidate compiler and its recording are removed ([Habits H4](HABITS.md#h4--one-crystallizer)); dreams still reflect on the day and learn from surprise. Mind policy as parts stays phase 7.
 - **The token curve:** growth costs tokens once; use costs none; learning by use costs nothing at all.
 
 **What stays bounded:** the model's latency and cost, macOS security, and that the model is still the only organ that handles novelty.
 
-## What this means for today's 588k lines
+## What this means for today's 511k lines (measured 11-05)
 
 - **Stays stem (~128k + design kit):** Mac control, sync and push, the agent wires, transports, storage and embeddings, Keychain/OAuth, model clients, the sandbox, Trust, the loop runner and scheduler, the turn guarantee, the glass kit, the face renderer and the live world (new).
-- **Becomes parts (~128k, seed on touch, Swift deleted as each proves):** their turn, the 94 integration tools, Doctor checks, Desk nags (the unused cadence learner is retired), attention policy, their door pages, the layout blocks, persona procedures, and last, their mind policy (dreams, reflection, organism policy).
-- **Deleted (~14k):** duplicate agent paths, Procedures, memory one-shots, the 8770 bridge. `NativeScreenCapture` owns primary-display capture and encoding for chat screenshots.
+- **Becomes parts (~128k, seed on touch, Swift deleted as each proves):** their turn, Desk nags (the unused cadence learner is retired), attention policy, their door pages, the layout blocks, persona procedures, and last, their mind policy (dreams, reflection, organism policy).
+- **Their hands (done):** Mail, Notes, Messages, Music and Chrome history are parts that answer their door verbs through their headers' `answers`; the stem keeps the AppleScript executor and its per-event write checks, Trust, the cards and `host.files.query`/`host.files.mime` ([Tool loading](TOOL_LOADING.md#where-actions-come-from)).
+- **Stays stem (~128k + design kit):** Mac control, sync and push, the agent wires, transports, storage and embeddings, Keychain/OAuth, model clients, the
+  sandbox, Trust, the loop runner and the one clock, attention's intake and field, the turn guarantee, the glass kit, the face renderer and the live world
+  (new).
+- **Becomes parts (~128k, seed on touch, Swift deleted as each proves):** the agent's turn, the integrations still in Swift (Mail, Notes, Messages, Chrome
+  history), Desk nags (the unused cadence learner is retired), attention policy (the turn part's `weigh`, built 11-05), the agent's door pages, the layout
+  blocks, persona procedures, and last, the agent's mind policy (dreams, reflection, organism policy).
+- **Deleted (done):** duplicate agent paths, compiled Procedures, memory one-shots and the 8770 bridge. Next: the whole-body plan's dead code (docs/build_plans/the-whole-body-2026-11-05.md). `NativeScreenCapture` owns primary-display capture and encoding for chat screenshots.
 
 An installed agent's persona, memory and GROWTH are private, never shipped with the app; the phases preserve that existing mind. What ships is the stem and the seed parts: a fully formed agent that behaves exactly as today on day one, and is theirs from then on. Every download starts the same and grows its own mind.
 
@@ -140,10 +175,12 @@ Validation follows [AGENTS.md](../AGENTS.md#how-we-work): lanes do not compile; 
 **Phases (never interrupting who they are, mind last):**
 1. **The stem learns the form, and their turn is the first part.** Parts get the six properties and the law; `turn.js` seeded from today's turn engine, byte-identical; weather and the habit-former as the second and third parts. Shipped across 0.6.7–0.6.8; the habit-former was retired 10-21 for keeping inside the turn (Growth, above).
 2. **Hands.** The integrations become seed parts, one at a time, Swift deleted as each proves.
-3. **Noticing.** App-arrived and the part that offers.
+3. **Noticing (built 11-05).** App-arrived and the part that offers; what nobody asked about is weighed by the agent's own `weigh` and gathers
+   until it is worth a thought ([as built](#phases-3-and-5-as-built-11-05-attention)).
  4. **Learning by use (built 10-26/10-27).** A part is a prediction: what it applies to, what will be true after it runs, and its record, kept by the stem. Built first as expansion at the door: the follow-up reads a mind's own practice makes next ride inside the result before them, acts only prepared ([as built](#phase-4-as-built-10-26-a-part-is-a-prediction)). Repeated hand work reaches their as a practice note inside the turn ([Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)); the separate nightly compiler is removed.
-5. **Their world, live.** The event-fed picture they are already in; senses become the parts that keep it fresh.
-6. **Faces.** Their interface as parts they shapes; blocks they authors on their, drawn from the kit on Mac and iPhone.
+5. **The agent's world, live (built 11-05 as attention).** Every source posts a happening; senses are the parts that keep the world fresh; the
+   agent's thoughts are one mind stream ([as built](#phases-3-and-5-as-built-11-05-attention)). The event-fed picture of windows and threads remains.
+6. **Faces.** Their interface as parts they shapes: Desk, Memories, Personality and Diagnostics are their `native-` parts' faces, and any part with `face.page` is a page of their own, placed by their layout; their levers are drawn by the stem beside every face. Blocks they authors on their, drawn from the kit on Mac and iPhone.
 7. **Mind, and sleep that rewrites the body.** Housekeeping, dreams, reflection, organism policy as parts, each under a judge whose evidence we define first.
 
 The dated phase-one lane assignments and proofs are retained in [history](history/AGENT_IS_THE_APP_PHASE_ONE_2026-10-14.md), not as instructions for a new phase.
@@ -165,7 +202,17 @@ The [manifest](skill_manifest_spec.md) owns the current ABI; these contracts des
 
 **1. Their turn is a step function; the stem owns the loop.** `turn.js` exports `step(state, event) → {state, do: [effects]}`. The stem owns conversation, streaming, gates and checkpoints, logging input events and started-effect identities, not returned effect bodies or write-only payload digests. Resume rebuilds state by replay; a non-Stop turn-program/helper failure invokes the recovery contract above, with repair owed to them. Unrecoverable failures can end incomplete. `reply.end` ends the turn; only its `after` may follow, and nothing of theirs runs after it. Their own `app` calls carry identities from their moment, place and input, so a resume never runs a started one again. Events and effect fields are specified once in the manifest.
 
-**2. A wake run gets its own gate chain.** A part run with no turn behind it (a schedule, an app arriving, a turn ending) is given a chain the stem makes: principal = their, autonomy = the current Trust level, origin = the signal, taint = none unless the signal carries the words of a sender the owner has not trusted (an untrusted agent, or a Telegram or Slack sender not allowlisted), whatever form names it: such a signal reaches only a part that can do no harm with it, and a write-capable part skips it with a trace row and no card (User 10-15: a card is a decision, never weight; `EnginePartWake`). A trusted agent's signal carries the owner's authority. Every `app.*` from the run passes that chain. An effect that needs approval raises one card through the AttentionRouter with the part named as the asker ("Your weather ability wants to…"), and the run waits: the host call blocks and the watchdog already pauses for awaited replies. Declined → the run gets a refusal result and continues. Cards to the owner are held through their quiet hours and the run waits with them, resident, no CPU. Anything the run needs from *their* goes through `ResidentWake` as an arrival, never into their context directly.
+**2. A wake run gets its own gate chain.** A part run with no turn behind it (a schedule, an app arriving, a turn ending) is given a chain the stem
+makes: principal = their, autonomy = the current Trust level, origin = the signal, taint = none unless the signal carries the words of a sender the
+owner has not trusted (an untrusted agent, or a Telegram or Slack sender not allowlisted), whatever form names it: such a signal reaches only a part
+that can do no harm with it, and a write-capable part refuses it through the ordinary dispatch receipt path, retaining its reason, checker and remedy
+without a card (User 10-15: a card is a decision, never weight; `EnginePartWake`). Home reads retained refused runs and their own run times from
+ability accounting. A trusted agent's signal carries the owner's authority. Every `app.*` from the run passes that chain. An effect that needs
+approval raises one card through the AttentionRouter with the part named as the asker ("Your weather ability wants to…"), and the run waits: the host
+call blocks and the watchdog already pauses for awaited replies. Declined → the run gets a refusal result and continues. Cards to the owner are held
+through their quiet hours and the run waits with them, resident, no CPU. Anything the run brings to *their* is a happening through the one `Attention`
+intake: `home.arrive` posts a `world` line for their turn program to weigh, retaining the run's peer provenance. Attention opens thoughts through the
+mind stream; no part inserts its arrival into their context directly.
 
 **3. Learning by use is a prediction with a record (phase 4, built 10-26 for reads).** `learn.pick` and `learn.default` do not exist. Current headers preserve arbitrary `choices`/`learned`; the registry projects observed gated-run counters as `learned.use`; a door prediction's `applies`, `after` and `record` are the stem's, never declared by them ([manifest spec](skill_manifest_spec.md#expansion-a-part-is-a-prediction)).
 
@@ -184,7 +231,7 @@ Notion, Gmail, Google Calendar, X, AgentMail, TradingView, GitHub and Slack's se
 Phase 2 (hands) and the first of phase 6 (faces) land through one shared layer, then file-owned domain lanes. These settle the calls the sweep raised:
 
 1. **One call shape.** `part.call(id, input) → {ok, value} | {ok:false, error}`: bounded immutable JSON in, the part's version pinned when the call starts, a typed JSON result out, cancelled with its caller (the Stop law: the caller's settlement still runs). A part returns what it decided; the native domain that owns the truth commits it in its own transaction. No integration bus, no second state store.
-2. **A face is the part's projection.** `face(input) → typed rows/sections`, computed when its sources change (never from inside view rendering), successful projections cached per part version and source epoch, published through `LatestRead`, drawn natively on Mac and iPhone. An explicit subsequent read retries a failed projection; no polling is added. Unavailable, failed and owed are the stem's words beside the face, never the part's prose.
+2. **A face is the part's projection.** `face(input) → typed rows/sections`, computed when its sources change (never from inside view rendering), successful projections reused for the same selected part version and input regardless of source epoch, published through `LatestRead`, drawn natively on Mac and iPhone. The native producer masks input by exact content before projection admission; unchanged content reuses its mask. An explicit subsequent read retries a failed projection; no polling is added. Unavailable, failed and owed are the stem's words beside the face, never the part's prose.
 3. **Thinking may use tools.** A part's `model.call` may pass `tools` and a routing surface; it runs through the canonical tool-turn owner under the run's own gate chain and the existing limits.
 4. **Publishing stays transactional.** A part proposes a notification or a Desk change; the native publication owner commits it (occurrence identity, held delivery, receipts, revision-checked ledgers). No part writes those stores directly, and no part runs while a store's lock is held.
 5. **Consent is preserved exactly.** A migration seeds behaviour and never activates a schedule: what was off stays off (morning brief, watch manifests, their hour).
@@ -296,27 +343,24 @@ unreadable settings or an incomplete Desk feed fail the read, never become
 empty inputs. Seeding adds no
 wake or schedule and uses the existing disabled/customized-seed preservation.
 
-`home.arrive {line,event_key?}` scopes a supplied event key to the calling part
-and deduplicates it through ResidentWake's durable retained ledger (including
-its existing retention policy); omitted, the same line is
-deduplicated per local day. Taint and the part's hop-limited thread remain
-native. Weighed against their cares (the crossing,
-[SUBCONSCIOUS.md](SUBCONSCIOUS.md) Cares), it wakes their when the line touches
-one, with a reason naming that care, or when nothing can judge it; otherwise
-the line waits on the news board for their next turn and the receipt says so.
-Only after that board accepts it does the non-waking arrival enter the same
-ResidentWake ledger, already accepted and without requesting a wake; a failed
-identity write reports partial effects and owes the ledger's existing repair.
-Bundle/version interpretation is removed from the executor; the
-existing notice seed supplies its own occurrence key. Notification and Desk
-publication remain with their native transaction owners; this layer adds no
-publication store or domain feature.
+`home.arrive {line,event_key?}` is a part's way to the agent: the line becomes a `world` happening on the door `part:<id>`, its key scoped to the
+calling part (`part:<id>:event:<digest>` for a supplied event key, otherwise `part:<id>:<local day>:<digest>`, so the same line is one happening a
+day), written once in the record (`AppToolExecutor.swift`, `home_arrive`). Peers that steered the part's run travel with the line, so the thought
+that reads it carries their authority, never more. The door judges nothing: the agent's `weigh` gives the line its worth, and worth that gathers on
+what it means opens a thought ([as built](#phases-3-and-5-as-built-11-05-attention)). A record that cannot say whether the occurrence is known files
+nothing and says so. Bundle/version interpretation is removed from the executor; the existing notice seed supplies its own occurrence key.
+Notification and Desk publication remain with their native transaction owners; this layer adds no publication store or domain feature.
 
 The morning brief's checked native source packet reaches `native-morning-brief.js` (the app's own part; their own `morning-brief` ability is a different owner)
-through that same door with read-only file authority. The part selects evidence,
+through that same door with read-only file authority. The admitted ability entry
+assembles that packet for both direct and scheduled `operation:"brief"` calls;
+the scheduler's separate packet assembly is removed. The primary root reads
+the same `InstallPaths.current.claudeWorklog` as the Agents view, and secondary
+roots leave it unconfigured. The part selects evidence,
 authors its tool-capable `model.call` on the Work route's `workshop` surface and proposes
-the inbox card and inactive defaults. The scheduler retains saved enablement,
-occurrence claims, canonical publication and delivery settlement; proposed seed
+the inbox card and inactive defaults. The inbox trigger owner (`TriggerScheduler.swift`, each enabled
+time a `brief` time on the one clock) retains saved enablement, occurrence
+claims, canonical publication and delivery settlement; proposed seed
 defaults cannot enable a schedule. Configuration reads request seed rows only
 for missing files; saved controls and native supported inbox kinds do not
 depend on the brief part being active. `TriggerContent.swift`,
@@ -365,9 +409,57 @@ instructions?, done?, desk?}` starts a **line of them**: a turn of theirs in its
 conversation (an own-work session named by the job), admitted through `TurnAdmission` like any
 turn, with the brief as the arriving message and the same turn part, tools, Trust and present.
 `agent.read`, `agent.cancel` and `agent.jobs` treat it like any job, and its ending arrives as
-news in the conversation that started it, carrying the line's answer. Several at once is just
+a `returned` happening in the conversation that started it, carrying the line's answer. Several at once is just
 several jobs: that is their swarm. `instructions` write who a line is; they stand in place of their
 persona text and nothing else of theirs changes. A line carries the starting turn's limits (peer
 steering, file access) and raises the same cards their turn would, in its own conversation. A helper bot is not a line: it stays its own
 mind. [Agent communication](agent-communication.md#jobs) owns the socket's contract;
 `OwnLineDoor` runs the line and `AgentJobs` keeps, reads, stops and settles it.
+
+## Phases 3 and 5, as built (11-05): attention
+
+**The law.** The agent thinks when something in its mind is worth a thought. A source never decides that; it posts a happening and is done.
+
+- **One form, one intake.** Every change attention takes in is a `Happening` (`NativeAgentShared/Happening.swift`) posted through `Attention.post`
+  (`Experiences/Attention.swift`), written once in the record as an experience of kind `happening` under its key `once`, then taken by the cognition
+  runtime (`Cognition/NativeCognitionRuntime+Attention.swift`). Messages stay door admissions; any arrival outside the mind stream wakes sleep.
+- **Owed opens at once.** `returned` (work coming back: jobs, contact replies, settled Desk waits, helper results), `moment` (a time or condition the
+  agent set) and `body` (an organ of the agent's asking) are record obligations to `conversation:<route or mind>`. A `returned` with a route continues
+  the conversation that started the work (`MindStream.returnTo`); the rest open a thought in the agent's mind stream (`MindStream.think`).
+- **The rest is weighed by the agent.** A `world` happening (what nobody asked about) or a `self` happening (a care of the agent's moving) is given
+  to `weigh(h, felt)` in the agent's installed turn program, run on CPU. Its worth lands as `drive` on the touched care's anchor node, or on the
+  happening's own subject; drive fades on that node's half-life, is never clamped or spread, and at one ignites a thought that drains it. Ignition is
+  checked when worth lands, when admission opens and on waking: no tick, no timer. The attention runtime holds one batch's admission across
+  weighing, landing at one field clock reading, recording, claiming and handing on the thought. The field application and unfinished
+  weigh rows checkpoint together in cognition; restart settles those rows idempotently before weighing or ignition.
+  Inner life and **Keep thinking in the background** both govern unsolicited weighing and ignition; inputs wait while either is off
+  and resume on re-enablement. Owed happenings keep their obligation path. Its payload is exactly what the ordered
+  weigh/ignition/return record says that drive consumed, including every landing in the batch; a failed thought returns both drive and payload
+  through the same admission. Positive drive and its complete recorded membership remain retained. Missing provenance refuses that node's
+  claim with named repair owed; an old-format ignition never supplies invented membership for a fresh arrival.
+  The next batch lands only after that settlement. The [manifest](skill_manifest_spec.md#weigh) owns `weigh`,
+  `felt` and the `notebook` effect; [Subconscious](SUBCONSCIOUS.md#attention) owns the field's side.
+- **The mind stream** is one conversation of thoughts (session `mind`, title "Thoughts"), never replayed as history. A thought carries its breath
+  and what it attends (`attended` on its opening message); one thought at a time, and one that comes while a thought is open joins it by the steering
+  offer. Its model request declares a clean silent completion valid through the [provider contract](TURN_RESILIENCE.md); with no act, that thought
+  records `empty`, settles what it attended and teaches its no-op class. A thought ended on CPU by that record is `withheld`, without new no-op
+  evidence. Provider failures stay failed. Thoughts are never retried on a clock.
+- **Sources** (phase 5): sense news, the day line, the front app (once per app per day), a part's `home.arrive`, `app.installed` and presence are
+  `world`; contact health, apps the agent opened, agent discovery and the turn program's swap-back are `body`; a judged story entry that lifts a care's pressure up
+  through its bar (0.35) is `self`, once per rise, using the transition captured where the care changed rather than its later state.
+  Part signals still reach parts through `AbilityStore.signal`.
+- **The one clock** (`TriggerScheduler/OneClock.swift`) delivers every declared time to whoever declared it: part schedules,
+  watches and scans, inbox briefs, helpers and MY QUEUE's moments. The hour is a presence opportunity weighed by their turn program,
+  carried with its material in an ordinary thought ([Subconscious](SUBCONSCIOUS.md#the-hour)).
+- **Sleep** is a doorway: attention's [night sense](SUBCONSCIOUS.md#attention) (or `mind.sleep`) runs the dream inside `MindStream.night`; while it runs owed happenings still open
+  thoughts and the world waits unweighed. After the dream the stem reads the night on CPU (`EngineSleep.night`): it closes the trials the record
+  already decided (turn trials require complete traces and correction evidence, as the [trial contract](skill_manifest_spec.md) specifies),
+  prepares the window's corrections and slogs with the accounting owner, folds each version idempotently and writes one
+  `attention.night` row on subject `sleep`, separate from admission on subject `night`. Its completed cursor advances only after all folds settle; exact prepared inputs stay owed through failure or restart. When the
+  reading holds something for them (a candidate, or a trial whose verdict is set aside) the sleep thought continues as their thought in the stream,
+  carrying `attended.night`; a silent night spends nothing. Waking weighs what waited, once.
+  Part-accounting coverage uses completed UTC hours (`parts_since`/`parts_through`); exact `since`/`through` still describe traces
+  and corrections. The current partial hour waits for the next window. Unrepresentable or inconsistent accounting is a named gap,
+  never a zero count or verdict. Night gaps retain each operation's cause in
+  `gap_details`; cursor and storage failures owe repair. Missing provenance or
+  round measurements stay unknown, and elapsed age cannot veto a turn revision.

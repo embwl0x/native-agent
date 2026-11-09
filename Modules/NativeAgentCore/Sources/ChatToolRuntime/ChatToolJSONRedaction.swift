@@ -9,10 +9,11 @@ import ToolRegistry
 package enum ChatToolJSONRedaction {
     /// Redact secret-bearing arguments before persistence or preview; malformed injection arguments cannot be inspected and are suppressed.
     package nonisolated static func injectionRedactedArgJSON(tool: String, json: String, turn: Turn?, catalog: [String: AppActionBinding]? = nil) -> String {
-        // Rewrite only calls carrying injections so ordinary argument bytes remain intact.
+        // App evidence uses the execution owner's bound names before any content policy sees the arguments.
         if MacInjectionArgRedaction.normalized(tool) == "app" {
-            guard let parsed = try? JSONValue.parse(Data(json.utf8)), case .object(let input) = parsed,
-                  MacInjectionArgRedaction.appDoorCarriesSecret(input, turn: turn, catalog: catalog) else { return json }
+            guard let parsed = try? JSONValue.parse(Data(json.utf8)), case .object(let input) = parsed else {
+                return "[redacted: \(tool) arguments could not be read]"
+            }
             return (try? JSONValue.object(MacInjectionArgRedaction.redacted(tool: tool, input: input, turn: turn, catalog: catalog))
                 .serialize(pretty: false)) ?? "[redacted: \(tool) arguments]"
         }

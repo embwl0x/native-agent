@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `TelegramTurnCardLedger.swift` | `TelegramTurnCardLedger`, `upsert`, `remove`, `TelegramTurnCardRestartRepairer` |
+// Blueprint: | `TelegramTurnCardLedger.swift` | `TelegramTurnCardLedger`, `upsert`, `remove`, `TelegramTurnCardRestartRepairer`; unchanged durable card facts preserve their timestamp and write nothing |
 
 struct TelegramPersistedTurnCard: Sendable, Codable, Equatable {
     let turnId: UUID
@@ -105,6 +105,10 @@ actor TelegramTurnCardLedger {
             }
         )
         let replacesExisting = records.contains { $0.turnId == safeRecord.turnId }
+        // A heartbeat changes presentation time, not durable identity. Preserve the timestamp of the last real change.
+        if let prior = records.first(where: { $0.turnId == safeRecord.turnId }),
+           prior.chatId == safeRecord.chatId, prior.messageId == safeRecord.messageId,
+           prior.phase == safeRecord.phase, prior.terminalText == safeRecord.terminalText { return }
         if !replacesExisting, records.count >= maximumRecords {
             throw TelegramTurnCardLedgerError.capacityExceeded(maximumRecords)
         }

@@ -27,7 +27,7 @@ extension NativeCognitionRuntime {
         return try SwiftNativeKnowledgeGraphIndexer.profileNames(profileURL: path).user ?? ""
     }
 
-    var reachEnabled: Bool {
+    var backgroundThinkingEnabled: Bool {
         let configuration = Self.loadConfiguration(
             defaults: preferenceDefaults, environment: configurationEnvironment)
         return !isFlushedForTermination && configuration.enabled && configuration.backgroundMicrocyclesEnabled
@@ -36,8 +36,6 @@ extension NativeCognitionRuntime {
     public func refreshConfiguration() async {
         sourceWakes.canonDirty = true
         sourceWakes.horizonDirty = true
-        sourceWakes.reachDirty = true
-        withdrawReachIfDisabled()
         if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot),
            preferenceDefaults.object(forKey: Self.enabledKey) == nil {
             let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
@@ -98,12 +96,20 @@ extension NativeCognitionRuntime {
         // Invalidate after replacing the clock so a concurrent read cannot consume invalidation before the new state exists.
         sourceWakes.clockDirty = true
         await somaticSignalBus.configure(organismConfiguration)
+        await resumeAttentionIfEnabled()
+    }
+
+    private func resumeAttentionIfEnabled() async {
+        guard backgroundThinkingEnabled, attention.opened, await substrate.hasRestoredAttention() else { return }
+        await igniteReady(mode: "awake")
+        await weighWaiting(mode: "awake")
     }
 
     public func setEnabled(_ enabled: Bool) async {
         preferenceDefaults.set(enabled, forKey: Self.enabledKey)
         await refreshConfiguration()
         if enabled { await bootstrap() }
+        await resumeAttentionIfEnabled()
         publishRuntimeChange(reason: "configuration:enabled")
     }
 
@@ -172,6 +178,7 @@ extension NativeCognitionRuntime {
                 await bootstrap()
             }
         }
+        await resumeAttentionIfEnabled()
         await rescheduleResidualRepairDeadline()
         await rescheduleCognitionMaintenanceDeadline()
         publishRuntimeChange(reason: "configuration:subconscious_master")
@@ -243,11 +250,10 @@ extension NativeCognitionRuntime {
             defaults.object(forKey: reflectionKey) as? Bool ?? true
                 || env["NATIVE_AGENT_COGNITION_REFLECTION_ENABLED"] == "1"
         )
-        // The rolling 24-hour cost ceiling bounds spending; admission uses load.
+        // Dream, replay and requested reflection share the rolling 24-hour cost ceiling.
         let budgetDefault = reflectionEnabled ? 2 : 0
         let storedBudget = defaults.object(forKey: reflectionBudgetKey) as? Int
         let budget = max(0, storedBudget ?? budgetDefault)
-        let storedLoadThreshold = defaults.object(forKey: reflectionLoadThresholdKey) as? Double
         return CognitiveConfiguration(
             enabled: enabled,
             persistenceEnabled: enabled,
@@ -255,11 +261,10 @@ extension NativeCognitionRuntime {
             backgroundMicrocyclesEnabled: backgroundEnabled,
             reflectiveCallsEnabled: reflectionEnabled,
             maximumActiveNodes: 256,
-            defaultDecayHalfLife: 60 * 60,
+            defaultDecayHalfLife: CognitiveConfiguration.turnHalfLife,
             maximumCapsuleCharacters: 4_000,
             maximumWorkspaceItems: 12,
             dailyReflectionCallBudget: budget,
-            reflectionLoadThreshold: storedLoadThreshold ?? CognitiveConfiguration().reflectionLoadThreshold,
             reflectionSurface: "cognition_reflection"
         )
     }
@@ -295,7 +300,5 @@ extension NativeCognitionRuntime {
     private static let backgroundKey = "cognitiveSubstrateBackgroundEnabled"
     private static let reflectionKey = "cognitiveSubstrateReflectionEnabled"
     private static let reflectionBudgetKey = "cognitiveSubstrateDailyReflectionBudget"
-    /// Tune reflection admission by unresolved load; the person controls its cost ceiling.
-    private static let reflectionLoadThresholdKey = "cognitiveSubstrateReflectionLoadThreshold"
     static let organismKernelEnabledKey = "organismKernelEnabled"
 }

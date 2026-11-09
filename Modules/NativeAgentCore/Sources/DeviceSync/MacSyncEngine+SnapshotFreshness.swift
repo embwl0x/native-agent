@@ -61,6 +61,7 @@ extension MacSyncEngine {
                 return Dictionary(uniqueKeysWithValues: stems.map { ($0, reason) })
             }
         }
+        let prior = unresolved
         for group in attemptedGroups {
             unresolved.removeValue(forKey: group)
             unresolved.removeValue(forKey: "_message.\(group)")
@@ -68,7 +69,7 @@ extension MacSyncEngine {
         for (group, reason) in currentSkips where group != "_observedAt" {
             unresolved[group] = reason
         }
-        persistSnapshotSkipState(unresolved, dataRoot: dataRoot)
+        if unresolved != prior { persistSnapshotSkipState(unresolved, dataRoot: dataRoot) }
         return unresolved
     }
 

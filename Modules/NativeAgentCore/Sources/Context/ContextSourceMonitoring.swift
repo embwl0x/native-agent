@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `ContextSourceMonitoring.swift` | `ContextSourceRegistry`: allowlists, owner inventories and bounded invalidation |
+// Blueprint: | `ContextSourceMonitoring.swift` | `ContextSourceRegistry`: allowlists, owner inventories and source-count health edges |
 
 public struct ContextSourceRegistration: Sendable, Equatable {
     public let descriptor: ContextSourceDescriptor
@@ -32,11 +32,13 @@ public enum ContextSourceRegistryError: Error, Equatable, Sendable {
 
 /// Explicit source allowlist. Registering one project file never authorizes a scan of its parent tree or any other path on the Mac.
 public actor ContextSourceRegistry {
+    private let healthEvents: ContextHealthEvents
     private var allowedRoots: Set<URL>
     private var registrations: [ContextSourceID: ContextSourceRegistration] = [:]
     private var authoritativeOwners: Set<String> = []
 
-    public init(allowedRoots: [URL] = []) throws {
+    public init(allowedRoots: [URL] = [], healthEvents: ContextHealthEvents = ContextHealthEvents()) throws {
+        self.healthEvents = healthEvents
         self.allowedRoots = try Set(allowedRoots.map(Self.canonicalFileURL))
     }
 
@@ -59,6 +61,7 @@ public actor ContextSourceRegistry {
         let ownedIDs = registrations.compactMap { id, registration in
             registration.descriptor.owner == owner ? id : nil
         }
+        let previousCount = registrations.count
         for id in ownedIDs {
             registrations[id] = nil
         }
@@ -66,6 +69,7 @@ public actor ContextSourceRegistry {
             registrations[id] = registration
         }
         authoritativeOwners.insert(owner)
+        if registrations.count != previousCount { healthEvents.signal() }
     }
 
     /// `replaceOwned` declares each owner's complete inventory, including an empty inventory so a removed owner's last source can be retired even when

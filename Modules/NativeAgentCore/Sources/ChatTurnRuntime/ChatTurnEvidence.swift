@@ -23,7 +23,7 @@ import ToolRegistry
 import StandingBots
 import ChatToolParsing
 import NativeAgentShared
-// Blueprint: | `ChatTurnEvidence.swift` | Produced turn evidence and durable answer/owner-turn stamps; records retain their existing locks and formats |
+// Blueprint: | `ChatTurnEvidence.swift` | Produced turn evidence and the durable owner-turn stamp; records retain their existing locks and formats |
 
 struct ProducedChatTurn: Sendable {
     let result: TurnEngineResult
@@ -31,6 +31,7 @@ struct ProducedChatTurn: Sendable {
     let personaFingerprint: String
     let attachments: [MultimodalAttachment]
     let answerID: String
+    let cognitiveProjection: (request: CognitiveCapsuleRequest, projection: CognitionAtTurn)?
 }
 
 /// Verified owner turns advance the current/previous stamp once per turn under its file lock.
@@ -75,8 +76,7 @@ public enum UserTurnStamp {
             let keptKey = try CredentialFileLock.withLock(url) {
                 let old = try read(dataRoot)
                 if let old, old.key == key { return old.key }
-                // Keep even a delayed event in pending offers, but never let its older timestamp replace a newer conversation stamp.
-                try ReachAnswerSettlement.record(dataRoot: dataRoot, turn: date, now: date)
+                // A delayed event's older timestamp never replaces a newer conversation stamp.
                 if var old, date.timeIntervalSince1970 < old.at {
                     if old.previous.map({ date.timeIntervalSince1970 > $0 }) ?? true {
                         old.previous = date.timeIntervalSince1970
@@ -102,84 +102,5 @@ public enum UserTurnStamp {
     /// The preceding verified user turn marks where this turn's gap opened.
     public static func previous(dataRoot: URL) -> Date? {
         reportedRead(dataRoot)?.previous.map { Date(timeIntervalSince1970: $0) }
-    }
-}
-
-/// The verified-turn boundary and codec share Reach answer fields; preserve all other offer fields.
-/// Hold the ledger lock so runtime snapshots cannot erase durable turn evidence.
-package enum ReachAnswerSettlement {
-    /// The one-day window records a structural return, never a verdict on the reply's meaning.
-    package static let window: TimeInterval = 24 * 3_600
-
-    private static func url(_ root: URL) -> URL { root.appendingPathComponent("cognition/reach.json") }
-
-    package static func record(dataRoot: URL, turn: Date? = nil, now: Date) throws {
-        try update(dataRoot: dataRoot, proposed: nil, turn: turn, now: now)
-    }
-
-    package static func write(_ data: Data, dataRoot: URL) throws {
-        try update(dataRoot: dataRoot, proposed: data, turn: nil, now: nil)
-    }
-
-    private static func update(dataRoot: URL, proposed: Data?, turn: Date?, now: Date?) throws {
-        let path = url(dataRoot)
-        try CredentialFileLock.withLock(path) {
-            let current = FileManager.default.fileExists(atPath: path.path) ? try Data(contentsOf: path) : nil
-            guard let data = proposed ?? current else { return }
-            func ledger(_ data: Data) throws -> [String: JSONValue] {
-                guard case .object(let object) = try JSONDecoder().decode(JSONValue.self, from: data),
-                      case .array? = object["offers"] else {
-                    throw CocoaError(.coderReadCorrupt)
-                }
-                return object
-            }
-            func epoch(_ value: JSONValue?) -> Double? {
-                switch value {
-                case .double(let value)?: return value.isFinite ? value : nil
-                case .int(let value)?: return Double(value)
-                default: return nil
-                }
-            }
-            let original = try ledger(data)
-            var object = original
-            guard case .array(var offers)? = object["offers"] else { return }
-            let previous = try current.map(ledger)
-            let priorOffers: [JSONValue]
-            if case .array(let rows)? = previous?["offers"] { priorOffers = rows } else { priorOffers = [] }
-            for index in offers.indices {
-                guard case .object(var offer) = offers[index], case .string(let id)? = offer["id"] else {
-                    throw CocoaError(.coderReadCorrupt)
-                }
-                if let prior = priorOffers.first(where: {
-                    if case .object(let row) = $0 { return row["id"] == .string(id) }; return false
-                }), case .object(let row) = prior {
-                    // A stale runtime snapshot never replaces durable answer evidence.
-                    for key in ["answered", "answeredAt"] where row[key] != nil && row[key] != .null { offer[key] = row[key] }
-                }
-                if let sent = epoch(offer["sentAt"]),
-                   offer["outcome"] == .string("sent") || offer["outcome"] == .string("sending") {
-                    if let turn, turn.timeIntervalSince1970 > sent,
-                       turn.timeIntervalSince1970 - sent <= window {
-                        let first = min(epoch(offer["answeredAt"]) ?? turn.timeIntervalSince1970, turn.timeIntervalSince1970)
-                        offer["answeredAt"] = .double(first)
-                    }
-                    // An uncertain delivery retains the event but cannot yet land an answer. Confirmation uses that same saved event.
-                    if offer["outcome"] == .string("sent") {
-                        if let answered = epoch(offer["answeredAt"]), answered > sent, answered - sent <= window {
-                            offer["answered"] = .bool(true)
-                        } else if offer["answered"] == nil || offer["answered"] == .null,
-                                  let now, now.timeIntervalSince1970 - sent > window {
-                            offer["answered"] = .bool(false)
-                        }
-                    }
-                }
-                offers[index] = .object(offer)
-            }
-            object["offers"] = .array(offers)
-            if proposed != nil || object != original {
-                try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(JSONValue.object(object)), to: path)
-            }
-        }
     }
 }

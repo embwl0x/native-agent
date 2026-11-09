@@ -22,9 +22,6 @@ public protocol AgentContactClients: Sendable {
     func chatClient(tools: any ToolDispatchClient) -> SwiftNativeChatOrchestrationClient
     func toolDispatchClient(enforceAppAutonomy: Bool) -> any ToolDispatchClient
     func bridgeToolDispatchClient(fileAccess: String, verifiedSessionId: String?, conversation: AgentConversationContext) -> any ToolDispatchClient
-    /// Return reach-wake answers to the mind that offered them.
-    func deliverReach(reply: String, itemID: String, turnID: String, turn: Turn) async
-    func cognitionChanges() async -> AsyncStream<NativeCognitionRuntimeChange>?
 }
 
 extension TurnRequest {
@@ -73,7 +70,8 @@ public final class AgentContacts: Sendable {
     public let humanReplies: HumanConversationReplies
     public let grok: GrokInboundReply
     public let continuation: AgentConversationContinuation
-    public let residentWake: ResidentWakeRuntime
+    /// The agent's mind stream: its own thoughts, and work coming back to the conversation that started it.
+    public let stream: MindStream
     private let dot: ChatGPTDotConversation
 
     public func refreshDotSession(_ sessionID: String) async -> Bool {
@@ -100,15 +98,15 @@ public final class AgentContacts: Sendable {
                 throw AgentConversationStore.Failure(message: "That contact's conversation belongs to another app data root.")
             }
             switch entry {
-            case let .send(owner, text, sendID, byPerson, turn):
-                try await clients.bridgeChatClient().appendAgentConversationSend(sessionID: ContactThread.session(owner: owner),
+            case let .send(_, _, text, sendID, byPerson, turn):
+                try await clients.bridgeChatClient().appendAgentConversationSend(sessionID: entry.session,
                     text: text, clientUserMessageID: sendID, byPerson: byPerson, turn: turn)
-            case let .state(owner, sendID, status):
-                if try await !clients.bridgeChatClient().recordAgentConversationSendState(sessionID: ContactThread.session(owner: owner),
+            case let .state(_, _, sendID, status):
+                if try await !clients.bridgeChatClient().recordAgentConversationSendState(sessionID: entry.session,
                     sendID: sendID, status: status) {
                     nativeLog("AgentContacts: send %@ has no row in its conversation; its state %@ has no line to show on", sendID, status)
                 }
-            case let .reply(owner, name, text, replyID, at, from, steeredBy):
+            case let .reply(owner, _, name, text, replyID, at, from, steeredBy):
                 // Persist words without running a turn; preserve the actual speaker’s stamp rather than the thread owner’s.
                 guard from.hasPrefix("peer:") else {
                     throw AgentConversationStore.Failure(message: "A reply copy needs the attested door that said it; \(from) is not one.")
@@ -117,7 +115,7 @@ public final class AgentContacts: Sendable {
                 origin.peerSources = steeredBy
                 let request = TurnRequest(
                     message: Self.savedReply(owner: owner, name: name, text: text),
-                    sessionID: ContactThread.session(owner: owner), surface: AgentBridgeSurface.id,
+                    sessionID: entry.session, surface: AgentBridgeSurface.id,
                     envelope: TurnEnvelope(surface: AgentBridgeSurface.id, agent: "peer", verifiedUserId: String(from.dropFirst(5)),
                                            commandSignatureVerified: true, declaredRemote: true),
                     origin: origin, threadKind: .agent)
@@ -143,6 +141,6 @@ public final class AgentContacts: Sendable {
         grok = GrokInboundReply(clients: clients)
         continuation = AgentConversationContinuation(dataRoot: dataRoot, clients: clients, grok: grok, dot: dot,
                                                      completionSender: completionSender)
-        residentWake = ResidentWakeRuntime(dataRoot: dataRoot, clients: clients, completionSender: completionSender)
+        stream = MindStream(dataRoot: dataRoot, clients: clients, completionSender: completionSender)
     }
 }

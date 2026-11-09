@@ -8,23 +8,12 @@ import PersistenceCore
 import ScreenCaptureKit
 import Synchronization
 import NativeAgentShared
-// Blueprint: | `MacScreenWatch+Hands.swift` | `MacScreenWatch.hand`: One deadline, per-event authority, exact-window input and secret drag checks |
+// Blueprint: | `MacScreenWatch+Hands.swift` | `MacScreenWatch.hand`: Watch-owned input, per-event authority, exact-window and secret drag checks |
 
 extension MacScreenWatch {
     /// Watch hands share the physical tail’s per-event authority, exact-window, obstruction and secret-field checks. The stream supplies observation;
     /// person input ends authority rather than being overridden.
     public func hand(_ verb: String, _ args: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
-        if context.deadline == nil {
-            do {
-                return try await OperationWaitBudget.withDeadline(
-                    seconds: Double(SwiftNativeMacControl.operationTimeoutSeconds(action: "hand", body: args)),
-                  budget: context.waitBudget) { budget in
-                    let context = context.with(\.deadline, budget.deadline)
-                    return try await self.hand(verb, args, context: context) }
-            } catch is OperationWaitBudget.Exceeded {
-                throw SenseFailure(code: "timed_out", message: MacFourVerbs.interruptedActReply(OperationWaitBudget.Exceeded()).text)
-            }
-        }
         if let refusal = handRefusal { throw SenseFailure(code: refusal.code, message: refusal.message, remedy: refusal.fields["remedy"]) }
         guard admitOperation() else { throw over ?? CancellationError() }
         defer { finishOperation() }

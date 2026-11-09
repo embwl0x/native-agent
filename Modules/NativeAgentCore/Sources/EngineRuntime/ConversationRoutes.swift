@@ -1,23 +1,14 @@
 import ChatSessionWork
 // Blueprint: | `ConversationRoutes.swift` | Sidebar routes, tab homes and fixed provenance labels |
 
-public enum SkillsToolsSection: String, CaseIterable, Identifiable, Sendable {
-    case skills = "Skills"
-    case tools = "Tools"
-
-    public var id: String { rawValue }
-}
-
 public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     case chat = "Chat"
     case bots = "Bots" // Injected by BotsShelfPreference; absent from unflagged destination lists.
     case activity = "Activity"
     case memories = "Memories"
-    case skills = "Skills"
     case desk = "Desk"
     case trust = "Trust"
     case providers = "Providers"
-    case macIntegration = "Mac Integration"
     case settings = "Settings"
 
     case personality = "Personality"
@@ -30,27 +21,17 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     case inboxPolicy = "Inbox Policy"
     case inspector = "Inspector"
 
-    case telegram = "Telegram"
-    case tools = "Tools"
+    /// A page of the agent's own (a part whose face is `{projection:true, page:"<id>"}`); the shell holds which one beside the selection.
+    case ownPage = "Own page"
 
     public var id: String { rawValue }
 
-    public var normalized: SidebarItem {
-        switch self {
-        case .tools: .skills
-        default: self
-        }
-    }
-
     public static func shellHome(for item: SidebarItem) -> (parent: SidebarItem, tab: String)? {
-        switch item.normalized {
+        switch item {
         case .knowledge: (.memories, "knowledge")
         case .dreams: (.personality, "dreams")
-        case .macIntegration: (.trust, "mac")
-        case .telegram: (.connectors, "telegram")
         case .cognition: (.diagnostics, "Cognition")
         case .inspector: (.diagnostics, "Inspector")
-        case .skills: (.diagnostics, "skills")
         default: nil
         }
     }
@@ -61,29 +42,25 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         case .bots: "books.vertical"
         case .activity: "tray.full"
         case .memories: "brain"
-        case .skills: "puzzlepiece.extension"
         case .desk: "checklist"
         case .personality: "person.crop.circle"
         case .connectors: "point.3.connected.trianglepath.dotted"
         case .trust: "lock.shield"
         case .providers: "server.rack"
-        case .macIntegration: "gearshape.2"
         case .settings: "gearshape"
         case .capabilities: "shippingbox"
         case .knowledge: "circle.hexagonpath"
         case .dreams: "moon.stars"
         case .cognition: "brain.head.profile"
         case .diagnostics: "stethoscope"
-        case .telegram: "paperplane"
         case .inboxPolicy: "tray.and.arrow.down"
-        case .tools: "wrench.and.screwdriver"
         case .inspector: "waveform.path.ecg"
+        case .ownPage: "doc.richtext"
         }
     }
 
     public var displayName: String {
-        switch normalized {
-        case .skills: "Skills & Tools"
+        switch self {
         case .inboxPolicy: "Notifications"
         case .bots: "Helpers"
         default: rawValue
@@ -91,9 +68,8 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     }
 
     public var shellRailTitle: String {
-        switch normalized {
+        switch self {
         case .activity: "Today"
-        case .skills: "Skills"
         case .inboxPolicy: "Notifications"
         case .bots: "Helpers"
         default: rawValue

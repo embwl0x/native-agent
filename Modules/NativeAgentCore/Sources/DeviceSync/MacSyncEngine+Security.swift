@@ -140,12 +140,21 @@ extension MacSyncEngine {
             syncError = "Could not write rejection response for \(msgId): \(writeError)"
             return false
         } else {
-            _ = await withCKTimeout("MacSyncEngine.writeRejectedResponse.kvsSignal") {
-                let kvs = NSUbiquitousKeyValueStore.default
-                kvs.set(msgId, forKey: "inbox_response_\(msgId)")
-                return kvs.synchronize()
-            }
+            await signalInboxResponse(msgId)
             return true
+        }
+    }
+
+    /// The durable response remains authoritative when its wake signal is unconfirmed.
+    func signalInboxResponse(_ messageID: String) async {
+        let key = inboxResponseKeyPrefix + messageID
+        let synchronized = await Task.detached(priority: .utility) {
+            let kvs = NSUbiquitousKeyValueStore.default
+            kvs.set(messageID, forKey: key)
+            return kvs.synchronize()
+        }.value
+        if !synchronized {
+            syncError = "Response \(messageID) is saved; iCloud KVS did not accept its wake signal. Remote receipt is unconfirmed."
         }
     }
 

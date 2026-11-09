@@ -1,6 +1,7 @@
 import MacControl
 import ChatTurnContracts
 import ChatToolParsing
+import Experiences
 import AgentWorkspace
 import ApprovalInbox
 import Foundation
@@ -14,13 +15,18 @@ extension AgentConversationSession {
     /// Routine replies belong to the asking chats; correlate their run IDs with the send record’s asks.
     static func routineRead(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, workspace: WorkspaceOperation, agent: String,
         name: String, peer: AgentPeerContact?, row: AgentConversationRecord?,
-                                    store: AgentConversationStore, args: [String: JSONValue], dataRoot: URL,
+                                    store: AgentConversationStore, args: [String: JSONValue], scope: String, dataRoot: URL,
                                     perform: Dispatch) async throws -> JSONValue {
         var result: JSONValue = .object(["agent": .string(name), "agent_id": .string(agent), "status": .string("no_history"), "state": .string("no_history")])
         // Refresh requires the request ID retained by the send.
-        if let row { result = AgentConversationView.view(row.readInput == nil ? row : try await refresh(turn: turn, mac: mac, conversation: conversation,
-            row, store: store, input: args,
-            perform: perform), details: false, read: true, dataRoot: dataRoot, includeHistory: conversation.returnsHistory) }
+        if let row {
+            let current: AgentConversationRecord
+            if row.readInput == nil { current = row }
+            else { current = try await refresh(turn: turn, mac: mac, conversation: conversation, row, store: store, input: args, perform: perform) }
+            result = AgentConversationView.view(current, details: false, read: true, dataRoot: dataRoot, includeHistory: conversation.returnsHistory)
+            consumeRead(result, peer: peer, message: string(current.readInput?["message_id"]), scope: scope, conversation: conversation,
+                            dataRoot: dataRoot)
+        }
         // Deduplicate identical replies within ten minutes when merging contact and asking-chat history.
         let said = try ContactThread.mergedLines(dataRoot: dataRoot, owner: agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : agent,
             identity: AgentContactIdentity(dataRoot: dataRoot))
@@ -32,7 +38,7 @@ extension AgentConversationSession {
         guard case .object(var fields) = result, !talk.isEmpty else { return result }
         if talk.contains(where: { !$0.mine }) {
             // A superseded ask’s late answer must not settle the current ask.
-            if fields["last_send_reply_state"] != .string("no_reply_expired"), !["waiting", "sending"].contains(fields["state"]
+            if !["waiting", "sending"].contains(fields["state"]
                 .flatMap { if case .string(let v) = $0 { v } else { nil } } ?? "") {
                 fields["state"] = .string("replied")
             }
@@ -82,6 +88,23 @@ extension AgentConversationSession {
             throw error
         }
     }
+    /// A read that returns a routine's saved answer to the asking chat consumes it, so its hand-over turn does not tell the same answer again.
+    /// The read has already answered: a consumption that cannot be recorded owes its repair and never fails the read it rides on.
+    static func consumeRead(_ result: JSONValue, peer: AgentPeerContact?, message: String?, scope: String, conversation: AgentConversationContext,
+                            dataRoot: URL) {
+        guard conversation.consumesAnswer, let peer, peer.transport == .grokBot, let message, case .object(let fields) = result,
+              let reply = string(fields["reply"]) else { return }
+        do {
+            try GrokRequestStore(dataRoot: dataRoot).shown(byReadIn: scope, message, peer: peer.id, reply: reply,
+                                                           truncated: fields["reply_truncated"] == .bool(true))
+        } catch {
+            RepairOwed.owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .message, operation: "agent.read.consume:" + message,
+                owner: GrokRequestStore(dataRoot: dataRoot).root.path,
+                words: "A read returned \(peer.name)'s saved answer but could not record it as taken: " + error.localizedDescription
+                    + "; its hand-over may tell the same answer again.",
+                lever: "Repair the saved request's hand-over state against the answer the read returned.")
+        }
+    }
     static func record(_ receipt: JSONValue, for row: AgentConversationRecord,
                                store: AgentConversationStore, peer: AgentPeerContact?,
                                firstActivity: Date? = nil, inline: Bool = false, background: Bool = false,
@@ -95,7 +118,7 @@ extension AgentConversationSession {
             if stopped, !AgentConversationRunning.shared.observing(row: row.id, operation: row.operationID) {
                 let detail = if case .object(let fields) = receipt { string(fields["detail"]) } else { nil as String? }
                 $0.stop = AgentConversationStop(state: "released", operationID: row.operationID, at: Date(), detail: detail
-                    ?? "Local work stopped; the remote outcome is unknown. Nothing was resent.")
+                    ?? stoppedDetail(row.name))
                 $0.phase = "ready"
             }
             $0.automaticRead = $0.phase == "waiting" && $0.readInput != nil
@@ -119,9 +142,9 @@ extension AgentConversationSession {
             }
         }
     }
-    /// The contact owns one session across asking chats; helper bots use their shelf.
-    static func threadID(_ agent: String) -> String? {
-        if agent.hasPrefix("peer:") { return ContactThread.session(owner: String(agent.dropFirst(5))) }
+    /// A contact's conversation has its session across asking chats (ContactThread.session); helper bots use their shelf.
+    static func threadID(_ row: AgentConversationRecord) -> String? {
+        if row.agent.hasPrefix("peer:") { return ContactThread.session(owner: String(row.agent.dropFirst(5)), conversation: row.conversationID) }
         return nil
     }
     static func noting(_ result: JSONValue, carried: AgentConversationRecord?) -> JSONValue {
@@ -141,8 +164,7 @@ extension AgentConversationSession {
     static func named(_ label: String?, agent: String, scope: String, rows: [AgentConversationRecord]) -> (label: String?, record: AgentConversationRecord?) {
         guard let label else { return (nil, nil) }
         let rows = rows.filter { $0.agent == agent }
-        let exact = rows.first { $0.id == label } ?? rows.filter { $0.conversationID == label }
-            .max { ($0.scopeSessionID == scope ? 1 : 0, $0.updatedAt) < ($1.scopeSessionID == scope ? 1 : 0, $1.updatedAt) }
+        let exact = AgentConversationStore.conversation(label, scope: scope, in: rows)
         return exact.map { ($0.label, $0) } ?? (label, nil)
     }
     static func readFailure(_ receipt: JSONValue, agent: String) -> ToolFailureError {
@@ -163,7 +185,7 @@ extension AgentConversationSession {
             recovery: kind.flatMap(ToolFailureError.Recovery.init(rawValue:)) ?? (call == nil ? .inspect : .repair))
     }
     package static func absorb(_ receipt: JSONValue, into row: inout AgentConversationRecord) {
-        var receipt = AgentConversationView.expiringReply(receipt)
+        var receipt = receipt
         if row.phase != "sending", case .object(let previous)? = row.receipt,
            let path = previous["filePath"], case .object(var fields) = receipt, fields["filePath"] == nil {
             fields["filePath"] = path
@@ -258,5 +280,12 @@ extension AgentConversationSession {
     }
     static func attention(_ name: String, label: String, _ text: String) -> JSONValue {
         .object(["agent": .string(name), "conversation": .string(label), "state": .string("attention"), "detail": .string(text), "sent": .bool(false)])
+    }
+    static func notSent(_ name: String, label: String, _ reason: String, item: String? = nil) -> JSONValue {
+        var fields: [String: JSONValue] = ["agent": .string(name), "conversation": .string(label),
+            "status": .string("not_sent"), "state": .string("not_sent"), "sent": .bool(false), "terminal": .bool(true),
+            "completed": .bool(false), "detail": .string(reason)]
+        if let item { fields["queued_id"] = .string(item) }
+        return .object(fields)
     }
 }

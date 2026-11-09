@@ -6,6 +6,7 @@ import AgentConversations
 import TrustCenter
 import MacControl
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `NativeAgentChatApprovalFiler.swift` | `NativeAgentChatApprovalFiler` actor; `fileApprovalRequest`, `peerRequesterName` |
 
@@ -58,6 +59,7 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         request["peer"] = PeerDataTaint.carriedRecord(turn: turn, peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                                       peerID: envelope.verifiedUserId)
         request["fileAccess"] = turn.fileAccess.map(JSONValue.string) ?? .null
+        request["fileAccessCeiling"] = turn.fileAccessCeiling.jsonValue
         request["hostCallID"] = turn.hostCallID.map { .string($0.uuidString) }
         request["telegram"] = telegram
         return .object(request)
@@ -68,13 +70,14 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
               case .string(let toolName)? = request["toolName"],
               case .string(let surface)? = request["surface"],
               case .object(let origin)? = request["origin"] else { preconditionFailure("Invalid chat approval request") }
-        let preview = try JSONValue.object(request.filter { $0.key != "hostCallID" }).serialize(pretty: false)
+        // The card says the call in words, never its envelope.
+        let words = ApprovalWords.call(tool: toolName, input: request["input"])
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         // Matching and touching are one locked operation, retaining the first request's attribution.
         let outcome = try await inbox.createOrTouchPending(
             .object([
                 "title": .string(Self.approvalTitle(
-                    toolName: toolName,
+                    act: words.act,
                     requester: Self.peerRequesterName(
                         surface: surface,
                         peerID: origin["userId"]?.stringValue,
@@ -85,7 +88,7 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
                 "risk": .string("confirm"),
                 "reason": .string(reason),
                 "payload": requestPayload,
-                "payloadPreview": .string(preview),
+                "payloadPreview": .string(words.says),
                 "remoteResolvable": .bool(true),
                 "localOnly": .bool(false),
             ]),
@@ -104,16 +107,13 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         return name.isEmpty ? nil : name
     }
 
-    /// Keep requester extraction aligned with the separator used to author card headings.
-    public static let requesterTitleSeparator = " asked: "
-
-    public static func approvalTitle(toolName: String, requester: String?) -> String {
-        guard let requester, !requester.isEmpty else { return "Approve \(toolName)" }
-        return "\(requester)\(requesterTitleSeparator)Approve \(toolName)"
+    public static func approvalTitle(act: String, requester: String?) -> String {
+        guard let requester, !requester.isEmpty else { return act }
+        return requester + ApprovalRecord.askerSeparator + act
     }
 
     public static func requester(inTitle title: String) -> String? {
-        guard let range = title.range(of: requesterTitleSeparator) else { return nil }
+        guard let range = title.range(of: ApprovalRecord.askerSeparator, options: .backwards) else { return nil }
         let who = title[title.startIndex..<range.lowerBound]
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return who.isEmpty ? nil : who
@@ -141,6 +141,7 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             && left["hostCallID"] == right["hostCallID"]
             // Different file-access authority makes a distinct request, including cards without retained access.
             && left["fileAccess"] == right["fileAccess"]
+            && left["fileAccessCeiling"] == right["fileAccessCeiling"]
     }
 
     public func pendingApprovalResult(
@@ -168,4 +169,9 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         }
         return .string(value)
     }
+}
+
+extension ICloudChatFileAccessPolicy.Ceiling {
+    /// The filed approval carries the complete ceiling; the shared transport type stays free of Core's JSON model.
+    var jsonValue: JSONValue { .object(["modes": .array(modes.map(JSONValue.string))]) }
 }

@@ -35,25 +35,21 @@ public enum ChatMessageAuthorship: String, Sendable, Equatable, Codable {
 }
 
 /// Persist before returning so crash recovery can find the reply without starting another turn.
-public struct CodexCompletionTranscriptBinding: Sendable, Equatable {
+public struct CodexCompletionTranscriptBinding: Sendable, Equatable, Codable {
     public let deliveryId: String
     public let requestDigest: String
     public let model: String
     public let reasoningEffort: String?
-    /// Nonterminal delegation notices retain recovery identity without settling work.
-    public let isTerminalCompletion: Bool
 
     public init(
         deliveryId: String,
         requestDigest: String,
         model: String,
-        reasoningEffort: String?,
-        isTerminalCompletion: Bool = true
+        reasoningEffort: String?
     ) {
         self.deliveryId = deliveryId
         self.requestDigest = requestDigest
         self.model = model
         self.reasoningEffort = reasoningEffort
-        self.isTerminalCompletion = isTerminalCompletion
     }
 }

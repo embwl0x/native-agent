@@ -18,9 +18,18 @@ public enum ChromePageMirror {
         public let number: String?
         public let acts: Set<String>
         public let options: [Option]
-        public init(node: String, role: String, label: String, acts: Set<String>, options: [Option], number: String? = nil) {
+        /// Why the captured row cannot act, from the same evidence as its displayed read.
+        public let actionBlock: ActionBlock?
+        public init(node: String, role: String, label: String, acts: Set<String>, options: [Option], number: String? = nil,
+                    actionBlock: ActionBlock? = nil) {
             self.node = node; self.role = role; self.label = label; self.acts = acts; self.options = options; self.number = number
+            self.actionBlock = actionBlock
         }
+    }
+
+    public struct ActionBlock: Sendable, Equatable {
+        public let code: String, reason: String
+        public init(code: String, reason: String) { self.code = code; self.reason = reason }
     }
 
     public struct Page: Sendable {
@@ -90,16 +99,18 @@ public enum ChromePageMirror {
     /// Accessible labels belong to their control, never nearby text; stale row numbers must reacquire a unique role/label/neighbour match.
     public static func find(_ target: String, wants: Set<String>, in page: Page, seen: Page? = nil) -> Match {
         func one(_ rows: [Row]) -> Match? { rows.count == 1 ? .row(rows[0]) : rows.count > 1 ? .ambiguous(rows) : nil }
+        // Empty wants asks whether the row was observed, independently of its actions.
+        func accepts(_ row: Row) -> Bool { wants.isEmpty || !wants.isDisjoint(with: row.acts) }
         let raw = target.trimmingCharacters(in: .whitespacesAndNewlines)
         let digits = raw
         if !digits.isEmpty, digits.allSatisfy(\.isNumber) {
             guard let seen, seen.snapshotID != page.snapshotID else {
-                return page.rows.first { $0.number == digits && !wants.isDisjoint(with: $0.acts) }.map(Match.row) ?? .none
+                return page.rows.first { $0.number == digits && accepts($0) }.map(Match.row) ?? .none
             }
-            guard let at = seen.rows.firstIndex(where: { $0.number == digits && !wants.isDisjoint(with: $0.acts) }) else { return .none }
+            guard let at = seen.rows.firstIndex(where: { $0.number == digits && accepts($0) }) else { return .none }
             let old = seen.rows[at]
             func label(_ rows: [Row], _ i: Int) -> String? { rows.indices.contains(i) ? norm(rows[i].label) : nil }
-            let same = page.rows.indices.filter { !wants.isDisjoint(with: page.rows[$0].acts) && page.rows[$0].role == old.role && norm(page.rows[$0]
+            let same = page.rows.indices.filter { accepts(page.rows[$0]) && page.rows[$0].role == old.role && norm(page.rows[$0]
                 .label) == norm(old.label) }
             if same.count < 2 { return one(same.map { page.rows[$0] }) ?? .none }
             let beside = same.filter { label(page.rows, $0 - 1) == label(seen.rows, at - 1) && label(page.rows, $0 + 1) == label(seen.rows, at + 1) }
@@ -107,7 +118,7 @@ public enum ChromePageMirror {
         }
         let wanted = norm(raw)
         guard !wanted.isEmpty else { return .none }
-        let able = page.rows.filter { !wants.isDisjoint(with: $0.acts) }
+        let able = page.rows.filter(accepts)
         if let exact = one(able.filter { norm($0.label) == wanted }) { return exact }
         if let loose = one(able.filter { norm($0.label).hasPrefix(wanted) || (wanted.count > 1 && norm($0.label).contains(wanted)) }) { return loose }
         return .none
@@ -159,7 +170,7 @@ extension AgentScreen {
             switch verb {
             case nil:
                 let place = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot",
-                    input: bound.merging(["max_nodes": .int(150), "scope": .string("main_content")]) { a, _ in a }, title: "Browser tab")
+                    input: bound.merging(["scope": .string("main_content")]) { a, _ in a }, title: "Browser tab")
                 return .action(.window(AgentWorkspaceNavigation.windowAction(place)))
             // The browser owner refuses tabs the user takes over.
             case "go": return .action(.perform(tool: "browser.chrome_navigate", input: bound, title: "Go to an address", textField: "url", isEffect: true))

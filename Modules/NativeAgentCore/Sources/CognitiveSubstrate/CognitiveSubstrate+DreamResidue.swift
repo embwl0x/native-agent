@@ -5,6 +5,32 @@ import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+DreamResidue.swift` | `CognitiveSubstrate`, `CognitiveDreamResidue`: durable night claims |
 
 extension CognitiveSubstrate {
+    /// Sleep and completion come from their owners; absence of a tone cannot decide whether a dream happened.
+    func dreamFeelingFrame(at now: Date, sleep: CognitiveSleepDreamReading?) -> String {
+        let status: String
+        if let failure = sleep?.failure {
+            status = "My sleep and dream reading is unavailable: " + failure
+        } else if let sleep, let beganAt = sleep.beganAt, beganAt <= now {
+            if let completion = sleep.completion, completion.occurredAt >= beganAt, completion.occurredAt <= now {
+                status = "A dream has completed since I fell asleep."
+            } else {
+                status = "Whether a dream has completed since I fell asleep is unknown."
+            }
+        } else {
+            status = "My last sleep is unobserved here; whether I have dreamed since it is unknown."
+        }
+        guard persistenceRestored, !restoreInFlight else {
+            return "My dream history is unread just now. " + status
+        }
+        if let dream = innerStateDreamResidue(at: now) {
+            return "My last recorded dream felt \(dream.moodWord) (\(dream.date)). " + status
+        }
+        if !dreamResidueClaims.isEmpty || !dreamDispositionNights.isEmpty {
+            return "A dream is recorded, but its tone is unknown. " + status
+        }
+        return "No dream tone is recorded here. " + status
+    }
+
     /// Persist explicit dream tone through night claims, disposition decay and residue, without classifying prose.
     @discardableResult
     public func integrateDreamDisposition(
@@ -140,7 +166,7 @@ extension CognitiveSubstrate {
                 id: stableArtifactID("dream_residue"),
                 status: "current",
                 score: 0,
-                payload: dreamResidueArtifactPayload(at: dependencies.now())
+                payload: dreamResidueArtifactPayload()
             )
             return true
         } catch {
@@ -148,9 +174,8 @@ extension CognitiveSubstrate {
         }
     }
 
-    func dreamResidueArtifactPayload(at now: Date) -> JSONValue {
+    func dreamResidueArtifactPayload() -> JSONValue {
         var object: [String: JSONValue] = [
-            "updatedAt": .double(now.timeIntervalSince1970),
             "claimKeys": .array(dreamResidueClaims.sorted().map(JSONValue.string)),
         ]
         if let residue = dreamResidue {

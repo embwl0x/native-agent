@@ -6,7 +6,7 @@ import Senses
 import TrustCenter
 import ToolRegistry
 import MacControl
-// Blueprint: | `PartHost.swift` | `Parts.rehearse`, `ToolHost`: gated host; previews suppress effects |
+// Blueprint: | `PartHost.swift` | `Parts.rehearse`, `ToolHost`: gated host; previews suppress effects; a read verb's run only reads |
 
 extension OwnedProgramExecution {
     func macOperation(dataRoot: URL) -> MacOperationContext {
@@ -23,14 +23,16 @@ extension Parts {
         guard let base = invocation.host else {
             throw PartError.invalid("Rehearsal needs the gated app door of a conversation or wake run.")
         }
-        try checkDependencies(candidate, invocation: invocation)
+        try await checkDependencies(candidate, invocation: invocation)
         let key = try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey()
         let broker = ToolPrimitiveBroker(permissions: Set(candidate.program.permissions), abilityID: candidate.id, dataRoot: root)
         let host = ToolHost(base: base, candidate: candidate, broker: broker, dataRoot: root, openScreenWatch: invocation.openScreenWatch, admission: {})
+        let face = Self.fields(Self.fields(candidate.manifest)["face"] ?? .null)["projection"] == .bool(true)
+        let schema = face ? Self.faceNeeds(candidate.program.schema) : candidate.program.schema
         do {
             let proof = try await store.validate(candidate, key: key, capture: capture, input: input, runner: OwnedProgramRunner(dataRoot: root).rehearsal(
                 ), host: { host }, execution: invocation.execution) {
-                if let problem = $0.schemaProblem(schema: candidate.program.schema) {
+                if let problem = $0.schemaProblem(schema: schema) {
                     throw SenseFailure(code: "bad_input", message: "Its input: \(problem.words).", remedy: .object([
                         "kind": .string("correct_arguments"), "instruction": .string(
                             "Correct the input to match \(problem.expected) in ability.validate for \(candidate.id)."), "next_call": .null]))
@@ -43,6 +45,21 @@ extension Parts {
             throw error
         }
     }
+
+    /// A face reads the facts it needs from its owner's packet, and packets grow: a face part's input is checked only for what the part
+    /// declares it needs. A field beyond its declaration is never refused, and a declared field it does not require may be null.
+    static func faceNeeds(_ schema: JSONValue) -> JSONValue {
+        guard case .object(var rules) = schema else { return schema }
+        if rules["additionalProperties"] == .bool(false) { rules.removeValue(forKey: "additionalProperties") }
+        let required = Set((rules["required"]?.arrayValue ?? []).compactMap(\.stringValue))
+        if case .object(let properties)? = rules["properties"] {
+            rules["properties"] = .object(Dictionary(uniqueKeysWithValues: properties.map { name, property in
+                (name, required.contains(name) ? faceNeeds(property) : ToolSchema.nullable(faceNeeds(property)))
+            }))
+        }
+        if let items = rules["items"] { rules["items"] = faceNeeds(items) }
+        return .object(rules)
+    }
 }
 
 struct ToolHost: OwnedProgramHostProfile {
@@ -53,16 +70,27 @@ struct ToolHost: OwnedProgramHostProfile {
     let openScreenWatch: (@Sendable (MacScreenWatch.Request, Bool) async throws -> MacScreenWatch)?
     var projection = false
     var preview = false
+    /// A verb the part declares read runs read-confined: its app events, app actions and primitives can only read.
+    var readOnly = false
     let admission: @Sendable () async throws -> Void
     private var appTargets: [String: String] {
         var targets: [String: String] = [:]
         for permission in candidate.program.permissions {
             let parts = permission.split(separator: ":", maxSplits: 1).map(String.init)
             if parts.count == 2, ["app_read", "app_write"].contains(parts[0]), targets[parts[1]] != "write" {
-                targets[parts[1]] = parts[0] == "app_write" ? "write" : "read"
+                targets[parts[1]] = parts[0] == "app_write" && !readOnly ? "write" : "read"
             }
         }
         return targets
+    }
+    private var readPaths: [String] { Parts.strings(Parts.fields(Parts.fields(candidate.manifest)["reach"] ?? .null)["readPaths"] ?? .array([])) }
+    /// A read verb's run refuses anything that can change something, before it is admitted or sent.
+    private func readRefusal(_ operation: String, _ arguments: JSONValue) -> JSONValue? {
+        guard readOnly else { return nil }
+        let reads = operation == "apps.call" ? AuthoredToolEffects.appReadOnly(Parts.fields(arguments))
+            : operation != "part.call" && ToolPrimitiveBroker.readOnly(operation, arguments)
+        return reads ? nil : Self.failure("read_verb", "\(operation) can change something, and this verb is declared read, so it only reads. Nothing ran.",
+            effects: "none", execution: "not_run")
     }
     var actionIDs: [String] { candidate.program.dependencies }
     private func declaredDependency(_ id: String) throws -> String? {
@@ -98,6 +126,9 @@ struct ToolHost: OwnedProgramHostProfile {
             detail: "The ability's action catalog is unavailable: \(error.localizedDescription). Repair its owner before running this call.")) }
     }
     func opensHomeItem(_ input: [String: JSONValue]) -> Bool { base.opensHomeItem(input) }
+    func callArgumentsForEvidence(_ id: String, given: [JSONValue]) throws -> [JSONValue] {
+        try base.callArgumentsForEvidence(id, given: given)
+    }
     func secretLine(_ text: String) -> Bool { base.secretLine(text) }
     func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence { base.evidence(receipt) }
     func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? { base.receiptField(key, in: receipt) }
@@ -112,12 +143,16 @@ struct ToolHost: OwnedProgramHostProfile {
             return Self.failure("invalid_args", "A rehearsal call needs an action id.", effects: "none", execution: "not_run")
         }
         if case .failure(let error) = doorInput(id: id, given: [call["args"] ?? .object([:])]) {
-            return Self.failure(error.reason, error.detail, effects: "none", execution: "not_run")
+            var fields = Parts.fields(Self.failure(error.reason, error.detail, effects: "none", execution: "not_run"))
+            fields["try_instead"] = error.tryInstead
+            return .object(fields)
         }
         // Interception must not turn a malformed dynamic call into a successful rehearsal. Live execution reaches this same schema at the app door.
         do {
             if let problem = try base.callProblem(id, given: [.object((call["args"]?.objectValue ?? [:]).mapValues(OwnedProgram.Calls.Argument.value))]) {
-                return Self.failure("invalid_args", "\(id) \(problem).", effects: "none", execution: "not_run")
+                var fields = Parts.fields(Self.failure("invalid_args", "\(id) \(problem).", effects: "none", execution: "not_run"))
+                fields["try_instead"] = try await base.callAdvice(id, given: [.value(call["args"] ?? .object([:]))])
+                return .object(fields)
             }
         } catch {
             return Self.failure(error, effects: "none", execution: "not_run")
@@ -151,6 +186,10 @@ struct ToolHost: OwnedProgramHostProfile {
         guard try reads(call) || Parts.string(call, "action").map({ try action($0) != nil }) == true else {
             return Self.failure("undeclared_dependency", "An ability calls only its declared app actions.", effects: "none")
         }
+        if readOnly, let id = Parts.string(call, "action"), let named = try base.action(id),
+           !(named.read || named.readOnly(Parts.fields(call["args"] ?? .null))) {
+            return Self.failure("read_verb", "\(id) changes something, and this verb is declared read, so it only reads. Nothing ran.", effects: "none")
+        }
             try Task.checkCancellation()
             try await admission()
             try Task.checkCancellation()
@@ -167,10 +206,12 @@ struct ToolHost: OwnedProgramHostProfile {
 
     func primitiveAction(_ operation: String) -> OwnedProgramAction? {
         if operation == "part.call" { return .init(id: operation, page: "tools", read: false, program: true, readOnly: { _ in false }) }
-        guard operation == "apps.call" || ToolPrimitiveBroker.operations.contains(operation) else { return nil }
+        let files = OwnedProgramRunner.hostFilePrimitives.contains(operation)
+        guard operation == "apps.call" || files || ToolPrimitiveBroker.operations.contains(operation) else { return nil }
         let read = ToolPrimitiveBroker.readOperations.contains(operation)
         let space = String(operation.prefix { $0 != "." })
-        let page = operation == "apps.call" ? "apps" : ["screen", "frame", "hand"].contains(space) ? "screen" : space == "program" ? "shell" : "network"
+        let page = operation == "apps.call" ? "apps" : files ? "files" : ["screen", "frame", "hand"].contains(space) ? "screen"
+            : space == "program" ? "shell" : "network"
         return OwnedProgramAction(id: operation, page: page, read: read,
                                   journaled: !ToolPrimitiveBroker.frameOperations.union(ToolPrimitiveBroker.programOperations).contains(operation),
                                   readOnly: { ToolPrimitiveBroker.readOnly(operation, .object($0)) })
@@ -178,8 +219,11 @@ struct ToolHost: OwnedProgramHostProfile {
 
     func checkPrimitive(_ operation: String, arguments: JSONValue, execution: OwnedProgramExecution) async -> JSONValue? {
         if projection { return Self.failure("projection_only", "A face reads only its frozen sources.", effects: "none") }
+        if let refused = readRefusal(operation, arguments) { return refused }
         do {
-            if operation == "part.call" {
+            if OwnedProgramRunner.hostFilePrimitives.contains(operation) {
+                _ = try PartFileReads.admitted(Parts.fields(arguments)["path"], readPaths: readPaths, permissions: candidate.program.permissions)
+            } else if operation == "part.call" {
                 _ = try partRequest(arguments)
             } else if operation == "apps.call" {
                 try Task.checkCancellation()
@@ -215,6 +259,7 @@ struct ToolHost: OwnedProgramHostProfile {
     }
 
     func primitive(_ operation: String, arguments: JSONValue, preview: Bool, execution: OwnedProgramExecution) async throws -> JSONValue {
+        if let refused = readRefusal(operation, arguments) { return refused }
         if operation == "part.call" {
             // Pin before any admission/card wait. The existing gated authored action runs it, retaining its terminal envelope for value calls.
             do {
@@ -274,6 +319,12 @@ struct ToolHost: OwnedProgramHostProfile {
             dispatched = true
             let result = if operation == "apps.call" {
                 try await AppleScriptExecution().callApp(arguments, targets: appTargets, context: execution.macOperation(dataRoot: dataRoot))
+            } else if operation == "files.query" {
+                try PartFileReads.query(try PartFileReads.admitted(Parts.fields(arguments)["path"], readPaths: readPaths,
+                    permissions: candidate.program.permissions), Parts.fields(arguments))
+            } else if operation == "files.mime" {
+                try PartFileReads.mime(try PartFileReads.admitted(Parts.fields(arguments)["path"], readPaths: readPaths,
+                    permissions: candidate.program.permissions), Parts.fields(arguments))
             } else { try await broker.perform(operation, arguments: arguments, host: base, profile: self, execution: execution,
                 openScreenWatch: openScreenWatch) }
             // The thought's envelope already carries its nested tool effects.
@@ -284,9 +335,10 @@ struct ToolHost: OwnedProgramHostProfile {
             let observed = if operation == "apps.call", case .object(let fields) = result, case .string(
                 let effects)? = fields["effects"] { effects } else { nil as String? }
             if operation == "apps.call", case .object(let fields) = result, case .string(let state)? = fields["state"] {
-                var refusal: [String: JSONValue] = ["status": .string("refused"), "reason": .string(state),
-                    "detail": fields["detail"] ?? .string(state), "result": result,
-                    "effects": .string(observed ?? (read || ["needs_consent", "denied", "unavailable"].contains(state) ? "none" : "unknown"))]
+                let effects = observed ?? (read || ["needs_consent", "denied", "unavailable"].contains(state) ? "none" : "unknown")
+                // A write that may have landed is unknown, never refused: a refusal says nothing happened.
+                var refusal: [String: JSONValue] = ["status": .string(effects == "unknown" ? "unknown" : "refused"), "reason": .string(state),
+                    "detail": fields["detail"] ?? .string(state), "result": result, "effects": .string(effects)]
                 refusal["remedy"] = fields["remedy"]
                 return .object(refusal)
             }

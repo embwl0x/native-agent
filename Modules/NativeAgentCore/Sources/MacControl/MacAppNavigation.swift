@@ -23,7 +23,7 @@ private final class ApplicationLaunchResult {
 }
 #endif
 
-// Blueprint: | `MacAppNavigation.swift` | `MacApplications`, `AppControlRunResult`, `OpenTarget`: Checked app identity; bounded launch waits |
+// Blueprint: | `MacAppNavigation.swift` | `MacApplications`, `AppControlRunResult`, `OpenTarget`: Checked app identity and workspace-owned activation |
 
 public struct AppControlRunResult: Sendable, Equatable {
     public let requestedName: String
@@ -134,7 +134,7 @@ public final class MacApplications: Sendable {
         let activated = front && frontmost?.processIdentifier == app.processIdentifier
         if front && !activated {
             throw ToolFailureError("""
-                Workspace opened \(url.path) with activation requested; after waiting up to 1.5 seconds for activation, the frontmost app is \
+                Workspace reported activation for \(url.path), but the frontmost app is \
                 \(frontmost?.localizedName ?? "none") (pid: \(frontmost?.processIdentifier ?? 0)), not \(query) (pid: \(app.processIdentifier)).
                 """,
                 effects: .occurred, owner: "macOS application activation", tap: "Dock > \(app.localizedName ?? query)")
@@ -144,28 +144,52 @@ public final class MacApplications: Sendable {
     }
 
     @MainActor
-    static func observeActivation(of pid: Int32, within seconds: TimeInterval = 1.5) async throws {
+    static func activate(_ app: NSRunningApplication, context: MacOperationContext) async throws {
+        try Task.checkCancellation()
+        guard context.driver?.allowsEmission(context: context) == true else {
+            throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal(context: context))
+        }
+        guard app.activate() else {
+            throw MacControlError.appControlFailed("macOS refused activation for pid \(app.processIdentifier).")
+        }
+        try await observeActivation(of: app.processIdentifier)
+    }
+
+    @MainActor
+    static func observeActivation(of pid: Int32) async throws {
         let (events, signal) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let center = NSWorkspace.shared.notificationCenter
-        let observer = center.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil, queue: nil) { notification in
-            if (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier == pid {
-                signal.yield(())
+        let observers = activationObservations(pid: pid, center: center, signal: signal)
+        defer { observers.forEach { center.removeObserver($0) }; signal.finish() }
+        func confirmed() throws -> Bool {
+            try Task.checkCancellation()
+            guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
+                throw MacControlError.appControlFailed("The app exited while waiting for macOS to activate pid \(pid).")
+            }
+            return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+        }
+        if try confirmed() { return }
+        for await _ in events { if try confirmed() { return } }
+        try Task.checkCancellation()
+        throw MacControlError.appControlFailed("Workspace activation observation closed without confirming pid \(pid).")
+    }
+
+    private static func activationObservations(
+        pid: Int32, center: NotificationCenter, signal: AsyncStream<Void>.Continuation
+    ) -> [NSObjectProtocol] {
+        [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didTerminateApplicationNotification].map { name in
+            center.addObserver(forName: name, object: nil, queue: nil) { notification in
+                if (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier == pid {
+                    signal.yield(())
+                }
             }
         }
-        defer { center.removeObserver(observer); signal.finish() }
-        // Register before reading so activation cannot fall between the read and the wait.
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier != pid else { return }
-        _ = await raceAgainstTimeout(seconds: seconds) {
-            for await _ in events { break }
-        }
-        try Task.checkCancellation()
     }
 
     @MainActor
     private static func quitAppOnMain(named query: String, indexedURL: Result<URL?, Error>, context: MacOperationContext) async throws -> AppControlRunResult {
         let running = try runningApplications(matching: query, indexedURL: indexedURL)
-        guard !running.isEmpty else {
+        guard let first = running.first else {
             if let url = try applicationURL(matching: query, indexedURL: indexedURL) {
                 return AppControlRunResult(
                     requestedName: query,
@@ -180,29 +204,63 @@ public final class MacApplications: Sendable {
             }
             throw MacControlError.appControlFailed("app_not_running_or_not_found: \(query)")
         }
-        let first = running[0]
         let identities = Set(running.map {
             $0.bundleURL?.standardizedFileURL.path ?? $0.bundleIdentifier ?? "pid:\($0.processIdentifier)"
         })
         guard identities.count == 1 else {
             throw MacControlError.appControlFailed("app_query_ambiguous: use an exact app name or bundle identifier")
         }
-        var terminated = false
         for app in running {
-            try Task.checkCancellation()
-            if let refusal = MacAppActGate.refusal(pid: app.processIdentifier, context: context) { throw refusal }
-            guard context.driver?.allowsEmission(context: context) == true else {
-                throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal(context: context))
-            }
-            if app.terminate() { terminated = true }
+            try await terminate(app, context: context)
         }
         return runResult(
             requested: query,
             app: first,
             launched: false,
             activated: false,
-            terminated: terminated
+            terminated: true
         )
+    }
+
+    @MainActor
+    private static func terminate(_ app: NSRunningApplication, context: MacOperationContext) async throws {
+        try Task.checkCancellation()
+        if app.isTerminated { return }
+        let collector = MacAXEffectCollector()
+        let signals = MacWaitSignals(collector: collector)
+        let center = NSWorkspace.shared.notificationCenter
+        let pid = app.processIdentifier
+        let observer = terminationObservation(pid: pid, center: center, collector: collector)
+        defer { center.removeObserver(observer); signals.stop() }
+        if app.isTerminated { return }
+        if let refusal = MacAppActGate.refusal(pid: pid, context: context) { throw refusal }
+        guard context.driver?.allowsEmission(context: context) == true else {
+            throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal(context: context))
+        }
+        guard app.terminate() else {
+            throw MacControlError.appControlFailed("macOS refused the quit request for pid \(pid); inspect the app before requesting quit again.")
+        }
+        // Ordinary apps took 4.7 to 5.7 s to exit on the installed Mac; only the process's termination proves it landed.
+        let end = await macSettle("quit", signals: signals, patience: 10) {
+            app.isTerminated
+        }
+        try Task.checkCancellation()
+        guard end == .held else {
+            throw MacControlError.appControlFailed("""
+                Quit was requested for pid \(pid), but the app is still running. It is likely waiting for a person at a save sheet, \
+                or it declined to quit; inspect the app before requesting quit again.
+                """)
+        }
+    }
+
+    private static func terminationObservation(
+        pid: Int32, center: NotificationCenter, collector: MacAXEffectCollector
+    ) -> NSObjectProtocol {
+        center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: nil) { notification in
+            if (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier == pid {
+                collector.record(MacAXEffectNotification(kind: notification.name.rawValue, at: Date()))
+            }
+        }
     }
 
     @MainActor

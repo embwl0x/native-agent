@@ -6,7 +6,7 @@ import Darwin
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `SensesHub.swift` | Locked installation task, bounded cancellable readiness, watch inventory and exact-version provenance |
+// Blueprint: | `SensesHub.swift` | Owned installation readiness, watch inventory and exact-version provenance |
 /// Wire at launch so Core readers reach senses without depending on the app; nil means not installed.
 public final class SensesHub: @unchecked Sendable {
     public static let shared = SensesHub()
@@ -17,8 +17,7 @@ public final class SensesHub: @unchecked Sendable {
     private var _runner: HelperSenseRunner?
     private var _source: SenseSourceProvider?
     private var _memoryProvenanceSink: (any SenseMemoryProvenanceSink)?
-    private var _crossing: (any SenseCrossing)?
-    // Read installation's exact task and completion; cancelling a waiter must leave installation and sibling waiters alive.
+    // Installation settles on registration success or failure; cancelling a waiter leaves installation and sibling waiters alive.
     private var _installation: (task: Task<Void, Error>, finished: ScopedWaiter)?
 
     public func installReadiness(_ task: Task<Void, Error>, finished: ScopedWaiter) {
@@ -30,30 +29,14 @@ public final class SensesHub: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; return _installation
     }
 
-    public func waitUntilReady(deadline parentDeadline: ContinuousClock.Instant? = nil) async throws {
+    public func waitUntilReady() async throws {
         guard let installation else {
             throw SenseFailure(code: "source_unavailable", message: "Senses installation has not started.")
         }
-        // Bound only this read's wait; expiry proves no readiness and must preserve installation repair and sibling waiters.
-        let ceiling = ContinuousClock.now.advanced(by: .seconds(4))
-        let deadline = parentDeadline.map { min($0, ceiling) } ?? ceiling
-        await installation.finished.park(budget: .init(deadline: deadline))
-        try Task.checkCancellation()
-        guard ContinuousClock.now < deadline else {
-            throw SenseFailure(code: "source_unavailable", message: """
-                Senses registration did not finish within this read's readiness wait. Inspect Doctor's Senses installation reading (launch.senses); if \
-                it names a failure, preserve and repair that source. A canonical repair change rechecks registration. This sense read did not run; \
-                other resident work continues.
-                """)
-        }
+        await installation.finished.park()
         try Task.checkCancellation()
         try await installation.task.value
     }
-    public func installCrossing(_ crossing: any SenseCrossing) {
-        lock.lock(); defer { lock.unlock() }
-        _crossing = crossing
-    }
-    public var crossing: (any SenseCrossing)? { lock.lock(); defer { lock.unlock() }; return _crossing }
     public func installMemoryProvenanceSink(_ sink: any SenseMemoryProvenanceSink) {
         lock.lock(); defer { lock.unlock() }
         _memoryProvenanceSink = sink

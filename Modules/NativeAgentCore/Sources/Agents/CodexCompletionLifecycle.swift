@@ -231,23 +231,33 @@ public struct CodexCompletionLifecycle: Sendable {
     public func cacheResponse(
         _ response: ChatTurnRuntime.ChatResponse,
         deliveryId: String,
-        requestDigest: String
+        requestDigest: String,
+        stopped: Bool = false
     ) async throws {
         let path = stateURL(deliveryId)
         try await SwiftNativePersistenceCore.withFileLock(path) {
             guard var state = try await loadState(path) else { throw LifecycleError.claimMissing }
             try Self.requireDigest(state, requestDigest)
-            if state.phase == .responseCached || state.phase == .settled {
+            let wasStopped = state.phase == .stopped
+            let stopping = stopped || wasStopped || response.terminalState == .stopped
+            // Only a Stop may move a saved outcome; delivery that has finished keeps it.
+            if state.phase == .responseCached || state.phase == .settled,
+               !stopping || ["completed", "let_go"].contains(state.delivery?.status ?? "") {
                 guard state.response == response else { throw LifecycleError.requestConflict }
                 return
             }
-            guard state.phase == .claimed else { throw LifecycleError.claimMissing }
+            guard [.claimed, .responseCached, .settled, .stopped].contains(state.phase) else { throw LifecycleError.claimMissing }
             guard state.responseRunId == response.runId else { throw LifecycleError.requestConflict }
-            state.phase = .responseCached
+            if let saved = state.response, saved != response { throw LifecycleError.requestConflict }
             state.ownerInstanceId = ownerInstanceId
             state.response = response
             state.responseRunId = response.runId
-            state.detail = nil
+            if stopping {
+                Self.stop(&state, detail: "turn_stopped")
+            } else {
+                state.phase = .responseCached
+                state.detail = nil
+            }
             state.updatedAt = Self.nowISO()
             try await write(state, to: path)
         }
@@ -318,13 +328,92 @@ public struct CodexCompletionLifecycle: Sendable {
         }
     }
 
+    /// Read/recover one accepted return without admitting work. A recovered partial remains stopped, never owed for delivery.
+    func attentionReturnState(_ batch: Attention.Batch) async throws -> Attention.BatchEnd.Status? {
+        let path = stateURL(batch.deliveryID)
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
+            guard var state = try await loadState(path) else { return nil }
+            try Self.requireDigest(state, batch.digest)
+            if state.phase == .outcomeUnknown || state.phase == .claimed && state.ownerInstanceId != ownerInstanceId {
+                _ = try await recover(state, at: path)
+                guard let recovered = try await loadState(path) else { throw LifecycleError.claimMissing }
+                state = recovered
+            }
+            if state.response?.terminalState == .stopped, state.phase != .stopped {
+                Self.stop(&state, detail: "turn_stopped")
+                try await write(state, to: path)
+            }
+            return state.phase == .stopped ? .stopped : .completed
+        }
+    }
+
+    /// Stop is terminal even if it won before the lifecycle claim. Retained transcript output can only enrich this stopped record.
+    func stopReturn(_ batch: Attention.Batch) async throws -> Attention.BatchEnd.Status {
+        let path = stateURL(batch.deliveryID)
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
+            let existing = try await loadState(path)
+            var state = existing ?? State(deliveryId: batch.deliveryID, requestDigest: batch.digest, sessionId: batch.route,
+                phase: .stopped, ownerInstanceId: ownerInstanceId, response: nil, artifacts: [:], delivery: nil, detail: nil,
+                updatedAt: Self.nowISO(), responseRunId: CausalTransitionEvidence.opaqueIdentity(batch.deliveryID))
+            try Self.requireDigest(state, batch.digest)
+            guard state.sessionId == batch.route else { throw LifecycleError.requestConflict }
+            if ["completed", "let_go"].contains(state.delivery?.status ?? "") { return .completed }
+            if existing == nil {
+                state.lifeID = try DataRootLife.current(in: dataRoot)
+                state.source = Attention.stream
+                state.principal = "self"
+            }
+            Self.stop(&state, detail: "turn_stopped")
+            state.ownerInstanceId = ownerInstanceId
+            try await write(state, to: path)
+            // First block all delivery, then retain any already-produced answer. A failed read cannot reopen this delivery.
+            if state.response == nil, let response = try await recoverTranscriptResponse(deliveryId: batch.deliveryID,
+                requestDigest: batch.digest, sessionId: state.sessionId, runId: state.responseRunId) {
+                state.response = response
+                try await write(state, to: path)
+            }
+            return .stopped
+        }
+    }
+
+    private static func stop(_ state: inout State, detail: String) {
+        state.phase = .stopped
+        state.detail = Self.safeDetail(detail)
+        state.delivery = AgentBridgeCompletionDelivery(status: "stopped", surface: state.route?.surface ?? "",
+            delivery: "transcript", artifactCount: state.artifacts.values.filter { $0.phase == .accepted }.count,
+            attempts: state.delivery?.attempts ?? 0, reason: state.detail)
+        state.updatedAt = Self.nowISO()
+    }
+
+    /// Older attention claims predate batch rows. The caller records their existing route grouping once; no claim is replayed.
+    func attentionReturns(in session: String, excluding recorded: Set<String>) async throws -> [(id: String, digest: String)] {
+        var claims: [(String, String)] = []
+        let recordedFiles = Set(recorded.map { stateURL($0).lastPathComponent })
+        for path in try stateURLs() where !recordedFiles.contains(path.lastPathComponent) {
+            guard let state = try await loadState(path), state.source == Attention.stream, state.sessionId == session,
+                  state.deliveryId.hasPrefix("return:happening:"),
+                  state.phase != .settled || !["completed", "let_go"].contains(state.delivery?.status ?? "") else { continue }
+            claims.append((state.deliveryId, state.requestDigest))
+        }
+        return claims
+    }
+
     public func reconciliationRows() async throws -> [(id: String, digest: String, status: String, response: ChatResponse?,
         route: AgentBridgeCompletionRoute?, routeSettled: Bool, principal: String?)] {
         var rows: [(String, String, String, ChatResponse?, AgentBridgeCompletionRoute?, Bool, String?)] = []
         let open = Set(try await ExperienceStore.at(dataRoot).open().map(\.id))
         for path in try stateURLs() {
             let loaded: State?
-            do { loaded = try await loadState(path) } catch LifecycleError.quarantinedReceipt { continue }
+            do {
+                loaded = try await SwiftNativePersistenceCore.withFileLock(path) {
+                    guard var state = try await loadState(path) else { return nil as State? }
+                    if state.response?.terminalState == .stopped, state.phase != .stopped {
+                        Self.stop(&state, detail: "turn_stopped")
+                        try await write(state, to: path)
+                    }
+                    return state
+                }
+            } catch LifecycleError.quarantinedReceipt { continue }
             guard let state = loaded else { continue }
             let decision = CodexCompletionReadout(state)
             guard let status = decision.status else { continue }
@@ -382,23 +471,30 @@ public struct CodexCompletionLifecycle: Sendable {
         }
     }
 
-    public static func letGoReplies(deliveryIDs: Set<String>, outcome: String, dataRoot: URL, configRoot: URL) async throws {
+    @discardableResult
+    public static func letGoReplies(deliveryIDs: Set<String>, outcome: String, dataRoot: URL, configRoot: URL) async throws -> Set<String> {
+        var released: Set<String> = []
         for directory in CodexCompletionReadout.directories(configRoot: configRoot, dataRoot: dataRoot) {
             let owner = CodexCompletionLifecycle(receiptURL: directory.deletingLastPathComponent().appendingPathComponent("receipts.jsonl"), dataRoot: dataRoot)
             for id in deliveryIDs {
                 let path = owner.stateURL(id)
-                guard FileManager.default.fileExists(atPath: path.path) else { continue }
-                try await SwiftNativePersistenceCore.withFileLock(path) {
-                    guard var state = try await owner.loadState(path) else { return }
-                    guard ["owed", "sent_unconfirmed", "failed_before_answer"].contains(CodexCompletionReadout(state).status ?? "") else { return }
+                do { _ = try FileManager.default.attributesOfItem(atPath: path.path) }
+                catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile { continue }
+                let didRelease = try await SwiftNativePersistenceCore.withFileLock(path) {
+                    guard var state = try await owner.loadState(path) else { return false }
+                    let status = CodexCompletionReadout(state).status
+                    guard CodexCompletionReadout.replyIsOwed(status) || status == "failed_before_answer" else { return false }
                     state.phase = .settled
                     state.delivery = AgentBridgeCompletionDelivery(status: "let_go", surface: state.route?.surface ?? "", delivery: "desk",
                         artifactCount: 0, attempts: 0, reason: outcome)
                     state.updatedAt = Self.nowISO()
                     try await owner.write(state, to: path)
+                    return true
                 }
+                if didRelease { released.insert(id) }
             }
         }
+        return released
     }
 
     func deliveryAdmission(deliveryId: String, requestDigest: String) async throws
@@ -465,7 +561,7 @@ public struct CodexCompletionLifecycle: Sendable {
                 guard state.delivery?.status != "completed" || delivery.status != "owed" else { return nil }
                 guard state.phase != .settled || state.delivery != delivery else { return nil }
                 let newlyRetained = state.phase != .settled && state.response != nil
-                state.phase = .settled
+                state.phase = delivery.status == "stopped" ? .stopped : .settled
                 state.delivery = delivery
                 state.ownerInstanceId = ownerInstanceId
                 state.updatedAt = Self.nowISO()
@@ -489,8 +585,9 @@ public struct CodexCompletionLifecycle: Sendable {
     }
 
     private func loadState(_ url: URL) async throws -> State? {
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        let data = try Data(contentsOf: url)
+        let data: Data
+        do { data = try Data(contentsOf: url) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile { return nil }
         guard var state = try? JSONDecoder().decode(State.self, from: data),
               state.schema == State.schema,
               stateURL(state.deliveryId).lastPathComponent == url.lastPathComponent else {
@@ -591,13 +688,17 @@ public struct CodexCompletionLifecycle: Sendable {
         if let response = try await recoverTranscriptResponse(deliveryId: state.deliveryId, requestDigest: state.requestDigest,
             sessionId: state.sessionId, runId: state.responseRunId) {
             var state = state
-            state.phase = .responseCached
             state.response = response
             state.ownerInstanceId = ownerInstanceId
-            state.detail = detail
+            if response.terminalState == .stopped {
+                Self.stop(&state, detail: "turn_stopped")
+            } else {
+                state.phase = .responseCached
+                state.detail = detail
+            }
             state.updatedAt = Self.nowISO()
             try await write(state, to: path)
-            return .cached(response)
+            return state.phase == .stopped ? .settled(state.delivery) : .cached(response)
         }
         return try hasReplyCheckpoint(for: state) ? .inProgress : nil
     }

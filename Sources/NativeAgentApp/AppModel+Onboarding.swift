@@ -27,11 +27,15 @@ import DeviceSync
 extension AppModel: FirstRunWelcomePort {
     var firstRunDataRoot: URL { engine.dataRoot }
     var firstRunIsPublicRelease: Bool { InstallPaths.isPublicReleaseBundle }
-    var firstRunSessionIsBusy: Bool { engine.turns.busySessions.contains(activeChatSessionId) }
+    var firstRunSessionIsBusy: Bool { engine.turns.runtime.busySessions.contains(activeChatSessionId) }
     var firstRunSyntheticErrorIDPrefix: String { Self.syntheticErrorIDPrefix }
 
     func firstRunMessages(for sessionID: String) -> [ChatMessage] {
-        engine.transcripts.messages(for: sessionID)
+        engine.transcripts.displayedTranscript(for: sessionID).messages
+    }
+    func firstRunLoadMessages(for sessionID: String) async throws {
+        _ = try await engine.transcripts.loadMessages(sessionId: sessionID, cached: true)
+        _ = try engine.transcripts.completeDisplayedMessages(for: sessionID)
     }
 
     func markFirstRunWelcomePending() {

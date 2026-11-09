@@ -4,7 +4,7 @@ import CoreServices
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `MacAppIndex.swift` | Resident Spotlight snapshots retain row/directory gaps; bounded async gather never stops the query |
+// Blueprint: | `MacAppIndex.swift` | Resident Spotlight snapshots retain row/directory gaps; initial reads await gather, failure or shutdown |
 
 /// The Mac's app index, kept live by Spotlight. No app is opened or activated.
 public final class MacAppIndex: @unchecked Sendable {
@@ -64,7 +64,7 @@ public final class MacAppIndex: @unchecked Sendable {
     public static func installed(_ apps: [App]) -> [App] { apps.filter { $0.kind == "installed" && $0.platform == "mac" } }
 
     private let queue = DispatchQueue(label: "NativeAgent.MacAppIndex", qos: .utility)
-    private var query: MDQuery!
+    private var query: MDQuery?
     private var failure: Error?
     private var rows: [App] = []
     private var directoryGaps: [String] = []
@@ -83,11 +83,11 @@ public final class MacAppIndex: @unchecked Sendable {
             guard let query else { return failedToStart() }
             MDQuerySetSearchScope(query, [kMDQueryScopeComputer] as CFArray, 0)
             MDQuerySetDispatchQueue(query, queue)
-            for name in [kMDQueryDidFinishNotification, kMDQueryDidUpdateNotification] {
-                observers.append(NotificationCenter.default.addObserver(forName: Notification.Name(name! as String), object: query,
+            for name in [kMDQueryDidFinishNotification, kMDQueryDidUpdateNotification].compactMap({ $0 }) {
+                observers.append(NotificationCenter.default.addObserver(forName: Notification.Name(name as String), object: query,
                     queue: nil) { [self] notification in
-                    guard !stopped, failure == nil else { return }
-                    let changed = materialize()
+                    guard !stopped, failure == nil, let query = self.query else { return }
+                    let changed = materialize(query)
                     if notification.name.rawValue == kMDQueryDidFinishNotification as String { finishGather() }
                     if changed { for continuation in listeners.values { continuation.yield(()) } }
                 })
@@ -116,7 +116,7 @@ public final class MacAppIndex: @unchecked Sendable {
         }
     }
 
-    private func initialGather(bounded: Bool = true, context: MacOperationContext) async throws {
+    private func initialGather(context: MacOperationContext) async throws {
         try Task.checkCancellation()
         if let snapshot = snapshotLock.withLock({ self.snapshot }) {
             _ = try snapshot.get()
@@ -131,21 +131,9 @@ public final class MacAppIndex: @unchecked Sendable {
             else { answer.resume(.success(())) }
         }
         defer { queue.async { self.gatherWaiters[id] = nil } }
-        let ceiling = ContinuousClock.now.advanced(by: .seconds(4))
-        // A resident observer lives until an edge or shutdown/Stop. Requests instead have a finite cold-gather wait even without a tool deadline.
-        let deadline: ContinuousClock.Instant? = bounded ? context.deadline.map { min($0, ceiling) } ?? ceiling : context.deadline
-        let pending = MacControlError.ioFailure("""
-            app_index_not_ready: The request's wait ended before Spotlight finished gathering. The live query remains active; no installed-app verdict is \
-            available yet.
-            """)
-        try await context.holding(\.deadline, deadline) { context in
-            guard !context.expired else { throw pending }
-            try await answer.wait(budget: context.waitBudget, cancellingWith: .failure(context.expired ? pending : context.cancellationError),
-                onCancel: { [self] in
-                queue.async { self.gatherWaiters[id] = nil }
-            }).get()
-            guard !context.expired else { throw pending }
-        }
+        try await answer.wait(budget: context.waitBudget, cancellingWith: .failure(context.cancellationError), onCancel: { [self] in
+            queue.async { self.gatherWaiters[id] = nil }
+        }).get()
         try Task.checkCancellation()
     }
 
@@ -177,7 +165,7 @@ public final class MacAppIndex: @unchecked Sendable {
     }
 
     public func changes(context: MacOperationContext) async throws -> AsyncStream<Void> {
-        try await initialGather(bounded: false, context: context)
+        try await initialGather(context: context)
         let id = UUID()
         let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         continuation.onTermination = { [self] _ in queue.async { self.listeners[id] = nil } }
@@ -238,7 +226,7 @@ public final class MacAppIndex: @unchecked Sendable {
         }
     }
 
-    private func materialize() -> Bool {
+    private func materialize(_ query: MDQuery) -> Bool {
         MDQueryDisableUpdates(query)
         defer { MDQueryEnableUpdates(query) }
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path

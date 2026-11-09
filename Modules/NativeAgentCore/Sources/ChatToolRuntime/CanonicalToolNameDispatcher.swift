@@ -21,7 +21,7 @@ import ChatToolParsing
 import ChatTurnContracts
 import ChatSessionWork
 import AgentConversations
-// Blueprint: | `CanonicalToolNameDispatcher.swift` | `CanonicalToolNameDispatcher` class; `canonical`, `dispatch` |
+// Blueprint: | `CanonicalToolNameDispatcher.swift` | Canonical dispatch; records non-Inbox calls before execution for message decisions |
 
 /// Every app call re-enters the complete gated chain with the consumer's current
 /// turn and operation, including the enclosing receipt and door dependencies.
@@ -62,6 +62,12 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         ToolNameAliases.canonical(name)
     }
 
+    /// The action's own result inside the door's reply; a reply the door answered itself (a refusal, a card) is returned whole.
+    public static func actionResult(_ reply: JSONValue, action: String) -> JSONValue {
+        guard case .object(let envelope) = reply, envelope["action"] == .string(action), let result = envelope["result"] else { return reply }
+        return result
+    }
+
     /// Map dotted ingress to its action identity and bare part IDs to authored.<id> so admission judges the executed door.
     static func doorAction(_ tool: String, turn: Turn) throws -> String? {
         let trimmed = tool.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -85,7 +91,41 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
             call["args"] = .object(input.filter { !$0.key.hasPrefix("__") })
             return try await dispatch(tool: "app", input: call, surface: surface, turn: turn, invocation: invocation)
         }
+        if try !Self.readsInboxOrAnswersApproval(tool: tool, input: input, turn: turn) {
+            turn.messageDecisionCalls?.noteOtherCallStarted()
+        }
         return try await dispatchWithWorkspacePorts(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
+    }
+
+    /// Only Inbox reads and decision routes are exempt; every other call closes message authority without inspecting content.
+    private static func readsInboxOrAnswersApproval(tool: String, input: [String: JSONValue], turn: Turn) throws -> Bool {
+        let name = canonical(tool)
+        let arguments: [String: JSONValue]
+        if name == "inbox" {
+            arguments = input
+        } else {
+            guard name == "app" else { return false }
+            if let script = input["script"], script != .null, script != .string("") { return false }
+            if let actions = input["actions"], actions != .null { return false }
+            if let binding = try AppActionBinding.action(input: input, turn: turn) {
+                guard binding.tool == "inbox" else { return false }
+                switch input["args"] {
+                case .object(let args)?: arguments = binding.arguments(args)
+                case nil, .null?: arguments = binding.arguments([:])
+                default: return false
+                }
+            } else {
+                func text(_ key: String) -> String { input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+                return text("page").lowercased() == "inbox" && text("action").isEmpty && text("find").isEmpty
+            }
+        }
+        switch arguments["verb"]?.stringValue {
+        case "list", "read", "archive", "dismiss", "not_now": return true
+        case "act":
+            guard let action = arguments["action"]?.stringValue else { return false }
+            return ["approve", "reject"].contains(InboxActionVocabulary.normalizedAction(action))
+        default: return false
+        }
     }
 
     private func dispatchWithWorkspacePorts(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
@@ -117,6 +157,8 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
 
     private func dispatchNormalized(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
         surface: String) async throws -> JSONValue {
+        // Re-entry must refuse before contact queues or other facade coordination can mutate state.
+        if let refusal = try PermissionLaw.requestFileAccessRefusal(tool: tool, input: input, turn: turn) { throw refusal }
         // Admit `app` by its action profile, then re-enter the complete chain for each folded tool or script call. The reached name is active for that call
         // only; the app door confers no authority on it.
         if Self.canonical(tool) == "app" {
@@ -150,14 +192,30 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
                   prepared["execution"] == .string("requires_workspace_runtime") else { return admission }
             // Workspace looks retain their own Mac frame slot.
             let invocation = invocation.with(\.frameSource, "workspace").with(\.insideWorkspace, true)
+            // A room's form may name a door verb a part answers; it runs through the door like the agent's own call. An unreadable registry offers none.
+            let answered = SwiftToolDispatcher.authoredTools(dataRoot: root).compactMap { tool -> LLMToolSchema? in
+                guard tool.answer != nil, let verb = tool.action else { return nil }
+                return LLMToolSchema(name: verb, toolClass: tool.schema.toolClass, reach: tool.schema.reach, capabilities: tool.schema.capabilities,
+                                     macIntegration: tool.schema.macIntegration, description: tool.schema.description,
+                                     parametersJSON: tool.schema.parametersJSON)
+            }
+            let verbs = Set(answered.map(\.name))
             let result = try await AgentWorkspaceReadiness.withSnapshot(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
                 dataRoot: root) { workspace in
               try await AgentWorkspace.dispatch(workspace: workspace, input: input, scope: scope, dataRoot: root,
-                catalog: { try await self.inner.listAvailableToolSchemas(turn: turn, surface: surface) }) { name, arguments in
+                catalog: { try await self.inner.listAvailableToolSchemas(turn: turn, surface: surface) + answered }) { name, arguments in
                 // The agent's own app is never read through the workspace's Mac verbs.
                 if let refusal = await AgentScreen.ownAppRefusal(tool: name, input: arguments) { return refusal }
                 let scoped = ChatToolSessionInjection.apply(toolName: name, input: arguments, sessionId: scope)
-                return try await self.dispatch(tool: name, input: scoped, surface: surface, turn: turn, invocation: invocation)
+                guard verbs.contains(name) else {
+                    return try await self.dispatch(tool: name, input: scoped, surface: surface, turn: turn, invocation: invocation)
+                }
+                // A verb a part answers runs through the door; the room reads the verb's own result.
+                var call = scoped.filter { $0.key.hasPrefix("__") }
+                call["action"] = .string(name)
+                call["args"] = .object(scoped.filter { !$0.key.hasPrefix("__") })
+                return Self.actionResult(try await self.dispatch(tool: "app", input: call, surface: surface, turn: turn, invocation: invocation),
+                    action: name)
               }
             }
             return result

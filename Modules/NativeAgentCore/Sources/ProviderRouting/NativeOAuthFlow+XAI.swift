@@ -10,7 +10,7 @@ private struct XAIOIDCDiscovery: Sendable {
 }
 
 extension NativeOAuthFlow {
-    @MainActor
+    @concurrent
     public static func startXAIOAuthFlow(
         platform: any NativeOAuthPlatformPort.Type,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -61,15 +61,13 @@ extension NativeOAuthFlow {
             return OAuthFlowResult(ok: false, error: "Could not build xAI authorization URL.")
         }
 
-        guard platform.openBrowser(authURL) else {
+        guard await platform.openBrowser(authURL) else {
             return OAuthFlowResult(ok: false, error: "Could not open browser for xAI sign-in.")
         }
 
         let callbackURL: URL
         do {
-            callbackURL = try await server.wait(timeoutSeconds: 300, expectedState: state)
-        } catch OAuthLoopbackCallbackError.timedOut {
-            return OAuthFlowResult(ok: false, error: "xAI sign-in timed out.")
+            callbackURL = try await server.wait(expectedState: state)
         } catch {
             return OAuthFlowResult(ok: false,
                 error: "xAI sign-in failed: \(OAuthGrantOperations.redact(error.localizedDescription))")
@@ -120,13 +118,15 @@ extension NativeOAuthFlow {
         guard let url = URL(string: "https://auth.x.ai/.well-known/openid-configuration") else { throw URLError(.badURL) }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
-        req.timeoutInterval = 20
+        req.timeoutInterval = .infinity
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (data, response) = try await URLSession.shared.data(for: req)
-        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            let snippet = String(data: data.prefix(400), encoding: .utf8) ?? ""
+        let session = ProviderHTTP.makeSession()
+        defer { session.invalidateAndCancel() }
+        let (data, response) = try await session.data(for: req)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        if http.statusCode >= 400 {
             throw NSError(domain: "NativeOAuthFlow.xAI", code: http.statusCode, userInfo: [
-                NSLocalizedDescriptionKey: "Discovery HTTP \(http.statusCode): \(OAuthGrantOperations.redact(snippet))",
+                NSLocalizedDescriptionKey: "xAI discovery endpoint answered HTTP \(http.statusCode).",
             ])
         }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -163,11 +163,11 @@ extension NativeOAuthFlow {
             "code_verifier": verifier,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-        ], timeout: 30, session: .shared)
-        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            let snippet = String(data: data.prefix(600), encoding: .utf8) ?? ""
+        ])
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        if http.statusCode >= 400 {
             throw NSError(domain: "NativeOAuthFlow.xAI", code: http.statusCode, userInfo: [
-                NSLocalizedDescriptionKey: "HTTP \(http.statusCode): \(OAuthGrantOperations.redact(snippet))",
+                NSLocalizedDescriptionKey: "xAI token endpoint answered HTTP \(http.statusCode).",
             ])
         }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {

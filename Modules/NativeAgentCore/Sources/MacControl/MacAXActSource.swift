@@ -70,7 +70,11 @@ public struct MacAXActTarget: Sendable, Equatable {
 }
 
 public struct MacAXActOutcome: Sendable, Equatable {
-    public enum Status: String, Sendable { case performed, unsupported, failed, invalidTarget }
+    public enum Status: String, Sendable {
+        case performed, unsupported, failed, invalidTarget
+        /// The request was accepted; its effect has not been observed yet.
+        case unverified
+    }
     public let status: Status
     public let emissionAttempted: Bool
     public let cause: String?
@@ -172,13 +176,11 @@ public protocol MacAXActSource: Sendable {
     func menuShortcut(_ target: MacAXActTarget, context: MacOperationContext) -> (glyphs: String, chord: String)?
     /// Keystroke typing focuses through AXFocused, never an activating AXPress.
     func setFocused(_ target: MacAXActTarget, turn: Turn, context: MacOperationContext) -> MacAXActOutcome
-    /// Select via AXSelected without invoking the element; sources that cannot select report `.unsupported`.
-    func setSelected(_ target: MacAXActTarget, turn: Turn, context: MacOperationContext) -> MacAXActOutcome
     /// The app's focused window, or nil when unknown; unknown is never evidence that synthesized input will reach the named window.
     func focusedWindow(pid: Int32, context: MacOperationContext) -> MacAXWindowRef?
     /// Raise the exact window and activate its app; either operation alone can leave a different window key.
     func raise(_ window: MacAXWindowRef, context: MacOperationContext) -> MacAXActOutcome
-    /// Read the last raise failure only after a failed raise so renderer-preparation causes reach the refusal.
+    /// Read the last raise diagnostic after a nonperformed raise, including an unverified activation.
     var raiseDiagnostic: String? { get }
     func reread(_ target: MacAXActTarget, context: MacOperationContext) -> MacAXActTarget?
 }
@@ -230,7 +232,6 @@ public extension MacAXActSource {
     func resolve(path: [Int], inWindow window: MacAXWindowRef, context: MacOperationContext) -> MacAXPidResolution {
         resolve(path: path, inAppPid: window.identity.pid, context: context)
     }
-    func setSelected(_ target: MacAXActTarget, turn: Turn, context: MacOperationContext) -> MacAXActOutcome { .unsupported }
 
     /// Without a window server, key-window ownership is unknown.
     func focusedWindow(pid: Int32, context: MacOperationContext) -> MacAXWindowRef? { nil }

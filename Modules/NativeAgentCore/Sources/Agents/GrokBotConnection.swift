@@ -10,59 +10,61 @@ import MacControl
 public enum GrokBotConnection {
     public static func perform(turn: Turn, mac: MacOperationContext, plan: [String: JSONValue], dataRoot: URL, inner: any ToolDispatchClient, surface: String,
                                port: DesktopAgentConversationRoute) async -> JSONValue {
-        guard case .string(let peerID)? = plan["peer_id"],
-              let contact = try? AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == peerID && $0.transport == .grokBot }) else {
+        guard case .string(let peerID)? = plan["peer_id"] else {
             return result("unavailable", "Grok Bot contact unavailable.")
         }
         let store = AgentPeerStore(dataRoot: dataRoot)
+        let contact: AgentPeerContact
+        do {
+            guard let saved = try store.list().first(where: { $0.id == peerID && $0.transport == .grokBot }) else {
+                return result("unavailable", "Grok Bot contact unavailable.")
+            }
+            contact = saved
+        } catch { return result("unavailable", "Grok Bot contact cannot be read: " + error.localizedDescription) }
         do {
             switch plan["status"] {
             case .string("grok_send"):
                 if contact.grokSetup != "set up" { return GrokBotRoute.setupRequired(contact) }
                 try await GrokRoutineAccessibility.ensureRunning(mac: mac)
                 guard case .string(let text)? = plan["text"], case .string(let id)? = plan["message_id"],
-                      case .string(let conversation)? = plan["conversation_id"] else { return result("invalid", "Missing message.") }
+                      case .string(let askedIn)? = plan["asking_session"] else { return result("invalid", "Missing message.") }
                 // Keep the asking door from the durable conversation row.
                 let asked = turn.replyRoute
-                let route = AgentBridgeCompletionRoute(surface: asked?.surface ?? surface, sessionId: conversation,
+                let route = AgentBridgeCompletionRoute(surface: asked?.surface ?? surface, sessionId: askedIn,
                     destinationId: asked?.destinationId, threadId: asked?.threadId, sourceKey: asked?.sourceKey,
                     replyTo: asked?.replyTo, correlationId: asked?.correlationId, requesterUserId: asked?.requesterUserId)
-                return try await GrokBotRoute.send(peer: contact, text: text, conversation: conversation, route: route,
+                return try await GrokBotRoute.send(peer: contact, text: text, askedIn: askedIn, route: route,
                     messageID: id, dataRoot: dataRoot,
                     credential: GrokLinkCredential.read(peer: contact.id),
                     quiet: turn.personInitiatedSend?.admitted == true)
             case .string("grok_disconnect"):
-                guard contact.grokBootstrapConfirmed == true, contact.grokConversation != nil else {
+                guard contact.grokBootstrapConfirmed == true, let conversation = contact.grokConversation else {
                     _ = try store.remove(peerID)
                     return result("disconnected", "Local keys revoked and contact removed. Routine creation was never confirmed; no cleanup request was sent.")
                 }
                 // Disconnect must settle even when its remote cleanup ask fails.
-                let asked = (try? await port.grokBootstrap(turn: turn, mac: mac, """
+                let cleanupError: Error?
+                do {
+                    try await port.grokBootstrap(turn: turn, mac: mac, """
                         Delete only the routine named \(GrokBotRoute.routineName(peerID)) that NativeAgent asked you to create in this \
                         conversation. Do not delete or change any other routine. Never show its URL or key in chat.
                         """,
-                    bot: contact.grokConversation ?? "grok", beforeSubmission: {})) != nil
+                        bot: conversation, beforeSubmission: {})
+                    cleanupError = nil
+                } catch { cleanupError = error }
                 _ = try store.remove(peerID)
-                return result("disconnected", asked
-                    ? "Local keys revoked. Asked Grok Bot to delete only this app's routine; deletion is not yet confirmed. Approve it in Grok Bot if asked."
-                    : """
-                        Local keys revoked and contact removed. I could not ask Grok Bot to delete the routine named \
-                        \(GrokBotRoute.routineName(peerID)); delete it in Grok Bot's Routines if it exists.
-                        """)
+                if let cleanupError {
+                    return result("disconnected", "Local keys revoked and contact removed. Routine cleanup failed: "
+                        + cleanupError.localizedDescription + ". Delete only \(GrokBotRoute.routineName(peerID)) in Grok Bot's Routines if it exists.")
+                }
+                return result("disconnected",
+                    "Local keys revoked. Asked Grok Bot to delete this app's routine; deletion is unconfirmed. Approve it in Grok Bot if asked.")
             default:
                 guard contact.grokSetup != "disconnected" else { return result("disconnected", "Finish disconnecting before creating a new connection.") }
-                let requests = GrokRequestStore(dataRoot: dataRoot)
-                let expired = try requests.expiredUnanswered(peer: peerID)
                 // Nil means no Return; false means uncertain submission, which must never authorize resend.
                 let requestStarted = contact.grokBootstrapConfirmed != nil
                 do {
                     let exposure = try await port.importGrokRoutine(turn: turn, mac: mac, peer: peerID, dataRoot: dataRoot, waitForCreation: requestStarted)
-                    // Fresh credentials repair reachability without resending unanswered requests.
-                    if let expired {
-                        try requests.update(expired.messageID, peer: peerID) {
-                            if $0.reply == nil { $0.handOver = "connection repaired; no resend" }
-                        }
-                    }
                     return result("set up", "Routine credentials refreshed from Grok Bot's native view. "
                         + exposure + " Send one message to verify an actual reply.")
                 } catch let blocker as GrokRoutineAccessibility.Blocker {
@@ -99,11 +101,6 @@ public enum GrokBotConnection {
                     }
                 })
                 _ = try store.updateGrok(peerID) { $0.grokBootstrapConfirmed = true }
-                if let expired {
-                    try requests.update(expired.messageID, peer: peerID) {
-                        if $0.reply == nil { $0.handOver = "connection bootstrap requested; no resend" }
-                    }
-                }
                 let approval = """
                     Asked Grok Bot to create or finish the one NativeAgent reply routine. The owner must approve routine creation inside Grok Bot \
                     if asked.\u{20}
@@ -148,8 +145,18 @@ extension GrokBotConnection {
             var credential = try GrokLinkCredential.read(peer: peer)
             try credential.importWebhook(url: url, key: key)
             try credential.write(peer: peer)
+            let saved = try GrokLinkCredential.read(peer: peer)
+            guard saved.webhookURL == credential.webhookURL, saved.webhookKey == credential.webhookKey,
+                  saved.descriptorPath == credential.descriptorPath, saved.replyToken == credential.replyToken else {
+                throw ToolFailureError("The credential write completed, but its Keychain readback did not match. Read the connection before changing it again.",
+                    effects: .unknown)
+            }
             current.grokSetup = "set up"
             current.grokBootstrapConfirmed = true
+        }
+        guard let saved = try store.list().first(where: { $0.id == peer }), saved.transport == .grokBot,
+              saved.grokSetup == "set up", saved.grokBootstrapConfirmed == true else {
+            throw ToolFailureError("Credentials were saved, but the contact's setup state could not be confirmed. Refresh Connectors.", effects: .occurred)
         }
         return true
     }

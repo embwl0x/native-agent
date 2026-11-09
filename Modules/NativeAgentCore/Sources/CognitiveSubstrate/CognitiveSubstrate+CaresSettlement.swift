@@ -86,12 +86,16 @@ extension CognitiveSubstrate {
         }
     }
 
-    static func careStanceHasDays(_ entries: [CognitiveCare.Moment], depth: CognitiveCare.Depth) -> Bool {
-        let calendar = Calendar.current
-        let days = Set(entries.map { calendar.startOfDay(for: $0.at) }).sorted()
-        guard days.count >= (depth == .life ? 3 : 2) else { return false }
-        guard depth == .life else { return true }
-        return (calendar.dateComponents([.day], from: days[0], to: days[days.count - 1]).day ?? 0) >= 14
+    /// The interpretation supplies the position and its cause; elapsed days cannot invalidate lived evidence.
+    static func settleCareStance(_ stance: CognitiveCare.Stance, source: String,
+                                 at now: Date, care: inout CognitiveCare) {
+        guard care.stance != stance else { return }
+        if let old = care.stance {
+            care.record(.init(at: now, moved: 0, by: .her, felt: "changed my mind",
+                              note: "used to think: \(old.text)", source: source))
+        }
+        care.stance = stance
+        care.record(.init(at: now, moved: 0, by: .her, felt: "became", note: stance.text, source: source, stanceChange: stance))
     }
 
     static func applyCareAnswers(_ night: CognitiveCareNight, at now: Date, cares: inout [UUID: CognitiveCare],
@@ -102,11 +106,13 @@ extension CognitiveSubstrate {
                 return .object(["answer": .string(line), "outcome": .string("skipped: invalid answer, missing open care or faded care")])
             }
             let current = care == shown
-            if current { care.open = nil }
             care.record(CognitiveCare.Moment(
                 at: now, moved: 0, by: .her, felt: current ? (answer.how == nil ? "let it go" : "settled") : "dreamed",
                 note: current ? (answer.how ?? "let go: \(open)")
-                    : "dream about \(open): \(answer.how ?? "let go")", source: night.source))
+                    : "dream about \(open): \(answer.how ?? "let go")", source: night.source,
+                closedGap: current ? true : nil, answered: current ? true : nil)) { care in
+                if current { care.open = nil }
+            }
             cares[care.id] = care
             changed.append(care.id)
             if current {
@@ -137,13 +143,11 @@ extension CognitiveSubstrate {
             let evidence = Self.careStancePressure(captured)
             let indices = Set(answer.pressure)
             guard !indices.isEmpty, indices.allSatisfy({ $0 > 0 && $0 <= evidence.count }),
-                  Self.careStanceHasDays(indices.sorted().map { evidence[$0 - 1] }, depth: care.depth) else {
-                outcome("skipped: invalid pressure or insufficient distinct days"); continue
+                  indices.allSatisfy({ evidence[$0 - 1].at <= now }) else {
+                outcome("skipped: invalid or future pressure evidence"); continue
             }
             outcome("changed stance")
-            care.record(.init(at: now, moved: 0, by: .her, felt: "changed my mind",
-                              note: "used to think: \(old.text)", source: night.source))
-            care.stance = answer.stance
+            Self.settleCareStance(answer.stance, source: night.source, at: now, care: &care)
             cares[care.id] = care
             changed.append(care.id)
             decided.insert(care.id)
@@ -182,6 +186,7 @@ extension CognitiveSubstrate {
                   members.allSatisfy({ Set($0.with) == Set(kept.with) }) else { outcome(
                       "skipped: the kept care is missing or held with different people"); continue }
             outcome("merged into \(String(kept.about.prefix(60)))", kept: keep)
+            let beforeMerge = kept
             if kept.open == nil {
                 kept.open = members.filter { $0.open != nil }.max {
                     let left = original[$0.id]?.updatedAt ?? $0.updatedAt
@@ -201,6 +206,7 @@ extension CognitiveSubstrate {
                 changed.append(other.id)
                 count += 1
             }
+            kept.finishPressureTransition(from: beforeMerge, at: now, source: night.source)
             cares[keep] = kept
             changed.append(keep)
             consumed.formUnion(ids)

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `ContextPacket.swift` | Context packet, expandable pointers, safe representation leads and retained memory provenance |
+import PersistenceCore
+// Blueprint: | `ContextPacket.swift` | Context packet, expandable pointers, safe representation leads and retained memory roots |
 public struct ContextAtomPointer: Codable, Equatable, Sendable {
     public let atomID: ContextAtomID
     public let sourceID: ContextSourceID
@@ -34,8 +35,8 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
     public let summary: String?
     /// Only a memory's recorded timestamp supports an age tag; missing source time claims no age.
     public let recordedAt: Date?
-    /// Render provenance only when the source record supplies evidence.
-    public let provenance: ContextMemoryProvenance?
+    /// A memory's roots, from the same atom as its text; other atoms carry none.
+    public let roots: [MemoryRoot]?
     /// Untrusted sources of the selected text, retained from its exact atom.
     public let untrustedSources: [String]?
 
@@ -46,7 +47,7 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
         mandatory: Bool,
         summary: String? = nil,
         recordedAt: Date? = nil,
-        provenance: ContextMemoryProvenance? = nil,
+        roots: [MemoryRoot]? = nil,
         untrustedSources: [String]? = nil
     ) {
         self.pointer = pointer
@@ -57,10 +58,10 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
         let trimmedSummary = summary?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.summary = (trimmedSummary?.isEmpty == false) ? trimmedSummary : nil
         self.recordedAt = recordedAt
-        self.provenance = provenance
+        self.roots = roots
         self.untrustedSources = untrustedSources
     }
-    /// Carry recorded time and provenance from the same atom as the text.
+    /// Carry recorded time and roots from the same atom as the text.
     public init(
         atom: ContextStoredAtom,
         generationID: Int64,
@@ -75,7 +76,7 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
             mandatory: mandatory,
             summary: atom.draft.deterministicSummary,
             recordedAt: ContextMemoryLead.recordedAt(for: atom.draft),
-            provenance: ContextMemoryLead.provenance(for: atom.draft),
+            roots: ContextMemoryLead.roots(for: atom.draft),
             untrustedSources: ContextMemoryLead.untrustedSources(for: atom.draft)
         )
     }

@@ -6,7 +6,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `AgentJobStem.swift` | `AgentJobs`: commission, read, stop, the done-check, deliverable registration and the settle into the agent's own context |
+// Blueprint: | `AgentJobStem.swift` | `AgentJobs`: commission, read, stop, required checks, deliverables and settlement |
 
 /// What the stem attests when it registers an organ's artifact as the agent's.
 public struct AgentJobProvenance: Sendable {
@@ -25,7 +25,6 @@ public typealias AgentJobRegistrar = @Sendable (_ file: URL, _ provenance: Agent
 public enum AgentJobs {
     static let briefLimit = 32_000
     static let reportLimit = 16_000
-    static let checkSeconds: TimeInterval = 600
 
     // MARK: Commission
 
@@ -104,7 +103,7 @@ public enum AgentJobs {
         do { events = try await runner.start(start(job, peer: peer)) }
         catch let refusal as JobRefusal {
             do { try store.withdraw(job.id) }
-            catch { nativeLog("Job %@ refused by its door; its commission could not be withdrawn: %@", job.id, error.localizedDescription) }
+            catch { owe(job.id, "withdraw a refused commission", error, store: store, dataRoot: dataRoot) }
             var words = refusal.message
             if worktree != nil, let place {
                 let left = await uncut(id, repo: place.path, dataRoot: dataRoot)
@@ -183,7 +182,7 @@ public enum AgentJobs {
         do { events = try await runner.start(job) }
         catch {
             do { try store.withdraw(job.id) }
-            catch { nativeLog("Line %@ did not start; its record could not be withdrawn: %@", job.id, error.localizedDescription) }
+            catch { owe(job.id, "withdraw an unstarted line", error, store: store, dataRoot: dataRoot) }
             return .object(["status": .string("refused"), "reason": .string("no_line"), "effects": .string("none"), "sent": .bool(false),
                 "agent": .string(job.agent), "detail": .string(error.localizedDescription)])
         }
@@ -199,25 +198,6 @@ public enum AgentJobs {
             comes back to you as yours and wakes you in this conversation when it ends.
             """)
         return .object(receipt)
-    }
-
-    /// The agent's weekly look back: per contact (the agent's own lines as self), how the jobs that ended this week and last week ended. Empty when none ended.
-    public static func weeklyOutcomes(dataRoot: URL, now: Date) throws -> String {
-        let week: TimeInterval = 7 * 86_400
-        var counts: [String: (this: [AgentJob.State: Int], last: [AgentJob.State: Int])] = [:]
-        for job in try AgentJobStore(dataRoot: dataRoot).jobs() {
-            guard let ended = job.endedAt, ended <= now, now.timeIntervalSince(ended) < 2 * week else { continue }
-            let who = job.isOwn ? "your lines" : job.name
-            var row = counts[who] ?? ([:], [:])
-            if now.timeIntervalSince(ended) < week { row.this[job.state, default: 0] += 1 } else { row.last[job.state, default: 0] += 1 }
-            counts[who] = row
-        }
-        guard !counts.isEmpty else { return "" }
-        let states: [AgentJob.State] = [.done, .delivered, .failed, .stopped]
-        return "## Jobs that ended (this week, last week in brackets)\n" + counts.keys.sorted().map { who in
-            let row = counts[who]!
-            return "- \(who): " + states.map { "\($0.rawValue) \(row.this[$0] ?? 0) (\(row.last[$0] ?? 0))" }.joined(separator: ", ")
-        }.joined(separator: "\n")
     }
 
     /// Home's WORKING block and crews room read the agent's jobs through their store, newest first.
@@ -238,9 +218,7 @@ public enum AgentJobs {
             || ($0.handles ?? []).contains { $0.lowercased() == key } }
     }
 
-    /// Called once per launch, before any job of this app is live. A job a relaunch left working continues through its door by the organ's own
-    /// session, or ends stopped and wakes the context that commissioned it, so no job waits on a flight that no longer exists. A job of an earlier
-    /// life is already stopped (restored) and stays so: a restore brings back what the agent had, never what it was doing.
+    /// Resume current-life jobs by their retained sessions. Restored jobs stay stopped.
     public static func resume(dataRoot: URL, register: @escaping AgentJobRegistrar) async {
         let store = AgentJobStore(dataRoot: dataRoot)
         let jobs: [AgentJob], peers: [AgentPeerContact]
@@ -507,7 +485,7 @@ public enum AgentJobs {
         } catch { outcome = .failed("\(error.localizedDescription). Its organ's outcome is unknown; nothing was resent.") }
         // The agent's stop already owns the record.
         guard !Task.isCancelled else { return }
-        await settle(id, outcome ?? .stopped("The job door closed without saying how the job ended."), store: store, dataRoot: dataRoot,
+        await settle(id, outcome ?? .failed("The job door closed without a terminal event; its outcome is unknown."), store: store, dataRoot: dataRoot,
                      register: register)
     }
 
@@ -574,10 +552,16 @@ public enum AgentJobs {
                 $0.request = nil
                 switch outcome {
                 case .finished:
+                    let refused = $0.deliverables.compactMap { row in row.refusal.map { "\(row.path): \($0)" } }
+                    if !refused.isEmpty {
+                        $0.state = .failed
+                        $0.detail = "Returned artifacts could not be registered: " + refused.joined(separator: "; ")
+                        break
+                    }
                     switch $0.check?.verdict {
                     case .passed?: $0.state = .done; $0.detail = "Done: your check passed."
                     case .failed?: $0.state = .failed; $0.detail = "Your check did not pass; its output is under check."
-                    case .unavailable?: $0.state = .delivered; $0.detail = "Delivered, unchecked: your check could not run; why is under check."
+                    case .unavailable?: $0.state = .failed; $0.detail = "Your required check could not run; its cause is under check."
                     case nil: $0.state = .delivered; $0.detail = "Delivered, unchecked: no check was set."
                     }
                 case .failed(let why): $0.state = .failed; $0.detail = "Its door reported a failure: " + why
@@ -586,12 +570,12 @@ public enum AgentJobs {
             }
         } catch { return owe(id, "record its end", error, store: store, dataRoot: dataRoot) }
         guard ended.state.isTerminal, ended.stoppedByHer != true else { return }
-        wake(ended, dataRoot: dataRoot, store: store)
+        wake(ended, dataRoot: dataRoot)
     }
 
-    /// The agent's own context wakes: the conversation that commissioned it, on the agent's own surface. The line is the stem's own words, never the organ's
-    /// or its door's, so the wake quotes no agent and latches no steering; the agent's own line's answer is the agent's and rides along.
-    static func wake(_ job: AgentJob, dataRoot: URL, store: AgentJobStore) {
+    /// The job returns to the conversation that commissioned it: a `returned` happening carrying the commissioning turn's steering. The line is the stem's
+    /// own words, never the organ's or its door's; the agent's own line's answer is the agent's and rides along.
+    static func wake(_ job: AgentJob, dataRoot: URL) {
         let made = job.deliverables.compactMap { item in item.ref.flatMap { ref in item.version.map { "Make \(ref) v\($0)" } } }
         let ended = switch job.state {
         case .done: "done: your check passed."
@@ -600,26 +584,26 @@ public enum AgentJobs {
         case .stopped: "stopped before it ended."
         case .working, .needsYou: job.state.rawValue
         }
-        var line = job.isOwn ? "Your line ended the work you gave it (\(job.id), \"\(String(job.brief.prefix(80)))\"): " + ended
+        let line = job.isOwn ? "Your line ended the work you gave it (\(job.id), \"\(String(job.brief.prefix(80)))\"): " + ended
             : "\(job.name) ended the job you gave it (\(job.id), \"\(String(job.brief.prefix(80)))\"): " + ended
+        var more: [String] = []
         // The agent's line's answer is the agent's own words, so it rides the news itself.
         if job.isOwn, let report = job.report?.text, !report.isEmpty {
-            line += " It said: \"" + String(report.prefix(600)) + (report.count > 600 ? "…" : "") + "\""
+            more.append("It said: \"" + String(report.prefix(600)) + (report.count > 600 ? "…" : "") + "\"")
         }
-        if !made.isEmpty { line += " Yours now, \(made.count) made by \(job.name): " + made.joined(separator: ", ") + "." }
+        if !made.isEmpty { more.append("Yours now, \(made.count) made by \(job.name): " + made.joined(separator: ", ") + ".") }
         let refused = job.deliverables.filter { $0.refusal != nil }.count
-        if refused > 0 { line += " \(refused) returned file\(refused == 1 ? " was" : "s were") not registered." }
+        if refused > 0 { more.append("\(refused) returned file\(refused == 1 ? " was" : "s were") not registered.") }
         if let worktree = job.worktree, let files = worktree.files, !files.isEmpty {
-            line += " Its diff (\(files.count) file\(files.count == 1 ? "" : "s") on \(worktree.branch)) waits for you: read it, then agent.apply or "
-                + "agent.discard with args {job:\"\(job.id)\"}."
+            more.append("Its diff (\(files.count) file\(files.count == 1 ? "" : "s") on \(worktree.branch)) waits for you: read it, then agent.apply or "
+                + "agent.discard with args {job:\"\(job.id)\"}.")
         }
-        if let desk = job.desk { line += " It carries your Desk item \(desk)." }
-        line += " Read it: app {action:\"agent.read\", args:{agent:\"\(job.agent)\", job:\"\(job.id)\"}}."
-        guard ResidentWake.shared.request(dataRoot: dataRoot, reason: "what resolved", items: [.init(id: "job:" + job.id + ":" + job.state.rawValue,
-            line: line, thread: job.id, session: job.commission.session)]) else {
-            return owe(job.id, "wake its commissioning context", AgentJobStore.Failure(message: "the arrival ledger did not keep it"),
-                store: store, dataRoot: dataRoot)
-        }
+        if let desk = job.desk { more.append("It carries your Desk item \(desk).") }
+        more.append("Read it: app {action:\"agent.read\", args:{agent:\"\(job.agent)\", job:\"\(job.id)\"}}.")
+        // The once key is the job and its outcome, which the return re-checks against the job's record before it runs.
+        Attention.post(Happening(.returned, subject: "job:" + job.id, door: "job:" + job.id, words: line,
+            once: "job:" + job.id + ":" + job.state.rawValue, route: job.commission.session, peers: job.peers, elevated: job.elevated,
+            shows: more.joined(separator: "\n")), dataRoot: dataRoot)
     }
 
     static func owe(_ id: String, _ stage: String, _ error: Error, store: AgentJobStore, dataRoot: URL) {
@@ -681,9 +665,8 @@ public enum AgentJobs {
         do {
             let ran = try await ProcessExecution().run(executable: "/usr/bin/sandbox-exec",
                 arguments: ["-p", sandbox(job.envelope), "/bin/sh", "-c", command], currentDirectory: URL(fileURLWithPath: folder, isDirectory: true),
-                environment: environment, standardInput: nil, timeoutSeconds: checkSeconds, outputByteLimit: 256 * 1024)
+                environment: environment, standardInput: nil, timeoutSeconds: nil, outputByteLimit: 256 * 1024)
             let output = [ran.stdout, ran.stderr].filter { !$0.isEmpty }.joined(separator: "\n")
-            if ran.timedOut { return verdict(.unavailable, "The check did not finish within \(Int(checkSeconds / 60)) minutes. " + output, folder: true) }
             return verdict(ran.exitCode == 0 ? .passed : .failed, "exit \(ran.exitCode)" + (output.isEmpty ? "" : "\n" + output), folder: true)
         } catch { return verdict(.unavailable, "The check could not run: \(error.localizedDescription)") }
     }

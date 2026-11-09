@@ -1,5 +1,12 @@
 /* NativeAgent ability
-{"id": "music-library", "kind": "ability", "version": 1, "reach": {"capabilities": ["app_read:com.apple.Music"]}, "face": {"page": "music"}, "record": {"description": "Read Music playback state and observed timing; page typed playlists and sorted, filtered library/search results with totals, without opening Music.", "actions": [], "inputSchema": {"type": "object", "properties": {"operation": {"type": "string", "enum": ["search", "library", "playlists", "now_playing"]}, "input": {"type": "object"}}, "required": ["operation", "input"], "additionalProperties": false, "readOnly": true}}}
+{"id": "music-library", "kind": "ability", "version": 2, "reach": {"capabilities": ["app_read:com.apple.Music"]}, "face": {"page": "music"},
+ "record": {"description": "Read Music playback state and observed timing; page typed playlists and sorted, filtered library/search results with totals, without opening Music.", "actions": []},
+ "answers": {
+ "music.now_playing": {"summary": "Playing, paused or stopped, with first-observed time and current track", "description": "Report playing / paused / stopped first, track and position, since (first observed, not an inferred transition time), and observed_at. Music closed is stopped. Read-only; requires Music → Read permission.", "class": "read", "irreversible": false, "screen": false, "args": {"type": "object", "properties": {}, "required": []}},
+ "music.search": {"summary": "Search library tracks with count, total and has_more", "description": "Search the user's Apple Music library by query; returns tracks with count, total and has_more. Read-only; requires Music -> Read permission.", "class": "read", "irreversible": false, "screen": false, "args": {"type": "object", "properties": {"query": {"type": "string", "description": "Search string (required)."}, "kind": {"type": "string", "enum": ["track", "artist", "album"], "description": "What to search for — one of track / artist / album. Defaults to track."}, "limit": {"type": "integer", "description": "Maximum results to return (1-100, default 20)."}, "offset": {"type": "integer", "description": "Zero-based match offset. Defaults to 0."}}, "required": ["query"]}},
+ "music.library": {"summary": "Page library tracks; sort title/artist/added and filter artist/album/genre", "description": "Page the Apple Music library with sort and filter applied before paging; returns count, filtered total and has_more. Read-only; requires Music -> Read permission.", "class": "read", "irreversible": false, "screen": false, "args": {"type": "object", "properties": {"offset": {"type": "integer", "description": "Zero-based track offset. Defaults to 0."}, "limit": {"type": "integer", "description": "Maximum tracks to return (1-100, default 50)."}, "sort": {"type": "string", "enum": ["title", "artist", "added"], "description": "Title or artist ascending, or newest added first. Defaults to title; ties retain library order."}, "filter": {"type": "object", "additionalProperties": false, "properties": {"artist": {"type": "string", "description": "Artist contains this text, ignoring case."}, "album": {"type": "string", "description": "Album contains this text, ignoring case."}, "genre": {"type": "string", "description": "Genre contains this text, ignoring case."}}}}, "required": []}},
+ "music.playlists": {"summary": "Page playlists labeled owner, smart or library with count and total", "description": "Page Apple Music playlists with names, track counts and kind: owner / smart / library; returns count, total and has_more. Read-only; requires Music -> Read permission.", "class": "read", "irreversible": false, "screen": false, "args": {"type": "object", "properties": {"offset": {"type": "integer", "description": "Zero-based playlist offset. Defaults to 0."}, "limit": {"type": "integer", "description": "Maximum playlists to return (1-100, default 50)."}}, "required": []}}
+ }}
 */
 const escape = value => value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r");
 const failed = reason => ({status:"failed", integration:"music", reason, effects:"none"});
@@ -112,8 +119,10 @@ function library(input, offset, limit) {
     return Object.assign(page([ordered.length, records], "library", offset, limit), {sort, filter});
 }
 
-function run(request) {
-    const input = request.input, operation = request.operation;
+// Each answered verb names one read; its args arrive beside the verb.
+const operations = {"music.now_playing":"now_playing", "music.search":"search", "music.library":"library", "music.playlists":"playlists"};
+function run(input) {
+    const operation = operations[input.verb];
     try {
         if (operation === "now_playing") return nowPlaying();
         const offset = input.offset === undefined ? 0 : input.offset, limit = input.limit === undefined ? (operation === "search" ? 20 : 50) : input.limit;

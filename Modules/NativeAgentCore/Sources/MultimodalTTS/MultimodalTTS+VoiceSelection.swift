@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import PersistenceCore
 import ProviderRouting

@@ -94,8 +94,28 @@ public final class PeerDataTaint: @unchecked Sendable {
     private struct Hooks {
         var name: @Sendable (String) -> String? = { _ in nil }
         var principal: @Sendable (String) -> String = { $0 }
+        var readTrust: @Sendable ([String]) -> TrustRead = { _ in TrustRead(principals: [:], trusted: [], names: [:]) }
     }
     private static let hooks = OSAllocatedUnfairLock(initialState: Hooks())
+
+    /// One pass's live trust and contact names, read by the trust owner. Lookups do no I/O; nothing survives into the next pass or authorizes an effect.
+    public struct TrustRead: Sendable {
+        private let principals: [String: String]
+        private let trusted: Set<String>
+        private let names: [String: String]
+
+        public init(principals: [String: String], trusted: Set<String>, names: [String: String]) {
+            self.principals = principals; self.trusted = trusted; self.names = names
+        }
+        public func principal(_ source: String) -> String { principals[source] ?? source }
+        public func ownerTrusts(_ source: String) -> Bool { trusted.contains(source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
+        public func sourceName(_ source: String) -> String? { names[source] }
+    }
+
+    public static var readTrust: @Sendable ([String]) -> TrustRead {
+        get { hooks.withLock { $0.readTrust } }
+        set { hooks.withLock { $0.readTrust = newValue } }
+    }
 
     public static func trustedTurn(_ turn: Turn) -> Bool {
         let envelope = TurnEnvelope.current(turn: turn, surface: "")

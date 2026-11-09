@@ -335,15 +335,8 @@ final class JavaScriptProgramRuntime {
                 try io.send(done); return
             }
             if let json, json.isString, let text = json.toString() {
-                if text.utf8.count > program.returnLimit {
-                    done["returned"] = String(text.prefix(program.returnLimit))
-                    done["returnedNote"] = "The returned value was \(text.utf8.count) bytes; this is its first \(program.returnLimit), as text."
-                } else {
-                    guard let returned = try? JSONSerialization.jsonObject(with: Data(text.utf8), options: [.fragmentsAllowed]) else {
-                        throw failure("bad_output", "The returned value has invalid JSON form.")
-                    }
-                    done["returned"] = returned
-                }
+                // This is transport, not a model view. The app's result owner retains the whole value before bounding it.
+                done["returned"] = try JSONSerialization.jsonObject(with: Data(text.utf8), options: [.fragmentsAllowed])
             }
         }
         try io.send(done)

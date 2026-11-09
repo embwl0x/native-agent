@@ -69,8 +69,9 @@ public struct CapabilityLifecycleCommands: Sendable {
             if existing == nil, !SwiftToolDispatcher.isAuthorableToolName(Parts.id(id)) {
                 return CapabilityCommandOutcome(false, "\(id) is a built-in tool's name. Pick another id; nothing was saved.", ["id": .string(id)])
             }
-            // Retain pre-save state so the Inbox distinguishes a new keep from a re-enable.
-            let before = existing.flatMap { $0["status"] } ?? .string("draft")
+            // Retain pre-save state so the Inbox distinguishes a new keep from a re-enable. The turn program has no row, and its save keeps only an
+            // installed program: it was active.
+            let before = existing.flatMap { $0["status"] } ?? .string(existing == nil && id == Parts.turnID ? "active" : "draft")
             do {
                 let receipt = try await parts.save(input, steer: steer, fullMac: fullMac, invocation: invocation)
                 let reply = ToolResult(.object(receipt))
@@ -150,7 +151,7 @@ public struct CapabilityLifecycleCommands: Sendable {
 
     private func decided(_ kept: CapabilityCommandOutcome, input: [String: JSONValue], id: String, turn: Turn) async -> CapabilityCommandOutcome {
         if PeerDataTaint.trustedTurn(turn) { return kept }
-        let decided = await HarnessDecidedRow.record(turn: turn,
+        let decided = await BodyDecidedRow.record(turn: turn,
             requester: kept.fields["state_before"] == .string("draft") ? "keep ability" : "re-enable ability",
             tool: kept.fields["name"]?.scalarText ?? id, sessionID: input["__session_id"]?.scalarText,
             dataRoot: dataRoot, ran: true)

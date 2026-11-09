@@ -111,41 +111,6 @@ public struct DelegationOutcomeLoop: LoopRunner {
                     """)
             }
         }
-        // Stalls are reversible warnings, never terminal outcomes.
-        // The projector owns liveness; only warning settlement is tracked here.
-        let newlyStalled = jobs.filter { job in
-            job.stalled && !job.isTerminal
-                && !cursor.store(job.source).announcedStallIDs.contains(job.id)
-        }.sorted { ($0.source, $0.id) < ($1.source, $1.id) }
-        let recovered = jobs.filter { job in
-            !job.stalled && !job.isTerminal
-                && cursor.store(job.source).announcedStallIDs.contains(job.id)
-        }.sorted { ($0.source, $0.id) < ($1.source, $1.id) }
-
-        var livenessFiled = 0
-        var livenessFailed = 0
-        let livenessPending = newlyStalled.map { (job: $0, stalled: true) }
-            + recovered.map { (job: $0, stalled: false) }
-        let livenessBatch = livenessPending.prefix(Self.maxCardsPerTick)
-        for entry in livenessBatch {
-            let card = entry.stalled
-                ? DelegationOutcomeCard.makeStalled(from: entry.job, now: now)
-                : DelegationOutcomeCard.makeStallCleared(from: entry.job, now: now)
-            guard let card else { continue }
-            if await fileCard(card, read), await observeTransition(entry.job) {
-                if entry.stalled {
-                    cursor.markStallAnnounced(source: entry.job.source, id: entry.job.id)
-                } else {
-                    cursor.clearStallAnnouncement(source: entry.job.source, id: entry.job.id)
-                }
-                livenessFiled += 1
-            } else {
-                livenessFailed += 1
-                break
-            }
-        }
-        let livenessDeferred = livenessPending.count - livenessBatch.count
-
         let pending = terminal.filter { job in
             let store = cursor.store(job.source)
             if store.cardedIDs.contains(job.id) {
@@ -162,9 +127,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         let ordered = pending.sorted {
             ($0.completionStamp ?? .distantPast, $0.id) < ($1.completionStamp ?? .distantPast, $1.id)
         }
-        // Current stalls take priority over terminal-history bursts within the shared card budget.
-        let outcomeCapacity = max(0, Self.maxCardsPerTick - livenessBatch.count)
-        let batch = ordered.prefix(outcomeCapacity)
+        let batch = ordered.prefix(Self.maxCardsPerTick)
         let deferred = ordered.count - batch.count
 
         var filed = 0
@@ -179,7 +142,6 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 }
                 cursor.record(source: job.source, id: job.id, outcome: job.terminalOutcome,
                               deliveryReceiptVersion: job.deliveryReceiptVersion)
-                cursor.clearStallAnnouncement(source: job.source, id: job.id)
                 receiptsRecorded += 1
                 continue
             }
@@ -187,7 +149,6 @@ public struct DelegationOutcomeLoop: LoopRunner {
             if await fileCard(card, read), await observeTransition(job) {
                 cursor.record(source: job.source, id: job.id,
                               outcome: card.outcome, deliveryReceiptVersion: job.deliveryReceiptVersion)
-                cursor.clearStallAnnouncement(source: job.source, id: job.id)
                 filed += 1
             } else {
                 // Stop on failed settlement; exact identity remains pending.
@@ -195,7 +156,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 break
             }
         }
-        if pending.isEmpty && livenessPending.isEmpty {
+        if pending.isEmpty {
             await reportDeferral(false)
             if wasSeeded || recoveryNote != nil {
                 do {
@@ -210,12 +171,10 @@ public struct DelegationOutcomeLoop: LoopRunner {
             guard stampsMayAdvance else { return .failed(error: unreadableStoreError) }
             // Idle ticks must not refresh successful-work age.
             return .skipped(
-                reason: "no newly-terminal or stuck delegated jobs (\(terminal.count) terminal on record)")
+                reason: "no newly-terminal delegated jobs (\(terminal.count) terminal on record)")
         }
-        let writeFailures = failed + livenessFailed
         let failureDeferred = max(0, batch.count - filed - failed - receiptsRecorded)
-        let livenessFailureDeferred = max(0, livenessBatch.count - livenessFiled - livenessFailed)
-        let totalDeferred = deferred + failureDeferred + livenessDeferred + livenessFailureDeferred
+        let totalDeferred = deferred + failureDeferred
         do {
             try cursor.write(to: cursorPath)
         } catch {
@@ -223,27 +182,25 @@ public struct DelegationOutcomeLoop: LoopRunner {
             return .failed(error: "delegation outcome cursor write failed after \(filed) card(s): \(error)")
         }
         // Publish capped work only after durable cursor progress to avoid a failed-write retry loop.
-        await reportDeferral(!Task.isCancelled && stampsMayAdvance && writeFailures == 0
-            && recoveryNote == nil && deferred + livenessDeferred > 0
-            && filed + livenessFiled + receiptsRecorded > 0)
+        await reportDeferral(!Task.isCancelled && stampsMayAdvance && failed == 0
+            && recoveryNote == nil && deferred > 0 && filed + receiptsRecorded > 0)
 
         var result = "filed \(filed) delegation outcome card(s)"
         if let recoveryNote { result += "; \(recoveryNote)" }
-        if livenessFiled > 0 { result += "; filed \(livenessFiled) delegation liveness card(s)" }
         if let seedResult { result += "; \(seedResult)" }
-        if writeFailures > 0 {
-            result += "; \(writeFailures) outcome settlement write(s) failed and will retry next tick"
+        if failed > 0 {
+            result += "; \(failed) outcome settlement write(s) failed and will retry next tick"
         }
         if totalDeferred > 0 { result += "; \(totalDeferred) more deferred for contiguous settlement" }
         // Settlement write failures make the tick fail so loop health reports them.
-        if writeFailures > 0 || recoveryNote != nil {
+        if failed > 0 || recoveryNote != nil {
             return .failed(error: result)
         }
         if !stampsMayAdvance {
             return .failed(error: "\(result); \(unreadableStoreError)")
         }
-        if filed == 0 && livenessFiled == 0 && failed == 0 && livenessFailed == 0 {
-            return .skipped(reason: "no delegation outcome or liveness card could be classified")
+        if filed == 0 && failed == 0 {
+            return .skipped(reason: "no delegation outcome card could be classified")
         }
         return .completed(result: result)
     }

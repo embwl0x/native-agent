@@ -87,10 +87,13 @@ extension NativeCognitionRuntime {
         }
         let id = UUID(), done = ScopedWaiter()
         organismPersistenceWaiters[generation, default: [:]][id] = OrganismPersistenceWait(done: done)
-        // An awaited save bypasses debounce even when cancelled.
-        organismPersistenceDebounceTask?.cancel()
         await Task { await done.park() }.value
-        let result = organismPersistenceWaiters[generation]!.removeValue(forKey: id)!.result!
+        guard let waiting = organismPersistenceWaiters[generation]?.removeValue(forKey: id), let result = waiting.result else {
+            await substrate.recordReceipt(kind: "organism.persist_failed", payload: .object([
+                "error": .string("The continuity writer released a waiter without its result."),
+            ]))
+            return false
+        }
         if organismPersistenceWaiters[generation]?.isEmpty == true { organismPersistenceWaiters[generation] = nil }
         return result
     }
@@ -102,23 +105,9 @@ extension NativeCognitionRuntime {
                 organismPersistenceDrainTask = nil
                 return
             }
-            // Coalesce unawaited saves for 30 seconds; awaited saves flush immediately.
-            if !organismPersistenceWaiters.values.contains(where: { $0.values.contains(where: { $0.result == nil }) }),
-               let last = organismPersistenceLastWriteAt,
-               ContinuousClock.now < last + .seconds(30) {
-                let due = last + .seconds(30)
-                let debounce = Task<Void, Never> {
-                    try? await Task.sleep(until: due, clock: .continuous)
-                }
-                organismPersistenceDebounceTask = debounce
-                await debounce.value
-                organismPersistenceDebounceTask = nil
-                continue
-            }
             let generation = organismPersistenceRequestedGeneration
             let reason = organismPersistenceLatestReason
             let succeeded = await writeOrganismContinuitySnapshot(reason: reason)
-            organismPersistenceLastWriteAt = ContinuousClock.now
             organismPersistenceCompletedGeneration = generation
             organismPersistenceLastResult = succeeded
             resumeOrganismPersistenceWaiters(through: generation, result: succeeded)
@@ -170,7 +159,16 @@ extension NativeCognitionRuntime {
         try await Task.detached(priority: .utility) {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = [.sortedKeys]
             let data = try encoder.encode(state)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            // Compare persisted values: JSON ordering and ISO8601 date precision do not change continuity.
+            let persisted = try decoder.decode(OrganismPersistentState.self, from: data)
+            do {
+                let stored = try decoder.decode(OrganismPersistentState.self, from: Data(contentsOf: url))
+                if stored == persisted { return }
+            } catch CocoaError.fileReadNoSuchFile, CocoaError.fileNoSuchFile {}
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
         }.value
     }

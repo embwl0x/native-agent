@@ -327,7 +327,7 @@ public struct OwnedProgramStore: Sendable {
             if recording {
                 let fixture: JSONValue = .array([.object(["input": input, "calls": .array(await interceptor.recorded),
                                                          "expected": final["returned"] ?? .null])])
-                guard try fixture.serializedData(pretty: false).count <= candidate.program.returnLimit else {
+                guard try fixture.serializedData(pretty: false).count <= candidate.program.materialLimit else {
                     throw SenseFailure(code: "output_limit", message: """
                         The captured fixture exceeds the candidate's material limit. Supply smaller input or explicit fixtures.
                         """)
@@ -487,8 +487,8 @@ public protocol OwnedProgramToolHost: OwnedProgramHostProfile {
     /// The host supplies these dependencies; no callback reads a surrounding task.
     var didWrite: (@Sendable (URL) -> Void)? { get }
     func admitModel(turn: Turn?) async throws -> Turn
-    /// Use door-owned discovery ranking without executing unknown actions.
-    func nearestActions(_ id: String) async throws -> [String]
+    /// The door supplies an exact corrected call or current action shapes; inspection never dispatches it.
+    func callAdvice(_ id: String, given: [OwnedProgram.Calls.Argument]?) async throws -> JSONValue
     func dependencyRevision(_ dependencies: [String]) throws -> [String]
     func performReach(_ operation: String, arguments: JSONValue, execution: OwnedProgramExecution) async throws -> JSONValue
     func dependencyShape(_ id: String) throws -> JSONValue?
@@ -496,6 +496,8 @@ public protocol OwnedProgramToolHost: OwnedProgramHostProfile {
     func callProblem(_ id: String, given: [OwnedProgram.Calls.Argument], schema: JSONValue?) throws -> String?
     func admitTool(_ id: String, input: [String: JSONValue], execution: OwnedProgramExecution,
         effect: (@Sendable () async throws -> JSONValue)?) async -> JSONValue?
+    /// Pre-entry failures use the door's ordinary dispatch completion without attempting the rejected call.
+    func recordRefusal(_ result: JSONValue, input: [String: JSONValue], turn: Turn, surface: String) async -> JSONValue
     func think(messages: [LLMMessage], tools: [String], surface: String?, host: any OwnedProgramHostProfile, execution: OwnedProgramExecution,
         purpose: String) async -> OwnedProgramThought
 }
@@ -504,8 +506,8 @@ public extension OwnedProgramToolHost {
     func callProblem(_ id: String, given: [OwnedProgram.Calls.Argument]) throws -> String? {
         try callProblem(id, given: given, schema: nil)
     }
-    func nearestActions(_ id: String) async throws -> [String] {
-        throw SenseFailure(code: "unavailable", message: "This host has no app-action ranking for \(id).")
+    func callAdvice(_ id: String, given: [OwnedProgram.Calls.Argument]?) async throws -> JSONValue {
+        throw SenseFailure(code: "unavailable", message: "This host has no app-action correction for \(id).")
     }
     func think(messages: [LLMMessage], tools: [String], surface: String?, host: any OwnedProgramHostProfile, execution: OwnedProgramExecution,
         purpose: String) async -> OwnedProgramThought {
@@ -535,6 +537,9 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
         base.doorInput(id: id, given: given)
     }
     public nonisolated func opensHomeItem(_ input: [String: JSONValue]) -> Bool { base.opensHomeItem(input) }
+    public nonisolated func callArgumentsForEvidence(_ id: String, given: [JSONValue]) throws -> [JSONValue] {
+        try base.callArgumentsForEvidence(id, given: given)
+    }
     public nonisolated func secretLine(_ text: String) -> Bool { base.secretLine(text) }
     public nonisolated func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence { base.evidence(receipt) }
     public nonisolated func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? { base.receiptField(key, in: receipt) }

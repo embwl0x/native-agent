@@ -72,8 +72,9 @@ extension AppActions {
 
     static func authored(dataRoot: URL, catalog: [AppAction], snapshot: SwiftToolDispatcher.AuthoredCatalog,
                                  requested: String? = nil) throws -> [AppAction] {
+        // A part that answers verbs is offered only as those verbs; a verb a native declaration still holds stays the native one.
         let tools = snapshot.tools.filter { tool in
-            tool.action.map { id in !catalog.contains { $0.id == id } } ?? true
+            (!tool.answering || tool.answer != nil) && (tool.action.map { id in !catalog.contains { $0.id == id } } ?? true)
         }
         let toolsByID = Dictionary(tools.map { ($0.action ?? ToolNameAliases.authoredAction($0.schema.name), $0) },
                                    uniquingKeysWith: { first, _ in first })
@@ -146,25 +147,30 @@ extension AppActions {
                     true) } else { false }
                 // readOnly describes intent, never authority. The complete permission/dependency closure must also be read-only; both watches and expansion
                 // consume this canonical binding.
-                let read = !cyclic && reach == .read && dependenciesRead
-                    && (node.dependencies.isEmpty ? declaredRead : true)
-                let toolClass: ToolClass = read ? .read : max(.write, reach)
+                // An answered verb's declared read is enforced at its run (read-confined); its other classes only raise the closure's.
+                let answered = tool.answer
+                let read = answered.map { _ in tool.schema.toolClass == .read } ?? (!cyclic && reach == .read && dependenciesRead
+                    && (node.dependencies.isEmpty ? declaredRead : true))
+                let toolClass: ToolClass = read ? .read : max(.write, reach, tool.schema.toolClass ?? .write)
                 let capabilities = read ? toolClass.baseCapabilities : tool.schema.capabilities.subtracting(["safe_read"]).union(toolClass.baseCapabilities)
                 let schema = LLMToolSchema(name: tool.schema.name, toolClass: toolClass, reach: reachesPerson ? .person : .agent,
-                    capabilities: capabilities, description: tool.schema.description,
+                    capabilities: capabilities, macIntegration: tool.schema.macIntegration, description: tool.schema.description,
                     parametersJSON: tool.schema.parametersJSON)
                 classified[member] = AppAction(member, tool.page ?? "diagnostics",
-                             firstSentence(tool.schema.description), try ToolSignature.doorArgs(tool.schema.parametersJSON),
-                             irreversible: cyclic || dependenciesIrreversible || authoredIrreversible,
+                             answered?["summary"]?.stringValue ?? firstSentence(tool.schema.description),
+                             try ToolSignature.doorArgs(tool.schema.parametersJSON),
+                             irreversible: cyclic || dependenciesIrreversible || authoredIrreversible || answered?["irreversible"] == .bool(true),
                              toolClass: toolClass, reach: reachesPerson ? .person : .agent,
-                             capabilities: capabilities, screen: dependenciesScreen,
-                             warn: "Resolved class: \(toolClass); reach: \(reachesPerson ? "person" : "agent") (includes action dependencies). "
+                             capabilities: capabilities, screen: dependenciesScreen || answered?["screen"] == .bool(true),
+                             // A verb a part answers says only its own words; an ability's line names its resolved class and primitives.
+                             warn: answered.map { $0["warn"]?.stringValue ?? "" }
+                                ?? "Resolved class: \(toolClass); reach: \(reachesPerson ? "person" : "agent") (includes action dependencies). "
                                 + "Declared primitives: "
                                 + (tool.permissions.isEmpty ? "none" : tool.permissions.joined(separator: ", "))
                                 + "; actions: " + (tool.actions.isEmpty ? "none" : tool.actions.joined(separator: ", ")),
                              // It executes its pinned contract, not a diagnostics-page edit.
-                             tool: tool.schema.name, read: read, versionExempt: true, schema: schema, partAction: tool.action != nil,
-                             folded: false)
+                             tool: tool.schema.name, input: answered == nil ? [:] : ["verb": .string(member)], read: read, versionExempt: true,
+                             schema: schema, partAction: tool.action != nil, folded: false)
             }
         }
         let selected = requested.map { key in
@@ -177,7 +183,8 @@ extension AppActions {
     /// Domain fields refine the app door's shared envelope.
     static let resultEnvelope: JSONValue = .object(["type": .string("object"), "properties": .object([
         "read_only": .object(["type": .string("boolean")]), "irreversible": .object(["type": .string("boolean")]),
-        "effect": .object(["type": .string("string")]), "execution": .object(["type": .string("string")])
+        "effect": .object(["type": .string("string")]), "execution": .object(["type": .string("string")]),
+        "argument_form": .object(["type": .string("string")]), "understood": .object(["type": .string("string")])
     ]), "required": .array(["read_only", "irreversible", "effect", "execution"].map(JSONValue.string))])
 
     static var personaReadResultSchema: JSONValue {

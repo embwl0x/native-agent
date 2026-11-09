@@ -5,79 +5,35 @@ import Transcripts
 import NativeAgentShared
 // Blueprint: | `SentTurnContext.swift` | SentTurnContext owner. |
 
-/// Delivery metadata is neither memory nor another transcript; missing retained context cannot be invented.
+/// Public moment context as sent, kept on its user row as evidence; private held choices remain with scratch and history replays neither.
 package struct SentTurnContext: Sendable {
     package static let metadataKey = "sentTurnContext"
     package let block: String
-    package let isKeyframe: Bool
-    /// Missing complete state cannot establish a delta baseline.
-    let fullBlock: String?
     let model: String
     let provider: String?
-    let window: String
     /// Retain exact sent words and attachment text; image pixels remain current-turn-only.
     package let userText: String?
 
-    package init(block: String, isKeyframe: Bool, model: String, provider: String?, window: String, userText: String?, fullBlock: String? = nil) {
-        self.block = block; self.isKeyframe = isKeyframe
-        self.fullBlock = fullBlock
-        self.model = model; self.provider = provider; self.window = window; self.userText = userText
+    package init(block: String, model: String, provider: String?, userText: String?) {
+        self.block = block; self.model = model; self.provider = provider; self.userText = userText
     }
 
     package init?(metadata: [String: JSONValue]?) {
         guard case .object(let value)? = metadata?[Self.metadataKey],
               case .string(let block)? = value["block"],
-              case .bool(let keyframe)? = value["keyframe"],
-              case .string(let model)? = value["model"],
-              case .string(let window)? = value["window"] else { return nil }
-        self.block = block; self.isKeyframe = keyframe; self.model = model; self.window = window
-        if case .string(let full)? = value["fullBlock"] { self.fullBlock = full } else { self.fullBlock = nil }
+              case .string(let model)? = value["model"] else { return nil }
+        self.block = block; self.model = model
         if case .string(let provider)? = value["provider"] { self.provider = provider } else { self.provider = nil }
         if case .string(let text)? = value["userText"] { self.userText = text } else { self.userText = nil }
     }
 
     private var json: JSONValue {
-        .object(["block": .string(block), "keyframe": .bool(isKeyframe), "model": .string(model),
-                 "provider": provider.map(JSONValue.string) ?? .null, "window": .string(window),
-                 "userText": userText.map(JSONValue.string) ?? .null,
-                 "fullBlock": fullBlock.map(JSONValue.string) ?? .null])
+        .object(["block": .string(block), "model": .string(model),
+                 "provider": provider.map(JSONValue.string) ?? .null,
+                 "userText": userText.map(JSONValue.string) ?? .null])
     }
 
-    /// Compare paragraph UTF-8 bytes because Swift String equality normalizes Unicode.
-    /// A changed route/window or absent keyframe starts a new baseline.
-    package static func delivery(full: String, replayed: [Self], model: String, provider: String?,
-                                 window: String, userText: String?) -> Self {
-        let keyframe = replayed.lastIndex(where: { $0.isKeyframe })
-        let retained = keyframe.map { Array(replayed[$0...]) } ?? []
-        guard let previous = retained.last?.fullBlock,
-              retained.allSatisfy({ $0.model == model && $0.provider == provider && $0.window == window }) else {
-            return Self(block: full, isKeyframe: true, model: model, provider: provider, window: window, userText: userText, fullBlock: full)
-        }
-        let old = previous.isEmpty ? [] : previous.components(separatedBy: "\n\n")
-        let new = full.isEmpty ? [] : full.components(separatedBy: "\n\n")
-        // One ordered splice preserves duplicates and reordering; a returning value still differs from the current state.
-        var start = 0
-        while start < min(old.count, new.count), Data(old[start].utf8) == Data(new[start].utf8) { start += 1 }
-        var end = old.count
-        var newEnd = new.count
-        while end > start, newEnd > start, Data(old[end - 1].utf8) == Data(new[newEnd - 1].utf8) {
-            end -= 1; newEnd -= 1
-        }
-        let delta: String
-        if start == end && start == newEnd { delta = "" }
-        else {
-            let replacement = new[start..<newEnd].joined(separator: "\n\n")
-            delta = """
-                [Context update: in the preceding complete context, skip the first \(start) paragraphs, remove the next \(end - start), and insert the \
-                following \(newEnd - start) in their place. Keep the remaining paragraphs in order. Paragraphs are separated by blank lines; this update \
-                supersedes the removed text.]
-                """
-                + (replacement.isEmpty ? "" : "\n\n" + replacement)
-        }
-        return Self(block: delta, isKeyframe: false, model: model, provider: provider, window: window, userText: userText, fullBlock: full)
-    }
-
-    /// A failed save leaves the next baseline absent so the next turn resends the missing context.
+    /// A failed save leaves the row without its evidence; the turn itself already carried the whole block.
     package func persist(sessionID: String, runID: String, userMessageID: String? = nil, dataRoot: URL?) async {
         do {
             try await persistMetadata(sessionID: sessionID, runID: runID, userMessageID: userMessageID, dataRoot: dataRoot)
@@ -113,7 +69,7 @@ package struct SentTurnContext: Sendable {
                 metadata[Self.metadataKey] = self.json
                 row["metadata"] = .object(metadata)
                 return [.object(row)]
-            }) else { return } // A turn without its own user row has no replay baseline.
+            }) else { return } // A turn without its own user row has no row to keep its block on.
             try ContactThread.replace(updated, to: path)
         }
     }

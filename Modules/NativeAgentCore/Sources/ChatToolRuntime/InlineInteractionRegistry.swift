@@ -6,33 +6,11 @@ import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import TrustCenter
-// Blueprint: | `InlineInteractionRegistry.swift` | `InlineInteractionRegistry` enum; `connectorSetup`, `canonicalConnectorID` |
+// Blueprint: | `InlineInteractionRegistry.swift` | Checked inline interaction descriptors for connector, provider, permission and capability owners |
 
 /// Derive cards from checked connector, integration, provider and capability owners so labels and permissions do not drift. Unknown IDs render unavailable
-/// text, never dead controls. Setup routes live here once and are shared with the wizard.
+/// text, never dead controls. Shared setup routes serve cards and the wizard.
 public enum InlineInteractionRegistry {
-
-    // MARK: - Connector setup routes
-    // Keep setup routes shared by wizard and cards so token setup cannot diverge.
-
-    public enum ConnectorSetup: String, Sendable, Equatable {
-        case manualToken
-        case unavailable
-    }
-
-    public static func connectorSetup(for rawID: String) -> ConnectorSetup {
-        switch canonicalConnectorID(rawID) {
-        case "slack", "telegram":
-            return .manualToken
-        default:
-            return .unavailable
-        }
-    }
-
-    /// Current connector IDs are exact after whitespace/case normalization.
-    public static func canonicalConnectorID(_ rawID: String) -> String {
-        rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
 
     // MARK: - Descriptors
 
@@ -44,7 +22,7 @@ public enum InlineInteractionRegistry {
     ) -> InlineInteractionDescriptor {
         switch kind {
         case .connector:
-            let id = canonicalConnectorID(target)
+            let id = ConnectorSetup.canonicalID(target)
             if id == "mail" {
                 return InlineInteractionDescriptor(kind: .connector, target: id, displayName: "Mail",
                     icon: "envelope", control: .internetAccounts, location: .macRequired)
@@ -55,7 +33,7 @@ public enum InlineInteractionRegistry {
                     icon: id == "chrome" ? "globe" : "iphone",
                     control: id == "chrome" ? .chromeSetup : .pairDevice, location: .macRequired)
             }
-            let setup = connectorSetup(for: id)
+            let setup = ConnectorSetup.resolve(id)
             return InlineInteractionDescriptor(
                 kind: .connector,
                 target: id,
@@ -184,7 +162,7 @@ public enum InlineInteractionRegistry {
 
     /// Use the connector catalog's display name so new entries need no renderer branch.
     public static func connectorDisplayName(_ id: String, dataRoot: URL) -> String {
-        let canonical = canonicalConnectorID(id)
+        let canonical = ConnectorSetup.canonicalID(id)
         do {
             let rows = try ConnectorOAuthRegistry.readRegistry(at: ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot))
             if let row = rows.first(where: { $0["id"]?.stringValue == canonical }),
@@ -287,6 +265,7 @@ public enum InlineInteractionRegistry {
         "openrouter": "OpenRouter",
         "moonshot": "Moonshot",
         "kimi-code": "Kimi Code",
+        "meta": "Meta",
     ]
 
     // MARK: - Providers you sign into
@@ -374,7 +353,7 @@ public enum InlineInteractionRegistry {
         dataRoot: URL,
         declineConsequence: String? = nil
     ) -> InlineInteraction {
-        let id = canonicalConnectorID(rawID)
+        let id = ConnectorSetup.canonicalID(rawID)
         let descriptor = descriptor(kind: .connector, target: id, dataRoot: dataRoot)
         let name = descriptor.displayName
         return InlineInteraction(
@@ -544,7 +523,7 @@ public enum InlineInteractionRegistry {
             persistenceNote: "Saved on this Mac until you remove it.",
             cardProse: (providerSignIn(for: provider) == nil
                 ? "I need a key for \(name)" : "I need \(name) connected")
-                + " \u{2014} add it below, "
+                + " \u{2014} enter it in the protected entry on the Mac, "
                 + InlineInteraction.ConsequenceCopy.keepGoingSuffix
         )
     }

@@ -19,6 +19,8 @@ public struct DeskStep: Sendable, Equatable {
     public var card: String?
     public var action: JSONValue?
     public var source: String?
+    /// Original moment/candidate identities survive refiling and closure so replay cannot recreate landed promises.
+    public var promiseCaptures: [String]
     public var peers: [String]
     public var elevated: [String]
     /// Resume with the originating conversation's context, never a later message's door.
@@ -31,10 +33,11 @@ public struct DeskStep: Sendable, Equatable {
     public init(words: String, when: String, card: String? = nil, action: JSONValue? = nil, source: String? = nil,
                 peers: [String] = [], elevated: [String] = [], session: String? = nil, origin: String? = nil, filedAt: String? = nil,
                 replyRoute: JSONValue? = nil, rhythm: JSONValue? = nil, until: String? = nil, say: String? = nil,
-                clockStart: String? = nil, scheduledJobID: String? = nil) {
+                clockStart: String? = nil, scheduledJobID: String? = nil, promiseCaptures: [String] = []) {
         self.words = words; self.when = when; self.card = card
         self.action = action.flatMap { $0 == .null ? nil : Self.plannedAction($0) ?? $0 }
         self.source = source
+        self.promiseCaptures = promiseCaptures
         self.rhythm = rhythm; self.until = until; self.say = say
         self.clockStart = clockStart; self.scheduledJobID = scheduledJobID
         self.peers = peers; self.elevated = elevated; self.session = session
@@ -50,6 +53,7 @@ public struct DeskStep: Sendable, Equatable {
               DeskJSON.optionalStringsAreValid(obj, keys: ["card", "source", "session", "origin", "filedAt", "lifeID", "status", "reason", "until", "say",
                   "clockStart", "scheduledJobID"]),
               let peers = DeskJSON.strings(obj["peers"]),
+              let promiseCaptures = DeskJSON.strings(obj["promiseCaptures"]),
               let elevated = DeskJSON.strings(obj["elevated"]) else { return nil }
         if let value = obj["replyRoute"] {
             guard case .object(let route) = value,
@@ -67,7 +71,8 @@ public struct DeskStep: Sendable, Equatable {
                   elevated: elevated, session: obj["session"]?.stringValue,
                   origin: obj["origin"]?.stringValue, filedAt: obj["filedAt"]?.stringValue, replyRoute: obj["replyRoute"],
                   rhythm: obj["rhythm"], until: obj["until"]?.stringValue, say: obj["say"]?.stringValue,
-                  clockStart: obj["clockStart"]?.stringValue, scheduledJobID: obj["scheduledJobID"]?.stringValue)
+                  clockStart: obj["clockStart"]?.stringValue, scheduledJobID: obj["scheduledJobID"]?.stringValue,
+                  promiseCaptures: promiseCaptures)
         lifeID = obj["lifeID"]?.stringValue
         status = obj["status"]?.stringValue
         reason = obj["reason"]?.stringValue
@@ -81,6 +86,7 @@ public struct DeskStep: Sendable, Equatable {
             if let value, !value.isEmpty { obj[key] = .string(value) }
         }
         if !peers.isEmpty { obj["peers"] = .array(peers.map(JSONValue.string)) }
+        if !promiseCaptures.isEmpty { obj["promiseCaptures"] = .array(promiseCaptures.map(JSONValue.string)) }
         if !elevated.isEmpty { obj["elevated"] = .array(elevated.map(JSONValue.string)) }
         if let replyRoute { obj["replyRoute"] = replyRoute }
         if let rhythm { obj["rhythm"] = rhythm }
@@ -101,7 +107,15 @@ public struct DeskStep: Sendable, Equatable {
 
     public var actionText: String? { action.flatMap { try? $0.serialize(pretty: false) } }
 
+    /// Filing, attachment and approval resumption use the same visible words and peer provenance.
+    public var title: String {
+        peers.isEmpty && elevated.isEmpty
+            ? String(words.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
+            : "A step from \((peers + elevated).joined(separator: ", "))'s turn"
+    }
+
     mutating func preserveOrigin(of previous: DeskStep) {
+        promiseCaptures = previous.promiseCaptures + promiseCaptures.filter { !previous.promiseCaptures.contains($0) }
         peers = previous.peers + peers.filter { !previous.peers.contains($0) }
         elevated = previous.elevated + elevated.filter { !previous.elevated.contains($0) }
         session = previous.session

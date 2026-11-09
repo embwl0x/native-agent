@@ -240,7 +240,7 @@ extension SwiftToolDispatcher {
         input: [String: JSONValue]
     ) async throws -> JSONValue {
         // Bind observed Mail identities before admission, without executing a backend.
-        let input = ["mail_save_attachment", "mail_read_batch", "mail_triage_batch"].contains(tool)
+        let input = tool == "mail_save_attachment"
             ? AgentWorkspace.bindMail(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation), input, dataRoot: dataRoot) : input
         guard let access = Self.macIntegrationAccess(forTool: tool) else {
             throw ToolFailureError("Mac integration tool has no permission declaration: \(tool)", effects: .none)
@@ -295,7 +295,7 @@ extension SwiftToolDispatcher {
         case "contacts_delete": result = try await bridge.contactsDelete(input: input)
         case "mail_save_attachment":
             if let error = input["binding_error"] { return .object(["status": .string("failed"), "message": error]) }
-            let attachment = try await bridge.mailAttachment(input: input)
+            let attachment = try MailAttachmentRead.attachment(input: input)
             var fileInput = input
             fileInput["path"] = input["destination"] ?? .string("~/Downloads")
             if try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
@@ -303,40 +303,11 @@ extension SwiftToolDispatcher {
                     attachment: attachment)
             }
             return try await impl_trusted_file_mutation(turn: turn, invocation: invocation, tool: tool, input: fileInput, attachment: attachment)
-        case "mail_list_recent": result = try await bridge.mailListRecent(input: input)
-        case "mail_read_batch": result = try await bridge.mailReadBatch(input: input)
-        case "mail_triage_batch": result = try await bridge.mailTriageBatch(input: input)
-        case "mail_search": result = try await bridge.mailSearch(input: input)
-        case "mail_senders": result = try await bridge.mailSenders(input: input)
-        case "mail_send": result = try await bridge.mailSend(input: input)
-        case "mail_mark_read": result = try await bridge.mailMarkRead(input: input)
-        case "mail_archive": result = try await bridge.mailArchive(input: input)
-        case "mail_delete": result = try await bridge.mailDelete(input: input)
-        case "mail_reply": result = try await bridge.mailReply(input: input)
-        case "mail_draft": result = try await bridge.mailDraft(input: input)
-        case "messages_recent_threads": result = try await bridge.messagesRecentThreads(input: input)
-        case "messages_send": result = try await bridge.messagesSend(input: input)
-        case "notes_search": result = try await bridge.notesSearch(input: input)
-        case "notes_create": result = try await bridge.notesCreate(input: input)
-        case "notes_update", "notes_delete": result = try await bridge.notesModify(input: input, deleting: tool == "notes_delete")
-        case "music_now_playing": result = try await bridge.musicNowPlaying(input: input)
-        case "music_control": result = try await bridge.musicControl(input: input)
-        case "music_search_library": result = try await bridge.musicSearchLibrary(input: input)
-        case "music_list_library": result = try await bridge.musicListLibrary(input: input)
-        case "music_list_playlists": result = try await bridge.musicListPlaylists(input: input)
-        // Scheduler has no read axis; every scheduler action gates on write.
+        // Scheduled reads have no read axis; every scheduler action gates on write.
         case "scheduler_list_jobs": result = try await bridge.schedulerListJobs(input: input)
         case "scheduler_create_job": result = try await bridge.schedulerCreateJob(input: input)
         case "scheduler_cancel_job": result = try await bridge.schedulerCancelJob(input: input)
-        case "scheduler_pause_job", "scheduler_resume_job":
-            result = try await bridge.schedulerSetJobEnabled(input: input, enabled: tool == "scheduler_resume_job")
-        case "scheduler_update_job": result = try await bridge.schedulerUpdateJob(input: input)
         default: throw ToolFailureError("Mac integration tool has no backend: \(tool)", effects: .none)
-        }
-        if ["mail_list_recent", "mail_search", "mail_senders"].contains(tool) {
-            AgentReadBadges.shared.note(result, dataRoot: dataRoot)
-            return AgentWorkspace.attachReadReferences(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
-                tool: tool, input: input, result: result, dataRoot: dataRoot)
         }
         if integration == MacIntegrationID.messages, case .object(var fields) = result,
            fields["reason"] == .string("database_unavailable") || fields["history_reason"] == .string("database_unavailable") {

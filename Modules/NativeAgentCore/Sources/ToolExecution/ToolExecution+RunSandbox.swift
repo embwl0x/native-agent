@@ -42,11 +42,11 @@ actor ToolPrimitiveBroker {
     private var ended: [String: Arrival] = [:]
     private final class Read {
         let done = ScopedWaiter()
-        var result: Result<Arrival?, Error>?
+        var result: Result<Arrival, Error>?
     }
     private var readers: [String: (token: Int, read: Read)] = [:]
 
-    private func complete(_ read: Read, _ result: Result<Arrival?, Error>) {
+    private func complete(_ read: Read, _ result: Result<Arrival, Error>) {
         read.result = result
         read.done.resume()
     }
@@ -135,6 +135,9 @@ actor ToolPrimitiveBroker {
             if closed { throw CancellationError() }
             throw Self.inputFailure("invalid_primitive", field: "operation/arguments",
                 accepted: "operation: \(Self.operations.sorted().joined(separator: ", ")); arguments: a JSON object")
+        }
+        if ["fetch", "network.receive", "network.accept", "network.send", "program.receive", "program.send"].contains(operation), args["wait"] != nil {
+            throw Self.inputFailure("unsupported_wait", field: "wait", accepted: "omitted; cancel an unfinished operation explicitly")
         }
         if let name = Keyring.names(in: arguments).first(where: { !permissions.contains("secret:" + $0) }) {
             throw Parts.revisionFailure("undeclared", "Declare reach.capabilities secret:\(name) to use {{secret:\(name)}} in ability \(abilityID).",
@@ -248,17 +251,11 @@ actor ToolPrimitiveBroker {
         do {
             if operation == "fetch" {
                 let host = try Self.destination(args), destination = Keyring.Destination.host(host), keys = ["url", "headers", "body"]
-                let wait = try Self.wait(args, default: 120)
                 func send(_ given: [String: JSONValue]) async throws -> JSONValue {
-                    try await self.sendFetch(given, to: host, wait: wait, execution: execution)
+                    try await self.sendFetch(given, to: host, execution: execution)
                 }
-                let (given, sent, grants, _) = try await inserting(args, keys, to: destination)
-                var result = try await send(given)
-                // Renew/retry a rejected secret only once under the same unchanged grant; another account's concurrent grant cannot authorize resend.
-                if Parts.fields(result)["status"] == .int(401), !sent.isEmpty {
-                    let (again, _, _, renewed) = try await inserting(args, keys, to: destination, rejected: sent, grants: grants)
-                    if renewed { result = try await send(again) }
-                }
+                let given = try await inserting(args, keys, to: destination)
+                let result = try await send(given)
                 if case .int(let status)? = Parts.fields(result)["status"], status == 429 || (500...599).contains(status) {
                     throw SenseFailure(code: "http_\(status)", message: """
                         fetch returned HTTP \(status) from \(host). Inspect the service's response and state; for 429 reduce request rate, for 5xx \
@@ -277,22 +274,9 @@ actor ToolPrimitiveBroker {
                             "A secret needs an established TLS connection or admitted TCP loopback. Open one with network.connect before sending it.",
                                 "Use network.connect with tls:true or an admitted loopback TCP host; send only on the id it returns.")
                     }
-                    given = try await inserting(args, ["text"], to: .host(host)).args
+                    given = try await inserting(args, ["text"], to: .host(host))
                 }
                 given["base64"] = .string(try Self.outgoing(given).base64EncodedString())
-            }
-            if operation == "network.send" {
-                // Bound sends to non-reading peers and close their connection when the wait expires.
-                let wait = try Self.wait(args), id = try text(args, "id"), sending = given
-                do { return try await TurnDeadline.withThrowingDeadline(seconds: wait, deadlines: execution.deadlines) { _ in
-                    try await self.network(operation, args: sending, onActivity: execution.onActivity)
-                } }
-                catch is TurnDeadline.DeadlineExceeded {
-                    _ = try? await network("network.close", args: ["id": .string(id)], onActivity: execution.onActivity)
-                    throw SenseFailure(code: "timeout",
-                        message: "The connection did not take all of this within \(String(format: "%g", wait)) seconds, so it was closed. "
-                        + "Pass wait (seconds, up to 86400) for a peer that reads slowly.")
-                }
             }
             let result = try await network(operation, args: given, onActivity: execution.onActivity)
             guard operation == "network.connect", case .string(let id)? = Parts.fields(result)["id"] else { return result }
@@ -327,17 +311,15 @@ actor ToolPrimitiveBroker {
         return url.host!.lowercased()
     }
 
-    /// Insert secrets only toward their granted destination and retain values/grants for redaction and same-grant renewal checks.
-    private func inserting(_ args: [String: JSONValue], _ keys: [String], to destination: Keyring.Destination,
-                           rejected: [String: String] = [:], grants: [String: Date] = [:]) async throws
-        -> (args: [String: JSONValue], values: [String: String], grants: [String: Date], renewed: Bool) {
+    /// Insert secrets only toward their granted destination and retain their values for redaction.
+    private func inserting(_ args: [String: JSONValue], _ keys: [String], to destination: Keyring.Destination) async throws -> [String: JSONValue] {
         let names = Keyring.names(in: .object(args.filter { keys.contains($0.key) }))
-        guard !names.isEmpty else { return (args, [:], [:], false) }
-        let (values, granted, renewed) = try await Keyring.values(names, to: destination, rejected: rejected, grants: grants)
+        guard !names.isEmpty else { return args }
+        let values = try await Keyring.values(names, to: destination).values
         redactor.add(values)
         var given = args
         for key in keys { given[key] = given[key]?.mapStrings { insertingSecrets($0, values, url: key == "url") } }
-        return (given, values, granted, renewed)
+        return given
     }
 
     /// Connections and programs must expose the same output shape.
@@ -345,9 +327,8 @@ actor ToolPrimitiveBroker {
         let id = try text(args, "id")
         guard connections[id] != nil else { throw denied("This ability does not own that connection.",
             "Use an id returned to this ability by network.connect or network.accept; a closed or replaced handle cannot be reused.") }
-        let deadline = try Self.deadline(args)
         while true {
-            guard let arrival = try await next(id, until: deadline, onActivity: onActivity) else { return Self.pending }
+            let arrival = try await next(id, onActivity: onActivity)
             switch arrival {
             case .bytes(let data, _, let end):
                 if var piece = piece(id, data, end: end) { piece["eof"] = .bool(end); return .object(piece) }
@@ -357,17 +338,6 @@ actor ToolPrimitiveBroker {
             }
         }
     }
-
-    /// A read timeout must retain split characters and secret prefixes until more bytes or terminal evidence arrives.
-    private static let pending: JSONValue = .object(["pending": .bool(true), "eof": .bool(false)])
-
-    /// Response waits are bounded: read/send default to 30 seconds and whole fetches to 120.
-    private static func wait(_ args: [String: JSONValue], default given: Double = 30) throws -> Double {
-        let wait: Double = switch args["wait"] { case nil: given; case .int(let n)?: Double(n); case .double(let n)?: n; default: -1 }
-        guard wait >= 0, wait <= 86_400 else { throw Self.inputFailure("invalid_wait", field: "wait", accepted: "a number of seconds from 0 to 86400") }
-        return wait
-    }
-    private static func deadline(_ args: [String: JSONValue]) throws -> ContinuousClock.Instant { .now + .seconds(try wait(args)) }
 
     /// Expose UTF-8 as text and other bytes as base64; no available output remains nil.
     private func piece(_ key: String, _ data: Data, end: Bool) -> [String: JSONValue]? {
@@ -397,7 +367,7 @@ actor ToolPrimitiveBroker {
                     executable in program.start command.
                     """)
             }
-            let given = try await inserting(args, ["args", "env"], to: .program(path: path, identity: identity)).args
+            let given = try await inserting(args, ["args", "env"], to: .program(path: path, identity: identity))
             guard case .array(let rows) = given["args"] ?? .array([]), case .object(let env) = given["env"] ?? .object([:]),
                   Parts.strings(.array(rows)).count == rows.count, JSONValue.object(env).stringFields.count == env.count else {
                 throw Self.inputFailure("invalid_program_arguments", field: "args/env", accepted: "args: [string], env: {name: string}")
@@ -482,22 +452,12 @@ actor ToolPrimitiveBroker {
         catch { endProgram(id); throw error }
         switch operation {
         case "program.send":
-            let data = try Self.outgoing(try await inserting(args, ["text"], to: .program(path: program.path, identity: program.identity)).args)
-            let wait = try Self.wait(args)
-            // A send timeout fails the send and ends its program.
-            do { try await TurnDeadline.withThrowingDeadline(seconds: wait, deadlines: execution.deadlines) { _ in
-                try await self.write(data, to: id, onActivity: onActivity)
-            } }
-            catch is TurnDeadline.DeadlineExceeded {
-                throw SenseFailure(code: "timeout",
-                    message: "The program did not take all of this input within \(String(format: "%g", wait)) seconds, so it was ended. "
-                    + "Pass wait (seconds, up to 86400) for a program that reads its input slowly.")
-            }
+            let data = try Self.outgoing(try await inserting(args, ["text"], to: .program(path: program.path, identity: program.identity)))
+            try await write(data, to: id, onActivity: onActivity)
             return .object(["bytes": .int(Int64(data.count))])
         case "program.receive":
-            let deadline = try Self.deadline(args)
             while true {
-                guard let arrival = try await next(id, until: deadline, onActivity: onActivity) else { return Self.pending }
+                let arrival = try await next(id, onActivity: onActivity)
                 switch arrival {
                 case .bytes(let data, let stream?, _):
                     program.backlog.read(data.count)
@@ -654,18 +614,14 @@ actor ToolPrimitiveBroker {
         }
     }
 
-    /// The response wait never owns the request. Only its wall-clock transport ceiling cancels it; actual exit and the one durable outcome are joined even
-    /// when DNS cannot be interrupted.
-    private func sendFetch(_ args: [String: JSONValue], to destination: String, wait: Double, execution: OwnedProgramExecution) async throws -> JSONValue {
+    /// The admitted request owns transport and durable settlement through completion or cancellation.
+    private func sendFetch(_ args: [String: JSONValue], to destination: String, execution: OwnedProgramExecution) async throws -> JSONValue {
         try Task.checkCancellation()
         guard !closed else { throw CancellationError() }
         let token = UUID(), reply = ContinuationOnce<Result<JSONValue, Error>>()
         let id = "fetch:" + token.uuidString.lowercased(), root = dataRoot, part = abilityID
-        let transportLimit = max(600, wait)
-        // Reads leave no durable effect receipt; writes need one so an unknown outcome cannot be blindly repeated.
         let keepsRecord = !["GET", "HEAD"].contains((args["method"]?.stringValue ?? "GET").uppercased())
         let cause = execution.turn.map { [$0.id] } ?? []
-        // Experience is the advisory projection; the request owns its raw receipt below.
         if keepsRecord {
             ExperienceStore.record(root, id) { store in
                 try await store.begin(Experience(id: id, kind: .act, cause: cause,
@@ -674,67 +630,16 @@ actor ToolPrimitiveBroker {
                     claims: RepairDebt(owner: "ability " + part, operation: id).claims))
             }
         }
-        // No suspension between admission and handing ownership to the retained task.
-        fetches[token] = Task.detached {
-            let body = TurnBodyLifetime<JSONValue>()
+        let transport = Task.detached {
             let outcome: Result<JSONValue, Error>
-            do {
-                // The retained transport owns its ceiling independently of the caller's response wait.
-                let value = try await TurnDeadline.withThrowingDeadline(seconds: transportLimit, clock: .wallClock, deadlines: .init()) { _ in
-                    try await body.run { try await self.fetch(args, to: destination, onActivity: execution.onActivity) }
-                }
-                outcome = .success(value)
-            } catch {
-                let failure = error
-                let actual = await body.finish()
-                switch actual {
-                case .success(let value)?: outcome = .success(value)
-                case .failure(let error)? where !(error is CancellationError): outcome = .failure(error)
-                default:
-                    outcome = .failure(failure is TurnDeadline.DeadlineExceeded
-                        ? SenseFailure(code: "fetch_transport_timeout", message: """
-                            Fetch \(id) reached its \(String(format: "%g", transportLimit))-second transport ceiling. Its transport was cancelled and \
-                            joined; service effects remain unknown. Inspect its receipt and service state before another request.
-                            """)
-                        : failure)
-                }
-            }
-            let settled = await settle {
-                await self.settleFetch(outcome, id: id, keepsRecord: keepsRecord)
-            }
+            do { outcome = .success(try await self.fetch(args, to: destination, onActivity: execution.onActivity)) }
+            catch { outcome = .failure(error) }
+            let settled = await settle { await self.settleFetch(outcome, id: id, keepsRecord: keepsRecord) }
             reply.resume(settled)
             await self.finishedFetch(token)
         }
-        do {
-            return try await TurnDeadline.withThrowingDeadline(seconds: wait, clock: .wallClock, deadlines: execution.deadlines) { _ in
-                let budget = OperationWaitBudget(deadline: execution.deadline)
-                return try await reply.wait(budget: budget, cancellingWith: .failure(budget.cancellationError)).get()
-            }
-        } catch is TurnDeadline.DeadlineExceeded where !keepsRecord {
-            throw SenseFailure(code: "fetch_timeout", message: """
-                The read from \(destination) had no complete answer within \(String(format: "%g", wait)) seconds. A read changes nothing, so it is safe \
-                to repeat; set wait (seconds, up to 86400) for a slower service.
-                """)
-        } catch is TurnDeadline.DeadlineExceeded {
-            throw SenseFailure(code: "fetch_timeout", message: """
-                fetch had no complete answer from \(destination) within \(String(format: "%g", wait)) seconds. Its outcome is unknown; the request \
-                remains owned under its \(String(format: "%g", transportLimit))-second transport limit.\u{20}
-                """
-                + """
-                    Read experience \(id) for its eventual response or failure and inspect service state before another request. Set wait (seconds, up to \
-                    86400) for a slower service.
-                    """)
-        } catch is CancellationError {
-            throw SenseFailure(code: "fetch_wait_cancelled", message: """
-                The fetch response wait ended. Its outcome is unknown; the admitted request still owns settlement. Read experience \(id) and inspect \
-                service state before another request.
-                """)
-        } catch is OperationWaitBudget.Exceeded {
-            throw SenseFailure(code: "fetch_timeout", message: """
-                The enclosing call's response deadline ended. The fetch outcome is unknown; the admitted request still owns settlement. Read experience \
-                \(id) and inspect service state before another request.
-                """)
-        }
+        fetches[token] = transport
+        return try await reply.wait(cancellingWith: .failure(CancellationError()), onCancel: { transport.cancel() }).get()
     }
 
     private func finishedFetch(_ token: UUID) { fetches[token] = nil }
@@ -792,13 +697,17 @@ actor ToolPrimitiveBroker {
                 onActivity: onActivity)
         let id = try text(Parts.fields(connected), "id")
         defer { connections.removeValue(forKey: id)?.cancel(); fetchConnections.remove(id) }
-        let message = CFHTTPMessageCreateRequest(nil, (request.httpMethod! as CFString), url as CFURL, kCFHTTPVersion1_1).takeRetainedValue()
+        guard let method = request.httpMethod else {
+            throw SenseFailure(code: "http_method_missing", message: "The fetch request has no HTTP method.")
+        }
+        let message = CFHTTPMessageCreateRequest(nil, method as CFString, url as CFURL, kCFHTTPVersion1_1).takeRetainedValue()
         for (key, value) in request.allHTTPHeaderFields ?? [:] {
             CFHTTPMessageSetHeaderFieldValue(message, key as CFString, value as CFString)
         }
         // URL.host omits IPv6 brackets required by the HTTP Host field.
         let named = host.contains(":") ? "[\(host)]" : host
-        CFHTTPMessageSetHeaderFieldValue(message, "Host" as CFString, (url.port == nil ? named : "\(named):\(url.port!)") as CFString)
+        let hostField = url.port.map { "\(named):\($0)" } ?? named
+        CFHTTPMessageSetHeaderFieldValue(message, "Host" as CFString, hostField as CFString)
         CFHTTPMessageSetHeaderFieldValue(message, "Connection" as CFString, "close" as CFString)
         CFHTTPMessageSetHeaderFieldValue(message, "Accept-Encoding" as CFString, "identity" as CFString)
         if let body = request.httpBody {
@@ -1056,7 +965,7 @@ actor ToolPrimitiveBroker {
             let id = try text(args, "id")
             guard listeners[id] != nil else { throw denied("This ability does not own that listener.",
                 "Use the id returned to this ability by network.listen; a closed listener cannot be reused.") }
-            guard let arrival = try await next(id, until: try Self.deadline(args), onActivity: onActivity) else { return .object(["pending": .bool(true)]) }
+            let arrival = try await next(id, onActivity: onActivity)
             switch arrival {
             case .accepted(let accepted):
                 try await ready(accepted, onActivity: onActivity)
@@ -1151,8 +1060,8 @@ actor ToolPrimitiveBroker {
         held?.signal("held", part: abilityID, ["id": .string(id), "kind": .string(kind)])
     }
 
-    /// Arrivals stay ordered; deadline expiry returns nil without inventing terminal evidence, while real terminal evidence remains repeatable.
-    private func next(_ id: String, until deadline: ContinuousClock.Instant, onActivity: (@Sendable () -> Void)?) async throws -> Arrival? {
+    /// Arrivals stay ordered; only data, terminal evidence or cancellation releases a reader.
+    private func next(_ id: String, onActivity: (@Sendable () -> Void)?) async throws -> Arrival {
         let arrival: Arrival
         if let first = inbox[id]?.first {
             inbox[id]?.removeFirst()
@@ -1163,27 +1072,24 @@ actor ToolPrimitiveBroker {
             pump(id)
             reads += 1
             let token = reads
-            var timer: Task<Void, Never>?
-            defer { timer?.cancel() }
             if closed || Task.isCancelled { throw CancellationError() }
             let read = Read()
             readers[id] = (token, read)
-            // Only this caller's wait ends at its deadline; arrival/exit owns the read result.
-            timer = Task { try? await Task.sleep(until: deadline, clock: .continuous); self.endRead(id, token, nil) }
             await read.done.park()
             endRead(id, token, CancellationError())
-            let came = try read.result!.get()
-            guard let came else { return nil }
-            arrival = came
+            guard let result = read.result else {
+                throw SenseFailure(code: "read_unsettled", message: "The stream reader woke without its result.")
+            }
+            arrival = try result.get()
         }
         onActivity?()
         if arrival.ends { ended[id] = arrival } else { pump(id) }
         return arrival
     }
 
-    private func endRead(_ id: String, _ token: Int, _ error: Error?) {
+    private func endRead(_ id: String, _ token: Int, _ error: Error) {
         guard readers[id]?.token == token, let waiting = readers.removeValue(forKey: id) else { return }
-        if let error { complete(waiting.read, .failure(error)) } else { complete(waiting.read, .success(nil)) }
+        complete(waiting.read, .failure(error))
     }
 
     /// Keep one read outstanding only while no connection piece waits unread, bounding held input.

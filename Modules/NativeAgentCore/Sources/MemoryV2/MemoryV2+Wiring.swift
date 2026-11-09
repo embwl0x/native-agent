@@ -38,15 +38,8 @@ extension SwiftNativeMemoryV2 {
         if case .object(let m)? = newMetadata { newMeta = m }
         let source = (newSource ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // Roots are unioned by the landing itself (`MemoryStorage.foldDuplicate`), never patched here.
         var out = MemorySenseProvenance.merging(existing: existing.extras, incoming: newMetadata)
-        out.merge(MemoryDataProvenance.merging(existing: existing.extras, incoming: newMetadata)) { _, value in value }
-        var peerSources: [JSONValue] = []
-        for metadata in [extras, newMeta] {
-            if case .array(let values)? = metadata["peer_data_sources"] {
-                for value in values where !peerSources.contains(value) { peerSources.append(value) }
-            }
-        }
-        if !peerSources.isEmpty { out["peer_data_sources"] = .array(peerSources) }
 
         // Seed source lineage from the row's own source so its first writer cannot disappear.
         var sources: [String] = []
@@ -166,7 +159,7 @@ extension SwiftNativeMemoryV2 {
             if case .string(let value)? = metaObj["observed_at"] { liftedObservedAt = value }
             liftedEvidence = metaObj["evidence"]
         }
-        let record = StoredMemory(
+        var record = StoredMemory(
             // A caller-owned id preserves one lesson origin per proposal and rejects racing inserts on the primary key.
             id: id ?? UUID().uuidString,
             content: content,
@@ -185,6 +178,20 @@ extension SwiftNativeMemoryV2 {
         )
         let targetIDs = Set(supersedes + [corrects].compactMap { $0 })
         let existingRows = try await storage.memories(ids: Array(targetIDs))
+        // This preliminary union checks the writer's claim about its own past. The retiring transaction unions the target's then-current roots
+        // again, so metadata-only changes during embedding cannot be lost.
+        let roots = MemoryRoot.union(try [MemoryRoot.roots(in: record.metadata)] + existingRows.map { try MemoryRoot.roots(in: $0.metadata) })
+        record.metadata = MemoryRoot.setting(roots, in: record.metadata)
+        // Words an untrusted agent steered stay its telling, dated when it told them: never the agent's own past.
+        let steer = MemoryDataProvenance.sources(in: record.metadata)
+        if context.restatesOwnPast, !steer.isEmpty {
+            throw ToolFailureError("""
+                These words came through \(steer.joined(separator: ", ")), so they stay its telling, dated when it told you. since and remembered \
+                are for your own past, kept in a turn no untrusted agent started.
+                """, argumentPath: "since / provenance", accepted: "provenance told by \(steer[0]), without since", effects: .none,
+                code: "memory_restatement_steered", status: .refused,
+                instruction: "Save it as told by \(steer[0]) without since, or leave the memory as it is.", recovery: .correctArguments)
+        }
         var superseding = try Set(supersedes).sorted().map { id in
             guard let row = existingRows.first(where: {
                 $0.id == id && $0.status == "active"
@@ -194,7 +201,7 @@ extension SwiftNativeMemoryV2 {
             }
             return SupersedingAcceptance(
                 targetId: id, expectedContentHash: MemoryStorage.contentHash(row.content),
-                reason: "explicit supersession")
+                reason: "explicit supersession", restatesOwnPast: context.restatesOwnPast)
         }
         // Share fingerprinted replacement intent with supersession, including cold admission; reasserting the exact target is duplicate evidence, never
         // demotion.
@@ -204,13 +211,13 @@ extension SwiftNativeMemoryV2 {
            }), MemoryStorage.comparisonKey(target.content, mode: .canonical) != MemoryStorage.comparisonKey(content, mode: .canonical) {
             superseding.append(SupersedingAcceptance(
                 targetId: corrects, expectedContentHash: MemoryStorage.contentHash(target.content),
-                reason: correctionReason ?? "explicit correction"))
+                reason: correctionReason ?? "explicit correction", restatesOwnPast: context.restatesOwnPast))
         }
         if superseding.isEmpty {
             // Reassert exact duplicates before paying for an embedding. The final admission repeats matching under its insertion transaction.
             if let existing = try await storage.admitMemory(
                 record,
-                insertIfMissing: false, preserveID: id != nil, context: context
+                insertIfMissing: false, preserveID: id != nil
             ) {
                 return MemoryRecord(stored: existing)
             }
@@ -227,12 +234,12 @@ extension SwiftNativeMemoryV2 {
         admitted.embeddingEpoch = embedded?.epoch.rawValue
         let inserted: StoredMemory
         if !supersedes.isEmpty || (embedded == nil && !superseding.isEmpty) {
-            inserted = try await storage.insertMemory(admitted, superseding: embedded == nil ? [] : superseding, context: context)
+            inserted = try await storage.insertMemory(admitted, superseding: embedded == nil ? [] : superseding)
         } else {
             guard let saved = try await storage.admitMemory(
                     admitted,
                     insertIfMissing: true, preserveID: id != nil,
-                    superseding: embedded == nil ? [] : superseding, context: context) else { throw MemoryV2Error.storageUnavailable }
+                    superseding: embedded == nil ? [] : superseding) else { throw MemoryV2Error.storageUnavailable }
             inserted = saved
         }
         let result = MemoryRecord(stored: inserted)

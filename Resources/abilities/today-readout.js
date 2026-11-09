@@ -6,7 +6,8 @@
   "record": {
     "description": "Draw Today as a timed timeline, upcoming intentions, earlier notes and named source gaps.",
     "actions": [], "inputSchema": {"type": "object",
-      "required": ["moments","dream","nextDream","toward","thinking","intentions","conversations","builders","notes","clusters"]}
+      "required": ["moments","dream","nextDream","toward","thinking","intentions","conversations","builders","notes","clusters",
+        "keys","waitingRows","waiting","hour"]}
   }
 }
 */
@@ -70,13 +71,17 @@ function run(input) {
         const head=plain(dreamTitle).replace(/\.$/,""), tail=plain(mood === null ? "" : mood).replace(/\.$/,"");
         did.push(row("dream","I dreamed",bounded(head+"."+(tail ? " "+capital(tail)+"." : "")),["dream"]));
     }
-    if (input.nextDream.state === "available") ahead.push(row("nextDream","I'll dream","",["nextDream"]));
+    const nextNight=input.nextDream;
+    const dreamPart=nextNight.dream.state === "off" ? " Dreams are off."
+        : nextNight.dream.state === "unavailable" ? " Dream setting unavailable: "+nextNight.dream.reason : "";
+    const nightLine=nextNight.reason+dreamPart;
+    if (nextNight.state === "available") ahead.push(row("nextDream","The night",nightLine,["nextDream"]));
     if (input.toward.state === "available") {
         const label=capital(input.toward.label);
         if (label.toLowerCase().includes("dream")) {
             if (input.nextDream.state === "available") {
                 ahead.length=0;
-                ahead.push(row("facingDream","I'll dream","",["nextDream"]));
+                ahead.push(row("facingDream","The night",nightLine,["nextDream"]));
             }
         } else if (label) {
             const t=input.toward, part=t.hour<12 ? "morning" : t.hour<17 ? "afternoon" : t.hour<21 ? "evening" : "night";
@@ -156,15 +161,24 @@ function run(input) {
             const starts=sources.filter(s=>s.start !== null).map(s=>s.start);
             return starts.length ? Math.min(...starts) : Math.max(...sources.map(s=>s.end));
         }
-        return Math.min(...sources.map(s=>s.at));
+        const times=sources.map(s=>s.at).filter(Number.isFinite);
+        return times.length ? Math.min(...times) : undefined;
     }
     function ends(keys,startField,endField) {
         const start=keys.slice().sort((a,b)=>facts.get(a)[startField]-facts.get(b)[startField])[0];
         const end=keys.slice().sort((a,b)=>facts.get(b)[endField]-facts.get(a)[endField])[0];
         return start===end ? [start] : [start,end];
     }
-    did.sort((a,b)=>atFor(a)-atFor(b) || (a.id<b.id ? -1 : a.id>b.id ? 1 : 0));
-    ahead.sort((a,b)=>atFor(a)-atFor(b));
+    function chronological(a,b) {
+        const left=atFor(a), right=atFor(b);
+        // Undated facts follow the timeline without inventing an instant for them.
+        if (left === undefined || right === undefined) {
+            if (left !== right) return left === undefined ? 1 : -1;
+        } else if (left !== right) return left-right;
+        return a.id<b.id ? -1 : a.id>b.id ? 1 : 0;
+    }
+    did.sort(chronological);
+    ahead.sort(chronological);
     const newest=g=>Math.max(...g.sources.map(key=>facts.get(key).at));
     earlier.sort((a,b)=>Number(b.failure)-Number(a.failure) || newest(b)-newest(a));
     for (const r of did) {
@@ -184,8 +198,10 @@ function face(input) {
     if (input.mode === "waiting") return {title:"Today",
         sections:[{id:"waiting",style:"waiting",rows:[{id:"waiting",title:run(input)}]}]};
     const decision=run(input), sections=[];
-    const waiting=input.waitingRows ? input.waitingRows.slice() : [];
-    if (input.waitingDesk) waiting.push({id:"desk",title:run(input.waitingDesk),open:"page:desk"});
+    // A row leads only where its key leads; the person's decisions stand beside this face, drawn by the app.
+    const keys=input.keys, open=key=>(keys[key]||{}).open;
+    const waiting=input.waitingRows.map(r=>({id:r.id,title:r.title,detail:r.detail,open:open(r.id)}));
+    if (input.waitingDesk) waiting.push({id:"desk",title:run(input.waitingDesk),open:open("desk")});
     for (let i=0;i<waiting.length;i+=256) {
         sections.push({id:"waiting:"+i,title:"Waiting for you",style:"list",rows:waiting.slice(i,i+256)});
     }
@@ -205,9 +221,10 @@ function face(input) {
     for (const area of ["did","ahead"]) {
         const rows=[];
         for (const row of decision[area]) {
-            const linked=row.sources.map(key=>facts.get(key)).find(fact=>fact && fact.open);
-            rows.push({id:row.id,title:row.title,detail:row.line,at:at(row.sources),open:linked ? linked.open : undefined});
-            row.details.forEach((title,i)=>rows.push({id:"detail:"+row.id+":"+i,title,tone:"quiet"}));
+            // A row that leads somewhere takes the key of the source it leads to.
+            const linked=row.sources.find(key=>open(key)), id=linked || row.id;
+            rows.push({id,title:row.title,detail:row.line,at:at(row.sources),open:linked ? open(linked) : undefined});
+            row.details.forEach((title,i)=>rows.push({id:"detail:"+id+":"+i,title,tone:"quiet"}));
         }
         if (rows.length) sections.push({id:area,title:area === "did" ? "What I did" : "Ahead",
             style:area === "did" ? "timeline" : "flow",rows});
@@ -215,7 +232,7 @@ function face(input) {
     const earlier=decision.earlier.map(group=>{
         const newest=group.sources.slice().sort((a,b)=>((facts.get(b)||{}).at||0)-((facts.get(a)||{}).at||0))[0];
         return {id:newest,title:group.title,value:String(group.sources.length),at:at(group.sources,true),
-            tone:group.failure ? "failed" : "quiet",open:(facts.get(newest)||{}).open};
+            tone:group.failure ? "failed" : "quiet",open:open(newest)};
     });
     for (const row of decision.omitted) earlier.push({id:"omitted:"+row.id,title:"Today row "+row.id+" omitted",
         detail:row.sources.length ? "Missing facts: "+row.sources.join(", ")+"." : "No source.",tone:"quiet"});
@@ -232,8 +249,17 @@ function face(input) {
     sections.push({id:"queues",style:"flow",rows:[
         {id:"approvals",title:"Approvals and past decisions",open:"page:today/approvals"},
         {id:"inbox",title:"Every note I've left you",open:"page:today/inbox"},
-        {id:"self-improvement",title:"Self-improvement",open:"page:today/selfImprovement"},
         {id:"rem",title:"REM Replay Lineage",open:"page:today/cognitionProposals"}
     ]});
-    return {title:"Today",line:input.line,sections};
+    return {title:"Today",line:dayLine(input,decision.did.length),sections};
+}
+// The page's one sentence: how full the day has been, and what waits on you. A Desk that would not read cannot vouch for "nothing".
+function dayLine(input,did) {
+    const part=input.hour<12 ? "morning" : input.hour<17 ? "afternoon" : "evening";
+    const day=did===0 ? "A quiet "+part+" so far." : did<=2 ? "A quiet "+part+"." : "I've had a full "+part+".";
+    const n=input.waiting.count;
+    if (!input.waiting.readable) return day;
+    if (n===0) return input.moments.state==="available" ? day+" Nothing is waiting on you." : day;
+    const word=["One","Two","Three","Four","Five","Six","Seven","Eight","Nine","Ten"][n-1] || "Several";
+    return day+" "+word+" "+(n===1 ? "thing is" : "things are")+" waiting on you.";
 }

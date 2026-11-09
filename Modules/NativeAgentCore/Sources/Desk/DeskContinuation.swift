@@ -41,6 +41,7 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
     public var sessionID: String?
     public var surface: String
     public var fileAccess: String
+    public var fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling?
     public var envelope: [String: JSONValue]
     public var replyRoute: [String: JSONValue]
     public var remainingWork: String

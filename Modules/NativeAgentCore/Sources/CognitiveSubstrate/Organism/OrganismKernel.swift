@@ -171,7 +171,7 @@ public actor OrganismKernel {
     public func refreshBodySchema(
         _ read: OrganismBodyRead,
         integratesChemistry: Bool = true,
-        canonicalAffect: CognitiveAffectState? = nil
+        canonicalAffect: OrganismLifeReading? = nil
     ) async {
         applyBodySchema(
             read,
@@ -186,7 +186,7 @@ public actor OrganismKernel {
     public func refreshBodySchemaAndFrozenRead(
         _ read: OrganismBodyRead,
         integratesChemistry: Bool = true,
-        canonicalAffect: CognitiveAffectState? = nil,
+        canonicalAffect: OrganismLifeReading? = nil,
         fixedAt: Date
     ) -> OrganismFrozenRead {
         applyBodySchema(
@@ -201,7 +201,7 @@ public actor OrganismKernel {
     private func applyBodySchema(
         _ read: OrganismBodyRead,
         integratesChemistry: Bool,
-        canonicalAffect: CognitiveAffectState?,
+        canonicalAffect: OrganismLifeReading?,
         at observedAt: Date
     ) {
         guard configuration.enabled else { return }
@@ -220,8 +220,19 @@ public actor OrganismKernel {
         }
         body.bodySchema = nextBodySchema
         if let canonicalAffect {
-            body.chemicalState.warmth = canonicalAffect.socialWarmth.clamped01()
-            body.chemicalState.urgency = canonicalAffect.taskPressure.clamped01()
+            let affect = canonicalAffect.affect
+            body.chemicalState.warmth = affect.socialWarmth.clamped01()
+            body.chemicalState.urgency = affect.taskPressure.clamped01()
+            // A refresh sustains current stakes without erasing lived outcomes or dosing again for another read.
+            body.chemicalState.vigilance = max(
+                body.chemicalState.vigilance, max(affect.uncertainty, canonicalAffect.careTension)
+            ).clamped01()
+            body.chemicalState.novelty = canonicalAffect.novelty
+            body.chemicalState.curiosity = canonicalAffect.novelty
+            body.chemicalState.coherence = (
+                ChemicalState.neutral.coherence + 0.15 * canonicalAffect.careValence - 0.25 * affect.uncertainty
+            ).clamped01()
+            body.bodySchema.handPain = canonicalAffect.handPain
             // Elapsed since the last CROSSING, not since the last read: an Observatory poll at the same instant integrates exactly nothing.
             body.chemicalState.tenderness = OrganismChemistry.tenderness(
                 body.chemicalState.tenderness,

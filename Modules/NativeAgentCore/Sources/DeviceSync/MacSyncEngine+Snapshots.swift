@@ -44,13 +44,15 @@ extension MacSyncEngine {
         republish: Bool = false,
         includeMemories: Bool = false,
         includeChatTranscripts: Bool = false,
-        scope: SnapshotWriteScope = .standard
+        scope: SnapshotWriteScope = .standard,
+        repairFiles: Set<String> = []
     ) async {
         guard isActive, let snapshotDir else { return }
         if snapshotWriteInFlight {
             snapshotWriteQueuedScope = scope.including(snapshotWriteQueuedScope)
             snapshotWriteQueuedNeedsHeavy = snapshotWriteQueuedNeedsHeavy || forceHeavy
             snapshotWriteQueuedNeedsRepublish = snapshotWriteQueuedNeedsRepublish || republish
+            snapshotWriteQueuedRepairs.formUnion(repairFiles)
             snapshotWriteQueuedNeedsMemories = snapshotWriteQueuedNeedsMemories || includeMemories
             snapshotWriteQueuedNeedsChatTranscripts =
                 snapshotWriteQueuedNeedsChatTranscripts || includeChatTranscripts
@@ -65,10 +67,12 @@ extension MacSyncEngine {
                 snapshotWriteQueuedScope = nil
                 let queuedForceHeavy = snapshotWriteQueuedNeedsHeavy
                 let queuedRepublish = snapshotWriteQueuedNeedsRepublish
+                let queuedRepairs = snapshotWriteQueuedRepairs
                 let queuedIncludeMemories = snapshotWriteQueuedNeedsMemories
                 let queuedIncludeChatTranscripts = snapshotWriteQueuedNeedsChatTranscripts
                 snapshotWriteQueuedNeedsHeavy = false
                 snapshotWriteQueuedNeedsRepublish = false
+                snapshotWriteQueuedRepairs = []
                 snapshotWriteQueuedNeedsMemories = false
                 snapshotWriteQueuedNeedsChatTranscripts = false
                 Task { @MainActor in
@@ -77,7 +81,7 @@ extension MacSyncEngine {
                         republish: queuedRepublish,
                         includeMemories: queuedIncludeMemories,
                         includeChatTranscripts: queuedIncludeChatTranscripts,
-                        scope: queuedScope
+                        scope: queuedScope, repairFiles: queuedRepairs
                     )
                 }
             }
@@ -87,6 +91,7 @@ extension MacSyncEngine {
         await Task.yield()
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
         let heavy = forceHeavy || snapshotWriteQueuedNeedsHeavy
+        let repairs = repairFiles.union(snapshotWriteQueuedRepairs)
         if republish || snapshotWriteQueuedNeedsRepublish {
             snapshotFileDigests.removeAll()
             sync.bridge.invalidateMobileSnapshotPublication()
@@ -97,11 +102,12 @@ extension MacSyncEngine {
         snapshotWriteQueuedScope = nil
         snapshotWriteQueuedNeedsHeavy = false
         snapshotWriteQueuedNeedsRepublish = false
+        snapshotWriteQueuedRepairs = []
         snapshotWriteQueuedNeedsMemories = false
         snapshotWriteQueuedNeedsChatTranscripts = false
         await buildAndWriteSnapshots(
             forceHeavy: heavy, includeMemories: memories, includeChatTranscripts: transcripts, scope: mergedScope,
-            snapshotDir: snapshotDir, lifecycleGeneration: lifecycleGeneration
+            snapshotDir: snapshotDir, lifecycleGeneration: lifecycleGeneration, repairFiles: repairs
         )
     }
 
@@ -117,14 +123,10 @@ extension MacSyncEngine {
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
         let snapshots = await sync.host.pageFaces()
         do {
-            let projection = try await MobileSnapshotBuilder.shared.faces(snapshots)
-            await writeSnapshot(.built(projection.data), to: "faces.json", in: snapshotDir,
+            let data = try await MobileSnapshotBuilder.shared.faces(snapshots)
+            await writeSnapshot(.built(data), to: "faces.json", in: snapshotDir,
                 lifecycleGeneration: lifecycleGeneration, readRevision: readRevision,
                 changed: &changed, skipped: &skipped, attempted: &attempted)
-            if !projection.skipped.isEmpty {
-                let omissions = projection.skipped.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: "; ")
-                skipped["faces"] = [skipped["faces"], omissions].compactMap { $0 }.joined(separator: "; ")
-            }
         } catch {
             await writeSnapshot(.skipped("face encoding failed: \(error.localizedDescription)"), to: "faces.json", in: snapshotDir,
                 lifecycleGeneration: lifecycleGeneration, readRevision: readRevision,
@@ -134,7 +136,7 @@ extension MacSyncEngine {
 
     private func buildAndWriteSnapshots(
         forceHeavy: Bool, includeMemories: Bool, includeChatTranscripts: Bool, scope: SnapshotWriteScope,
-        snapshotDir: URL, lifecycleGeneration: UInt64
+        snapshotDir: URL, lifecycleGeneration: UInt64, repairFiles: Set<String>
     ) async {
         if scope == .workActivity {
             await writeWorkActivitySnapshots(in: snapshotDir, lifecycleGeneration: lifecycleGeneration)
@@ -168,7 +170,12 @@ extension MacSyncEngine {
             }()
             async let memoriesTask: [MemoryRecord]? = {
                 guard includeHeavySnapshots || includeMemories else { return nil }
-                return try await api.activeMemories().map(MemoryRecord.init(phoneRow:))
+                let records = try await api.activeMemories()
+                let now = Date()
+                return records.filter { record in
+                    MemoryRecordDisclosurePolicy.classify(record, at: now)?.permits(surface: "ios", personaID: nil) == true
+                        && Self.memoryPhoneFields(record).allSatisfy { ContextSecretContentPolicy.redactedFragment($0) == $0 }
+                }.map(MemoryRecord.init(phoneRow:))
             }()
             async let connectorsTask: [MobileConnectorSnapshot]? = {
                 guard includeHeavySnapshots else { return nil }
@@ -268,7 +275,24 @@ extension MacSyncEngine {
             }
 
             await publish(await helpersSnapshotData(), to: "helpers_agents.json")
-            await write(overview, to: "work_overview.json")
+            do {
+                let mobileOverview = try await MobileSnapshotBuilder.shared.state(
+                    overview, storedAt: snapshotDir.appendingPathComponent("work_overview.json"),
+                    rebuilding: repairFiles.contains("work_overview.json"), clock: MobileSnapshotBuilder.CapturedClock.self,
+                    retainingClocks: {
+                        $0.capturedAt = $1.capturedAt
+                    }, stamp: { value, previous, now in
+                        let changedAt: Date
+                        if let previous {
+                            guard let prior = NativeTimestampFormat.parseISO8601(previous.capturedAt) else {
+                                throw CocoaError(.fileReadCorruptFile)
+                            }
+                            changedAt = max(now, prior.addingTimeInterval(0.001))
+                        } else { changedAt = now }
+                        value.capturedAt = NativeTimestampFormat.fractionalZulu(changedAt)
+                    })
+                await write(mobileOverview, to: "work_overview.json")
+            } catch { recordFetchFailure("work_overview", error) }
             if let deskItems {
                 do {
                     let projection = try await MobileSnapshotBuilder.shared.desk(deskItems, evidence: jobEvidence)
@@ -289,7 +313,6 @@ extension MacSyncEngine {
                     recordFetchFailure("desk", error)
                 }
             }
-            await publish(await schedulerSnapshotData(), to: "scheduler.json")
             if let skills { await write(skills, to: "skills_snapshot.json") }
             if let toolCatalog { await write(toolCatalog, to: "tools_snapshot.json") }
             if let memories { await write(memories, to: "memories.json") }
@@ -398,9 +421,25 @@ extension MacSyncEngine {
                     }
                 }
             }
-            if let health { await write(health, to: "health.json") }
-            await publish(await telegramSnapshotData(), to: "telegram.json")
-            await write(organismLivingStatus, to: Self.organismLivingStatusSnapshotFilename)
+            if let health {
+                do {
+                    let mobileHealth = try await MobileSnapshotBuilder.shared.health(
+                        health, storedAt: snapshotDir.appendingPathComponent("health.json"),
+                        rebuilding: repairFiles.contains("health.json"))
+                    await writeData(mobileHealth, to: "health.json")
+                } catch { recordFetchFailure("health", error) }
+            }
+            await publish(await telegramSnapshotData(in: snapshotDir, rebuilding: repairFiles.contains("telegram.json")), to: "telegram.json")
+            do {
+                let mobileOrganism = try await MobileSnapshotBuilder.shared.state(
+                    organismLivingStatus, storedAt: snapshotDir.appendingPathComponent(Self.organismLivingStatusSnapshotFilename),
+                    rebuilding: repairFiles.contains(Self.organismLivingStatusSnapshotFilename),
+                    clock: MobileSnapshotBuilder.GeneratedClock.self,
+                    retainingClocks: { $0.generatedAt = $1.generatedAt }, stamp: { value, previous, now in
+                        value.generatedAt = previous.map { max(now, $0.generatedAt.addingTimeInterval(1)) } ?? now
+                    })
+                await write(mobileOrganism, to: Self.organismLivingStatusSnapshotFilename)
+            } catch { recordFetchFailure("organism_living_status", error) }
             if let memProposals { await write(memProposals, to: "memory_proposals.json") }
             await write([JSONValue](), to: "training_proposals.json")
             if let providers { await write(providers.providers, to: "providers.json") }
@@ -416,7 +455,7 @@ extension MacSyncEngine {
 
             await commitSnapshots(committedSnapshots, skipped: skippedSnapshotGroups,
                 attempted: attemptedSnapshotGroups, in: snapshotDir,
-                lifecycleGeneration: lifecycleGeneration, readRevision: readRevision, scope: .standard)
+                lifecycleGeneration: lifecycleGeneration, readRevision: readRevision)
 
         } catch {
             syncError = "Snapshot error: \(error.localizedDescription)"
@@ -461,7 +500,7 @@ extension MacSyncEngine {
             for group in attempted { skipped[group] = "sessions unavailable: \(error.localizedDescription)" }
         }
         await commitSnapshots(changed, skipped: skipped, attempted: attempted, in: snapshotDir,
-            lifecycleGeneration: lifecycleGeneration, readRevision: readRevision, scope: .chatSessions)
+            lifecycleGeneration: lifecycleGeneration, readRevision: readRevision)
         await sync.host.retryRequestedResults()
     }
 
@@ -501,7 +540,7 @@ extension MacSyncEngine {
     /// Every scope holds the snapshot writer through publication and staleness reconciliation.
     func commitSnapshots(
         _ changed: [String: Data], skipped: [String: String], attempted: Set<String>, in snapshotDir: URL,
-        lifecycleGeneration: UInt64, readRevision: Double, scope: SnapshotWriteScope
+        lifecycleGeneration: UInt64, readRevision: Double
     ) async {
         var committedSnapshots = changed
         var skippedSnapshotGroups = skipped
@@ -510,7 +549,8 @@ extension MacSyncEngine {
             changed: &committedSnapshots, skipped: &skippedSnapshotGroups, attempted: &attemptedSnapshotGroups)
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
         lastSnapshotAt = Date()
-        let prunedDigests = Self.digestsPrunedToExistingFiles(snapshotFileDigests, in: snapshotDir)
+        let digests = snapshotFileDigests
+        let prunedDigests = await MobileSnapshotBuilder.shared.build { Self.digestsPrunedToExistingFiles(digests, in: snapshotDir) }
         if prunedDigests.count != snapshotFileDigests.count {
             snapshotFileDigests = prunedDigests
             await saveSnapshotDigests()
@@ -519,8 +559,7 @@ extension MacSyncEngine {
             let failed = await publishChangedSnapshots(
                 committedSnapshots,
                 in: snapshotDir,
-                lifecycleGeneration: lifecycleGeneration,
-                scope: scope
+                lifecycleGeneration: lifecycleGeneration
             )
             guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
             var publicationSkips = Self.publishFailureSkips(failed, changed: Set(committedSnapshots.keys))
@@ -539,7 +578,9 @@ extension MacSyncEngine {
         }
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
         if unresolvedSnapshotGroups.isEmpty {
-            syncError = nil
+            let questionsFailure = await sync.needsUser.failure
+            guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
+            syncError = questionsFailure.map { "Desk questions remain owed: " + $0 }
         } else {
             let messages = NAMobileSnapshotGroup.stalenessMessages(unresolvedSnapshotGroups)
             syncError = messages.keys.sorted().first.flatMap { messages[$0] }
@@ -558,8 +599,7 @@ extension MacSyncEngine {
             await publishChangedSnapshots(
                 committedSnapshots,
                 in: snapshotDir,
-                lifecycleGeneration: lifecycleGeneration,
-                scope: scope
+                lifecycleGeneration: lifecycleGeneration
             )
         }
     }
@@ -569,8 +609,7 @@ extension MacSyncEngine {
     func publishChangedSnapshots(
         _ committed: [String: Data],
         in snapshotDir: URL,
-        lifecycleGeneration: UInt64,
-        scope: SnapshotWriteScope
+        lifecycleGeneration: UInt64
     ) async -> [NAMobileSnapshotGroup: DeviceSyncError] {
         let changedFilenames = Set(committed.keys)
         let groups = NAMobileSnapshotGroup.groups(containingAny: changedFilenames)
@@ -587,16 +626,12 @@ extension MacSyncEngine {
             forgetSnapshotDigests(for: changedFilenames)
         }
         if !sync.bridge.usesCloudKitDeviceTransport {
-            let timeoutLabel = switch scope {
-            case .standard: "MacSyncEngine.writeSnapshots.kvsSignal"
-            case .chatSessions: "MacSyncEngine.writeChatSessionSnapshots.kvsSignal"
-            case .workActivity: "MacSyncEngine.writeWorkActivitySnapshots.kvsSignal"
-            }
-            let signaled = await signalSnapshotGroups(groups, timeoutLabel: timeoutLabel)
-            if signaled != true {
+            syncError = "Waiting on iCloud to synchronize the snapshot signal."
+            let signaled = await signalSnapshotGroups(groups)
+            guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return [:] }
+            if !signaled {
                 let reason = """
-                    iPhone updates could not be delivered. The last received data is still available. The Mac will try again on its next update; keep \
-                    NativeAgent open.
+                    iCloud could not synchronize the snapshot signal. Delivery to the iPhone is unconfirmed; keep NativeAgent open and check iCloud access.
                     """
                 syncError = reason
                 for group in groups { failures[group] = .transient(message: reason) }
@@ -621,18 +656,15 @@ extension MacSyncEngine {
         return skips
     }
 
-    private func signalSnapshotGroups(_ groups: Set<NAMobileSnapshotGroup>, timeoutLabel: String) async -> Bool? {
+    private func signalSnapshotGroups(_ groups: Set<NAMobileSnapshotGroup>) async -> Bool {
         let stamp = ISO8601DateFormatter().string(from: Date())
-        // Faces are never named: a phone before them refuses a ping naming a group it does not know, and reads a ping naming none as an
-        // error, so a faces-only change names core (the lightest re-read). Phones that know faces fetch them with every ping.
-        let named = groups.subtracting([.faces])
-        let names = (named.isEmpty ? [.core] : named).map(\.rawValue).sorted().joined(separator: ",")
+        let names = groups.map(\.rawValue).sorted().joined(separator: ",")
         let signal = "\(stamp)|groups=\(names)"
-        return await withCKTimeout(timeoutLabel) {
+        return await Task.detached(priority: .utility) {
             let kvs = NSUbiquitousKeyValueStore.default
             kvs.set(signal, forKey: KVSKey.snapshotUpdated)
             return kvs.synchronize()
-        }
+        }.value
     }
 
     private func transcriptSnapshotSessions(from sessions: [ChatSession], navigation: ChatSessionNavigation) throws -> [ChatSession] {
@@ -820,21 +852,63 @@ extension MacSyncEngine {
             }
             data = bounded.data
         }
+        // One byte representation for every builder; no filename-specific payload filtering.
+        do {
+            data = try await MobileSnapshotBuilder.shared.build { [data] in
+                try JSONSerialization.data(withJSONObject: JSONSerialization.jsonObject(with: data), options: [.sortedKeys])
+            }
+        } catch { return .failed("Snapshot state could not be compared: \(error.localizedDescription)") }
         let digest = await MobileSnapshotBuilder.shared.build { [data] in MacSyncSnapshotIntegrity.digest(data) }
         guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive else { return .unchanged }
         let url = snapshotDir.appendingPathComponent(filename)
-        // A saved digest cannot suppress recreation of a missing file.
-        if snapshotFileDigests[filename]?.payload == digest {
+        // Digests narrow the read; only equal payload bytes in the last committed file can suppress a write.
+        if let previous = snapshotFileDigests[filename], previous.payload == digest {
             do {
-                if try await VolumeIO.run({ FileManager.default.fileExists(atPath: url.path) }) { return .unchanged }
-            } catch { return .failed(error.localizedDescription) }
+                let equal = try await VolumeIO.run { [data] in
+                    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                    guard attributes[.type] as? FileAttributeType == .typeRegular,
+                          let size = attributes[.size] as? NSNumber,
+                          size.intValue >= 0, size.intValue <= MacSyncSnapshotIntegrity.maximumSnapshotBytes else {
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    let written = try VolumeIO.contents(of: url)
+                    guard MacSyncSnapshotIntegrity.digest(written) == previous.wire else { return false }
+                    if Self.revisionedSnapshotFiles.contains(filename) {
+                        guard let envelope = try JSONSerialization.jsonObject(with: written) as? [String: Any],
+                              let payload = envelope["value"] else { throw CocoaError(.fileReadCorruptFile) }
+                        return try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) == data
+                    }
+                    return written == data
+                }
+                guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive else { return .unchanged }
+                if equal { return .unchanged }
+            } catch {
+                // Proven absence is recreated; an unreadable copy is neither equal nor empty.
+                if !Self.isNoSuchFileError(error) { return .failed(error.localizedDescription) }
+            }
         }
         guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive else { return .unchanged }
         if Self.revisionedSnapshotFiles.contains(filename) {
-            do { data = try Self.revisionedSnapshotData(data, revision: readRevision) }
+            do { data = try await MobileSnapshotBuilder.shared.build { [data] in try Self.revisionedSnapshotData(data, revision: readRevision) } }
             catch { return .failed(error.localizedDescription) }
         }
-        let wireDigest = MacSyncSnapshotIntegrity.digest(data)
+        let wireDigest = await MobileSnapshotBuilder.shared.build { [data] in MacSyncSnapshotIntegrity.digest(data) }
+        do {
+            let equal = try await VolumeIO.run { [data] in
+                do { return try VolumeIO.contents(of: url) == data }
+                catch { if Self.isNoSuchFileError(error) { return false }; throw error }
+            }
+            guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive else { return .unchanged }
+            if equal {
+                // A lost digest can owe publication of these bytes without replacing the file.
+                snapshotFileDigests[filename] = SnapshotFileDigest(payload: digest, wire: wireDigest)
+                return .changed(data)
+            }
+        } catch {
+            // These bytes are a derived copy; an unreadable comparison cannot block its canonical producer's replacement.
+            nativeLog("[MacSyncEngine] Rebuilding unreadable snapshot %@: %@", filename, error.localizedDescription)
+        }
+        guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive, !Task.isCancelled else { return .unchanged }
         // Await the coordinated write before recording its digest or admitting another snapshot pass.
         let writeResult = await VolumeIO.result { [data, url] in
             Self.coordinatedWriteReturningError(data: data, to: url)
@@ -1018,6 +1092,14 @@ extension MacSyncEngine {
                 return .skipped("model preferences could not be encoded: \(error.localizedDescription)")
             }
         }
+    }
+}
+
+private extension MacSyncEngine {
+    /// Inspect each source fragment before encoding; only fields the deployed phone record actually carries belong here.
+    nonisolated static func memoryPhoneFields(_ record: MemoryV2.MemoryRecord) -> [String] {
+        [record.id, record.layer, record.text, record.sourceRunId, record.status, record.createdAt, record.updatedAt].compactMap { $0 }
+            + (record.tags ?? [])
     }
 }
 

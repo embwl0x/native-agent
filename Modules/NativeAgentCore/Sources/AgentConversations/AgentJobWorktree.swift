@@ -29,11 +29,9 @@ public typealias AgentJobGit = @Sendable (_ args: [String], _ cwd: String) async
 extension AgentJobs {
     static func worktreeConfigRoot(_ dataRoot: URL) -> URL { InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot) }
 
-    private static func git(_ args: [String], _ folder: String, timeout: TimeInterval = 30) async -> BuilderWorktreeAllocator.GitResult {
-        await BuilderWorktreeAllocator.git(args, cwd: URL(fileURLWithPath: folder, isDirectory: true), timeout: timeout)
+    private static func git(_ args: [String], _ folder: String) async -> BuilderWorktreeAllocator.GitResult {
+        await BuilderWorktreeAllocator.git(args, cwd: URL(fileURLWithPath: folder, isDirectory: true))
     }
-
-    private static func said(_ result: BuilderWorktreeAllocator.GitResult) -> String { BuilderWorktreeAllocator.detail(result) }
 
     // MARK: The cut
 
@@ -52,7 +50,7 @@ extension AgentJobs {
             let base = await git(["rev-parse", "--verify", "HEAD^{commit}"], assignment.workingDirectory)
             guard base.status == 0, !base.trimmed.isEmpty else {
                 let left = await uncut(id, repo: repo, dataRoot: dataRoot)
-                return .failure(JobRefusal("Its worktree's base commit could not be read: \(said(base)). \(left) Nothing was sent."))
+                return .failure(JobRefusal("Its worktree's base commit could not be read: \(BuilderWorktreeAllocator.detail(base)). \(left) Nothing was sent."))
             }
             return .success(.init(path: assignment.workingDirectory, branch: assignment.branch, base: base.trimmed))
         }
@@ -80,36 +78,36 @@ extension AgentJobs {
         let on = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], folder)
         guard on.status == 0, on.trimmed == worktree.branch else {
             return kept(on.status == 0 ? "the worktree is on \(on.trimmed), not its job branch." : on.status == 1
-                ? "the worktree's HEAD is detached from its job branch." : "its branch could not be read: \(said(on)).")
+                ? "the worktree's HEAD is detached from its job branch." : "its branch could not be read: \(BuilderWorktreeAllocator.detail(on)).")
         }
         let model = job.report?.model?.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ") ?? ""
         let trailer = "Assisted-by: \(job.name):\(model.isEmpty ? "unknown" : model)"
         // The stem's own commit runs no hooks: it records what the organ left. The agent's merge runs the agent's hooks.
         let quiet = ["-c", "core.hooksPath=/dev/null"]
         let status = await git(["status", "--porcelain", "--untracked-files=all"], folder)
-        guard status.status == 0 else { return kept("git status failed: \(said(status)).") }
+        guard status.status == 0 else { return kept("git status failed: \(BuilderWorktreeAllocator.detail(status)).") }
         if !status.trimmed.isEmpty {
-            let add = await git(["add", "-A"], folder, timeout: 120)
-            guard add.status == 0 else { return kept("git add failed: \(said(add)).") }
+            let add = await git(["add", "-A"], folder)
+            guard add.status == 0 else { return kept("git add failed: \(BuilderWorktreeAllocator.detail(add)).") }
             let subject = "\(job.name) for \(job.id): " + String(job.brief.split(whereSeparator: \.isNewline).first?.prefix(72) ?? "")
-            let commit = await git(quiet + ["commit", "--quiet", "--no-verify", "-m", subject, "--trailer", trailer], folder, timeout: 120)
-            guard commit.status == 0 else { return kept("committing what it left uncommitted failed: \(said(commit)).") }
+            let commit = await git(quiet + ["commit", "--quiet", "--no-verify", "-m", subject, "--trailer", trailer], folder)
+            guard commit.status == 0 else { return kept("committing what it left uncommitted failed: \(BuilderWorktreeAllocator.detail(commit)).") }
         } else {
             let own = await git(["rev-list", "--count", worktree.base + "..HEAD"], folder)
-            guard own.status == 0 else { return kept("its commits could not be counted: \(said(own)).") }
+            guard own.status == 0 else { return kept("its commits could not be counted: \(BuilderWorktreeAllocator.detail(own)).") }
             if own.trimmed != "0" {
                 let carried = await git(["log", "-1", "--format=%(trailers:key=Assisted-by,valueonly)"], folder)
-                guard carried.status == 0 else { return kept("its last commit could not be read: \(said(carried)).") }
+                guard carried.status == 0 else { return kept("its last commit could not be read: \(BuilderWorktreeAllocator.detail(carried)).") }
                 if carried.trimmed.isEmpty {
-                    let amend = await git(quiet + ["commit", "--quiet", "--no-verify", "--amend", "--no-edit", "--trailer", trailer], folder, timeout: 120)
-                    guard amend.status == 0 else { return kept("adding \(trailer) to its last commit failed: \(said(amend)).") }
+                    let amend = await git(quiet + ["commit", "--quiet", "--no-verify", "--amend", "--no-edit", "--trailer", trailer], folder)
+                    guard amend.status == 0 else { return kept("adding \(trailer) to its last commit failed: \(BuilderWorktreeAllocator.detail(amend)).") }
                 }
             }
         }
         let head = await git(["rev-parse", "--verify", "HEAD^{commit}"], folder)
-        guard head.status == 0 else { return kept("its branch tip could not be read: \(said(head)).") }
-        let names = await git(["diff", "--name-only", "-z", "--no-renames", worktree.base, head.trimmed], folder, timeout: 120)
-        guard names.status == 0 else { return kept("its changed files could not be listed: \(said(names)).") }
+        guard head.status == 0 else { return kept("its branch tip could not be read: \(BuilderWorktreeAllocator.detail(head)).") }
+        let names = await git(["diff", "--name-only", "-z", "--no-renames", worktree.base, head.trimmed], folder)
+        guard names.status == 0 else { return kept("its changed files could not be listed: \(BuilderWorktreeAllocator.detail(names)).") }
         var captured = worktree
         captured.head = head.trimmed
         captured.files = names.stdout.split(separator: "\0").map(String.init)
@@ -120,8 +118,10 @@ extension AgentJobs {
                                                     attributes: [.posixPermissions: 0o700])
         } catch { return (captured, .init(path: patch.path, refusal: "the patch could not be written: \(error.localizedDescription)")) }
         let diff = await git(["diff", "--binary", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/",
-                              "--output=" + patch.path, worktree.base, head.trimmed], folder, timeout: 120)
-        guard diff.status == 0 else { return (captured, .init(path: patch.path, refusal: "the patch could not be written: \(said(diff))")) }
+                              "--output=" + patch.path, worktree.base, head.trimmed], folder)
+        guard diff.status == 0 else {
+            return (captured, .init(path: patch.path, refusal: "the patch could not be written: \(BuilderWorktreeAllocator.detail(diff))"))
+        }
         do {
             guard let bytes = try patch.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
                 return (captured, .init(path: patch.path, refusal: "the patch has no readable size, so it was not registered"))
@@ -170,9 +170,7 @@ extension AgentJobs {
 
     // MARK: The agent's hands
 
-    /// `agent.apply {job}`: the agent's merge of the job branch into its repository's current branch, with its own git. The stem first checks with reads only
-    /// that the job ended and was captured, the branch still points at the commit the agent read, the agent's checkout has no uncommitted tracked changes, and
-    /// the merge has no conflict. A conflict is reported with its files and the agent's repository is left exactly as it was.
+    /// Merge the captured branch through the agent's gated Git call. Its result owns the outcome; a stopped merge remains for forward repair.
     public static func apply(_ id: String, dataRoot: URL, git hands: AgentJobGit) async -> JSONValue {
         let store = AgentJobStore(dataRoot: dataRoot)
         let job: AgentJob
@@ -194,12 +192,13 @@ extension AgentJobs {
         guard !files.isEmpty else { return refusedHands("nothing_to_apply", "\(job.name) changed nothing in \(id). Nothing was merged.", job: id) }
         let repo = place.path
         func unread(_ what: String, _ result: BuilderWorktreeAllocator.GitResult) -> JSONValue {
-            failedHands("\(what) could not be read: \(said(result)). Nothing was merged.", effects: "none", job: id)
+            failedHands("\(what) could not be read: \(BuilderWorktreeAllocator.detail(result)). Nothing was merged.", effects: "none", job: id)
         }
         let tip = await git(["rev-parse", "--verify", "--quiet", "refs/heads/\(worktree.branch)^{commit}"], repo)
-        guard tip.status == 0 else {
+        if tip.status == 1 {
             return refusedHands("branch_gone", "\(worktree.branch) is no longer in \(repo). Nothing was merged.", job: id)
         }
+        guard tip.status == 0 else { return unread("\(worktree.branch)'s tip", tip) }
         guard tip.trimmed == head else {
             return refusedHands("branch_moved", """
                 \(worktree.branch) now points at \(tip.trimmed), not \(head), the commit that was captured and that you read. Nothing was merged.
@@ -217,7 +216,7 @@ extension AgentJobs {
         guard dirty.status == 0 else { return unread("\(repo)'s status", dirty) }
         guard dirty.trimmed.isEmpty else {
             return refusedHands("uncommitted_changes", """
-                \(repo) has uncommitted changes to tracked files; commit or stash them first, so a merge that stops can leave it exactly as it was. \
+                \(repo) has uncommitted changes to tracked files; commit or stash them before starting a merge. \
                 Nothing was merged.
                 """, job: id, extra: ["changes": .string(String(dirty.trimmed.prefix(4000)))])
         }
@@ -232,59 +231,36 @@ extension AgentJobs {
         case 1: break
         default: return unread("Whether \(current.trimmed) holds \(worktree.branch)", already)
         }
-        // A trial merge in Git's object store answers "would it conflict" without touching the agent's branch, index or files.
-        let trial = await git(["merge-tree", "--write-tree", "--name-only", "--no-messages", "HEAD", head], repo, timeout: 120)
-        switch trial.status {
-        case 0: break
-        case 1:
-            let conflicts = trial.stdout.split(separator: "\n").dropFirst().map(String.init).filter { !$0.isEmpty }
-            return conflict(id, worktree.branch, into: current.trimmed, conflicts, untouched: true)
-        default: return unread("A trial merge of \(worktree.branch)", trial)
-        }
         let ran: JSONValue
         do { ran = try await hands(["merge", "--no-ff", "--no-edit", worktree.branch], repo) }
-        catch { ran = .object(["status": .string("failed"), "detail": .string(error.localizedDescription)]) }
-        // Git says what happened; the tool's envelope says how the agent's call went.
-        let after = await git(["merge-base", "--is-ancestor", head, "HEAD"], repo)
-        if after.status == 0 {
-            let merged = await git(["rev-parse", "--verify", "HEAD^{commit}"], repo)
-            let commit = merged.status == 0 ? merged.trimmed : nil
-            if let commit { recordApplied(id, commit, store: store, dataRoot: dataRoot) }
-            return .object(["status": .string("applied"), "effects": .string("occurred"), "job": .string(id), "commit": commit.map(JSONValue.string) ?? .null,
-                "branch": .string(worktree.branch), "into": .string(current.trimmed), "files": .int(Int64(files.count)), "git": ran,
-                "detail": .string("Merged \(worktree.branch) into \(current.trimmed) with your git: \(files.count) file\(files.count == 1 ? "" : "s").")])
+        catch {
+            return failedHands("Your Git call failed: \(error.localizedDescription). Its merge outcome is unknown; inspect the repository before acting again.",
+                               effects: "unknown", job: id)
         }
-        let midway = await git(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], repo)
-        guard midway.status == 0 else {
-            return .object(["status": .string("not_applied"), "effects": .string("none"), "job": .string(id), "git": ran,
-                "detail": .string("Your git did not merge \(worktree.branch); its own result is under git. \(repo) was not changed.")])
+        guard let reply = ran.objectValue, let status = reply["status"]?.stringValue else {
+            return failedHands("Your Git call returned no readable status; its merge outcome is unknown. Inspect the repository before acting again.",
+                               effects: "unknown", job: id, extra: ["git": ran])
         }
-        // The merge stopped partway: the agent's own git takes it back to exactly where it was.
-        let stopped = await git(["diff", "--name-only", "--diff-filter=U"], repo)
-        let conflicts = stopped.status == 0 ? stopped.trimmed.split(separator: "\n").map(String.init) : []
-        let undone: JSONValue
-        do { undone = try await hands(["merge", "--abort"], repo) }
-        catch { undone = .object(["status": .string("failed"), "detail": .string(error.localizedDescription)]) }
-        let back = await git(["rev-parse", "--verify", "HEAD^{commit}"], repo)
-        let clean = await git(["status", "--porcelain", "--untracked-files=no"], repo)
-        let still = await git(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], repo)
-        let restored = still.status == 1 && back.status == 0 && back.trimmed == before.trimmed && clean.status == 0 && clean.trimmed.isEmpty
-        guard restored else {
-            return failedHands("""
-                Merging \(worktree.branch) stopped partway and \(repo) could not be taken back by `git merge --abort`; it is mid-merge now. Run \
-                git merge --abort in \(repo) before anything else there.
-                """, effects: "occurred", job: id, extra: ["git": ran, "abort": undone])
+        guard status == "completed" else {
+            var result = reply
+            result["job"] = .string(id)
+            result["branch"] = .string(worktree.branch)
+            result["into"] = .string(current.trimmed)
+            return .object(result)
         }
-        return conflict(id, worktree.branch, into: current.trimmed, conflicts, untouched: false)
-    }
-
-    private static func conflict(_ id: String, _ branch: String, into: String, _ files: [String], untouched: Bool) -> JSONValue {
-        let left = untouched ? "Your repository was not touched." : "The merge was taken back; your repository is exactly as it was."
-        return .object(["status": .string("conflict"), "effects": .string("none"), "job": .string(id), "branch": .string(branch), "into": .string(into),
-            "conflicts": .array(files.map(JSONValue.string)), "detail": .string("""
-                Merging \(branch) into \(into) conflicts in \(files.count) file\(files.count == 1 ? "" : "s"): \(files.prefix(20).joined(separator: ", ")). \
-                \(left) Nothing was merged.
-                """)])
+        var fields: [String: JSONValue] = ["status": .string("applied"), "effects": .string("occurred"), "job": .string(id),
+            "branch": .string(worktree.branch), "into": .string(current.trimmed), "files": .int(Int64(files.count)), "git": ran]
+        let merged = await git(["rev-parse", "--verify", "HEAD^{commit}"], repo)
+        if merged.status == 0 {
+            fields["commit"] = .string(merged.trimmed)
+            recordApplied(id, merged.trimmed, store: store, dataRoot: dataRoot)
+        } else {
+            let failure = "The successful merge's commit could not be recorded: " + BuilderWorktreeAllocator.detail(merged)
+            fields["recording_failure"] = .string(failure)
+            owe(id, "read its merged commit", JobDoorFailure(failure), store: store, dataRoot: dataRoot)
+        }
+        fields["detail"] = .string("Your Git call merged \(worktree.branch) into \(current.trimmed).")
+        return .object(fields)
     }
 
     /// `agent.discard {job}`: drop the job's worktree, uncommitted work included, and delete its branch. The agent's repository's own branches and files stay

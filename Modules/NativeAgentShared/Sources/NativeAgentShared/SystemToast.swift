@@ -1,16 +1,17 @@
 import Foundation
+#if os(iOS)
 import Combine
+#endif
 // Blueprint: | `SystemToast.swift` | `SystemToast`, `SystemToastCenter`: replace-by-ID notices and owned dismissal timers |
 
-@MainActor
-public struct SystemToast: Identifiable, Sendable, Equatable {
+public struct SystemToast: Identifiable, FaceValue {
     public let id: UUID
     public let kind: Kind
     public let text: String
     public let createdAt: Date
     public let autoDismissAfter: TimeInterval?
 
-    public enum Kind: String, Sendable { case info, warn, error, success }
+    public enum Kind: String, Sendable, Codable { case info, warn, error, success }
 
     public init(kind: Kind, text: String, autoDismissAfter: TimeInterval? = 3, id: UUID = UUID(), createdAt: Date = Date()) {
         self.id = id
@@ -19,21 +20,40 @@ public struct SystemToast: Identifiable, Sendable, Equatable {
         self.createdAt = createdAt
         self.autoDismissAfter = autoDismissAfter
     }
-
-    public nonisolated static func == (lhs: SystemToast, rhs: SystemToast) -> Bool {
-        lhs.id == rhs.id
-    }
 }
 
 @MainActor
-public final class SystemToastCenter: ObservableObject {
+public final class SystemToastCenter {
     public static let shared = SystemToastCenter()
 
-    @Published public private(set) var queue: [SystemToast] = []
+    public nonisolated let id = UUID()
+    private var observers: [UUID: AsyncStream<[SystemToast]>.Continuation] = [:]
+    #if os(iOS)
+    @Published public private(set) var queue: [SystemToast] = [] {
+        didSet { for observer in observers.values { observer.yield(queue) } }
+    }
+    #else
+    private var queue: [SystemToast] = [] {
+        didSet { for observer in observers.values { observer.yield(queue) } }
+    }
+    #endif
 
     private var dismissTasks: [UUID: Task<Void, Never>] = [:]
 
     public init() {}
+
+    isolated deinit { for observer in observers.values { observer.finish() } }
+
+    public func updates() -> AsyncStream<[SystemToast]> {
+        let observerID = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            observers[observerID] = continuation
+            continuation.yield(queue)
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.observers.removeValue(forKey: observerID) }
+            }
+        }
+    }
 
     public func push(_ toast: SystemToast) {
         // Replacement retires the previous notice and its timer together.
@@ -86,3 +106,7 @@ public final class SystemToastCenter: ObservableObject {
         queue.removeAll()
     }
 }
+
+#if os(iOS)
+extension SystemToastCenter: ObservableObject {}
+#endif

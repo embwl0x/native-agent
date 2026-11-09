@@ -11,12 +11,15 @@ import PersistenceCore
 
 public struct TelegramMemoryWriterBridge: TelegramMemoryWriteRef, Sendable {
     let memory: SwiftNativeMemoryV2
+    let dataRoot: URL
 
     public init(dataRoot: URL) {
         self.memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+        self.dataRoot = dataRoot
     }
 
     public func remember(text: String, source: String, turn: Turn) async throws -> String {
+        let sender = try TelegramCommandSender(turn: turn, dataRoot: dataRoot)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw TelegramBotError.invalidRequest }
         let record = try await memory.store(
@@ -26,12 +29,15 @@ public struct TelegramMemoryWriterBridge: TelegramMemoryWriteRef, Sendable {
                 "surface": .string("telegram"),
                 "command": .string("/remember"),
             ]),
-            context: MemoryWriteContext(turn: turn, senseReads: nil)
+            context: MemoryWriteContext(turn: sender.turn, senseReads: nil, telling: sender.isOwner
+                ? MemoryDataProvenance.toldByPerson(dataRoot: dataRoot)
+                : .init(how: .told, by: "Telegram user " + sender.sender))
         )
         return record.id
     }
 
     public func note(text: String, kind: String, source: String, turn: Turn) async throws -> String {
+        let sender = try TelegramCommandSender(turn: turn, dataRoot: dataRoot)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw TelegramBotError.invalidRequest }
         let resolvedKind = kind.isEmpty ? "telegram_note" : kind
@@ -46,7 +52,9 @@ public struct TelegramMemoryWriterBridge: TelegramMemoryWriteRef, Sendable {
                 "surface": .string("telegram"),
                 "command": .string("/note"),
             ]),
-            context: MemoryWriteContext(turn: turn, senseReads: nil)
+            context: MemoryWriteContext(turn: sender.turn, senseReads: nil, telling: sender.isOwner
+                ? MemoryDataProvenance.toldByPerson(dataRoot: dataRoot)
+                : .init(how: .told, by: "Telegram user " + sender.sender))
         )
         return record.id
     }

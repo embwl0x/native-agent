@@ -128,7 +128,7 @@ extension SwiftToolDispatcher {
 
         do {
             let record = try await memoryV2.acceptProposal(id: id,
-                context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads))
+                context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads, telling: nil))
             return .object([
                 "status": .string("ok"),
                 "decision": .string("accept"),

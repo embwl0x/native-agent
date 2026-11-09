@@ -30,27 +30,31 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient {
         return (requester, requester != nil && protectedAction)
     }
 
-    public func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
-        // Peer provenance comes from the turn's origin, never a read. Check provenance_by against the transport-attested peer and its contact record, never a
-        // word the peer put in its message.
-        let peerIdentity: PeerTurnEffectPolicy.PeerIdentity?
+    /// The refusal for a memory call whose telling is not by the door that started the turn. That door is read from the turn's peer sources and the
+    /// person's contact record, never a word the peer put in its message; a trusted door, or a turn no peer started, has none.
+    static func provenanceRefusal(tool: String, input: [String: JSONValue], surface: String, turn: Turn, peerStore: AgentPeerStore?) -> String? {
+        let peerIdentity: PeerTurnEffectPolicy.PeerIdentity
         let taint = turn.peerSteering
         let readPeerData = taint?.isTainted == true
         if let taint, readPeerData {
-            peerIdentity = PeerTurnEffectPolicy.PeerIdentity(name: taint.sourceDescription)
+            let steering = taint.checkpointSources.filter { !PeerDataTaint.ownerTrusts($0) }
+            peerIdentity = PeerTurnEffectPolicy.PeerIdentity(name: steering.map { PeerDataTaint.sourceName($0) ?? $0 }.joined(separator: ", "))
         } else if PeerTurnEffectPolicy.isPeerBridge(surface: surface), !PeerDataTaint.trustedTurn(turn) {
             let peerID = turn.envelope?.verifiedUserId
             peerIdentity = PeerTurnEffectPolicy.PeerIdentity(
                 id: peerID,
-                name: peerID.flatMap { contactName(forPeerID: $0) }
+                name: peerID.flatMap { contactName(forPeerID: $0, peerStore: peerStore) }
             )
         } else {
-            peerIdentity = nil
+            return nil
         }
-        if let peerIdentity,
-           let refusal = PeerTurnEffectPolicy.provenanceRefusal(
-            tool: tool, input: input, peer: peerIdentity, readPeerData: readPeerData
-           ) {
+        return PeerTurnEffectPolicy.provenanceRefusal(tool: tool, input: input, peer: peerIdentity, readPeerData: readPeerData)
+    }
+
+    public func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
+        // Peer provenance comes from the turn's origin, never a read. Check provenance_by against the transport-attested peer and its contact record, never a
+        // word the peer put in its message.
+        if let refusal = Self.provenanceRefusal(tool: tool, input: input, surface: surface, turn: turn, peerStore: peerStore) {
             throw AutonomyGateError.toolDenied(reason: refusal)
         }
         var result = try await inner.dispatch(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
@@ -94,7 +98,7 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient {
 
     /// The configured contact's display name for an attested peer id. Read from the same store `isElevated` consults — the person's own peer records, never
     /// anything the peer supplied.
-    private func contactName(forPeerID id: String) -> String? {
+    private static func contactName(forPeerID id: String, peerStore: AgentPeerStore?) -> String? {
         guard let peerStore, !id.isEmpty, let peers = try? peerStore.list() else { return nil }
         guard let name = peers.first(where: { $0.id == id })?.name else { return nil }
         return name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : name

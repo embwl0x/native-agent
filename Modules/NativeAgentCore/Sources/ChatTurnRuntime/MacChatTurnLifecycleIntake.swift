@@ -56,9 +56,6 @@ public extension MacChatTurnPresentationPort {
             macChatTurns.lifecycleBySession[sessionId] = reduced
             if reduced.replyTextSettled != state.replyTextSettled {
                 if !reduced.replyTextSettled { macChatTurns.replyingSessions.remove(sessionId) }
-                if !reduced.replyTextSettled {
-                    macChatTurns.streamProgressAppliedAt[sessionId] = nil
-                }
             }
             if reduced.presentation.lastMovementAt != state.presentation.lastMovementAt
                 || reduced.presentation.writing != state.presentation.writing
@@ -83,22 +80,13 @@ public extension MacChatTurnPresentationPort {
         ))
     }
 
-    /// Coalesce length-only movement to 1 Hz to avoid invalidating the chat and reprojecting its card for every chunk.
-    /// Publish phase changes immediately so coalescing never delays first reply, tool progress or retry state.
+    /// Each stream event reaches the face feed; the display coalesces its own frames.
     @discardableResult
     func recordChatTurnStreamProgress(
         identity: MacChatTurnIdentity,
         accumulatedUTF16Length: Int,
         at instant: Date
     ) -> MacChatTurnLifecycleState? {
-        let sessionId = identity.sessionId
-        if macChatTurns.lifecycleBySession[sessionId]?.presentation.phase == .working,
-           let last = macChatTurns.streamProgressAppliedAt[sessionId],
-           last.turnId == identity.turnId,
-           instant.timeIntervalSince(last.at) < MacChatTurnRuntime.streamProgressCoalesceSeconds {
-            return nil
-        }
-        macChatTurns.streamProgressAppliedAt[sessionId] = (identity.turnId, instant)
         return applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
             identity: identity,
             kind: .streamProgress(accumulatedUTF16Length: accumulatedUTF16Length),
@@ -134,7 +122,6 @@ public extension MacChatTurnPresentationPort {
         macChatTurns.activeTurnIDsBySession.removeValue(forKey: sessionId)
         // Release desktop frames when work ends so a transient preview does not retain the user's screen.
         macChatTurns.screenPreviewBySession.removeValue(forKey: sessionId)
-        presentMacChatTurn(.intakeClosed)
         return state
     }
 
@@ -146,7 +133,6 @@ public extension MacChatTurnPresentationPort {
         }
         // Discard the frame with its turn because no later close owns that key.
         macChatTurns.screenPreviewBySession.removeValue(forKey: sessionId)
-        presentMacChatTurn(.intakeClosed)
     }
 
     @discardableResult
@@ -235,8 +221,8 @@ public extension MacChatTurnPresentationPort {
         for record in records {
             let hasCheckpoint: Bool
             do {
-                hasCheckpoint = try TurnCheckpoint.read(dataRoot: macChatTurns.dataRoot,
-                    sessionId: record.sessionId, turnId: record.turnId) != nil
+                hasCheckpoint = try await macChatTurns.lifecycleStore.hasCheckpoint(
+                    dataRoot: macChatTurns.dataRoot, identity: record.identity)
             } catch {
                 hasPendingRepairWork = true
                 logChatTurnLifecyclePersistenceFailure("repair_checkpoint", error: error)
@@ -327,7 +313,7 @@ public final class OtherDoorTurns {
         }
     }
 
-    public func show(_ sessionId: String, _ appModel: any MacChatTurnPresentationPort) {
+    private func show(_ sessionId: String, _ appModel: any MacChatTurnPresentationPort) {
         guard let state = open[sessionId] else { return }
         let turns = appModel.macChatTurns
         if let held = turns.lifecycle(for: sessionId), held.identity.turnId != state.identity.turnId,
@@ -382,13 +368,16 @@ public final class OtherDoorTurns {
         guard let state = open[sessionId], state.identity == identity else { return nil }
         let kind: MacChatTurnLifecycleInput.Kind
         switch event.kind {
+        case "provider.waiting", "provider.reconnecting":
+            guard case .object(let payload) = event.payload, case .string(let detail)? = payload["detail"] else { return nil }
+            kind = .activity(MacChatTurnActivityBoundary.notice(kind: event.kind, text: detail, identity: identity, at: event.ts))
         case "tool.dispatch":
-            var action: String?
             if case .object(let payload) = event.payload, payload["phase"] == .string("begin"),
                case .string(let name)? = payload["shown"] ?? payload["name"] {
-                action = ToolActivityPresentation.progress(name)
+                kind = .activity(MacChatTurnActivityBoundary.toolUse(name: name, args: [:], identity: identity, at: event.ts))
+            } else {
+                kind = .working(action: nil)
             }
-            kind = .working(action: action)
         case let output where Self.outputKinds.contains(output):
             kind = .streamProgress(accumulatedUTF16Length: state.presentation.streamedTextLength + 1)
         case "stream.tick":

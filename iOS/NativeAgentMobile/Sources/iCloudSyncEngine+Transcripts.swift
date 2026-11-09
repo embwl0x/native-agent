@@ -91,7 +91,13 @@ extension iCloudSyncEngine {
                             attachments[id]?.base64
                     }
                 }
-                published.historyIDs = current.historyIDs.intersection(Set((history + published.messages).map(\.id)))
+                let canonicalRecordIDs = Set(published.records.map { $0.id.lowercased() })
+                let historyRecords = published.messages.isEmpty || !overlaps ? [] : current.records.filter {
+                    UUID(uuidString: $0.id).map { current.historyIDs.contains($0) } == true
+                        && !canonicalRecordIDs.contains($0.id.lowercased())
+                }
+                published.records = historyRecords + published.records
+                published.historyIDs = current.historyIDs.intersection(published.publishedIDs)
                 published.messages = history + published.messages + kept
             }
             if chatTranscripts[session] != published { chatTranscripts[session] = published }
@@ -122,15 +128,16 @@ extension iCloudSyncEngine {
             for row in rows {
                 let clean = row.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !clean.isEmpty else { continue }
-                let records = row.messages.map(ChatMessageRecord.canonical)
-                do { out[clean] = PublishedTranscript(
-                    records: records,
-                    messages: try ChatMessage.projectChatRecords(records),
-                    otherRooms: row.otherRooms ?? [],
-                    generation: row.transcriptGeneration,
-                    hasOlder: row.hasOlder ?? false,
-                    readError: row.readError
-                ) } catch {
+                do {
+                    let records = try row.messages.map(ChatMessageRecord.canonical)
+                    out[clean] = PublishedTranscript(
+                        records: records,
+                        messages: try ChatMessage.projectChatRecords(records),
+                        otherRooms: row.otherRooms ?? [],
+                        generation: row.transcriptGeneration,
+                        hasOlder: row.hasOlder ?? false,
+                        readError: row.readError)
+                } catch {
                     out[clean] = PublishedTranscript(records: [], messages: [],
                         generation: row.transcriptGeneration,
                         readError: "The Mac transcript projection could not be read: \(error.localizedDescription)")
@@ -159,6 +166,15 @@ extension iCloudSyncEngine {
             throw CancellationError()
         }
         if beforeID != nil || throughID != nil, var current = chatTranscripts[sessionID] {
+            // History contains rows the message projection deliberately leaves out (tools and their Mac faces).
+            // Insert by the Mac's page order; identity replacement also refreshes a requested full row.
+            let incomingRecordIDs = Set(records.map { $0.id.lowercased() })
+            let recordInsertion = beforeID.flatMap { anchor in
+                current.records.firstIndex { $0.id.lowercased() == anchor.lowercased() }
+            } ?? current.records.firstIndex { incomingRecordIDs.contains($0.id.lowercased()) } ?? current.records.endIndex
+            let preceding = current.records[..<recordInsertion].filter { !incomingRecordIDs.contains($0.id.lowercased()) }
+            let following = current.records[recordInsertion...].filter { !incomingRecordIDs.contains($0.id.lowercased()) }
+            current.records = preceding + records + following
             let firstIndex = Dictionary(current.messages.enumerated().map { ($0.element.id, $0.offset) },
                                         uniquingKeysWith: { first, _ in first })
             let insertion = beforeID.flatMap(UUID.init(uuidString:)).flatMap { firstIndex[$0] } ?? current.messages.endIndex
@@ -170,7 +186,7 @@ extension iCloudSyncEngine {
                     current.messages[index] = row
                 }
             }
-            current.historyIDs.formUnion(messages.map(\.id))
+            current.historyIDs.formUnion(records.compactMap { UUID(uuidString: $0.id) })
             current.generation = generation
             chatTranscripts[sessionID] = current
         } else {
@@ -183,23 +199,22 @@ extension iCloudSyncEngine {
 }
 
 extension ChatMessageRecord {
-    /// The row with its embedded JSON in one spelling (keys sorted), so a snapshot that says the same thing compares equal and an
-    /// unchanged conversation is never adopted, redrawn or moved because the Mac wrote a key in another order.
-    nonisolated static func canonical(_ record: ChatMessageRecord) -> ChatMessageRecord {
+    /// Sorted embedded JSON preserves equality across equivalent snapshot encodings.
+    nonisolated static func canonical(_ record: ChatMessageRecord) throws -> ChatMessageRecord {
         var record = record
-        record.interactionJSON = canonicalJSON(record.interactionJSON)
-        record.interactionDescriptorJSON = canonicalJSON(record.interactionDescriptorJSON)
+        record.interactionJSON = try canonicalJSON(record.interactionJSON)
+        record.interactionDescriptorJSON = try canonicalJSON(record.interactionDescriptorJSON)
         if var metadata = record.metadata {
-            metadata.inputJSON = canonicalJSON(metadata.inputJSON)
+            metadata.inputJSON = try canonicalJSON(metadata.inputJSON)
             record.metadata = metadata
         }
         return record
     }
 
-    private nonisolated static func canonicalJSON(_ text: String?) -> String? {
-        guard let text, let object = try? JSONSerialization.jsonObject(with: Data(text.utf8), options: [.fragmentsAllowed]),
-              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .fragmentsAllowed, .withoutEscapingSlashes])
-        else { return text }
+    private nonisolated static func canonicalJSON(_ text: String?) throws -> String? {
+        guard let text else { return nil }
+        let object = try JSONSerialization.jsonObject(with: Data(text.utf8), options: [.fragmentsAllowed])
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .fragmentsAllowed, .withoutEscapingSlashes])
         return String(decoding: data, as: UTF8.self)
     }
 }

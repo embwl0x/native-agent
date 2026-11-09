@@ -277,18 +277,52 @@ extension SwiftNativeChatOrchestrationClient {
             try settled.get()
             return response
         }
-        guard let user = rows.first(where: { $0.role == "user" }) else {
-            throw ChatOrchestrationError.underlying("The resumed turn's saved user message is missing; repair its transcript.")
-        }
         var request = request
-        guard case .object(let fields)? = user.extras, case .object(let metadata)? = fields["metadata"] else {
-            throw ChatOrchestrationError.underlying("The resumed turn's input metadata is missing; repair its transcript.")
+        var restoredTurn = turn
+        restoredTurn.fileAccess = checkpoint.fileAccess
+        if let ceiling = checkpoint.fileAccessCeiling { restoredTurn.fileAccessCeiling = ceiling }
+        // Joined readings replay from the held log, outside history, which ends before this turn's first shown input.
+        let joinedRuns = Set((checkpoint.log ?? []).compactMap { $0.objectValue?["arrival"]?.objectValue?["run"]?.stringValue })
+        if let boundary = history.messages.first(where: { row in
+            guard row.role == "user", let run = row.extras?.objectValue?["runId"]?.stringValue else { return false }
+            return run == checkpoint.runId || joinedRuns.contains(run)
+        }) {
+            guard let id = boundary.extras?.objectValue?["id"]?.stringValue else {
+                throw ChatOrchestrationError.underlying("The resumed turn's history boundary has no row identity; repair its transcript.")
+            }
+            restoredTurn.rows.replacementUserMessageID = id
         }
-        if case .string(let persona)? = metadata["persona"] { request.persona = persona }
-        request.origin = try metadata["origin"].map {
-            try JSONDecoder().decode(ChatMessageOrigin.self, from: $0.serializedData(pretty: false))
+        if let input = checkpoint.hiddenInput {
+            request.message = checkpoint.userMessage
+            request.suppressUserAppend = true
+            request.persona = input.persona
+            request.origin = .some(try input.origin.map {
+                try JSONDecoder().decode(ChatMessageOrigin.self, from: $0.serializedData(pretty: false))
+            })
+            request.attachments = input.attachments
+            request.codexCompletion = .some(try input.completion.map {
+                try JSONDecoder().decode(CodexCompletionTranscriptBinding.self, from: $0.serializedData(pretty: false))
+            })
+            request.queryUserMessage = .some(input.queryUserMessage)
+            request.threadKind = input.threadKind
+            request.ownedSessionID = input.ownedSessionID
+            request.verifiedSessionID = .some(input.verifiedSessionID)
+            restoredTurn.rows.hiddenInput = input
+            restoredTurn.rows.questionRunID = input.questionRunID
+        } else {
+            guard let user = rows.first(where: { $0.role == "user" }) else {
+                throw ChatOrchestrationError.underlying("The resumed turn's saved user message is missing; repair its transcript.")
+            }
+            guard case .object(let fields)? = user.extras, case .object(let metadata)? = fields["metadata"] else {
+                throw ChatOrchestrationError.underlying("The resumed turn's input metadata is missing; repair its transcript.")
+            }
+            if case .string(let persona)? = metadata["persona"] { request.persona = persona }
+            request.origin = try metadata["origin"].map {
+                try JSONDecoder().decode(ChatMessageOrigin.self, from: $0.serializedData(pretty: false))
+            }
+            request.attachments = try CodexCompletionTranscriptEvidence.savedAttachments(metadata["attachments"])
         }
-        request.attachments = try CodexCompletionTranscriptEvidence.savedAttachments(metadata["attachments"])
+        let turn = restoredTurn
         var record = checkpoint
         let sources = rows.flatMap { row -> [String] in
             guard case .object(let fields)? = row.extras, case .object(let metadata)? = fields["metadata"],
@@ -345,6 +379,7 @@ extension SwiftNativeTurnEngine {
                 commandSignatureVerified: envelope.commandSignatureVerified, declaredRemote: envelope.declaredRemote,
                 helperDefinition: try turn.standingBot.map { try JSONValue.fromEncodable($0) })
         record.lifeID = try DataRootLife.current(in: dataRoot)
+        record.fileAccessCeiling = turn.fileAccessCeiling.intersecting(.init(fileAccess))
         return record
     }
 
@@ -368,24 +403,31 @@ extension SwiftNativeTurnEngine {
         }
     }
 
-    nonisolated static func checkpoint(_ saved: DeskContinuation, turnId: String, sessionId: String) -> TurnCheckpoint {
-        TurnCheckpoint(runId: saved.runID, turnId: turnId, sessionId: sessionId, surface: saved.surface,
+    nonisolated static func checkpoint(_ saved: DeskContinuation, turnId: String, sessionId: String,
+                                       hiddenInput: TurnCheckpoint.HiddenInput? = nil) -> TurnCheckpoint {
+        var record = TurnCheckpoint(runId: saved.runID, turnId: turnId, sessionId: sessionId, surface: saved.surface,
             userMessage: saved.remainingWork, envelope: saved.envelope, replyRoute: saved.replyRoute,
             fileAccess: saved.fileAccess, capabilityProfile: saved.capabilityProfile, peerSources: saved.peerSources,
             commandSignatureVerified: saved.commandSignatureVerified, declaredRemote: saved.declaredRemote,
             helperDefinition: saved.helperDefinition, lifeID: saved.lifeID)
+        record.hiddenInput = hiddenInput
+        record.fileAccessCeiling = saved.fileAccessCeiling
+        return record
     }
 
     public func executeTurnWithStreamingToolLoop(
         surface: String = "chat", userMessage: String, sessionId: String? = nil,
         toolSessionId: String? = nil, runId: String? = nil,
         llm: any LLMClient,
-        tools: any ToolDispatchClient, preBuiltContext: TurnContext,
+        tools: any ExpansionToolDispatchClient, preBuiltContext: TurnContext,
         progress: ToolProgress? = nil,
         onDelivery: (@Sendable () async -> Void)? = nil,
         cancelFlagPath: URL? = nil, providerAdmission: (@Sendable () async throws -> Void)? = nil,
         fileAccess: String = "auto", capabilityProfile: String? = nil,
         turn: Turn, work: ChatTurnWork, call: LLMCall) async throws -> TurnEngineResult {
+        var heldTurn = turn
+        if heldTurn.providerRecovery == nil { heldTurn.providerRecovery = ProviderRecovery() }
+        let turn = heldTurn
         let heardID = sessionId == nil ? turn.id : turn.envelope?.answerExperienceID
         let effectiveProgress = ToolProgress { [remPinsDataRoot] event, receipt, invocationID in
             if let root = remPinsDataRoot, let heardID {
@@ -411,7 +453,7 @@ extension SwiftNativeTurnEngine {
         if let root = remPinsDataRoot, let saved, let owner = sessionId ?? runId.map({ "worker-" + $0 }),
            case let turnId = turn.id {
             let restarted = turn.resumingCheckpoint.flatMap { $0.runId == runId && $0.turnId == turnId ? $0 : nil }
-            let record = restarted ?? Self.checkpoint(saved, turnId: turnId, sessionId: owner)
+            let record = restarted ?? Self.checkpoint(saved, turnId: turnId, sessionId: owner, hiddenInput: turn.rows.hiddenInput)
             if sessionId == nil { workerRecord = record }
             checkpoint = TurnCheckpointWriter(record: record, dataRoot: root)
         } else { checkpoint = nil }

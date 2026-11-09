@@ -28,26 +28,11 @@ public struct OrganPulse: Sendable, Equatable {
         self.cadence = cadence
     }
 
-    /// A beat that repeats the organ's last beat word for word within this window is the same news seen again and writes nothing. A clocked organ's window
-    /// is at most half its cadence, so its repeats still land before it could read as silent.
-    public static let newsWindow: TimeInterval = 10 * 60
-
     public static func record(_ organ: String, _ outcome: Outcome, note: String = "", yield: Int? = nil, cadence: TimeInterval? = nil) {
         let at = Date()
-        let words = [outcome.rawValue, note, yield.map(String.init) ?? ""].joined(separator: "\u{1F}")
-        let window = cadence.map { min(newsWindow, $0 / 2) } ?? newsWindow
-        let news = lastSaid.withLock { said in
-            if let last = said[organ], last.words == words, at.timeIntervalSince(last.at) < window { return false }
-            said[organ] = Said(words: words, at: at)
-            return true
-        }
-        guard news else { return }
         let pulse = OrganPulse(organ: organ, at: at, outcome: outcome, note: note, yield: yield, cadence: cadence)
         sink.withLock { $0 }?(pulse)
     }
-
-    private struct Said: Sendable { let words: String; let at: Date }
-    private static let lastSaid = Mutex<[String: Said]>([:])
 
     /// Starts a `.held` note when the organ's clock stopped on purpose: such a pulse declares no cadence, is never overdue and is never felt. Same words as
     /// BackgroundLoops' `LoopTickOutcome.offPrefix`, which this target cannot import.

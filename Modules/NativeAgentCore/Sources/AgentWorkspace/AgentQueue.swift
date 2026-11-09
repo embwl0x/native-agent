@@ -9,13 +9,8 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Synchronization
-// Blueprint: | `AgentQueue.swift` | `MyQueueTurnProjectionProviding`, `MyQueueReady`, `AgentScreen.queueContext`, `resume`: checked conditions |
-// Use Desk-revision-checked queue candidates and pending-after-write state; read approval and conversation evidence before evaluating conditions.
-
-/// Nil candidates are unavailable; only a pending write refresh calls for a notice.
-public protocol MyQueueTurnProjectionProviding: Sendable {
-    func queueTurnCandidates() async -> (candidates: [DeskItem]?, refreshPendingAfterWrite: Bool)
-}
+// Blueprint: | `AgentQueue.swift` | `MyQueueReady` (`due`, `next`, `line`), `AgentScreen.queueContext`, `resume`: checked conditions and moments |
+// Read approval and conversation evidence before evaluating conditions.
 
 /// Read readiness through the wake's shared queue hook.
 public enum MyQueueReady {
@@ -59,28 +54,14 @@ public enum MyQueueReady {
         return experience.kind == .decision ? "card" : experience.kind.rawValue
     }
 
-    /// Carried work whose unattended condition is met. A peer-steered step retains its recorded peers when the wake admits it.
-    package static func ready(items: [DeskItem], context: MyQueue.Context) -> [DeskItem] {
-        let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: ""), now: context.now)
-        return items.filter { item in
-            guard !item.isPursuit, plan.byHandle[item.handle]?.isReady == true,
-                  item.project == MyQueue.project || item.assignee == "agent" else { return false }
-            guard let entry = MyQueue.entry(item) else { return true }
-            guard entry.step.status != "stopped", let when = MyQueue.when(entry) else { return false }
-            switch when {
-            case .nextTurn: return !entry.owedToPerson && context.ownTurn
-            case .userWrites: return false
-            default: return MyQueue.isReady(entry, context)
-            }
-        }
-    }
-
-    /// Offered into the recorded conversation's next matching turn, including one that answers without tools. Its caller restores every recorded peer.
+    /// Due in the recorded conversation's next matching turn, including one that answers without tools. The agent's own next turn is its next
+    /// thought. The changing moment shows these steps without activating their peer steering.
     package static func forTurn(items: [DeskItem], session: String, door: String, personTurn: Bool, at: Date) -> [MyQueue.Entry] {
         let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: ""), now: at)
+        let thought = session == Happening.stream && !personTurn
         return items.compactMap(MyQueue.entry).filter { entry in
             guard entry.step.status != "stopped",
-                  entry.owedToPerson == personTurn, entry.step.session == session, plan.byHandle[entry.item.handle]?.isReady == true,
+                  entry.owedToPerson == personTurn, thought || entry.step.session == session, plan.byHandle[entry.item.handle]?.isReady == true,
                   let filed = DeskClock.parseISO(entry.step.filedAt ?? entry.item.openedAt), at > filed,
                   let when = MyQueue.when(entry) else { return false }
             switch when {
@@ -90,6 +71,126 @@ public enum MyQueueReady {
             default: return false
             }
         }
+    }
+
+    // MARK: - Moments
+
+    /// The one clock's owner of MY QUEUE's times: `moment:<handle>` for a step's next time, `moment:free` for when the agent is next free.
+    package static let owner = "moment"
+    package static let freeTime = owner + ":free"
+    package static func time(_ handle: String) -> String { owner + ":" + handle }
+
+    /// A moment's key. The same occurrence of a step always gets the same key, so it is posted once; a new occurrence gets a new key.
+    package static func once(_ handle: String, _ occurrence: Date) -> String { "queue:" + handle + ":" + String(occurrence.timeIntervalSince1970) }
+
+    /// Carried work whose condition came, and the occurrence that names it.
+    package struct Moment: Sendable {
+        package let item: DeskItem
+        package let occurrence: Date
+    }
+
+    /// The agent's own carried work: MY QUEUE steps and Desk items assigned to the agent, never pursuits.
+    package static func carried(_ item: DeskItem) -> Bool {
+        MyQueue.carries(item)
+    }
+
+    /// Carried work owed to the agent now: its time or rhythm's occurrence came, its event released it (a signal, news, the person arriving or leaving,
+    /// its card succeeding), or it is work for when the agent is free and the agent is free. Next-turn and message steps join turns instead. Work for
+    /// when free that is ready while the agent is not free is reported as waiting.
+    package static func due(items: [DeskItem], context: MyQueue.Context, free: Bool) -> (moments: [Moment], waitingForFree: Bool) {
+        let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: ""), now: context.now)
+        var moments: [Moment] = [], waiting = false
+        for item in items where carried(item) && plan.byHandle[item.handle]?.isReady == true {
+            let occurrence: Date?
+            if let entry = MyQueue.entry(item) {
+                guard entry.step.status != "stopped", !MyQueue.isOver(entry, at: context.now), let when = MyQueue.when(entry),
+                      let filed = DeskClock.parseISO(entry.step.filedAt ?? item.openedAt) else { continue }
+                switch when {
+                case .nextTurn, .userWrites: continue
+                case .ownTurn, .quiet:
+                    guard free else { waiting = true; continue }
+                    occurrence = freeOccurrence(item, filed: filed)
+                case .at(let date): occurrence = context.now >= date ? date : nil
+                case .every: occurrence = context.occurrence(entry.step, context.now)
+                case .afterCard(let card): occurrence = context.completedCards.contains(card) ? filed : nil
+                case .userHere, .userAway:
+                    guard let presence = context.presence(), presence.since > filed, presence.here == (when == .userHere) else { continue }
+                    occurrence = presence.since
+                case .news, .signal: occurrence = MyQueue.releaseNotes(for: entry).compactMap { DeskClock.parseISO($0.ts) }.max()
+                }
+            } else {
+                guard let opened = DeskClock.parseISO(item.openedAt) else { continue }
+                guard free else { waiting = true; continue }
+                occurrence = freeOccurrence(item, filed: opened)
+            }
+            if let occurrence { moments.append(Moment(item: item, occurrence: occurrence)) }
+        }
+        return (moments, waiting)
+    }
+
+    /// Work for when free comes again when it changes: refiled, a note from anyone but the agent, or a defer that ended.
+    private static func freeOccurrence(_ item: DeskItem, filed: Date) -> Date {
+        let notes = item.notes.filter { $0.author != "agent" }.compactMap { DeskClock.parseISO($0.ts) }
+        return (notes + [item.deferUntil.flatMap(DeskSequencing.parseDeferStamp)].compactMap { $0 }).reduce(filed, max)
+    }
+
+    /// When a carried item's condition next comes on the clock: its time, its rhythm's next occurrence, its end, or the end of its defer.
+    package static func next(_ item: DeskItem, after now: Date) -> Date? {
+        guard carried(item) else { return nil }
+        var times = [item.deferUntil.flatMap(DeskSequencing.parseDeferStamp)]
+        if let entry = MyQueue.entry(item) {
+            guard entry.step.status != "stopped" else { return nil }
+            times.append(MyQueue.until(entry).endsAt)
+            switch MyQueue.when(entry) {
+            case .at(let date)?: times.append(date)
+            case .every?: times.append(IntentionClock.next(entry.step, after: now))
+            default: break
+            }
+        }
+        return times.compactMap { $0 }.filter { $0 > now }.min()
+    }
+
+    /// A rhythm step's rhythm, which its clock time carries.
+    package static func rhythm(_ item: DeskItem) -> JSONValue? {
+        guard let entry = MyQueue.entry(item), case .every? = MyQueue.when(entry) else { return nil }
+        return entry.step.rhythm
+    }
+
+    /// What the agent meant, as the agent reads it when it comes: `head` names it by the id it is finished with, `rest` says how to finish it.
+    package static func line(_ item: DeskItem, at: Date) -> (head: String, rest: String) {
+        let step = item.step
+        let peers = (step?.peers ?? []).filter { !CapabilityLifecycle.ownerTrusts($0) }
+        let provenance = peers.isEmpty ? "" : " Peer steering retained: " + peers.joined(separator: ", ")
+            + ". The answer covers this turn and its carried steps, without permanently trusting the peer."
+        let released = MyQueue.entry(item).map { MyQueue.releaseNotes(for: $0).map { $0.text + " " }.joined() } ?? ""
+        let words = step?.words ?? item.summary ?? item.title
+        let name = "desk." + item.alias
+        let done = "app {action:\"queue.done\", args:{id:\"\(name)\"}}"
+        let wait = "desk.wait {handle:\"\(name)\", on: <the card, message or debt id it needs>}: it comes back when that settles, not before."
+        let head: String
+        var rest: String
+        if let step, step.rhythm != nil {
+            // A rhythm is never done by one occurrence: it comes back at its next time.
+            head = "You meant to, now (" + MyQueue.shown(IntentionClock.occurrence(step, at: at) ?? at) + "): \(words) (\(name))."
+            rest = (IntentionClock.next(step, after: at).map { "It comes back " + MyQueue.shown($0) + "." } ?? "This is its last time.")
+                + " Keep it open unless it is finished for good; then \(done)."
+        } else if step != nil {
+            head = "You meant to (\(name)): \(words)."
+            rest = "Do it now if it is safe, reversible and within what you are allowed, then say it is done. "
+                + "Once it is done, \(done); if it can't move yet, say what it waits on with \(wait)"
+        } else {
+            head = "Yours to carry, \(name): \(item.title) — \(words)."
+            rest = "Do it now if it is safe, reversible and within what you are allowed, then say it is done. "
+                + "Close it with desk.close {handle:\"\(name)\", reason} only once it is actually done. "
+                + "If it can't move yet, say what it waits on with \(wait)"
+        }
+        switch step.map({ MyQueue.Until($0.until) }) ?? .once {
+        case .words(let until): rest += " It is done when: \(until). Once it is, \(done)."
+        case .time(let ends): rest += " It ends by itself " + MyQueue.shown(ends) + "."
+        case .once, .standing: break
+        }
+        if let say = step?.say { rest += " Say this as it is, nothing added: \"\(say)\"" }
+        return (head, released + rest + provenance)
     }
 }
 
@@ -166,7 +267,7 @@ extension AgentScreen {
             } else if !completed {
                 lines.append("The approved call did not confirm success, so the step you queued for after it was not run "
                     + "and is still in MY QUEUE: \(queued).")
-            } else if !entry.peerBorn, entry.item.title != String(entry.step.words.prefix(200)) {
+            } else if !entry.peerBorn, entry.item.title != entry.step.title {
                 lines.append("You queued \(entry.name) for after this card as \"\(entry.step.words)\", but it reads "
                     + "\"\(entry.item.title)\" now. It was not run; look at it and decide.")
             } else {

@@ -162,7 +162,7 @@ public actor PersonaCompiler {
     public func compile(
         surface: String,
         personaOverride: String? = nil,
-        userMemoryCore: [String]? = nil
+        userMemoryCore: [String] = []
     ) async throws -> PersonalityPacket {
         try await resolvedCompilation(
             surface: surface,
@@ -178,7 +178,7 @@ public actor PersonaCompiler {
     private func resolvedCompilation(
         surface: String,
         personaOverride: String?,
-        userMemoryCore: [String]? = nil
+        userMemoryCore: [String] = []
     ) async throws -> ResolvedCompilation {
         let root = await engine.personaRoot
 
@@ -217,7 +217,7 @@ public actor PersonaCompiler {
         persona: (kind: String, id: String, subdir: URL?),
         documents: [PersonaContextDocumentSource],
         identity: String,
-        userMemoryCore: [String]? = nil
+        userMemoryCore: [String] = []
     ) throws -> ResolvedCompilation {
         var documents = documents
         if let guidance = try readDoc(root: root.appendingPathComponent("surfaces", isDirectory: true),
@@ -254,14 +254,14 @@ public actor PersonaCompiler {
     public static func renderPrompt(
         documents: [String: String],
         surface: String? = nil,
-        userMemoryCore: [String]? = nil
+        userMemoryCore: [String] = []
     ) -> String {
         let surfaceID = surface.map { "surface:\($0)" }
         let order = ["IDENTITY"] + canonicalDocOrder + (surfaceID.map { [$0] } ?? [])
         return order.compactMap { id -> String? in
             guard let document = documents[id] else { return nil }
             let body = id == "USER"
-                ? UserMDAutogenMarkers.promptText(document, pinnedCore: userMemoryCore) : document
+                ? UserMDAutogenMarkers.promptText(document, userMemoryCore: userMemoryCore) : document
             if let surface, id == surfaceID {
                 return "Surface guidance for \(surface):\n\(body)"
             }
@@ -392,20 +392,6 @@ public actor PersonaCompiler {
 
     /// A custom persona must override at least one canonical marker document.
     private static let personaMarkerDocs: Set<String> = ["SOUL", "VOICE", "GROWTH", "USER", "AGENTS"]
-
-    public static func customPersonaNames(root: URL) throws -> [String] {
-        try customPersonaDirectories(root: root, fileManager: .default).map(\.lastPathComponent)
-    }
-
-    private static func customPersonaDirectories(root: URL, fileManager: FileManager) throws -> [URL] {
-        try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey],
-                                           options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants])
-            .filter { dir in
-                guard try dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { return false }
-                let selected = try selectedPersonaDirectory(name: dir.lastPathComponent, root: root)
-                return try subdirHasMarker(selected, fileManager: fileManager)
-            }.sorted { $0.lastPathComponent < $1.lastPathComponent }
-    }
 
     /// Only absent selection uses the canonical root; a missing custom persona cannot select another.
     private static func resolveActivePersona(

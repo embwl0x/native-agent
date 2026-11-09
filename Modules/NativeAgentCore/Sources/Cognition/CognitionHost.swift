@@ -45,7 +45,6 @@ public protocol CognitionHost: Sendable {
     /// When the window holding `date` ends: the next background slot opens then.
     func backgroundWorkWindowEnd(_ date: Date) -> Date
     func pursuitChoiceTotal(for item: DeskItem, now: Date) -> Double?
-    func schedulerJobRows(at path: URL) throws -> [JSONValue]
     func archiveSupersededMorningBriefs(dataRoot: URL) async
     func studioWanderClient(dataRoot: URL, usesLiveAppBody: Bool) -> any StudioWanderClientPort
     /// Native source selection uses the engine's ordinary originating door.

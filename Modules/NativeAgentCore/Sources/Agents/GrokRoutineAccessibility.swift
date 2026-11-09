@@ -1,22 +1,24 @@
 import AppKit
+import Foundation
 import os
 import ApplicationServices
 import AgentConversations
 import MacControl
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import Senses
-// Blueprint: | `GrokRoutineAccessibility.swift` | Native-only secret and clipboard handling. |
+import Synchronization
+// Blueprint: | `GrokRoutineAccessibility.swift` | Non-main native setup and sends; secret values and clipboard settlement stay native. |
 /// Secret values stay inside native code, never model, screenshot, result, log, preview or transcript. Use only the field’s own Copy control and release its
 /// clipboard.
-@MainActor public enum GrokRoutineAccessibility {
+public enum GrokRoutineAccessibility {
     public enum Blocker: String, Error, LocalizedError {
         case offline = "Grok Bot desktop app is not running. Open Grok Bot and sign in, then Connect again."
         case permission = "Allow NativeAgent Accessibility access to set up the Grok Bot routine."
         case conversation = """
             Grok Bot does not expose one unambiguous current chat and empty composer. Open the intended chat with no draft, then Connect again.
             """
-        case submission = "Message submission is unconfirmed. Check Grok Bot; this app will not resend it automatically."
         case accessibility = "Grok Bot's web Accessibility tree could not be enabled or read. Check NativeAgent Accessibility access, then Connect again."
         case missingRoutine = """
             The NativeAgent reply routine is missing from Grok Bot's Routines panel. Check its creation request and approve it in Grok Bot if \
@@ -27,11 +29,6 @@ import Senses
             agent.recipe_write, then Connect again.
             """
         case frontmost = "Grok Bot is not the front app. Bring Grok Bot forward, then Connect again."
-        case focus = "Grok Bot's message box did not take focus. Open the intended chat with an empty composer, then Connect again."
-        case paste = """
-            The pasted request was not confirmed in Grok Bot's message box. Check the draft in Grok Bot before continuing; nothing will be resent \
-            automatically.
-            """
         case busy = "The desktop is handling another conversation. Connect again when that operation finishes; this request has not started."
         case input = "NativeAgent could not create the mouse or keyboard input for Grok Bot; no submission is confirmed."
         case clipboard = "NativeAgent could not preserve or fill the clipboard for Grok Bot. Check the clipboard before continuing; no request was submitted."
@@ -58,9 +55,9 @@ import Senses
     }
     static var running: Bool { !NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).isEmpty }
     /// Open and await the target app so setup does not require a separate manual launch.
-    public static func ensureRunning(mac: MacOperationContext) async throws {
+    @concurrent public static func ensureRunning(mac: MacOperationContext) async throws {
         try Task.checkCancellation()
-        let events = try DesktopRouteObservation(bundleID: GrokBotRoute.bundleID, context: mac, accessibility: false)
+        let events = try await DesktopRouteObservation(bundleID: GrokBotRoute.bundleID, context: mac, accessibility: false)
         defer { events.stop() }
         if running { return }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: GrokBotRoute.bundleID) else { throw Blocker.offline }
@@ -70,20 +67,18 @@ import Senses
         do { _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration) }
         catch is CancellationError { throw CancellationError() }
         catch { throw Failure(detail: "Grok Bot could not be opened: \(error.localizedDescription) Open Grok Bot and sign in, then Connect again.") }
-        let deadline = Date().addingTimeInterval(20)
         try Task.checkCancellation()
-        while !running, Date() < deadline { try await events.next(until: deadline) }
-        guard running else { throw Blocker.offline }
+        while !running { try await events.next() }
     }
     public static func window(mac: MacOperationContext) throws -> AXUIElement {
         guard SystemMacAXElementSource().isTrusted() else { throw Blocker.permission }
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first else { throw Blocker.offline }
         let windows = try SystemMacAXElementSource().nativeWindows(pid: app.processIdentifier, context: mac)
-        guard windows.count == 1 else {
+        guard windows.count == 1, let window = windows.first else {
             throw Failure(
                 detail: "Grok Bot exposes \(windows.count) windows; setup needs exactly one. Leave one Grok Bot chat window open, then Connect again.")
         }
-        return windows[0]
+        return window
     }
     /// Navigation belongs to the window shell, never to historical messages. The log itself remains visible to selectors; only its body is excluded.
     private static func outsideTranscript(mac: MacOperationContext, _ node: AXUIElement) -> Bool {
@@ -103,12 +98,28 @@ import Senses
     static let log = Logger(subsystem: "NativeAgent", category: "GrokBot")
     static func step(_ name: String) { log.error("grok setup stopped at \(name, privacy: .public)") }
     /// Before typing, resend is safe; after submission, Return makes the outcome uncertain.
-    enum SendStage { case opening, conversation, typing, submitted }
-    static var reached = SendStage.opening
+    enum SendStage: Sendable { case opening, conversation, typing, submitted }
+    private struct SendState: Sendable {
+        var reached = SendStage.opening
+        var layout: GrokDesktopReply.Layout?
+        var observation: JSONValue?
+    }
+    // The existing send owner survives executor hops; no lock is held during AX or an await.
+    private static let sendState = Mutex(SendState())
+    static var reached: SendStage {
+        get { sendState.withLock { $0.reached } }
+        set { sendState.withLock { $0.reached = newValue } }
+    }
     /// Capture exact outgoing occurrences and transcript location while foreground so reply watches correlate the new send.
-    static var sentLayout: GrokDesktopReply.Layout?
-    static var submissionObservation: JSONValue?
-    static func awake(turn: Turn, mac: MacOperationContext) async throws -> NSRunningApplication {
+    static var sentLayout: GrokDesktopReply.Layout? {
+        get { sendState.withLock { $0.layout } }
+        set { sendState.withLock { $0.layout = newValue } }
+    }
+    static var submissionObservation: JSONValue? {
+        get { sendState.withLock { $0.observation } }
+        set { sendState.withLock { $0.observation = newValue } }
+    }
+    @concurrent static func awake(turn: Turn, mac: MacOperationContext) async throws -> NSRunningApplication {
         do { try await MacScreenLock.wakeIfCovered(turn: turn, context: mac) }
         catch let covered as MacScreenLock.Covered { throw Failure(detail: covered.detail) }
         try await ensureRunning(mac: mac)
@@ -116,13 +127,13 @@ import Senses
         guard SystemMacAXElementSource().isTrusted() else { throw Blocker.permission }
         try requireDriver(mac: mac)
         guard let runningApp = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first else { throw Blocker.accessibility }
-        // Settle a cold renderer here, before the synchronous main-lane reads.
-        try? await SystemMacAXElementSource.prepareRenderer(pid: runningApp.processIdentifier, context: mac)
+        // Settle a cold renderer here before the synchronous reads on this non-main path.
+        try await SystemMacAXElementSource.prepareRenderer(pid: runningApp.processIdentifier, context: mac)
         try await bringForward(mac: mac, pid: runningApp.processIdentifier)
-        try await waitUntil(mac: mac, accessibility: false, failure: Blocker.frontmost) {
+        try await waitUntil(mac: mac, accessibility: false) {
             NSWorkspace.shared.frontmostApplication?.processIdentifier == runningApp.processIdentifier
         }
-        try await waitUntil(mac: mac, failure: Blocker.accessibility) {
+        try await waitUntil(mac: mac) {
             (try navigationNodes(mac: mac)).contains { MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac) == "AXWebArea" }
         }
         return runningApp
@@ -176,17 +187,17 @@ import Senses
         }
         let boxes = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac) == kAXTextAreaRole
             && MacAXAttributeRead.text($0, kAXDescriptionAttribute, context: mac).lowercased() == "prompt" }
-        guard boxes.count == 1 else {
+        guard boxes.count == 1, let box = boxes.first else {
             throw Failure(detail: """
                 Grok Bot exposes \(boxes.count) message boxes; setup needs exactly one empty composer. Open the intended chat with no draft, then \
                 Connect again.
                 """)
         }
-        let value = try composerValue(mac: mac, boxes[0])
+        let value = try composerValue(mac: mac, box)
         guard isEmptyBox(value, conversation: bot) else {
             throw Failure(detail: "Grok Bot's message box already holds a draft, left untouched. Finish or clear that draft before continuing.")
         }
-        return boxes[0]
+        return box
     }
     nonisolated static func composerValue(mac: MacOperationContext, _ node: AXUIElement) throws -> String {
         guard let value = MacAXAttributeRead.copyRaw(node, kAXValueAttribute, context: mac) as? String else {
@@ -199,31 +210,42 @@ import Senses
         guard let frame = MacAXAttributeRead.frame(node, context: mac) else { throw Blocker.geometry }
         return CGPoint(x: frame.midX, y: frame.midY)
     }
-    public static func copyPasteboard(_ pasteboard: NSPasteboard) throws -> [NSPasteboardItem] {
+    public static func copyPasteboard(_ pasteboard: NSPasteboard) throws -> [[(type: String, data: Data)]] {
         try (pasteboard.pasteboardItems ?? []).map { item in
-            let copy = NSPasteboardItem()
+            let checked = NSPasteboardItem()
+            var copy: [(type: String, data: Data)] = []
             for type in item.types {
-                guard let data = item.data(forType: type), copy.setData(data, forType: type) else { throw Blocker.clipboard }
+                guard let data = item.data(forType: type), checked.setData(data, forType: type) else { throw Blocker.clipboard }
+                copy.append((type.rawValue, data))
             }
             return copy
         }
     }
-    /// Bounded observation only; actions are never retried.
-    @discardableResult static func waitUntil(mac: MacOperationContext, seconds: TimeInterval = 4, accessibility: Bool = true,
-                          failure: any Error, _ ready: () throws -> Bool) async throws -> JSONValue {
-        let deadline = Date().addingTimeInterval(seconds)
-        let events = try DesktopRouteObservation(bundleID: GrokBotRoute.bundleID, context: mac, accessibility: accessibility)
+    /// Carry clipboard bytes across settlement, not AppKit objects shared between executors.
+    static func restorePasteboard(_ saved: [[(type: String, data: Data)]], to pasteboard: NSPasteboard) -> Bool {
+        var items: [NSPasteboardItem] = []
+        for contents in saved {
+            let item = NSPasteboardItem()
+            for (type, data) in contents {
+                guard item.setData(data, forType: NSPasteboard.PasteboardType(type)) else { return false }
+            }
+            items.append(item)
+        }
+        return pasteboard.writeObjects(items)
+    }
+    /// Source changes resume the same predicate; silence remains cancellable and actions are never repeated.
+    @concurrent @discardableResult static func waitUntil(mac: MacOperationContext, accessibility: Bool = true,
+                          _ ready: () throws -> Bool) async throws -> JSONValue {
+        let events = try await DesktopRouteObservation(bundleID: GrokBotRoute.bundleID, context: mac, accessibility: accessibility)
         defer { events.stop() }
         repeat {
             try Task.checkCancellation()
-            if try ready() { return events.receipt(readBy: accessibility ? "accessibility" : "workspace") }
-            if Date() >= deadline { break }
-            try await events.next(until: deadline)
+            if try ready() { return await events.receipt(readBy: accessibility ? "accessibility" : "workspace") }
+            try await events.next()
         } while true
-        throw failure
     }
     /// Routine creation needs the one-to-one bot chat with Auto-review; confirm its list entry and open heading.
-    static func openBotChat(turn: Turn, mac: MacOperationContext, _ bot: String) async throws {
+    @concurrent static func openBotChat(turn: Turn, mac: MacOperationContext, _ bot: String) async throws {
         func heading() throws -> Bool {
             isCurrentBotChat(mac: mac, bot, in: try navigationNodes(mac: mac))
         }
@@ -234,16 +256,16 @@ import Senses
             return title == bot || title.hasPrefix(bot + ", ")
         }
         try requireDriver(mac: mac)
-        guard chats.count == 1 else {
+        guard chats.count == 1, let chat = chats.first else {
             throw Failure(
                 detail: "Chat \"\(bot)\" matches \(chats.count) Grok Bot sidebar entries; setup needs exactly one. Open that exact chat, then Connect again.")
         }
-        guard try SystemMacAXActSource().performNative(chats[0], action: kAXPressAction, turn: turn, context: mac).get() == .success else {
+        guard try SystemMacAXActSource().performNative(chat, action: kAXPressAction, turn: turn, context: mac).get() == .success else {
             throw Failure(detail: "Grok Bot refused the Accessibility action to open chat \"\(bot)\". Open that chat in Grok Bot, then Connect again.")
         }
-        try await waitUntil(mac: mac, failure: Blocker.conversation) { try heading() }
+        try await waitUntil(mac: mac) { try heading() }
     }
-    static func send(turn: Turn, mac: MacOperationContext, _ text: String, bot: String, watchReply: Bool = false,
+    @concurrent static func send(turn: Turn, mac: MacOperationContext, _ text: String, bot: String, watchReply: Bool = false,
                      beforeSubmission: @Sendable () throws -> Void = {}) async throws {
         try await withDriver(mac: mac) { mac in
             try await sendWithDriver(turn: turn, mac: mac, text, bot: bot, watchReply: watchReply, beforeSubmission: beforeSubmission)
@@ -259,7 +281,7 @@ import Senses
             try await sendInForeground(turn: turn, mac: mac, text, bot: bot, watchReply: watchReply, previous: previous, beforeSubmission: beforeSubmission)
         } catch {
             if let watch = sentLayout?.watchID { await GrokDesktopReply.abandon(watch) }
-            else { await settle { @MainActor in
+            else { await settle {
                 await withAgentMacDriver(mac, driver: driver) { mac in await restoreForeground(mac: mac, previous) }
             } }
             let failure: Error
@@ -271,7 +293,7 @@ import Senses
             step(failure.localizedDescription)
             throw failure
         }
-        if sentLayout?.watchID == nil { await settle { @MainActor in
+        if sentLayout?.watchID == nil { await settle {
             await withAgentMacDriver(mac, driver: driver) { mac in await restoreForeground(mac: mac, previous) }
         } }
     }
@@ -285,7 +307,7 @@ import Senses
         let driver = mac.driver?.settlementBinding()
         let result: Result<Value, Error>
         do { result = .success(try await operation(mac)) } catch { result = .failure(error) }
-        await settle { @MainActor in
+        await settle {
             await withAgentMacDriver(mac, driver: driver) { mac in await restoreForeground(mac: mac, previous) }
         }
         return try result.get()
@@ -295,7 +317,7 @@ import Senses
         previousPID != nil && !previousTerminated && previousPID != currentPID
             && currentBundleID == GrokBotRoute.bundleID
     }
-    static func restoreForeground(mac: MacOperationContext, _ previous: NSRunningApplication?) async {
+    @concurrent static func restoreForeground(mac: MacOperationContext, _ previous: NSRunningApplication?) async {
         let current = NSWorkspace.shared.frontmostApplication
         guard shouldRestoreForeground(previousPID: previous?.processIdentifier,
                                       previousTerminated: previous?.isTerminated ?? true,
@@ -322,8 +344,8 @@ import Senses
               let paste = sink.keyEvents(9, flags: .maskCommand),
               let submit = sink.keyEvents(36) else { throw Blocker.input }
         try requireFrontmost()
-        click.forEach { sink.postNative($0, context: mac) }
-        try await waitUntil(mac: mac, failure: Blocker.focus) {
+        for event in click { try await sink.postNative(event, context: mac) }
+        try await waitUntil(mac: mac) {
             try requireFrontmost()
             return (MacAXAttributeRead.copyRaw(box, kAXFocusedAttribute, context: mac) as? Bool) == true
         }
@@ -333,6 +355,9 @@ import Senses
         }
         guard let submission = try GrokDesktopReply.submission(mac: mac, text, chat: bot) else { throw Blocker.transcript }
         sentLayout = submission.layout
+        try await DesktopClipboard.shared.acquire()
+        defer { DesktopClipboard.shared.release() }
+        try requireFrontmost()
         let pasteboard = NSPasteboard.general
         let saved = try copyPasteboard(pasteboard)
         pasteboard.clearContents()
@@ -341,37 +366,38 @@ import Senses
             // Only put the person's clipboard back if nothing new was copied meanwhile.
             if pasteboard.changeCount == ours {
                 pasteboard.clearContents()
-                if !saved.isEmpty { pasteboard.writeObjects(saved) }
+                if !saved.isEmpty { _ = restorePasteboard(saved, to: pasteboard) }
             }
         }
         guard pasteboard.setString(text, forType: .string) else { throw Blocker.clipboard }
         ours = pasteboard.changeCount
         try requireFrontmost()
         reached = .typing
-        paste.forEach { sink.postNative($0, context: mac) }
-        try await waitUntil(mac: mac, failure: Blocker.paste) {
+        for event in paste { try await sink.postNative(event, context: mac) }
+        try await waitUntil(mac: mac) {
             try requireFrontmost()
             // Accept the composer’s own trailing newline as part of its pasted representation.
             let value = (MacAXAttributeRead.copyRaw(box, kAXValueAttribute, context: mac) as? String) ?? ""
             return !isEmptyBox(value, conversation: bot) && GrokDesktopReply.same(value, text)
         }
         try requireFrontmost()
-        if watchReply, let layout = sentLayout {
-            sentLayout?.watchID = try GrokDesktopReply.start(mac: mac, message: text, chat: bot, layout: layout, previous: previous)
+        if watchReply, var layout = sentLayout {
+            layout.watchID = try await GrokDesktopReply.start(mac: mac, message: text, chat: bot, layout: layout, previous: previous)
+            sentLayout = layout
         }
         try beforeSubmission()
         try requireFrontmost()
         reached = .submitted
-        submit.forEach { sink.postNative($0, context: mac) }
+        for event in submit { try await sink.postNative(event, context: mac) }
         try await verifySubmission(mac: mac, text, bot: bot, baseline: submission.baseline)
     }
-    static func verifySubmission(mac: MacOperationContext, _ message: String, bot: String, baseline: Int) async throws {
-        submissionObservation = try await waitUntil(mac: mac, seconds: 10, failure: Blocker.submission) {
+    @concurrent static func verifySubmission(mac: MacOperationContext, _ message: String, bot: String, baseline: Int) async throws {
+        submissionObservation = try await waitUntil(mac: mac) {
             let tree = try navigationNodes(mac: mac)
             guard isCurrentBotChat(mac: mac, bot, in: tree) else { throw Blocker.conversation }
             let boxes = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac) == kAXTextAreaRole
                 && MacAXAttributeRead.text($0, kAXDescriptionAttribute, context: mac).lowercased() == "prompt" }
-            if boxes.count == 1, let value = MacAXAttributeRead.copyRaw(boxes[0], kAXValueAttribute, context: mac) as? String,
+            if boxes.count == 1, let box = boxes.first, let value = try MacAXAttributeRead.checkedRaw(box, kAXValueAttribute, context: mac) as? String,
                isEmptyBox(value, conversation: bot),
                let read = try GrokDesktopReply.submission(mac: mac, message, chat: bot), read.baseline > baseline { return true }
             return false
@@ -472,9 +498,9 @@ import Senses
             descendInto: { outsideTranscript(mac: mac, $0) }) }
     }
     /// The recipe contains selectors and navigation only. Credential handling and clipboard lifetime remain native and cannot be changed by the file.
-    static func importRoutine(turn: Turn, mac: MacOperationContext, peer: String, dataRoot: URL, waitForCreation: Bool) async throws -> String {
+    @concurrent static func importRoutine(turn: Turn, mac: MacOperationContext, peer: String, dataRoot: URL, waitForCreation: Bool) async throws -> String {
         let recipe: RoutineRecipe
-        do { recipe = try AgentRecipeStore.grokRoutine(dataRoot: dataRoot) }
+        do { recipe = try await Task.detached { try AgentRecipeStore.grokRoutine(dataRoot: dataRoot) }.value }
         catch { throw recipeFailure("Grok Bot's routine recipe could not be read: \(error.localizedDescription)", dataRoot: dataRoot, uiMismatch: false) }
         guard let navigation = recipe.navigation, !navigation.isEmpty, recipe.list != nil, recipe.pause != nil else {
             throw recipeFailure("host.grokRoutine has no navigation, list or Pause selector.", dataRoot: dataRoot, uiMismatch: false)
@@ -491,7 +517,7 @@ import Senses
             } catch { result = .failure(error) }
             let driver = mac.driver?.settlementBinding()
             let ownedSteps = opened
-            let cleanup: [String] = await settle { @MainActor in
+            let cleanup: [String] = await settle {
                 await withAgentMacDriver(mac, driver: driver) { mac in
                     var failures: [String] = []
                     for step in ownedSteps.reversed() {
@@ -515,58 +541,52 @@ import Senses
             }
         }
     }
-    private static func dismiss(turn: Turn, mac: MacOperationContext, _ dismissal: RoutineRecipe.Dismissal, step: String, openMarker: RoutineRecipe.Control?,
-                                dataRoot: URL) async throws {
+    @concurrent private static func dismiss(turn: Turn, mac: MacOperationContext, _ dismissal: RoutineRecipe.Dismissal, step: String,
+        openMarker: RoutineRecipe.Control?, dataRoot: URL) async throws {
         let tree = dismissal.control.roles.contains(kAXMenuRole) ? try menus(mac: mac) : try nativeViewNodes(mac: mac)
         let controls = tree.filter { matches(mac: mac, $0, dismissal.control) }
         if controls.isEmpty && dismissal.ifPresent { return }
         // The panel’s own absent open marker proves closure.
         if controls.isEmpty, let openMarker, !tree.contains(where: { matches(mac: mac, $0, openMarker) }) { return }
-        guard controls.count == 1 else {
+        guard controls.count == 1, let node = controls.first else {
             throw recipeFailure("""
                 After \(step), closure is unconfirmed: found \(controls.count) controls matching \
                 \"\(dismissal.control.label ?? dismissal.control.roles.joined(separator: "/"))\".
                 """, dataRoot: dataRoot)
         }
-        let node = controls[0]
         try requireDriver(mac: mac)
         let outcome = SystemMacAXActSource().performNative(node, action: dismissal.action.rawValue, turn: turn, context: mac)
         guard case .success(.success) = outcome else {
             throw actionFailure(outcome, action: dismissal.action.rawValue, step: "closing " + step, dataRoot: dataRoot)
         }
-        let events = try DesktopRouteObservation(bundleID: GrokBotRoute.bundleID, context: mac)
+        let events = try await DesktopRouteObservation(bundleID: GrokBotRoute.bundleID, context: mac)
         defer { events.stop() }
-        let deadline = Date().addingTimeInterval(2)
         repeat {
             try Task.checkCancellation()
             let remaining = dismissal.control.roles.contains(kAXMenuRole) ? try menus(mac: mac) : try nativeViewNodes(mac: mac)
             if !remaining.contains(where: { matches(mac: mac, $0, dismissal.control) }) { return }
-            if Date() >= deadline { break }
-            try await events.next(until: deadline)
+            try await events.next()
         } while true
-        throw recipeFailure("After \(step), the closing action ran but the view's closing control remains present; closure is unconfirmed.", dataRoot: dataRoot)
     }
-    private static func importRoutineInForeground(turn: Turn, mac: MacOperationContext, peer: String, dataRoot: URL, waitForCreation: Bool,
+    @concurrent private static func importRoutineInForeground(turn: Turn, mac: MacOperationContext, peer: String, dataRoot: URL, waitForCreation: Bool,
         recipe: RoutineRecipe, navigation: [RoutineRecipe.Step], opened: inout [RoutineRecipe.Step]) async throws -> String {
         let store = AgentPeerStore(dataRoot: dataRoot)
-        guard let contact = try store.list().first(where: { $0.id == peer && $0.transport == .grokBot }) else {
+        let contacts = try await Task.detached { try store.list() }.value
+        guard let contact = contacts.first(where: { $0.id == peer && $0.transport == .grokBot }) else {
             throw Failure(detail: "This Grok Bot contact is unavailable. Connect Grok Bot again before continuing.")
         }
         let bot = contact.grokConversation ?? contact.conversationLabel ?? recipe.mainChat
         try await openBotChat(turn: turn, mac: mac, bot)
-        try store.updateGrok(peer) { $0.grokConversation = bot }
+        try await Task.detached { try store.updateGrok(peer) { $0.grokConversation = bot } }.value
         let routine = GrokBotRoute.routineName(peer)
         for step in navigation {
             // An already visible section belongs to the person, not our cleanup.
             if let marker = step.alreadyOpen,
                try navigationNodes(mac: mac, searching: "the already-open \(step.name) marker").filter({ matches(mac: mac, $0, marker) })
                    .count == 1 { continue }
-            let events = try DesktopRouteObservation(bundleID: GrokBotRoute.bundleID, context: mac)
+            let events = try await DesktopRouteObservation(bundleID: GrokBotRoute.bundleID, context: mac)
             defer { events.stop() }
-            let deadline = Date().addingTimeInterval(step.scope == .routineRow && waitForCreation ? 120 : 4)
-            var selected: AXUIElement?
-            var enabledItems: [String] = []
-            var exposedActions: [String] = []
+            let selected: AXUIElement
             repeat {
                 try Task.checkCancellation()
                 let tree: [AXUIElement]
@@ -581,13 +601,7 @@ import Senses
                         throw recipeFailure("The Routines row exposed \(open.count) menus; setup needs one.", dataRoot: dataRoot)
                     }
                     tree = try open.first.map { try MacAccessibilityReader.elements(in: $0, searching: "the routine navigation control", context: mac) } ?? []
-                    // Enumerate only the row menu before opening the webhook panel.
-                    enabledItems = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac) == kAXMenuItemRole
-                        && (MacAXAttributeRead.copyRaw($0, kAXEnabledAttribute, context: mac) as? Bool) == true }.map { MacAXAttributeRead.label($0,
-                            context: mac) }
                 }
-                exposedActions = Array(Set(try tree.filter { matches(mac: mac, $0, step.control) }.flatMap { try MacAXAttributeRead.copyActions($0,
-                    context: mac) })).sorted()
                 let controls = try tree.filter { node in
                     guard matches(mac: mac, node, step.control), try MacAXAttributeRead.copyActions(node, context: mac).contains(step.action.rawValue),
                           try MacAXAttributeRead.checkedBool(node, kAXEnabledAttribute, context: mac) == true else { return false }
@@ -605,30 +619,8 @@ import Senses
                 if let control = controls.first { selected = control; break }
                 if step.scope == .routineRow, tree.isEmpty, !waitForCreation,
                    try routineList(mac: mac, recipe, dataRoot: dataRoot) != nil { throw Blocker.missingRoutine }
-                if Date() >= deadline { break }
-                try await events.next(until: deadline)
+                try await events.next()
             } while true
-            guard let selected else {
-                if step.scope == .routineRow {
-                    guard try routineList(mac: mac, recipe, dataRoot: dataRoot) != nil else {
-                        throw recipeFailure("The \"\(recipe.routines)\" section did not expose one content list matching the recipe.", dataRoot: dataRoot)
-                    }
-                    if try routineRow(mac: mac, recipe, title: routine, dataRoot: dataRoot) == nil { throw Blocker.missingRoutine }
-                }
-                let expected = step.control.roles.joined(separator: "/")
-                    + (step.control.subrole.map { " (subrole \($0))" } ?? "")
-                    + (step.control.label.map { " \"\($0)\"" } ?? "")
-                let detail = step.scope == .menu
-                    ? """
-                        The Routines row has no enabled menu item \"\(step.control.label ?? step.name)\" supporting \(step.action.rawValue); \
-                        enabled items: \(enabledItems.isEmpty ? "(none)" : enabledItems.map { "\"\($0)\"" }.joined(separator: ", ")).
-                        """
-                    : """
-                        Step \"\(step.name)\" did not find one \(expected) control supporting \(step.action.rawValue); matching controls expose \
-                        actions: \(exposedActions.isEmpty ? "(none)" : exposedActions.joined(separator: ", ")).
-                        """
-                throw recipeFailure(detail, dataRoot: dataRoot)
-            }
             try requireDriver(mac: mac)
             let outcome = SystemMacAXActSource().performNative(selected, action: step.action.rawValue, turn: turn, context: mac)
             guard case .success(.success) = outcome else {
@@ -636,9 +628,8 @@ import Senses
             }
             opened.append(step)
         }
-        let events = try DesktopRouteObservation(bundleID: GrokBotRoute.bundleID, context: mac)
+        let events = try await DesktopRouteObservation(bundleID: GrokBotRoute.bundleID, context: mac)
         defer { events.stop() }
-        let deadline = Date().addingTimeInterval(4)
         var urlFields: [AXUIElement] = [], keyFields: [AXUIElement] = []
         repeat {
             try Task.checkCancellation()
@@ -646,31 +637,32 @@ import Senses
             urlFields = fields.filter { MacAXAttributeRead.label($0, context: mac) == recipe.webhookURL }
             keyFields = fields.filter { MacAXAttributeRead.label($0, context: mac) == recipe.webhookKey }
             if urlFields.count == 1 && keyFields.count == 1 { break }
-            if Date() >= deadline { break }
-            try await events.next(until: deadline)
+            try await events.next()
         } while true
-        guard urlFields.count == 1, keyFields.count == 1 else {
+        guard urlFields.count == 1, keyFields.count == 1, let urlField = urlFields.first, let keyField = keyFields.first else {
             throw recipeFailure("""
                 Webhook view exposed \(urlFields.count) text fields labeled \"\(recipe.webhookURL)\" and \(keyFields.count) labeled \
                 \"\(recipe.webhookKey)\"; setup needs one of each. No field values were reported.
                 """, dataRoot: dataRoot)
         }
-        let url = try await nativeField(turn: turn, mac: mac, urlFields[0], copyLabel: recipe.copyURL, name: recipe.webhookURL, dataRoot: dataRoot)
-        let key = try await nativeField(turn: turn, mac: mac, keyFields[0], copyLabel: recipe.copyKey, name: recipe.webhookKey, dataRoot: dataRoot)
-        try store.updateGrok(peer) { contact in
-            var credential = try GrokLinkCredential.read(peer: peer)
-            try credential.importWebhook(url: url.value, key: key.value)
-            try credential.write(peer: peer)
-            contact.grokSetup = "set up"
-            contact.grokBootstrapConfirmed = true
-        }
+        let url = try await nativeField(turn: turn, mac: mac, urlField, copyLabel: recipe.copyURL, name: recipe.webhookURL, dataRoot: dataRoot)
+        let key = try await nativeField(turn: turn, mac: mac, keyField, copyLabel: recipe.copyKey, name: recipe.webhookKey, dataRoot: dataRoot)
+        try await Task.detached {
+            try store.updateGrok(peer) { contact in
+                var credential = try GrokLinkCredential.read(peer: peer)
+                try credential.importWebhook(url: url.value, key: key.value)
+                try credential.write(peer: peer)
+                contact.grokSetup = "set up"
+                contact.grokBootstrapConfirmed = true
+            }
+        }.value
         return "Webhook view exposed one URL text field (\(url.exposure)) and one key text field (\(key.exposure)); no values were reported."
     }
     private static func masked(_ value: String) -> Bool {
         value.contains("•") || value.contains("●") || value.hasPrefix("***")
             || (!value.isEmpty && value.allSatisfy { "*·".contains($0) })
     }
-    private static func nativeField(turn: Turn, mac: MacOperationContext, _ field: AXUIElement, copyLabel: String?, name: String,
+    @concurrent private static func nativeField(turn: Turn, mac: MacOperationContext, _ field: AXUIElement, copyLabel: String?, name: String,
                                    dataRoot: URL) async throws -> (value: String, exposure: String) {
         try requireDriver(mac: mac)
         let value = MacAXAttributeRead.copyRaw(field, kAXValueAttribute, context: mac) as? String
@@ -687,10 +679,10 @@ import Senses
         while let candidate = container, MacAXAttributeRead.text(candidate, kAXRoleAttribute, context: mac) != kAXWindowRole {
             let tree = try MacAccessibilityReader.elements(in: candidate, searching: "the webhook field's own Copy control", context: mac)
             let fields = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac) == kAXTextFieldRole }
-            guard fields.count == 1, CFEqual(fields[0], field) else { break }
+            guard fields.count == 1, let candidateField = fields.first, CFEqual(candidateField, field) else { break }
             let buttons = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac) == kAXButtonRole && MacAXAttributeRead.label($0,
                 context: mac) == copyLabel }
-            if buttons.count == 1 { copy = buttons[0]; break }
+            if buttons.count == 1, let button = buttons.first { copy = button; break }
             if buttons.count > 1 { break }
             container = MacAXAttributeRead.parent(candidate, context: mac)
         }
@@ -701,49 +693,43 @@ import Senses
                 """, dataRoot: dataRoot)
         }
         try requireDriver(mac: mac)
+        try await DesktopClipboard.shared.acquire()
+        defer { DesktopClipboard.shared.release() }
+        try requireDriver(mac: mac)
         let pasteboard = NSPasteboard.general
         let saved = try copyPasteboard(pasteboard)
         pasteboard.clearContents()
         let baseline = pasteboard.changeCount
         let copyOutcome = SystemMacAXActSource().performNative(copy, action: kAXPressAction, turn: turn, context: mac)
-        let afterAction = pasteboard.changeCount
-        let driver = mac.driver?.settlementBinding()
-        // Copy has run. Stop still waits for its bounded publication and clipboard release; it cannot cancel release and leave a late key.
-        let transfer: Result<(value: String, cleared: Bool), Error> = await settle { @MainActor in
-            do { return .success(try await withAgentMacDriver(mac, driver: driver) { mac in
-                var ours = afterAction
-                let result: Result<String, Error>
-                do {
-                    guard case .success(.success) = copyOutcome else {
-                        throw actionFailure(copyOutcome, action: kAXPressAction, step: name + " own Copy control (" + exposure + ")", dataRoot: dataRoot)
-                    }
-                    try await waitUntil(mac: mac, seconds: 2, accessibility: false, failure: recipeFailure(
-                        "Webhook field \"\(name)\" is \(exposure); its Copy action did not publish a clipboard value.", dataRoot: dataRoot)) {
-                        let current = pasteboard.changeCount
-                        // Capture a pending publication once, even after physical takeover. A confirmed Copy generation is never replaced by a subsequent
-                        // clipboard writer.
-                        if ours == baseline, current != baseline { ours = current }
-                        return ours != baseline
-                    }
-                    try requireDriver(mac: mac)
-                    let conflict = Failure(detail: """
-                        The clipboard changed after Grok Bot's field Copy. Import stopped; the newer clipboard was left in place. Connect again \
-                        when the clipboard is free.
-                        """)
-                    guard pasteboard.changeCount == ours else {
-                        throw conflict
-                    }
-                    let copied = pasteboard.string(forType: .string)
-                    guard pasteboard.changeCount == ours else { throw conflict }
-                    guard let value = copied, !value.isEmpty, !masked(value) else {
-                        throw recipeFailure("Webhook field \"\(name)\" is \(exposure); its Copy action exposed no readable text.", dataRoot: dataRoot)
-                    }
-                    result = .success(value)
-                } catch { result = .failure(error) }
+        let ours = pasteboard.changeCount
+        // The native Copy returns before settlement can restore its clipboard; Stop cannot interrupt adoption or release.
+        let transfer: Result<(value: String, cleared: Bool), Error> = await settle {
+            let pasteboard = NSPasteboard.general
+            let result: Result<String, Error> = Result {
+                guard case .success(.success) = copyOutcome else {
+                    throw actionFailure(copyOutcome, action: kAXPressAction, step: name + " own Copy control (" + exposure + ")", dataRoot: dataRoot)
+                }
+                guard ours != baseline else {
+                    throw recipeFailure("Webhook field \"\(name)\" is \(exposure); its Copy action completed without publishing clipboard text.",
+                        dataRoot: dataRoot)
+                }
+                let conflict = Failure(detail: """
+                    The clipboard changed after Grok Bot's field Copy. Import stopped; the newer clipboard was left in place. Connect again \
+                    when the clipboard is free.
+                    """)
+                guard pasteboard.changeCount == ours else { throw conflict }
+                let copied = pasteboard.string(forType: .string)
+                guard pasteboard.changeCount == ours else { throw conflict }
+                guard let value = copied, !value.isEmpty, !masked(value) else {
+                    throw recipeFailure("Webhook field \"\(name)\" is \(exposure); its Copy action exposed no readable text.", dataRoot: dataRoot)
+                }
+                return value
+            }
+            do {
                 let cleared = pasteboard.changeCount == ours
                 if cleared {
                     pasteboard.clearContents()
-                    if !saved.isEmpty, !pasteboard.writeObjects(saved) {
+                    if !saved.isEmpty, !restorePasteboard(saved, to: pasteboard) {
                         let primary: String
                         switch result {
                         case .success: primary = "The native copy completed."
@@ -752,8 +738,8 @@ import Senses
                         throw Failure(detail: primary + " Cleanup: the temporary clipboard was cleared, but its previous contents could not be restored.")
                     }
                 }
-                return (try result.get(), cleared)
-            }) } catch { return .failure(error) }
+                return .success((try result.get(), cleared))
+            } catch { return .failure(error) }
         }
         if Task.isCancelled, case .failure(let error) = transfer {
             throw Failure(detail: "Grok Bot setup stopped. Native Copy settlement: " + error.localizedDescription, stopped: true)
@@ -762,5 +748,50 @@ import Senses
         try Task.checkCancellation()
         return (copied.value, exposure + "; own Copy control used natively; "
             + (copied.cleared ? "temporary clipboard cleared" : "newer clipboard preserved"))
+    }
+}
+
+/// Copy/import and desktop sends share the pasteboard until their own cleanup completes.
+final class DesktopClipboard: Sendable {
+    static let shared = DesktopClipboard()
+
+    private struct State: Sendable {
+        var held = false
+        var waiters: [(UUID, ScopedWaiter)] = []
+    }
+    private let state = Mutex(State())
+
+    @concurrent func acquire() async throws {
+        try Task.checkCancellation()
+        let id = UUID()
+        let waiter = ScopedWaiter()
+        let queued = state.withLock {
+            if !$0.held { $0.held = true; return false }
+            $0.waiters.append((id, waiter))
+            return true
+        }
+        if queued { await waiter.park() }
+        if Task.isCancelled {
+            let next = state.withLock { state -> ScopedWaiter? in
+                if let index = state.waiters.firstIndex(where: { $0.0 == id }) {
+                    state.waiters.remove(at: index)
+                    return nil
+                }
+                // A cancelled recipient passes on a slot already transferred to it.
+                return Self.release(&state)
+            }
+            next?.resume()
+            throw CancellationError()
+        }
+    }
+
+    func release() {
+        let next = state.withLock { Self.release(&$0) }
+        next?.resume()
+    }
+
+    private static func release(_ state: inout State) -> ScopedWaiter? {
+        guard !state.waiters.isEmpty else { state.held = false; return nil }
+        return state.waiters.removeFirst().1
     }
 }

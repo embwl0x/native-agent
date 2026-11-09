@@ -64,6 +64,23 @@ public final class ContactThreadReadouts {
         if contactsWatch == nil { restartContacts() }
     }
 
+    /// Captures join the contact owner's first read instead of drawing its uninitialized catalog.
+    public func prepareContactsForCapture() async throws {
+        start()
+        let (events, wake) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        defer { wake.finish() }
+        var changes = events.makeAsyncIterator()
+        try await withTaskCancellationHandler {
+            while true {
+                try Task.checkCancellation()
+                let reading = withObservationTracking { (loaded, contactRefreshError) } onChange: { wake.yield(()) }
+                if let issue = reading.1 { throw PartCallError(code: "contacts_unavailable", message: issue) }
+                if reading.0 { return }
+                guard await changes.next(isolation: #isolation) != nil else { throw CancellationError() }
+            }
+        } onCancel: { wake.finish() }
+    }
+
     private func restartContacts() {
         contactsWatch?.cancel()
         let root = dataRoot, ids = helpers.map(\.id)
@@ -99,7 +116,7 @@ public final class ContactThreadReadouts {
     public private(set) var helpersUnattended: Bool?
 
     static func helperPaths(_ root: URL) -> [URL] {
-        ["bots/definitions", "bots/shelf-index.json", "bots/run-queue.json", "bots/runner-jobs.json", "bots/last-events.json",
+        ["bots/definitions", "bots/shelf-index.json", "bots/run-queue.json", "clock/times.json", "bots/missed-runs.json", "bots/last-events.json",
          "workflows/approvals/requests.json", "trust/policy.json", "providers", "providers/surfaces.json", "providers/active.json",
          "codex_home/auth.json", "codex_home/models_cache.json"]
             .map { root.appendingPathComponent($0) }
@@ -113,7 +130,7 @@ public final class ContactThreadReadouts {
         helpersWatch = Task { [weak self] in
             await EventDeadlinePhysiology.refreshOnChanges(paths: Self.helperPaths(root),
                 notifications: [BotRunQueue.didChange, ShelfStore.didChange, ChatGPTAccountModelRefresh.didRefresh,
-                    .NSSystemTimeZoneDidChange, .NSSystemClockDidChange]) { [weak self] in
+                    .NSSystemTimeZoneDidChange, .NSSystemClockDidChange], directoryFiles: engine.pageDirectoryFiles) { [weak self] in
                 _ = await self?.refreshHelpers()
             }
         }

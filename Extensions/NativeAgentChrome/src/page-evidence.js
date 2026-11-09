@@ -20,7 +20,7 @@ export function boundSnapshotForTransport(snapshot, routes, byteLimit = MAX_SNAP
     truncated: true,
     truncationReasons: [...new Set([...snapshot.summary.truncationReasons, "encoded_size_limit"])],
   };
-  // Counts grow by at most three digits; reserve accounting margin and measure each retained node once.
+  // Counts grow by at most four digits; reserve accounting margin and measure each retained node once.
   let remainingBytes = byteLimit - encodedBytes(snapshot) - 1_024;
   if (remainingBytes < 0) {
     throw new ProtocolError(
@@ -35,7 +35,7 @@ export function boundSnapshotForTransport(snapshot, routes, byteLimit = MAX_SNAP
   const byPath = new Map(candidates.map(node => [node.elementPath, node]));
   for (const node of candidates) {
     if (node.inlineProof === true || retainedIDs.has(node.nodeId)) continue;
-    const key = `${node.frameId}:${node.sectionPath ?? ""}`;
+    const key = `${node.overlay === true}:${node.frameId}:${node.sectionPath ?? ""}`;
     if (key !== sectionKey) { sectionKey = key; sectionStart = { node, count: retainedOrder.length, contentCount }; }
     const block = `${node.frameId}:${node.paragraphPath ?? node.elementPath}`;
     if (block !== paragraphKey) { paragraphKey = block; paragraphStart = { node, count: retainedOrder.length }; }
@@ -52,8 +52,10 @@ export function boundSnapshotForTransport(snapshot, routes, byteLimit = MAX_SNAP
       const boundary = sectionStart?.contentCount > 0 ? sectionStart : paragraphStart?.count > 0 ? paragraphStart : null;
       const nextNode = boundary?.node ?? node;
       if (boundary) for (const id of retainedOrder.splice(boundary.count)) retainedIDs.delete(id);
-      snapshot.readMore = { url: snapshot.url, frameId: nextNode.frameId,
+      snapshot.readMore = { url: snapshot.url, tabId: snapshot.tabId, documentId: snapshot.documentId,
+        frameId: nextNode.frameId, readLayer: nextNode.readLayer, anchor: nextNode.readAnchor,
         frameURL: snapshot.frames.find(frame => frame.frameId === nextNode.frameId)?.url,
+        frameDocumentId: nextNode.frameDocumentId,
         position: nextNode.readPosition, textOffset: nextNode.textOffset ?? 0,
         ...(snapshot.reading.viewportObservationId && nextNode.frameId === snapshot.reading.cursor?.frameId
           ? { viewportObservationId: snapshot.reading.viewportObservationId } : {}),
@@ -78,7 +80,8 @@ export function boundSnapshotForTransport(snapshot, routes, byteLimit = MAX_SNAP
   for (const frame of snapshot.frames) frame.nodeCount = frameCounts.get(frame.frameId) ?? 0;
   snapshot.summary.nodeCount = snapshot.nodes.length;
   // A folded snapshot summarizes only its retained evidence.
-  snapshot.summary.text = snapshot.nodes.filter(node => !node.inlineProof)
+  snapshot.summary.text = [...snapshot.nodes].sort((a, b) => Number(a.overlay === true) - Number(b.overlay === true))
+    .filter(node => !node.inlineProof)
     .map(node => node.text || node.name).filter(Boolean).join("\n");
   snapshot.reading.sections = [...new Set(snapshot.nodes.map(node => node.sectionName).filter(Boolean))];
   return snapshot;

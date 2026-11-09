@@ -537,16 +537,18 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
         let task: Task<JSONValue, Error>
         if let result { task = result }
         else {
-            task = Task {
-                var rawOperation = operation
-                rawOperation.options.raw = true; rawOperation.perform = nil
-                return try await raw(rawOperation)
-            }
+            task = Task { try await readRaw(operation: operation) }
             result = task
         }
         let value = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
         try Task.checkCancellation()
         return value
+    }
+
+    @concurrent nonisolated private func readRaw(operation: SenseReadOperation) async throws -> JSONValue {
+        var operation = operation
+        operation.options.raw = true; operation.perform = nil
+        return try await raw(operation)
     }
 
     func material(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> SenseMaterial {

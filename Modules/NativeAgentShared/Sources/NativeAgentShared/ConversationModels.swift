@@ -4,7 +4,7 @@ import ImageIO
 #if canImport(UIKit)
 import UIKit
 #endif
-// Blueprint: | `ConversationModels.swift` | `ChatThreadKind`, shared transcript codecs, attachments and Mac-owned navigation |
+// Blueprint: | `ConversationModels.swift` | `ChatThreadKind`, transcript codecs, session row/list faces, attachments and Mac-owned navigation |
 
 public struct MultimodalAttachment: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -266,6 +266,62 @@ public struct ChatSessionNavigation: Codable, Sendable, Equatable {
     public let anchor: ConversationAnchorPin?
     public init(rows: [Row], pinnedSessionIDs: [String], anchor: ConversationAnchorPin?) {
         self.rows = rows; self.pinnedSessionIDs = pinnedSessionIDs; self.anchor = anchor
+    }
+}
+
+/// Finished conversation copy; relative age belongs to the drawing row's minute timeline.
+public struct SessionRowFace: FaceValue {
+    public let title: String
+    public let preview: String
+    public let surface: String
+    public let date: Date?
+    public let isUnread: Bool
+    public let isPinned: Bool?
+    public let isRunning: Bool
+    public let isPresent: Bool
+    public let issue: String?
+
+    public init(title: String, preview: String, surface: String, date: Date?, isUnread: Bool,
+                isPinned: Bool?, isRunning: Bool, isPresent: Bool = true, issue: String? = nil) {
+        self.title = title; self.preview = preview; self.surface = surface; self.date = date
+        self.isUnread = isUnread; self.isPinned = isPinned; self.isRunning = isRunning; self.isPresent = isPresent
+        self.issue = issue
+    }
+}
+
+/// Membership or order changes republish the list; row content that preserves both does not.
+public struct SessionListFace: FaceValue {
+    public var allIDs: [String] = []
+    public var rows: [String] = []
+    public var working: [String] = []
+    public var briefs: [String] = []
+    public var emptyIDs: [String] = []
+    public var navigationIDs: [String] = []
+    public var pinnedIDs: [String] = []
+    public init() {}
+}
+
+/// Finished sidebar sections and the view's query travel together.
+public struct SessionSearchFace: FaceValue {
+    public let query: String
+    public let sections: SessionListFace
+    public init(query: String, sections: SessionListFace) { self.query = query; self.sections = sections }
+}
+
+/// A completed palette ranking and the query it answers travel together.
+public struct SessionPaletteFace: FaceValue {
+    public let query: String
+    /// Exact title, title prefix, preview prefix, title words and preview words.
+    public let matches: [[String]]
+    public init(query: String, matches: [[String]]) { self.query = query; self.matches = matches }
+}
+
+/// Read availability has its own key, independent of the list's membership.
+public struct SessionNavigationFace: FaceValue {
+    public let hasLoadedIndex: Bool
+    public let issue: String?
+    public init(hasLoadedIndex: Bool, issue: String?) {
+        self.hasLoadedIndex = hasLoadedIndex; self.issue = issue
     }
 }
 

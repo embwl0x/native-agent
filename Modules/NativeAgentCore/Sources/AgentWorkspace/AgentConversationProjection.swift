@@ -11,7 +11,7 @@ import Transcripts
 // Resumable work retains DataRootLife; other-life work reads stopped/restored, and selected history failures stay unavailable.
 
 /// App-owned routing bookmarks, not another transcript or authority store. The last receipt is a bounded cache; the adapter remains the evidence owner.
-public struct AgentConversationRecord: Codable, Sendable {
+public struct AgentConversationRecord: Codable, Sendable, Equatable {
     public var retainedReply: (text: String, resultID: UUID?)? {
         guard case .object(let value)? = receipt else { return nil }
         for key in ["reply", "answer"] {
@@ -183,24 +183,29 @@ public struct AgentConversationNotice: Codable, Sendable, Equatable {
     public init(event: String, text: String) { self.event = event; self.text = text }
 }
 
-/// Queued messages must be sent or retained `held` with a reason; only pre-Return Mac holds release on free input.
+/// Only a pre-Return Mac hold can resume; a saved refusal is terminal evidence that this message was not sent.
 public struct AgentConversationQueued: Codable, Sendable, Equatable {
     public var lifeID: String?
     public var id: String
+    /// This send's caller, independent of the conversation's active exchange.
+    public var scopeSessionID: String?
     public var text: String
     public var queuedAt: Date
     public var byPerson: Bool?
     public var arguments: [String: JSONValue]?
     public var held: String?
+    public var notSentReason: String? { waitingForMac == true ? nil : held }
     /// No Return was emitted. The conversation's release drain can unhold this send.
     public var waitingForMac: Bool?
     package init(id: String,
+                 scopeSessionID: String,
                  text: String,
                  queuedAt: Date,
                  byPerson: Bool? = nil,
                  arguments: [String: JSONValue]? = nil,
                  held: String? = nil) {
         self.id = id
+        self.scopeSessionID = scopeSessionID
         self.text = text
         self.queuedAt = queuedAt
         self.byPerson = byPerson
@@ -231,7 +236,7 @@ public struct AgentConversationStop: Codable, Sendable, Equatable {
 
 /// Bounded display history inside the routing bookmark. Never provider context, replay input or a replacement for the reply's owner. Experience settlement
 /// reads its retained reply/status as evidence; eviction supplies no acceptance.
-public struct AgentConversationExchange: Codable, Sendable {
+public struct AgentConversationExchange: Codable, Sendable, Equatable {
     public var lifeID: String?
     public var id: String
     /// Bind the protocol's opaque message identity once; it is independent of the operation UUID.
@@ -290,7 +295,14 @@ extension ContactThread {
         (1...128).contains(id.utf8.count) && id.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
     }
 
-    public static func session(owner: String) -> String { prefix(owner: owner) + "mcp-" + owner }
+    /// The contact's own conversation's session.
+    public static func session(owner: String) -> String { session(owner: owner, conversation: nil) }
+
+    /// One session per conversation the contact opened by calling in (its own, or one caller's); every other conversation with it lives in the
+    /// contact's own session.
+    public static func session(owner: String, conversation: String?) -> String {
+        prefix(owner: owner) + (ContactCaller.held(conversation, peer: owner) ?? ContactCaller.shared(peer: owner))
+    }
 
     /// Presentation-only union for Simple and home rows. Route readers use lines. Everything said between the agent and the contact, oldest first, from its
     /// sessions: the live and archived logs, once each by message id (`tailBytes`: only the newest bytes of each live log). The contact's lines
@@ -373,16 +385,24 @@ extension ContactThread {
         return text
     }
 
+    /// Each entry names the conversation it belongs to (its record's `conversationID`); `session` places it in that conversation's session.
     public enum Entry: Sendable {
-        case send(owner: String, text: String, sendID: String, byPerson: Bool, turn: Turn)
-        /// Reply attribution follows its transport stamp; `owner` only places the line.
-        case reply(owner: String, name: String, text: String, replyID: String, at: Date, from: String, steeredBy: [String])
+        case send(owner: String, conversation: String?, text: String, sendID: String, byPerson: Bool, turn: Turn)
+        /// Reply attribution follows its transport stamp; `owner` and `conversation` only place the line.
+        case reply(owner: String, conversation: String?, name: String, text: String, replyID: String, at: Date, from: String, steeredBy: [String])
         /// A send's last state, kept on its own row when the record's bounded ledger lets the send go: the evidence stays with the send.
-        case state(owner: String, sendID: String, status: String)
+        case state(owner: String, conversation: String?, sendID: String, status: String)
 
         var owner: String {
             switch self {
-            case .send(let owner, _, _, _, _), .reply(let owner, _, _, _, _, _, _), .state(let owner, _, _): owner
+            case .send(let owner, _, _, _, _, _), .reply(let owner, _, _, _, _, _, _, _), .state(let owner, _, _, _): owner
+            }
+        }
+
+        public var session: String {
+            switch self {
+            case .send(let owner, let conversation, _, _, _, _), .reply(let owner, let conversation, _, _, _, _, _, _),
+                 .state(let owner, let conversation, _, _): ContactThread.session(owner: owner, conversation: conversation)
             }
         }
     }
@@ -404,7 +424,7 @@ extension ContactThread {
         guard let write = writer.withLock({ $0 }) else {
             throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "no conversation writer is installed yet"])
         }
-        try await SessionConversation.declare(session(owner: entry.owner), kind: .agent,
+        try await SessionConversation.declare(entry.session, kind: .agent,
             title: entry.owner, source: "agent-bridge", dataRoot: dataRoot, createIfMissing: false)
         try await write(dataRoot, entry)
     }

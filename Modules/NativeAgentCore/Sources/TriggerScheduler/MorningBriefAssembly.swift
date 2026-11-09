@@ -16,8 +16,7 @@ extension SwiftNativeTriggerScheduler {
         let id = uuid()
         let createdAt = Self.isoTimestamp(now())
 
-        let packet = await MorningBriefSources(root: root, now: now(), worklogPath: worklogPath).packet()
-        let built = try await callBrief(packet, as: MorningBriefProposal.self)
+        let built = try await callBrief(.object(["operation": .string("brief")]), as: MorningBriefProposal.self)
 
         let item: JSONValue = .object([
             "id": .string(id),

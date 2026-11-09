@@ -30,13 +30,14 @@ public final class OpenAITransport: LLMTransport {
     public static var defaultEndpoint: URL {
         get throws {
             guard let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT"] else {
-                return URL(string: "https://api.openai.com/v1/chat/completions")!
+                guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else { throw URLError(.badURL) }
+                return url
             }
             guard let url = URL(string: raw),
                   ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
                   ["127.0.0.1", "localhost", "[::1]"].contains(url.host?.lowercased() ?? ""),
                   url.user == nil, url.password == nil, url.fragment == nil,
-                  url.port == nil || (1...65535).contains(url.port!) else {
+                  url.port.map({ (1...65535).contains($0) }) != false else {
                 throw ProviderFailure.Diagnostic(cause: .routingUnavailable,
                     detail: """
                         Invalid NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT: supply an absolute HTTP(S) loopback URL without credentials or fragment, or remove \
@@ -48,7 +49,7 @@ public final class OpenAITransport: LLMTransport {
     }
 
     public init(
-        session: URLSession = .shared,
+        session: URLSession = ProviderHTTP.session,
         endpoint: URL? = nil,
         apiKeyOverride: String? = nil,
         dataRootOverride: URL? = nil,
@@ -155,17 +156,16 @@ public final class OpenAITransport: LLMTransport {
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
                     let requestStartNs = DispatchTime.now().uptimeNanoseconds
-                    let bytes: URLSession.AsyncBytes
+                    let bytes: ProviderHTTPBytes
                     let response: URLResponse
                     do {
                         (bytes, response) = try await ProviderWire.open(session, req, call: call)
                     } catch {
                         throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")"))
                     }
-                    defer { bytes.task.cancel() }
+                    defer { bytes.cancel() }
                     try await ProviderWire.validateChatCompletions(bytes, response)
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI", diagnosticDataRoot: telemetry.diagnosticDataRoot(call: call),
-                        call: call)
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI")
                     try await decoder.consume(
                         SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
                         request: req, providerID: providerId, model: model, idPrefix: "openai",
@@ -227,10 +227,10 @@ public final class OpenAITransport: LLMTransport {
                     var req = try responsesRequest(messages: messages, system: system, model: model, tools: tools, call: call)
                     let requestStartNs = DispatchTime.now().uptimeNanoseconds
                     let (bytes, response) = try await ProviderWire.open(session, req, call: call)
-                    defer { bytes.task.cancel() }
+                    defer { bytes.cancel() }
                     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                     if !(200..<300).contains(status) {
-                        let data = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
+                        let data = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096)
                         try throwIfChatCompletionsError(status: status, data: data, response: response)
                         throw LLMError.invalidResponse(status: status)
                     }

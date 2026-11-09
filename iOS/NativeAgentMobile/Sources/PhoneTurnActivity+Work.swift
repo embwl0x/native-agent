@@ -24,42 +24,46 @@ extension PhoneTurnActivity {
 
     func receive(_ snapshot: MobileWorkActivitySnapshot) {
         guard activityPairing != nil, snapshot.pairingFingerprint == activityPushPairing else { return }
-        if workPairing != snapshot.pairingFingerprint { work.removeAll(); workPairing = snapshot.pairingFingerprint }
+        adoptWorkPairing(snapshot.pairingFingerprint)
+        if let turnSessions = snapshot.turnSessions { self.turnSessions = turnSessions }
         if isEnabled, activityPairing != UserDefaults.standard.string(forKey: "NativeAgentMobile.workActivityPairing") {
             setEnabled(false)
         }
         pushConfigured = snapshot.pushConfigured
         if disableRegistrationPending { registerActivity(enabled: false) }
         if let error = snapshot.pushConfigurationError { activityError("Live Activity push is unavailable: \(error)") }
+        if let unavailable = snapshot.unavailable {
+            activityError("Work state is unavailable: \(unavailable)")
+            return
+        }
         for row in snapshot.activities {
-            guard row.content.updatedAt <= Date().addingTimeInterval(60),
-                  row.content.updatedAt >= (work[row.id]?.content.updatedAt ?? .distantPast) else { continue }
+            guard acceptsWork(row) else { continue }
             if work[row.id] == row { continue }
             work[row.id] = row
             applyWork(row)
         }
         let ids = Set(snapshot.activities.map(\.id))
-        workCorrelations = Dictionary((snapshot.experiences ?? []).filter { ids.contains("turn:" + $0.id) }.map {
+        let correlations = Dictionary((snapshot.experiences ?? []).filter { ids.contains("turn:" + $0.id) }.map {
             ("turn:" + $0.id, Set($0.evidence.filter { $0.source == "correlation" }.map(\.id)))
         }, uniquingKeysWith: { $0.union($1) })
-        for activity in Activity<PhoneTurnAttributes>.activities where !ids.contains(activity.attributes.workID) {
-            let workID = activity.attributes.workID
-            enqueueWork(workID) { await Self.endWork(workID, content: nil) }
-        }
-        for (id, row) in Array(work) where !ids.contains(id) && row.staleDate.addingTimeInterval(10 * 60) <= Date() {
-            work.removeValue(forKey: id)
-            workExpirations.removeValue(forKey: id)?.cancel()
-            enqueueWork(id) { await Self.endWork(id, content: nil) }
-        }
+        workCorrelations.merge(correlations) { _, current in current }
+        reconcileWork(heldWorkIDs.subtracting(ids))
         if isEnabled { observeWorkTokens() }
     }
 
     func resumeWorkActivities() {
         failedWorkStarts.removeAll()
-        guard activityPairing != nil else { workCorrelations = [:]; Task { await Self.endAllWork() }; return }
-        if workPairing != activityPushPairing { work.removeAll(); workCorrelations = [:]; workPairing = activityPushPairing }
+        adoptWorkPairing(activityPushPairing)
+        guard activityPairing != nil else {
+            workReconciliationTask?.cancel()
+            workReconciliationIDs.removeAll()
+            workCorrelations = [:]
+            Task { await Self.endAllWork() }
+            return
+        }
         Task { await Self.endUnpairedWork() }
         if activityObserver == nil { activityObserver = Task { await Self.observeWorkActivities() } }
+        reconcileWork(heldWorkIDs)
         guard isEnabled else {
             if disableRegistrationPending { registerActivity(enabled: false) }
             Task { await Self.endAllWork() }
@@ -70,7 +74,6 @@ extension PhoneTurnActivity {
             work.removeAll()
             return
         }
-        for row in work.values { applyWork(row) }
         for activity in Activity<PhoneTurnAttributes>.activities where activity.pushToken == nil
             && activity.attributes.pairingFingerprint == activityPushPairing
             && activity.activityState != .ended && activity.activityState != .dismissed {
@@ -80,33 +83,79 @@ extension PhoneTurnActivity {
         registerActivity(enabled: true, reconcile: true)
     }
 
+    private var heldWorkIDs: Set<String> {
+        Set(work.values.filter { !$0.content.state.isTerminal }.map(\.id)).union(
+            Activity<PhoneTurnAttributes>.activities.filter {
+                $0.attributes.pairingFingerprint == activityPushPairing
+                    && $0.activityState != .ended && $0.activityState != .dismissed
+            }.map { $0.attributes.workID })
+    }
+
+    /// Omission from a bounded snapshot asks the canonical owner; it is not a terminal verdict.
+    private func reconcileWork(_ ids: Set<String>) {
+        guard let pairing = activityPairing, !ids.isEmpty else { return }
+        workReconciliationIDs.formUnion(ids)
+        guard workReconciliationTask == nil else { return }
+        workReconciliationTask = Task {
+            defer {
+                workReconciliationTask = nil
+                if activityPairing != pairing { reconcileWork(heldWorkIDs) }
+            }
+            do {
+                while !workReconciliationIDs.isEmpty {
+                    try Task.checkCancellation()
+                    guard activityPairing == pairing else { return }
+                    let batch = Array(workReconciliationIDs.sorted().prefix(64))
+                    workReconciliationIDs.subtract(batch)
+                    let payload = String(decoding: try JSONEncoder().encode(batch), as: UTF8.self)
+                    let sync = iCloudSyncEngine.shared
+                    let response = try sync.requireSuccessfulActionResponse(await sync.sendActionAndWait(
+                        InboxAction.make(action: "workActivityState", payload: ["workIds": payload])))
+                    guard let encoded = response["activities"] else {
+                        throw SyncError.persistence("The Mac work response has no activity evidence.")
+                    }
+                    let rows = try await Task.detached(priority: .utility) {
+                        let decoder = JSONDecoder()
+                        decoder.dateDecodingStrategy = .iso8601
+                        return try decoder.decode([MobileWorkActivity].self, from: Data(encoded.utf8))
+                    }.value
+                    try Task.checkCancellation()
+                    guard activityPairing == pairing else { return }
+                    guard rows.count == batch.count, Set(rows.map(\.id)) == Set(batch) else {
+                        throw SyncError.persistence("The Mac work response does not match the requested activities.")
+                    }
+                    for row in rows {
+                        guard acceptsWork(row) else { continue }
+                        if work[row.id] != row { work[row.id] = row }
+                        applyWork(row)
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                activityError("Work state could not be reconciled: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func acceptsWork(_ row: MobileWorkActivity) -> Bool {
+        guard let sequence = row.content.sequence else {
+            activityError("Work state has no event sequence for \(row.id); its activity remains unresolved.")
+            return false
+        }
+        guard let current = work[row.id]?.content.sequence else { return true }
+        return sequence >= current
+    }
+
     private func applyWork(_ row: MobileWorkActivity) {
-        workExpirations.removeValue(forKey: row.id)?.cancel()
         if row.content.state.isTerminal {
             enqueueWork(row.id) { await Self.endWork(row.id, content: row.content) }
             return
-        } else if row.staleDate <= Date() {
-            enqueueWork(row.id) { await Self.endWork(row.id, content: nil) }
         } else if isEnabled {
             enqueueWork(row.id) {
                 guard self.isEnabled, self.work[row.id] == row else { return }
                 self.startWork(row)
                 await Self.updateWork(row)
-            }
-        }
-        workExpirations[row.id] = Task {
-            var deadline = row.staleDate.addingTimeInterval(10 * 60)
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
-                catch { return }
-                guard !Task.isCancelled else { return }
-                guard let nextDeadline = await Self.endWork(row.id, content: nil) else { break }
-                // APNs may have advanced ActivityKit beyond the cached snapshot.
-                deadline = nextDeadline
-            }
-            if !Task.isCancelled {
-                workCorrelations.removeValue(forKey: row.id)
-                workExpirations.removeValue(forKey: row.id)
             }
         }
     }
@@ -122,7 +171,7 @@ extension PhoneTurnActivity {
     }
 
     private func startWork(_ row: MobileWorkActivity) {
-        guard isEnabled, !pushConfigured, row.staleDate > Date(), !row.content.state.isTerminal, !failedWorkStarts.contains(row.id),
+        guard isEnabled, !pushConfigured, !row.content.state.isTerminal, !failedWorkStarts.contains(row.id),
               UIApplication.shared.applicationState == .active, ActivityAuthorizationInfo().areActivitiesEnabled,
               !Activity<PhoneTurnAttributes>.activities.contains(where: {
                   $0.attributes.workID == row.id && $0.activityState != .ended && $0.activityState != .dismissed
@@ -193,12 +242,18 @@ extension PhoneTurnActivity {
                     }.map { $0.attributes.workID })
                     payload["observedWorkIds"] = String(decoding: try JSONEncoder().encode(ids.sorted()), as: UTF8.self)
                 }
+                // The Mac already holds what it accepted, so saying the same thing again sends nothing.
+                let told = workID ?? (startToken == nil ? "reconcile" : "start")
+                if enabled, acceptedRegistrations[told] == payload, acceptedRegistrationPairing == expectedPairing { return }
                 let response = try iCloudSyncEngine.shared.requireSuccessfulActionResponse(await iCloudSyncEngine.shared.sendActionAndWait(
                     InboxAction.make(action: "registerWorkActivity", payload: payload)))
                 if !enabled, response["ok"] == "true", !isEnabled, activityPairing == expectedPairing {
                     disableRegistrationPending = false
                     activityError(nil)
                 }
+                if acceptedRegistrationPairing != expectedPairing || !enabled { acceptedRegistrations.removeAll() }
+                acceptedRegistrationPairing = expectedPairing
+                if enabled { acceptedRegistrations[told] = payload }
             } catch { activityError("Live Activity registration failed: \(error.localizedDescription)") }
         }
     }
@@ -236,32 +291,29 @@ extension PhoneTurnActivity {
     }
 
     @concurrent nonisolated private static func updateWork(_ row: MobileWorkActivity) async {
+        guard let incoming = row.content.sequence else {
+            await shared.activityError("Work state has no event sequence for \(row.id); its activity remains unresolved.")
+            return
+        }
         let pairing = await shared.activityPushPairing
         for activity in Activity<PhoneTurnAttributes>.activities where activity.attributes.workID == row.id
             && activity.attributes.pairingFingerprint == pairing
-            && activity.activityState != .ended && activity.activityState != .dismissed
-            && activity.content.state.updatedAt <= row.content.updatedAt {
+            && activity.activityState != .ended && activity.activityState != .dismissed {
+            if let current = activity.content.state.sequence, incoming < current { continue }
             await activity.update(ActivityContent(state: row.content, staleDate: row.staleDate))
         }
     }
 
-    @discardableResult
-    @concurrent nonisolated private static func endWork(_ id: String, content: MobileWorkActivity.ContentState?) async -> Date? {
-        var nextDeadline: Date?
+    @concurrent nonisolated private static func endWork(_ id: String, content: MobileWorkActivity.ContentState) async {
+        guard let incoming = content.sequence else {
+            await shared.activityError("Work state has no event sequence for \(id); its activity remains unresolved.")
+            return
+        }
         for activity in Activity<PhoneTurnAttributes>.activities where activity.attributes.workID == id
             && activity.activityState != .ended && activity.activityState != .dismissed {
-            if let content, content.updatedAt < activity.content.state.updatedAt { continue }
-            if content == nil {
-                let deadline = activity.content.state.updatedAt.addingTimeInterval(15 * 60)
-                if deadline > Date() {
-                    nextDeadline = max(nextDeadline ?? deadline, deadline)
-                    continue
-                }
-            }
-            let final = content.map { ActivityContent(state: $0, staleDate: nil) }
-            await activity.end(final, dismissalPolicy: .after(Date().addingTimeInterval(30)))
+            if let current = activity.content.state.sequence, incoming < current { continue }
+            await activity.end(ActivityContent(state: content, staleDate: nil), dismissalPolicy: .default)
         }
-        return nextDeadline
     }
 
     @concurrent nonisolated private static func endAllWork() async {

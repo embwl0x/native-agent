@@ -71,6 +71,11 @@ extension QuietSettings {
     static func botRows(_ appModel: (any QuietSettingsHost)?, snapshot: Bool = false) throws -> [QuietSetting] {
         guard let appModel else { throw QuietSettingError.unavailable("The helper settings owner is unavailable. Open Bots again before reading schedules.") }
         let bots = try botStore(appModel).list()
+        return botRows(bots, snapshot: snapshot)
+    }
+
+    @MainActor
+    static func botRows(_ bots: [BotDefinition], snapshot: Bool = false) -> [QuietSetting] {
         return bots.flatMap { bot -> [QuietSetting] in
             let key = bot.id.uuidString.lowercased()
             let name = bot.name

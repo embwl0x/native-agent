@@ -13,7 +13,7 @@ import ChatTurnRuntime
 import ChatTurnContracts
 import Experiences
 
-// Blueprint: | `TelegramPollLoop.swift` | `TelegramPollLoop`: durable admission; owned media preparation and recovery |
+// Blueprint: | `TelegramPollLoop.swift` | Durable admission; complete media preparation; admitted generation never replays from missing output |
 
 // MARK: - TelegramPollLoop
 
@@ -100,8 +100,6 @@ public struct TelegramPollLoop: LoopRunner {
     let revokeDriverControl: @Sendable () async -> Void
     let turnCardLedger: TelegramTurnCardLedger
     let turnCardRestartRepairer: TelegramTurnCardRestartRepairer
-    /// Retain admitted continuations awaiting replies; their approved tools have already run.
-    let approvalInbox: SwiftNativeApprovalInbox
     let pollBackoff: TelegramExponentialBackoff
     let commandMenuBackoff: TelegramExponentialBackoff
 
@@ -151,7 +149,6 @@ public struct TelegramPollLoop: LoopRunner {
         )
         self.turnCardLedger = cardLedger
         self.turnCardRestartRepairer = TelegramTurnCardRestartRepairer(ledger: cardLedger)
-        self.approvalInbox = SwiftNativeApprovalInbox(root: resolvedDataRoot)
         self.syncCommandMenu = syncCommandMenu
         self.approvalHandler = approvalHandler
         self.attachmentChatHandler = attachmentChatHandler
@@ -203,7 +200,8 @@ public struct TelegramPollLoop: LoopRunner {
         let claims = try await inbox.snapshots()
         if response.isSilentCompletion {
             if let claim = claims.first(where: { $0.assistantRunId == runId && $0.assistantSessionId == sessionId }) {
-                _ = try await inbox.transition(updateId: claim.updateId, from: [.processing, .outcomeUnknown], to: .completed)
+                _ = try await inbox.transition(updateId: claim.updateId, from: [.processing, .outcomeUnknown],
+                    to: .completed, noRecoverableAnswer: true)
             }
             try await settleReplyCheckpoint(sessionId: sessionId, runId: runId, verdict: "completed")
             return "completed"
@@ -268,25 +266,14 @@ public struct TelegramPollLoop: LoopRunner {
                     Telegram setup; do not resend to another destination.
                     """)
             }
-        var delivery = try await retainedAssistantDelivery(for: claim)
-        if delivery == nil {
-            if let session = claim.assistantSessionId, let run = claim.assistantRunId,
-               try TurnCheckpoint.turnIds(dataRoot: dataRoot, sessionId: session).contains(where: { turn in
-                   // This run's own file decides; a damaged one may be it, so it is owed.
-                   (try? TurnCheckpoint.read(dataRoot: dataRoot, sessionId: session, turnId: turn)).map { $0?.runId == run } ?? true
-               }) {
-                return "owed"
-            }
-            delivery = try await inbox.recordAssistantDelivery(updateId: claim.updateId,
-                delivery: TelegramAssistantDeliveryState(reply: "Couldn't finish the reply.", imagePaths: []),
-                failedBeforeAnswer: true)
+        if let session = claim.assistantSessionId, let run = claim.assistantRunId,
+           try SwiftNativeChatOrchestrationClient.silentTurn(dataRoot: dataRoot, sessionId: session, runId: run) != nil {
+            _ = try await inbox.transition(updateId: claim.updateId, from: [.processing, .outcomeUnknown],
+                to: .completed, noRecoverableAnswer: true)
+            try await settleReplyCheckpoint(sessionId: session, runId: run, verdict: "completed")
+            return "completed"
         }
-        guard let delivery else {
-            throw TelegramBotError.underlying("""
-                telegram_reply_missing: No saved reply is available for update \(claim.updateId). Inspect its conversation and \
-                update_inbox claim before attempting delivery.
-                """)
-        }
+        guard let delivery = try await retainedAssistantDelivery(for: claim) else { return "owed" }
         let phase: TelegramUpdateClaimPhase
         if delivery.isDelivered { phase = .completed }
         else if delivery.outcomeUnknown { phase = .sentUnconfirmed }
@@ -311,14 +298,6 @@ public struct TelegramPollLoop: LoopRunner {
         await inbox.pruneTerminalClaims(dataRoot: dataRoot)
         return verdict
         }
-    }
-
-    /// A message whose run wrote no checkpoint and no reply never reached the agent's turn: its own intake still owns it.
-    func neverStarted(_ claim: TelegramUpdateClaim) async throws -> Bool {
-        guard try await retainedAssistantDelivery(for: claim) == nil else { return false }
-        guard let session = claim.assistantSessionId, let run = claim.assistantRunId else { return true }
-        guard try !SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run) else { return false }
-        return try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: session, runId: run) == nil
     }
 
     func settleReplyCheckpoint(sessionId: String, runId: String, verdict: String) async throws {
@@ -382,9 +361,6 @@ public struct TelegramPollLoop: LoopRunner {
                     if claim.phase == .processing,
                        await turnCoordinator.isUpdateProcessing(claim.updateId) {
                         reconciled.append(claim)
-                    } else if claim.phase == .processing, try await neverStarted(claim) {
-                        // Its run reached no checkpoint and no reply, so nothing it did can repeat: it runs again, under that run.
-                        reconciled.append(try await updateInbox.transition(updateId: claim.updateId, from: [.processing], to: .pending))
                     } else if claim.phase == .processing {
                         let quarantined = try await updateInbox.transition(
                             updateId: claim.updateId,
@@ -412,8 +388,12 @@ public struct TelegramPollLoop: LoopRunner {
                 evidence: .init(source: updateInbox.directory.path, id: _tgNowString()))
         } catch {
             let failure = updateInbox.repairFailure(error, dataRoot: dataRoot)
+            guard let owner = failure.owner else {
+                await recordError(context: "update_inbox_load", error: failure.message)
+                return .failed(error: failure.message)
+            }
             RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run,
-                operation: "telegram.inbox:" + updateInbox.directory.path, owner: failure.owner!,
+                operation: "telegram.inbox:" + updateInbox.directory.path, owner: owner,
                 words: failure.message, nextCall: failure.nextCall)
             await recordError(context: "update_inbox_load", error: failure.message)
             return .failed(error: failure.message)
@@ -431,16 +411,7 @@ public struct TelegramPollLoop: LoopRunner {
         }
 
         let result: TelegramPollResult
-        var recoveredWork = recoveredClaims.contains { $0.phase == .pending }
-        if !recoveredWork {
-            // Only claims saved queued before the upgrade are .queued; one with no live owner is work to recover.
-            for claim in recoveredClaims where claim.phase == .queued {
-                if await !turnCoordinator.isUpdateProcessing(claim.updateId) {
-                    recoveredWork = true
-                    break
-                }
-            }
-        }
+        let recoveredWork = recoveredClaims.contains { $0.phase == .pending }
         if recoveredWork {
             // The durable inbox is the transport for this tick. Do not make a network outage block already-admitted user work.
             result = TelegramPollResult(updates: [], nextOffset: offset)
@@ -490,7 +461,7 @@ public struct TelegramPollLoop: LoopRunner {
         var updatesById: [Int: TelegramUpdate] = [:]
         for update in result.updates { updatesById[update.updateId] = update }
         // Durable bytes win if Telegram returns the same id with a payload that differs from the one already admitted before a crash.
-        for claim in recoveredClaims where claim.phase == .pending || claim.phase == .queued {
+        for claim in recoveredClaims where claim.phase == .pending {
             updatesById[claim.updateId] = claim.update
         }
         let updates = updatesById.values.sorted { $0.updateId < $1.updateId }
@@ -517,31 +488,14 @@ public struct TelegramPollLoop: LoopRunner {
                     continue
                 }
                 // Same-process ticks are single-flight, so this can only be an unexpected persisted ambiguity. Never duplicate effects.
-                _ = try? await updateInbox.transition(
-                    updateId: update.updateId,
-                    from: [.processing],
-                    to: .outcomeUnknown
-                )
+                do {
+                    _ = try await updateInbox.transition(updateId: update.updateId, from: [.processing], to: .outcomeUnknown)
+                } catch {
+                    await recordError(context: "update_inbox_unknown", error: String(describing: error), update: update)
+                    return .failed(error: "Telegram could not retain the uncertain update: \(error)")
+                }
                 continue
             case .pending:
-                break
-            case .queued:
-                guard claim.resolvedSessionId != nil else {
-                    do {
-                        if let message = claim.update.message {
-                            try await Self.defaultSendMessage(token, message.destination,
-                                "This queued message has no saved conversation binding. Select the conversation and resend it; I haven't run it.")
-                        }
-                        _ = try await updateInbox.transition(updateId: claim.updateId,
-                            from: [.queued], to: .outcomeUnknown)
-                    } catch {
-                        return .failed(error: "Telegram queued conversation recovery failed: \(error)")
-                    }
-                    continue
-                }
-                // A queued claim may already have a live owner before its body starts; rehydrate only after restart to avoid duplicate turns.
-                if await turnCoordinator.isUpdateProcessing(claim.updateId) { continue }
-                await turnCoordinator.beginUpdateProcessing(claim.updateId)
                 break
             }
             await recordSeen(update: update)
@@ -587,6 +541,12 @@ public struct TelegramPollLoop: LoopRunner {
             if let callback = update.callbackQuery,
                await handleApprovalCallback(update: update, callback: callback) {
                 shouldCompleteClaim = false
+                break updateProcessing
+            }
+            // A button no handler reads any more (one sent before its card changed shape) is answered in words, never left spinning.
+            if let id = update.callbackQuery?.objectValue?["id"]?.stringValue {
+                await answerRecordedCallback(id, text: "This button no longer does anything; answer the card in the Inbox on the Mac or the phone.",
+                    context: "unread_callback_answer", update: update)
                 break updateProcessing
             }
             guard let msg = update.message else {
@@ -689,7 +649,7 @@ public struct TelegramPollLoop: LoopRunner {
                     guard let ownUsername = await resolveBotUsername() else {
                         do {
                             let pending = try await updateInbox.transition(
-                                updateId: update.updateId, from: [.processing, .queued], to: .pending
+                                updateId: update.updateId, from: [.processing], to: .pending
                             )
                             guard pending.phase == .pending else {
                                 await turnCoordinator.endUpdateProcessing(update.updateId)
@@ -779,12 +739,6 @@ public struct TelegramPollLoop: LoopRunner {
                 AbilityStore(dataRoot: dataRoot).signal("message.arrived:telegram", arrived)
             }
             let turnBody: @Sendable (UUID) async -> Void = { turnId in
-                if let queuedMessageId = claim.queueAcknowledgementMessageId {
-                    await clearQueueAcknowledgement(
-                        chatId: msg.chatId,
-                        messageId: queuedMessageId
-                    )
-                }
                 let preparedText = await runTurn(turnId: turnId, turn: turn, update: update, message: msg,
                     text: text, sessionId: turnSessionId) { card in
                     await card.transition(.working(action: voiceAttachment != nil
@@ -797,26 +751,17 @@ public struct TelegramPollLoop: LoopRunner {
                     } catch {
                         // No chat turn has started: shutdown may release media for recovery, while an explicit Stop remains terminal.
                         let canceled = Task.isCancelled || error is CancellationError
+                        if !canceled, Self.isSpeechPermissionDenial(error) {
+                            await retainForSpeechPermission(error: error, card: card, update: update, message: msg, text: text)
+                            return nil
+                        }
                         let shuttingDown = await turnCoordinator.shutdownInterruptedTurn(destination: msg.destination, turnId: turnId)
                         let retryAfterShutdown = canceled && shuttingDown && !runStop.isRaised
                             && (voiceAttachment != nil || mediaAttachment != nil)
                         await settle {
-                            let permission = !canceled && Self.isSpeechPermissionDenial(error)
                             await card.transition(canceled ? .canceled(reason: retryAfterShutdown
                                 ? "Interrupted by shutdown; message saved for retry" : "Stopped by user") : .failed(reason: Self.chatErrorNotice(for: error)))
-                            if permission, await !voicePermissionNotice.sent {
-                                await onCapabilityDenied?("speechRecognition")
-                                do {
-                                    try await Self.defaultSendMessage(token, msg.destination, """
-                                        The voice note is saved. I've asked the Mac for Speech Recognition: allow it there and I'll transcribe this note \
-                                        and the next ones by myself. If the Mac refused it before, the card in NativeAgent opens the exact pane.
-                                        """)
-                                    await voicePermissionNotice.setSent(true)
-                                } catch {
-                                    await recordError(context: "send_voice_permission_notice", error: String(describing: error),
-                                        update: update, message: msg, text: nil)
-                                }
-                            } else if !permission, !canceled {
+                            if !canceled {
                                 let notice = voiceAttachment != nil ? Self.voiceTranscriptionNotice(for: error) : Self.attachmentDroppedNotice(for: error)
                                 do {
                                     try await Self.defaultSendMessage(token, msg.destination, notice)
@@ -831,7 +776,7 @@ public struct TelegramPollLoop: LoopRunner {
                             }
                             do {
                                 _ = try await updateInbox.transition(updateId: update.updateId, from: [.processing],
-                                    to: permission ? .awaitingSpeechPermission : retryAfterShutdown ? .pending : canceled ? .stopped : .completed,
+                                    to: retryAfterShutdown ? .pending : canceled ? .stopped : .completed,
                                     resolvedSessionId: retryAfterShutdown ? turnSessionId : nil)
                             } catch {
                                 await recordError(context: "media_preparation_settlement", error: String(describing: error),
@@ -859,7 +804,7 @@ public struct TelegramPollLoop: LoopRunner {
                 priority: .userInitiated, operation: turnOperation) != nil else {
                 // Refused only while shutting down: the update waits for the next launch instead of settling unanswered.
                 await turnCoordinator.endUpdateProcessing(update.updateId)
-                do { _ = try await updateInbox.transition(updateId: update.updateId, from: [.processing, .queued], to: .pending) }
+                do { _ = try await updateInbox.transition(updateId: update.updateId, from: [.processing], to: .pending) }
                 catch { await recordError(context: "update_inbox_shutdown_hold", error: String(describing: error), update: update) }
                 continue
             }
@@ -868,10 +813,9 @@ public struct TelegramPollLoop: LoopRunner {
             guard shouldCompleteClaim else { continue }
             await turnCoordinator.endUpdateProcessing(update.updateId)
             do {
-                // Completed replayed claims may still be .queued when no turn takes ownership.
                 let completed = try await updateInbox.transition(
                     updateId: update.updateId,
-                    from: [.processing, .queued],
+                    from: [.processing],
                     to: .completed
                 )
                 guard completed.phase == .completed else {
@@ -894,29 +838,60 @@ public struct TelegramPollLoop: LoopRunner {
         return .completed(result: "Telegram poll processed \(updates.count) update(s)")
     }
 
+    func retainForSpeechPermission(error: Error, card: TelegramTurnProgressCardDriver,
+                                   update: TelegramUpdate, message: TelegramMessage, text: String) async {
+        await settle {
+            do {
+                _ = try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).transition(
+                    updateId: update.updateId, from: [.processing], to: .awaitingSpeechPermission)
+            } catch {
+                await recordError(context: "speech_permission_settlement", error: String(describing: error),
+                    update: update, message: message, text: text)
+                return
+            }
+            await card.transition(.failed(reason: Self.chatErrorNotice(for: error)))
+            await recordError(context: "media_preparation", error: String(describing: error), update: update, message: message, text: text)
+            await onCapabilityDenied?("speechRecognition")
+            if await !voicePermissionNotice.sent {
+                do {
+                    try await Self.defaultSendMessage(token, message.destination, """
+                        The voice note is saved. I've asked the Mac for Speech Recognition: allow it there and I'll transcribe this note \
+                        and the next ones by myself. If the Mac refused it before, the card in NativeAgent opens the exact pane.
+                        """)
+                    await voicePermissionNotice.setSent(true)
+                } catch {
+                    await recordError(context: "send_voice_permission_notice", error: String(describing: error),
+                        update: update, message: message, text: nil)
+                }
+            }
+        }
+    }
+
     /// Runs only after the destination's turn owns cancellation and its durable update claim. No download or transcription can hold the poller's tick.
     func prepareIncomingMedia(
         text: String, caption: String?, voice: TelegramMediaAttachment?, media: TelegramMediaAttachment?,
         update: TelegramUpdate, message: TelegramMessage, turn: Turn
     ) async throws -> (text: String, attachments: [TelegramMediaAttachment], receiptKind: String) {
         try Task.checkCancellation()
-        if let voice, let voiceTranscriber {
-            try? await Self.defaultSendChatAction(token, message.destination, "typing")
-            do {
-                var downloaded = try await mediaDownloader.download(token: token, attachment: voice, maxBytes: voiceMaxBytes)
-                let transcription = try await voiceTranscriber.transcribe(downloaded)
-                try Task.checkCancellation()
-                guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    throw TelegramVoiceTranscriptionError.malformedResponse
-                }
-                await voicePermissionNotice.setSent(false)
-                await recordVoiceTranscription(update: update, message: message, attachment: downloaded, transcription: transcription)
-                var utterance = transcription.utterance
-                utterance.correctionReferences = []
-                downloaded.utterance = utterance
-                let spoken = "[Telegram voice message]\n" + transcription.utterance.face
-                return (caption.map { $0 + "\n\n" + spoken } ?? spoken, [downloaded], "voice_reply")
+        if let voice {
+            guard let voiceTranscriber else {
+                throw TelegramVoiceTranscriptionError.speechUnavailable("Voice transcription is not configured. Enable it on the Mac before resending.")
             }
+            do { try await Self.defaultSendChatAction(token, message.destination, "typing") }
+            catch { await recordError(context: "voice_typing", error: String(describing: error), update: update, message: message) }
+            var downloaded = try await mediaDownloader.download(token: token, attachment: voice, maxBytes: voiceMaxBytes)
+            let transcription = try await voiceTranscriber.transcribe(downloaded)
+            try Task.checkCancellation()
+            guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw TelegramVoiceTranscriptionError.malformedResponse
+            }
+            await voicePermissionNotice.setSent(false)
+            await recordVoiceTranscription(update: update, message: message, attachment: downloaded, transcription: transcription)
+            var utterance = transcription.utterance
+            utterance.correctionReferences = []
+            downloaded.utterance = utterance
+            let spoken = "[Telegram voice message]\n" + transcription.utterance.face
+            return (caption.map { $0 + "\n\n" + spoken } ?? spoken, [downloaded], "voice_reply")
         }
         guard let media else { return (text, [], "reply") }
         do {
@@ -926,7 +901,10 @@ public struct TelegramPollLoop: LoopRunner {
             guard let bytes = downloaded.bytes, !bytes.isEmpty else { throw TelegramMediaDownloadError.malformedResponse }
             let mime: String
             if downloaded.kind == "photo" {
-                mime = Self.imageMime(forFilename: downloaded.captureFilename, fallbackMime: downloaded.mimeType) ?? "image/jpeg"
+                guard let photoMime = Self.imageMime(forFilename: downloaded.captureFilename, fallbackMime: downloaded.mimeType) else {
+                    throw TelegramMediaDownloadError.malformedResponse
+                }
+                mime = photoMime
             } else {
                 guard let resolved = downloaded.chatTypeAndMime else { throw TelegramMediaDownloadError.malformedResponse }
                 mime = resolved.mime

@@ -309,16 +309,17 @@ enum AgentContactRuntime {
                     }
                     try Task.checkCancellation()
                     guard let final, failure == nil else {
+                        let output = try final.map { try outputParts($0, taskID: turn.taskID, dataRoot: dataRoot, job: turn.job) }
                         return AgentContactOutcome(state: waiting ? .inputRequired : .failed,
-                            parts: try final.map { try outputParts($0, taskID: turn.taskID, dataRoot: dataRoot, job: turn.job) } ?? [],
+                            parts: output?.parts ?? [],
                             detail: waiting ? "Waiting for the person" : (failure ?? "The reply ended without a finished result") + ". Work: " + (
-                                ranPartly ? "ran partly." : "outcome unknown."))
+                                ranPartly ? "ran partly." : "outcome unknown."), replyRecovery: output?.recovery)
                     }
-                    let parts = try outputParts(final, taskID: turn.taskID, dataRoot: dataRoot, job: turn.job)
+                    let output = try outputParts(final, taskID: turn.taskID, dataRoot: dataRoot, job: turn.job)
                     // Only an explicit incomplete outcome retains unfinished-turn state, matching the chat owner.
                     let state: AgentContactTaskState = waiting ? .inputRequired : (final.completionState == .incomplete ? .failed : .completed)
-                    return AgentContactOutcome(state: state, parts: parts,
-                        detail: state == .failed ? "The work did not finish" : nil)
+                    return AgentContactOutcome(state: state, parts: output.parts,
+                        detail: state == .failed ? "The work did not finish" : nil, replyRecovery: output.recovery)
                 } onCancel: { Task { try? await MacChatTurnRuntime(dataRoot: dataRoot).stop(sessionId: session, runId: runID) } }
                 await MainActor.run {
                     NotificationCenter.default.post(name: .chatTurnCompleted, object: session)
@@ -333,23 +334,23 @@ enum AgentContactRuntime {
         }
     }
 
-    static func outputParts(_ result: TurnEngineResult, taskID: String, dataRoot: URL, job: AgentContactJob? = nil) throws -> [AgentContactPart] {
+    static func outputParts(_ result: TurnEngineResult, taskID: String, dataRoot: URL,
+                            job: AgentContactJob? = nil) throws -> (parts: [AgentContactPart], recovery: AgentContactReplyRecovery?) {
         var parts: [AgentContactPart] = result.reply.isEmpty ? [] : [.text(result.reply)]
         if let bytes = result.reply.data(using: .utf8), bytes.count <= 64000,
            let value = try? JSONDecoder().decode(JSONValue.self, from: bytes), case .object = value {
             parts.append(.data(value, metadata: .object(["source": .string("agent"), "taskId": .string(taskID)])))
         }
-        // A file too big to send drops out, not the finished reply with it.
-        let omitted = "[Files produced by this reply that were too large or unreadable were left out.]"
-        var dropped = false
+        var failures: [String] = []
         if job != nil {
             // A job's artifacts are the files in its folder, whichever tool made them.
             let made = try AgentContactJob.fileParts(taskID: taskID, dataRoot: dataRoot)
             parts += made.parts
-            dropped = made.unsent > 0
+            failures += made.failures
         } else {
             for attachment in ChatGeneratedImageArtifacts.attachments(from: result.toolDispatches, dataRoot: dataRoot) {
-                if let part = try? AgentContactPart.output(attachment, taskID: taskID) { parts.append(part) } else { dropped = true }
+                do { parts.append(try AgentContactPart.output(attachment, taskID: taskID)) }
+                catch { failures.append((attachment.path ?? attachment.name ?? "generated attachment") + ": " + error.localizedDescription) }
             }
             // Use successful write receipts as produced-file evidence; never infer paths from prose or arbitrary tool results.
             for file in ChatWrittenFileArtifacts.files(from: result.toolDispatches, maximumBytes: AgentContactPart.maximumFileBytes) {
@@ -359,9 +360,12 @@ enum AgentContactRuntime {
         }
         let size = try JSONSerialization.data(withJSONObject: parts.map(\.wire03)).count
         guard size <= AgentContactPart.maximumOutputBytes else {
-            return parts.filter { if case .file = $0 { return false }; return true } + [.text(omitted)]
+            throw AgentContactFailure(code: -32603,
+                message: "Produced reply artifacts exceed the wire limit; reduce the named task's artifact sizes before retrieving them.")
         }
-        return dropped ? parts + [.text(omitted)] : parts
+        let recovery = failures.isEmpty ? nil : AgentContactReplyRecovery(source: AgentContactJob.folder(taskID: taskID, dataRoot: dataRoot).path,
+            detail: failures.joined(separator: "; ") + ". Repair these artifacts, then read this retained task; do not repeat the work.")
+        return (parts, recovery)
     }
 }
 

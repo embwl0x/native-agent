@@ -61,8 +61,7 @@ public struct HeartbeatBackgroundWork: Sendable {
                         + workflowFiles
                         + ErrorFeeds.errorFeeds.map { $0.url(dataRoot: dataRoot) },
                     stores: [.desk],
-                    notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange,
-                        DeskContinuationScheduler.ownerReceiptChanged, LoopFailureReceipts.didWrite],
+                    notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange, LoopFailureReceipts.didWrite],
                     loopId: "heartbeat"
                 )
             },
@@ -85,9 +84,7 @@ public struct HeartbeatBackgroundWork: Sendable {
             }
         )
     }
-    internal let heartbeatJobStuckAge: TimeInterval = 6 * 60 * 60
     internal let heartbeatWorkflowStaleAge: TimeInterval = 60 * 60
-    internal let heartbeatClaimStaleAge: TimeInterval = 24 * 60 * 60
     internal let heartbeatDeskStaleAge: TimeInterval = 30 * 24 * 60 * 60
 
     /// Time alone can make a retained input stale or clear an error burst.

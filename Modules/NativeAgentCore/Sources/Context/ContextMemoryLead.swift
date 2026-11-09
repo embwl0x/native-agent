@@ -1,32 +1,7 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `ContextMemoryLead.swift` | `ContextMemoryLead`: rendered age, provenance and source |
-
-/// Render only recorded provenance: verified, told with its speaker, or inferred; unstamped rows make no claim.
-public struct ContextMemoryProvenance: Codable, Equatable, Sendable {
-    public enum Kind: String, Codable, Sendable, CaseIterable {
-        case verified
-        case told
-        case inferred
-    }
-
-    public let kind: Kind
-    public let by: String?
-
-    public init(kind: Kind, by: String? = nil) {
-        self.kind = kind
-        let trimmed = by?.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.by = (trimmed?.isEmpty == false) ? trimmed : nil
-    }
-
-    public var text: String {
-        if kind == .told, let by { return "told by \(by)" }
-        return kind.rawValue
-    }
-
-    /// Context brackets the same wording recall returns as plain text.
-    public var tag: String { "[\(text)]" }
-}
+import PersistenceCore
+// Blueprint: | `ContextMemoryLead.swift` | `ContextMemoryLead`: rendered age, roots and source |
 
 /// Freeze time and calendar per turn so midnight and rerendering cannot change age tags. Without a turn clock, `.unstamped` claims no age.
 public struct ContextRenderClock: Sendable, Equatable {
@@ -40,33 +15,24 @@ public struct ContextRenderClock: Sendable, Equatable {
 
     public static let unstamped = ContextRenderClock(
         now: nil,
-        calendar: ContextRenderClock.calendar(in: TimeZone(secondsFromGMT: 0) ?? .current)
+        calendar: MemoryRoot.calendar(in: TimeZone(secondsFromGMT: 0) ?? .current)
     )
 
-    /// Capture the user's time zone once per turn, never per atom.
+    /// Capture the user's time zone once per turn, never per atom. Fixed Gregorian/POSIX formatting keeps month names and root dates independent of
+    /// host locale.
     public static func turn(
         _ need: NeedSignal,
         timeZone: TimeZone = .current
     ) -> ContextRenderClock {
-        ContextRenderClock(now: need.evaluationTime, calendar: calendar(in: timeZone))
-    }
-
-    /// Fixed Gregorian/POSIX formatting keeps model-facing month names independent of host locale.
-    public static func calendar(in timeZone: TimeZone) -> Calendar {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = timeZone
-        calendar.locale = Locale(identifier: "en_US_POSIX")
-        return calendar
+        ContextRenderClock(now: need.evaluationTime, calendar: MemoryRoot.calendar(in: timeZone))
     }
 }
 
-/// Render age and provenance without changing compiled bodies, hashes or selection; coarse day buckets keep older age tags stable within a day.
+/// Render age and roots without changing compiled bodies, hashes or selection; coarse day buckets keep older age tags stable within a day.
 public enum ContextMemoryLead {
     public static func untrustedSources(for draft: ContextAtomDraft) -> [String] {
         draft.entities.filter { $0.kind == "untrusted_source" && !$0.label.isEmpty }.map(\.label)
     }
-
-    public static let provenanceEntityKind = "provenance"
 
     /// Under two hours reads as the same breath, not as a memory.
     public static let justNowSeconds: TimeInterval = 2 * 60 * 60
@@ -81,42 +47,10 @@ public enum ContextMemoryLead {
         return draft.freshness.createdAt
     }
 
-    /// Typed attribution and delimited labels carry provenance; evidence terminates the label prefix and must never be parsed as a field.
-    public static func provenance(for draft: ContextAtomDraft) -> ContextMemoryProvenance? {
+    /// A memory's roots travel on its compiled atom; other atoms carry none.
+    public static func roots(for draft: ContextAtomDraft) -> [MemoryRoot]? {
         guard draft.kind == .memory || draft.kind == .correction else { return nil }
-        if let provenance = draft.memoryProvenance {
-            return ContextMemoryProvenance(kind: provenance.kind, by: provenance.by.flatMap(validDisplayName))
-        }
-        guard let label = draft.entities.first(where: { $0.kind == provenanceEntityKind })?.label,
-              !label.isEmpty else { return nil }
-        var rawKind: String?
-        var rawBy: String?
-        for component in label.split(separator: ";") {
-            let piece = component.trimmingCharacters(in: .whitespaces)
-            if piece.hasPrefix("evidence=") { break }
-            if let value = piece.dropPrefix("provenance=") {
-                if rawKind == nil { rawKind = unquoted(value) }
-            } else if let value = piece.dropPrefix("provenance_by="), rawBy == nil {
-                rawBy = unquoted(value)
-            }
-        }
-        guard let rawKind, let kind = ContextMemoryProvenance.Kind(
-            rawValue: rawKind.trimmingCharacters(in: .whitespaces).lowercased()
-        ) else { return nil }
-        return ContextMemoryProvenance(kind: kind, by: rawBy.flatMap(validDisplayName))
-    }
-
-    /// Exclude delimiters, brackets and controls because provenance names enter model-facing lines and delimited metadata.
-    public static let displayNameMaximumCharacters = 40
-
-    public static func validDisplayName(_ raw: String) -> String? {
-        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, name.count <= displayNameMaximumCharacters else { return nil }
-        let allowed = name.unicodeScalars.allSatisfy { scalar in
-            CharacterSet.alphanumerics.contains(scalar)
-                || scalar == " " || scalar == "." || scalar == "-" || scalar == "'"
-        }
-        return allowed ? name : nil
+        return draft.memoryRoots
     }
 
     // MARK: Rendering
@@ -149,11 +83,12 @@ public enum ContextMemoryLead {
             : "(in \(month) \(recordedYear))"
     }
 
-    /// Preserve the atom's text between age and provenance; `.unstamped` renders provenance without guessing time.
+    /// Preserve the atom's text between age and roots; `.unstamped` renders roots without guessing time. Roots read as one bracket: one to three
+    /// in full, past three the earliest, the latest and how many more.
     public static func decorate(
         _ text: String,
         recordedAt: Date?,
-        provenance: ContextMemoryProvenance?,
+        roots: [MemoryRoot]?,
         clock: ContextRenderClock
     ) -> String {
         var parts: [String] = []
@@ -161,7 +96,7 @@ public enum ContextMemoryLead {
             parts.append(ageTag(recordedAt: recordedAt, now: now, calendar: clock.calendar))
         }
         if !text.isEmpty { parts.append(text) }
-        if let provenance { parts.append(provenance.tag) }
+        if let lead = roots.flatMap({ MemoryRoot.lead(of: $0, calendar: clock.calendar) }) { parts.append("[\(lead)]") }
         return parts.joined(separator: " ")
     }
 
@@ -173,7 +108,7 @@ public enum ContextMemoryLead {
         MemoryDisplayText.attributed(decorate(
             text,
             recordedAt: item.recordedAt,
-            provenance: item.provenance,
+            roots: item.roots,
             clock: clock
         ), sources: item.untrustedSources ?? [])
     }
@@ -187,20 +122,5 @@ public enum ContextMemoryLead {
         formatter.timeZone = calendar.timeZone
         formatter.dateFormat = "MMMM"
         return formatter.string(from: date)
-    }
-
-    private static func unquoted(_ value: String) -> String {
-        var text = value.trimmingCharacters(in: .whitespaces)
-        if text.count >= 2, text.hasPrefix("\""), text.hasSuffix("\"") {
-            text = String(text.dropFirst().dropLast())
-        }
-        return text
-    }
-
-}
-
-private extension String {
-    func dropPrefix(_ prefix: String) -> String? {
-        hasPrefix(prefix) ? String(dropFirst(prefix.count)) : nil
     }
 }

@@ -164,7 +164,7 @@ extension SwiftToolDispatcher {
         case developerFullMac = "developer_full_mac"
         case off
     }
-    /// Explicit Full Mac authority removes the workspace wrapper; the harness must respect that choice.
+    /// Explicit Full Mac authority removes the workspace wrapper; the body must respect that choice.
     static let builderYoloPermissionLevels: Set<String> = [
         "full_mac_os",
     ]

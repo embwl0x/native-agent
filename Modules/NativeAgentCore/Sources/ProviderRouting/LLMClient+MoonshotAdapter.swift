@@ -12,14 +12,14 @@ public final class MoonshotTransport: LLMTransport {
 
     public let providerId = "moonshot"
 
-    public static let defaultEndpoint = URL(string: "https://api.moonshot.ai/v1/chat/completions")!
+    public static let defaultEndpoint = URL(string: "https://api.moonshot.ai/v1/chat/completions")
     /// An empty catalog cannot supply a default model.
     public static var defaultModel: String {
         FirstPartyModelCatalog.models(forProviderID: "moonshot").first?.id ?? ""
     }
 
     private let session: URLSession
-    private let endpoint: URL
+    private let endpoint: URL?
     private let apiKeyOverride: String?
     private let dataRootOverride: URL?
     private let telemetry: LLMCallTraceRecorder
@@ -28,8 +28,8 @@ public final class MoonshotTransport: LLMTransport {
     private var credentialRoot: URL { dataRootOverride ?? PersistenceCore.defaultDataRoot() }
 
     public init(
-        session: URLSession = .shared,
-        endpoint: URL = MoonshotTransport.defaultEndpoint,
+        session: URLSession = ProviderHTTP.session,
+        endpoint: URL? = MoonshotTransport.defaultEndpoint,
         apiKeyOverride: String? = nil,
         dataRootOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil
@@ -79,6 +79,7 @@ public final class MoonshotTransport: LLMTransport {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    guard let endpoint else { throw URLError(.badURL) }
                     let key = try self.apiKey()
                     var request = URLRequest(url: endpoint)
                     request.httpMethod = "POST"
@@ -89,17 +90,16 @@ public final class MoonshotTransport: LLMTransport {
                     ))
 
                     let started = DispatchTime.now().uptimeNanoseconds
-                    let bytes: URLSession.AsyncBytes
+                    let bytes: ProviderHTTPBytes
                     let response: URLResponse
                     do {
                         (bytes, response) = try await ProviderWire.open(session, request, call: call)
                     } catch {
                         throw mapTransportError(error, fallback: .transient(message: "connection failed: \(endpoint.host ?? "moonshot")"))
                     }
-                    defer { bytes.task.cancel() }
+                    defer { bytes.cancel() }
                     try await ProviderWire.validateChatCompletions(bytes, response)
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "Moonshot", retainReasoning: true, diagnosticDataRoot: telemetry
-                        .diagnosticDataRoot(call: call), call: call)
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "Moonshot", retainReasoning: true)
                     try await decoder.consume(
                         SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
                         request: request, providerID: providerID, model: model, idPrefix: "moonshot_tool",

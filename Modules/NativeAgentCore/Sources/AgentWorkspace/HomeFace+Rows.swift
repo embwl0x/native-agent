@@ -1,4 +1,5 @@
 import ApprovalInbox
+import ChromeControl
 import Desk
 import Experiences
 import Foundation
@@ -7,34 +8,124 @@ import NativeAgentShared
 import PersistenceCore
 import StandingBots
 import Transcripts
-// Blueprint: | `HomeFace+Rows.swift` | Home's waits, queue, repairs and contacts as structured rows; cached condition evidence never becomes an empty verdict |
+// Blueprint: | `HomeFace+Rows.swift` | Home's sections as keyed facts with the stem's verdict codes; approvals and the night's trials as the person's levers |
 
 extension HomeFace {
-    static func waits(_ world: AgentWorld, person: String) -> [PartFace.Row] {
-        var rows = (world.desk?.items ?? []).filter(OwnerAttentionPolicy.waitsOnOwner).sorted { $0.updatedAt > $1.updatedAt }.map { item in
-            PartFace.Row(id: "desk." + item.alias, title: AgentScreen.clip(item.title, 100), value: "Waits on " + person,
-                at: item.updatedAt, tone: .attention, open: "page:desk/" + item.handle)
+    /// The person's say over the agent on Home: each approval waiting on the person, and the night's trials, drawn by the stem beside whatever
+    /// the face draws. A read that has not landed or failed stands here too, so a missing reading never reads as nothing to decide.
+    static func levers(_ world: AgentWorld, now: Date) -> [PartFace.Section] {
+        let night = trials(world, now: now)
+        return approvals(world) + refusedRuns(world)
+            + (night.isEmpty ? [] : [.init(id: TrialLevers.sectionID, title: TrialLevers.sectionTitle, style: .list, rows: night)])
+    }
+
+    /// A refused run is an answer with a cause, not a repair debt. Home reads its accounting owner directly.
+    private static func refusedRuns(_ world: AgentWorld) -> [PartFace.Section] {
+        var rows = world.abilityRuns.compactMap { id, value -> (id: String, run: [String: JSONValue])? in
+            guard let run = value.objectValue?["lastRun"]?.objectValue, run["outcome"] == .string("refused") else { return nil }
+            return (id, run)
+        }.sorted { ($0.run["at"]?.stringValue ?? "", $0.id) > ($1.run["at"]?.stringValue ?? "", $1.id) }.prefix(5).map { entry in
+            let run = entry.run, fault = run["error"]?.objectValue ?? run["stopped"]?.objectValue ?? run
+            let cause = run["detail"]?.stringValue ?? fault["detail"]?.stringValue ?? fault["message"]?.stringValue ?? fault["reason"]?.stringValue
+                ?? "The cause was not retained for this run; inspect its dispatch receipt."
+            return PartFace.Row(id: "ability-run:" + entry.id, title: entry.id,
+                detail: AgentScreen.failureReason(ContextSecretContentPolicy.redactedFragment(cause)),
+                value: "Refused", at: run["at"]?.stringValue, tone: .attention, open: "page:tools/" + entry.id)
         }
-        rows += world.approvals.map { approval in
-            .init(id: "approval:" + approval.id,
-                title: AgentScreen.clip(ApprovalWords.title(action: approval.action, title: approval.title, reason: approval.reason), 120),
-                value: "Asking first", at: approval.lastRequestedAt ?? approval.createdAt, tone: .attention, open: "approval:" + approval.id)
+        if let failure = world.failures["ability runs"] {
+            rows.append(.init(id: "ability-runs:failed", title: "Ability runs unavailable", detail: failure, tone: .failed))
+        } else if world.unread.contains("ability runs") {
+            rows.append(.init(id: "ability-runs:unread", title: "Ability runs not read yet", tone: .attention))
         }
-        rows += world.asksToOpen.map { item in
-            .init(id: "ask:" + item.id, title: AgentScreen.clip(item.title, 100), detail: AgentScreen.clip(item.summary, 140),
-                at: item.created_at, tone: .attention, open: "card:" + item.id)
+        return rows.isEmpty ? [] : [.init(id: "ability-runs", title: "Refused ability runs", style: .list, rows: rows)]
+    }
+
+    /// The night's trials (`TrialLevers`, the producer every page shares), or the stem's words for a record not read yet or failed.
+    static func trials(_ world: AgentWorld, now: Date) -> [PartFace.Row] {
+        var rows = TrialLevers.rows(world.trials, agent: world.profile.map { AgentScreen.clip($0.name, 40) } ?? "The agent", now: now)
+        if let failure = world.failures["trials"] {
+            rows.append(.init(id: "trials:failed", title: "Trials unavailable", detail: failure, tone: .failed))
+        } else if world.unread.contains("trials") {
+            rows.append(.init(id: "trials:unread", title: "Trials not read yet", tone: .attention))
         }
-        rows += repairs(world, person: true)
         return rows
     }
 
-    static func repairs(_ world: AgentWorld, person: Bool) -> [PartFace.Row] {
-        world.repairs.filter { RepairOwed.isOwed($0) && ($0.owes["repair"]?.to == "person") == person }.map { act in
+    /// Each approval waiting on the person.
+    static func approvals(_ world: AgentWorld) -> [PartFace.Section] {
+        var rows = world.approvals.map { approval in
+            let matter = approval.matter
+            return PartFace.Row(id: "approval:" + approval.id,
+                title: AgentScreen.clip(matter.title, 120),
+                value: "Asking first", at: approval.lastRequestedAt ?? approval.createdAt, tone: .attention, open: "approval:" + approval.id)
+        }
+        if let failure = world.failures["approvals"] {
+            rows.append(.init(id: "approvals:failed", title: "Approvals unavailable", detail: failure, tone: .failed))
+        } else if world.unread.contains("approvals") {
+            rows.append(.init(id: "approvals:unread", title: "Approvals not read yet", tone: .attention))
+        }
+        return rows.isEmpty ? [] : [.init(id: "approvals", title: "Asking first", style: .list, rows: rows)]
+    }
+
+    /// The agent's latest thoughts: when, how each settled, whether a care moved after it, and what it attended.
+    static func thoughts(_ world: AgentWorld) -> [JSONValue] {
+        world.thoughts.map { line -> JSONValue in
+            let thought = line.thought
+            return fact([
+                "id": .string(thought.id), "at": recorded(thought.at), "outcome": text(thought.outcome?.status),
+                "mattered": .bool(thought.claims.contains { $0.claim == Thought.careMoved }),
+                "node": text(thought.thought?.node), "kind": text(thought.thought?.kind),
+                "through": .array((thought.thought?.through ?? []).map(JSONValue.string)),
+                "count": .int(Int64(thought.thought?.happenings.count ?? 0)),
+                "attended": .array(line.attended.compactMap { $0.happening.map(happening) }),
+            ])
+        }
+    }
+
+    /// What is owed, newest twelve, and how many in all.
+    static func owed(_ world: AgentWorld) -> JSONValue {
+        .object(["count": .int(Int64(world.owedToMe.count)), "rows": .array(world.owedToMe.prefix(12).compactMap { owed -> JSONValue? in
+            guard case .object(var fields)? = owed.happening.map(happening) else { return nil }
+            fields["id"] = .string(owed.id)
+            fields["at"] = recorded(owed.at) ?? .null
+            return .object(fields)
+        })])
+    }
+
+    /// A happening as the face reads it; `quoted`: an agent's words are among its words.
+    private static func happening(_ happening: Happening) -> JSONValue {
+        fact(["kind": .string(happening.kind.rawValue), "door": .string(happening.door), "words": .string(happening.words),
+              "quoted": .bool(happening.peers != nil || happening.elevated != nil), "returns": .bool(happening.route != nil)])
+    }
+
+    static func waits(_ world: AgentWorld, keys: inout RowKeys) -> [JSONValue] {
+        var rows: [JSONValue] = []
+        for item in (world.desk?.items ?? []).filter(OwnerAttentionPolicy.waitsOnOwner).sorted(by: { $0.updatedAt > $1.updatedAt }) {
+            keys.add("desk." + item.alias, open: "page:desk/" + item.handle)
+            rows.append(fact(["key": .string("desk." + item.alias), "kind": .string("desk"), "title": .string(AgentScreen.clip(item.title, 100)),
+                "at": .string(item.updatedAt)]))
+        }
+        for item in world.asksToOpen {
+            keys.add("ask:" + item.id, open: "card:" + item.id)
+            rows.append(fact(["key": .string("ask:" + item.id), "kind": .string("ask"), "title": .string(AgentScreen.clip(item.title, 100)),
+                "detail": .string(AgentScreen.clip(item.summary, 140)), "at": .string(item.created_at)]))
+        }
+        return rows
+    }
+
+    static func repairs(_ open: [Experience], person: Bool, keys: inout RowKeys, cache: inout [String: RepairRow]) -> [JSONValue] {
+        open.filter { ($0.owes["repair"]?.to == "person") == person }.map { act -> JSONValue in
+            keys.add(act.id, open: "page:home/desk")
+            if let kept = cache[act.id], kept.source == act { return kept.facts }
             let debt = RepairDebt(act)
-            let verb = repairVerb(debt.nextCall).map { "repair with " + $0 }
+            let verb: String?
+            do { verb = try repairVerb(debt.nextCall).map { "repair with " + $0 } }
+            catch { verb = "Repair call unreadable: " + error.localizedDescription }
             let words = [act.face?.words, debt.tap, verb].compactMap { $0 }.map(AgentScreen.failureReason).joined(separator: " · ")
-            return .init(id: act.id, title: AgentScreen.failureReason(repairTitle(debt.operation)), detail: AgentScreen.clip(words, 240),
-                value: act.outcome?.status, at: act.at, tone: .attention, open: "page:home/desk")
+            let row = fact(["key": .string(act.id), "kind": .string("repair"), "title": .string(AgentScreen.failureReason(repairTitle(debt.operation))),
+                "detail": .string(AgentScreen.clip(words, 240)), "state": text(act.outcome?.status), "at": .string(act.at)])
+            cache[act.id] = RepairRow(source: act, facts: row)
+            return row
         }
     }
 
@@ -52,154 +143,234 @@ extension HomeFace {
     }
 
     /// The repair call's verb alone (its action, else its tool); the call's arguments stay with the debt.
-    static func repairVerb(_ call: String?) -> String? {
-        guard let call, case .object(let fields)? = try? JSONValue.parse(Data(call.utf8)) else { return nil }
+    static func repairVerb(_ call: String?) throws -> String? {
+        guard let call else { return nil }
+        guard case .object(let fields) = try JSONValue.parse(Data(call.utf8)) else {
+            throw PersistenceCoreError.ioFailure("The recorded repair call is not an object; repair its next_call claim.")
+        }
         if case .object(let input)? = fields["input"], case .string(let action)? = input["action"] { return action }
         if case .string(let tool)? = fields["tool"] { return tool }
-        return nil
+        throw PersistenceCoreError.ioFailure("The recorded repair call names neither an input.action nor a tool; repair its next_call claim.")
     }
 
-    static func queue(_ world: AgentWorld, person: String, now: Date) -> [PartFace.Row] {
-        var rows: [PartFace.Row] = []
+    /// MY QUEUE's steps with the stem's verdict on each (`state`): `unread` (its condition evidence has not landed), `blocked` (with `blockers`),
+    /// `cycle`, `deferred`, `conditions`, `conditions_unavailable`, `ready`, `stopped`, `waits` (with `when`) or `unavailable` (with `detail`).
+    static func queue(_ world: AgentWorld, now: Date, keys: inout RowKeys) -> [JSONValue] {
+        var rows: [JSONValue] = []
         if let desk = world.desk {
             let plan = DeskSequencing.compute(desk, now: now)
             for entry in MyQueue.entries(desk) {
-                var value = "Condition not read yet", tone = PartFace.Tone.attention
-                let blockers = plan.byHandle[entry.item.handle]?.effectiveBlockers ?? []
+                var state = "unread", blockers: [String] = [], when: String?, detail: String?
+                let blocked = plan.byHandle[entry.item.handle]?.effectiveBlockers ?? []
                 if let evidence = world.queueEvidence,
                    evidence.revision == desk.generatedTs, world.failures["queue evidence"] == nil {
-                    if !blockers.isEmpty {
-                        value = "Waits " + blockers.map { blocker in
+                    if !blocked.isEmpty {
+                        state = "blocked"
+                        blockers = blocked.map { blocker in
                             guard blocker.hasPrefix("exp:") else {
                                 return "on desk." + (desk.items.first { $0.handle == blocker }?.alias ?? blocker)
                             }
                             let id = String(blocker.dropFirst(4))
                             guard let condition = evidence.conditions[id] else { return "on experience \(id) (unavailable)" }
                             return "on " + MyQueueReady.conditionName(condition) + " " + id
-                        }.joined(separator: ", ")
+                        }
                     } else if plan.byHandle[entry.item.handle]?.isReady == false {
                         let step = plan.byHandle[entry.item.handle]
-                        value = step?.blockedByCycle == true ? "Blocked by a cycle"
-                            : step?.isDeferred == true ? "Deferred" : "Waits on its Desk conditions"
-                        tone = .attention
+                        state = step?.blockedByCycle == true ? "cycle" : step?.isDeferred == true ? "deferred" : "conditions"
                     } else if plan.byHandle[entry.item.handle] == nil {
-                        value = "Desk conditions unavailable"; tone = .attention
+                        state = "conditions_unavailable"
                     } else {
                         var context = evidence.context
                         context.now = now
                         switch MyQueue.readiness(entry, context) {
-                        case .ready: value = "Ready"; tone = .plain
-                        case .waiting: value = entry.step.status == "stopped" ? "Stopped" : "Waits " + entry.step.when; tone = .quiet
-                        case .unavailable(let detail): value = detail; tone = .failed
+                        case .ready: state = "ready"
+                        case .waiting:
+                            if entry.step.status == "stopped" { state = "stopped" } else { state = "waits"; when = entry.step.when }
+                        case .unavailable(let reason): state = "unavailable"; detail = AgentScreen.failureReason(reason)
                         }
                     }
                 }
                 let note = entry.item.notes.max { $0.ts < $1.ts }
-                let detail = entry.peerBorn ? "Peer-carried step; open it to read."
-                    : AgentScreen.clip(entry.step.words, 140) + (entry.step.source == nil ? "" : " · inferred")
                 // A peer's step froze the peer's id into its Desk title at filing; the contact list names that peer now.
-                let title = entry.peerBorn ? "A step from " + (entry.step.peers + entry.step.elevated).map { peer in
+                let from = entry.peerBorn ? (entry.step.peers + entry.step.elevated).map { peer in
                     world.contacts.first { $0.id == peer || $0.agents.contains(peer) }?.name ?? "an agent no longer in contacts"
-                }.joined(separator: ", ") + "'s turn" : entry.item.title
-                rows.append(.init(id: entry.name, title: AgentScreen.clip(title, 100),
-                    detail: detail + (entry.item.blockedReason.map { " · " + AgentScreen.clip($0, 100) } ?? "")
-                        + (note.map { " · note: " + AgentScreen.clip($0.text, 100) } ?? ""),
-                    value: AgentScreen.failureReason(value), at: note?.ts ?? entry.item.updatedAt, tone: tone, open: "page:desk/" + entry.item.handle,
-                    actions: [.init(id: "queue.done", label: "Done"), .init(id: "queue.drop", label: "Drop", role: .destructive)]))
+                } : nil
+                let step = PartFace.Value.string(entry.name)
+                keys.add(entry.name, open: "page:desk/" + entry.item.handle,
+                    actions: [(PartFace.Call("queue.done", ["id": step]), false), (PartFace.Call("queue.drop", ["id": step]), true)])
+                rows.append(fact([
+                    "key": .string(entry.name), "kind": .string("step"), "title": .string(AgentScreen.clip(entry.item.title, 100)),
+                    "from": from.map { JSONValue.array($0.map(JSONValue.string)) },
+                    "words": entry.peerBorn ? nil : JSONValue.string(AgentScreen.clip(entry.step.words, 140)),
+                    "inferred": .bool(entry.step.source != nil),
+                    "blockedReason": text(entry.item.blockedReason.map { AgentScreen.clip($0, 100) }),
+                    "note": text(note.map { AgentScreen.clip($0.text, 100) }),
+                    "state": .string(state), "blockers": blockers.isEmpty ? nil : JSONValue.array(blockers.map(JSONValue.string)), "when": text(when),
+                    "detail": text(detail), "at": .string(note?.ts ?? entry.item.updatedAt),
+                ]))
             }
             for item in desk.items where item.assignee == "agent" && item.project != MyQueue.project
-                && !item.status.isTerminal && !item.blockedOn.isEmpty {
-                rows.append(.init(id: "blocked:desk." + item.alias, title: AgentScreen.clip(item.title, 100),
-                    detail: item.blockedReason.map { AgentScreen.clip($0, 140) }, value: "Waits on " + item.blockedOn.joined(separator: ", "),
-                    at: item.updatedAt, tone: .quiet, open: "page:desk/" + item.handle))
+                && MyQueue.entry(item) == nil && !item.status.isTerminal && !item.blockedOn.isEmpty {
+                keys.add("blocked:desk." + item.alias, open: "page:desk/" + item.handle)
+                rows.append(fact(["key": .string("blocked:desk." + item.alias), "kind": .string("blocked"),
+                    "title": .string(AgentScreen.clip(item.title, 100)), "detail": text(item.blockedReason.map { AgentScreen.clip($0, 140) }),
+                    "waitsOn": .array(item.blockedOn.map(JSONValue.string)), "at": .string(item.updatedAt)]))
             }
-            let harness = HarnessQueue.open(desk)
-            for item in harness {
-                rows.append(.init(id: "harness:desk." + item.alias, title: AgentScreen.clip(item.title, 100), detail: item.assignee,
-                    value: "Open harness work", at: item.updatedAt, open: "page:desk/" + item.handle))
+            for item in BodyQueue.open(desk) where MyQueue.entry(item) == nil {
+                keys.add("body:desk." + item.alias, open: "page:desk/" + item.handle)
+                rows.append(fact(["key": .string("body:desk." + item.alias), "kind": .string("body"),
+                    "title": .string(AgentScreen.clip(item.title, 100)), "assignee": text(item.assignee), "at": .string(item.updatedAt)]))
             }
-        }
-        for arrival in world.arrivals {
-            let accepts = world.acceptableArrivals.contains(arrival.id)
-            rows.append(.init(id: "arrival:" + arrival.id, title: AgentScreen.clip(arrival.line, 160), detail: AgentScreen.clip(arrival.reason, 100),
-                value: arrival.state, at: clock(arrival.at), tone: accepts ? .attention : .quiet,
-                open: arrival.session.map { "chat:" + $0 } ?? "page:home/arrivals",
-                actions: accepts ? [.init(id: "home.accept", label: "Accept")] : nil))
         }
         if world.reviews.count > 0 {
-            rows.append(.init(id: "memory.proposals", title: "Memories to review",
-                detail: "app {action:\"memory.proposals\"}", value: "\(world.reviews.count)" + (world.reviews.capped ? "+" : ""),
-                open: "page:memory_proposals"))
+            keys.add("memory.proposals", open: "page:memory_proposals")
+            rows.append(fact(["key": .string("memory.proposals"), "kind": .string("reviews"), "count": .int(Int64(world.reviews.count)),
+                "capped": .bool(world.reviews.capped)]))
         }
         for contact in world.contacts {
             let record = AgentScreen.latest(contact, records: world.records)
             if record?.sendEvidence["needs_input"] == .bool(true) || record?.sendEvidence["needs_authentication"] == .bool(true) {
-                rows.append(.init(id: "input:" + contact.id, title: AgentScreen.clip(contact.name, 60), value: "Asks for input",
-                    at: record.map { clock($0.updatedAt) }, tone: .attention,
-                    open: "page:home/agent/" + contact.id))
+                keys.add("input:" + contact.id, open: "page:home/agent/" + contact.id)
+                rows.append(fact(["key": .string("input:" + contact.id), "kind": .string("input"), "name": .string(AgentScreen.clip(contact.name, 60)),
+                    "at": record.map { JSONValue.string(clock($0.updatedAt)) }]))
             }
         }
-        rows += repairs(world, person: false)
         return rows
     }
 
-    static func people(_ world: AgentWorld, now: Date) -> [PartFace.Row] {
-        var rows = world.contacts.map { contact -> PartFace.Row in
+    /// The agents in conversation with this agent, newest exchange first, with the stem's verdict on each (`state`): `unread`, `unavailable`,
+    /// `send_failed`, `problem` (with `problem`), `ready`, `replied_in_chat`, `replied`, `waiting`, `asks_input`, `send_unconfirmed`,
+    /// `needs_attention`, `sent`, `none`, or `execution` (with `run`, `delivery`, `failed`); then discovery offers.
+    static func people(_ world: AgentWorld, keys: inout RowKeys) -> [JSONValue] {
+        var rows = world.contacts.map { contact -> (at: String?, fact: JSONValue) in
             let record = AgentScreen.latest(contact, records: world.records), chat = world.threads[contact.id]
             let health = world.health[world.healthID(for: contact, record: record)]
-            var value = "No recorded exchange", tone = PartFace.Tone.quiet
+            var state = "none", problem: String?, execution: [String: JSONValue?] = [:]
             // A contact's time is its last exchange, never the record's bookkeeping writes (a read schedule moves those every few seconds).
             var at = record.flatMap { $0.exchanges?.last.map { $0.settledAt ?? $0.sentAt } ?? $0.operationStartedAt }
             if world.unread.contains("people") {
-                value = world.failures["people"] == nil ? "Exchange not read yet" : "Exchange unavailable"; tone = .attention
+                state = world.failures["people"] == nil ? "unread" : "unavailable"
             } else if let record, record.phase != "sending", record.sendFailed {
-                value = "Send failed"; tone = .failed
-            } else if let problem = health?.problemWord {
-                value = problem; tone = .failed; at = health?.checkedAt
+                state = "send_failed"
+            } else if let word = health?.problemWord {
+                state = "problem"; problem = word; at = health?.checkedAt
             } else if let record, health?.resolves(record) == true {
-                value = "Ready"; tone = .plain; at = health?.checkedAt
+                state = "ready"; at = health?.checkedAt
             } else if let heard = chat?.heard, heard > (record?.updatedAt ?? .distantPast) {
-                value = "Replied in chat"; tone = .done; at = heard
+                state = "replied_in_chat"; at = heard
             } else if let record {
                 let receipt = record.sendEvidence
                 let message = record.readInput?["message_id"]?.stringValue
                 if ["sending", "waiting"].contains(record.phase) {
                     if let message, let answered = world.answered[message] {
-                        value = "Replied"; tone = .done; at = answered
-                    } else { value = "Waiting"; tone = .attention; at = record.operationStartedAt ?? record.updatedAt }
+                        state = "replied"; at = answered
+                    } else { state = "waiting"; at = record.operationStartedAt ?? record.updatedAt }
                 } else if receipt["needs_input"] == .bool(true) || receipt["needs_authentication"] == .bool(true) {
-                    value = "Asks for input"; tone = .attention
+                    state = "asks_input"
                 } else if record.phase == "attention" {
-                    value = receipt["status"] == .string("outcome_unknown") ? "Send unconfirmed" : "Needs attention"; tone = .attention
+                    state = receipt["status"] == .string("outcome_unknown") ? "send_unconfirmed" : "needs_attention"
                 } else if record.retainedReply?.text ?? record.exchanges?.last?.reply != nil {
-                    value = "Replied"; tone = .done
+                    state = "replied"
                     at = record.exchanges?.last?.settledAt ?? record.exchanges?.last?.sentAt ?? at
-                } else { value = "Sent"; tone = .plain }
+                } else { state = "sent" }
             }
             let exchangeAt = record?.exchanges?.last?.settledAt ?? record?.operationStartedAt ?? record?.updatedAt ?? .distantPast
             if !world.unread.contains("people"), record?.sendFailed != true, health?.problem == nil,
                let job = world.jobs.first(where: { $0.agent == contact.id || contact.agents.contains($0.agent) }),
                let jobAt = (job.completedAt ?? job.startedAt ?? job.createdAt).flatMap(AgentScreen.date),
                jobAt > max(exchangeAt, chat?.at ?? .distantPast) {
-                value = "Execution: " + (job.runStatus ?? job.status ?? job.state ?? "not recorded")
-                    + (job.deliveryOutcome.map { " · delivery: " + $0 } ?? "")
-                    + (job.executionError == nil ? "" : " · execution error recorded")
-                    + (job.stalled(at: now) ? " · stalled" : "")
-                tone = job.executionError == nil ? .plain : .failed
+                state = "execution"
+                execution = ["run": .string(job.runStatus ?? job.status ?? job.state ?? "not recorded"), "delivery": text(job.deliveryOutcome),
+                    "failed": .bool(job.executionError != nil)]
                 at = jobAt
             }
-            return .init(id: contact.id, title: AgentScreen.clip(contact.name, 60), detail: contact.kind,
-                value: value, at: at.map(clock), tone: tone,
-                open: "page:home/agent/" + contact.id)
+            keys.add(contact.id, open: "page:home/agent/" + contact.id)
+            let shown = at.map(clock)
+            return (shown, fact(["key": .string(contact.id), "kind": .string("contact"), "name": .string(AgentScreen.clip(contact.name, 60)),
+                "about": text(contact.kind), "state": .string(state), "problem": text(problem),
+                "execution": execution.isEmpty ? nil : fact(execution), "at": text(shown)]))
         }
         rows.sort { ($0.at ?? "") > ($1.at ?? "") }
-        rows += world.found.keys.sorted().compactMap { id in
-            world.found[id].map { offer in
-                .init(id: "found:" + id, title: "Found " + AgentScreen.clip(offer.name, 60),
-                    detail: id.hasPrefix("app:") ? "No recipe yet; tell me in chat to look." : "Tell me in chat to connect.",
-                    at: offer.offeredAt.map(clock), tone: .attention, open: "page:agents")
+        var found: [JSONValue] = []
+        for id in world.found.keys.sorted() {
+            guard let offer = world.found[id] else { continue }
+            keys.add("found:" + id, open: "page:agents")
+            found.append(fact(["key": .string("found:" + id), "kind": .string("found"), "name": .string(AgentScreen.clip(offer.name, 60)),
+                "app": .bool(id.hasPrefix("app:")), "at": text(offer.offeredAt.map(clock))]))
+        }
+        return rows.map(\.fact) + found
+    }
+
+    /// Helpers, running ones first then by latest run, with the stem's verdict (`state`): `unread` (the run queue is not read), `running`,
+    /// `never`, or the latest run's status (with `failed`).
+    static func helpers(_ world: AgentWorld, keys: inout RowKeys) -> [JSONValue] {
+        world.bots.sorted {
+            (world.running.contains($0.id) ? 1 : 0, world.latest[$0.id]?.runAt ?? .distantPast)
+                > (world.running.contains($1.id) ? 1 : 0, world.latest[$1.id]?.runAt ?? .distantPast)
+        }.map { bot -> JSONValue in
+            let entry = world.latest[bot.id], running = world.running.contains(bot.id)
+            var state = "never", failed = false
+            if world.unread.contains("running helpers") { state = "unread" }
+            else if running { state = "running" }
+            else if let entry {
+                state = entry.runtimeStatus.rawValue
+                failed = entry.runtimeStatus == .failed || entry.runtimeStatus == .interrupted
             }
+            let key = "bot:" + bot.id.uuidString
+            keys.add(key, open: "page:home/agent/" + key)
+            return fact(["key": .string(key), "name": .string(AgentScreen.clip(bot.name, 60)),
+                "detail": .string(entry.map { AgentScreen.clip($0.headline, 120) } ?? StandingBotSchedule.words(bot.cadence)),
+                "state": .string(state), "failed": .bool(failed), "paused": .bool(bot.paused),
+                "at": running ? nil : text(entry.map { clock($0.runAt) })])
+        }
+    }
+
+    static func senses(_ world: AgentWorld, keys: inout RowKeys) -> [JSONValue] {
+        var rows: [JSONValue] = []
+        for (index, words) in world.senses.enumerated() {
+            keys.add("sense:" + String(index), open: "page:home/senses")
+            rows.append(fact(["key": .string("sense:" + String(index)), "words": .string(words)]))
+        }
+        for (index, failure) in world.senseFailures.enumerated() {
+            keys.add("sense:failed:" + String(index), open: "page:home/senses")
+            rows.append(fact(["key": .string("sense:failed:" + String(index)), "failure": .string(failure)]))
         }
         return rows
+    }
+
+    /// The newest speaker on each door (each bridge conversation its own), five at most.
+    static func elsewhere(_ world: AgentWorld, person: String, keys: inout RowKeys) -> [JSONValue] {
+        var doors: Set<String> = []
+        let peers = Dictionary(world.routes.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
+        return world.doors.filter { doors.insert($0.door == "bridge" ? $0.session : $0.door).inserted }.prefix(5).map { line -> JSONValue in
+            keys.add("elsewhere:" + line.session, open: "chat:" + line.session)
+            return fact(["key": .string("elsewhere:" + line.session), "door": .string(line.door),
+                "who": .string(AgentScreen.who(line, person: person, peers: peers)), "at": .string(clock(line.at))])
+        }
+    }
+
+    static func places(_ world: AgentWorld, dataRoot: URL, layout: SurfaceLayoutAvailability, keys: inout RowKeys) -> [JSONValue] {
+        layout.contentNames("places", profile: SurfaceLayoutStore.profile).map(AppDoorNames.resolve).map { place -> JSONValue in
+            let badge = AgentReadBadges.shared.latest(place, dataRoot: dataRoot)
+            let detail: String?
+            if place == "browser" {
+                detail = BrowserConnectionMirror.connected.map { $0 ? "Chrome connected" : "Chrome not connected" } ?? "Chrome connection unobserved"
+            } else if place == "desk", let state = world.desk {
+                detail = "\(world.split.active.count) active · \(world.split.parked.count) parked · \(world.split.waiting.count) waiting · "
+                    + state.boardCountSummary
+            } else { detail = badge?.words }
+            keys.add(place, open: "page:home/" + place)
+            return fact(["key": .string(place), "name": .string(place.capitalized), "detail": text(detail),
+                "at": text(badge.map { clock($0.at) })])
+        }
+    }
+
+    static func mac(_ world: AgentWorld, keys: inout RowKeys) -> [JSONValue] {
+        world.touched.map { item -> JSONValue in
+            let key = "mac:" + item.app + ":" + (item.kind ?? "")
+            keys.add(key, open: "page:home/mac")
+            return fact(["key": .string(key), "app": .string(item.app), "about": text(item.kind), "readout": text(item.readout),
+                "at": .string(clock(Date(timeIntervalSince1970: item.at)))])
+        }
     }
 }

@@ -9,6 +9,35 @@ extension SwiftNativeProviderRouting {
     nonisolated var providersDir: URL {
         dataRoot.appendingPathComponent("providers", isDirectory: true)
     }
+
+    public nonisolated static func observationPaths(dataRoot: URL) throws -> [URL] {
+        try configurationFiles(dataRoot: dataRoot) + snapshotFiles(dataRoot: dataRoot)
+            + [LLMProviderStatusFeed.path(in: dataRoot)]
+            + CodexAccountModelCatalog.observationPaths(dataRoot: dataRoot)
+    }
+
+    private nonisolated static func snapshotFiles(dataRoot: URL) -> [URL] {
+        let directory = dataRoot.appendingPathComponent("providers", isDirectory: true)
+        return ["registry.json", "active.json", "surfaces.json", "pending-surface-configuration.json",
+                "openrouter-models-cache.json", "moonshot-models-cache.json"].map { directory.appendingPathComponent($0) }
+            + [ChatGPTTransport.cliAdoptionConsentPath(dataRoot: dataRoot)]
+    }
+
+    private nonisolated static func configurationFiles(dataRoot: URL) throws -> [URL] {
+        let directory = dataRoot.appendingPathComponent("providers", isDirectory: true)
+        let skipNames = Set(snapshotFiles(dataRoot: dataRoot).map(\.lastPathComponent)).union(["models.json"])
+        let files: [URL]
+        do { files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) }
+        catch CocoaError.fileReadNoSuchFile { return [] }
+        catch {
+            throw ProviderRoutingError.underlying("""
+                Provider directory \(directory.path) could not be enumerated: \(error.localizedDescription). Repair its access before listing \
+                providers.
+                """)
+        }
+        return files.filter { $0.pathExtension == "json" && !skipNames.contains($0.lastPathComponent) }
+    }
+
     func nativeListProviders(
         openRouterModels: [[String: JSONValue]]? = nil,
         moonshotModels: [[String: JSONValue]]? = nil,
@@ -20,22 +49,8 @@ extension SwiftNativeProviderRouting {
         for provider in try Self.loadProviderRegistryChecked(at: providersDir.appendingPathComponent("registry.json")) ?? [] {
             byId[provider.id] = provider
         }
-        let skipNames: Set<String> = [
-            "registry.json", "models.json", "active.json", "surfaces.json",
-            "pending-surface-configuration.json", "cli_session_adoption.json",
-            "openrouter-models-cache.json", "moonshot-models-cache.json",
-        ]
         var ids = Set(Self.connectableProviderIds).union(byId.keys)
-        let files: [URL]
-        do { files = try FileManager.default.contentsOfDirectory(at: providersDir, includingPropertiesForKeys: nil) }
-        catch CocoaError.fileReadNoSuchFile { files = [] }
-        catch {
-            throw ProviderRoutingError.underlying("""
-                Provider directory \(providersDir.path) could not be enumerated: \(error.localizedDescription). Repair its access before listing \
-                providers.
-                """)
-        }
-        for file in files where file.pathExtension == "json" && !skipNames.contains(file.lastPathComponent) {
+        for file in try Self.configurationFiles(dataRoot: dataRoot) {
             ids.insert(file.deletingPathExtension().lastPathComponent)
         }
         let cache = providerConfigCache(for: ids.union(additionalProviderIDs), authEnvironment: authEnvironment)
@@ -89,6 +104,7 @@ extension SwiftNativeProviderRouting {
         row.lastError = readiness.ready && readiness.state != "failed" ? nil : readiness.detail
         var extras: [String: JSONValue] = [:]
         if case .object(let saved)? = row.extras { extras = saved }
+        extras["entry_revision"] = cache.reads[row.id]?.revision.map(JSONValue.string)
         let config = cache.reads[row.id]?.object ?? [:]
         for key in ["auth_mode", "default_model"] {
             if let value = (config[key] as? String)?
@@ -103,7 +119,7 @@ extension SwiftNativeProviderRouting {
     public nonisolated func hasUsableCredentials() -> Bool {
         let receipts = ProviderConfigCache(receipts: LLMProviderStatusFeed.receipts(dataRoot: dataRoot))
         return ["anthropic_oauth_direct", "anthropic", "openai_oauth_direct", "openai",
-                "openrouter", "moonshot", "kimi-code", "xai_oauth_direct"].contains {
+                "openrouter", "moonshot", "kimi-code", "meta", "xai_oauth_direct"].contains {
             providerReadiness(id: $0, cache: receipts).ready
         }
     }
@@ -186,6 +202,7 @@ extension SwiftNativeProviderRouting {
         case "openrouter": return keyReadiness("OpenRouter")
         case "moonshot": return keyReadiness("Moonshot")
         case "kimi-code": return keyReadiness("Kimi Code")
+        case "meta": return keyReadiness("Meta")
         default:
             // The cached read has already resolved any Keychain reference. Bookkeeping alone (auth mode/default model) is not a credential.
             let config = (cache?.reads[id] ?? readProviderConfig(id)).object ?? [:]
@@ -208,7 +225,13 @@ extension SwiftNativeProviderRouting {
     public nonisolated func providerDisplayName(_ id: String) throws -> String {
         if Self.connectableProviderIds.contains(id) { return Self.displayName(for: id) }
         let registered = try Self.loadProviderRegistryChecked(at: providersDir.appendingPathComponent("registry.json"))?.first { $0.id == id }
-        return registered?.displayName ?? Self.displayName(for: id)
+        guard let registered else {
+            throw ProviderRoutingError.configurationFailed("Provider \(id) is not registered. Add its provider record before requesting its name.")
+        }
+        guard let name = registered.displayName, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ProviderRoutingError.configurationFailed("Provider \(id) has no registered display name. Set its name in the provider registry.")
+        }
+        return name
     }
     nonisolated static func displayName(for id: String) -> String {
         switch id {
@@ -222,12 +245,13 @@ extension SwiftNativeProviderRouting {
         case "openrouter": return "OpenRouter"
         case "moonshot": return "Moonshot AI (Kimi)"
         case "kimi-code": return "Kimi Code"
+        case "meta": return "Meta"
         default: return id.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
     private nonisolated func authModes(for id: String) -> [String] {
         if id.contains("oauth") || id == "codex" { return ["oauth"] }
-        if ["openai", "anthropic", "openrouter", "moonshot", "kimi-code"].contains(id) { return ["api_key"] }
+        if ["openai", "anthropic", "openrouter", "moonshot", "kimi-code", "meta"].contains(id) { return ["api_key"] }
         return ["api_key", "oauth"]
     }
     /// Validate explicit helper choices without network or reselection. Required catalog faults stop membership checks; incomplete OpenRouter evidence

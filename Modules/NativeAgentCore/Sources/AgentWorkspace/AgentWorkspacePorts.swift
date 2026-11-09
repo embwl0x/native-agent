@@ -10,6 +10,7 @@ import NativeAgentCore
 package protocol AgentWorkspaceConversationPort: Sendable {
     func liveHealth(dataRoot: URL) throws -> [String: AgentLocalHealth]
     func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord]
+    func acceptedSends(dataRoot: URL) throws -> Set<String>
     func find(dataRoot: URL, scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord?
     func peers(dataRoot: URL) throws -> [AgentWorkspacePeer]
     func identity(dataRoot: URL) throws -> AgentContactIdentity

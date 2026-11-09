@@ -210,13 +210,16 @@ extension SwiftNativeResearchClient {
             || (htmlEvidence.map { evidence in
                 evidence.bodyCharacters == 0
                     || (evidence.bodyCharacters < 400 && evidence.scripts > 0)
+                    || (evidence.scripts > 0 && evidence.bodyCharacters < 8_000
+                        && evidence.bodyCharacters * 50 < response.body.count)
                     || ["enable javascript", "javascript is required", "javascript must be enabled", "turn on javascript"]
                         .contains { text.localizedCaseInsensitiveContains($0) }
             } ?? false))
         let complete = !response.truncated && extracted && !thinPage && !textTruncated
         let hint: JSONValue = thinPage ? .string("""
-            The fetched text is thin or requires JavaScript; it does not establish the rendered page's content. Follow next_call to open and read it in your \
-            Chrome tab.
+            The fetched text is thin or requires JavaScript; it does not establish the rendered page's content. web.read selects Chrome's rendered reader \
+            in a new NativeAgent background tab. Chrome supplies top-level text only when it has more readable content; otherwise the HTTP text stays at \
+            the top with the browser result and cause attached. This HTTP extraction is retained separately in either case.
             """) : .null
         var verdict: [String: JSONValue] = ["status": .string(extracted ? (complete ? "completed" : (text.isEmpty ? "failed" : "partial")) : "failed")]
         if !extracted { verdict["reason"] = .string(status) }

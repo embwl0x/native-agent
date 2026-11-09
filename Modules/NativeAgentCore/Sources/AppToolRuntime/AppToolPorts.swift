@@ -41,6 +41,7 @@ public struct AppActionExecution: Sendable {
     public var handsBack = false
     public var wake: JSONValue?
     public var valueCall: (id: String, version: String)?
+    public var valueReach: OwnedProgramExecution.ValueReach?
     public var arrived: (@Sendable () -> Parts.Arrival?)?
     public var admissionOnly = false
     public var authoredCall: (tool: String, perform: @Sendable () async throws -> JSONValue)?
@@ -65,6 +66,7 @@ public struct AppActionExecution: Sendable {
         invocation.handsBack = handsBack
         invocation.wake = wake
         invocation.valueCall = valueCall
+        invocation.valueReach = valueReach
         invocation.programHost = host
         invocation.insideWorkspace = workspaceMacCall
         invocation.frameSource = lookSource
@@ -80,6 +82,7 @@ public struct AppActionExecution: Sendable {
         execution.handsBack = invocation.handsBack
         execution.wake = invocation.wake
         execution.valueCall = invocation.valueCall
+        execution.valueReach = invocation.valueReach
         if let host = invocation.programHost { execution.host = host }
         execution.workspaceMacCall = invocation.insideWorkspace
         execution.lookSource = invocation.frameSource
@@ -99,7 +102,7 @@ public struct AppActionExecution: Sendable {
     func programExecution(turn: Turn?, surface: String, preview: Bool = false) -> OwnedProgramExecution {
         OwnedProgramExecution(turn: turn, surface: surface, deadlines: deadlines, preview: preview, wake: wake,
             options: .init(handsBack: handsBack), readContent: invocation.readContent,
-            valueIdentity: valueCall, deadline: invocation.waitDeadline, onActivity: { deadlines.progressed() })
+            valueIdentity: valueCall, valueReach: valueReach, deadline: invocation.waitDeadline, onActivity: { deadlines.progressed() })
     }
 
     func partInvocation(turn: Turn, surface: String, preview: Bool = false) -> Parts.Invocation {
@@ -129,6 +132,7 @@ public struct AppActionExecution: Sendable {
         execution.handsBack = program.options.handsBack
         execution.wake = program.wake
         execution.valueCall = program.valueIdentity
+        execution.valueReach = program.valueReach
         execution.invocation.readContent = program.readContent
         execution.invocation.waitDeadline = program.deadline
         execution.deadlines = program.deadlines
@@ -151,6 +155,9 @@ public struct BrowserToolPlatformPort: Sendable {
 @MainActor public protocol QuietToolHost: QuietSettingsHost {
     var activeChatSessionId: String { get }
     func pageRead(_ page: QuietToolPage, turn: Turn) async -> [JSONValue]
+    /// The document or structured item the page's owner answers; offset reads a current collection page.
+    /// Nil means this owner has no such reader. A declared reader's refusal throws.
+    func pageBody(page: String, item: String, offset: Int, turn: Turn) async throws -> String?
     /// Empty sessionId targets the visible conversation.
     func composerState(sessionId: String, turn: Turn) async -> [String: JSONValue]
     /// Attachments are already resolved and fenced; turnSessionId retains the asking conversation's __session_id.
@@ -162,9 +169,10 @@ public struct BrowserToolPlatformPort: Sendable {
     func runChatSession(verb: String, input: [String: JSONValue], reachesUser: Bool, turn: Turn) async -> JSONValue
     /// Read-only app fences are shared by preview and execution, including screen, sound, drafts and conversation ownership.
     func composerFence(verb: String, value: String, sessionId: String, reachesUser: Bool, turnSessionId: String, turn: Turn)
-        -> QuietComposerOutcome?
-    func chatSessionFence(verb: String, input: [String: JSONValue], reachesUser: Bool, turn: Turn) -> JSONValue?
-    func saveProviderKey(_ key: String, provider: String) async -> NativeOAuthFlow.InlineSetupOutcome
+        async -> QuietComposerOutcome?
+    func chatSessionFence(verb: String, input: [String: JSONValue], reachesUser: Bool, turn: Turn) async -> JSONValue?
+    /// The person's tap on a card's answer at the Mac runs the card's own control there (its window, page or sheet), as the Mac presents it.
+    func runCardControl(id: String, sessionID: String, choice: String?) async
     func runUpkeep(verb: String, input: [String: JSONValue], turn: Turn) async -> (ok: Bool, detail: String, fields: [String: JSONValue])
     /// Upkeep previews use effect-free input and target checks.
     func upkeepFence(verb: String, input: [String: JSONValue]) async -> JSONValue?
@@ -205,13 +213,22 @@ public struct QuietComposerOutcome: Sendable {
 public typealias QuietToolPage = NativeAgentShared.QuietToolPage
 
 @MainActor public protocol QuietToolPresentationPort: Sendable {
-    var pages: [QuietToolPage] { get throws }
+    var pages: [QuietToolPage] { get async throws }
     var currentPage: QuietToolPage? { get }
     var visiblePageInput: [String: JSONValue]? { get }
-    func page(named: String) -> QuietToolPage?
+    func page(named: String) async -> QuietToolPage?
     func contextReceiptRead(input: [String: JSONValue]) async -> JSONValue
     func agentViewRead(input: [String: JSONValue]) async -> JSONValue
     func pageScreenshot(input: [String: JSONValue], imageSink: LocalToolImage.Sink?) async -> JSONValue
+}
+
+public struct AppToolPresentationBinding: Sendable {
+    public let host: @MainActor @Sendable () -> (any QuietToolHost)?
+    public let presentation: any QuietToolPresentationPort
+    public init(host: @escaping @MainActor @Sendable () -> (any QuietToolHost)?, presentation: any QuietToolPresentationPort) {
+        self.host = host
+        self.presentation = presentation
+    }
 }
 
 /// Desktop effects require the app's platform adapters.

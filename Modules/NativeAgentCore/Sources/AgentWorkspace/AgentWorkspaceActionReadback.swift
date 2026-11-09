@@ -119,7 +119,7 @@ enum AgentWorkspaceActionReadback {
         }
         if browserEffects.contains(tool), status == "outcome_unknown", owner["error"] != nil,
            let tab = integer(input["tab_id"]) {
-            let arguments: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
+            let arguments: [String: JSONValue] = ["tab_id": .int(tab)]
             let source = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot", input: arguments, title: title)
             do {
                 let fresh = try await perform("browser.chrome_snapshot", arguments)
@@ -142,32 +142,20 @@ enum AgentWorkspaceActionReadback {
         // Only navigation may open a new owned tab after user takeover; other effects retain the selected tab.
         if tool != "browser.chrome_navigate", let selected = integer(input["tab_id"]), selected != tab { return nil }
         let sequence = integer(owner["userSequence"]) ?? integer(actionReceipt["userSequence"]) ?? integer(input["expected_user_sequence"])
-        var readInput: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
-        var location = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot", input: readInput, title: title)
+        let readInput: [String: JSONValue] = ["tab_id": .int(tab)]
+        var requestInput = readInput
+        if tool == "browser.chrome_navigate" {
+            requestInput["__chrome_document_id"] = owner["documentId"]
+            requestInput["__chrome_page_url"] = owner["url"]
+        }
+        let location = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot", input: readInput, title: title)
         do {
-            // The read waits for Chrome to finish loading the tab.
-            var snapshot = try await perform("browser.chrome_snapshot", readInput)
+            // Chrome owns settlement and default bounds for this same page read.
+            let snapshot = try await perform("browser.chrome_snapshot", requestInput)
             guard matches(snapshot, tab: tab, sequence: sequence) else {
                 return .init(location: location, result: unavailable(receipt: receipt,
                     detail: "The action returned, but its exact page could not be read. Read this page again to continue; the action will not be repeated.",
                         observation: snapshot))
-            }
-            let snapshotRow = object(snapshot)
-            let reading = object(snapshotRow["reading"] ?? .null)
-            let summary = object(snapshotRow["summary"] ?? .null)
-            if reading["mainContentAvailable"] == .bool(true), reading["scope"] == .string("page"),
-               case .array(let reasons)? = summary["truncationReasons"], reasons.contains(.string("node_limit")) {
-                // A sidebar can consume the 80-node budget before the article; use the owner's content scope without raising the budget.
-                readInput["scope"] = .string("main_content")
-                location = .record(tool: "browser.chrome_snapshot", input: readInput, title: title)
-                let content = try await perform("browser.chrome_snapshot", readInput)
-                guard matches(content, tab: tab, sequence: sequence),
-                      object(object(content)["reading"] ?? .null)["scope"] == .string("main_content") else {
-                    return .init(location: location, result: unavailable(receipt: receipt,
-                        detail: "The page's main content could not be read from the selected tab. Read this page again to continue; no action was repeated.",
-                            observation: content))
-                }
-                snapshot = content
             }
             return .init(location: location, result: attaching(snapshot, receipt: receipt))
         } catch is CancellationError { throw CancellationError() }

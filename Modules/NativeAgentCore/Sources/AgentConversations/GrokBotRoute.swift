@@ -10,8 +10,8 @@ public struct GrokPendingRequest: Codable, Sendable {
     public var lifeID: String?
     public let messageID: String
     public let peerID: String
+    /// The chat that asked: its session receives the answer. Grok's own conversation is `GrokBotRoute.conversation(peer:)`.
     public let conversationID: String
-    public let expiresAt: Date
     public var state: String
     public var runID: String?
     /// Person-initiated thread sends keep their answer in that thread.
@@ -54,16 +54,16 @@ public struct GrokRequestStore: Sendable {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         return root.appendingPathComponent(id + ".json")
     }
-    public func create(id: String, peer: String, conversation: String, route: AgentBridgeCompletionRoute, quiet: Bool = false,
+    public func create(id: String, peer: String, askedIn: String, route: AgentBridgeCompletionRoute, quiet: Bool = false,
                        now: Date = Date()) throws -> GrokPendingRequest {
-        guard NativeAgentChatSessionID.normalizedPathComponent(conversation) == conversation else { throw GrokLinkCredential.Failure.invalid }
+        guard NativeAgentChatSessionID.normalizedPathComponent(askedIn) == askedIn else { throw GrokLinkCredential.Failure.invalid }
         let file = try url(id)
         try pruneSettled(now: now)
         return try CredentialFileLock.withLock(file) {
             guard !FileManager.default.fileExists(atPath: file.path) else { throw GrokLinkCredential.Failure.invalid }
             let request = GrokPendingRequest(lifeID: try DataRootLife.current(in: root.deletingLastPathComponent().deletingLastPathComponent()),
-                messageID: id, peerID: peer, conversationID: conversation,
-                expiresAt: now.addingTimeInterval(600), state: "sending", quiet: quiet ? true : nil, route: route)
+                messageID: id, peerID: peer, conversationID: askedIn,
+                state: "sending", quiet: quiet ? true : nil, route: route)
             try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(request), to: file)
             return request
         }
@@ -84,16 +84,6 @@ public struct GrokRequestStore: Sendable {
             value.handOver = DataRootLife.stoppedReason
         }
         return value
-    }
-    public func expiredUnanswered(peer: String, now: Date = Date()) throws -> GrokPendingRequest? {
-        guard FileManager.default.fileExists(atPath: root.path) else { return nil }
-        let latest = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
-            .filter { $0.pathExtension == "json" }
-            .map { try load($0) }.filter { $0.peerID == peer }.max { $0.expiresAt < $1.expiresAt }
-        guard let latest, latest.expiresAt < now, latest.expiresAt > now.addingTimeInterval(-7 * 86_400),
-              ["sending", "accepted", "outcome_unknown", "no answer in time"].contains(latest.state), latest.reply == nil,
-              latest.handOver != "connection bootstrap requested; no resend" else { return nil }
-        return latest
     }
     @discardableResult public func update(_ id: String, peer: String, _ edit: (inout GrokPendingRequest) throws -> Void) throws -> GrokPendingRequest {
         let file = try url(id)
@@ -129,6 +119,15 @@ public struct GrokRequestStore: Sendable {
             $0.seen = true
             if $0.handOver == "pending" { $0.handOver = "taken by " + door }
         }
+    }
+
+    /// A read that returned this saved answer to the chat that asked consumes it, as a wait or the room does; a clipped reply matches by its prefix.
+    /// Another chat's read leaves the answer to be handed to its asker.
+    public func shown(byReadIn scope: String, _ id: String, peer: String, reply: String, truncated: Bool) throws {
+        // Only settled requests are pruned, so a request no longer on file has nothing left to hand over.
+        guard FileManager.default.fileExists(atPath: root.appendingPathComponent(id + ".json").path) else { return }
+        guard try read(id, peer: peer).conversationID == scope else { return }
+        try shown(id, peer: peer, by: "read") { $0 == reply || (truncated && $0.hasPrefix(reply)) }
     }
 
     private static func isSettled(_ value: GrokPendingRequest) -> Bool {
@@ -170,6 +169,10 @@ public struct GrokRequestStore: Sendable {
 }
 
 public enum GrokBotRoute {
+    /// The one conversation with a Grok Bot contact: each routine run starts fresh, so the app's thread with the contact is the conversation, whichever
+    /// chat asked. Webhook bodies and receipts name it; the asking chat is kept apart in `GrokPendingRequest.conversationID`.
+    public static func conversation(peer: String) -> String { ContactThread.session(owner: peer) }
+
     /// Retained request evidence must keep its recorded protocol identity without creating another send.
     package static func messageID(for exchange: AgentConversationExchange) -> String {
         exchange.messageID ?? exchange.id
@@ -211,13 +214,12 @@ public enum GrokBotRoute {
     /// Wait for the asking turn's `wait`; a consumed answer prevents a duplicate handover turn.
     public static func takenByWaiter(peer: String, messageID: String, dataRoot: URL) async throws -> Bool {
         let running = AgentConversationRunning.shared
-        let deadline = Date().addingTimeInterval(300) // a wait runs at most 300s
-        while !Task.isCancelled, Date() < deadline {
+        while !Task.isCancelled {
             let seen = running.seen
             let rows = try AgentConversationStore(dataRoot: dataRoot).records()
             guard let row = rows.first(where: { $0.agent == "peer:" + peer && $0.readInput?["message_id"] == .string(messageID) }),
                   running.watched(row.id) else { break }
-            await running.change(after: seen, until: deadline)
+            await running.change(after: seen)
         }
         try Task.checkCancellation()
         return try GrokRequestStore(dataRoot: dataRoot).read(messageID, peer: peer).seen == true
@@ -251,9 +253,8 @@ public enum GrokBotRoute {
     }
     public static func projection(_ pending: GrokPendingRequest) -> JSONValue {
         var fields: [String: JSONValue] = ["agent": .string("peer:" + pending.peerID), "transport": .string("grokBot"),
-            "message_id": .string(pending.messageID), "conversation_id": .string(pending.conversationID),
+            "message_id": .string(pending.messageID), "conversation_id": .string(conversation(peer: pending.peerID)),
             "status": .string(pending.state), "completed": .bool(pending.state == "answered"),
-            "reply_deadline": .string(ISO8601DateFormatter().string(from: pending.expiresAt)),
             "automatic_resend": .bool(false),
             "detail": .string(pending.state == "accepted" ? """
                 Accepted, waiting for Grok. The run started; it has not answered. Its answer arrives by itself as the next turn in this \
@@ -272,29 +273,37 @@ public enum GrokBotRoute {
                 tap: "Repair the named unreadable request or conversation; its saved answer is still pending.")
         }
         if pending.state == "stopped" { fields["reason"] = .string(DataRootLife.stoppedReason) }
-        return AgentConversationView.expiringReply(.object(fields))
+        return .object(fields)
     }
-    public static func send(peer: AgentPeerContact, text: String, conversation: String, route: AgentBridgeCompletionRoute,
+    public static func send(peer: AgentPeerContact, text: String, askedIn: String, route: AgentBridgeCompletionRoute,
                             messageID: String, dataRoot: URL, credential: GrokLinkCredential, quiet: Bool = false,
                             post: @Sendable (URLRequest) async throws -> Int = postOnce) async throws -> JSONValue {
         if peer.grokSetup != "set up" { return setupRequired(peer) }
         guard let address = credential.webhookURL,
               let key = credential.webhookKey, let url = URL(string: address) else { throw GrokLinkCredential.Failure.unavailable }
         let store = GrokRequestStore(dataRoot: dataRoot)
-        _ = try store.create(id: messageID, peer: peer.id, conversation: conversation, route: route, quiet: quiet)
+        _ = try store.create(id: messageID, peer: peer.id, askedIn: askedIn, route: route, quiet: quiet)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // Sorted keys keep IDs before potentially truncated webhook text.
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["message_id": messageID, "conversation_id": conversation,
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["message_id": messageID, "conversation_id": conversation(peer: peer.id),
             "text": try withHistory(text, peer: peer.id, messageID: messageID, dataRoot: dataRoot)], options: [.sortedKeys])
         let state: String
         do {
             let code = try await post(request)
             // The documented contract establishes only 200. Other status codes do not prove usage exhaustion or a local policy denial.
             state = code == 200 ? "accepted" : "webhook refused the request (HTTP \(code))"
-        } catch { state = "outcome_unknown" } // Never expose URLSession errors/URLs.
+        } catch {
+            _ = try store.update(messageID, peer: peer.id) { if $0.state == "sending" { $0.state = "outcome_unknown" } }
+            if error is CancellationError { throw error }
+            let cause = error.localizedDescription
+            throw ToolFailureError("Grok webhook acceptance is unknown: " + cause, effects: .unknown,
+                owner: "Grok webhook transport", code: "grok_webhook_transport_failed",
+                instruction: "Inspect this retained message's reply or repair the configured Grok connection; do not resend an uncertain delivery.",
+                recovery: .reconcile)
+        }
         let pending = try store.update(messageID, peer: peer.id) {
             if $0.state == "sending" { $0.state = state }
         }
@@ -306,7 +315,8 @@ public enum GrokBotRoute {
     public static func postOnce(_ request: URLRequest) async throws -> Int {
         let config = URLSessionConfiguration.ephemeral
         config.urlCache = nil; config.httpShouldSetCookies = false
-        config.timeoutIntervalForRequest = 30; config.timeoutIntervalForResource = 30
+        config.timeoutIntervalForRequest = .infinity
+        config.timeoutIntervalForResource = .infinity
         let session = URLSession(configuration: config, delegate: GrokNoRedirect(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         let (_, response) = try await session.bytes(for: request)

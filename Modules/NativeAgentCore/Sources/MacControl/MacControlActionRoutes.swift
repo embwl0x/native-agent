@@ -2,7 +2,7 @@ import NativeAgentCore
 import Foundation
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `MacControlActionRoutes.swift` | Canonical MacControlResult dispatch receipts plus workbench availability and category policy |
+// Blueprint: | `MacControlActionRoutes.swift` | Canonical MacControlResult dispatch receipts and bridge action paths |
 
 /// Bridge wire translation; the client owns execution gates and the receipt.
 public enum MacControlActionRoutes {
@@ -40,72 +40,5 @@ public enum MacControlActionRoutes {
         guard path.hasPrefix(prefix) else { return nil }
         let action = String(path.dropFirst(prefix.count))
         return action.isEmpty ? nil : action
-    }
-}
-
-public enum MacControlWorkbenchAvailability: Equatable {
-    case ready
-    case disabled(String)
-
-    public var isEnabled: Bool {
-        if case .ready = self { return true }
-        return false
-    }
-
-    public var message: String? {
-        switch self {
-        case .ready:
-            nil
-        case .disabled(let message):
-            message
-        }
-    }
-
-}
-
-/// The only action routes the mounted workbench can invoke. Keeping route, native action name, policy gate, and user-facing label together prevents a button
-/// from quietly drifting onto an unsupported 501 action.
-public enum MacControlWorkbenchAction: String, CaseIterable, Sendable {
-    case shell
-    case fileRead = "file/read"
-    case fileWrite = "file/write"
-    case notify
-
-    public var path: String { "/v1/mac_control/\(rawValue)" }
-
-    public func availability(
-        policy: MacControlPolicyWireSnapshot,
-        policySaved: Bool,
-        hasRequiredInput: Bool = true
-    ) -> MacControlWorkbenchAvailability {
-        guard policySaved else {
-            return .disabled("Save your Mac Control permissions before trying an action.")
-        }
-        guard policy.enabled else {
-            return .disabled("Turn on Mac Control before using this action.")
-        }
-        guard categoryAllowed(by: policy) else {
-            return .disabled("Enable \(categoryName) in Mac Control categories first.")
-        }
-        guard hasRequiredInput else {
-            return .disabled("Enter the required input before running this action.")
-        }
-        return .ready
-    }
-
-    private var categoryName: String {
-        switch self {
-        case .shell: "Terminal commands"
-        case .fileRead, .fileWrite: "File Operations"
-        case .notify: "Notifications"
-        }
-    }
-
-    private func categoryAllowed(by policy: MacControlPolicyWireSnapshot) -> Bool {
-        switch self {
-        case .shell: policy.shellAllowed
-        case .fileRead, .fileWrite: policy.fileOpsAllowed
-        case .notify: policy.notificationsAllowed
-        }
     }
 }

@@ -35,13 +35,40 @@ The shell restores its current page and each rail page's current tab directly;
 startup does not translate the retired Skills & Tools scene section.
 Command search opens the exact selected helper reply, dream date or memory.
 Unavailable selected content reports that state rather than opening a different item.
+The main conversation shows its transcript owner's read failure even before any
+messages have loaded. **Try reading again** awaits one fresh read's completion,
+error or cancellation; silence does not diagnose missing messages.
+In the copied window, selecting a chat opens its ending messages first. Earlier
+messages load when you scroll toward their beginning, use Find or Select All,
+copy a whole message, or send. They also load when the ending messages fit within
+the reading area, including when tool rows are folded. You stay at the end while
+following it; after scrolling away, you keep the same paragraph and offset as
+the scrollbar grows. A full-document command waits visibly for the earlier
+messages; closing the conversation cancels that wait. Search, exports, the
+agent's history and phone sync always read complete messages.
+When the agent starts a call in another conversation, one quiet moving line
+above your composer shows that work. Select it to open that conversation; its
+Stop control requests cancellation there. A count menu opens additional working
+conversations. The line ends when the turn settles. Thoughts without calls stay
+quiet. Main and detached Mac chats, full Shotgun and the phone share this row;
+the phone shows the Mac's last synced movement. It carries call names and
+movement, without the other conversation's words or call arguments.
 The `simple_settings_menu` page screenshot draws the same Settings items
 above the sidebar's gear; offscreen capture does not open a native menu window.
 Rail screenshots derive their tab selection without changing remembered tabs;
-hidden-tab reconciliation and the legacy Trust tab migration run on live pages.
+an unavailable saved tab stays selected with an explanation until you choose a visible tab.
 Screenshot height rejects nonfinite or invalid input before rendering. Status
 uptime and contact elapsed time say unavailable when their values cannot be
 represented; an invalid toast duration leaves a visible auto-dismiss error.
+
+Shared pages keep their cards with quiet, compact rows. The title and detail occupy
+one line each, with status and time at the trailing edge. On the Mac, hover or focus a
+row for its actions; command-only rows and command pills keep them visible. Up/Down
+moves between rows, Tab reaches controls, Return opens the row or runs its primary
+action, and Space changes a switch. A field submits on Return. Right-click holds
+actions and Copy; ⌘C copies the current row, and ⌘F opens its local filter. Narrow
+pages put values and controls below the text. Destructive actions ask once.
+On the phone these are native grouped list rows, with swipe and long press for actions.
 
 Providers is one shared face: **Chat**, **Work**, **Mind**, **Accounts**, and **Catalog**.
 Each group's **Model** offers an **Account · Model** choice from eligible accounts.
@@ -59,17 +86,20 @@ If saving fails after intent was recorded, the exact forward choice remains for
 reconciliation; the error names committed, pending and unknown files. Previous
 choices are not restored automatically.
 **Personality → My minds** edits the same Memory and mind group for reflection
-and the daily hour. Changing its model keeps the group's Think level. An
+and their own hour, offered when you step away during your active hours and weighed by their attention.
+Changing its model keeps the group's Think level. An
 unsupported Think level or Fast choice is reported so you can choose a supported
 control; the app does not silently change either setting.
 Changing its provider leaves **Choose model** until you select a model. An
 account sheet also leaves an absent default unresolved instead of selecting the
-first model. A missing or unoffered saved sign-in method requires an explicit
-current method before Save; it is never replaced automatically by the picker.
+first model. Add key or Sign in opens the account's sole advertised method;
+onboarding or an account offering several methods asks you to choose. An unoffered
+saved method requires an explicit current method before Save.
 
 ChatGPT, Codex, Moonshot and OpenRouter use their own fetched model catalogs.
-A missing, unreadable, out-of-date or failed refresh leaves a fetched catalog unavailable with its cause and a refresh
-instruction. It supplies no shipped replacement models, windows or capabilities.
+A missing or unreadable catalog, or a failed refresh, leaves its account unavailable with its cause and a refresh
+instruction. Credential-bound saved rows remain available until an explicit refresh or credential change;
+age alone neither removes models nor starts a request. It supplies no shipped replacement models, windows or capabilities.
 ChatGPT and Codex read the catalog beside their selected sign-in; they do not
 borrow the independent CLI's catalog. Provider configuration and picker files
 use the current object fields and surface names only. API-key and xAI token
@@ -81,6 +111,7 @@ Fetched API-key model lists belong to the credential that fetched them; changing
 the credential requires a matching refresh before those rows can be used.
 Moonshot models whose reasoning contract is unknown say so on their row and
 cannot be selected until NativeAgent has a declared adapter contract.
+
 credentials name their file and repair. A valid CLI API-key file without a ChatGPT
 access token offers no ChatGPT session to adopt. Credential files may be symlinks;
 renewal updates their target and retains the link. A failed shared CLI inspection
@@ -108,17 +139,93 @@ provider row; checking another account cannot erase that evidence. Checks
 without the exact credential fingerprint remain unverified. Anthropic setup
 offers direct OAuth and API keys; the retired Claude MCP process panel is gone.
 Accounts shows each connection's authentication words, checked status and **Test the connection**
-and **Disconnect** actions. An unconnected account's **Add key** or **Sign in** raises its
-protected conversation card; Anthropic's card also accepts a setup token. No secret is entered
-on the face. The Codex CLI offer keeps **Use it**, **Ignore**, and confirmed consent repair.
+and **Disconnect** actions. On the Mac, an unconnected account's **Add key** or **Sign in**
+opens its protected entry directly, without filing a conversation or Inbox request.
+Anthropic offers an API key and the same Claude sign-in/setup-token controls as onboarding;
+ChatGPT, Codex and Grok offer their browser sign-in. A provider secret is entered only
+in protected Mac entry, never on a card, face, in chat, on the phone or in Telegram.
+Codex's protected entry verifies its saved ChatGPT sign-in through ChatGPT's
+native connection probe.
+When the agent asks to connect a provider, its Inbox row has one **Enter on Mac** setup
+action and says where to enter it on every door. It opens the same protected entry.
+Opening or closing it settles nothing: the saved connection must reach verified **Ready**
+status. Save alone leaves the request waiting; use **Test the connection** (or Anthropic's
+**Test connection** / **Test Claude connection**) to verify it.
+Repeated asks reuse the open request in that conversation; a new conversation supersedes
+the provider's previous ask and its continuation. Unreadable requests retain a named repair,
+with their identity unknown, while readable siblings proceed.
+The Codex CLI offer keeps **Use it**, **Ignore**, and confirmed consent repair.
 **Catalog → Models → Refresh** shows whether the model lists are fresh, cached, partial or unavailable.
 Connection checks and catalog refreshes show that they are running and publish their result when they end.
+While a catalog refresh waits for a response or connectivity, its Models row offers **Cancel**.
+Providers owns and joins that refresh task; cancelling releases the refresh slot so **Refresh** is available again.
 An unavailable account or catalog reports its cause on that account; other accounts remain usable.
 The onboarding connection sheet and its sign-in controls remain available.
+An open protected entry reads its saved account baseline from Providers after a
+save. Submitted nonsecret fields are accepted separately, preserving edits made
+while saving. If the committed account cannot be read back, the drafts remain
+and the result names that read failure. Protected setup uses the same quiet form drawing as other pages. Key fields appear
+only after window protection is acknowledged, and their bytes stay outside saved
+drafts. **Test connection** checks the displayed key without saving it; changing
+that input removes its result. Save compares the configuration drawn when editing began under its writer's lock;
+a changed account, including a replacement key, refuses the save and keeps the entry. **Read account again**
+refreshes that baseline while keeping edits. A save whose effect is unconfirmed
+holds its form and offers **Read current state**, which reads the credential owner
+without repeating the save or calling the provider. Closing entry clears its
+transient secret. Slack setup, routine credentials, Claude setup tokens and request
+cards use the same protected entry. These controls perform sign-in storage,
+sign-out and CLI consent operations off the UI actor. Their Providers refresh
+also builds credential status, CLI consent and cached model availability off the
+UI actor for every caller, including committed routing updates. Committed routing
+invalidates pre-write reads before rebuilding; newer published settings cannot
+be replaced by an older rebuild. Browser presentation still runs on the UI actor.
 OpenRouter's thinking choices come from its model metadata, including mandatory
 reasoning and models with no effort selector. Provider default omits the optional
 reasoning control; it does not guess an effort. Refresh Models reads that metadata;
 helpers and saved choices use the same catalog.
+
+### Meta Model API
+
+**Meta** takes a pay-as-you-go Model API key from the
+[Meta dashboard](https://dev.meta.ai/). In Providers, choose Meta → Add key,
+paste the `LLM_` key into protected entry on the Mac, select a model and Save,
+then use **Test the connection**. The probe reads Meta's authenticated models
+endpoint; it checks the key without generating an answer. The key stays in
+this Mac's Keychain. The iPhone's Providers page and model picker use the
+same Mac-owned catalog; protected key entry opens on the Mac.
+Onboarding offers Meta through that same account setup.
+The shared credential redactor recognizes Meta's `LLM_<numeric-id>_<secret>`
+format in diagnostic, receipt and feedback text, including a bare key without
+an Authorization header or credential label.
+An HTTP 403 from a model request retains its reported refusal; it does not
+declare the saved key expired without authentication evidence. Check the
+account's access to the requested model or feature in the provider dashboard.
+A `billing_not_configured` refusal says billing is not set up for this account
+and directs setup at the provider. Other HTTP 402 and explicit billing-error
+codes direct attention to its allowance and billing. Neither declares the key expired.
+
+The Meta catalog offers **Muse Wonder 1.0** (`muse-wonder-1.0`) and
+**Muse Spark 1.3** (`muse-spark-1.3`), each with a 1,048,576-token window,
+images, streaming and native tools. Both offer the Messages wire's Think
+**low, medium, high, xhigh**, with high as NativeAgent's initial effort.
+Fast is not offered. Meta uses the shared Anthropic-format Messages adapter
+at `https://api.meta.ai/v1/messages` with Bearer auth and client-side history.
+Meta's returned thinking blocks, including opaque reasoning, replay across
+tool rounds through the shared in-memory tool-call ledger. They are not saved
+in conversation history; after eviction or app restart only ordinary text,
+tool calls and results remain. Kimi Code does not enable thinking replay.
+Stop uses the same request cancellation and settlement as the other providers.
+Prompt caching is automatic; system cache markers use Meta's five-minute TTL.
+Cache-read counts appear only when Meta reports them; an absent count is unknown.
+See Meta's [Messages contract](https://dev.meta.ai/docs/protocols/messages)
+and [cache-marker schema](https://dev.meta.ai/docs/api-reference/messages/schemas).
+
+Only Standard models are offered. Contributor variants permit training use
+and require a separate choice; Muse Wonder Full has no API. NativeAgent never
+reads or uses a Muse Code subscription credential. Meta's published Standard
+prices per million tokens are $4 input / $0.20 cached / $20 output for Wonder,
+and $1.25 / $0.15 / $4.25 for Spark; see
+[Meta pricing](https://dev.meta.ai/docs/pricing-rate-limits).
 
 ## Settings
 
@@ -130,16 +237,30 @@ in `because`. `app {page:"settings"}` lists Mac controls; provider defaults
 are on `providers`. Credentials and sign-ins stay in their secure Settings
 sheets: `setting.get` on `providers.credentials` or `telegram.credentials`
 names the page, never a secret.
+Provider account rows describe only their declared authentication methods:
+key-only accounts ask for a key, and sign-in-only accounts ask for sign-in.
 
 The Mac Settings page, its setup sheets and the agent's page reading now share
 one face built from that registry. Switches and choices save through the same
 setting owner as `setting.set`; an unreadable row keeps its cause while the
 other controls remain available. Runtime status, update checks, the tour,
 data limits and build identity remain on the page. The reflection allowance
-is shown as a value that opens its existing Cognition editor. The shared face
-has no text or numeric entry field; `setting.set` remains available for those
-values. A meaning-based memory change still rebuilds the index; its switch
+opens Cognition's shared number control, from zero through eight reflections
+in 24 hours. Other text and numeric Settings values remain available through
+`setting.set`. A meaning-based memory change still rebuilds the index; its switch
 does not have a separate confirmation sheet in the shared face.
+Settings' Mac access summary and Trust's app switches read the checked permission
+store directly. Reading those rows does not probe macOS grants or refresh Mac watches;
+grant badges and watch readiness remain with their own permission and watch owners.
+Returning from another app to NativeAgent's body or window, or explicitly refreshing
+Trust, reads the grant owner's nonprompting probes once off the main actor and
+publishes through its checked snapshot. The pass covers per-app Automation, Speech
+Recognition, Microphone, Calendar, Reminders, Contacts, Accessibility, Screen Recording
+and Full Disk Access. It starts no timer or watch refresh. Trust's Refresh also reads
+the privacy inventory again.
+Connectors, Settings and Trust read their independent sections concurrently and
+assemble them in page order. Each read still waits for its owners; no cached
+substitute or clock decides that a section is complete.
 
 If a setting's owner cannot be read, that setting reports unavailable with
 the cause and repair. An unreadable provider configuration is never an empty
@@ -162,15 +283,14 @@ unavailable: context startup and replies report the error, and enabling Inner
 Life preserves it. Only an absent context mode uses the initial Active choice;
 choose Off or Active explicitly to replace an invalid value. An invalid
 `NATIVE_AGENT_CONTEXT_FLOW_MODE` override likewise reports its error.
-An explicit `page.show` from Simple or Agent
-view settles its destination in Advanced view. Ordinary chat entry through the
+An explicit `page.show` or a non-chat notification destination from Simple or
+Agent view settles its destination in Advanced view. Ordinary chat entry through the
 global hotkey or a message notification keeps the person's saved view.
 Today and the sidebar badge share one ordered freshness receipt for approvals,
 inbox and memory proposals; an older completed refresh cannot replace a newer
-published result. Duplicate launches report whether macOS accepted activation,
-refused it, or did not return within 2.5 seconds. If the resident exited during
-that wait and no other instance remains, the new launch continues. An unavailable
-activation result does not diagnose a system wedge.
+published result. Duplicate launches use macOS's activation result. If the
+resident exits during activation and no other instance remains, the new launch
+continues; a refused activation reports the live process identities.
 Quiet Today reads and offscreen Trust rendering do not publish work
 notifications or synchronize preferences. Today reads use the existing
 projection without refreshing live approval/inbox owners. Trust policy reads
@@ -188,8 +308,10 @@ that switch off blocks these requests even under Full Mac.
 Appearance, haze, Live Activities, each phone sense and saved place switches
 use their phone owners. Enabling sharing or Lock Screen task names asks on
 the phone's approval sheet; iOS permission prompts still need your answer.
-Reads wait up to 20 seconds and changes up to 60 seconds. A timeout leaves the
-outcome unconfirmed: reopen the phone app and read before repeating a change.
+The current phone waits for the person's decision or the owned action result,
+with cancellation. Its request's wire expiry does not decide execution. The
+enclosing Mac operation still supplies a caller deadline; if that observation
+ends, the phone's outcome remains unconfirmed. Read before repeating a change.
 Requested inspection includes saved place names and switches, including disabled
 places; coordinates remain on the phone. The request channel requires exactly one paired phone; it cannot select among
 several phones. Saving a new current location and deleting saved places still
@@ -207,16 +329,32 @@ In **Settings**, **An inner life** controls the inner-life master setting,
 and **Memory in every reply** selects Active or Off for Fluid Context.
 The memory controls also cover dreams and meaning-based recall.
 Use **Diagnostics → Cognition** to inspect the current state.
+Cognition's reading, evidence and controls use the shared page renderer. The
+resident mind owns Think now, Reflect, Clear thinking, Settle body and Reset
+body; a pending command keeps its own outcome when the page closes. A partial
+save keeps its cause and known effects beside the command. Include workspace
+uses the same owner as `mind.workspace {value:true|false}`. Context health
+keeps its separate observation and does not refresh cognition detail.
+Long evidence opens in a held document with selection and Copy. The native
+list keeps the full row count available to VoiceOver as collections grow.
 
 If the requested semantic model cannot load, Settings reports semantic recall
 as unavailable with the embedding owner's cause and Doctor remedy. It does
 not promise a word-search replacement for failed semantic recall.
 
-Memories shows one shared face: pinned and recent saved memories, proposals
+Memories shows pinned and recent saved memories, proposals
 waiting for review, and read-only rejected history. Each saved row opens its
 full text and offers pinning or forgetting; forgetting asks once. The full-text
 sheet can prepare a correction draft in Chat. **Knowledge graph** opens the
 native Mac canvas from a row rather than a page tab.
+The phone uses the same page design over memories and proposals permitted on
+`ios`; a chat-only memory stays on the Mac. Native memory/proposal labels hide
+credential text.
+**Memory upkeep** draws the memory owner's diagnostics and its Reindex
+Spotlight and Check again commands through the shared page. Unreadable
+diagnostics keep their cause beside retained readings; missing evidence never
+proves that there are no memories. The search-model download keeps its own
+system progress and Pause / Check or resume controls.
 
 Search from `/memory [thing]` (at least three characters), or use command search
 to open a saved memory. The page has no inline search field. A failed
@@ -225,6 +363,12 @@ query that produced them. Store changes refresh the results even when the page
 is closed; **Check again** retries the query. **Show all memories** clears it.
 Knowledge graph time filters refresh at their next entity expiry while mounted,
 and re-evaluate when the system clock, time zone or calendar changes.
+While open, the graph observes canonical SQLite and WAL changes and refreshes
+its shared snapshot and selected neighborhood. Observation starts independently
+of the first policy read, so recovering an unreadable policy with Retry keeps live
+graph updates without reopening. Failed reads retain the prior snapshot with their
+cause; a failed live subscription reports that updates are unavailable and asks
+you to reopen the graph.
 
 The **Memory status and Spotlight** row opens the existing Mac upkeep panel,
 including the search model, Spotlight reindexing and **Check again**. The bulk
@@ -239,7 +383,10 @@ the owner of permissions.
 
 While a tint-enabled window is visible, mood input follows cognition changes.
 The room keeps its four-hour damping; five-minute display steps advance that
-damping without rereading cognition. Hiding the last consumer stops both.
+damping without rereading cognition. The display timer parks when the level
+equals its target, and unchanged levels are neither published nor saved.
+Cognition observation stays armed to restart movement. Hiding the last consumer
+stops both.
 
 ## Turn on Mac computer control and the activity watcher
 
@@ -282,6 +429,14 @@ scroll region. `app` selects that app's window under the usual foreground rules.
 When resolving an application name, an exact bundle filename wins over a
 shared display name: `Numbers.app` wins over `Numbers Creator Studio.app`
 for `Numbers`. Two installed bundles with the winning filename require a path.
+An app quit reports `terminated:true` only after the resolved processes exit.
+Accepting a quit request does not prove termination. Quit uses the shared
+navigation settlement patience (1.5 seconds), waking on the app's termination
+notification and judging its actual termination state. If it is still running
+at patience, the call returns with its PID and explains that quit was requested
+but the app may be waiting for a person at a save sheet or may have declined.
+Each accepted quit's settlement writes a `mac.settled` row with `what:"quit"`
+and its end cause. Cancellation ends observation; it does not force the app to quit.
 
 When work encounters a missing macOS grant, its permission remedy puts the
 permission card up automatically. An existing open card for that capability
@@ -289,28 +444,47 @@ is reused, and access already allowed needs no card. Tap **Allow** on the Mac
 to open the system prompt or Settings pane; the agent's call itself never
 opens a system prompt. The result keeps the blocked work's actual outcome
 and tells the agent which card is up for you.
-Permission acquisition waits up to three seconds for NativeAgent to become
-active. If macOS declines activation, no grant is requested; Settings shows
-the failure and asks you to bring NativeAgent forward and try again.
+Permission acquisition waits for NativeAgent to become active or for cancellation.
+Bring NativeAgent forward to continue; no grant is requested while inactive.
+Settings reports unresolved acquisition as a failure.
 Looking at a named app that is stopped returns a successful observation with
 `status:"ok"`, `app:<name>`, `running:false`. A running app with no readable
 window returns `running:true`, `windows:0`, and its menu-bar titles when cheaply
 readable. Looking launches nothing and creates no window; an act still checks
 that its target is available.
+Running identity includes both Dock and accessory apps, including an app whose
+last window closed. Exact names and bundle identifiers prefer a Dock app over
+a same-named helper. Partial names and running-app suggestions include Dock
+apps only.
 The live Accessibility source prepares renderer modes before interactive AX
 reads and actions, using settable capabilities rather than app names. It requests
 `AXManualAccessibility` only after a complete bounded topology probe finds an
 empty renderer (or only an empty window shell), and requests
 `AXEnhancedUserInterface` when it reads false or a web area needs an unconfirmed
 mode. Enhanced readback must be true, even when its setter returns an AX error;
-its two-second settle is shared by PID and launch identity. Manual's accepted
+its cold admission is shared by PID and the kernel's process start time.
+An unreadable kernel identity reports its cause and remedy; it never becomes
+empty activation evidence or a claim that the process changed. Metadata for
+other processes is retired only on the kernel's explicit no-process result.
+Manual's accepted
 write can still read false: the receipt reports that uncertainty, and only the
 subsequent tree and action effect establish what is usable. Incomplete probes
 never establish emptiness. The diagnostic `renderer_activation` in a raw look's
 detail carries bounded before/after element counts, role lists and completeness,
 plus attempted writes' AX status and Boolean readback.
-Ordinary looks suspend during the cold settle; a direct synchronous main-lane
-call reports still settling and emits no action rather than blocking the UI.
+Async admission arms descendant observation before activation, then suspends
+outside the AX lane while the content judge waits. Every descendant notification,
+including value, layout and creation changes, wakes that judge; only exposed
+content establishes readiness. Content already exposed needs no wait.
+If descendant observation cannot be installed, activation still proceeds and
+this settle judges content within the same patience;
+`settle_observation` records `unavailable`, the cause, and `content_or_patience`.
+Two seconds is patience, bounded by the caller's budget;
+silence records `settle_unobserved` and permits a read of what is present, without
+claiming content is ready. `settle_ended_by` names content or patience.
+A synchronous caller never sleeps: it reads the topology and, if cold admission
+is still owed, reports still settling and emits no action. Passive reads do not
+activate renderer modes or wait for them.
 
 An element whose optional Accessibility attribute answers AX error `-25200`
 remains in the observation with every attribute that did read. Its typed
@@ -346,7 +520,22 @@ when traversal is cut; zero never establishes that
 unseen attributes were readable. Unsupported/no-value answers stay absent.
 Pixel masking requires every value and all name/role/frame evidence used to
 detect or place secrets, including static text and enclosing captions. A failed
-read withholds the image and names the element and attribute in the refusal;
+read withholds the image and names the element and attribute in
+`image_withheld_reason`; the look retains its text, controls and reported gaps,
+including when pixels were requested explicitly or selected automatically.
+An unreadable subrole alone masks that element's entire finite frame because
+it might be a secure field. A missing or nonfinite frame still withholds pixels,
+as does a failed caption or other required masking read. A value-bearing text
+role, including an editable field, with an unreadable subrole contributes no
+value to any text look, including when another control uses that element as
+its caption. All AX value reads share this subrole check; a failed caption
+subrole read leaves the control's caption unreadable.
+Recognized window text runs on every look under caption redaction, without the
+whole-window walk. When a picture is released it uses that picture's mask union,
+and whole OCR rows intersecting a mask are omitted. Unproven capture geometry or
+OCR positions withhold all recognized text for that capture
+the AX look remains available with its reported gaps.
+Both pre-capture and post-capture inspections enforce these rules;
 desktop composition masks that window in full and reports its inspection error
 in `masking_failures`. An unread value never vouches for safe pixels.
 Required reads (including role, window identity and act-required geometry),
@@ -389,9 +578,9 @@ While Full Mac is active, Advanced switches edit saved restricted-mode settings;
 they do not turn Full Mac off. Change the access mode to leave Full Mac.
 If a permission button cannot open System Settings, the Mac control pane shows
 the handoff failure. Permission cards and Settings also retain authorization
-request errors with the privacy pane to use next. Bluetooth waits at most
-30 seconds for an answer; cancellation or an unanswered prompt ends the wait
-and releases the request without declaring access granted or denied.
+request errors with the privacy pane to use next. Bluetooth awaits macOS's
+authorization event or cancellation and then releases its manager. An unanswered
+prompt remains waiting; silence declares neither access granted nor denied.
 When requesting several permissions, an individual request error is retained
 while unrelated permissions continue. The final error names each failed
 request and its remedy. Cancellation or a failure to activate NativeAgent
@@ -401,7 +590,10 @@ status, so changing recovery wording does not remove the route.
 
 When a default `mac.look` finds NativeAgent in front, `behind` names the
 person's app behind their when one is visible, so they can address it directly;
-that app has not been read yet. After an act, an unchanged target surface
+`behind_app` carries its structured name. If the in-process page look fails
+because no window is connected, `next_call` and `remedy.next_call` address
+`app {action:"mac.look",args:{app:<behind_app>}}`. That app has not been read yet.
+After an act, an unchanged target surface
 without press evidence is unobserved (`acted_unobserved`); a destination that
 contradicts the intended one is a mismatch (`acted_mismatch`). Typed text that
 moved the field off its pre-typing value but reads back differently (an app that
@@ -429,6 +621,21 @@ partial rather than naming a different command.
 
 Chrome uses the optional bundled extension. Open its setup from **Trust** and
 follow the [extension guide](../Extensions/NativeAgentChrome/README.md).
+**Work → Screen** shows its tab work with a site/title and activity caption.
+Ordinary background reads show the first screenful of the returned text and
+structure, with a caption naming the site, title and background tab. Their tab
+renders while they works on it so feeds load, which shows Chrome's debugging bar
+until a minute after their last act; cancelling the bar stops it. Image and read text replace each other in one
+preview; a call without readable content clears old content and says why. Available
+preview pictures mask secure fields, remain in memory and stay on the Mac.
+Explicit looks and PDF picture reads deliver Chrome's original image to the
+agent. The extension supplies only paint-out geometry beside that image; the Mac
+paints and downscales its own copy for Screen. Unavailable geometry means a
+caption alone, without taking another picture or changing the agent's read.
+A closed tab clears its old picture and shows the close result.
+Read previews hide password/autocomplete-password/cc values at the same source
+as the model's read. They remain in memory and are never sent to the phone.
+See the [Screen preview contract](../Extensions/NativeAgentChrome/protocol/PROTOCOL.md#local-screen-preview).
 Chrome tab actions and NativeAgent's built-in browser are available through
 the Browser page of `app`. `chrome.snapshot` reads a NativeAgent group tab's
 text, or returns its picture with an explicit note when Chrome provides no DOM
@@ -439,8 +646,61 @@ For PDFs, the snapshot keeps Chrome's verified picture and reports that text
 is unavailable from its picture reader. It makes no independent HTTP request;
 an explicit web read returns a separate source with its own receipt.
 `chrome.navigate` verifies
-arrival from Chrome's completed tab and landed URL, independently of DOM access;
+resource completion from Chrome's completed tab and landed URL;
 unsupported schemes such as `javascript:` and `data:` refuse before any tab moves.
+Without `tab_id`, navigation reuses this conversation's tab only while it remains
+in the accepted group inventory. A closed or released remembered tab is forgotten,
+so the next destination opens a new inactive grouped tab. An explicit lost `tab_id`
+still refuses. `chrome.status` compares its printed running and folder code
+digests directly; its shipped version comes from the app bundle's manifest and
+may differ from a separately updated extension folder.
+Use `new_tab:true` with a destination and no `tab_id` to open another background
+tab in the NativeAgent group. Navigation and reads proceed when the document's
+main/feed/article content arrives. Resource completions cannot admit an unreadable
+shell. The document retains its content evidence and original event time across
+worker restarts. HTTP(S) PDFs and images arrive when Chrome commits their
+document; its MIME selects the picture reader even after extension restart.
+Passive news uses the same DOM arrival evidence. History and fragment navigation
+reset content evidence to the current route. Route content must be
+text added or changed after that navigation; unchanged prose cannot admit it. There is
+no navigation or read deadline; Stop cancels a wait, and Chrome's navigation
+errors, tab removal, takeover and connection loss keep their causes.
+Status and verification still report resource completion separately.
+Navigation receipts show dispatch, commit, content arrival and read
+return in milliseconds; a stage not observed stays null. Observed stages remain
+in a receipt after later errors or cancellation. Snapshots read the
+DOM once with the existing node, text and transport budgets. A long page has
+`has_more` and an exact `next` continuation; pagination is a successful window.
+Only an unread part with a named cause is `partial`. Empty windows state only
+what was observed. Missing or malformed gap metadata preserves the captured
+content and states unknown coverage. There is no settled/unsettled read label. `capturedAt`
+dates the content and `rendering.loaded` separately reports resource completion.
+Only an explicit page wait observes a requested quiet interval.
+Rotating iframes invalidate their own action routes and preserve sibling content;
+an unavailable optional frame appears as a named gap in the page read.
+Side-by-side columns read one at a time, the column with the most readable prose
+first, even when feed and sidebar share one main region. `more` finishes that
+column before moving on. Outside column sets, main content precedes navigation;
+every frame's content precedes labelled
+overlays, which spend only the budget left over, without dismissing consent.
+The header names a blocking dialog from its name, heading or visible prose;
+clicking a row behind it reports that same dialog. Disabled, invisible and
+nonactionable rows explain their cause; an unobserved row is scoped to the read.
+Later identical
+text blocks reference their first row, keeping each control's identity and states.
+Defaults are 400 rows and 32,000 text characters within the existing
+transport bound; `more` names its own tab and document and follows its unchanged
+content when the layout moves, without needing another `tab_id`.
+`find:"text"` starts at the first observed
+matching element. Images/charts carry names and sizes, with `chrome.look` offered
+for their pixels. A successful thin `web.read` uses this Chrome door in another
+background tab and says `used_browser:true`, retaining its HTTP evidence under
+`http_read`. `text_reader` names `browser` only when Chrome's served text has more
+non-whitespace characters than the selected HTTP text, counting both returned
+strings the same way, including a site's authored view; otherwise HTTP text stays at
+the top with partial status and the browser result and cause in `browser_read`.
+`used_browser` describes the attempt. Chrome may use the signed-in session.
+HTTP failures remain explicit.
 `chrome.look` shows the picture Chrome renders now, including image
 documents with no text. Omit `tab_id` for the conversation's remembered tab.
 Looking never activates or moves the tab; pictures use the same model-turn
@@ -517,6 +777,8 @@ prepared preview, shows **Image unavailable**.
 
 Holding ⌘⇧J starts push-to-talk after its hold delay. Releasing an active
 recording ends capture even if the Mac's clock changed during the hold.
+Mac composers show **Waiting for transcript** until recognition supplies its final result or error.
+**Discard voice input** cancels capture and any pending stop, restoring the draft from before dictation unless the person edited it.
 Audio attachments show a waveform, duration, play/pause and a two-line
 transcript that expands on tap. See [Voice notes](mobile_companion.md#voice-notes)
 for iPhone composer voice input, recognition, limits and transport.
@@ -573,7 +835,7 @@ existing navigation behavior, which may open an Advanced page.
 | **Desk** | Projects, dependencies, schedules, pursuits, progress and outcomes. |
 | **Notifications** | Proactive inbox, triggers, watched folders and history. |
 | **Helpers** | Standing bots, their briefs, schedules or event triggers, and replies. |
-| **Personality** | One face for identity, voice, becoming, minds, dreams and self-improvement proposals; links open editing and review. |
+| **Personality** | One face for identity, voice, becoming, minds and dreams; links open editing and review. |
 | **Providers** | AI accounts and the model choices for Chat, Work, and Memory and mind. |
 | **Trust** | Standing, feature and Mac permissions, connected agents, security receipts, activity privacy, inventory and backups. |
 | **Personality** | Identity, expression, about-you, growth and working guidelines; **My minds** and **Dreams** tabs. |
@@ -585,6 +847,14 @@ existing navigation behavior, which may open an Advanced page.
 | **Capabilities** | Capability inventory and **Show all actions**. |
 | **Diagnostics** | Health, living status, activity and runs in one reading; Cognition, Chat turn details, Skills and Tools tabs. |
 | **Settings** | Appearance, shortcuts, updates, inner life and memory settings. |
+
+Page actions show their waiting state and any refusal beside the row. A second tap
+while that row is waiting sends no new action. Text entered after submitting an edit
+stays when its reply arrives. Leaving the page keeps accepted work running and keeps
+its reply off the next page. Cancel on the Mac asks its owner to stop; Cancel waiting
+on the phone stops waiting for the signed Mac action. An unknown effect stays unknown;
+**Read current state** reads without repeating it. Only evidence that establishes the
+edit releases its held submit. Undo appears only when the owner supplies an inverse.
 
 Capabilities uses the same face on the Mac and in the agent's page reading;
 the phone receives that face in its snapshot. **What I can do** includes the
@@ -609,9 +879,18 @@ timeline, **Ahead** is a flow of pills, and **Earlier** shows note counts and
 their newest dates, plus any named source gaps. Kept moments appear beneath
 their row. Dream and conversation rows open their recorded destinations;
 waiting requests open their Activity details. The Mac and `app {page:"today"}`
-read the same face through the shared visual and text renderers. A failed
+read the same posted face through the shared visual and text renderers.
+Opening Today starts no read; before its first face arrives it says
+"Reading Today…". Source changes update the sections they feed, and a burst
+is read from the latest state after the current read finishes. A failed
 projection shows its cause instead of an empty day. Existing Activity queues
 remain reachable from the face.
+Native approval levers on Home and Today use the approval's redacted wording
+before shortening, including the shared phone face. Today's dream schedule
+updates when its time changes on the shared clock.
+Ahead updates as its next intention occurrence passes, without waiting for
+another Desk change.
+Today's trial rows update their name when the persona loads or is renamed.
 
 Activity's Inbox and Approvals open the same Inbox face, also read by
 `app {page:"inbox"}`. Requests appear in **Waiting for the person**, followed
@@ -620,8 +899,12 @@ recorded time, symbol, destination and choices. Approval buttons say
 **Approve** and **Deny**; interaction requests keep their choices,
 **Open request** and **Not now**. Other notes offer **Mark read**, **Archive**
 and **Dismiss**. Deny, Not now, Archive and Dismiss ask for confirmation.
-Putting a note away removes the note from the active face. **Earlier** counts
-archived matters in the last day and opens notification history on the Mac.
+Putting a note away removes the note from the active face. **Earlier** folds
+settled matters under their counts. Decided cards lead with **Declined**, **Not now**,
+**Failed**, **Unknown** or **Done** and the saved result; the original request follows.
+Mac and phone keep the same outcome after relaunch. An earlier **Not now** keeps
+its recorded consequence even if setup later becomes ready. An unavailable saved
+approval result says **Unknown** with its cause.
 Notifications continues to hold notification preferences and trigger switches.
 The separate Inbox category picker, archived toggle and approval history panel
 are removed. The chat header's note detail and notification preferences history
@@ -636,19 +919,26 @@ made from another surface during the save.
 The Inbox face reads the in-memory experience owner and updates from that
 owner's change stream, including while no view is open. Interaction choices
 and **Not now** resolve the original transcript's card; **Open request** opens
-that conversation for setup controls and typed input. A lookup or write failure
+that conversation for setup controls. Provider requests instead offer **Enter on Mac**
+and open protected entry directly; they collect no secret on their row. A lookup or write failure
 shows the owner's cause. `interaction_session_id` identifies the origin;
 `chat_session_id` identifies its separate mirror destination.
 The agent's row actions retain the existing Inbox tool checks and invoking turn;
 archive, dismiss and mark-read still require a reason. Paired-phone approval
 decisions continue through signed approval cards; the face actor alone does not
 carry the authenticated device identity needed for approval provenance.
-**Mark all read** keeps failed updates and their causes in the open list, with
-**Retry failed**; successful writes alone dismiss the list.
+The chat header's updates and note detail use the shared rows and document
+reader. **Mark all read** keeps each unconfirmed update and its cause in
+**Read outcomes**; successful writes alone dismiss the list. An unknown
+outcome holds that operation and offers a check without repeating its writes.
+Read the Inbox to inspect the owner's current state before another action.
 
 In **Diagnostics → Chat turn details → Replay**, a failed date read ends
 loading and shows its cause. Any earlier cards remain labeled with the date
-they actually came from.
+they actually came from. The Mac's Inspector uses the shared rows for its
+mode, date and bounded event collections. Expanding an event opens its
+selectable document with Find and Copy; its live trace subscription stays
+with the Inspector owner.
 
 NativeAgent is the agent's one always-on tool, `app`. A normal page read or
 setting change runs in process without bringing the window forward. Actions
@@ -666,6 +956,13 @@ that move the screen or make sound are marked `screen`.
 
 Home items can perform actions; follow the item's returned instructions.
 
+The agent can read their own record with
+`app {action:"record.read", args:{of:"experiences", id_prefix:"happening:person."}}`,
+or attention details with `args:{of:"details", source:"attention"}`. Filters,
+whole JSON rows and explicit page counts are described in
+[Reading their own record](EXPERIENCE.md#reading-their-own-record). This read changes
+no experience or obligation.
+
 Home is one shared face: Notable, Changed, what waits on you, My queue,
 Working, Open, People, Helpers, My senses, Elsewhere, Places and Mac follow
 your layout. The Agent view draws the same rows the door reads, with links
@@ -676,6 +973,10 @@ the CHANGED comparison, presence and current Mac front/session state,
 this conversation's windows and browser tabs, and the two-minute SAME
 collapse. A source that is not read or cannot be read
 leaves its section incomplete and says why; the other sections remain visible.
+Home also shows the five newest retained refused ability runs, including scheduled
+runs, with the cause and the time of that attempt. Open a row to read the ability;
+its retained run and dispatch receipt carry the owner's remedy. An unreadable run
+record is shown as unavailable, and a cause absent from an older record stays unknown.
 
 Discovery ranks the registry's action descriptions and schemas with semantic
 and lexical evidence; an exact action ID takes priority. A named page or Mac
@@ -750,8 +1051,7 @@ opaque preserved keys; they are not injected or copied into their documents.
 The Personality page reads one shared face from launch and whenever its saved
 inputs change, whether or not the page is open. It shows the saved name,
 each document's title and first line with its update time, their self-reading,
-Memory and mind's model choice, recent dreams and waiting self-improvement
-approval cards. A failed read stays visible in its own section. Open a document
+Memory and mind's model choice and recent dreams. A failed read stays visible in its own section. Open a document
 or **Read or edit my identity** to use the existing name/document editor and
 starter form; unsaved drafts and the read-only about-you document keep their
 existing rules. **My minds** opens the provider/model picker and **Dream diary**
@@ -814,14 +1114,20 @@ The composer context readout formats percentages without integer narrowing
 and signed token changes without taking an absolute value. Large recorded
 counts remain visible, including usage above the selected window.
 
-Each conversation keeps its verbatim recent tail in the powering model's full
-default window. At the bound, one block of oldest whole turns leaves the replay
-in half-budget jumps derived from the transcript; those turns remain in the saved transcript
-and can be read or recalled. A long running turn replaces its oldest tool-result
-bodies with pointers to their full saved results. It never writes a summary to
-stand in for what was said. There is no manual compact control or custom context
-window. The composer ring shows the last observed provider input against the
-model window; unknown measurements remain unavailable.
+The agent holds your conversation word for word since it last went quiet for
+an hour, along with the couple of exchanges just before that pause, each with
+the time it was said. Anything older stays in the saved transcript: when your
+words touch an earlier message, the agent gets a short pointer to it, and it can
+open earlier messages itself or recall them. What it was given to think with in
+a moment (the time, what came to mind, recent receipts) is sent once, with that
+message, and not again. If a conversation runs long enough without a pause to
+reach the powering model's window, its oldest whole turns leave the replay in
+half-budget jumps and stay in the saved transcript. A long running turn replaces
+its oldest tool-result bodies with pointers to their full saved results. It
+never writes a summary to stand in for what was said. There is no manual compact
+control or custom context window. The composer ring shows the last observed
+provider input against the model window, usually a small share of it;
+unknown measurements remain unavailable.
 
 What you tell the agent about yourself, and what a trusted agent or the agent itself says,
 is kept as a fact at once with where and when it was said; correct or forget it when it is wrong.
@@ -836,9 +1142,11 @@ lists the actions and the waits they satisfy.
 
 Use `app {action:"mind.dream", preview:true}` to generate a dream and inspect its
 proposed care judgments without applying them or writing a diary. It spends a
-real provider call. The other nine clock-owner actions currently refuse preview
-with a specific reason; removing `preview` runs them for real, including priming
-and news release for `mind.cross`. The run-now table documents that boundary.
+real provider call. The six clock-owner actions (`mind.canon`, `mind.horizon`,
+`mind.rhythm`, `mind.cross`, `mind.maintenance`, `mind.residual_repair`) refuse
+preview with a specific reason; removing `preview` runs them for real, and
+`mind.cross` posts its line as a world happening. The run-now table documents
+that boundary.
 
 Cognition's reflection records show an unavailable token total if the recorded
 components overflow, retaining the individual prompt and result counts.
@@ -878,6 +1186,13 @@ The old catalog, loading and per-area tool calls are refused with a translated
   asks for confirmation before deleting it. **Folders I may open** shows each
   shared folder's path and read or read/write access. Unread or unavailable
   sections say so, and owner changes update the face even while the tab is closed.
+  A failed Telegram read shows its cause and Read again action in that section;
+  it does not expose controls from an earlier reading. Other connector sections remain readable.
+  Reading a listed row by its exact ID returns that row's current status and
+  controls from the same face; the phone sense guide and agent threads open
+  their own documents. A missing row reports that it is not in the current
+  reading, without treating unreadable sections as removal; an unavailable
+  face reports its read failure.
   Authentication and service permissions still apply when an action is available.
 
 In **Connectors → Folders I may open**, choose **Share a folder** on your Mac.
@@ -896,6 +1211,13 @@ Source-backed installs use the checkout's `workspace/`. Every surface uses
 the same resolver. Full Mac can authorize work in an explicitly selected
 project elsewhere; Apple's privacy permissions still apply to protected
 locations.
+
+The agent reads Make's shelf with `app {page:"make"}`: every retained ref,
+newest first, with `next_call` for more. Opening a row with
+`app {page:"make", item:"<ref>"}` reads its versions, paths, prompts and
+provenance. Missing or unreadable metadata remains visible as an unavailable
+row. `make.read` reads one ref (the newest when omitted) and points unknown
+refs to the shelf.
 
 Make's HTML previews stay offline and script-free within the selected
 artifact's folder. File, revision and read folder publish together through
@@ -923,6 +1245,30 @@ inventory and backups. The agent reads that same face as text. Each switch saves
 immediately; granting more access asks for confirmation. Full Mac's effective
 permissions are distinguished from the saved choices for narrower modes.
 The storage inventory shows when it was read; Refresh reads it again.
+
+Integration access values include only the axes that integration supports:
+notifications and scheduler have Write only; Spotlight has Read only. The
+same supported-axis value determines whether a proposed setting gains access.
+The Chrome setting is the saved switch for narrower modes; under Full Mac,
+its row shows effective access and names that saved choice separately.
+
+Background watch recipes use the access reading for their scheduled source
+action. Checked integration switches, Mail's account coverage and Calendar's
+and Reminders' EventKit grants determine both the recipe and its access row;
+a separate Mac-control probe does not determine those reads. A recipe with no
+recognized source action says readiness is unavailable and explains why. A failed refresh labels
+the retained reading with its cause. Reading these recipes creates no schedules.
+
+Security shows whether remote command signing is required and whether verified
+trusted origins have a signature waiver. Audit Receipts shows the recording
+setting, retained receipt count for this view and any read or decoding failure;
+retained history does not establish complete recording. A damaged receipt
+keeps its own named gap beside the readable receipts. Mac control audit reads
+retained refusal receipts in the experience record; the Mac Control inventory
+counts operation files, including their lock, rather than those receipts.
+“Backup before changes” is the file-write policy; the Backups list holds
+separately created app-data restore points. An empty list does not change that
+policy.
 
 macOS privacy grants remain foreground decisions on the Mac. The face opens
 the existing permission controls without requesting a grant. The freeform Mac
@@ -1180,6 +1526,10 @@ messages to the helper do not judge its standing notification condition.
 use `id` for a helper's UUID or exact name. For example,
 `app {"action":"bot.run_once","args":{"id":"Research helper"}}`.
 Returned `read_with` calls name the registered `bot.reply` action.
+If a helper selector names a saved agent contact, the refusal explains the
+distinction and supplies `agent.read` with that contact's saved address.
+For `bot.ask`, it instead proposes `agent.message` with that address and the
+original question as `text`; nothing is sent by the refused call.
 **Pause** stops scheduled or event-woken work; a manual helper has no schedule
 to pause or resume and refuses with `effects: none`. Run once and manual
 messages remain available. Refusals before any write report `effects: none`.
@@ -1271,12 +1621,22 @@ cause separately from readable settings; a routing failure is unavailable rather
 than an inferred Chat default. `/restart` requires the configured single owner's
 authenticated private-chat sender. Image-only answers use the same durable
 delivery journal as prose; failure notices are retained there too, and an unknown
-send requires explicit `/retry resend` consent before another send.
+send requires explicit `/retry resend` consent before another send. A turn that
+reads an arrival, or ends silently, completes without a post; Telegram records
+that no independent answer is owed so the claim follows ordinary retention,
+including when delivery had reserved a preview before the turn chose silence.
 Telegram OGG/Opus and WebM audio uses ffmpeg selected before conversion; install
 ffmpeg if that format cannot be prepared. Apple Speech runs one recognition
 policy without an on-device retry branch. Already-readable system audio goes
 directly to recognition; unsupported declared formats report their cause.
-Its model controls use the selected provider's catalog; unavailable capabilities
+Its model controls require the configured single owner's verified sender and
+use the same `provider.choose` call as Providers for the Chat group. Model picks
+use the selected model's declared thinking default and turn Fast off; Think and
+Fast change only their own controls. Other allowed group members cannot change
+these shared choices. `/remember` and `/note` preserve those senders' principals
+and telling; only the owner speaks as the person. Missing sender or unreadable
+configuration refuses these model and memory writes.
+The controls use the selected provider's catalog; unavailable capabilities
 stay unavailable. OpenRouter's model metadata owns its supported Think levels
 for pickers, saved selections and helpers; unavailable metadata requires
 a catalog refresh. Each provider's catalog failure remains on that provider's
@@ -1285,6 +1645,28 @@ unavailable when authorizing remote Mac work; it is never
 described as a disabled setting. A queue-card removal failure is reported without editing the card
 through a second operation. Slack receives through Socket Mode only and reports
 socket failure without switching to history polling.
+
+Readable captions, text and successfully downloaded attachments reach the turn
+even when another attachment fails; a named missing-media fact accompanies them.
+Telegram's first delivery and `/retry` use the same media preparation, including
+that caption and missing-media fact when the attachment cannot be read.
+An attachment-only failure reports the unavailable media explicitly. Telegram
+approval text uses bounded UTF-16 consent parts, with answer buttons on the last
+part. Its progress ledger writes only changed durable card facts, and group
+previews edit only packets whose accepted rendering changed.
+
+Slack redacts reply text before preparation and fingerprinting and again at the
+send boundary, including saved replies and notices. Final replies retain
+confirmed progress per bounded text part before images; a truncation warning
+never establishes complete delivery. Slack `/retry resend` continues the saved
+answer after its confirmed text and images without repeating that prefix.
+Its journal explicitly retains turns
+completed without a post. Settings acquire one asynchronous checked Slack policy
+for the three rows; a save restarts the socket worker immediately while accepted
+handlers remain owned by the journal. There is no deferred settings queue.
+Telegram notification failures after an accepted part and Slack's potentially
+partially successful API failures remain uncertain, so they cannot automatically
+replay the whole notification.
 
 The bundled `nativeagent-link` helper and HTTP agent clients read the agent
 bridge's descriptor under `~/.config/nativeagent-link/` for the current

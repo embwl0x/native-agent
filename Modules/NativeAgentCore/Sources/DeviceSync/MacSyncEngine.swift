@@ -21,7 +21,9 @@ public final class MacSyncEngine: ObservableObject {
     @Published public internal(set) var isActive = false
     @Published public internal(set) var lastSnapshotAt: Date?
     @Published public internal(set) var lastInboxAt: Date?
-    @Published public var syncError: String?
+    @Published public var syncError: String? {
+        didSet { if oldValue != syncError { sync.bridge.refreshPhoneConnection() } }
+    }
 
     var snapshotDir: URL?
     var inboxDir: URL?
@@ -39,7 +41,6 @@ public final class MacSyncEngine: ObservableObject {
     var presenceBeatRegistrationID = UUID()
     var presenceBeatEvents: AsyncStream<Void>.Continuation?
     var presenceBeatDue: Date?
-    var presenceBeatDelay = NAMacPresence.beat
     /// Resident-state events own normal phone updates; exact files and launch/repair reconciliation protect integrity.
     var cognitionSnapshotObservationTask: Task<Void, Never>?
     var helpersSnapshotWatcher: FileChangeWatcher?
@@ -51,12 +52,9 @@ public final class MacSyncEngine: ObservableObject {
     /// Transcript rewrites outside turns feed the same snapshot coalescer as turn completions.
     var chatTranscriptDidChangeObserver: NSObjectProtocol?
     var pageFacePublishedObserver: NSObjectProtocol?
-    var chatTranscriptSnapshotPublicationTask: Task<Void, Never>?
-    var chatSnapshotCoalescer = MacSyncChatSnapshotCoalescerState()
+    var turnSessionsFacePublishedObserver: NSObjectProtocol?
     var pruneDeadlineTask: Task<Void, Never>?
-    var archiveRetentionRetryAfter: Date?
     var archiveRetentionWatcher: FileChangeWatcher?
-    var schedulerSnapshotWatcher: FileChangeWatcher?
     var connectorsSnapshotWatcher: FileChangeWatcher?
     var connectorHealthState: JSONValue?
     var activeDocsURL: URL?
@@ -64,6 +62,7 @@ public final class MacSyncEngine: ObservableObject {
     var snapshotWriteQueuedScope: SnapshotWriteScope?
     var snapshotWriteQueuedNeedsHeavy = false
     var snapshotWriteQueuedNeedsRepublish = false
+    var snapshotWriteQueuedRepairs: Set<String> = []
     var snapshotWriteQueuedNeedsMemories = false
     var snapshotWriteQueuedNeedsChatTranscripts = false
     /// Generation fences stop late passes from publishing into a restarted cache or container.

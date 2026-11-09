@@ -31,7 +31,8 @@ extension QuietSettings {
         var rows: [QuietSetting] = []
         rows.append(defaultsBool(
             id: "personality.self_improvement", page: "settings",
-            label: "Weekly self-improvement pass", key: "selfImprovementEnabled", defaultOn: true
+            label: "Overnight revision", key: "selfImprovementEnabled", defaultOn: true,
+            note: "Overnight, the agent may revise a part that keeps failing, as a trial the record keeps or sets aside."
         ).ownedByMind())
         rows.append(QuietSetting(
             id: "personality.dreams", page: "settings", label: "Dreams at night",
@@ -39,7 +40,7 @@ extension QuietSettings {
             note: "One switch over two policy gates (personalityPolicy.dream_cycle_enabled and "
                 + "trainingPolicy.dream_scheduler), which move together. The read-back is the "
                 + "composite, so it says whether dreams can actually run.",
-            read: { appModel in .bool(try await appModel.dreamEnabled()) },
+            read: .dreams,
             write: { appModel, value, context in
                 let enabled = try boolValue(value, "Dreams at night")
                 guard await appModel.setDreamCycleEnabled(enabled) else {
@@ -51,7 +52,7 @@ extension QuietSettings {
         rows.append(QuietSetting(
             id: "personality.rem_cycle", page: "settings",
             label: "Weekly dream consolidation", kind: .boolean,
-            read: { host in .bool(try await readMindPolicy(host).trainingPolicy?.rem_cycle_enabled ?? true) },
+            read: .remCycle,
             write: { appModel, value, context in
                 let enabled = try boolValue(value, "Weekly dream consolidation")
                 guard await appModel.setRemCycleEnabled(enabled) else {

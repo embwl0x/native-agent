@@ -8,7 +8,7 @@ import SystemOps
 // Blueprint: | `ProductionExport+Archive.swift` | Owner-selected copy scopes, coherent SQLite and credential exclusions. |
 
 extension ProductionExport {
-    public typealias ArtifactProcessRunner = @Sendable (String, [String], URL, TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String)
+    public typealias ArtifactProcessRunner = @Sendable (String, [String], URL) async throws -> (status: Int32, stdout: String, stderr: String)
 
     /// Export consistent SQLite memory and selected stores as one checksummed archive recorded in the registry.
     public static func createArchive<Hardening: Encodable>(
@@ -124,7 +124,7 @@ extension ProductionExport {
         "runtime",
         "release",
         "activity/events.jsonl",
-        "harness/learning_receipts.jsonl",
+        "body/learning_receipts.jsonl",
         "improvements/gauntlet/runs.json",
         "telegram/state.json",
         "cutover",
@@ -156,8 +156,7 @@ extension ProductionExport {
         let result = try await runProcess(
             "/usr/bin/tar",
             ["-czf", archiveURL.path, "-C", sourceDirectory.path, "."],
-            sourceDirectory.deletingLastPathComponent(),
-            180
+            sourceDirectory.deletingLastPathComponent()
         )
         guard result.status == 0 else {
             throw NSError(domain: "NativeAgentArtifact", code: Int(result.status), userInfo: [

@@ -1,5 +1,10 @@
 export const HOST_ID = "com.nativeagent.chrome";
 export const PROTOCOL_VERSION = 1;
+// About eight screens of a page per read; find and more reach further without putting a whole site in every turn.
+export const DEFAULT_SNAPSHOT_NODES = 400;
+export const DEFAULT_SNAPSHOT_TEXT_CHARS = 32_000;
+export const MAX_SNAPSHOT_NODES = 2_000;
+export const MAX_SNAPSHOT_TEXT_CHARS = 200_000;
 
 export const ACTIONS = Object.freeze([
   "attach",
@@ -8,6 +13,7 @@ export const ACTIONS = Object.freeze([
   "navigate",
   "page.snapshot.read",
   "page.look",
+  "page.preview",
   "page.element.click",
   "page.element.fill",
   "page.element.type",
@@ -160,18 +166,40 @@ function validatePayload(action, payload) {
     case "page.look":
       requireInteger(payload.tabId, "tabId", 0);
       optionalInteger(payload.expectedUserSequence, "expectedUserSequence", 0, Number.MAX_SAFE_INTEGER);
+      if (action === "page.look") optionalInteger(payload.screenPreviewMaxWidth, "screenPreviewMaxWidth", 1, 4096);
+      return;
+    case "page.preview":
+      requireInteger(payload.tabId, "tabId", 0);
+      optionalInteger(payload.expectedUserSequence, "expectedUserSequence", 0, Number.MAX_SAFE_INTEGER);
+      requireInteger(payload.maxWidth, "maxWidth", 1, 4096);
+      optionalBoolean(payload.hasReadText, "hasReadText");
       return;
     case "navigate":
       optionalInteger(payload.tabId, "tabId", 0, Number.MAX_SAFE_INTEGER);
       optionalInteger(payload.expectedUserSequence, "expectedUserSequence", 0, Number.MAX_SAFE_INTEGER);
+      optionalBoolean(payload.newTab, "newTab");
+      if (payload.newTab === true && (payload.tabId !== undefined || ["back", "forward"].includes(payload.url))) {
+        throw new ProtocolError("invalid_payload", "newTab opens a destination in a new tab; omit tabId and do not use back/forward.");
+      }
       // "back" / "forward" walk the owned tab's own history.
       if (payload.url !== "back" && payload.url !== "forward") requireNavigationURL(payload.url);
       return;
     case "page.snapshot.read":
       requireInteger(payload.tabId, "tabId", 0);
+      if (payload.navigationStartedAtMs !== undefined) {
+        requireFiniteNumber(payload.navigationStartedAtMs, "navigationStartedAtMs", 0, Number.MAX_SAFE_INTEGER);
+      }
+      optionalString(payload.expectedDocumentId, "expectedDocumentId", 128);
+      if (payload.expectedURL !== undefined) requireNavigationURL(payload.expectedURL);
       optionalInteger(payload.expectedUserSequence, "expectedUserSequence", 0, Number.MAX_SAFE_INTEGER);
+      optionalInteger(payload.screenPreviewMaxWidth, "screenPreviewMaxWidth", 1, 4096);
       if (payload.readCursor !== undefined) {
         const cursor = requireObject(payload.readCursor, "readCursor");
+        requireInteger(cursor.tabId, "readCursor.tabId", 0);
+        if (cursor.tabId !== payload.tabId) throw new ProtocolError("invalid_payload", "This continuation belongs to another tab.");
+        requireId(cursor.documentId, "readCursor.documentId");
+        requireId(cursor.frameDocumentId, "readCursor.frameDocumentId");
+        if (!["content", "overlay"].includes(cursor.readLayer)) throw new ProtocolError("invalid_payload", "A continuation must name its reading layer.");
         requireHttpURL(cursor.url);
         optionalString(cursor.frameURL, "frameURL", 8192);
         requireInteger(cursor.frameId, "frameId", 0);
@@ -182,8 +210,21 @@ function validatePayload(action, payload) {
           }
           requireFiniteNumber(position.distance, "position.distance", 0, Number.MAX_SAFE_INTEGER);
           requireInteger(position.ordinal, "position.ordinal", 0);
+          if (!Array.isArray(position.flow) || position.flow.length < 4) {
+            throw new ProtocolError("invalid_payload", "A reading position needs its layout order. Read the current page for a new continuation.");
+          }
+          for (const value of position.flow) requireFiniteNumber(value, "position.flow", -Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+          optionalBoolean(position.overlay, "position.overlay");
+          optionalBoolean(position.complementary, "position.complementary");
+        }
+        if (cursor.anchor !== undefined) {
+          const anchor = requireObject(cursor.anchor, "readCursor.anchor");
+          requireId(anchor.identity, "readCursor.anchor.identity");
+          requireId(anchor.key, "readCursor.anchor.key");
+          if (!cursor.position) throw new ProtocolError("invalid_payload", "A content anchor needs its reading position.");
         }
         optionalInteger(cursor.textOffset, "textOffset", 0, Number.MAX_SAFE_INTEGER);
+        optionalString(cursor.find, "readCursor.find", 2_048);
         optionalInteger(cursor.optionOffset, "optionOffset", 0, Number.MAX_SAFE_INTEGER);
         optionalBoolean(cursor.elementOnly, "elementOnly");
         if (cursor.viewportObservationId !== undefined) {
@@ -196,8 +237,12 @@ function validatePayload(action, payload) {
           throw new ProtocolError("invalid_payload", "Read continuations use page positions; read the current viewport to get a new continuation.");
         }
       }
-      optionalInteger(payload.maxNodes, "maxNodes", 1, 500);
-      optionalInteger(payload.maxTextChars, "maxTextChars", 1, 50000);
+      optionalInteger(payload.maxNodes, "maxNodes", 1, MAX_SNAPSHOT_NODES);
+      optionalInteger(payload.maxTextChars, "maxTextChars", 1, MAX_SNAPSHOT_TEXT_CHARS);
+      optionalString(payload.find, "find", 2_048);
+      if (payload.find !== undefined && (!payload.find.trim() || payload.readCursor !== undefined)) {
+        throw new ProtocolError("invalid_payload", "find needs text and cannot be combined with a continuation.");
+      }
       if (payload.scope !== undefined && !["page", "main_content"].includes(payload.scope)) {
         throw new ProtocolError("invalid_payload", "Snapshot scope must be page or main_content.");
       }

@@ -283,9 +283,9 @@ package actor AgentWorkspaceNavigation {
                 do { return tool + ":" + (try ["query", "list_name", "due_start", "due_end", "undated_only", "include_completed", "offset"].map { try (
                     input[$0] ?? .null).serialize(pretty: false) }.joined(separator: "\u{0}")) }
                 catch { return nil }
-            case "mail_search": target = "query"
-            case "messages_recent_threads": target = "thread_id"
-            case "mail_list_recent":
+            case "mail.search": target = "query"
+            case "messages.recent": target = "thread_id"
+            case "mail.recent":
                 guard case .int(let id)? = input["message_id"], case .string(let expected)? = input["expected_message_id"] else { return nil }
                 return "mail:" + String(id) + "\u{0}" + expected
             case "browser.chrome_snapshot":

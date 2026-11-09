@@ -167,27 +167,6 @@ public enum ConnectorRegistryActions {
         let rows = try await SwiftNativeConnectorsClient(root: root).listWorkspaces()
         return try JSONDecoder().decode([WorkspaceRecord].self, from: JSONValue.array(rows).serializedData(pretty: false))
     }
-
-    public static func searchWorkspace(query: String, root: URL) async throws -> WorkspaceSearchResponse {
-        try await SwiftNativeConnectorsClient(root: root).searchWorkspaces(query: query)
-    }
-}
-
-public struct WorkspaceSearchResult: Identifiable, Codable, Hashable, Sendable {
-    public var workspaceId: String?
-    public var workspaceName: String?
-    public var path: String
-    public var relativePath: String
-    public var reason: String
-
-    public var id: String { path }
-}
-
-public struct WorkspaceSearchResponse: Codable, Hashable, Sendable {
-    public var query: String
-    public var results: [WorkspaceSearchResult]
-    /// Scope the search could not examine, "path: why"; absent when it saw all of it.
-    public var unexamined: [String]?
 }
 
 public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {

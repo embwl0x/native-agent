@@ -5,6 +5,7 @@ import TurnTrace
 import AuthoredCapabilities
 import AttentionRouting
 import ChatTurnContracts
+import ChatTurnRuntime
 import ChatToolRuntime
 import AgentConversations
 import ChatToolParsing
@@ -72,9 +73,11 @@ extension AppToolExecutor {
                 remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
         }
         guard (1...AppScriptRunner.actionLimit).contains(entries.count) else {
+            let advice = try Self.doorBatchAdvice(.array(entries), input: base.merging(["actions": .array(entries)]) { _, entries in entries })
             return Self.doorRefusal("invalid_actions",
                 "One call runs 1 to \(AppScriptRunner.actionLimit) actions; this one has \(entries.count). Nothing ran.",
-                remedy: "correct_arguments", "Split it into calls of at most \(AppScriptRunner.actionLimit).")
+                remedy: "correct_arguments", "Use try_instead's declared batch shape; split it into calls of at most \(AppScriptRunner.actionLimit).",
+                extra: ["try_instead": advice])
         }
         let snapshot = execution.notesSnapshot ?? DoorNotesSnapshot()
         var batchExecution = execution
@@ -84,29 +87,38 @@ extension AppToolExecutor {
         defer { if outerBatch { snapshot.versions = nil } }
         let given = Self.doorText(base["expected_version"])
         if let scope = given.split(separator: "@").first?.split(separator: "/").first.map(String.init) {
-            snapshot.versions?[doorPage(scope)?.id ?? scope] = .string(given)
+            let pageID = await doorPage(scope)?.id ?? scope
+            snapshot.versions?[pageID] = .string(given)
         }
         var receipts: [ToolResult] = []
         var stopped = false
+        var handedBack = false
         var barrier: (index: Int, action: String, reply: ToolResult)?
         var notRun: [(index: Int, action: String)] = []
         var readsAfter: [String] = []
         var nextIndex = 0
-        // Each action reads the inbox only after itself, matching script execution.
         for (index, entry) in entries.enumerated() {
             if stopped || Task.isCancelled { stopped = true; break }
-            guard case .object(let fields) = entry else {
-                let reply = ToolResult(Self.doorRefusal("invalid_actions", "Each entry is one app call, an object. Nothing ran.",
-                    remedy: "correct_arguments", "Write it as {action, args}, {page} or {item}."))
-                receipts.append(reply)
-                if barrier == nil { barrier = (index + 1, "app", reply) }
-                nextIndex = index + 1
-                continue
+            if let session = turn.verifiedSessionID ?? turn.session, await ChatTurnSteering.shared.personWaiting(in: session) {
+                handedBack = true
+                break
             }
-            var call = base.filter { $0.key != "expected_version" }.merging(fields) { $1 }
-            // A previewed list previews every entry; an entry's own preview:false never runs one.
-            if base["preview"] == .bool(true) { call["preview"] = .bool(true) }
+            var call = base.filter { $0.key != "expected_version" }
             do {
+                guard case .object(let fields) = entry else {
+                    // Suggest only the refused entry: earlier entries may already have changed something.
+                    let advice = try Self.doorBatchAdvice(entry, input: base.merging(["actions": entry]) { _, entry in entry })
+                    let reply = ToolResult(Self.doorRefusal("invalid_actions", "Each entry is one app call, an object. Nothing ran.",
+                        remedy: "correct_arguments", "Write this entry using try_instead's declared shape; earlier entries keep their receipts.",
+                        next: advice.objectValue, extra: ["try_instead": advice]))
+                    receipts.append(reply)
+                    if barrier == nil { barrier = (index + 1, "app", reply) }
+                    nextIndex = index + 1
+                    continue
+                }
+                call.merge(fields) { $1 }
+                // A previewed list previews every entry; an entry's own preview:false never runs one.
+                if base["preview"] == .bool(true) { call["preview"] = .bool(true) }
                 let action = (try await AppActions.resolvedAction(Self.doorText(call["action"]),
                                                              dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot(), turn: turn))?.action
                 let name = action?.id ?? ["action", "page", "item"].map { Self.doorText(call[$0]) }.first(where: { !$0.isEmpty })
@@ -123,6 +135,10 @@ extension AppToolExecutor {
                 } else { page = action?.page ?? "" }
                 if call["expected_version"] == nil { call["expected_version"] = snapshot.versions?[page] }
                 if Task.isCancelled { stopped = true; break }
+                if let session = turn.verifiedSessionID ?? turn.session, await ChatTurnSteering.shared.personWaiting(in: session) {
+                    handedBack = true
+                    break
+                }
                 let receipt: JSONValue
                 do { receipt = try await perform("app", call, turn, batchExecution) }
                 catch is CancellationError {
@@ -149,7 +165,8 @@ extension AppToolExecutor {
             }
         }
         stopped = stopped || Task.isCancelled
-        return await settle { @MainActor [receipts, stopped, barrier, notRun, readsAfter, nextIndex] in
+        return await settle { @MainActor [receipts, stopped, handedBack, barrier, notRun, readsAfter, nextIndex] in
+            let failure = receipts.first { $0.carriesFailureEvidence }
             // A person wait speaks for the batch; a skipped permission card does so only if nothing ran, since answering replays it.
             let speaking = receipts.first { ChatToolOutcome.isWaitingApproval($0.payload) || $0.isWaitingInteraction }
                 ?? (receipts.allSatisfy { ChatToolOutcome.neverRan($0.payload) }
@@ -173,7 +190,7 @@ extension AppToolExecutor {
             }
             result["remedy"] = landed == 0 && partial == 0 ? .object(["kind": .string("per_receipt"),
                 "instruction": .string("Each receipt says why it did not land and what to do next."), "next_call": .null]) : nil
-            if !stopped, case .object(let waiting)? = speaking?.payload {
+            if !stopped, !handedBack, case .object(let waiting)? = speaking?.payload {
                 result = waiting.merging(["receipts": .array(receipts.map(\.payload))]) { _, value in value }
             }
             if let barrier {
@@ -186,6 +203,28 @@ extension AppToolExecutor {
                 result["failed_step"] = .int(Int64(barrier.index))
                 result["not_run"] = .array(notRun.map { .object(["index": .int(Int64($0.index)), "action": .string($0.action)]) })
                 result["steps_total"] = .int(Int64(entries.count))
+            }
+            if !stopped, handedBack {
+                // An earlier step's real failure stays the batch's word, with its remedy; the hand-back only adds what did not start.
+                if let failure {
+                    result["remedy"] = failure.remedy ?? result["remedy"] ?? nil
+                } else {
+                    result["status"] = .string(receipts.isEmpty ? "skipped" : "partial")
+                    result["remedy"] = nil
+                }
+                result["reason"] = .string("person_arrival")
+                result["detail"] = .string(Self.doorText(result["detail"]) + " A message from the person is waiting. "
+                    + "Steps \(nextIndex + 1) through \(entries.count) did not start; "
+                    + "earlier steps keep their receipts. Read the message before deciding what to do next.")
+                let skipped = Set(notRun.map(\.index))
+                result["unrun"] = .array(entries.enumerated().compactMap { index, entry in
+                    index >= nextIndex || skipped.contains(index + 1) ? entry : nil
+                })
+                result["next_step"] = .int(Int64(nextIndex + 1))
+                if receipts.isEmpty {
+                    result["execution"] = .string("not_run")
+                    result["effects"] = .string("none")
+                }
             }
             return .object(result)
         }

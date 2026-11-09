@@ -65,7 +65,6 @@ public actor SwiftNativeApprovalInbox {
     ]
     /// Owner reviews allow paired-phone and bound owner-DM decisions, except executable reviews. `validateResolutionAuthority` owns that rule.
     public nonisolated static let ownerReviewActions: Set<String> = [
-        "self_improvement.apply",
         "rem.proposal",
         "care.life",
         "memory.kind_backfill",
@@ -154,18 +153,25 @@ public actor SwiftNativeApprovalInbox {
     }
     @discardableResult
     private func recordProjection(_ record: ApprovalRecord) -> Task<Void, Never> {
-        let projection = ExperienceStore.record(root, record.id) { store in
-            try await Self.project(record, into: store)
+        let projection = ExperienceStore.record(root, record.id) { [root] store in
+            try await Self.project(record, into: store, dataRoot: root)
         }
-        if record.status != "pending", record.decision == nil {
-            let root = root
-            Task {
-                do { try await ForPerson.at(root).answered(record.id, evidence: nil, letGo: .expired) }
-                catch { nativeLog("[approvals] expiry settlement failed for \(record.id): \(error)") }
+        let settlement = Task.detached { [root] in
+            await projection.value
+            if record.status != "pending", record.decision == nil {
+                let operation = "approval.expiry:" + record.id
+                do {
+                    try await ForPerson.at(root).answered(record.id, evidence: nil, letGo: .expired)
+                    await RepairOwed.settle(root, operation: operation, evidence: .init(source: Matter.approvals, id: record.id)).value
+                } catch {
+                    await RepairOwed.owe(root, id: record.id, kind: .decision, operation: operation, owner: Matter.approvals,
+                        words: "Approval expiry could not settle: " + error.localizedDescription,
+                        lever: "Repair the approval's matter and refresh the approval projection.").value
+                }
             }
         }
         // Later answers settle with the decision; the first rides its continuation. Without a decision, the inbox lets go of every answer it held.
-        guard record.status != "pending", case .object(let payload) = record.payload else { return projection }
+        guard record.status != "pending", case .object(let payload) = record.payload else { return settlement }
         var heards: [JSONValue] = if case .array(let waiting)? = payload["waitingHeards"] { waiting } else { [] }
         if record.decision == nil, case .object(let origin)? = payload["origin"],
            case .string(let heard)? = origin["answerExperienceID"], !heards.contains(.string(heard)) {
@@ -180,7 +186,7 @@ public actor SwiftNativeApprovalInbox {
                 try await store.append([settle], to: heard)
             }
         }
-        return projection
+        return settlement
     }
     /// The durable domain row is the decision's source, not its advisory copy. Reads are projections only; a failed experience write cannot hold a turn.
     public func decisionsForREM() async throws -> [String: Experience] {
@@ -194,10 +200,10 @@ public actor SwiftNativeApprovalInbox {
         }
         return decisions
     }
-    private static func project(_ record: ApprovalRecord, into store: ExperienceStore) async throws {
+    private static func project(_ record: ApprovalRecord, into store: ExperienceStore, dataRoot: URL) async throws {
         let projection = record.decisionExperience
         if try await store.experience(record.id) == nil {
-            var born = record.matter.born(doors: record.isAgentsOwnDecision ? [] : try record.personDoors)
+            var born = record.matter.born(doors: record.isAgentsOwnDecision ? [] : try record.personDoors(dataRoot: dataRoot))
             if record.isAgentsOwnDecision { born.addressedTo = [] }
             try await store.begin(born)
         }
@@ -298,20 +304,21 @@ public actor SwiftNativeApprovalInbox {
         } else {
             payload = .object([:])
         }
+        let action = codepointPrefix(pyStr(bodyObj["action"], fallback: "unknown"), 120)
+        // A filer that words nothing gets its call said in words, never its serialized payload.
         let rawPayloadPreview: String
         if case .string(let s)? = bodyObj["payloadPreview"],
            !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             rawPayloadPreview = s
         } else {
-            rawPayloadPreview = (try? payload.serialize(pretty: false)) ?? ""
+            rawPayloadPreview = ApprovalWords.call(tool: action, input: payload.objectValue?["input"] ?? payload).says
         }
         if let id = turn?.hostCallID, case .object(var fields) = payload {
             fields["hostCallID"] = .string(id.uuidString)
             payload = .object(fields)
         }
-        let action = codepointPrefix(pyStr(bodyObj["action"], fallback: "unknown"), 120)
         // Every executable-code approval shows the whole staged review.
-        let executableReview = Self.requiresExecutableReview(action: action, payload: payload)
+        let executableReview = Self.requiresExecutableReview(action: action)
         let previewLimit = executableReview ? Self.skillScriptPreviewLimit : 4000
         guard !executableReview || rawPayloadPreview.count <= previewLimit else {
             throw ApprovalInboxError.malformedResponse("the script is too long to show whole on the card")
@@ -350,10 +357,9 @@ public actor SwiftNativeApprovalInbox {
         let stamp = isoTimestamp(now)
         var approval = ApprovalRecord(
             id: UUID().uuidString.lowercased(),
-            title: codepointPrefix(turn?.requester.map {
-                let verb = ToolActivityPresentation.title(action)
-                return "\($0) wants to \(verb.prefix(1).lowercased())\(verb.dropFirst())"
-            } ?? strip(pyStr(bodyObj["title"], fallback: "Approval required")), 160),
+            // A part or script that asked is named first, in the one asker form the card keeps.
+            title: codepointPrefix((turn?.requester.map { $0 + ApprovalRecord.askerSeparator } ?? "")
+                + strip(pyStr(bodyObj["title"], fallback: "Approval required")), 160),
             action: action,
             risk: pyStr(bodyObj["risk"], fallback: "medium"),
             reason: codepointPrefix(strip(pyStr(bodyObj["reason"], fallback: "")), 1000),
@@ -457,7 +463,9 @@ public actor SwiftNativeApprovalInbox {
             try await SwiftNativePersistenceCore.writeJSON(.array(mutated), to: approvalsPath)
             return annotated
         }
-        let settled = try readContinuations([record])[0]
+        guard let settled = try readContinuations([record]).first else {
+            throw ApprovalInboxError.malformedResponse("approval \(record.id) has no execution continuation")
+        }
         await ApprovalLifecycleBus.shared.publish(.init(phase: .executed, record: settled,
             result: result ?? executedAction))
         await recordProjection(settled).value

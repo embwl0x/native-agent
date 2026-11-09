@@ -56,8 +56,9 @@ the old add-time coercion of a non-rhythm standing step to once is removed.
 
 A MY QUEUE step's `action` becomes real: `{action: "<action id>", args: {…}}`
 (usually `authored.<their ability>`), set by `queue.add`/`queue.update`. When the
-step's moment comes round (the same `considerCarried` path the `say` reflex
-uses — clock, rhythm, person, news, signal), the action runs through the door
+step's moment comes round (MY QUEUE's moment pass in
+`NativeCognitionRuntime+Pursuit.swift`, the same one the `say` reflex uses —
+clock, rhythm, person, news, signal), the action runs through the door
 as their own call (origin self, their posture's gates, the part-wake run path),
 with no model call. Then:
 
@@ -66,46 +67,47 @@ with no model call. Then:
 - **It asks for them**: any receipt or nested result has `effects:"unknown"`,
   the result carries `needs_me: "<why>"` (an ability that
   gathers and wants their judgment says so), or the run failed, was refused, or
-  waits on the person → they are woken as today, and the turn opens with the
-  run's receipt as `already_looked` — they starts from what the habit found
-  instead of redoing it.
+  waits on the person → the step's `moment` happening is posted with the
+  run's receipt beside it as `already_looked`, and the thought starts from what
+  the habit found instead of redoing it.
 
 `say` and `action` together: the action runs first; the words are said when it
 finished and needed nothing. `needs_me` is new vocabulary for their abilities, so
 ability.save's help and the keep prompt name it: a habit that gathers and wants
 their judgment returns `{…, needs_me: "<why>"}`.
 Unknown effects never close the step or send its fixed words. A habit's
-`chat.post` carries initiative `.intention`, as its own wake turn does: its
-moment paces speech without spending the hourly proactive quota.
+`chat.post` uses the shared deduplicated speech owner without an hourly quota.
 
-`considerCarried` uses the same prompt and quiet readiness as speech. Its
+The habit's run (`runCarriedAction`) is taken at the same moment as speech. Its
 host reaches `EnginePartWake`'s shared self-call door, with the carried peer
 steering, current Chat model binding, Autonomy and ordinary Trust gates.
 There is no planning model call. An ability that itself declares model work
 can still do that work. The authored runner's `returned` value is inspected
 for `needs_me`, inside the door's result receipt.
 
-The existing ResidentWake ledger keeps the latest attempted occurrence per
-step (at most 256). It reserves an unknown-outcome receipt before effects and
+MY QUEUE's carried ledger (`AgentWorkspace/MyQueueCarried.swift`,
+`desk/my-queue-carried.json`) keeps the latest attempted occurrences (at most 256). It reserves an unknown-outcome receipt before effects and
 keeps the actual receipt through `settle` afterward. A stopped or interrupted
 attempt reaches their with that unknown outcome instead of running again.
+An already-run receipt's `already_looked` handoff is also awaited through
+`settle`, under its original occurrence and route, before the next occurrence
+can replace the run. Readiness changes and Stop can cancel new work, never this handoff.
 Successful action plus speech reuses the run receipt if speech needs a retry.
 Successful delivery records the occurrence and its owed Desk settlement in
-one wake-ledger write, then keeps its `Ran h:mm a` one-line note (and `Said`
+one carried-ledger write, then keeps its `Ran h:mm a` one-line note (and `Said`
 note when present) idempotently and closes a `once` step using a fresh
 unchanged-step snapshot. Launch and each carried pass finish saved debts
 without running the habit or speaking again, then mark them settled.
 Changed or already closed steps are left alone. Standing and rhythms remain open;
 their next occurrence is still owned by `IntentionClock`. An until condition
-in words still needs their judgment. An unfinished/refused/needs-me result rides
-the normal carried arrival as `already_looked` text; refreshing that arrival
-preserves the receipt. What comes out is the display-only planned call and
-the routine wake merely to decide to run it.
+in words still needs the agent's judgment. An unfinished/refused/needs-me result
+rides the step's moment as `already_looked` text. What comes out is the
+display-only planned call and the routine thought merely to decide to run it.
 
 ### H2 — a habit forms from what they keeps doing (their law, their choice)
 
-**As built in source, 10-30.** `EngineCarriedHabits` joins the durable
-resident-wake terminal and persisted dispatch-closure notifications in either
+**As built in source, 10-30.** `EngineCarriedHabits` joins a mind-stream
+thought's terminal and persisted dispatch-closure notifications in either
 order: closure re-reads the trial, and the existing turn identity prevents a
 duplicate trial. Off the turn path,
 it drains accepted trace ingress and reads that turn's `work.identified.workIdentity`
@@ -118,11 +120,11 @@ An overlong handling is unknown, not a clipped candidate. Damaged state is
 retained and logged, never replaced by an empty ledger.
 
 Each occurrence of a carried step is a trial. The handling of an occurrence is
-the wake turn's first top-level ability run (or, when they ran none, its ordered
+the thought's first top-level ability run (or, when none ran, its ordered
 call ids). When the same handling recurs and stands under `Expectation`
 (hits = occurrences handled that way, tries = occurrences, cHit = the turn's
-measured model calls, cMiss = one wasted run plus the wake it still causes),
-the next carried line for that step says so, in the line they already reads:
+measured model calls, cMiss = one wasted run plus the thought it still causes),
+the step's next moment says so, beside the line the agent already reads:
 
 > You meant to (desk.68): office check-in … You have handled it the same way
 > 4 times (authored.office-checkin). To let it run on its own and wake you only
@@ -133,10 +135,10 @@ They decides; nothing binds behind their back. A bound habit they can drop with
 step's notes (their own record of how they changed).
 
 The most repeated handling's hit cost is its turns' mean model-call count;
-miss cost is one run plus the recorded trials' mean wake model calls.
-`Expectation.stands(..., among: nil)` is the only standing law. The carried
-arrival offers that choice at most once per local day and retains the offered
-words while it waits. Ordered hand work without an authored call asks their to
+miss cost is one run plus the recorded trials' mean thought model calls.
+`Expectation.stands(..., among: nil)` is the only standing law. A step's
+moment offers that choice at most once per local day (only a moment not yet in
+the record carries it). Ordered hand work without an authored call asks the agent to
 keep it as an ability first, then bind that authored id. Nothing binds itself.
 No trace read, model call or file write is added to a model turn for learning;
 its existing work-identification event now also names its work identity.
@@ -191,12 +193,12 @@ crystallizer; there is no producer of new compiled candidates.
 
 ## Proof on them
 
-- Before/after: model calls per carried wake (traces: `llm.call` per
-  `turn.accepted` in resident-wake with work identity `carry.*`); no
+- Before/after: model calls per carried thought (traces: `llm.call` per
+  `turn.accepted` in `mind` with work identity `carry.*`); no
   `llm.call` row has `purpose: keep`.
 - Drive: bind desk.68 via queue.update; the 16:00 (or next) occurrence runs
   with no model call and leaves its "Ran" note; an ability that returns
-  `needs_me` wakes their with `already_looked`.
+  `needs_me` opens a thought with `already_looked`.
 - The habit line appears on a step they have handled the same way ≥ standing.
 - H3: first hand-work meeting traces `met:first, noted:false`; a later meeting
   traces `met:again`, with `noted:true` only when no active recorded route covers
@@ -207,5 +209,5 @@ crystallizer; there is no producer of new compiled candidates.
 
 | Lane | What | Owners |
 |---|---|---|
-| habits-reflex | H1 + H2 | Desk/MyQueue.swift, Desk/DeskCadence.swift (DeskStep.action), AppToolRuntime/AppToolExecutor+MyQueue.swift (queue.add/update action), Cognition/NativeCognitionRuntime+Pursuit.swift (run on due), EngineRuntime/EnginePartWake.swift run path (reuse), AgentWorkspace/HarnessQueue.swift (the habit line), NativeAgentCore/Expectation.swift (use), docs |
+| habits-reflex | H1 + H2 | Desk/MyQueue.swift, Desk/DeskCadence.swift (DeskStep.action), AppToolRuntime/AppToolExecutor+MyQueue.swift (queue.add/update action), Cognition/NativeCognitionRuntime+Pursuit.swift (run on due), EngineRuntime/EnginePartWake.swift run path (reuse), AgentWorkspace/CarriedHabits.swift (the habit line), NativeAgentCore/Expectation.swift (use), docs |
 | habits-keep | H3 + H4 | Resources/abilities/turn.js, ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift (familiarity nerve inside the turn), removed nightly compiler/recorder, docs/SURPRISE.md S3/S4 |

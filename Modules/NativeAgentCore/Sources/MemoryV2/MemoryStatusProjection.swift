@@ -9,7 +9,7 @@ public enum MemoryRecoveryReadout {
                                              owedCount: owed)
     }
 
-    public static func getMemoryV2Status(dataRoot: URL) async throws -> MemoryV2Status {
+    @concurrent public static func getMemoryV2Status(dataRoot: URL) async throws -> MemoryV2Status {
         // Counts stay in SQLite; embedding fields share one runtime snapshot.
         var memCount: Int?
         var activeCount: Int?
@@ -70,7 +70,7 @@ public enum MemoryRecoveryReadout {
 
     /// Count every canonical occurrence in the requested weeks, including graduated rows, before bounding examples. Incomplete history fails explicitly;
     /// disclosure withholds text but never counts.
-    public static func misses(dataRoot: URL, weeks: [String], surface: String? = nil) async throws -> [MemoryMissLesson] {
+    @concurrent public static func misses(dataRoot: URL, weeks: [String], surface: String? = nil) async throws -> [MemoryMissLesson] {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let calendar = Calendar(identifier: .iso8601)
         let windows = try weeks.map { week -> DateInterval in
@@ -292,13 +292,4 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         coreMLLastLoadError = runtime.lastLoadError
         coreMLLoadCount = runtime.loadCount
     }
-}
-
-extension MemoryRecoveryReadout {
-    /// Nil means the miss ledger could not be read, never zero misses.
-    public static func recentMisses(dataRoot: URL) async -> [MemoryMissLesson]? {
-        try? await MemoryRecoveryReadout.misses(
-            dataRoot: dataRoot, weeks: [MemoryRecoveryReadout.isoWeek(), MemoryRecoveryReadout.isoWeek(ago: 1)])
-    }
-
 }

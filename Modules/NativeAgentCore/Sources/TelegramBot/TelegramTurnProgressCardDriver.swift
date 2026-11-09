@@ -11,7 +11,7 @@ struct TelegramTurnProgressCardDriverSnapshot: Sendable, Equatable {
     let messageId: Int?
 }
 
-/// Coalesce transient active-card misses; the ledger owns terminal delivery repair.
+/// One event-driven card writer; the ledger owns terminal delivery repair.
 actor TelegramTurnProgressCardDriver {
     typealias SendCard = @Sendable (
         _ token: String,
@@ -34,8 +34,6 @@ actor TelegramTurnProgressCardDriver {
     private let token: String
     private let destination: TelegramDestination
     private let turnId: UUID
-    private let minimumEditInterval: TimeInterval = 5
-    private let heartbeatNanoseconds: UInt64 = 7_000_000_000
     private let face: TelegramProgressFace
     private let sendCard: SendCard
     private let editCard: EditCard
@@ -52,12 +50,8 @@ actor TelegramTurnProgressCardDriver {
     private var initialSendAttempted = false
     private var transportFailed = false
     private var lastRenderedText: String?
-    private var lastEditAt: Date?
-    private var heartbeatTask: Task<Void, Never>?
     private var progressFlushTask: Task<Void, Never>?
     private var progressFlushRequested = false
-    private var progressForcedFlush = false
-    private var progressBypassThrottle = false
     private var untrackedCardSettlementRequested = false
     private var terminalLedgerRowRemoved = false
     private var detailsVisible = false
@@ -111,15 +105,13 @@ actor TelegramTurnProgressCardDriver {
             )
             messageId = sentMessageId
             lastRenderedText = rendered
-            lastEditAt = now
             guard await persistIdentity(at: now, terminalText: nil) else {
                 transportFailed = true
                 untrackedCardSettlementRequested = true
-                scheduleProgressFlush(force: true, bypassThrottle: true)
+                scheduleProgressFlush()
                 await progressFlushTask?.value
                 return
             }
-            startHeartbeatIfNeeded()
         } catch {
             transportFailed = true
             await reportFailure(step: "initial send", error: error)
@@ -136,11 +128,14 @@ actor TelegramTurnProgressCardDriver {
                     state, lifecycle: .working(action: nil), at: Date()
                 )
             }
-            scheduleProgressFlush(force: true, bypassThrottle: true)
+            scheduleProgressFlush()
             return
         }
         replyTextSettled = false
-        if case .delta(let chunk) = event { accumulatedUTF16Length += chunk.utf16.count }
+        if case .delta(let chunk) = event {
+            let (length, overflow) = accumulatedUTF16Length.addingReportingOverflow(chunk.utf16.count)
+            if !overflow { accumulatedUTF16Length = length }
+        }
         let next = TelegramTurnPresentationReducer.reduce(
             state,
             progress: event,
@@ -150,13 +145,11 @@ actor TelegramTurnProgressCardDriver {
         guard next != state else { return }
         state = next
         guard !transportFailed else { return }
-        scheduleProgressFlush(force: false)
+        scheduleProgressFlush()
     }
 
-    private func scheduleProgressFlush(force: Bool, bypassThrottle: Bool = false) {
+    private func scheduleProgressFlush() {
         progressFlushRequested = true
-        progressForcedFlush = progressForcedFlush || force
-        progressBypassThrottle = progressBypassThrottle || bypassThrottle
         guard progressFlushTask == nil else { return }
         progressFlushTask = Task { [weak self] in
             await self?.flushRecordedProgress()
@@ -165,11 +158,7 @@ actor TelegramTurnProgressCardDriver {
 
     private func flushRecordedProgress() async {
         while progressFlushRequested {
-            let force = progressForcedFlush
-            let bypassThrottle = progressBypassThrottle
             progressFlushRequested = false
-            progressForcedFlush = false
-            progressBypassThrottle = false
             if untrackedCardSettlementRequested {
                 untrackedCardSettlementRequested = false
                 await flushUntrackedCard()
@@ -178,7 +167,7 @@ actor TelegramTurnProgressCardDriver {
             guard !transportFailed else { break }
             if !state.isTerminal { _ = await persistIdentity(at: Date(), terminalText: nil) }
             guard !state.isTerminal || terminalIdentityPersisted == true else { break }
-            await flushIfDue(force: force, bypassThrottle: bypassThrottle)
+            await flush()
         }
         progressFlushTask = nil
     }
@@ -204,27 +193,17 @@ actor TelegramTurnProgressCardDriver {
                 transportFailed = true
                 resolveTerminalWaiters(nil)
                 untrackedCardSettlementRequested = true
-                scheduleProgressFlush(force: true, bypassThrottle: true)
+                scheduleProgressFlush()
                 await progressFlushTask?.value
                 return
             }
             resolveTerminalWaiters(state.phase)
-            scheduleProgressFlush(force: true, bypassThrottle: true)
+            scheduleProgressFlush()
         } else {
             guard !transportFailed else { return }
-            scheduleProgressFlush(force: false)
+            scheduleProgressFlush()
         }
         await progressFlushTask?.value
-    }
-
-    @discardableResult
-    func heartbeat() async -> Bool {
-        guard !closed, !state.isTerminal, !transportFailed, messageId != nil else {
-            return false
-        }
-        scheduleProgressFlush(force: false)
-        await progressFlushTask?.value
-        return !state.isTerminal && !transportFailed
     }
 
     func snapshot() -> TelegramTurnProgressCardDriverSnapshot {
@@ -237,14 +216,14 @@ actor TelegramTurnProgressCardDriver {
     func showStatus() async {
         guard !closed, !state.isTerminal else { return }
         detailsVisible = false
-        scheduleProgressFlush(force: true)
+        scheduleProgressFlush()
         await progressFlushTask?.value
     }
 
     func showDetails() async {
         guard !closed, !state.isTerminal else { return }
         detailsVisible = true
-        scheduleProgressFlush(force: true)
+        scheduleProgressFlush()
         await progressFlushTask?.value
     }
 
@@ -258,34 +237,11 @@ actor TelegramTurnProgressCardDriver {
         return response.phase
     }
 
-    private func startHeartbeatIfNeeded() {
-        guard heartbeatTask == nil, !state.isTerminal else {
-            return
-        }
-        let delay = heartbeatNanoseconds
-        heartbeatTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    try await Task.sleep(nanoseconds: delay)
-                } catch {
-                    return
-                }
-                guard !Task.isCancelled, let self else { return }
-                guard await self.heartbeat() else { return }
-            }
-        }
-    }
-
-    private func stopHeartbeat() {
-        heartbeatTask?.cancel()
-    }
-
     /// The turn releases its card only after its remaining wire/projection work settles. Closing the derived face also drains version refreshes.
     func close() async {
         closed = true
         if terminalIdentityPersisted == nil { resolveTerminalWaiters(nil) }
-        let pending = [heartbeatTask, progressFlushTask].compactMap { $0 }
-        heartbeatTask = nil
+        let pending = [progressFlushTask].compactMap { $0 }
         if !state.isTerminal {
             progressFlushRequested = false
             for task in pending { task.cancel() }
@@ -299,23 +255,9 @@ actor TelegramTurnProgressCardDriver {
         }
     }
 
-    private func flushIfDue(force: Bool, bypassThrottle: Bool = false) async {
+    private func flush() async {
         guard !transportFailed, let messageId else { return }
-        var now = Date()
-        if !force, let lastEditAt,
-           now.timeIntervalSince(lastEditAt) < minimumEditInterval {
-            return
-        }
-        if force, !bypassThrottle, let lastEditAt {
-            let remaining = minimumEditInterval - now.timeIntervalSince(lastEditAt)
-            if remaining > 0 {
-                let nanoseconds = UInt64(
-                    min(remaining, minimumEditInterval) * 1_000_000_000
-                )
-                try? await Task.sleep(nanoseconds: nanoseconds)
-                now = Date()
-            }
-        }
+        let now = Date()
         guard !transportFailed, !state.isTerminal || terminalIdentityPersisted == true else { return }
         let renderedState = state
         let renderedReplySettled = replyTextSettled
@@ -333,8 +275,6 @@ actor TelegramTurnProgressCardDriver {
             : TelegramTurnControlCallback.replyMarkup(turnId: turnId)
 
         let deleting = renderedIsTerminal && renderedState.phase == .completed
-        // Cadence bounds attempts as well as successful edits during an outage.
-        lastEditAt = now
         do {
             if deleting {
                 do {
@@ -346,10 +286,7 @@ actor TelegramTurnProgressCardDriver {
             }
             lastRenderedText = rendered
         } catch {
-            if !Self.shouldRetryEdit(after: error) {
-                transportFailed = true
-                stopHeartbeat()
-            }
+            transportFailed = true
             await reportFailure(step: deleting ? "delete" : "edit", error: error)
             return
         }
@@ -399,14 +336,6 @@ actor TelegramTurnProgressCardDriver {
         }
     }
 
-    private static func shouldRetryEdit(after error: Error) -> Bool {
-        if error is CancellationError { return false }
-        guard let failure = error as? TelegramAPIFailure else { return true }
-        if failure.errorCode == 429 || failure.httpStatus == 429 { return true }
-        if let code = failure.errorCode, code >= 500 { return true }
-        return !TelegramAssistantDeliveryDriver.isKnownNotDelivered(error)
-    }
-
     private func reportFailure(step: String, error: Error) async {
         let safe = TurnTraceRedactor.redactText(String(describing: error))
         let detail = "Telegram turn card \(step) failed for chat \(destination.chatId): \(safe)"
@@ -450,9 +379,8 @@ actor TelegramTurnProgressCardDriver {
                 TelegramTurnControlCallback.clearedReplyMarkup
             )
             lastRenderedText = notice
-            lastEditAt = Date()
         } catch {
-            await reportFailure(step: "persistence fallback edit", error: error)
+            await reportFailure(step: "persistence failure notice", error: error)
         }
     }
 }

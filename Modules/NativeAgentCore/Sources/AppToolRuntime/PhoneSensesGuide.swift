@@ -3,7 +3,7 @@ import NativeAgentShared
 import PersistenceCore
 
 // Blueprint: | `PhoneSensesGuide.swift` | Pairing guide reads canonical phone evidence and per-organ setup |
-enum PhoneSensesGuide {
+public enum PhoneSensesGuide {
     static func read(dataRoot: URL) throws -> JSONValue {
         // A damaged history throws through the door's ordinary read failure. It must never become an all-off or setup-complete reading.
         let lines = try PhoneSenseHistory.setupLines(dataRoot)
@@ -12,7 +12,7 @@ enum PhoneSensesGuide {
             "content": .array(lines.map(JSONValue.string)), "guide": .string(steps)])
     }
 
-    static let steps = """
+    public static let steps = """
     Guide for any agent helping its person. These are optional. Read the setup lines above first: they say what the phone last reported, not what silence \
     proves. If setup has not arrived, ask the person to open the paired NativeAgent phone app with the Mac awake and NativeAgent running. Check again once; if \
     still absent, inspect pairing rather than guessing permissions. An off switch, denied permission, unsupported device or no saved place each has its own \
@@ -70,7 +70,7 @@ enum PhoneSensesGuide {
     filenames, identifiers, locations or individual asset dates leave the phone. If the count does not answer in five seconds it is unknown; a late result \
     cannot replace that query's outcome.
 
-    Updates use launch/foreground, enabled Places events, significant location changes only with an existing Always grant, and existing background pushes. \
+    Updates use launch/foreground, each message sent from the phone, enabled Places events, significant location changes only with an existing Always grant, and existing background pushes. \
     None of these senses keep the app running. No reading means unobserved; observations older than fifteen minutes are historical, with current state \
     unknown. Setup is last reported too; reopen the app to refresh changed permissions.
 

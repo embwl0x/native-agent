@@ -115,8 +115,19 @@ public enum ToolSignature {
             return .object(["type": .string("array"),
                 "items": doorProperty(String(shape.dropFirst().dropLast()))])
         }
-        if shape.hasPrefix("{") {
-            return .object(["type": .string("object")])
+        if shape.hasPrefix("{"), shape.hasSuffix("}") {
+            // `{a,b?,c?:int}` declares a closed object: its fields' own shapes, `?` optional.
+            var properties: [String: JSONValue] = [:]
+            var required: [JSONValue] = []
+            for field in shape.dropFirst().dropLast().split(separator: ",") {
+                let parts = field.split(separator: ":", maxSplits: 1).map(String.init)
+                guard let head = parts.first, !head.isEmpty else { continue }
+                let name = head.hasSuffix("?") ? String(head.dropLast()) : head
+                properties[name] = doorProperty(parts.count > 1 ? parts[1] : "string")
+                if !head.hasSuffix("?") { required.append(.string(name)) }
+            }
+            return .object(["type": .string("object"), "properties": .object(properties), "required": .array(required),
+                            "additionalProperties": .bool(false)])
         }
         if shape.contains("|") {
             return .object(["type": .string("string"),

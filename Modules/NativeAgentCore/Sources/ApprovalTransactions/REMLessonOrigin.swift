@@ -123,7 +123,7 @@ public enum REMLessonOrigin {
             // Approval reconciliation records durable lesson evidence, outside a live turn or sense read.
             return try await memory.store(
                 content: text, source: "rem-lesson-origin:\(row.id)", metadata: .object(metadata), id: id,
-                context: MemoryWriteContext(turn: nil, senseReads: nil))
+                context: MemoryWriteContext(turn: nil, senseReads: nil, telling: MemoryRoot.Telling(how: .inferred)))
         } catch {
             // Two runs raced past the read above: the loser finds the winner's row.
             if let kept = try await memory.authorityRecord(id: id) { return kept }

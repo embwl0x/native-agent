@@ -12,7 +12,6 @@ import TrustCenter
 
 /// Effect adapters supplied by the host; transaction ordering and replay fences remain in ApprovalExecution.
 public protocol ApprovalTransactionEffects: Sendable {
-    func disableSkill(name: String, turn: Turn) async throws
     /// Only a reviewed digest admits executable code as the owner's; nil restores Markdown guidance.
     func enableSkill(name: String, reviewedDigest: String?, turn: Turn) async throws
     func runConnectorAction(descriptor: ConnectorActionDescriptor, dryRun: Bool, input: [String: JSONValue], approvedReplayApprovalID: String,

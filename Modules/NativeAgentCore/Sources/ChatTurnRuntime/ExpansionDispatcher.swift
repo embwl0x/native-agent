@@ -8,8 +8,13 @@ import TurnTrace
 import ChatToolRuntime
 // Blueprint: | `ExpansionDispatcher.swift` | `ExpansionDispatcher`; `already_looked`; `ready_to_confirm`; Gated bounded reads and excluded act previews |
 
+/// The turn loop holds opening reads with dispatch; wrappers must carry both operations.
+public protocol ExpansionToolDispatchClient: ToolDispatchClient {
+    func readAhead(surface: String, session: String?, turn: Turn, work: ChatTurnWork) async -> JSONValue?
+}
+
 /// Wrap the gated chain once for practice feedback; nested calls re-enter below this node so the outer call owns them.
-final class ExpansionDispatcher: ToolDispatchClient {
+final class ExpansionDispatcher: ExpansionToolDispatchClient {
     /// Act proposals ride under this marker; learning readers exclude its subtree.
     static let previewResultsKey = "ready_to_confirm"
     private let work: ChatTurnWork
@@ -89,25 +94,18 @@ final class ExpansionDispatcher: ToolDispatchClient {
             if next.nature == .act { call["preview"] = .bool(true) }
             let sent = call
             let inner = self.inner
-            // Reserve half the remaining ceiling to return the original result, and spend no more than the saved round.
-            // Do not start a predicted read whose measured runtime cannot fit.
-            let budget = min(next.within, work.deadlines.secondsLeft.map { $0 / 2 } ?? .infinity)
-            guard !Task.isCancelled, budget >= next.expected else {
+            guard !Task.isCancelled else {
                 await expansion.delivered(caller, invocation: next.invocation, landed: nil, seconds: nil)
                 break
             }
             let started = Date()
             let got: JSONValue?
             do {
-                got = try await TurnDeadline.withThrowingDeadline(seconds: budget, clock: .wallClock, deadlines: work.deadlines) { deadlines in
-                    try await TurnTraceContext.$automaticOrigin.withValue("expansion") {
-                        return try await inner.dispatch(tool: "app", input: sent, surface: surface, turn: turn,
-                            invocation: work.with(\.deadlines, deadlines).invocation)
-                    }
+                got = try await TurnTraceContext.$automaticOrigin.withValue("expansion") {
+                    try await inner.dispatch(tool: "app", input: sent, surface: surface, turn: turn, invocation: work.invocation)
                 }
             } catch {
-                let reason = error is TurnDeadline.DeadlineExceeded ? "deadline"
-                    : error is CancellationError || Task.isCancelled ? "cancelled" : "dispatch_failed"
+                let reason = error is CancellationError || Task.isCancelled ? "cancelled" : "dispatch_failed"
                 fields["expansion_failure"] = .object(["call": .object(next.call),
                     "reason": .string(reason), "message": .string(error.localizedDescription)])
                 got = nil

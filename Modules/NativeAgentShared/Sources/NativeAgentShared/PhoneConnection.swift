@@ -3,8 +3,8 @@ import Foundation
 // Blueprint: | `PhoneConnection.swift` | `NAPhoneConnection`: pairing/transport/exchange assessment; `NAPhoneStanding`: connected and can-approve |
 
 /// Pairing, transport and accepted exchange are independent facts. All surfaces use this assessment to name the first unmet fact and its repair owner.
-public struct NAPhoneConnection: Equatable, Sendable {
-    public enum State: String, Sendable {
+public struct NAPhoneConnection: Equatable, Sendable, Codable {
+    public enum State: String, Sendable, Codable {
         case holds
         /// Not a fault: something is pending on someone, or not known yet.
         case waiting
@@ -12,7 +12,7 @@ public struct NAPhoneConnection: Equatable, Sendable {
         case broken
     }
 
-    public enum Owner: String, Sendable {
+    public enum Owner: String, Sendable, Codable {
         case nobody
         case personOnMac
         case personOnPhone
@@ -22,7 +22,7 @@ public struct NAPhoneConnection: Equatable, Sendable {
         case builder
     }
 
-    public struct Fact: Equatable, Sendable {
+    public struct Fact: Equatable, Sendable, Codable {
         public var state: State
         public var line: String
         public var owner: Owner
@@ -63,8 +63,8 @@ public struct NAPhoneConnection: Equatable, Sendable {
 
 /// What the phone is to the Mac, said once for every surface. The shared iCloud key admits a phone's chat, so a phone is **connected** once it has spoken
 /// over it; it can **approve** only once its own device key is paired on the Mac with the Pair button.
-public struct NAPhoneStanding: Equatable, Sendable {
-    /// Nil when the saved contact evidence can't be read: unknown, never "not connected".
+public struct NAPhoneStanding: Equatable, Sendable, Codable {
+    /// Nil when verified contact evidence is unavailable: unknown, never "not connected".
     public var connected: Bool?
     /// Phones that asked to pair and wait for the Pair button.
     public var waiting: Int
@@ -89,7 +89,7 @@ public struct NAPhoneStanding: Equatable, Sendable {
         switch connected {
         case true?: contact = "Your iPhone is connected over iCloud."
         case false?: contact = "No iPhone has connected over iCloud yet."
-        case nil: contact = "Whether your iPhone has connected can't be read right now."
+        case nil: contact = "No verified iPhone contact is available."
         }
         var approval: [String] = []
         if approvers > 0 { approval.append(approvers == 1 ? "1 phone can approve actions." : "\(approvers) phones can approve actions.") }

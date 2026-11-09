@@ -149,23 +149,6 @@ public actor SwiftNativePersonaEngine {
 
 // MARK: - PersonaDocSpec / PersonaDocListing
 
-public struct PersonaDocSpec: Sendable, Equatable, Codable {
-    public let id: String
-    public let title: String
-    public let filename: String
-    public let path: String
-    public let content: String
-    public let updatedAt: String?
-
-    public init(id: String, title: String, filename: String, path: String, content: String, updatedAt: String?) {
-        self.id = id
-        self.title = title
-        self.filename = filename
-        self.path = path
-        self.content = content
-        self.updatedAt = updatedAt
-    }
-}
 
 public struct PersonaDocListing: Sendable, Equatable, Codable {
     public let docs: [PersonaDocSpec]

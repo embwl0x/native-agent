@@ -1,6 +1,7 @@
 // Resolve without activation so missing, ambiguous and self-process targets can refuse without walking a guessed or unsafe tree.
 
 import Foundation
+import NativeAgentCore
 
 // Blueprint: | `MacBackgroundSight.swift` | `MacBackgroundSight.resolve`: Exact identities precede partial names; preserve ambiguity and source failures |
 
@@ -12,7 +13,7 @@ public enum MacBackgroundSight {
         case notRunning(candidates: [String])
         case ambiguous(candidates: [String])
         case indexUnavailable
-        /// Refuse self-process names before AX resolution because in-process AppKit re-entry can deadlock.
+        /// The agent reads her own state through app pages, never person-only UI.
         case selfProcess
 
         var failureCode: String? {
@@ -44,11 +45,13 @@ public enum MacBackgroundSight {
         func squashed(_ text: String) -> String { normalized(text).filter { $0.isLetter || $0.isNumber } }
         let flat = squashed(bare)
         func resolution(_ hits: [MacAXAppInfo]) -> Resolution? {
-            guard let first = hits.first else { return nil }
-            if Set(hits.map(\.processIdentifier)).count > 1 {
-                return .ambiguous(candidates: candidateNames(hits))
+            let dockApps = hits.filter(\.isDockApp)
+            let preferred = dockApps.isEmpty ? hits : dockApps
+            guard let first = preferred.first else { return nil }
+            if Set(preferred.map(\.processIdentifier)).count > 1 {
+                return .ambiguous(candidates: candidateNames(preferred))
             }
-            return first.processIdentifier == getpid() ? .selfProcess : .matched(first)
+            return PersonOnlyWindows.isOwnProcess(first.processIdentifier) ? .selfProcess : .matched(first)
         }
         if let exact = resolution(apps.filter {
             normalized($0.name) == bare || normalized($0.bundleIdentifier ?? "") == bare
@@ -82,14 +85,14 @@ public enum MacBackgroundSight {
             { !flat.isEmpty && (squashed($0.name) == flat || squashed($0.bundleIdentifier ?? "").contains(flat)) },
         ]
         for pass in passes {
-            if let match = resolution(apps.filter(pass)) { return match }
+            if let match = resolution(apps.filter { $0.isDockApp && pass($0) }) { return match }
         }
         return .notRunning(candidates: candidateNames(apps))
     }
 
-    /// Every running app by name, sorted, so the list is the real answer to "what is running"; a list past the cap says how many it left out.
+    /// Dock apps keep the suggestion list useful without flooding it with menu-bar agents.
     static func candidateNames(_ apps: [MacAXAppInfo]) -> [String] {
-        let names = Set(apps.filter { $0.processIdentifier != getpid() }.map(\.name))
+        let names = Set(apps.filter { $0.isDockApp && !PersonOnlyWindows.isOwnProcess($0.processIdentifier) }.map(\.name))
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         guard names.count > maxCandidates else { return names }
         return Array(names.prefix(maxCandidates)) + ["and \(names.count - maxCandidates) more"]
@@ -106,7 +109,7 @@ public enum MacBackgroundSight {
         case .selfProcess:
             // Match the AX path's `selfInspectionNote` refusal and recovery direction.
             return "\"\(name)\" is NativeAgent itself, and this app's own window can never be "
-                + "captured — reading our own UI over accessibility deadlocks the app. "
+                + "captured through Mac control: its UI is person-only. "
                 + "Use app (desk.read, mind.inner_state, agent.introspect) for our own state, and "
                 + "screen only for another app's window."
         case .notRunning(let candidates):

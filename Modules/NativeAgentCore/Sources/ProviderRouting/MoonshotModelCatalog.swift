@@ -6,32 +6,32 @@ import NativeAgentShared
 
 /// Only provider metadata supplies model capabilities; native wire support and Think controls remain explicit.
 public enum MoonshotModelCatalog {
-    public static let endpoint = URL(string: "https://api.moonshot.ai/v1/models")!
+    public static let endpoint = URL(string: "https://api.moonshot.ai/v1/models")
 
-    /// ModelCatalogTTLCache owns TTL and backoff; Moonshot supplies fetching and capabilities.
-    static let ttlCache = ModelCatalogTTLCache(
+    /// The cache owns credential binding and publication; Moonshot owns the wire format.
+    static let cache = ModelCatalogCache(
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
-        readCache: { readDecodedCache(dataRoot: $0) },
+        readCache: { try readDecodedCache(dataRoot: $0) },
         providerConfigFile: "moonshot.json",
         fetchLive: { ModelCatalogFetch(models: try await fetchLiveModels(key: $0, session: $1), isComplete: true) }
     )
 
     public static func models(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        session: URLSession = .shared,
+        session: URLSession = ProviderHTTP.session,
         refresh: Bool = false
     ) async -> [ProviderModelInfo] {
-        await ttlCache.models(dataRoot: dataRoot, session: session, refresh: refresh)
+        await cache.models(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
     /// Discovery provenance must say whether the network was reached.
     public static func modelsWithFreshness(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        session: URLSession = .shared,
+        session: URLSession = ProviderHTTP.session,
         refresh: Bool = false
     ) async -> ModelCatalogRead {
-        await ttlCache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
+        await cache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
     /// Routing reads the same credential-bound cache without network access; shipped rows retain their own catalog authority.
@@ -99,13 +99,15 @@ public enum MoonshotModelCatalog {
         guard let key, !key.isEmpty else {
             throw LLMError.notConfigured(provider: "moonshot")
         }
+        guard let endpoint else { throw URLError(.badURL) }
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
-        request.timeoutInterval = 15
+        request.timeoutInterval = .infinity
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        let status = http.statusCode
         guard (200..<300).contains(status) else {
             throw ProviderRoutingError.invalidResponse(status: status)
         }
@@ -118,24 +120,29 @@ public enum MoonshotModelCatalog {
 
     static func cacheFault(dataRoot: URL) -> String? {
         do {
-            return try ttlCache.currentCache(dataRoot: dataRoot) == nil
+            return try cache.currentCache(dataRoot: dataRoot) == nil
                 ? "Moonshot model catalog is not available. Refresh its models in Providers." : nil
         } catch { return error.localizedDescription }
     }
 
     static func readCache(dataRoot: URL) -> [ProviderModelInfo]? {
-        do { return try ttlCache.currentCache(dataRoot: dataRoot)?.models }
+        do { return try cache.currentCache(dataRoot: dataRoot)?.models }
         catch { return nil } // cacheFault carries the unavailable cause.
     }
 
     private static let decodedCache = ModelCatalogDecodeCache()
 
-    private static func readDecodedCache(dataRoot: URL) -> DecodedModelCatalog? {
-        decodedCache.read(url: cachePath(dataRoot: dataRoot), decode: decodeCache)
+    private static func readDecodedCache(dataRoot: URL) throws -> DecodedModelCatalog? {
+        try decodedCache.read(url: cachePath(dataRoot: dataRoot)) { data in
+            guard let decoded = try decodeCache(data) else {
+                throw ProviderRoutingError.configurationFailed("The saved Moonshot model catalog is malformed. Refresh its models in Providers.")
+            }
+            return decoded
+        }
     }
 
-    private static func decodeCache(_ data: Data) -> DecodedModelCatalog? {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    private static func decodeCache(_ data: Data) throws -> DecodedModelCatalog? {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = root["models"] as? [[String: Any]] else { return nil }
         let models = rows.compactMap { row -> ProviderModelInfo? in
             guard let id = row["id"] as? String, !id.isEmpty,

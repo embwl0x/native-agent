@@ -1,5 +1,9 @@
 import Foundation
 import PersistenceCore
+import NativeAgentCore
+#if canImport(AppKit)
+import AppKit
+#endif
 
 // Blueprint: | `ActivityPolicy.swift` | `ActivityPolicy`, `ActivityPolicyStore`: capture consent, exclusions, title gates and persistence |
 
@@ -51,6 +55,11 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
         if let host = Bundle.main.bundleIdentifier, !host.isEmpty {
             ids.insert(host)
         }
+        #if canImport(AppKit)
+        for app in NSWorkspace.shared.runningApplications where PersonOnlyWindows.isOwnProcess(app.processIdentifier) {
+            if let bundle = app.bundleIdentifier { ids.insert(bundle) }
+        }
+        #endif
         return ids
     }
 

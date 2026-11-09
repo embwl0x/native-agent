@@ -6,7 +6,7 @@ import PersistenceCore
 import TrustCenter
 // Blueprint: | `UnattendedWork.swift` | `UnattendedWork.allowed`: the one admission for work the agent does while nobody is watching |
 
-/// Work the agent starts on its own (part wakes, reflection, self-improvement, resumed turns) needs saved autonomy or a checked Full Mac grant.
+/// Work the agent starts on its own (part wakes, reflection, resumed turns) needs saved autonomy or a checked Full Mac grant.
 /// Partial or damaged policy fails closed and owes its repair.
 public enum UnattendedWork {
     public static func allowed(dataRoot: URL) async -> Bool {

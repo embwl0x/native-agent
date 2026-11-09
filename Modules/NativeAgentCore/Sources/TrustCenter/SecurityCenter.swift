@@ -41,6 +41,11 @@ struct TelegramSecurityAllowlist: Sendable {
 }
 
 public actor SwiftNativeSecurityCenter {
+    private struct AuditHistory: Sendable {
+        var receipts: [SecurityReceiptSummary] = []
+        var issues: [String] = []
+    }
+
     public static let consentDidWrite = Notification.Name("NativeAgent.consentDidWrite")
     public nonisolated let dataRoot: URL
     let clock: @Sendable () -> Date
@@ -68,13 +73,28 @@ public actor SwiftNativeSecurityCenter {
     /// Render the caller's checked authority generation without rereading it.
     public func status(policy checkedPolicy: Result<[String: JSONValue], any Error>, limit: Int = 8) async throws -> SecurityCenterStatus {
         // Readability proves only the retained history, not complete recording.
-        let history: Result<[JSONValue], any Error>
+        let history: Result<AuditHistory, any Error>
         do {
             let details = try await ExperienceStore.at(dataRoot).details(.init(kinds: ["consent"], limit: limit, newestFirst: true))
-            history = .success(try details.reversed().map { try JSONValue.parse($0.row) })
+            var reading = AuditHistory()
+            for detail in details.reversed() {
+                do {
+                    guard let receipt = Self.receiptSummary(try JSONValue.parse(detail.row)) else {
+                        throw PersistenceCoreError.ioFailure("Required receipt identity or display fields are missing.")
+                    }
+                    reading.receipts.append(receipt)
+                } catch {
+                    reading.issues.append("Consent detail \(detail.seq): \(error.localizedDescription)")
+                }
+            }
+            history = .success(reading)
         }
         catch { history = .failure(error) }
-        let recent = ((try? history.get()) ?? []).compactMap(Self.receiptSummary)
+        let recent: [SecurityReceiptSummary]
+        switch history {
+        case .success(let reading): recent = reading.receipts
+        case .failure: recent = []
+        }
         let policy: [String: JSONValue]
         do {
             policy = try checkedPolicy.get()
@@ -93,7 +113,7 @@ public actor SwiftNativeSecurityCenter {
                     status: "blocked",
                     detail: "Saved authority state is unavailable: \(error.localizedDescription)",
                     enabled: false
-                ), Self.auditFlag(enabled: true, history: history)],
+                ), Self.auditFlag(enabled: nil, history: history)],
                 recentReceipts: recent
             )
         }
@@ -103,6 +123,9 @@ public actor SwiftNativeSecurityCenter {
         let fullMac = Self.fullMacActive(policy: policy)
         let trustedOrigins = try await trustedOriginCount()
         let killSwitch = Self.bool(security["killSwitchEnabled"], default: false)
+        let signingRequired = Self.bool(security["signedRemoteCommandsRequired"], default: true)
+        let trustedSigningWaiver = Self.bool(security["trustedRemoteHighRiskAllowed"], default: true)
+        let audit = Self.auditFlag(enabled: Self.bool(security["auditReceiptsEnabled"], default: true), history: history)
         let flags = [
             SecurityStatusFlag(
                 id: "security_center",
@@ -124,17 +147,17 @@ public actor SwiftNativeSecurityCenter {
             SecurityStatusFlag(
                 id: "signed_remote_commands",
                 title: "Signed Remote Commands",
-                status: "unknown",
-                detail: """
-                    Trusted remote requests normally use the Mac's permission law. With strict signing on and the signature waiver for trusted \
-                    origins disabled, an unsigned effect waits for you.
-                    """,
-                enabled: Self.bool(security["signedRemoteCommandsRequired"], default: true)
+                status: signingRequired ? "required" : "off",
+                detail: (signingRequired
+                    ? "An unsigned remote effect needs your approval unless its origin has a signature waiver. "
+                    : "The signature requirement is off. Remote origin verification and ordinary permission checks still apply. ")
+                    + (trustedSigningWaiver ? "Verified trusted origins have that waiver." : "Trusted origins have no signature waiver."),
+                enabled: signingRequired
             ),
-            Self.auditFlag(enabled: Self.bool(security["auditReceiptsEnabled"], default: true), history: history),
+            audit,
         ]
         return SecurityCenterStatus(
-            status: killSwitch ? "blocked" : "unknown",
+            status: killSwitch ? "blocked" : ["failed", "partial"].contains(audit.status) ? "attention" : "configured",
             mode: permission,
             developerMode: developerMode,
             fullMac: fullMac,
@@ -146,18 +169,30 @@ public actor SwiftNativeSecurityCenter {
         )
     }
 
-    private static func auditFlag(enabled: Bool, history: Result<[JSONValue], any Error>) -> SecurityStatusFlag {
-        let detail: String
+    private static func auditFlag(enabled: Bool?, history: Result<AuditHistory, any Error>) -> SecurityStatusFlag {
+        var detail: String
         let status: String
-        switch (enabled, history) {
-        case (false, _):
+        switch enabled {
+        case nil:
+            (status, detail) = ("unavailable", "The recording setting is unavailable because Trust policy could not be read.")
+        case false?:
             (status, detail) = ("off", "Recording is off, so gated actions are not being logged.")
-        case (true, .failure(let error)):
-            (status, detail) = ("failed", "Consent details did not read (\(error.localizedDescription)), so I cannot show what was recorded.")
-        case (true, .success):
-            (status, detail) = ("unknown", "The retained audit history reads back; this does not prove every gated action was recorded.")
+        case true?:
+            switch history {
+            case .failure: status = "failed"
+            case .success(let reading): status = reading.issues.isEmpty ? "on" : "partial"
+            }
+            detail = "Recording is on."
         }
-        return SecurityStatusFlag(id: "audit_receipts", title: "Audit Receipts", status: status, detail: detail, enabled: enabled)
+        switch history {
+        case .failure(let error):
+            detail += " Consent details could not be read: \(error.localizedDescription)"
+        case .success(let reading):
+            detail += " \(reading.receipts.count) retained receipts read in this view."
+            if !reading.issues.isEmpty { detail += " " + reading.issues.joined(separator: " ") }
+        }
+        detail += " Retained history does not establish that every gated action was recorded."
+        return SecurityStatusFlag(id: "audit_receipts", title: "Audit Receipts", status: status, detail: detail, enabled: enabled == true)
     }
 
     /// "Pause everything": every door that admits an action reads it here.
@@ -258,7 +293,8 @@ public actor SwiftNativeSecurityCenter {
             reasons.append(.init(.origin, originAssessment.reason))
         }
 
-        if let paused = Self.killSwitchRefusal(policy: policy) {
+        // Pause everything stops the agent; the person's own act (Resume among them) is never paused.
+        if let paused = Self.killSwitchRefusal(policy: policy), !PermissionLaw.personDecided(tool: tool, input: input, turn: turn) {
             decision = .block
             reasons.append(.init(.cause, paused.reason))
             remedy = paused.remedy
@@ -279,7 +315,9 @@ public actor SwiftNativeSecurityCenter {
         // policy, including the hard kill switch.
         let signatureMissing = !(originAssessment.trusted && Self.bool(security["trustedRemoteHighRiskAllowed"], default: true))
             && Self.bool(security["signedRemoteCommandsRequired"], default: true) && origin.commandSignatureVerified != true
-        if decision != .block, originAssessment.isRemote, !originAssessment.trusted || signatureMissing, toolClass != .read {
+        // The person's own verified act (the phone's signed tap) is theirs, not a remote request to authenticate.
+        if decision != .block, originAssessment.isRemote, !originAssessment.trusted || signatureMissing, toolClass != .read,
+           !PermissionLaw.personDecided(tool: tool, input: input, turn: turn) {
             decision = .ask
             reasons.append(.init(.cause, originAssessment.trusted
                 ? "This remote request has no verified signature, so it needs the person."

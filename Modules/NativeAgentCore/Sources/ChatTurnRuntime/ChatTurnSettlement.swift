@@ -51,10 +51,18 @@ extension SwiftNativeChatOrchestrationClient {
                 answer.outcome = .init(domain: "turn", status: state.rawValue)
             }
             if silence == nil, let conversation,
-               let checkpoint = try? TurnCheckpoint.read(dataRoot: dataRoot, sessionId: conversation.session, turnId: conversation.turn),
-               let owed = checkpoint.owedDelivery(status: state.rawValue) {
-                answer.addressedTo.append(owed.to)
-                answer.owes[owed.key] = .init(to: owed.to)
+               let checkpoint = try TurnCheckpoint.read(dataRoot: dataRoot, sessionId: conversation.session, turnId: conversation.turn) {
+                if let owed = checkpoint.owedDelivery(status: state.rawValue) {
+                    answer.addressedTo.append(owed.to)
+                    answer.owes[owed.key] = .init(to: owed.to)
+                } else if let surface = checkpoint.replyRoute["surface"]?.stringValue,
+                          AgentBridgeCompletionRoute.Kind(surface: surface) == .local, answerEvidence != nil {
+                    // The local destination already accepted the saved transcript row; other doors settle their own delivery.
+                    var delivery = Experience.Obligation(to: "conversation:" + conversation.session)
+                    delivery.phase = .accepted
+                    delivery.evidence = answerEvidence
+                    answer.owes["deliver:conversation"] = delivery
+                }
             }
             try await store.begin(answer)
         }
@@ -97,6 +105,7 @@ extension SwiftNativeChatOrchestrationClient {
         let failed = result.toolDispatches.filter {
             let reply = ToolResult($0.result)
             return !ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome)
+                && !ChatToolOutcome.isPersonArrivalHandBack($0.result)
                 && reply.outcome != .cancelled
                 && !ChatToolOutcome.isWaitingOnPerson(reply.payload, verdict: reply.outcome)
         }.count
@@ -380,6 +389,11 @@ extension SwiftNativeChatOrchestrationClient {
             nativeLog("Turn terminal could not be saved; checkpoint retained: %@", String(describing: error))
             await noticeSink("turn_settlement_failed", "Couldn't save this turn's final record.")
             settled = .failure(error)
+        }
+        if case .success(let execution) = settled, case .success(let produced) = outcome,
+           produced.result.cognitiveContextDelivered, execution.response.terminalState == .completed,
+           !execution.response.isSilentCompletion {
+            await commitRepliedCognitiveTurnProjection(produced.cognitiveProjection)
         }
         // The accepted message owns its incoming appraisal even without a saved answer; a reply that captured a promotion already owns that appraisal.
         if !promotionStarted {

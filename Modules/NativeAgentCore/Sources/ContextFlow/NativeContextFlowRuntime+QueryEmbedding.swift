@@ -1,5 +1,6 @@
 import Context
 import DreamREMCycle
+import Experiences
 import Foundation
 import Senses
 import MemoryV2
@@ -20,33 +21,39 @@ extension NativeContextFlowRuntime {
         catch { return ContextQueryEmbeddingTicket(unavailable: error.localizedDescription) }
         guard lifecycle == nil else {
             return configuration.mode == .active
-                ? ContextQueryEmbeddingTicket(unavailable: "memory search is still starting")
+                ? ContextQueryEmbeddingTicket(unavailable: "memory search is still starting", repairRequired: false)
                 : nil
         }
         guard let coordinator else {
             return configuration.mode == .active
-                ? ContextQueryEmbeddingTicket(unavailable: "memory search is still starting")
+                ? ContextQueryEmbeddingTicket(unavailable: "memory search is still starting", repairRequired: false)
                 : nil
         }
         guard await coordinator.mode == .active,
               let memory = memoryRuntime else { return nil }
         guard epoch == semanticQueryEpoch, lifecycle == nil, self.coordinator === coordinator,
               !Task.isCancelled else {
-            return ContextQueryEmbeddingTicket(unavailable: Self.retiredSemanticQueryCause)
+            return ContextQueryEmbeddingTicket(unavailable: Self.retiredSemanticQueryCause, repairRequired: false)
         }
         guard query.utf8.count <= 8 * 1_024 else {
-            return ContextQueryEmbeddingTicket(unavailable: "the message is over 8 KB, too long to embed")
+            return ContextQueryEmbeddingTicket(unavailable: "the message is over 8 KB, too long to embed", repairRequired: false)
         }
-        guard let runtime = await memory.embeddingRuntimeSnapshot(),
-              runtime.effectiveBackend != ManagedEmbeddingProvider.failClosedBackend,
-              runtime.coreMLLoaded
+        guard let runtime = await memory.embeddingRuntimeSnapshot() else {
+            return ContextQueryEmbeddingTicket(unavailable: "the memory-search runtime is unavailable")
+        }
+        guard runtime.effectiveBackend != ManagedEmbeddingProvider.failClosedBackend else {
+            return ContextQueryEmbeddingTicket(unavailable: runtime.lastLoadError
+                ?? "the memory-search backend is unavailable")
+        }
+        guard runtime.coreMLLoaded
                 || runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend else {
-            return ContextQueryEmbeddingTicket(unavailable: "the memory-search model is not loaded")
+            return ContextQueryEmbeddingTicket(unavailable: runtime.lastLoadError
+                ?? "the memory-search model is not loaded", repairRequired: !runtime.modelLoadable)
         }
         // Backend inspection suspends; stop/reload must prevent admission against a drained runtime.
         guard epoch == semanticQueryEpoch, lifecycle == nil, self.coordinator === coordinator,
               !Task.isCancelled else {
-            return ContextQueryEmbeddingTicket(unavailable: Self.retiredSemanticQueryCause)
+            return ContextQueryEmbeddingTicket(unavailable: Self.retiredSemanticQueryCause, repairRequired: false)
         }
         let normalized = query.split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
@@ -65,7 +72,7 @@ extension NativeContextFlowRuntime {
         let own = ownWords.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .flatMap { $0.isEmpty || $0 == query ? nil : $0 }
         if let own, own.utf8.count > 8 * 1_024 {
-            return ContextQueryEmbeddingTicket(unavailable: "The follow-up's own words exceed the semantic reader's 8 KB bound.")
+            return ContextQueryEmbeddingTicket(unavailable: "The follow-up's own words exceed the semantic reader's 8 KB bound.", repairRequired: false)
         }
         let ownTexts = own.map { [$0] + (MemoryRecallQueryExpansion.rewriteIncoming($0, names: names, turn: turn).map { [$0] } ?? []) } ?? []
         // Use the snapshot's vector-space identity without rereading backend/mode files.
@@ -94,7 +101,8 @@ extension NativeContextFlowRuntime {
 
         // Bounded admission reports unavailable; it never substitutes lexical recall.
         guard semanticQueryTasks.count < Self.maximumConcurrentSemanticQueries else {
-            return ContextQueryEmbeddingTicket(unavailable: "\(Self.maximumConcurrentSemanticQueries) query embeddings are already in flight")
+            return ContextQueryEmbeddingTicket(unavailable: "\(Self.maximumConcurrentSemanticQueries) query embeddings are already in flight",
+                repairRequired: false)
         }
         let ticket = ContextQueryEmbeddingTicket()
         semanticQueryTickets[key] = ticket
@@ -134,8 +142,17 @@ extension NativeContextFlowRuntime {
         let ticket = semanticQueryTickets.removeValue(forKey: key)
         switch result {
         case .failure(let error):
+            // A fault may arrive after the turn's bounded wait. Owe it here too;
+            // RepairOwed folds it with a turn's report of this same owner.
+            if !(error is CancellationError) {
+                RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run,
+                    operation: "context.semantic_query", owner: "memory.embedding",
+                    words: "Query embedding failed: \(error.localizedDescription)", nextCall: "app {\"action\":\"doctor.run\"}")
+            }
             ticket?.fail("Query embedding failed: \(error.localizedDescription)")
         case .success(let value):
+            RepairOwed.settle(dataRoot, operation: "context.semantic_query",
+                evidence: .init(source: "memory.embedding", id: value.modelFingerprint))
             cacheSemanticQuery(value, key: key)
             ticket?.publish(value.values, alternate: value.alternateValues, ownWords: value.ownWordsValues,
                             modelFingerprint: value.modelFingerprint, modelID: value.modelID)

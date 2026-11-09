@@ -37,7 +37,11 @@ public final class DeviceSync {
 
     /// Attention follows the app's overview, so phone-sync shutdown cannot suppress it.
     public nonisolated func evaluateNeedsUser(items: [DeskItem]) async {
-        await needsUser.evaluate(items: items)
+        do { try await needsUser.evaluate(items: items) }
+        catch {
+            let failure = "Desk questions remain owed: \(error.localizedDescription)"
+            await MainActor.run { self.engine.syncError = failure }
+        }
     }
 }
 
@@ -46,10 +50,16 @@ actor DeskNeedsUser {
     private let dataRoot: URL
     private var pending: [DeskItem]?
     private var evaluating = false
+    private(set) var failure: String?
 
     init(dataRoot: URL) { self.dataRoot = dataRoot }
 
-    func evaluate(items: [DeskItem]) async {
+    struct EvaluationFailure: LocalizedError {
+        let causes: [String]
+        var errorDescription: String? { causes.joined(separator: "; ") }
+    }
+
+    func evaluate(items: [DeskItem]) async throws {
         pending = items
         guard !evaluating else { return }
         evaluating = true
@@ -60,31 +70,45 @@ actor DeskNeedsUser {
             let matters: [Experience]
             do { matters = try await forPerson.matters() }
             catch {
+                if pending == nil { pending = items }
+                failure = error.localizedDescription
                 nativeLog("needs_user: questions unavailable: %@", error.localizedDescription)
-                continue
+                throw error
             }
+            var failed: [DeskItem] = []
+            var causes: [String] = []
             for item in items {
                 do {
                     let question = item.title + "\n" + (item.blockedReason ?? item.summary ?? "")
                     let digest = SHA256.hash(data: Data(question.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
                     let id = "needs_user:" + item.handle + ":" + digest
                     let evidence = Experience.Ref(source: "desk", id: item.handle)
+                    if item.requiresOwnerInput {
+                        let reason = (item.blockedReason ?? item.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        let body = reason.isEmpty ? item.title : item.title + " — " + reason
+                        try await forPerson.tell(Matter(id: id, form: .ask, from: "needs_user",
+                            title: "\(NativeAgentNotificationDefaults.agentDisplayName(dataRoot: dataRoot)) needs you",
+                            summary: MobileDeskProjectionBounds.clipped(body, to: 500), words: body,
+                            open: "page:desk/" + item.handle, evidence: [evidence]), doors: Door.person(thread: nil))
+                    }
                     for old in matters where old.face?.from == "needs_user" && old.evidence.contains(evidence)
                         && old.owes["decide"]?.phase.isSettled == false && (!item.requiresOwnerInput || old.id != id) {
                         try await forPerson.answered(old.id, evidence: evidence)
                     }
-                    guard item.requiresOwnerInput else { continue }
-                    let reason = (item.blockedReason ?? item.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                    let body = reason.isEmpty ? item.title : item.title + " — " + reason
-                    try await forPerson.tell(Matter(id: id, form: .ask, from: "needs_user",
-                        title: "\(NativeAgentNotificationDefaults.agentDisplayName(dataRoot: dataRoot)) needs you",
-                        summary: MobileDeskProjectionBounds.clipped(body, to: 500), words: body,
-                        open: "page:desk/" + item.handle, evidence: [evidence]), doors: Door.person(thread: nil))
                 } catch {
+                    failed.append(item)
+                    causes.append(item.handle + ": " + error.localizedDescription)
                     nativeLog("needs_user: %@ question remains owed: %@", item.handle, error.localizedDescription)
                 }
             }
+            if !failed.isEmpty {
+                if pending == nil { pending = failed }
+                let error = EvaluationFailure(causes: causes)
+                failure = error.localizedDescription
+                throw error
+            }
         }
+        failure = nil
     }
 }
 

@@ -13,13 +13,13 @@ import MacIntegration
 // Blueprint: | `ChatOrchestrationClient+ToolDispatching.swift` | `SwiftNativeChatOrchestrationClient`: `makeTracedGatedDispatcher` |
 
 extension SwiftNativeChatOrchestrationClient {
-    /// Build each chat dispatch chain here so its tracer sees provenance, autonomy and file-gate refusals once.
-    /// Expansion and canonical naming wrap the tracer; the loop records offered-contract refusals.
+    /// Build each chat dispatch chain here so its tracer sees admitted provenance and autonomy once.
+    /// Request ceilings precede expansion; the loop records calls refused before the inner tracer as well as offered-contract refusals.
     /// Direct bridge tools use the shared untraced factory because they create no chat rows.
     func makeTracedGatedDispatcher(
         fileAccess: String,
         verifiedSessionId: String?, work: ChatTurnWork
-    ) -> any ToolDispatchClient {
+    ) -> any ExpansionToolDispatchClient {
         makeGatedToolDispatchClient(
             tools: tools,
             fileAccess: fileAccess,

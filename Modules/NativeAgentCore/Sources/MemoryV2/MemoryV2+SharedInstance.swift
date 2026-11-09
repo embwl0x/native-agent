@@ -48,13 +48,12 @@ extension SwiftNativeMemoryV2 {
     /// Attach USER.md to this actor's exact storage before returning its generator so launch and mutation hooks cannot split owners.
     public func bindUserMDGenerator(
         dataRoot: URL,
-        personaRoot: URL? = nil,
-        debounceInterval: TimeInterval = 30
+        personaRoot: URL? = nil
     ) async -> UserMDGenerator? {
         guard !memoryProjectionsStopped else { return nil }
         if let canonicalDataRoot,
            Self.canonicalRootIdentity(canonicalDataRoot) != Self.canonicalRootIdentity(dataRoot) { return nil }
-        userProjectionBinding = (dataRoot, personaRoot, debounceInterval)
+        userProjectionBinding = (dataRoot, personaRoot)
         do { try await ensureCanonicalAttachment() }
         catch { emitDiagnostic("[MemoryV2] USER projection attachment failed: \(error)"); return nil }
         guard let underlying = storage else { return nil }
@@ -70,8 +69,7 @@ extension SwiftNativeMemoryV2 {
         let generator = UserMDGenerator(
             storage: underlying,
             dataRoot: dataRoot,
-            personaRoot: personaRoot,
-            debounceInterval: debounceInterval
+            personaRoot: personaRoot
         )
         await underlying.attachUserMDGenerator(generator)
         guard !memoryProjectionsStopped else { return nil }
@@ -112,8 +110,8 @@ extension SwiftNativeMemoryV2 {
         return try await underlying.memory(id: id).map(MemoryRecord.init(stored:))
     }
 
-    /// Uses disclosure-filtered user facts until a pinned core is chosen.
-    public func userPromptCore(surface: String, preview: Bool = false) async throws -> [String]? {
+    /// Carries disclosure-filtered person facts with pinned facts first.
+    public func userPromptCore(surface: String, preview: Bool = false) async throws -> [String] {
         try await ensureCanonicalAttachment(preview: preview)
         guard let underlying = storage else { throw MemoryV2Error.storageUnavailable }
         return try await underlying.userPromptCore(surface: surface)
@@ -160,7 +158,7 @@ extension SwiftNativeMemoryV2 {
 
     private static func sharedBackingStore(
         dataRoot: URL,
-        userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?,
+        userProjectionBinding: (dataRoot: URL, personaRoot: URL?)?,
         projectionsEnabled: Bool
     ) throws -> (MemoryStorage, Task<Void, Never>) {
         let storage = try MemoryStorage(dataRoot: dataRoot)
@@ -177,8 +175,7 @@ extension SwiftNativeMemoryV2 {
         let ready = Task {
             if let binding = userProjectionBinding {
                 await storage.attachUserMDGenerator(UserMDGenerator(
-                    storage: storage, dataRoot: binding.dataRoot, personaRoot: binding.personaRoot,
-                    debounceInterval: binding.debounceInterval
+                    storage: storage, dataRoot: binding.dataRoot, personaRoot: binding.personaRoot
                 ))
             }
             await storage.attachSpotlightHook { stored, deleted in
@@ -260,6 +257,8 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
     public init(memory: SwiftNativeMemoryV2 = .shared) {
         self.memory = memory
     }
+    /// A failed recall remains owed until its owner supplies a successful reading.
+    public func recallRepairRequired(for _: Error) async -> Bool { true }
     /// Retrieve without credit; the accepted context credits only delivered IDs.
     public func recall(
         _ query: String,
@@ -392,7 +391,7 @@ public extension ProposalRecord {
 
 extension SwiftNativeMemoryV2 {
     /// Background thought uses chat's own prompt core; unavailable required context fails the work.
-    public static func userCoreForBackground(dataRoot: URL) async throws -> [String]? {
+    public static func userCoreForBackground(dataRoot: URL) async throws -> [String] {
         try await resolvedOwner(dataRoot: dataRoot).userPromptCore(surface: "chat")
     }
 }

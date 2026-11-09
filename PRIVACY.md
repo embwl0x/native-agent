@@ -73,6 +73,9 @@ Key-Value Store, iCloud Drive, or the app's CloudKit private database. These
 records are associated with the user's Apple account and are governed by
 Apple's terms and privacy policy. NativeAgent does not use a public CloudKit
 database for personal agent data.
+Phone chat projections and outgoing reply/progress text redact credentials
+recognized by the shared secret policy before publication. This does not rewrite
+the original Mac conversation or remove data already accepted by iCloud or a phone.
 
 Optional phone senses start off in Settings → Places and Phone senses.
 Their switches explicitly permit enabled place names/transition times, motion

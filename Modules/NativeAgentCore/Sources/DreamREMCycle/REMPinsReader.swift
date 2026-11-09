@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `REMPinsReader.swift` | `REMPinsReader`: checked mtime-cached pin reads; only absence is empty, unavailable bytes fail the turn; `latest` |
+// Blueprint: | `REMPinsReader.swift` | `REMPinsReader`: checked mtime-cached pin reads; only absence is empty, unavailable bytes throw to the caller; `latest` |
 
 // MARK: - REMPin (chat-turn injection shape)
 

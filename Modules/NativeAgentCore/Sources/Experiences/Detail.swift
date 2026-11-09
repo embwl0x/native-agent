@@ -1,10 +1,10 @@
 import Foundation
 import GRDB
 import NativeAgentCore
-// Blueprint: | `Detail.swift` | `ExperienceStore` detail grain: what the body noticed while a happening ran (a turn's steps, power draws, consent answers, organ beats), one ordered `detail` table in the same store, read by subject, kind and time, forgotten after `detailHorizon` |
+// Blueprint: | `Detail.swift` | `ExperienceStore`: ordered detail writes, checked durable flush and retained attention provenance |
 
 /// The record has two grains in one store. An experience is a happening in the agent's life, kept by the law in `ExperienceStore`. A detail is what the body
-/// noticed while it ran: written once, never folded, read by subject, kind or time, and forgotten after `detailHorizon`. It never copies substance.
+/// noticed while it ran: written once and read by subject, kind or time. Attention membership is retained; other details have `detailHorizon`.
 extension ExperienceStore {
     public struct Detail: Sendable, Equatable {
         /// The record's order. Zero on a detail not yet written.
@@ -38,6 +38,7 @@ extension ExperienceStore {
     public struct DetailQuery: Sendable {
         public var sources: [String]?
         public var subjects: [String]?
+        public var subjectPrefix: String?
         public var kinds: [String]?
         public var from: Date?
         public var through: Date?
@@ -49,23 +50,32 @@ extension ExperienceStore {
         public var newestFirst: Bool
 
         public init(sources: [String]? = nil, subjects: [String]? = nil, kinds: [String]? = nil, from: Date? = nil, through: Date? = nil,
-                    after: Int64? = nil, before: Int64? = nil, limit: Int? = nil, newestFirst: Bool = false) {
+                    after: Int64? = nil, before: Int64? = nil, limit: Int? = nil, newestFirst: Bool = false, subjectPrefix: String? = nil) {
             (self.sources, self.subjects, self.kinds, self.from, self.through, self.after) = (sources, subjects, kinds, from, through, after)
             (self.before, self.limit, self.newestFirst) = (before, limit, newestFirst)
+            self.subjectPrefix = subjectPrefix
         }
     }
 
     public enum DetailError: Error, LocalizedError {
         case tooLarge(String, Int)
+        case missingTransactionResult
+        case unreadableFullSync
+        case fullSyncCleanup(committed: Bool, transaction: String?, cleanup: String)
         public var errorDescription: String? {
             switch self {
             case .tooLarge(let kind, let bytes):
                 "A \(kind) detail of \(bytes) bytes is not a detail; its owner keeps the substance and the detail points to it."
+            case .missingTransactionResult: "The detail transaction returned without its result."
+            case .unreadableFullSync: "SQLite did not return its fullfsync setting; the durable detail write did not run."
+            case .fullSyncCleanup(let committed, let transaction, let cleanup):
+                "The detail transaction \(committed ? "committed" : "did not commit"); fullfsync restoration failed: \(cleanup)."
+                    + (transaction.map { " Transaction failure: " + $0 } ?? "")
             }
         }
     }
 
-    /// The body keeps what it noticed for two weeks; the agent's experiences have no horizon.
+    /// Non-membership details have a two-week horizon; experiences and attention provenance are retained.
     public static let detailHorizon: TimeInterval = 14 * 86_400
     /// The largest row any writer may build: a model call's trace (FeedPolicy.traceMaximumBytes).
     public static let maxRowBytes = 8 << 20
@@ -92,7 +102,7 @@ extension ExperienceStore {
             guard try !already(existing) else { return false }
             return try Self.insert(detail, db) != nil
         }
-        try forgetPastHorizon()
+        if wrote { try forgetPastHorizon() }
         return wrote
     }
 
@@ -100,45 +110,78 @@ extension ExperienceStore {
     private func write<T>(durable: Bool, _ body: (Database) throws -> T) throws -> T {
         guard durable else { return try database().write(body) }
         return try database().writeWithoutTransaction { db in
-            try db.execute(sql: "PRAGMA fullfsync = ON")
-            defer { try? db.execute(sql: "PRAGMA fullfsync = OFF") }
-            var result: T?
-            try db.inTransaction {
-                result = try body(db)
-                return .commit
+            guard let original = try Int.fetchOne(db, sql: "PRAGMA fullfsync"), original == 0 || original == 1 else {
+                throw DetailError.unreadableFullSync
             }
-            return result!
+            if original == 0 { try db.execute(sql: "PRAGMA fullfsync = ON") }
+            var result: Result<T, Error>?
+            var committed = false
+            do {
+                try db.inTransaction {
+                    result = .success(try body(db))
+                    return .commit
+                }
+                committed = true
+            } catch { result = .failure(error) }
+            do { if original == 0 { try db.execute(sql: "PRAGMA fullfsync = OFF") } } catch {
+                let transaction: String?
+                if let result, case .failure(let failure) = result { transaction = failure.localizedDescription } else { transaction = nil }
+                throw DetailError.fullSyncCleanup(committed: committed, transaction: transaction, cleanup: error.localizedDescription)
+            }
+            guard let result else { throw DetailError.missingTransactionResult }
+            return try result.get()
         }
     }
 
     public func details(_ query: DetailQuery) throws -> [Detail] {
+        if query.sources?.isEmpty == true || query.subjects?.isEmpty == true || query.kinds?.isEmpty == true { return [] }
+        return try database().read { try Self.selectDetails(query, in: $0).items }
+    }
+
+    /// A history page and its full match count share the store's read-only snapshot; reading never trims retained rows.
+    public func recordedDetails(_ query: DetailQuery) throws -> (total: Int, items: [Detail]) {
+        try readRecorded { try Self.selectDetails(query, in: $0, counting: true) }
+    }
+
+    private static func selectDetails(_ query: DetailQuery, in db: Database,
+                                      counting: Bool = false) throws -> (total: Int, items: [Detail]) {
         var clauses: [String] = [], arguments = StatementArguments()
         if let sources = query.sources {
-            guard !sources.isEmpty else { return [] }
+            guard !sources.isEmpty else { return (0, []) }
             clauses.append("source IN (" + Array(repeating: "?", count: sources.count).joined(separator: ",") + ")")
             arguments += StatementArguments(sources)
         }
         if let subjects = query.subjects {
-            guard !subjects.isEmpty else { return [] }
+            guard !subjects.isEmpty else { return (0, []) }
             clauses.append("subject IN (" + Array(repeating: "?", count: subjects.count).joined(separator: ",") + ")")
             arguments += StatementArguments(subjects)
         }
         if let kinds = query.kinds {
-            guard !kinds.isEmpty else { return [] }
+            guard !kinds.isEmpty else { return (0, []) }
             clauses.append("kind IN (" + Array(repeating: "?", count: kinds.count).joined(separator: ",") + ")")
             arguments += StatementArguments(kinds)
+        }
+        if let prefix = query.subjectPrefix {
+            clauses.append("substr(subject, 1, length(?)) = ?")
+            arguments += [prefix, prefix]
         }
         if let from = query.from { clauses.append("at >= ?"); arguments += [from.timeIntervalSince1970] }
         if let through = query.through { clauses.append("at <= ?"); arguments += [through.timeIntervalSince1970] }
         if let after = query.after { clauses.append("seq > ?"); arguments += [after] }
         if let before = query.before { clauses.append("seq < ?"); arguments += [before] }
-        var sql = "SELECT * FROM detail"
-        if !clauses.isEmpty { sql += " WHERE " + clauses.joined(separator: " AND ") }
+        let matching = clauses.isEmpty ? "" : " WHERE " + clauses.joined(separator: " AND ")
+        let total: Int
+        if counting {
+            guard let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM detail" + matching, arguments: arguments) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            total = count
+        } else { total = 0 }
+        var sql = "SELECT * FROM detail" + matching
         sql += query.newestFirst ? " ORDER BY seq DESC" : " ORDER BY seq"
         if let limit = query.limit { sql += " LIMIT \(max(0, limit))" }
-        return try database().read { db in
-            try Row.fetchAll(db, sql: sql, arguments: arguments).map(Detail.init(row:))
-        }
+        let items = try Row.fetchAll(db, sql: sql, arguments: arguments).map(Detail.init(row:))
+        return (counting ? total : items.count, items)
     }
 
     /// The newest sequence written, or nil when the record holds no detail.
@@ -146,21 +189,27 @@ extension ExperienceStore {
         try database().read { try Int64.fetchOne($0, sql: "SELECT MAX(seq) FROM detail") }
     }
 
-    private static func insert(_ detail: Detail, _ db: Database) throws -> Int64? {
-        try db.execute(sql: "INSERT OR IGNORE INTO detail (source, at, subject, kind, row, once) VALUES (?, ?, ?, ?, ?, ?)",
+    static func insert(_ detail: Detail, _ db: Database) throws -> Int64? {
+        if let once = detail.once,
+           try Int64.fetchOne(db, sql: "SELECT seq FROM detail WHERE once = ?", arguments: [once]) != nil { return nil }
+        try db.execute(sql: "INSERT INTO detail (source, at, subject, kind, row, once) VALUES (?, ?, ?, ?, ?, ?)",
                        arguments: [detail.source, detail.at.timeIntervalSince1970, detail.subject, detail.kind,
                                    String(decoding: detail.row, as: UTF8.self), detail.once])
         return db.changesCount == 0 ? nil : db.lastInsertedRowID
     }
 
-    /// At most four times a day, after a write, the details older than the horizon go. Experiences are never touched.
+    /// Detail retention preserves attention's outstanding membership and consumption boundaries.
     private func forgetPastHorizon() throws {
         let now = Date()
         guard now.timeIntervalSince(detailsForgottenAt) >= 6 * 3_600 else { return }
-        detailsForgottenAt = now
         _ = try database().write { db in
-            try db.execute(sql: "DELETE FROM detail WHERE at < ?", arguments: [now.addingTimeInterval(-Self.detailHorizon).timeIntervalSince1970])
+            try db.execute(sql: """
+                DELETE FROM detail WHERE at < ? AND NOT (source = ? AND kind IN (?, ?, ?, ?, ?, ?))
+                """, arguments: [now.addingTimeInterval(-Self.detailHorizon).timeIntervalSince1970,
+                                 Attention.detailSource, Attention.weighKind, Attention.igniteKind, Attention.restoreKind,
+                                 Attention.batchKind, Attention.batchEndKind, Attention.nightKind])
         }
+        detailsForgottenAt = now
     }
 
     static let detailSchema = """

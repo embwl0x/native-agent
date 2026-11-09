@@ -3,30 +3,10 @@ import Foundation
 import CloudKit
 import CryptoKit
 import OSLog
-import Foundation
-import CloudKit
-import CryptoKit
-import OSLog
-// Blueprint: | `CloudKitDeviceTransport+Messages.swift` | Signed sends, exact replay proof and serialized two-family drains |
+// Blueprint: | `CloudKitDeviceTransport+Messages.swift` | Signed sends and serialized two-family drains |
 
 extension CloudKitDeviceTransport {
     // MARK: send
-
-    /// How long the caller waits before calling a send's outcome unknown: CloudKit's own upload limit plus ten seconds. The wait never cancels the
-    /// upload; CloudKit's limit decides it and reports the real result.
-    public static func sendTimeoutSeconds(for message: BridgeMessage) throws -> TimeInterval {
-        let fields = try NAChatMessageCodec.encode(message)
-        return sendTimeoutSeconds(assetBytes: NAChatMessageCodec.usesAsset(fields) ? fields.payloadJSON.utf8.count + 28 : 0)
-    }
-
-    private static func sendTimeoutSeconds(assetBytes: Int) -> TimeInterval {
-        uploadSeconds(assetBytes: assetBytes) + 10
-    }
-
-    /// Cellular-sized: fifteen seconds for the record, plus one second per started 50,000 encrypted asset bytes, capped at two minutes.
-    private static func uploadSeconds(assetBytes: Int) -> TimeInterval {
-        min(120, 15 + ceil(Double(assetBytes) / 50_000))
-    }
 
     public func send(_ message: BridgeMessage) async throws {
         try await send(message, beforeDispatch: {})
@@ -38,7 +18,7 @@ extension CloudKitDeviceTransport {
         let recordType = Self.recordType(for: message)
         let usesAsset = NAChatMessageCodec.usesAsset(fields)
         var assetURL: URL?
-        var assetBytes = 0
+        defer { if let assetURL { Self.removePreparedAsset(assetURL) } }
         if usesAsset {
             guard let secret = await loadAssetSecretProvider()?(), secret.count == 32 else {
                 throw DeviceSyncError.underlying(message: "Pairing is required to encrypt this attachment.")
@@ -46,110 +26,71 @@ extension CloudKitDeviceTransport {
             let box = try AES.GCM.seal(Data(fields.payloadJSON.utf8), using: Self.assetKey(secret),
                 authenticating: Self.assetContext(recordName: fields.recordName, direction: fields.direction))
             guard let bytes = box.combined else { throw DeviceSyncError.underlying(message: "Attachment encryption failed.") }
-            assetBytes = bytes.count
             let url = FileManager.default.temporaryDirectory.appendingPathComponent("nativeagent-chat-\(UUID().uuidString).sealed")
-            do {
-                try bytes.write(to: url, options: .atomic)
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-            } catch {
-                try? FileManager.default.removeItem(at: url)
-                throw error
-            }
             assetURL = url
+            try bytes.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
         let preparedAssetURL = assetURL
-        let sendTimeout = Self.sendTimeoutSeconds(assetBytes: assetBytes)
-        let uploadTimeout = Self.uploadSeconds(assetBytes: assetBytes)
-        do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.send", seconds: sendTimeout, onFailure: accountFailureReporter,
-                                                  beforeDispatch: {
-                do { try await beforeDispatch() }
-                catch {
-                    if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) }
-                    throw error
-                }
-            }, cancelWorkOnTimeout: false) {
-                defer { if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) } }
-                let ck = CKRecord(
-                    recordType: recordType,
-                    recordID: CKRecord.ID(recordName: fields.recordName)
-                )
-                ck["direction"] = fields.direction as CKRecordValue
-                if let s = fields.sessionId { ck["sessionId"] = s as CKRecordValue }
-                ck["text"] = fields.text as CKRecordValue
-                if let preparedAssetURL { ck["payloadAsset"] = CKAsset(fileURL: preparedAssetURL) }
-                if preparedAssetURL == nil { ck["payloadJSON"] = fields.payloadJSON as CKRecordValue }
-                ck["createdAt"] = fields.createdAt as CKRecordValue
-                ck["senderDevice"] = fields.senderDevice as CKRecordValue
-                if let k = fields.kind { ck["kind"] = k as CKRecordValue }
-                if let title = fields.notificationTitle {
-                    ck["notificationTitle"] = title as CKRecordValue
-                }
-                if let screen = fields.notificationScreen {
-                    ck["notificationScreen"] = screen as CKRecordValue
-                }
-                if let eventID = fields.notificationEventID {
-                    ck["notificationEventId"] = eventID as CKRecordValue
-                }
+        try await withDeviceCKOperation("CloudKitDeviceTransport.send", onFailure: accountFailureReporter,
+                                        beforeDispatch: beforeDispatch) {
+            let ck = CKRecord(
+                recordType: recordType,
+                recordID: CKRecord.ID(recordName: fields.recordName)
+            )
+            ck["direction"] = fields.direction as CKRecordValue
+            if let s = fields.sessionId { ck["sessionId"] = s as CKRecordValue }
+            ck["text"] = fields.text as CKRecordValue
+            if let preparedAssetURL { ck["payloadAsset"] = CKAsset(fileURL: preparedAssetURL) }
+            if preparedAssetURL == nil { ck["payloadJSON"] = fields.payloadJSON as CKRecordValue }
+            ck["createdAt"] = fields.createdAt as CKRecordValue
+            ck["senderDevice"] = fields.senderDevice as CKRecordValue
+            if let k = fields.kind { ck["kind"] = k as CKRecordValue }
+            if let title = fields.notificationTitle {
+                ck["notificationTitle"] = title as CKRecordValue
+            }
+            if let screen = fields.notificationScreen {
+                ck["notificationScreen"] = screen as CKRecordValue
+            }
+            if let eventID = fields.notificationEventID {
+                ck["notificationEventId"] = eventID as CKRecordValue
+            }
 
-                let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
-                op.savePolicy = .ifServerRecordUnchanged
-                op.qualityOfService = .userInitiated
-                do { try await self.performModifyRecords(op, resourceTimeout: uploadTimeout) }
-                catch let error as DeviceSyncError {
-                    // Only exact accepted bytes prove replay; record-type rejection may be wrapped in an underlying CloudKit error.
-                    if Self.canReconcileSend(error), await self.existingMessageRecordMatches(fields) {
-                        do { try await self.resignalMessage(named: fields.recordName) }
-                        catch { throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription) }
-                        return
-                    }
-                    switch error {
-                    case .transient, .underlying, .conflict:
-                        throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription)
-                    default: throw error
-                    }
-                } catch {
-                    throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription)
-                }
-            }
-        } catch is DeviceCKLandmineTimeout {
-            if await existingMessageRecordMatches(fields) {
-                return
-            }
-            throw DeviceSyncSendOutcomeUnknown(message: "CloudKit send timed out; server acceptance is unknown")
-        } catch is CancellationError {
-            if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) }
-            throw CancellationError()
-        }
-    }
-
-    /// Renew the original delivery, never mint a second request. A changed query clock makes it eligible for an update push; the signed payload keeps
-    /// its original timestamp and identity. Uses the existing CloudKit schema.
-    public func resignalMessage(named recordName: String) async throws {
-        try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.resignal", onFailure: accountFailureReporter) {
-            let id = CKRecord.ID(recordName: recordName)
-            let records = try await self.database.records(for: [id], desiredKeys: ["direction", "createdAt"])
-            guard let fetched = records[id] else { throw CKError(.unknownItem) }
-            let record = try fetched.get()
-            let direction: NAChatDirection = self.role == .mac ? .mac2ios : .ios2mac
-            guard record["direction"] as? String == direction.rawValue else {
-                throw DeviceSyncError.underlying(message: "Cannot re-signal another device's message.")
-            }
-            record["createdAt"] = ISO8601DateFormatter().string(from: Date()) as CKRecordValue
-            let op = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: nil)
-            op.savePolicy = .changedKeys
+            let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
+            op.savePolicy = .ifServerRecordUnchanged
             op.qualityOfService = .userInitiated
-            try await self.performModifyRecords(op)
+            do { try await self.performModifyRecords(op) }
+            catch let error as DeviceSyncError {
+                switch error {
+                case .transient, .underlying, .conflict:
+                    try await self.reconcileMessage(fields, recordType: recordType, saveError: error)
+                default: throw error
+                }
+            } catch {
+                try await self.reconcileMessage(fields, recordType: recordType, saveError: error)
+            }
         }
     }
 
-    /// Resolves timeout-after-commit and stable-id retries without weakening conflict handling. Only exact payloadJSON + direction equality converts
-    /// the ambiguous write into success.
-    private static func canReconcileSend(_ error: DeviceSyncError) -> Bool {
-        switch error {
-        case .conflict, .underlying: true
-        default: false
+    /// The existing signed record proves acceptance of this identity; a different payload remains a conflict.
+    private func reconcileMessage(_ fields: NAChatMessageFields, recordType: String, saveError: Error) async throws {
+        let record: CKRecord
+        let payload: String
+        do {
+            record = try await database.record(for: CKRecord.ID(recordName: fields.recordName))
+            payload = try Self.payload(in: record, secret: await loadAssetSecretProvider()?())
+        } catch {
+            throw DeviceSyncSendOutcomeUnknown(message:
+                "CloudKit save is unconfirmed (\(saveError.localizedDescription)); "
+                    + "the existing record could not be read: \(error.localizedDescription)")
         }
+        guard record.recordType == recordType, record["direction"] as? String == fields.direction,
+              payload == fields.payloadJSON else { throw DeviceSyncError.conflict }
+    }
+
+    private static func removePreparedAsset(_ url: URL) {
+        do { try FileManager.default.removeItem(at: url) }
+        catch { nativeLog("[ck-device] sealed attachment cleanup failed for \(url.lastPathComponent): \(error)") }
     }
 
     /// Event kind chooses the renderer before any transport runs. Keep the signed envelope unchanged; both record families reach the same reader.
@@ -158,26 +99,6 @@ extension CloudKitDeviceTransport {
             && message.metadata?["userInfo.source"] != "requested_result"
             ? NADeviceSyncRecordType.notification
             : NADeviceSyncRecordType.chatMessage
-    }
-
-    /// A missing/unreadable record is no proof of rejection. Callers retain the unknown outcome and may check again within their own bounded window.
-    public func messageRecordMatches(_ message: BridgeMessage, timeoutSeconds: TimeInterval = deviceCKHangSeconds) async -> Bool {
-        guard let fields = try? NAChatMessageCodec.encode(message) else { return false }
-        return await existingMessageRecordMatches(fields, timeoutSeconds: timeoutSeconds)
-    }
-
-    private func existingMessageRecordMatches(_ fields: NAChatMessageFields, timeoutSeconds: TimeInterval = deviceCKHangSeconds) async -> Bool {
-        let secret = await loadAssetSecretProvider()?()
-        return await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayProof", seconds: timeoutSeconds, onFailure: accountFailureReporter) {
-            let record = try await self.database.record(
-                for: CKRecord.ID(recordName: fields.recordName)
-            )
-            return NAChatMessageCodec.isExactIdempotentReplay(
-                existingPayloadJSON: try Self.payload(in: record, secret: secret),
-                existingDirection: record["direction"] as? String,
-                intended: fields
-            )
-        } ?? false
     }
 
     // MARK: observeIncoming
@@ -221,7 +142,7 @@ extension CloudKitDeviceTransport {
     /// covers their wake, and repeated timer ticks must not keep that owner running.
     @discardableResult
     public func drainIncoming(queueIfBusy: Bool = true, recovery: DeviceSyncRecovery = .init()) async -> DeviceSyncDrainResult {
-        guard recovery.hasTime else { return .skipped(0) }
+        guard recovery.isActive else { return .skipped(0) }
         guard holdsPairing else { return .skipped(0) }
         // Acquire the single drain slot under a synchronous lock, never across an await.
         guard beginDrainOrCoalesce(queueIfBusy: queueIfBusy) else {
@@ -254,7 +175,7 @@ extension CloudKitDeviceTransport {
 
     private func endDrainOrContinue(recovery: DeviceSyncRecovery) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        if drainAgain && recovery.hasTime { drainAgain = false; return true }
+        if drainAgain && recovery.isActive { drainAgain = false; return true }
         drainAgain = false
         drainInFlight = false
         return false
@@ -268,7 +189,7 @@ extension CloudKitDeviceTransport {
 
         let inbound = role.inboundDirection.rawValue
         let fetched: DeviceCKPullResult
-        var earlyDispatched = 0
+        var earlyDelivery: DeviceSyncDrainResult = .success(0)
         do {
             var records = try await pull(
                 recordType: NADeviceSyncRecordType.chatMessage,
@@ -279,7 +200,7 @@ extension CloudKitDeviceTransport {
             if role == .ios {
                 // Show words as soon as chat is fetched. The notification read may be slow or fail; it must not hold already-fetched words. Keep the
                 // shared cursor pinned until both families were read.
-                earlyDispatched = await deliverIncoming(records.records, since: since, queryStartedAt: queryStartedAt,
+                earlyDelivery = await deliverIncoming(records.records, since: since, queryStartedAt: queryStartedAt,
                                                         advanceCursor: false, recovery: recovery)
                 let notifications = try await pull(
                     recordType: NADeviceSyncRecordType.notification,
@@ -287,40 +208,46 @@ extension CloudKitDeviceTransport {
                     inboundDirection: inbound,
                     recovery: recovery
                 )
-                records.records += notifications.records
+                records.records = notifications.records
                 records.payloadError = records.payloadError ?? notifications.payloadError
             }
             fetched = records
         } catch {
             nativeLog("[ck-device] drainIncoming pull failed: \(error)")
-            return .failure(Self.mapError(error), dispatched: earlyDispatched)
+            return .failure(Self.mapError(error), dispatched: earlyDelivery.dispatchedCount)
         }
 
-        let remainingDispatched = await deliverIncoming(fetched.records, since: since, queryStartedAt: queryStartedAt,
-                                                        advanceCursor: fetched.payloadError == nil, recovery: recovery)
-        let dispatched = earlyDispatched + remainingDispatched
+        let earlyAccepted: Bool = if case .success = earlyDelivery { true } else { false }
+        let remainingDelivery = await deliverIncoming(fetched.records, since: since, queryStartedAt: queryStartedAt,
+            advanceCursor: fetched.payloadError == nil && earlyAccepted, recovery: recovery)
+        let dispatched = earlyDelivery.dispatchedCount + remainingDelivery.dispatchedCount
+        if case .failure(let error, _) = earlyDelivery { return .failure(error, dispatched: dispatched) }
+        if case .failure(let error, _) = remainingDelivery { return .failure(error, dispatched: dispatched) }
         if let error = fetched.payloadError { return .failure(error, dispatched: dispatched) }
+        if case .skipped = earlyDelivery { return .skipped(dispatched) }
+        if case .skipped = remainingDelivery { return .skipped(dispatched) }
         return .success(dispatched)
     }
 
     func deliverIncoming(_ fetched: [(fields: NAChatMessageFields, modDate: Date?)], since: Date?, queryStartedAt: Date,
-                         advanceCursor: Bool = true, recovery: DeviceSyncRecovery) async -> Int {
-        guard let handler = loadHandlerAndCursor().0 else { return 0 }
+                         advanceCursor: Bool = true, recovery: DeviceSyncRecovery) async -> DeviceSyncDrainResult {
+        guard let handler = loadHandlerAndCursor().0 else { return .skipped(0) }
         let inbound = role.inboundDirection.rawValue
         // CloudKit query order is undefined; deliver in server chronology.
         let sorted = Self.orderedIncoming(fetched)
 
         // Controls in this batch must reach their owners before awaiting chat.
         var decoded: [Int: (id: String, message: Result<BridgeMessage, Error>?)] = [:]
-        guard let controls = await deliverControls(sorted, decoded: &decoded, recovery: recovery) else { return 0 }
+        guard let controls = await deliverControls(sorted, decoded: &decoded, recovery: recovery) else { return .skipped(0) }
         var dispatched = controls
         // Pin the cursor before the first undelivered inbound record.
         var cursorAdvance: Date? = nil
         var halted = false
+        var failure: DeviceSyncError?
         for (index, item) in sorted.enumerated() {
             // A concurrent cancellation has not yet earned acknowledgement. Never advance the ordinary cursor past its temporary claim.
             if isControlDrainInFlight() { halted = true; break }
-            if !recovery.hasTime { halted = true; break }
+            if !recovery.isActive { halted = true; break }
             if halted && role != .ios { break }
             let m = item.modDate
             guard item.fields.direction == inbound else {
@@ -333,9 +260,14 @@ extension CloudKitDeviceTransport {
                 if !halted, let m { cursorAdvance = m }    // already delivered — safe to pass
                 continue
             }
-            guard let message = try? (decoded[index]?.message ?? Result { try NAChatMessageCodec.decode(item.fields) }).get() else {
-                nativeLog("[ck-device] drainIncoming: undecodable payload for \(id)")
-                if !halted, let m { cursorAdvance = m }    // poison — keep it claimed, pass
+            let message: BridgeMessage
+            do {
+                message = try (decoded[index]?.message ?? Result { try NAChatMessageCodec.decode(item.fields) }).get()
+            } catch {
+                nativeLog("[ck-device] unreadable record \(id) remains pending: \(error)")
+                releaseClaim(id)
+                halted = true
+                if failure == nil { failure = Self.mapError(error) }
                 continue
             }
             if await handler(message) {
@@ -362,7 +294,8 @@ extension CloudKitDeviceTransport {
                 persistImmediately: cursorAdvance != nil || halted
             )
         }
-        return dispatched
+        if let failure { return .failure(failure, dispatched: dispatched) }
+        return halted ? .skipped(dispatched) : .success(dispatched)
     }
 
     private static func orderedIncoming(_ records: [(fields: NAChatMessageFields, modDate: Date?)]) -> [(fields: NAChatMessageFields, modDate: Date?)] {
@@ -383,7 +316,7 @@ extension CloudKitDeviceTransport {
 
     @discardableResult
     public func drainIncomingControls(recovery: DeviceSyncRecovery = .init()) async -> Int {
-        guard role == .mac, recovery.hasTime, holdsPairing,
+        guard role == .mac, recovery.isActive, holdsPairing,
               loadControlAdmission() != nil, beginControlDrain() else { return 0 }
         defer { endControlDrain() }
         let (_, since) = loadHandlerAndCursor()
@@ -436,13 +369,20 @@ extension CloudKitDeviceTransport {
               let handler = loadHandlerAndCursor().0 else { return 0 }
         var delivered = 0
         for (index, record) in records.enumerated() {
-            guard recovery.hasTime else { break }
+            guard recovery.isActive else { break }
             guard record.fields.direction == role.inboundDirection.rawValue else { continue }
             let id = Self.deliveryClaimKey(record.fields)
             let message = isSeen(id) ? nil : Result { try NAChatMessageCodec.decode(record.fields) }
             decoded[index] = (id, message)
-            guard let message = try? message?.get(), await admission(message), claimIfUnseen(id) else { continue }
-            if await handler(message) {
+            guard let result = message else { continue }
+            let admitted: BridgeMessage
+            do { admitted = try result.get() }
+            catch {
+                nativeLog("[ck-device] unreadable control record \(id) remains pending: \(error)")
+                continue
+            }
+            guard await admission(admitted), claimIfUnseen(id) else { continue }
+            if await handler(admitted) {
                 delivered += 1
                 recovery.didApplyData?()
             } else {

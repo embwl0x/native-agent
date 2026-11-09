@@ -26,6 +26,7 @@ import ProviderRouting
 import ToolRegistry
 import ToolExecution
 import Transcripts
+import TurnTrace
 import StandingBots
 import ChatTurnContracts
 // Blueprint: | `EngineDeviceSync+Snapshots.swift` | `engine.connectors`, `engine.persona`, `engine.runs`, `engine.trust.snapshotData`; Checked phone adapter |
@@ -87,13 +88,15 @@ extension NAProviderCatalogProvider {
 }
 
 extension NativeAgentEngine {
-    public func mobileChatMessages(sessionId: String) async throws -> [ChatMessageRecord] {
-        let projection = try await transcripts.loadTranscript(sessionId: sessionId, cached: true)
+    @concurrent public func mobileChatMessages(sessionId: String) async throws -> [ChatMessageRecord] {
+        guard let safeID = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return [] }
+        // A phone read prepares the same cards and attachments without mounting saved rows in the Mac's live slot.
+        let projection = try await transcripts.readTranscriptProjection(safeSessionId: safeID, cached: true)
         let cards = projection.cardsByRow
         var result: [ChatMessageRecord] = []
         let messages = projection.messages
-        let window = Array(messages.filter { !$0.isAgentOwnTurnInput }.suffix(MacSyncEngine.transcriptSnapshotRowLimit))
-        let faces = await mobileTranscriptFaces(window)
+        // Snapshot and history callers select their windows after this shared projection; every row must already carry its face.
+        let faces = await mobileTranscriptFaces(messages)
         var toolsByRun: [String: [ToolEvent]] = [:]
         let lastReplyByRun = Dictionary(messages.filter { $0.role == "assistant" }.compactMap { row in
             row.runId.map { ($0, row.id) }
@@ -117,30 +120,70 @@ extension NativeAgentEngine {
         for message in messages {
             let events = message.runId.flatMap { lastReplyByRun[$0] == message.id ? toolsByRun[$0] : nil } ?? []
             var row = ChatMessageRecord(id: Self.phoneMessageID(message.id), sessionId: message.sessionId, role: message.role,
-                content: message.content, createdAt: message.createdAt, runId: message.runId,
+                content: TurnSecretRedactor.redactText(message.content), createdAt: message.createdAt, runId: message.runId,
                 source: message.source, metadata: message.metadata, isPersonVisible: !message.isAgentOwnTurnInput)
-            row.face = faces[message.id]
-            row.toolEvents = events.isEmpty ? nil : events
-            if let projected = cards[message.id]?.first {
-                var card = projected.interaction
-                card.continuation = nil
-                let encoder = JSONEncoder()
-                encoder.dateEncodingStrategy = .iso8601
-                // Stable bytes: an unchanged card never reads as a changed transcript, so the phone never rebuilds a chat for nothing.
-                encoder.outputFormatting = [.sortedKeys]
-                row.interactionJSON = String(decoding: try encoder.encode(card), as: UTF8.self)
-                row.interactionDescriptorJSON = String(decoding: try encoder.encode(projected.descriptor), as: UTF8.self)
-                row.interactionSessionID = projected.sessionID
+            do {
+                row.metadata = try Self.phoneDisplayCopy(row.metadata)
+                // Tool input is embedded JSON, not prose: redact its values without breaking its keys or syntax.
+                if let input = message.metadata?.inputJSON {
+                    do {
+                        row.metadata?.inputJSON = try TurnTraceRedactor.redactValue(JSONValue.parse(Data(input.utf8))).serialize(pretty: false)
+                    } catch {
+                        // This row alone has unreadable input. Keep its outcome, provenance and siblings; name the display gap.
+                        row.metadata?.inputJSON = nil
+                        let prior = row.metadata?.error
+                        row.metadata?.error = [prior, "Phone tool input unavailable: saved input is not readable JSON."]
+                            .compactMap { $0 }.joined(separator: " · ")
+                    }
+                }
+                row.face = try Self.phoneDisplayCopy(faces[message.id])
+                if !events.isEmpty { row.toolEvents = try Self.phoneDisplayCopy(events) }
+                // The phone draws a row's card as its matter's Inbox row, named by the card's id (`interaction:` and that id).
+                if let projected = cards[message.id]?.first {
+                    var card = projected.interaction
+                    card.continuation = nil
+                    let encoder = JSONEncoder()
+                    encoder.dateEncodingStrategy = .iso8601
+                    // Stable bytes: an unchanged card never reads as a changed transcript, so the phone never rebuilds a chat for nothing.
+                    encoder.outputFormatting = [.sortedKeys]
+                    row.interactionJSON = try Self.phoneDisplayJSON(card, encoder: encoder)
+                    // Phone builds 61/63 require all three fields to draw their conversation card. These are the same prepared owner's facts.
+                    row.interactionDescriptorJSON = try Self.phoneDisplayJSON(projected.descriptor, encoder: encoder)
+                    row.interactionSessionID = projected.sessionID
+                }
+            } catch {
+                // One row the phone copy cannot prepare is that row's own failure, named with its cause; its siblings still cross.
+                row.metadata = nil
+                row.toolEvents = nil
+                row.face = TranscriptRowFace(seat: TranscriptRowFace.plain(message).seat,
+                    line: "This row could not be prepared for the phone.", failed: true, detail: String(describing: error))
             }
             result.append(row)
         }
         return result
     }
 
-    @MainActor
+    /// Only display values cross this projection; row/session/run identities remain the transcript owner's values.
+    private nonisolated static func phoneDisplayJSON<Value: Encodable>(_ value: Value, encoder: JSONEncoder) throws -> String {
+        let object = try JSONValue.parse(encoder.encode(value))
+        // This is a typed display schema: a card's `secret.signIn.token` is an endpoint, not a credential field.
+        // Withholding by argument name belongs only to the tool-input object above.
+        return try object.mapStrings(TurnSecretRedactor.redactText).serialize(pretty: false)
+    }
+
+    private nonisolated static func phoneDisplayCopy<Value: Codable>(_ value: Value) throws -> Value {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let text = try phoneDisplayJSON(value, encoder: encoder)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(Value.self, from: Data(text.utf8))
+    }
+
+    @concurrent
     private func mobileTranscriptFaces(_ messages: [ChatMessage]) async -> [String: TranscriptRowFace] {
         guard !messages.isEmpty else { return [:] }
-        let receiptTitle = transcripts.firstConversationReceiptTitle
+        let receiptTitle = await transcripts.readFirstConversationReceiptTitle()
         let presentation = transcripts.presentation
         var faces = Dictionary(uniqueKeysWithValues: messages.map {
             ($0.id, TranscriptRowFace.read($0, receiptTitle: receiptTitle))
@@ -150,18 +193,20 @@ extension NativeAgentEngine {
             let foldRows = group.messages.filter { faces[$0.id]?.asks != true && faces[$0.id]?.receipt == nil }
             guard let first = foldRows.first else { continue }
             let key = "headline:" + first.id
-            if presentation.words(key, readyOnly: true) == nil {
-                let previous = presentation.words(key)
+            if await presentation.words(key, readyOnly: true) == nil {
+                let previous = await presentation.words(key)
                 let prepared = await transcripts.prepareToolFold(foldRows)
                 // The owner's retained diagnostic suppresses repeated logs while later snapshots retry the failed preparation.
-                if presentation.words(key, readyOnly: true) == nil, previous != prepared {
+                if await presentation.words(key, readyOnly: true) == nil, previous != prepared {
                     nativeLog("[DeviceSync] Tool fold %@ has no prepared headline: %@", first.id, prepared)
                 }
             }
-            faces[first.id]?.headline = presentation.words(key, readyOnly: true)
+            // A snapshot or history page may begin inside this group; its first visible fold row needs the same owner's headline.
+            let headline = await presentation.words(key)
+            for row in foldRows { faces[row.id]?.headline = headline }
         }
         for message in messages {
-            faces[message.id]?.detail = presentation.words("detail:" + message.id, readyOnly: true)
+            faces[message.id]?.detail = await presentation.words("detail:" + message.id)
         }
         return faces
     }
@@ -212,8 +257,9 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
         await engine.trace.summaryData()
     }
 
-    public func schedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue {
-        try await engine.ports.macIntegration.schedulerCreateJob(input: input)
+    public func turnSessionsFace() async -> TurnSessionsFace? {
+        let projection = await engine.turns.turnFaceProjection
+        return await projection?.sessionsFace()
     }
 
     public func workOverview() async -> (
@@ -249,16 +295,111 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
         for sessions: [NativeAgentShared.ChatSession]
     ) -> ChatSessionNavigation { engine.transcripts.navigation(for: sessions) }
     @MainActor public func surfaceLayout() -> SurfaceLayoutAvailability { engine.layout.availability }
-    /// The published faces: every page is read by its owner at launch and at each change, so a pass never reads one again.
-    @MainActor public func pageFaces() async -> [String: PartFaceSnapshot] { engine.pages.snapshots }
+    /// Published faces, with Memories drawn from its owner's ios-disclosed packet. No phone face means no Memories entry yet.
+    @MainActor public func pageFaces() async -> [String: PartFaceSnapshot] {
+        var snapshots = await engine.pages.snapshots
+        snapshots["memories"] = await engine.phoneMemoryPages.snapshots["memories"]
+        return snapshots
+    }
+    public func faceRead(_ request: DocumentRequest, cursor: Int, revision: String?, device: String) async throws -> FaceReadPage {
+        try await engine.documentPage(request, cursor: cursor, revision: revision, device: device)
+    }
     @MainActor public func faceAction(page: String, row: String, action: String, value: String?, device: String) async throws -> String? {
-        try await engine.pages.act(page: page, row: row, action: action, value: value, by: .person(door: "phone", device: device))
+        let pages = page == "memories" ? engine.phoneMemoryPages : engine.pages
+        return try await pages.act(page: page, row: row, action: action, value: value, door: "phone", device: device)
+    }
+    @MainActor public func faceOutcome(page: String, row: String, action: String, value: String?, values: [String: PartFace.Value]?,
+                                       formRevision: String?, device: String,
+                                       expecting: PartFace.Call, operation: UUID, undoOf: UUID?, checking: Bool) async throws -> FaceActOutcome {
+        let pages = page == "memories" ? engine.phoneMemoryPages : engine.pages
+        if checking { return await pages.reconcile(page: page, row: row, value: value, values: values, expecting: expecting) }
+        do {
+            var outcome = try await pages.actOutcome(page: page, row: row, action: action, value: value, values: values,
+                                              formRevision: formRevision,
+                                              door: "phone", device: device, expecting: expecting, operation: operation, undoOf: undoOf)
+            let request = PageActRequest(page: page, row: row, action: action,
+                                         value: values.map(PartFace.Value.object) ?? value.map(PartFace.Value.string),
+                                         expectedRevision: formRevision, expectedCall: expecting)
+            outcome.failure = outcome.failure.map { EngineFaceActs.redacted($0, act: .pageAct(request)) }
+            return outcome
+        } catch let error as PartCallError {
+            return .interrupted(WireFailure(code: error.code, message: error.message, cause: nil, effects: .none))
+        }
+    }
+    public func decidePhoneApproval(id: String, decision: String, device: String) async throws -> ApprovalRecord {
+        let provenance = ApprovalResolutionProvenance.signedIOS(clientID: device, decidedBy: "ios_signed_operator")
+        return try await engine.ports.backgroundWork.approvals.resolveApproval(id: id, decision: decision, provenance: provenance,
+            turn: provenance.resolvingTurn)
+    }
+
+    @MainActor public func answerPhoneInteraction(_ fields: [String: String], device: String) async throws -> [String: String] {
+        if fields["action"] == "open", let item = fields["itemID"], fields.count == 2 {
+            let pointer = try await InlineInteractionDelivery.pointer(id: item, dataRoot: engine.dataRoot)
+            return ["status": "ok", "ok": "true", "sessionID": pointer.sessionID]
+        }
+        // Deployed forms may contain a key/token. No credential is accepted, copied into a call, or reflected in an error.
+        let allowed: Set<String> = ["sessionID", "interactionID", "revision", "action", "choice", "scope"]
+        guard Set(fields.keys).isSubset(of: allowed) else {
+            throw PartCallError(code: "mac_required", message: "Enter credentials in the protected entry on the Mac. Nothing was changed.")
+        }
+        guard let session = fields["sessionID"], NativeAgentChatSessionID.normalizedPathComponent(session) == session,
+              let id = fields["interactionID"], let revision = fields["revision"].flatMap(Int.init),
+              let action = fields["action"], ["primary", "decline", "verify"].contains(action),
+              let card = try await InlineInteractionResolver.interaction(id: id, sessionID: session, dataRoot: engine.dataRoot),
+              card.revision == revision else {
+            throw PartCallError(code: "card_changed", message: "This card changed or is unavailable. Refresh the conversation before answering.")
+        }
+        let matter = "interaction:" + id
+        if action == "verify" {
+            // Check only: the canonical verifier reads the saved owners and runs no setup effect.
+            let selection = try await InlineInteractionResolver.selectionForReturn(card, dataRoot: engine.dataRoot)
+            _ = await InlineInteractionResolver.completeIfVerified(id: id, sessionID: session, expectedRevision: revision,
+                selection: selection, scope: card.kind == .modelChoice ? .persistent : nil, includeRetryable: true, dataRoot: engine.dataRoot)
+        } else {
+            let answer: String
+            if action == "decline" { answer = "reject" }
+            else if let choice = fields["choice"], let index = card.options.firstIndex(where: { $0.id == choice }) {
+                if card.kind == .modelChoice, let scope = fields["scope"], scope != card.primaryScope?.rawValue {
+                    throw PartCallError(code: "mac_required", message: "Change the saved group model in Providers on the Mac. Nothing was changed.")
+                }
+                answer = "interaction_choice_\(index)"
+            } else {
+                throw PartCallError(code: "mac_required", message: "Complete this setup in its control on the Mac, then Check again here.")
+            }
+            _ = try await faceAction(page: "inbox", row: matter, action: answer, value: nil, device: device)
+        }
+        let after: InlineInteraction
+        do {
+            guard let found = try await InlineInteractionResolver.interaction(id: id, sessionID: session, dataRoot: engine.dataRoot) else {
+                return ["status": "outcome_unknown", "result_class": "unknown",
+                    "message": "The answer returned, but its card is absent from readback. Check before repeating it."]
+            }
+            after = found
+        } catch {
+            return ["status": "outcome_unknown", "result_class": "unknown",
+                "message": "The answer returned, but its card readback failed. Check before repeating it: "
+                    + TurnSecretRedactor.redactText(error.localizedDescription)]
+        }
+        switch after.state {
+        case .pending, .running, .unknown, .stopped, .superseded:
+            return ["status": "pending", "result_class": "unknown", "state": after.state.name,
+                "message": "The saved card is \(after.state.name); completion is not confirmed. "
+                    + "Refresh the conversation and finish setup on the Mac if needed."]
+        case .settled, .declined, .failed: break
+        }
+        let failed = after.continuationFailure ?? after.state.failureReason
+        return ["status": failed == nil ? "ok" : "error", "ok": failed == nil ? "true" : "false", "state": after.state.name,
+            "message": failed ?? after.state.outcome?.summary ?? (after.state == .declined ? after.declineConsequence : "The card is \(after.state.name).")]
     }
     public func getChatMessages(sessionId: String) async throws -> [ChatMessageRecord] {
         try await engine.mobileChatMessages(sessionId: sessionId)
     }
     public func getOtherRoomExchanges() async throws -> [OtherRoomExchange] {
-        try await AgentContactThreads.read(root: engine.dataRoot, contacts: engine.contacts, includeHelpers: false).otherRooms
+        try await AgentContactThreads.read(root: engine.dataRoot, contacts: engine.contacts, includeHelpers: false).otherRooms.map { event in
+            OtherRoomExchange(id: event.id, sessionID: event.sessionID, contactID: event.contactID,
+                contact: TurnSecretRedactor.redactText(event.contact), agent: TurnSecretRedactor.redactText(event.agent), at: event.at,
+                message: TurnSecretRedactor.redactText(event.message), reply: TurnSecretRedactor.redactText(event.reply))
+        }
     }
     public func getHealth() async throws -> RuntimeHealth { engine.doctor.readHealth() }
     public func pendingMemoryProposals() async throws -> DeviceSyncSnapshotRows {
@@ -300,47 +441,21 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
             graphPath: engine.dataRoot.appendingPathComponent("memory/memory.sqlite"), surface: "ios")
     }
     public func getRunsStrict() async -> [RunRecord]? { try? await engine.runs.refresh(dataRoot: engine.dataRoot) }
-    public func submitDeskTask(title: String, objective: String) async throws -> DeviceSyncDeskTask {
-        let result = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
-        return DeviceSyncDeskTask(job: result.job, desk_handle: result.deskItem.handle, desk_alias: result.deskItem.alias)
-    }
-    public func acceptMemoryProposal(proposalID: String) async throws -> MemoryV2.MemoryRecord {
-        try await engine.memory.accept(proposalID: proposalID)
-    }
-    public func rejectMemoryProposal(proposalID: String, reason: String) async throws {
-        try await engine.memory.reject(proposalID: proposalID, reason: reason)
-    }
-    public func deleteMemory(id: String) async throws { try await engine.memory.delete(id: id) }
-    public func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord {
-        try await engine.ports.backgroundWork.approvals.resolveApproval(id: id, decision: decision, provenance: provenance,
-            turn: provenance.resolvingTurn)
-    }
-    public func inboxAction(_ id: String, action: String) async throws {
-        try await platform.inboxAction(id, action: action)
-    }
-    @MainActor
-    public func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String] {
-        try await platform.interactionAction(payload: payload, actionID: actionID, clientID: clientID)
-    }
     public func cancelChatSession(sessionId: String, runIDs: [String]) async throws {
         try await engine.turns.runtime.stop(sessionId: sessionId, runIDs: runIDs)
-    }
-    public func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String?) async throws {
-        try await engine.providers.configureProvider(id: id, apiKey: apiKey, authMode: authMode, defaultModel: defaultModel)
-        await platform.adoptProvider(id)
-    }
-    public func testProvider(_ id: String) async throws -> NativeAgentShared.ProviderTestResult { try await engine.providers.testProvider(id) }
-    public func clearProvider(_ id: String) async throws { try await engine.providers.clearProvider(id) }
-    public func setActiveProvider(surface: String, providerId: String) async throws {
-        try await engine.providers.routing.setActiveProvider(surface: surface, providerId: providerId)
     }
     public func saveSurfaceSelection(surface: String, model: String, reasoningEffort: String?, serviceTier: String?,
         providerID: String?) async throws -> ProviderRoutingSnapshot {
         try await engine.providers.saveSurfaceSelection(
             surface: surface, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier, providerID: providerID)
     }
-    @MainActor public func pinnedChatSessionIDs() -> [String] { engine.transcripts.pinnedSessionIDs }
-    @MainActor public func savePinnedChatSessionIDs(_ ids: [String]) throws { _ = try engine.transcripts.savePinnedSessionIDs(ids) }
+    @MainActor public func closePinnedChatSession(_ sessionID: String) async throws -> Bool {
+        switch try await engine.transcripts.closePinnedTab(sessionID) {
+        case .closed: return true
+        case .refusedAlreadyUnpinned: return false
+        case .refusedInvalidSessionID: throw CocoaError(.fileReadInvalidFileName)
+        }
+    }
     @MainActor
     public func remoteMacControl(payload: [String: String], turn: Turn) async throws -> [String: String] {
         let method = payload["method"] ?? ""
@@ -428,8 +543,6 @@ public protocol EngineDeviceSyncPlatform: Sendable {
     @MainActor func settingsHost() throws -> any QuietSettingsHost
     @MainActor var oauthPlatform: any NativeOAuthPlatformPort.Type { get }
     @MainActor func adoptProvider(_ id: String) async
-    func inboxAction(_ id: String, action: String) async throws
-    @MainActor func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String]
     @MainActor func runMacControl(path: String, bodyData: Data, turn: Turn, context: MacOperationContext) async throws -> JSONValue
 }
 
@@ -438,27 +551,9 @@ extension EngineDeviceSyncHost {
         try await engine.deviceHelpersSnapshot()
     }
 
-    public func helperAction(action: String, payload: [String: String]) async throws -> [String: String] {
-        try await engine.deviceHelperAction(action: action, payload: payload)
+    public func agentThreadAction(action: String, payload: [String: String], device: String) async throws -> [String: String] {
+        try await engine.deviceAgentThreadAction(action: action, payload: payload, device: device)
     }
-
-    public func agentThreadAction(action: String, payload: [String: String], turn: Turn) async throws -> [String: String] {
-        try await engine.deviceAgentThreadAction(action: action, payload: payload, turn: turn)
-    }
-}
-
-extension EngineDeviceSyncHost {
-    @MainActor
-    public func appSettings() async throws -> [MobileAppSetting] {
-        try await QuietSettings.mobileSettings(host: platform.settingsHost())
-    }
-
-    @MainActor
-    public func setAppSetting(id: String, value: String, actionID: String, clientID: String) async throws -> MobileAppSetting {
-        try await QuietSettings.setMobileSetting(host: platform.settingsHost(), id: id, value: value,
-                                                actionID: actionID, clientID: clientID, turn: Turn(id: actionID))
-    }
-
 }
 
 extension EngineDeviceSyncHost {
@@ -467,56 +562,14 @@ extension EngineDeviceSyncHost {
             manager: BackgroundLoops.BackgroundLoopLifetimes.shared)
     }
 
-    public func disconnectTelegram() async throws -> MobileTelegramSnapshot {
-        try await TelegramFacade(dataRoot: engine.dataRoot).disconnectTelegram {
-            await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll").didRestart
-        }
-        return try await telegramSnapshot()
-    }
 }
 
 extension EngineDeviceSyncHost {
-    public func applyMobileTrustAction(_ request: MobileTrustAction) async throws -> Data {
-        let root = engine.dataRoot
-        let saved = try await request.apply(dataRoot: root) { preset, confirmed in
-            try await preset.save(dataRoot: root, fullMacConfirmed: confirmed)
-        }
-        await engine.trust.publishPolicy(saved)
-        return try await trustSnapshotData()
-    }
-}
-
-extension EngineDeviceSyncHost {
-    @MainActor
-    public func startProviderSignIn(_ id: String, requestID: String) -> [String: String] {
-        ProviderSignInHandoff.shared.start(id, requestID: requestID) {
-            let root = engine.dataRoot
-            let result = await NativeOAuthFlow.startOAuthFlow(
-                platform: platform.oauthPlatform, providerId: id, dataRoot: root
-            )
-            guard result.ok else {
-                throw ProviderRoutingError.configurationFailed(result.error ?? "Provider sign-in did not complete.")
-            }
-            let status = NativeOAuthFlow.signInStatus(providerID: id, dataRoot: root)
-            if let error = status.error { throw ProviderRoutingError.configurationFailed(error) }
-            let signedIn = status.isSignedIn
-            if signedIn {
-                await platform.adoptProvider(id)
-            }
-            return signedIn
-        } publish: {
-            await engine.deviceSync?.engine.writeSnapshots(forceHeavy: true)
-        }
-    }
-
     @MainActor
     public func providerSignInStates() -> [String: [String: String]] { ProviderSignInHandoff.shared.states }
 }
 
 extension EngineDeviceSyncHost {
-    public func setConnectorEnabled(id: String, enabled: Bool) async throws -> DeviceSyncSnapshotRows {
-        try await engine.connectors.setMobileConnectorEnabled(id: id, enabled: enabled)
-    }
     public func disconnectConnector(id: String) async throws -> DeviceSyncSnapshotRows {
         try await engine.connectors.disconnectMobileConnector(id: id)
     }

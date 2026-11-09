@@ -79,17 +79,6 @@ public struct MacChatTurnLifecycleState: Sendable, Equatable {
         self.terminalEvidence = terminalEvidence
         self.replyTextSettled = replyTextSettled
     }
-
-    public func effectivePhase(
-        at instant: Date,
-        stalledAfter: TimeInterval = TurnPresentationReducer.defaultStalledAfter
-    ) -> TurnPresentationPhase {
-        TurnPresentationReducer.effectivePhase(
-            presentation,
-            secondsSinceMovement: max(0, instant.timeIntervalSince(presentation.lastMovementAt)),
-            stalledAfter: stalledAfter
-        )
-    }
 }
 
 public struct MacChatTurnLifecycleInput: Sendable, Equatable {
@@ -159,6 +148,7 @@ public enum MacChatTurnLifecycleReducer {
                 detail: activity.actionSummary,
                 delegateName: activity.delegateDisplayName,
                 outcome: activity.outcome,
+                callName: activity.callName,
                 at: activity.occurredAt,
                 resetStreamLength: activity.phase == .retrying,
                 additionalRedactor: additionalRedactor

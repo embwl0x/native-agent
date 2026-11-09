@@ -62,11 +62,7 @@ public enum AgentConversationRouting {
         guard ["agent_message", "agent_read", "agent_cancel"].contains(tool), let dataRoot,
               case .string(let raw)? = input["agent"], !raw.contains(":") else { return input }
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let peers = try AgentPeerStore(dataRoot: dataRoot).list()
-        var matches = Set(peers.filter {
-            $0.id == name.lowercased() || $0.name.caseInsensitiveCompare(name) == .orderedSame
-                || ($0.handles ?? []).contains { $0.caseInsensitiveCompare(name) == .orderedSame }
-        }.map { peer in peer.handles?.first { $0.caseInsensitiveCompare(name) == .orderedSame } ?? "peer:" + peer.id })
+        var matches = try AgentPeerStore(dataRoot: dataRoot).references(named: name)
         matches.formUnion(try BotDefinitionStore(dataRoot: dataRoot).list().filter {
             $0.id.uuidString.lowercased() == name.lowercased() || $0.name.caseInsensitiveCompare(name) == .orderedSame
         }.map { "bot:" + $0.id.uuidString })
@@ -104,7 +100,7 @@ public enum AgentConversationRouting {
                 throw invalid("conversation_id must identify this same bot; use its bot:<UUID> handle.")
             }
         }
-        // These are harness context, not the remote conversation or bot session. Preserve even malformed values for the existing admission owner to reject.
+        // These are turn routing fields, not the remote conversation or bot session. Preserve even malformed values for the existing admission owner to reject.
         var args = input.filter { ["session_id", "__session_id"].contains($0.key) }
         if sending {
             let text = try string(input["text"], field: "text", maximum: 100_000)

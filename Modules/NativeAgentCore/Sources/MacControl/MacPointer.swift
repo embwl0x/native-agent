@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
@@ -18,7 +19,7 @@ import AppKit
 import Carbon
 #endif
 
-// Blueprint: | `MacPointer.swift` | `MacMouseEvent`, `MacScrollEvent`, `AgentPointerHold`: Bounded pointer ownership restores the person's cursor |
+// Blueprint: | `MacPointer.swift` | `MacMouseEvent`, `MacScrollEvent`, `AgentPointerHold`: Input-owned pointer holds restore the person's cursor |
 
 public enum MacMouseButton: String, Sendable, Equatable {
     case left
@@ -71,95 +72,44 @@ public struct MacScrollEvent: Sendable, Equatable {
 
 #if canImport(CoreGraphics) && os(macOS)
 
-/// Unhook the person's mouse during agent pointer actions, then restore its cursor; held buttons defer release only up to `cap`.
+/// The emitted gesture holds the cursor until its buttons are released; move and scroll release when their post ends.
 enum AgentPointerHold {
-    static let settle: TimeInterval = 1.0
-    /// Bound the time the person’s mouse can remain unhooked.
-    static let cap: TimeInterval = 15
-
-    private static let lock = NSLock()
-    private nonisolated(unsafe) static var held = false
-    private nonisolated(unsafe) static var generation = 0
-    private nonisolated(unsafe) static var personPoint = CGPoint.zero
-    private nonisolated(unsafe) static var agentPoint: CGPoint?
-    private nonisolated(unsafe) static var buttonsDown = 0
-    private nonisolated(unsafe) static var startedAt = 0.0
-    private nonisolated(unsafe) static var lastPost = 0.0
-    private nonisolated(unsafe) static var releaseTimer: DispatchSourceTimer?
-
-    static var lastAgentPoint: CGPoint? {
-        lock.lock()
-        defer { lock.unlock() }
-        return agentPoint
+    private struct State {
+        var held = false
+        var personPoint = CGPoint.zero
+        var agentPoint: CGPoint?
+        var buttonsDown: Set<MacMouseButton> = []
     }
+    private static let state = Mutex(State())
 
-    /// Save the person’s cursor before unhooking; scroll delivery follows the agent’s actual cursor position.
+    static var lastAgentPoint: CGPoint? { state.withLock { $0.agentPoint } }
+
     @discardableResult
     static func begin(warpTo point: CGPoint?) -> CGPoint? {
-        let now = ProcessInfo.processInfo.systemUptime
-        lock.lock()
-        lastPost = now
-        guard !held else {
-            scheduleReleaseLocked()
-            let current = agentPoint
-            lock.unlock()
-            return current
+        state.withLock {
+            if $0.held { return $0.agentPoint }
+            guard let current = CGEvent(source: nil)?.location else { return nil }
+            $0.held = true
+            $0.personPoint = current
+            CGAssociateMouseAndMouseCursorPosition(0)
+            if let point { CGWarpMouseCursorPosition(point) }
+            return point ?? current
         }
-        guard let current = CGEvent(source: nil)?.location else { lock.unlock(); return nil }
-        held = true
-        generation &+= 1
-        personPoint = current
-        startedAt = now
-        CGAssociateMouseAndMouseCursorPosition(0)
-        if let point { CGWarpMouseCursorPosition(point) }
-        let chain = generation
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInteractive))
-        timer.setEventHandler { releaseIfIdle(chain: chain) }
-        releaseTimer = timer
-        scheduleReleaseLocked()
-        timer.resume()
-        lock.unlock()
-        return point ?? current
     }
 
-    /// Keep the pointer overlay aligned with emitted input and held-button state.
-    static func posted(phase: MacMousePhase?, at point: CGPoint) {
-        lock.lock()
-        lastPost = ProcessInfo.processInfo.systemUptime
-        agentPoint = point
-        if phase == .down { buttonsDown += 1 }
-        if phase == .up { buttonsDown = max(0, buttonsDown - 1) }
-        scheduleReleaseLocked()
-        lock.unlock()
-        PersonOnlyWindows.noteAgentPointer(at: point, pressed: phase == .down)
-    }
-
-    /// Posts move one deadline; held buttons wait only for release or the original cap, without polling.
-    private static func scheduleReleaseLocked() {
-        guard held else { return }
-        let due = buttonsDown > 0 ? startedAt + cap : min(startedAt + cap, lastPost + settle)
-        releaseTimer?.schedule(deadline: .now() + max(0, due - ProcessInfo.processInfo.systemUptime))
-    }
-
-    /// A stale callback rearms to the newest exact deadline; final release restores the person’s cursor and mouse.
-    private static func releaseIfIdle(chain: Int) {
-        let now = ProcessInfo.processInfo.systemUptime
-        lock.lock()
-        guard held, chain == generation else { lock.unlock(); return }
-        let idle = now - lastPost
-        if now - startedAt < cap, buttonsDown > 0 || idle < settle {
-            scheduleReleaseLocked()
-            lock.unlock()
-            return
+    static func posted(phase: MacMousePhase?, button: MacMouseButton? = nil, at point: CGPoint, emitted: Bool) {
+        state.withLock {
+            if emitted { $0.agentPoint = point }
+            if emitted, let button {
+                if phase == .down { $0.buttonsDown.insert(button) }
+                if phase == .up { $0.buttonsDown.remove(button) }
+            }
+            guard $0.held, $0.buttonsDown.isEmpty else { return }
+            $0.held = false
+            CGWarpMouseCursorPosition($0.personPoint)
+            CGAssociateMouseAndMouseCursorPosition(1)
         }
-        // Hold the lock across restoration so another action cannot begin between cursor return and mouse reattachment.
-        held = false
-        releaseTimer?.cancel()
-        releaseTimer = nil
-        buttonsDown = 0
-        CGWarpMouseCursorPosition(personPoint)
-        CGAssociateMouseAndMouseCursorPosition(1)
-        lock.unlock()
+        if emitted { PersonOnlyWindows.noteAgentPointer(at: point, pressed: phase == .down) }
     }
 }
 

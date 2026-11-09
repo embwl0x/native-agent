@@ -1,5 +1,6 @@
 import AuthoredCapabilities
 import AgentWorkspace
+import Experiences
 import Foundation
 import NativeAgentShared
 import MacControl
@@ -214,7 +215,7 @@ public actor AgentDiscoverySession {
         return await task.value
     }
 
-    /// Report each whole installed bundle version once; the first scan establishes a silent baseline.
+    /// Each whole installed bundle version is one world happening and the parts' `app.installed` signal; the first scan establishes a silent baseline.
     private func arrived(_ bundles: [AgentPeerDiscovery.Bundle], dataRoot: URL) {
         let url = dataRoot.appendingPathComponent("agents/installed-apps.json")
         let baseline = FileManager.default.fileExists(atPath: url.path)
@@ -227,8 +228,10 @@ public actor AgentDiscoverySession {
             if let sdef = info["OSAScriptingDefinition"] as? String,
                !FileManager.default.fileExists(atPath: app.url.appendingPathComponent("Contents/Resources/" + sdef).path) { continue }
             guard seen.insert(id + " " + app.version).inserted, baseline else { continue }
-            guard case .object(let payload) = app.json else { continue }
-            AbilityStore(dataRoot: dataRoot).signal("app.installed", payload)
+            if case .object(let payload) = app.json { AbilityStore(dataRoot: dataRoot).signal("app.installed", payload) }
+            Attention.post(Happening(.world, subject: "app:" + id, door: "mac:installed",
+                words: app.name + " " + app.version + " arrived on this Mac" + (app.scriptable == true ? "; it can be scripted." : "."),
+                once: "app.installed:" + id + ":" + app.version, signal: "app.installed"), dataRoot: dataRoot)
         }
         guard seen != before || !baseline else { return }
         do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(seen), to: url) }
@@ -304,16 +307,17 @@ public actor AgentDiscoverySession {
     /// Successful connection ends its offer in the same call.
     public func settle(dataRoot: URL) { offer(cached ?? [], dataRoot: dataRoot) }
 
-    private static func key(_ id: String) -> String { "agent.found." + id }
-
     private func setupFailed(_ detail: String, for found: [AgentDiscoveryCandidate], dataRoot: URL) {
         let ids = Set(found.map(\.id))
         for index in (cached ?? []).indices where ids.contains(cached![index].id) {
             cached![index].setupFailure = detail
         }
-        _ = ResidentWake.shared.request(dataRoot: dataRoot, reason: "agent connection setup failed", items: found.map {
-            .init(id: "agent.setup." + $0.id, line: detail, key: "agent.setup." + $0.id, home: true)
-        })
+        // The same failure of the same agent is one happening; a different failure is a new one.
+        let failure = SHA256.hash(data: Data(detail.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        for candidate in found {
+            Attention.post(Happening(.body, subject: "agent:" + candidate.id, door: "agents:discovery", who: "self", words: detail,
+                once: "agent.setup:" + candidate.id + ":" + failure), dataRoot: dataRoot)
+        }
     }
 
     /// Decline and disconnect survive discovery and program updates.
@@ -331,7 +335,7 @@ public actor AgentDiscoverySession {
                 throw AgentHostConfigWriter.Failure.unreadable("discovery decisions at \(AgentDiscoveryOffer.url(dataRoot).path)")
             }
             let before = offers, now = Date()
-            var items: [ResidentWake.Item] = []
+            var told: [Happening] = []
             for candidate in found {
                 let row = AgentHostDirectory.rows.first { $0.id == candidate.hostID }
                 // Workspace rows need an explicitly selected folder; offer only recipes that connecting can actually find.
@@ -368,40 +372,35 @@ public actor AgentDiscoverySession {
                         cached?[index].setupFailure = nil
                         cached?[index].decision = nil
                     }
-                    ResidentWake.shared.clear(dataRoot: dataRoot, key: "agent.setup." + candidate.id)
                     if entry.connectedAt == nil {
                         entry.connectedAt = now
-                        ResidentWake.shared.withdraw(dataRoot: dataRoot, key: Self.key(candidate.id))
                         if let row, row.settingsSupported, row.restartRequired,
                            candidate.foundBy.contains(where: { $0.hasPrefix("process: ") }) {
-                            items.append(.init(id: "agent.restart." + candidate.id,
-                                line: "\(row.displayName): connector added. Restart: \(row.restartNote)",
-                                key: "agent.restart." + candidate.id, home: true))
+                            told.append(Happening(.body, subject: "agent:" + candidate.id, door: "agents:discovery", who: "self",
+                                words: "\(row.displayName): connector added. Restart: \(row.restartNote)",
+                                once: "agent.restart:" + candidate.id + ":" + (candidate.version ?? "")))
                         }
                     }
                 } else if entry.connectedAt == nil, entry.declinedAt == nil, entry.offeredAt == nil {
                     entry.offeredAt = now; entry.version = candidate.version
                     let place = candidate.foundBy.joined(separator: "; ")
-                    items.append(.init(id: Self.key(candidate.id) + ":" + (candidate.version ?? ""),
-                        line: "Found \"\(candidate.name)\" on this Mac (\(place)), not connected. Connect: "
+                    told.append(Happening(.body, subject: "agent:" + candidate.id, door: "agents:discovery", who: "self",
+                        words: "Found \"\(candidate.name)\" on this Mac (\(place)), not connected. Connect: "
                             + (candidate.draft.map { _ in """
                                 agent.recipe_write with the recipe_draft agent.contacts {discover: \"\(candidate.name)\"} shows, then agent.connect
                                 """ } ?? "agent.connect")
                             + "; not wanted: agent.discovery_dismiss.",
-                        // Peer-authored card text must retain unidentified-peer provenance until a tainted wake can consume it.
-                        key: Self.key(candidate.id), agent: candidate.hostID == nil ? "another agent" : nil))
+                        once: "agent.found:" + candidate.id + ":" + (candidate.version ?? ""),
+                        // Peer-authored card text keeps unidentified-peer provenance: the thought that reads it is steered by that peer.
+                        peers: candidate.hostID == nil ? ["another agent"] : nil))
                 } else if entry.open {
                     entry.version = candidate.version
                 } else { continue }
                 offers[candidate.id] = entry
             }
-            // Count an offer only after its wake is durably retained.
-            if !items.isEmpty, !ResidentWake.shared.request(dataRoot: dataRoot, reason: "an agent found on this Mac", items: items) {
-                nativeLog("AgentDiscoverySession: the wake for %ld found agents was not kept; offering again next pass", items.count)
-                for id in Array(offers.keys) where offers[id]?.offeredAt == now || offers[id]?.connectedAt == now { offers[id] = before[id] }
-            }
-            guard offers != before else { return }
-            try AgentDiscoveryOffer.write(offers, dataRoot)
+            // Told only once the decisions are saved: a failed save tells its failure, and the next pass offers again under the same keys.
+            if offers != before { try AgentDiscoveryOffer.write(offers, dataRoot) }
+            for happening in told { Attention.post(happening, dataRoot: dataRoot) }
         } } catch {
             setupFailed("""
                 Agent discovery state failed: \(error.localizedDescription) Contacts: \(AgentPeerStore(dataRoot: dataRoot).fileURL.path); \
@@ -441,7 +440,6 @@ public actor AgentDiscoverySession {
             }
             offers[id]?.declinedAt = Date()
             try AgentDiscoveryOffer.write(offers, dataRoot)
-            ResidentWake.shared.withdraw(dataRoot: dataRoot, key: Self.key(id))
             return .object(["status": .string("declined"), "changed": .bool(true), "name": .string(offers[id]!.name),
                 "detail": .string("Decline saved. This agent will not be offered or connected automatically again.")])
         } } catch { return failed("discovery_decision_save_failed",

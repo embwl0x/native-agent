@@ -1,19 +1,17 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `MyQueue.swift` | `MyQueue`, `entries`, `add`, `isReady`, `releaseSignal`, `releaseNews`, `When.isPrompt`, `Entry.owedToPerson` |
+// Blueprint: | `MyQueue.swift` | `MyQueue`, `entries`, `add`, `isReady`, `releaseSignal`, `releaseNews`, `freeAfter`, `shown`, `Entry.owedToPerson` |
 
 /// Desk steps carry readiness so waiting on the person or a card does not nag the agent.
 public enum MyQueue {
     public static let project = "my queue"
 
-    /// The durable launch commit prevents restored scheduler rows importing duplicate steps.
-    public static func scheduledMigrationMarker(dataRoot: URL) -> URL {
-        dataRoot.appendingPathComponent("scheduler/.intentions-finished")
+    /// The agent carries queue intentions and work assigned to her; pursuits have their own admission.
+    public static func carries(_ item: DeskItem) -> Bool {
+        !item.isPursuit && !item.status.isTerminal && (item.project == project || item.assignee == "agent")
     }
 
-    public static func migrationReady(_ step: DeskStep, dataRoot: URL) -> Bool {
-        step.scheduledJobID == nil || (try? Data(contentsOf: scheduledMigrationMarker(dataRoot: dataRoot))) != nil
-    }
+    public static func promiseCaptureID(moment: String, candidate: Int) -> String { "promise:" + moment + ":" + String(candidate) }
 
     public struct Entry: Sendable {
         public let item: DeskItem
@@ -26,8 +24,8 @@ public enum MyQueue {
 
     /// The newest step ref owns readiness after a refile or condition change.
     public static func entry(_ item: DeskItem) -> Entry? {
-        guard item.project == project, !item.status.isTerminal else { return nil }
-        guard let step = item.step else { return nil }
+        guard carries(item) else { return nil }
+        guard let step = item.step, item.project == project || !step.promiseCaptures.isEmpty else { return nil }
         return Entry(item: item, step: step)
     }
 
@@ -165,10 +163,17 @@ public enum MyQueue {
         }
 
         public var card: String? { if case .afterCard(let id) = self { id } else { nil } }
-        /// Prompt moments bypass free-time quiet so their trigger can act promptly.
-        public var isPrompt: Bool {
-            switch self { case .at, .every, .userHere, .userAway, .news, .signal: true; default: false }
-        }
+    }
+
+    /// When-free work is due this long after the agent's last turn.
+    public static let freeAfter: TimeInterval = 30 * 60
+
+    /// A moment as the agent reads it: the time today, or the day and time.
+    public static func shown(_ date: Date) -> String {
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.dateFormat = Calendar.current.isDate(date, inSameDayAs: Date()) ? "'at' HH:mm" : "EEE MMM d 'at' HH:mm"
+        return format.string(from: date)
     }
 
     public static func when(_ entry: Entry) -> When? {
@@ -320,23 +325,14 @@ public enum MyQueue {
         }
     }
 
-    /// Revalidate the weighed snapshot and topic under the lock that appends the release.
-    public static func releaseNews(_ expected: Entry, summary: String, store: SwiftNativeDeskStore,
-                                   at now: Date, rest: TimeInterval) async throws -> Bool {
+    /// Revalidate the weighed snapshot and topic under the lock that appends the release. Each news line that touches the step is its own release.
+    public static func releaseNews(_ expected: Entry, summary: String, store: SwiftNativeDeskStore, at now: Date) async throws -> Bool {
         try await SwiftNativePersistenceCore.withFileLock(store.opsPath) {
             let feed = try await store.readFeedUnlocked()
             let state = try store.inCurrentLife(SwiftNativeDeskStore.compact(base: feed.base, feed.ops))
             guard let item = state.items.first(where: { $0.handle == expected.item.handle }), let entry = Self.entry(item),
                   entry.step.when == expected.step.when, entry.step.filedAt == expected.step.filedAt,
                   case .news(let topic)? = when(entry), entry.step.status != "stopped", !isOver(entry, at: now) else { return false }
-            guard let filed = DeskClock.parseISO(entry.step.filedAt ?? item.openedAt) else {
-                throw DeskError.journalUnavailable(path: store.opsPath.path, reason: "\(item.handle) has an unreadable condition filing timestamp")
-            }
-            let last = item.notes.filter {
-                $0.author == "system" && $0.releaseCondition == When.news(topic).stored
-                    && DeskClock.parseISO($0.ts).map { $0 > filed } == true
-            }.compactMap { DeskClock.parseISO($0.ts) }.max()
-            guard last.map({ now.timeIntervalSince($0) >= rest }) ?? true else { return false }
             let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: item.handle,
                 body: .appendNote(text: "Released: news: " + summary, author: "system", releaseCondition: When.news(topic).stored))
             _ = try await store.appendAndRecompactUnlocked(op, feed: feed)
@@ -346,6 +342,64 @@ public enum MyQueue {
 
     public enum Change: String, Sendable { case added, reused, updated }
 
+    public struct PromiseFiling: Sendable {
+        public let target: String?
+        public let step: DeskStep
+        public init(target: String?, step: DeskStep) {
+            self.target = target; self.step = step
+        }
+    }
+
+    public struct PromiseLanding: Sendable {
+        public let id: String
+        public let change: Change
+    }
+
+    /// Land the judgment under the Desk lock, matching selected rows by id in the current carried work.
+    public static func capture(_ filings: [PromiseFiling], store: SwiftNativeDeskStore) async throws
+        -> [Result<PromiseLanding, Error>] {
+        try await SwiftNativePersistenceCore.withFileLock(store.opsPath) {
+            let current = try await store.liveState().items.filter(carries)
+            var results: [Result<PromiseLanding, Error>] = []
+            for filing in filings {
+                do {
+                    let landing: PromiseLanding
+                    if let target = filing.target {
+                        guard let item = current.first(where: { $0.handle == target }) else { throw DeskError.unknownHandle(target) }
+                        var step = filing.step
+                        if let previous = item.step {
+                            step = previous
+                            step.words = filing.step.words
+                            step.when = filing.step.when
+                            step.card = filing.step.card
+                            step.source = filing.step.source
+                            step.promiseCaptures = filing.step.promiseCaptures
+                            step.peers = filing.step.peers
+                            step.elevated = filing.step.elevated
+                            step.preserveOrigin(of: previous)
+                        }
+                        if let entry = entry(item) {
+                            let updated = try await update(entry, step: step, store: store)
+                            landing = PromiseLanding(id: updated.name, change: updated.step == entry.step ? .reused : .updated)
+                        } else {
+                            step.filedAt = DeskClock.commitStamp(notBefore: item.updatedAt)
+                            if item.title != step.title {
+                                _ = try await store.updateTitle(item.handle, title: step.title)
+                            }
+                            _ = try await store.addRef(item.handle, ref: DeskRef(kind: .step(step)))
+                            landing = PromiseLanding(id: "desk." + item.alias, change: .updated)
+                        }
+                    } else {
+                        let queued = try await store.addQueueStep(filing.step, matchingWords: false)
+                        landing = PromiseLanding(id: queued.entry.name, change: queued.change)
+                    }
+                    results.append(.success(landing))
+                } catch { results.append(.failure(error)) }
+            }
+            return results
+        }
+    }
+
     /// Refiling preserves origin and peer steering; inferred repeats cannot overwrite conditions or unlink cards.
     public static func add(_ step: DeskStep, store: SwiftNativeDeskStore) async throws -> (entry: Entry, change: Change) {
         try await store.addQueueStep(step)
@@ -353,13 +407,6 @@ public enum MyQueue {
 
     public static func update(_ entry: Entry, step: DeskStep, store: SwiftNativeDeskStore) async throws -> Entry {
         try await store.addQueueStep(step, replacing: entry).entry
-    }
-
-    /// Bound inferred steps so repeated promises cannot grow the queue indefinitely.
-    public static let inferredCap = 20
-
-    public struct Full: LocalizedError {
-        public var errorDescription: String? { "MY QUEUE already holds \(MyQueue.inferredCap) inferred steps" }
     }
 
     public struct Superseded: Error, LocalizedError, Sendable {
@@ -373,6 +420,22 @@ public enum MyQueue {
                                                    outcomeSummary: why, canceled: dropped) else {
             throw Superseded()
         }
+        if let run = skillRun(in: entry.step.words) {
+            do { try PartRunStore.discard(run, root: store.dataRoot) }
+            catch { throw RunCleanupFailure(entry: entry, runID: run, underlying: error) }
+        }
+    }
+
+    public struct RunCleanupFailure: Error, LocalizedError, Sendable {
+        public let entry: Entry
+        public let runID: String
+        public let underlying: any Error
+        public var errorDescription: String? { underlying.localizedDescription }
+    }
+
+    /// A closed resume step releases its retained run and the reservations that depend on it.
+    public static func releaseFinishedRun(words: String, store: SwiftNativeDeskStore) throws {
+        if let run = skillRun(in: words) { try PartRunStore.discard(run, root: store.dataRoot) }
     }
 
     /// Stopped runs retain landed holds while their resume step waits for an own turn.

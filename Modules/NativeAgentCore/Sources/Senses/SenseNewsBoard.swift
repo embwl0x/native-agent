@@ -3,9 +3,11 @@ import Foundation
 import AppKit
 import CryptoKit
 import Darwin
+import Experiences
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `SenseNewsBoard.swift` | Bounded deduplicated news and care crossing; checked persistence precedes publication |
+// Blueprint: | `SenseNewsBoard.swift` | Bounded deduplicated news; checked persistence precedes publication, and each new item is a world happening |
 public actor SenseNewsBoard {
     public static let shared = SenseNewsBoard()
     public static let presentationDidChange = Notification.Name("NativeAgent.sensePresentationDidChange")
@@ -14,7 +16,7 @@ public actor SenseNewsBoard {
     public static let maximumAge: TimeInterval = 60 * 60
     private var items: [SenseNews] = []
     private var recent: [SenseNews] = []
-    private struct History: Codable {
+    private struct History: Codable, Equatable {
         var count: Int
         var deltas: [String]
     }
@@ -31,6 +33,7 @@ public actor SenseNewsBoard {
     private var histories: [UUID: History] = [:]
     private var view: SenseInteractiveView?
     private var storageURL: URL?
+    private var dataRoot: URL?
     private var storageBlocked = false
     private var storageNotice: SenseNews?
     public private(set) var storageFailure: String?
@@ -41,6 +44,7 @@ public actor SenseNewsBoard {
         defer { NotificationCenter.default.post(name: Self.presentationDidChange, object: nil) }
         let directory = dataRoot.appendingPathComponent("senses/news", isDirectory: true)
         storageURL = directory.appendingPathComponent("unread.json")
+        self.dataRoot = dataRoot
         do {
             let fm = FileManager.default
             for folder in [directory.deletingLastPathComponent(), directory] {
@@ -106,13 +110,18 @@ public actor SenseNewsBoard {
         NotificationCenter.default.post(name: Self.presentationDidChange, object: nil)
     }
     public func interactiveView() -> SenseInteractiveView? { view }
-    /// Keep news for the next turn; care wakes name it without duplicating its text.
+    /// Keep news for the next turn; each new item is posted to attention as a world happening, weighed by the agent's turn program.
     @discardableResult
     public func post(_ news: SenseNews) async -> Bool {
         guard !Task.isCancelled else { return false }
         let before = (items, recent, histories)
         let fresh: SenseNews?
-        do { fresh = try postCurrent(news); try persist() }
+        do {
+            _ = try checkedStorage()
+            fresh = try postCurrent(news)
+            guard items != before.0 || recent != before.1 || histories != before.2 else { return true }
+            try persist()
+        }
         catch {
             (items, recent, histories) = before
             fail(error)
@@ -121,20 +130,26 @@ public actor SenseNewsBoard {
         }
         NotificationCenter.default.post(name: Self.presentationDidChange, object: nil)
         await published(news)
-        guard let fresh, let crossing = SensesHub.shared.crossing else { return storageURL != nil }
-        let watch = "sense:" + fresh.senseID + ":v\(fresh.version):" + (fresh.observationID ?? Self.identity(fresh.address))
-        // Only new source change identities may end this watch's care rest.
-        let changedWatch = watch + ":change:" + (fresh.changeID ?? Self.identity(fresh.summary))
-        _ = await crossing.cross(fresh.summary, watch: changedWatch, reason: "what your senses noticed",
-            id: watch + ":" + fresh.id.uuidString, says: fresh.senseID + ": news at " + Self.updateLine(fresh.address), agent: nil)
-        return storageURL != nil
+        // Pruning alone changes retained state, but a repeat or expired item is no new occurrence.
+        guard let fresh, let dataRoot else { return true }
+        // What it is about is the watched address (its private identity); the door is the sense, so its yield gathers per sense.
+        let address = String((fresh.observationID ?? Self.identity(fresh.address)).prefix(16))
+        Attention.post(Happening(.world, subject: "sense:" + fresh.senseID + ":" + address, door: "sense:" + fresh.senseID,
+            words: fresh.senseID + " at " + Self.updateLine(fresh.address) + ": " + Self.updateLine(fresh.summary),
+            once: "sense:" + fresh.senseID + ":" + fresh.id.uuidString.lowercased()), dataRoot: dataRoot)
+        return true
     }
-    /// Keep already-weighed lines for the next turn without weighing them again.
+    /// Keep a notice for the next turn without posting it to attention (a watch's own availability).
     @discardableResult
     public func keep(_ news: SenseNews) async -> Bool {
         guard !Task.isCancelled else { return false }
         let before = (items, recent, histories)
-        do { try postCurrent(news); try persist() }
+        do {
+            _ = try checkedStorage()
+            try postCurrent(news)
+            guard items != before.0 || recent != before.1 || histories != before.2 else { return true }
+            try persist()
+        }
         catch {
             (items, recent, histories) = before
             fail(error)
@@ -201,11 +216,12 @@ public actor SenseNewsBoard {
     }
     /// Acknowledge immutable notices only after provider output proves delivery; newer events at the same address must survive.
     public func acknowledge(_ ids: Set<UUID>) async {
-        defer { NotificationCenter.default.post(name: Self.presentationDidChange, object: nil) }
         let previousItems = items
         let previousHistories = histories
         items.removeAll { ids.contains($0.id) }
         retainHistories()
+        guard items != previousItems || histories != previousHistories else { return }
+        defer { NotificationCenter.default.post(name: Self.presentationDidChange, object: nil) }
         // Persist removal before publication; failed bookkeeping cannot promise restart safety.
         do { try persist() } catch {
             items = previousItems
@@ -246,9 +262,13 @@ public actor SenseNewsBoard {
     private static func updateLine(_ text: String) -> String {
         bounded(text.split(whereSeparator: \.isNewline).joined(separator: " · "), bytes: maximumUpdateBytes)
     }
-    private func persist() throws {
+    private func checkedStorage() throws -> URL {
         guard let storageURL else { throw storageError("Private news storage is not bound.") }
         guard !storageBlocked else { throw storageError(storageFailure ?? "Private news storage is unavailable.") }
+        return storageURL
+    }
+    private func persist() throws {
+        let storageURL = try checkedStorage()
         let bytes = try JSONEncoder().encode(Saved(items: items, recent: recent, histories: histories))
         guard bytes.count <= Self.maximumStorageBytes else { throw storageError("Private news storage exceeded its byte bound.") }
         guard NativePrivateFile.write(bytes, to: storageURL) else { throw storageError("Cannot durably write private unread news.") }

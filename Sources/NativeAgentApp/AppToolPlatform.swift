@@ -8,6 +8,7 @@ import Cognition
 import CognitiveSubstrate
 import MacIntegration
 import NativeAgentCore
+import NativeAgentShared
 import ChatToolRuntime
 import ChatTurnContracts
 import PersistenceCore
@@ -44,7 +45,7 @@ extension AppToolExecutor {
         securityCenter: SwiftNativeSecurityCenter = SwiftNativeSecurityCenter(),
         enforceAutonomySecurity: Bool = true,
         browserActionRunner: (@Sendable (String, Bool, [String: JSONValue], Turn, AppActionExecution) async throws -> JSONValue)? = nil,
-        mobileNotificationSender: @escaping @Sendable (String, String, [String: String], Turn) async throws -> MobileNotificationDeliveryReceipt = {
+        mobileNotificationSender: @escaping @Sendable (String, String, [String: String], Turn) async throws -> AttentionOutcome = {
             title, body, userInfo, turn in
             try await AppToolExecutor.defaultMobileNotificationSender(
                 title: title, body: body, userInfo: userInfo, router: AttentionRouter.shared, turn: turn)
@@ -65,7 +66,6 @@ extension AppToolExecutor {
                     dataRoot: securityCenter.dataRoot, turn: turn, execution: execution)
             },
             chrome: { NativeAgentEngine.live.chrome },
-            macPersonAway: MacScreenLock.personAway,
             motorActionObserver: { await NativeAgentEngine.liveCognition.observeMotorActionState($0) },
             mobileNotificationSender: mobileNotificationSender,
             macNotificationSender: macNotificationSender,
@@ -77,9 +77,24 @@ extension AppToolExecutor {
             },
             proactiveSpeechClient: { NativeAgentEngine.forRoot($0).chatClient(profile: .background) },
             attention: { AttentionRouter.shared },
-            quietHost: { ApplicationLifetime.shared.appModel.map(AppQuietToolHost.init) },
+            // Her window is one window: a turn from any door works the window that is attached.
+            quietHost: {
+                ApplicationLifetime.shared.appModel.map { model in
+                    (try? BodyFacePresentation.current(model: model)).map { AppQuietToolHost(model, face: $0) } ?? AppQuietToolHost(model)
+                }
+            },
             presentation: AppQuietToolPresentation(),
-            actionExecution: .init(invocation: .init(), deadlines: .init(), turnWork: .init())
+            actionExecution: .init(invocation: .init(), deadlines: .init(), turnWork: .init()),
+            bindPresentation: { turn in
+                guard let model = ApplicationLifetime.shared.appModel else { throw FaceWireError.disconnected }
+                let target: BodyFacePresentation
+                if let connection = turn[FacePresentationPart.self] {
+                    target = BodyFacePresentation(connection: connection, model: model)
+                } else if let attached = try? BodyFacePresentation.current(model: model) {
+                    target = attached
+                } else { return nil }
+                return AppToolPresentationBinding(host: { AppQuietToolHost(model, face: target) }, presentation: target)
+            }
         )
     }
     static func defaultBrowserActionRunner(
@@ -89,7 +104,7 @@ extension AppToolExecutor {
     ) async throws -> JSONValue {
         return try await defaultBrowserActionRunner(
             actionId: actionId, dryRun: dryRun, input: input,
-            chrome: { NativeAgentEngine.forRoot(dataRoot).chrome }, macPersonAway: MacScreenLock.personAway,
+            chrome: { NativeAgentEngine.forRoot(dataRoot).chrome },
             motorActionObserver: { await NativeAgentEngine.liveCognition.observeMotorActionState($0) },
             platform: BrowserToolPlatformPort(
                 setUpChrome: {

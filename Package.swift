@@ -11,6 +11,7 @@ let package = Package(
     products: [
         .executable(name: "nativeagent-link", targets: ["NativeAgentLink"]),
         .executable(name: "NativeAgentApp", targets: ["NativeAgentApp"]),
+        .executable(name: "NativeAgentFace", targets: ["NativeAgentFace"]),
         .executable(name: "NativeAgentChromeRelay", targets: ["NativeAgentChromeRelay"]),
         .executable(name: "NativeAgentSenseHost", targets: ["NativeAgentSenseHost"])
     ],
@@ -27,6 +28,12 @@ let package = Package(
         .package(path: "Modules/NativeAgentCore")
     ],
     targets: [
+        .executableTarget(
+            name: "NativeAgentFace",
+            dependencies: [.product(name: "NativeAgentShared", package: "NativeAgentShared"),
+                           .product(name: "Sparkle", package: "Sparkle")],
+            path: "Sources/NativeAgentFace"
+        ),
         .executableTarget(
             name: "NativeAgentSenseHost",
             dependencies: [.product(name: "Senses", package: "NativeAgentCore"),

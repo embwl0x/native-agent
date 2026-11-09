@@ -1,14 +1,42 @@
 import Foundation
-// Blueprint: | `ProviderRecoveryPolicy.swift` | `ProviderWire`: typed verdicts; wire-owned redelivery |
+// Blueprint: | `ProviderRecoveryPolicy.swift` | `ProviderRecoveryPolicy`: typed failure classification and descriptions |
 
 public enum ProviderRecoveryPolicy {
+    enum Reconnect: Sendable {
+        case network(retryAfter: Int?)
+        case provider(retryAfter: Int?)
+
+        var retryAfter: Int? {
+            switch self {
+            case .network(let seconds), .provider(let seconds): return seconds
+            }
+        }
+    }
+
+    /// Only connection loss and capacity refusals admit another request, paced by the server's Retry-After when it sends one.
+    static func reconnect(_ error: Error) -> Reconnect? {
+        func delay(_ error: Error) -> Int? {
+            if let diagnostic = error as? ProviderFailure.Diagnostic { return diagnostic.retryAfter }
+            if let wrapped = error as? any ProviderFailureWrapping { return delay(wrapped.providerFailureCause) }
+            return nil
+        }
+        switch ProviderFailure.classify(error) {
+        case .network?, .offline?: return .network(retryAfter: delay(error))
+        case .overloaded?: return .provider(retryAfter: delay(error))
+        case .rateLimited(let seconds)?:
+            guard let seconds = seconds ?? delay(error) else { return nil }
+            return .provider(retryAfter: seconds)
+        default: return nil
+        }
+    }
+
     /// One typed recovery verdict serves every adapter and surface while preserving the selected model.
     public static func isRecoverable(_ error: Error) -> Bool {
         if let wrapped = error as? any ProviderFailureWrapping {
             return isRecoverable(wrapped.providerFailureCause)
         }
         switch ProviderFailure.classify(error) {
-        case .network, .noReply, .overloaded, .rateLimited: return true
+        case .network, .offline, .noReply, .overloaded, .rateLimited: return true
         default: return false
         }
     }
@@ -18,6 +46,7 @@ public enum ProviderRecoveryPolicy {
     }
 
     public static func personMessage(_ error: Error) -> String? {
+        if let stopped = error as? ProviderRecovery.Stopped { return stopped.errorDescription }
         if let repair = (error as? ProviderFailure.Diagnostic)?.repair { return repair.message }
         if let report = error as? ProviderFailure.Report { return report.personDescription }
         if let wrapped = error as? any ProviderFailureWrapping { return personMessage(wrapped.providerFailureCause) }

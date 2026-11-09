@@ -3,10 +3,10 @@ import Experiences
 import NativeAgentCore
 import os
 import PersistenceCore
-// Blueprint: | `AgentRecipeStore.swift` | `AgentRecipeStore`, `Resources/grok-routine.json`, `AgentHostDirectory.rows`, `AgentHostRow.A2A`, `recipe(for:)`, `load`, `recipe`, `launch`, `read`, `write`, `learn`; dry-run mode belongs to the explicit conversation operation |
+// Blueprint: | `AgentRecipeStore.swift` | `AgentRecipeStore`, `Resources/agent-hosts.json`, `Resources/grok-routine.json`, `AgentHostDirectory.rows`, `AgentHostRow.A2A`, `recipe(for:)`, `load`, `recipe`, `launch`, `read`, `write`, `learn`; dry-run mode belongs to the explicit conversation operation |
 
-/// Saved recipes own every connect, send and health read; tables and bundles only seed them. Reseeding may update only seed-owned fields; authored values
-/// survive, including hosts absent from the table.
+/// Saved recipes own every connect, send and health read; the shipped recipe files only seed them. Reseeding may update only seed-owned fields; authored
+/// values survive, including hosts absent from the shipped recipes.
 public enum AgentRecipeStore {
     public struct Recipe: Codable, Sendable, Equatable {
         /// Hand edits need not bump versions, so versions alone cannot prove identity.
@@ -308,7 +308,7 @@ public enum AgentRecipeStore {
         guard recipe.recipeVersion > 0, recipe.recipeVersion < Int.max else {
             throw ShapeError(description: "recipeVersion must be positive and leave room for the next version; existing bytes were preserved")
         }
-        if AgentHostDirectory.seed.contains(where: { $0.id == recipe.host.id }),
+        if try shippedHosts.get().contains(where: { $0.id == recipe.host.id }),
            recipe.seedHost == nil || recipe.authoredFields == nil {
             throw ShapeError(
                 description: "Seeded hosts require explicit seedHost and authoredFields; preserve and repair missing provenance from retained evidence")
@@ -358,11 +358,28 @@ public enum AgentRecipeStore {
 
     private static func folder(_ root: URL) -> URL { root.appendingPathComponent("agents/recipes", isDirectory: true) }
 
+    /// The shipped host recipes; restart steps do not prove connection, and conflicting configuration contracts cannot seed a host.
+    private static let shippedHosts = Result<[AgentHostRow], Error> {
+        guard let file = Bundle.module.url(forResource: "agent-hosts", withExtension: "json") else {
+            throw ShapeError(
+                description: "The bundled agent-hosts.json seed is missing; tell the person this copy of NativeAgent is missing its agent host recipes")
+        }
+        return try JSONValue.parse(Data(contentsOf: file)).decodedExactly(as: [AgentHostRow].self)
+    }
+
     private static func scan(_ root: URL, a2a peers: [AgentPeerContact] = [], seedMissing: Bool = true) -> Loaded {
         let folder = folder(root)
-        let order = AgentHostDirectory.seed.map(\.id)
+        let shipped: [AgentHostRow]
+        do { shipped = try shippedHosts.get() }
+        catch {
+            // Saved recipes validate against the shipped ids, so none can be read without them.
+            let words = "The shipped agent host recipes could not be read: \(error). Reinstall NativeAgent; no recipe was read or seeded."
+            owe(root, id: "catalog", file: folder, words: words, recipe: nil)
+            return Loaded(root: root, recipes: [], problems: ["catalog": words])
+        }
+        let order = shipped.map(\.id)
         let build = NativeAgentBuildIdentity.current
-        var hosts = AgentHostDirectory.seed + peers.map(AgentHostDirectory.seed)
+        var hosts = shipped + peers.map(AgentHostDirectory.seed)
         var seedProblems: [String: String] = [:]
         do {
             guard let file = Bundle.module.url(forResource: "grok-routine", withExtension: "json") else {
@@ -403,7 +420,7 @@ public enum AgentRecipeStore {
             owe(root, id: id, file: folder.appendingPathComponent(name), words: problems[id]!,
                 recipe: hosts.first { $0.id == id })
         }
-        // Keep seed table ordering so name resolution precedence stays stable.
+        // Keep the shipped recipes' order so name resolution precedence stays stable.
         recipes.sort { (order.firstIndex(of: $0.host.id) ?? order.count, $0.host.id) < (order.firstIndex(of: $1.host.id) ?? order.count, $1.host.id) }
         return Loaded(root: root, recipes: recipes, problems: problems)
     }

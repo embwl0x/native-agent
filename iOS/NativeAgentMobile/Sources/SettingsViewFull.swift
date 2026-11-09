@@ -1,4 +1,6 @@
 import SwiftUI
+import Foundation
+import UIKit
 import NativeAgentShared
 // Blueprint: | `SettingsViewFull.swift` | Device settings, appearance and release version; shared refresh/availability; push diagnostics in Status |
 
@@ -7,8 +9,8 @@ enum SettingsMacHealthPresentation {
         version.components(separatedBy: "-dev.").first ?? version
     }
 
-    static func uptimeText(_ seconds: Double) -> String {
-        let formatted = UserDisplayFormatters.humanizeDuration(seconds)
+    static func uptimeText(_ launchedAt: Date, now: Date = Date()) -> String {
+        let formatted = UserDisplayFormatters.humanizeDuration(max(0, now.timeIntervalSince(launchedAt)))
         return formatted.isEmpty ? "Unknown" : formatted
     }
 }
@@ -36,258 +38,155 @@ struct SettingsViewFull: View {
     @StateObject private var store = SettingsStore()
     @ObservedObject private var turnActivity = PhoneTurnActivity.shared
     @State private var showRePairSheet = false
-    @State private var repairResult: String?
-    @State private var isForceRefreshing = false
-    @AppStorage(NativeAgentAppearance.storageKey) private var appearanceRawValue = NativeAgentAppearance.system.rawValue
     @State private var pushedFace: FaceDestination?
+    // The wrappers invalidate the projection when either device preference changes.
+    @AppStorage(NativeAgentAppearance.storageKey) private var appearanceRawValue = NativeAgentAppearance.system.rawValue
+    @AppStorage(HazeColor.key) private var hazeRawValue = HazeColor.defaultValue.rawValue
+    private var session: FacePageSession { store.sync.pageSessions.page("phone-settings") }
+    private var localControls: [PhoneLocalSetting] {
+        [NativeAgentAppearance.settingControl, HazeSwatches.settingControl, turnActivity.settingControl]
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
-            settingsPage.navigationDestination(item: $pushedFace) { $0.view }.onAppear {
-                if opensConnection { proxy.scrollTo("connection", anchor: .top) }
+            AlivePage(title: "Settings", line: "This iPhone, its link to the Mac, and the Mac's own settings.") {
+                FaceView(face: appearanceFace, door: localDoor, session: session)
+                FaceView(face: connectionFace, door: localDoor, session: session).id("connection")
+                MobileFaceRows(page: "settings") { pushedFace = $0 }
+                PhonePlacesSettings()
+                PhoneSensesSettings()
+                FaceView(face: aboutFace, door: localDoor, session: session)
             }
-        }
-    }
-
-    private var settingsPage: some View {
-        AlivePage(title: "Settings", line: "This iPhone, its link to the Mac, and the Mac's own settings.") {
-            AliveSection("Appearance") {
-                MobileAdaptiveRow(spacing: 12) {
-                    Text("Color scheme").foregroundStyle(AlivePalette.text)
-                    Spacer(minLength: 8)
-                    Picker("Color scheme", selection: $appearanceRawValue) {
-                        ForEach(NativeAgentAppearance.allCases) { appearance in
-                            Text(appearance.title).tag(appearance.rawValue)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .hazeTinted()
-                }
-                .padding(.horizontal, AliveMetrics.rowInsetH)
-                .padding(.top, 6)
-                Text("System follows your iPhone or iPad appearance automatically.")
-                    .font(.footnote)
-                    .foregroundStyle(AlivePalette.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, AliveMetrics.rowInsetH)
-                    .padding(.bottom, AliveMetrics.rowInsetV)
-                AliveDivider()
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Haze").foregroundStyle(AlivePalette.text)
-                    HazeSwatches()
-                    Text("The light that drifts behind every screen. Same colors as on the Mac.")
-                        .font(.footnote)
-                        .foregroundStyle(AlivePalette.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .aliveRow()
-            }
-
-            AliveSection("Mac") {
-                if let health = store.sync.health {
-                    AliveValueRow(label: "Health", value: health.ok ? "Reported healthy" : "Reported issue",
-                                 valueColor: health.ok ? AlivePalette.secondary : NativeAgentMobileTheme.Colors.trouble)
-                    AliveDivider()
-                    AliveValueRow(label: "App", value: health.app)
-                    AliveDivider()
-                    AliveValueRow(label: "Version", value: SettingsMacHealthPresentation.versionText(health.version))
-                    AliveDivider()
-                    AliveValueRow(label: "Uptime", value: SettingsMacHealthPresentation.uptimeText(health.uptimeSeconds))
-                    if !store.availableFields.contains(.health) {
-                        AliveDivider()
-                        AliveNote("The latest health snapshot could not be read. Showing the last known report.")
-                    }
-                } else if store.isLoading {
-                    ProgressView("Loading health snapshot…")
-                        .tint(AlivePalette.secondary)
-                        .foregroundStyle(AlivePalette.secondary)
-                        .aliveRow()
-                } else {
-                    AliveNote("No health report has reached this iPhone yet. Connection below shows the next step.")
-                }
-            }
-
-            connectionGroup.id("connection")
-            AliveSection("On your Mac") {
-                macLink("Telegram", "Telegram settings on your Mac") { TelegramView() }
-                AliveDivider()
-                macLink("Providers", "The models I think with") { MobileFacePage(page: "providers") }
-            }
-            MobileFaceRows(page: "settings") { pushedFace = $0 }
-            PhonePlacesSettings()
-            PhoneSensesSettings()
-            AliveSection("Live Activities") {
-                Toggle("Show task names on the Lock Screen", isOn: Binding(
-                    get: { turnActivity.isEnabled }, set: { turnActivity.setEnabled($0) }))
-                    .aliveRow()
-                AliveNote("""
-                    Includes work started on the Mac, Telegram, helpers and agent bridges. Task names may be visible while this iPhone is locked. Without an \
-                    APNs key on the Mac, activities start when this app is open or next wakes; updates can be delayed while it is asleep.
-                    """)
-                if let error = turnActivity.errorMessage { AliveNote(error) }
-            }
-
-            AliveSection("About") {
-                aboutLink("Privacy Policy", key: "NativeAgentPrivacyPolicyURL")
-                AliveDivider()
-                aboutLink("Support", key: "NativeAgentSupportURL")
-                AliveDivider()
-                AliveValueRow(
-                    label: "Version",
-                    value: SettingsMacHealthPresentation.versionText(
-                        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—")
-                )
-            }
+            .navigationDestination(item: $pushedFace) { $0.view }
+            .onAppear { if opensConnection { proxy.scrollTo("connection", anchor: .top) } }
         }
         .macSyncErrorBanner()
-        .task {
-            async let macSettings: Void = iCloudSyncEngine.shared.refreshAppSettings()
-            await store.refresh()
-            await macSettings
-        }
-        .refreshable {
-            async let macSettings: Void = iCloudSyncEngine.shared.refreshAppSettings()
-            await store.refresh()
-            await macSettings
-        }
+        .task { await store.refresh() }
+        .refreshable { await store.refresh() }
         .fullScreenCover(isPresented: $showRePairSheet) {
-            PairingView(onSkip: {
-                showRePairSheet = false
-            }, onPaired: {
+            PairingView(onSkip: { showRePairSheet = false }, onPaired: {
                 showRePairSheet = false
                 UserDefaults.standard.set(false, forKey: "NativeAgentMobile.pairingSkipped")
                 iCloudSyncEngine.shared.pairingStore = pairingStore
                 iCloudBridge.shared.pairingStore = pairingStore
-                if pairingStore.usesICloudTransport {
-                    bridgeClient.configureICloud()
-                    bridgeClient.recordMacConfirmation()
-                } else {
-                    bridgeClient.disconnect()
-                }
+                if pairingStore.usesICloudTransport { bridgeClient.configureICloud() }
+                else { bridgeClient.disconnect() }
             })
             .environmentObject(pairingStore)
-            // Full-screen pairing covers the tab toast host; rehost the same queue so sync/delivery feedback remains visible.
-            .safeAreaInset(edge: .bottom) {
-                iOSSystemToastBar(center: SystemToastCenter.shared)
-            }
+            .safeAreaInset(edge: .bottom) { iOSSystemToastBar(center: SystemToastCenter.shared) }
         }
     }
 
-    private func macLink<Destination: View>(_ title: String, _ detail: String,
-                                            @ViewBuilder destination: @escaping () -> Destination) -> some View {
-        NavigationLink(destination: destination) {
-            AliveRow(title, detail: detail) { AliveChevron() }
+    private var appearanceFace: PartFace {
+        let rows = localControls.map { control -> PartFace.Row in
+            let row = control.row()
+            let drawn: PartFace.Control?
+            if let value = row.value {
+                if control.type == "boolean" { drawn = .init(on: value == "true", call: .init("phone.setting", ["id": .string(control.id)])) }
+                else {
+                    drawn = .init(options: control.choices.map { .init(id: $0, label: $0.capitalized) }, selected: value,
+                        call: .init("phone.setting", ["id": .string(control.id)]))
+                }
+            } else { drawn = nil }
+            return .init(id: control.id, title: control.label, detail: row.unavailableReason, control: drawn)
         }
-        .aliveRowButtonStyle()
+        return .init(sections: [
+            .init(id: "appearance", title: "Appearance", footer: "System follows this iPhone's appearance. Haze is the light behind every screen.",
+                rows: Array(rows.prefix(2))),
+            .init(id: "live-activities", title: "Live Activities", footer: """
+                Task names include work from Mac, Telegram, helpers and bridges and may be visible while this iPhone is locked. \
+                Without a Mac APNs key, activities start when this app opens or wakes; updates can be delayed while it is asleep.
+                """, rows: Array(rows.dropFirst(2)) + (turnActivity.errorMessage.map { [.init(id: "activity-error", title: $0, tone: .failed)] } ?? []))
+        ])
     }
 
-    private var connectionGroup: some View {
-        // Connection recency uses the newest delivery across groups, never a cache read.
-        let snapshotState = StatusConnectionPresentation.syncState(
-            lastSyncedAt: iCloudSyncEngine.shared.lastTransportDeliveryAt
-        )
-        return AliveSection("Connection") {
-            ForEach(bridgeClient.connection.facts, id: \.label) { item in
-                AliveConnectionFactLine(label: item.label, fact: item.fact)
-                AliveDivider()
+    private var connectionFace: PartFace {
+        var healthRows: [PartFace.Row] = []
+        if let health = store.sync.health {
+            healthRows = [.init(id: "state", title: "Health", value: health.ok ? "Reported healthy" : "Reported issue"),
+                .init(id: "app", title: "App", value: health.app),
+                .init(id: "version", title: "Version", value: SettingsMacHealthPresentation.versionText(health.version)),
+                .init(id: "uptime", title: "Uptime", value: SettingsMacHealthPresentation.uptimeText(health.launchedAt))]
+            if !store.availableFields.contains(.health) {
+                healthRows.append(.init(id: "health-read", title: "The latest health snapshot could not be read.", detail: "Showing the last known report."))
             }
-            AliveValueRow(label: "Last synced", value: StatusConnectionPresentation.cardValue(for: snapshotState),
-                         emphasized: StatusConnectionPresentation.needsAttention(snapshotState))
-            if let repairResult { AliveNote(repairResult) }
-            if pairingStore.isICloudSigned,
-               let detail = StatusConnectionPresentation.detail(for: snapshotState) {
-                AliveNote(detail)
-            }
-            AliveDivider()
-            if !bridgeClient.connection.holds {
-                repairConnectionRow
-                AliveTapRow(title: "Pair with Mac") { showRePairSheet = true }
-                AliveDivider()
-            }
-            if !pairingStore.isICloudSigned {
-                AliveNote("This iPhone has no pairing key for the Mac. Setup checks iCloud and connects both devices using the same Apple Account.")
-                AliveTapRow(title: "Set up Mac connection") { showRePairSheet = true }
-            } else if bridgeClient.connection.transport.state == .broken {
-                AliveNote(bridgeClient.connection.transport.lever ?? bridgeClient.connection.transport.line)
-                AliveTapRow(title: "Connection setup help") { showRePairSheet = true }
-            } else {
-                AliveTapRow(title: isForceRefreshing ? "Checking for Mac updates…" : "Check for Mac updates") {
-                    // Refresh pairing and settings without blocking MainActor.
-                    Task {
-                        guard !isForceRefreshing else { return }
-                        isForceRefreshing = true
-                        defer { isForceRefreshing = false }
+        } else { healthRows = [.init(id: "waiting", title: store.isLoading ? "Loading health snapshot…" : "No health report has reached this iPhone.")] }
+        var rows = bridgeClient.connection.facts.map { item in
+            PartFace.Row(id: item.label, title: item.label, detail: item.fact.lever, value: item.fact.line)
+        }
+        let presence = StatusConnectionPresentation.syncState(lastSyncedAt: bridgeClient.lastSeenAt, staleAfter: NAMacPresence.phoneWindow)
+        rows.append(.init(id: "last-seen", title: "Mac last seen", value: StatusConnectionPresentation.cardValue(for: presence),
+            tone: StatusConnectionPresentation.needsAttention(presence) ? .attention : .plain))
+        if pairingStore.isICloudSigned, let detail = StatusConnectionPresentation.presenceDetail(for: presence) {
+            rows.append(.init(id: "presence", title: detail, tone: .quiet))
+        }
+        rows += [.init(id: "refresh", title: "Mac updates", actions: [.init(id: "check", label: "Check for Mac updates",
+            call: .init("phone.connection.refresh"))]),
+            .init(id: "pair", title: pairingStore.isICloudSigned ? "Pair with Mac" : "Set up Mac connection", actions: [
+                .init(id: "pair", label: "Pair with Mac", call: .init("phone.connection.pair"))]),
+            .init(id: "repair", title: "Connection repair", actions: [.init(id: "repair", label: "Repair connection",
+                call: .init("phone.connection.repair"), unavailable: pairingStore.isRepairingConnection ? "Repair is already running." : nil)]),
+            .init(id: "pairing-version", title: "Pairing version", value: String(pairingStore.knownSecretVersion))]
+        return .init(sections: [.init(id: "mac", title: "Mac", rows: healthRows),
+            .init(id: "connection", title: "Connection", footer: "Keep NativeAgent open on the Mac so a current report can reach this iPhone.", rows: rows),
+            .init(id: "on-mac", title: "On your Mac", rows: [
+                .init(id: "connectors", title: "Connectors", detail: "Telegram and the other services I can reach", open: "page:connectors"),
+                .init(id: "providers", title: "Providers", detail: "The models I think with", open: "page:providers")
+            ])])
+    }
 
-                        let pairingMaterialChanged = await pairingStore.refreshFromCloudKit()
-                        let settingsOutcome = await store.refresh()
-                        repairResult = SettingsICloudRefreshPresentation.statusText(
-                            pairingMaterialChanged: pairingMaterialChanged,
-                            snapshotError: settingsOutcome.feedbackMessage
-                        )
+    private var aboutFace: PartFace {
+        var rows = [("Privacy Policy", "NativeAgentPrivacyPolicyURL"), ("Support", "NativeAgentSupportURL")].map { title, key in
+            if let url = SettingsLegalLinksPresentation.destination(for: Bundle.main.object(forInfoDictionaryKey: key) as? String) {
+                return PartFace.Row(id: key, title: title, open: "url:" + url.absoluteString)
+            }
+            return PartFace.Row(id: key, title: title, detail: SettingsLegalLinksPresentation.unavailableText(for: title))
+        }
+        rows.append(.init(id: "phone-version", title: "Version", value: SettingsMacHealthPresentation.versionText(
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—")))
+        return .init(sections: [.init(id: "about", title: "About", rows: rows)])
+    }
+
+    private var localDoor: ClosureFaceDoor {
+        ClosureFaceDoor(open: { link in
+            if let destination = FaceDestination(link) { pushedFace = destination }
+            else if link.hasPrefix("url:"), let url = URL(string: String(link.dropFirst(4))) { UIApplication.shared.open(url) }
+        }, waitingOn: "this iPhone's settings or the Mac connection") { submission in
+            do {
+                if submission.expectedCall.action == "phone.setting" {
+                    guard let id = submission.expectedCall.args["id"]?.stringValue,
+                          let control = localControls.first(where: { $0.id == id }), let write = control.write else {
+                        throw PhoneLocalSetting.failure("Read this iPhone setting before changing it.")
                     }
+                    if !submission.checking {
+                        guard let value = submission.value else { throw PhoneLocalSetting.failure("The setting needs its new value.") }
+                        if control.type == "boolean" {
+                            guard ["on", "off"].contains(value) else { throw PhoneLocalSetting.failure("The switch takes on or off.") }
+                            let wanted = value == "on" ? "true" : "false"
+                            if try control.read() != wanted { try await write(wanted, .person) }
+                        } else if try control.read() != value { try await write(value, .person) }
+                    }
+                    let saved = try control.read()
+                    let readback = control.type == "boolean" ? (saved == "true" ? "on" : "off") : saved
+                    return .init(effects: .known, accepted: true, committed: [.init(id: "value", value: .string(readback))])
                 }
-                .disabled(isForceRefreshing)
-                AliveNote("Keep NativeAgent open on the Mac so a current report can reach this iPhone.")
-            }
-            AliveDivider()
-            DisclosureGroup {
-                repairConnectionRow
-                HStack {
-                    Text("Pairing version").foregroundStyle(AlivePalette.text)
-                    Spacer()
-                    Text("\(pairingStore.knownSecretVersion)").foregroundStyle(AlivePalette.secondary)
-                }
-                .padding(.top, 10)
-                .accessibilityElement(children: .combine)
-            } label: {
-                Text("Diagnostics").foregroundStyle(AlivePalette.text)
-            }
-            .tint(AlivePalette.secondary)
-            .aliveRow()
-        }
-    }
-
-    private var repairConnectionRow: some View {
-        AliveTapRow(title: pairingStore.isRepairingConnection ? "Repairing connection…" : "Repair connection") {
-            Task {
-                repairResult = nil
-                do {
+                if submission.checking { return .init(words: "Read Connection for the current evidence.", effects: .unknown) }
+                switch submission.expectedCall.action {
+                case "phone.connection.pair": showRePairSheet = true
+                case "phone.connection.repair":
                     try await bridgeClient.repairConnection()
                     showRePairSheet = true
-                } catch {
-                    repairResult = "Connection repair couldn’t finish: \(error.localizedDescription)"
+                case "phone.connection.refresh":
+                    let changed = await pairingStore.refreshFromCloudKit()
+                    let result = await store.refresh()
+                    let words = SettingsICloudRefreshPresentation.statusText(pairingMaterialChanged: changed, snapshotError: result.feedbackMessage)
+                    if let error = result.feedbackMessage { throw SyncError.unsupported(error) }
+                    return .init(words: words, effects: .known, accepted: true)
+                default: throw PhoneLocalSetting.failure("This Settings action is unavailable.")
                 }
-            }
+                return .init(effects: .none, accepted: true)
+            } catch { return .phoneFailure(error) }
         }
-        .disabled(pairingStore.isRepairingConnection || isForceRefreshing)
-    }
-
-    @ViewBuilder
-    private func aboutLink(_ title: String, key: String) -> some View {
-        if let url = Self.configuredHTTPSURL(key: key) {
-            Link(destination: url) {
-                HStack {
-                    Text(title).foregroundStyle(AlivePalette.text)
-                    Spacer()
-                    Image(systemName: "arrow.up.right")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(AlivePalette.secondary)
-                        .accessibilityHidden(true)
-                }
-                .aliveRow()
-                .contentShape(Rectangle())
-            }
-            .aliveRowButtonStyle()
-        } else {
-            AliveNote(SettingsLegalLinksPresentation.unavailableText(for: title))
-        }
-    }
-
-    private static func configuredHTTPSURL(key: String) -> URL? {
-        SettingsLegalLinksPresentation.destination(
-            for: Bundle.main.object(forInfoDictionaryKey: key) as? String
-        )
     }
 }
 
@@ -336,22 +235,5 @@ final class SettingsStore: ObservableObject {
             isLoading = false
         }
         return await task.value
-    }
-}
-
-enum SettingsSnapshotContentPresentation: Equatable {
-    case loading, unavailable, empty, content, stale
-
-    static func state(
-        hasContent: Bool,
-        fieldAvailable: Bool,
-        isLoading: Bool,
-        hasCompletedRefresh: Bool
-    ) -> Self {
-        if hasContent {
-            return hasCompletedRefresh && !fieldAvailable ? .stale : .content
-        }
-        if isLoading || !hasCompletedRefresh { return .loading }
-        return fieldAvailable ? .empty : .unavailable
     }
 }

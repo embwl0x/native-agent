@@ -72,7 +72,9 @@ stays the speaker. No path picks, switches or escalates any model.
 
 `agent: "self"` is the same socket with the agent themselves as the power: a **line of them**. It
 is a turn of theirs in its own work conversation (an own-work session whose id is the job's, so
-the person's chat list does not show it), admitted through `TurnAdmission` like any turn, with
+the person's chat list does not show it), through the `chat` surface, with a recorded
+`builder` conversation kind
+([conversation identity](session-conversations.md)). It is admitted through `TurnAdmission` like any turn, with
 the brief as the arriving message and the same turn part, tools, Trust and present: their breath
 reaches it each round and its words reach their other lines as their own work. `instructions`
 (self only) write who the line is, a researcher, a critic or a specialist; they stand in place
@@ -113,8 +115,32 @@ A failed resume does not silently start another conversation.
 
 A waiting exchange remains pending; sending or accepting a message does not make
 it an answer. A follow-up queues behind it until settlement or an explicit
-stop/release. Desktop and background reply watches belong to their sending
-process.
+stop/release. The conversation store owns admission and settlement: a send is
+occupied from its committed admission, including before its task registers.
+A queue reservation names that exact record, skips transport refresh, and
+admits only its oldest eligible message. If settlement races enqueue, the
+caller reads the current record before deciding whether it can send. Store
+writes, approval settlement and watch release wake the retained sender;
+silence leaves the queue visibly waiting with `agent.cancel {clear_queue: true}`
+as its withdrawal lever. Desktop and background reply watches belong to their
+sending process.
+
+A queued send refused before begin is terminal `not_sent`, with `sent: false`,
+`terminal: true` and its reason. It releases its reservation in the same write
+and never waits for a later gate change or sends itself again. A refusal
+already decided when the message call returns appears in that call's own
+result; a later refusal returns news to the caller scope saved on that queued
+send. Each queued send, including a pre-Return Mac hold, keeps its own caller
+scope independently of the conversation's active exchange. An older
+agent-initiated item without caller scope still saves its terminal refusal,
+but owes a named queue repair instead of guessing a destination for its news. `agent.read`,
+conversation views and contact rows read that same refusal; its experience
+lets go every outstanding deliver, accept and answer obligation as failed, so
+Home and Desk do not keep an impossible send owed. Existing saved refusals
+read the same way without a migration or history rewrite. The saved `held`
+reason is current storage: only `waitingForMac: true` names a live pre-Return
+hold; without that flag the saved reason proves refusal, not pending delivery.
+No missing reply, missing row or missing owner supplies that proof.
 
 Contact decoding rejects unknown fields at every depth.
 Bridge, human-reply and contact completion
@@ -196,7 +222,7 @@ reads: unavailable evidence reports its owner rather than becoming no contacts,
 no work or completed delivery. A2A's retained task is the declared state reader
 with its 15/60-second pending/read-error deadlines; authenticated pushes wake that
 same reader sooner and never select a different state mechanism.
-Contact rooms and `agent.wait` mark Grok routine requests as shown only for
+Contact rooms and `mac.wait` with an `agent` mark Grok routine requests as shown only for
 `grokBot` contacts; ACP, MCP and desktop contacts read their own retained
 conversation evidence. A real authenticated inbound contact clears an older
 unavailable mark, while a newer failure remains visible.
@@ -210,6 +236,45 @@ text/attachments independently. Read receipts classify
 execution from that turn verdict; historical combined statuses decode at the read
 boundary. Reading a reply, finishing its turn and delivering it onward are separate facts.
 
+A conversation lives on the door it was opened through. Each caller of a
+contact's door has its own conversation: the `nativeagent-link mcp` relay a host
+session starts names its caller on every call (`x-nativeagent-caller`: the parent
+process id and its start time, `ContactCaller`), and that caller's conversation is
+`mcp-` plus a UUID holding those values and a check binding them to the contact.
+A call that names no caller (the one-shot CLI, `/agent/message`, `/agent/reply`,
+or A2A) is in the contact's own conversation, `mcp-<id>`
+(`AgentConversationStore.heldThread`). An MCP relay whose parent cannot be
+identified exits with the cause on stderr before forwarding any call;
+a malformed caller header is refused. A turn in a held conversation names it to the
+agent by `conversation_id` in its contact line, never by the label "Main".
+
+The MCP relay's descriptor wait follows publication or cancellation without a
+local deadline and names that wait on stderr with its cancellation lever.
+`notifications/cancelled` cancels the matching string or numeric request ID;
+input EOF cancels every outstanding request before joining its exit. Cancellation
+retires response and SSE forwarding immediately. Descriptor events and HTTP
+dispatch check cancellation before sending; URLSession owns cancellation of an
+in-flight exchange. Watch closure reports an observation failure, never an absent
+bridge verdict. Chrome relay waits follow the socket's file events, including
+the producer's metadata change after `listen` on the same inode. Observation is
+armed before connecting; only a successful connect admits the greeting, using
+that connected socket. Refused connects wait for another socket event. Browser
+exit, directory loss or incomplete observation ends the wait with its cause;
+elapsed silence never initiates a dial.
+Each such conversation has its own session (`ContactThread.session(owner:
+conversation:)`); a call whose `session_id` names another of the contact's
+conversations runs in that one, and any other context runs in the contact's
+own. A thread the contact opened by calling in is answered by holding the
+message for its caller's next call, even when its host also has a command line.
+In that thread, an unnamed message to the same contact goes back on that caller's
+held thread (`AgentConversationStore.ownThread`), never to another caller or a
+conversation of another door that was carried in; from any other chat an unnamed
+message continues the chat's own conversation or the contact's Main, and never
+lands on a held thread. A named conversation goes where it is named: every send
+in a held conversation carries that conversation's name (the contact and when
+its caller opened; the contact's name for its own), so another chat reaches it
+by that name.
+
 `agent.message` waits on the existing conversation-change signal, without
 polling a file. `AgentConversationDelivery.answersLive` admits MCP hosts (including held messages), ACP, remote NativeAgent/A2A and desktop-chat
 reply readers. A reply received within it returns `reply`, `replied_at` and
@@ -220,6 +285,14 @@ When the deadline expires the receipt retains its current send evidence with
 running and its later answer follows the existing delivery path once. A
 queued receipt does not prove remote delivery: `sent: null` still means
 unconfirmed.
+
+An explicit `mac.wait` with an `agent` also watches an unanswered held send whose receipt is
+`held`, `delivering` or `delivered`, through the same conversation-change signal.
+Stop or release ends that watch; its requested deadline returns `still_waiting`
+without resending or ending the owed answer. This leaves held sends' ordinary
+queue behavior unchanged. Reading an already-selected conversation with no new
+receipt or selection change performs no store rewrite or change notification;
+the store compares the completed row collection, including sibling selections.
 
 A bridge reply names the accepted send, or answers the sole delivered held
 message in its returned conversation. That inbound arrival hands the answer
@@ -242,7 +315,11 @@ Completed full transport answers are committed to the contact's canonical thread
 before making bounded receipt or send-ledger excerpts. A cached receipt over
 96 KiB keeps its original outcome, conversation identity, a labelled answer
 excerpt and `reply_location`, an exact `agent.read` history selection for the
-committed answer. Upstream excerpts remain labelled and are never saved as
+committed answer. An explicit `history_exchange` or `history_before` reads that
+committed session directly, independently of the latest send's transport or
+execution outcome. A missing selected row or an unreadable session reports
+`unavailable` with its own cause; it does not claim that the message was removed.
+Upstream excerpts remain labelled and are never saved as
 complete transcript messages. A live connection or send still running when
 `wait_seconds` expires reports delivery unconfirmed (`sent: null`) until its
 transport supplies evidence. Asynchronous ability sends retain their existing
@@ -261,7 +338,7 @@ appending another contact message or replaying it again as prior context.
 
 ## Connecting by name
 
-`AgentHostDirectory` seeds each host's launch contract and discovery words.
+The shipped `AgentConversations/Resources/agent-hosts.json` seeds each host's launch contract and discovery words.
 Loaded editable recipes govern setup through the declared configuration,
 command line, ACP or desktop adapter; an arbitrary app name implies no protocol.
 The connection action presents a card when policy requires one.
@@ -422,12 +499,12 @@ asks the conversation's existing release drain to unhold it only with positive
 away evidence and a permitted driver. The resumed send clears the driver on its
 explicit Mac operation and obtains a fresh binding at the desktop route,
 through the normal permission chain. Startup uses the same path. A person-typed
-queued send is still held after a restart because their original send act does not carry over.
+queued send is terminal not sent after a restart because their original send
+act does not carry over.
 Explicit handback is distinguished from physical input and says to return
-control; it does not enter automatic retry. A held send expires into a visible
-nonautomatic hold at the existing one-day queue boundary, retaining its text;
-`agent.cancel {clear_queue: true}` withdraws it. Missing/unreadable presence or
-authority never means free. The receipt is `held`, not failed; when released,
+control; it does not enter automatic retry. A live hold has no expiry and
+retains its text; `agent.cancel {clear_queue: true}` withdraws it. Missing or
+unreadable presence or authority never means free. The receipt is `held`, not failed; when released,
 the ordinary reply and delayed-answer path continues. An emitted Return always
 keeps submission uncertain until the outgoing row confirms it and never enters
 this queue automatically. This replaces the former “try again shortly” refusal.
@@ -474,6 +551,9 @@ missing times display **Time unavailable** and supply no chronological evidence.
 A failed helper refresh labels retained history; an empty-history claim requires
 a successful first read. After an accepted replacement, a failed held-copy
 withdrawal leaves that copy visible and reports the separate withdrawal failure.
+An unchanged normalized conversation record leaves its committed store bytes,
+experience publications and follow-up wake notifications untouched. Necessary
+life normalization still commits when it differs from saved state.
 
 Builder, MCP and A2A ingress share `AgentContactTasks` admission, record-owned
 execution, output settlement and retained receipts. Builder formatting remains
@@ -492,6 +572,20 @@ does not acknowledge output.
 MCP acceptance and requested retrieval are independent: an accepted message with
 a failed waited read retains enqueue evidence and returns `isError: true` with
 the read failure and repair lever, without suggesting a resend.
+The MCP projection and `nativeagent-link` share a 1 MiB limit for the complete
+encoded JSON-RPC body, including text, structured content and held messages;
+SSE allows only its framing bytes beyond that body. If files do not fit, the
+result carries `reply_artifact` instead of their inline payload. Its `read_with`
+calls `agent_reply` with the same session/request, an exact content-digest
+`artifact_id`, and a byte `offset`. Each call returns at most 64 KiB as base64,
+with `next_offset` and `has_more`. Concatenating decoded chunks yields JSON with
+the original `attachments` and `delegated_completions`, including every file's
+bytes. `nativeagent-link reply --artifact <id> --offset <n>` reaches the same
+read. The canonical task remains the only payload owner; a changed, expired,
+missing or unreadable payload is unavailable, never another send. References
+alone do not acknowledge output; returned words, inline files or the last
+artifact chunk do. Oversized non-file fields report a projection failure while
+retaining execution evidence and held-message settlement.
 
 The old builder receipt reader remains solely for retained historical rows that
 have no canonical task. Missing execution fields stay unknown; combined delivery
@@ -546,6 +640,8 @@ transcript index also feeds up to three helpers' newest replies into that
 turn's context, under the [elsewhere bounds](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled).
 Peer-steered turns receive the person's other-door count and time, never their
 words, bridge words or helper replies.
+Phone contact sends retain the action owner's refusal or unconfirmed outcome;
+only an accepted terminal send returns the refreshed thread as success.
 The former per-bridge action/count summary is removed. These shared timeline
 reads preserve unavailable classification/history evidence through the checked
 workspace owner; see the [turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled).
@@ -602,7 +698,12 @@ actual exit and never runs again to repair bookkeeping.
 Held replies have one owner, `AgentConversationStore.drainHeld`, across contact
 doors. Native HTTP `/agent/message` and `/agent/reply`, MCP calls, and the
 Claude/Codex/OMP bridge's message and reply results carry `held_messages` and
-`held_remaining`. Each message contains `at`, `text` and `conversation_id`.
+`held_remaining`. Each message contains `at`, `text`, `conversation_id` and
+`conversation_name`. A caller takes what is held in its own conversation, in
+the contact's own, and in any caller's conversation whose process is gone
+(`AgentConversationStore.reaches`: the pid no longer runs, or runs with another
+start time); a live caller's messages go only to it, and a caller whose process
+cannot be read keeps its messages until a later read decides.
 A2A send/get responses carry `nativeagent.held_messages` and
 `nativeagent.held_remaining` in the returned task's `metadata`; streaming
 send/subscribe carries that metadata on its first event payload, across
@@ -613,12 +714,15 @@ response or first stream event settles the batch as delivered; failed writes,
 encoding failures and cancellation before writing release it back to held.
 Later stream events do not repeat the batch. Delivery alone does not end the
 sender's wait for the contact's answer, regardless of the original transport.
+Repeated settlement writes nothing and wakes no observers unless an exchange
+or its acceptance obligation actually changes.
 
 News that reaches a contact conversation after its turn ended runs in that
 conversation. `AgentContactHeldAnswer.hold` also accepts an answer without an
 open turn: it saves the send before appending a held exchange, under
-`AgentBridgeCompletionRouter.stableUUID(deliveryID)`. A resident arrival reuses
-its canonical completed assistant row as that send, preserving one visible
+`AgentBridgeCompletionRouter.stableUUID(deliveryID)`. A return to the contact's
+conversation (`MindStream.returnTo`) reuses its canonical completed assistant row
+as that send, preserving one visible
 answer and its completion evidence. Working commentary is excluded from the
 held payload; saved attachment paths accompany the answer. Empty payloads,
 missing file references and payloads over 8 KiB refuse with their reason and
@@ -730,4 +834,5 @@ Paths below are relative to `Modules/NativeAgentCore/Sources/`.
 | `AgentLinkTransport/AgentA2AWire.swift` | A2A negotiation and wire projection. |
 | `Agents/AgentContactRoutes.swift` | Inbound bridge, MCP and HTTP A2A routes. |
 | `Agents/NativeAgentA2AWire+Tasks.swift`, `AgentContactTasks+Bridge.swift`, `AgentContactTaskReceipts.swift` | One retained task owner for inbound contact and builder admission, work, produced output and receipts; HTTP waits do not own accepted work. |
-| `Agents/ResidentWakeRuntime.swift`, `EngineRuntime/EngineComposition.swift` | Resident due work and its deadlines, composed with independent contact continuation through the existing delegation scheduler. |
+| `Agents/MindStream.swift`, `Agents/AgentContactHeldAnswer.swift` | Returns to the conversation that started the work; a contact's held answer. |
+| `Agents/AgentConversationContinuation.swift`, `EngineComposition.swift` | The contact doors' reply reads and deadlines, run by `delegation_outcome`. |

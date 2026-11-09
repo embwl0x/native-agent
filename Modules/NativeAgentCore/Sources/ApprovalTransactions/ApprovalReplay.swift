@@ -32,6 +32,7 @@ extension ApprovalExecution {
         let toolName: String
         let surface: String
         let fileAccess: String
+        let fileAccessCeiling: Result<ICloudChatFileAccessPolicy.Ceiling, any Error>
         let input: [String: JSONValue]
         let sessionId: String?
         let telegramChatId: String?
@@ -67,12 +68,20 @@ extension ApprovalExecution {
             )
             : nil
         let fileAccess = if case .string(let mode)? = payload["fileAccess"] { mode } else { "auto" }
+        let ceiling = Result {
+            guard let saved = payload["fileAccessCeiling"] else {
+                throw ToolFailureError("This approval has no recorded file-access ceiling; raise a new request from its originating conversation.",
+                    effects: .none, code: "approval_file_access_unavailable")
+            }
+            return try JSONDecoder().decode(ICloudChatFileAccessPolicy.Ceiling.self, from: saved.serializedData(pretty: false))
+        }
         // A verified paired-phone decision authorizes follow-up because the persisted envelope has no raising-turn signature.
-        let signedDecision: Bool? = if case .signedIOS? = rec.resolutionProvenance { true } else { nil }
+        let signedDecision: Bool? = if case .signedIOS? = rec.resolutionProvenance?.transport { true } else { nil }
         return ChatToolApprovalReplay(
             toolName: toolName,
             surface: surface,
             fileAccess: fileAccess,
+            fileAccessCeiling: ceiling,
             input: input,
             sessionId: sessionId,
             telegramChatId: chatId,

@@ -3,30 +3,56 @@ import ChatToolParsing
 import AuthoredCapabilities
 import Foundation
 import NativeAgentShared
+import PersistenceCore
 import StandingBots
-// Blueprint: | `BotsFace.swift` | Helpers face over the helper owner's published memory; Run once and Paused return to the canonical owners |
+// Blueprint: | `BotsFace.swift` | Helpers rows and brief document bodies from the helper owner; Run once and Paused call their owners |
 
-@MainActor enum BotsFace {
-    private static let timestamp = ISO8601DateFormatter()
-    @MainActor static func reader(_ engine: NativeAgentEngine) -> PartFaces.Read {
-        engine.contactThreads.startHelpers(engine: engine)
-        return { try read(engine) }
+enum BotsFace {
+    static func isDocument(_ item: String) -> Bool {
+        let parts = item.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2, let id = parts.first, parts.last == "brief" else { return false }
+        return UUID(uuidString: String(id)) != nil
     }
 
-    @MainActor static func read(_ engine: NativeAgentEngine) throws -> (face: PartFace, epoch: UInt64) {
+    @MainActor static func body(_ engine: NativeAgentEngine) -> PartFaces.Body {
+        { item in
+            guard isDocument(item), let raw = item.split(separator: "/").first, let id = UUID(uuidString: String(raw)) else {
+                throw PartCallError(code: "helper_document_invalid", message: "Choose a helper's brief document.")
+            }
+            let owner = engine.contactThreads
+            if let failure = owner.helpersRefreshError { throw PartCallError(code: "helpers_unavailable", message: failure) }
+            guard owner.helpersLoaded else {
+                throw PartCallError(code: "helpers_unread", message: "The helper owner has not returned its definitions.")
+            }
+            guard let helper = owner.helpers.first(where: { $0.definition.id == id }) else {
+                throw PartCallError(code: "helper_not_found", message: "This helper is absent from the owner's checked definitions.")
+            }
+            return helper.definition.brief
+        }
+    }
+
+    @MainActor static func reader(_ engine: NativeAgentEngine) -> PartFaces.Read {
+        engine.contactThreads.startHelpers(engine: engine)
+        return { try await read(engine) }
+    }
+
+    @concurrent static func read(_ engine: NativeAgentEngine) async throws -> (face: PartFace, epoch: UInt64) {
         let epoch = UInt64(Date().timeIntervalSince1970 * 1000)
-        let owner = engine.contactThreads
-        if let problem = owner.helpersRefreshError {
+        let state = await MainActor.run {
+            let owner = engine.contactThreads, transcripts = engine.transcripts
+            return (problem: owner.helpersRefreshError, loaded: owner.helpersLoaded, unattended: owner.helpersUnattended,
+                    records: owner.helpers, indexProblem: transcripts.sessionIndexError, indexLoaded: transcripts.hasLoadedSessionIndex,
+                    sessions: transcripts.sessions)
+        }
+        if let problem = state.problem {
             throw PartCallError(code: "helpers_unavailable", message: problem)
         }
-        guard owner.helpersLoaded, let unattended = owner.helpersUnattended else {
+        guard state.loaded, let unattended = state.unattended else {
             throw PartCallError(code: "helpers_unread", message: "Helpers are still being read. Their definitions and run history are kept.")
         }
-        let records = owner.helpers
-        let transcripts = engine.transcripts
-        let indexProblem = transcripts.sessionIndexError
-            ?? (transcripts.hasLoadedSessionIndex ? nil : "The conversation index is still being read.")
-        let sessions = indexProblem == nil ? Set(transcripts.sessions.map(\.id)) : []
+        let records = state.records
+        let indexProblem = state.indexProblem ?? (state.indexLoaded ? nil : "The conversation index is still being read.")
+        let sessions = indexProblem == nil ? Set(state.sessions.map(\.id)) : []
         var sections: [PartFace.Section] = []
         for record in records {
             sections += helper(record, sessions: sessions, indexProblem: indexProblem)
@@ -60,11 +86,11 @@ import StandingBots
                 symbol: bot.eventTrigger != nil ? "bolt" : bot.cadence == .manual ? "wrench.and.screwdriver" : "clock",
                 tone: record.running ? .live : issue != nil || indexProblem != nil ? .attention : tone(record.status),
                 open: issue == nil && conversation ? "chat:" + bot.sessionID : nil,
-                actions: [.init(id: "bot.run_once", label: "Run once", role: .primary)])
+                actions: [.init(id: "bot.run_once", label: "Run once", role: .primary, call: PartFace.Call("bots.check", ["id": .string(id)]))])
         ]
         if bot.cadence != .manual || bot.eventTrigger != nil || bot.paused {
             rows.append(.init(id: id + "/paused", title: "Paused", detail: "Scheduled and event work; Run once remains available.",
-                control: .toggle(bot.paused)))
+                control: .toggle(bot.paused, call: PartFace.Call("bots.paused", ["id": .string(id)]))))
         }
         if let wake = record.wakeLine { rows.append(.init(id: id + "/wake", title: "Wake", detail: wake)) }
         if let missed = record.missed {
@@ -86,42 +112,47 @@ import StandingBots
         return [
             .init(id: id, title: bot.name, style: .list, rows: rows),
             .init(id: id + "/brief", title: bot.name + " · Brief", style: .note,
-                rows: [.init(id: id + "/job", title: bot.brief)]),
+                rows: [], block: .init(key: id + "/brief", revision: String(bot.updatedAt.timeIntervalSinceReferenceDate))),
             .init(id: id + "/runs", title: bot.name + " · Latest runs", style: .timeline,
                 footer: record.entries.count > 5 ? "Earlier runs are in the helper's conversation." : nil,
                 rows: runs.isEmpty ? [.init(id: id + "/no-runs", title: "No runs yet.", tone: .quiet)] : runs)
         ]
     }
 
-    @MainActor static func act(_ engine: NativeAgentEngine, row: String, action: String, value: String?) async throws -> String? {
-        do { return try await perform(engine, row: row, action: action, value: value) }
-        catch let error as PartCallError { throw error }
-        catch { throw PartCallError(code: "helper_action_failed", message: ChatToolOutcome.errorMessage(error)) }
+    /// A requested check (`bots.check`): the helper runs once and its reply stays in its own conversation.
+    @MainActor static func check(_ engine: NativeAgentEngine, _ input: [String: JSONValue]) async throws -> String {
+        let id = try await helper(engine, input)
+        do {
+            let request = try await BotRunConversation.enqueueRequestedCheck(botID: id, dataRoot: engine.dataRoot)
+            return "Run request: " + request.uuidString + ". Its reply stays in this helper's conversation."
+        } catch { throw PartCallError(code: "helper_action_failed", message: ChatToolOutcome.errorMessage(error)) }
     }
 
-    @MainActor private static func perform(_ engine: NativeAgentEngine, row: String, action: String, value: String?) async throws -> String? {
-        let pieces = row.split(separator: "/", omittingEmptySubsequences: false)
-        guard let first = pieces.first, let id = UUID(uuidString: String(first)), pieces.count <= 2 else {
-            throw PartCallError(code: "helper_row", message: "Choose a helper's Run once or Paused row on Helpers.")
+    /// The Paused switch (`bots.paused`): value true pauses the helper's scheduled and event work, false resumes it.
+    @MainActor static func paused(_ engine: NativeAgentEngine, _ input: [String: JSONValue]) async throws -> String {
+        guard case .bool(let paused)? = input["value"] else {
+            throw PartCallError(code: "paused_value", message: "Paused takes value true or false; nothing changed.")
+        }
+        let id = try await helper(engine, input)
+        let store = BotDefinitionStore(dataRoot: engine.dataRoot)
+        do { _ = try await Task.detached { try store.pause(id, paused: paused) }.value }
+        catch { throw PartCallError(code: "helper_action_failed", message: ChatToolOutcome.errorMessage(error)) }
+        return paused ? "Paused." : "Resumed."
+    }
+
+    /// The helper `id` names, refused when it is unreadable or deleted.
+    @MainActor private static func helper(_ engine: NativeAgentEngine, _ input: [String: JSONValue]) async throws -> UUID {
+        guard let id = input["id"]?.stringValue.flatMap(UUID.init(uuidString:)) else {
+            throw PartCallError(code: "helper_row", message: "id is a helper's id from Helpers; nothing changed.")
         }
         let store = BotDefinitionStore(dataRoot: engine.dataRoot)
-        let bot = try await Task.detached { try store.get(id) }.value
+        let bot: BotDefinition
+        do { bot = try await Task.detached { try store.get(id) }.value }
+        catch { throw PartCallError(code: "helper_action_failed", message: ChatToolOutcome.errorMessage(error)) }
         guard bot.deleted != true else {
             throw PartCallError(code: "helper_unavailable", message: "This helper was deleted. Read Helpers again; its saved replies are kept.")
         }
-        switch action {
-        case "bot.run_once" where pieces.count == 1:
-            let request = try await BotRunConversation.enqueueRequestedCheck(botID: id, dataRoot: engine.dataRoot)
-            return "Run request: " + request.uuidString + ". Its reply stays in this helper's conversation."
-        case "set" where pieces.count == 2 && pieces[1] == "paused":
-            guard value == "on" || value == "off" else {
-                throw PartCallError(code: "paused_value", message: "Set Paused to on or off.")
-            }
-            _ = try await Task.detached { try store.pause(id, paused: value == "on") }.value
-            return nil
-        default:
-            throw PartCallError(code: "helper_action", message: "Use Run once or the Paused switch. To change this helper, tell me in chat.")
-        }
+        return id
     }
 
     private static func timingKind(_ bot: BotDefinition) -> String {
@@ -157,5 +188,5 @@ import StandingBots
         return BotHeadline.make(from: entry.headline.isEmpty ? entry.actualReply : entry.headline)
     }
 
-    private static func absolute(_ date: Date) -> String { timestamp.string(from: date) }
+    private static func absolute(_ date: Date) -> String { ISO8601DateFormatter().string(from: date) }
 }

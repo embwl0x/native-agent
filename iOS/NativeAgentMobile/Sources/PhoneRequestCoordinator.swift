@@ -16,7 +16,8 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
     /// Read the durable executing record for settings execution/recovery; do not mirror consent-free work in another latch.
     var presented: PhoneRequest? {
         guard let active else { return nil }
-        if active.kind.isSettings, records.first(where: { $0.request.id == active.id })?.executing == true { return nil }
+        if active.kind.isSettings, !interrupted.contains(active.id),
+           records.first(where: { $0.request.id == active.id })?.executing == true { return nil }
         return active
     }
     @Published var errorMessage: String?
@@ -27,29 +28,25 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         var result: PhoneRequestResult?
         var attachments: [MultimodalAttachment] = []
         var envelope: BridgeMessage?
-        var recoveryAttempts: Int?
     }
-    private var records: [Record] = [] { didSet { stateRevision += 1 } }
+    private var records: [Record] = [] { didSet { stateRevision = UUID() } }
     private struct Replay: Codable, Sendable {
         let id: String
-        let kind: PhoneRequest.Kind
         let state: PhoneRequestResult.Status
-        let expiresAt: Date
-        let finishedAt: Date
     }
     private struct History: Codable, Sendable {
         var pending: [Record]
         var replay: [Replay]
     }
-    private var replay: [Replay] = [] { didSet { stateRevision += 1 } }
-    private var stateRevision = 0
+    private var replay: [Replay] = [] { didSet { stateRevision = UUID() } }
+    private var stateRevision = UUID()
     private let storage = MobileLocalStorage()
     private var loadTask: Task<History, Error>?
     private var loaded = false
+    private var interrupted: Set<String> = []
     private var publishing = false
     private var connectivity: AnyCancellable?
     private var recoveryQueued = false
-    private var deadline: Task<Void, Never>?
     private var locationManager: CLLocationManager?
     private var locationRequestID: String?
     private var locationStarted = false
@@ -79,6 +76,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
             let history = try await loadTask.value
             guard !loaded else { return }
             records = history.pending; replay = history.replay
+            interrupted = Set(history.pending.filter { $0.executing && $0.result == nil }.map { $0.request.id })
             loaded = true
             self.loadTask = nil
         } catch { self.loadTask = nil; throw error }
@@ -89,28 +87,23 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
     }
 
     private func remember(_ record: Record, state: PhoneRequestResult.Status) {
-        replay.append(Replay(id: record.request.id, kind: record.request.kind, state: state,
-                            expiresAt: record.request.expiresAt, finishedAt: Date()))
-        replay = Array(replay.filter { $0.expiresAt > Date().addingTimeInterval(-86_400) }.suffix(128))
+        replay.append(Replay(id: record.request.id, state: state))
     }
 
-    private func expireObsolete(pairing: String) {
-        let obsolete = records.filter {
-            // Bound delivery retention after completion with a short grace period.
-            $0.pairing != pairing || $0.request.expiresAt.addingTimeInterval(300) <= Date()
-                || ($0.result == nil && $0.request.expiresAt <= Date())
-        }
-        for record in obsolete { remember(record, state: .expired) }
+    private func retireOtherPairings(pairing: String) {
+        let obsolete = records.filter { $0.pairing != pairing }
+        for record in obsolete { remember(record, state: .cancelled) }
         let ids = Set(obsolete.map { $0.request.id })
         records.removeAll { ids.contains($0.request.id) }
-        replay.removeAll { $0.expiresAt <= Date().addingTimeInterval(-86_400) }
         if let active, ids.contains(active.id) { clearActive() }
     }
 
     func accept(_ message: BridgeMessage, secret: Data) async -> Bool {
         var validRequest = false
         do {
-            let request = try JSONDecoder().decode(PhoneRequest.self, from: Data(message.text.utf8))
+            let request = try await Task.detached(priority: .utility) {
+                try JSONDecoder().decode(PhoneRequest.self, from: Data(message.text.utf8))
+            }.value
             guard request.id == message.id, PhoneLocalSettings.validate(request),
                   request.expiresAt.timeIntervalSince(message.timestamp) <= 125,
                   request.expiresAt > message.timestamp,
@@ -120,7 +113,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
             }
             validRequest = true
             try await load()
-            expireObsolete(pairing: pairing)
+            retireOtherPairings(pairing: pairing)
             try await save()
             if replay.contains(where: { $0.id == request.id }) { return true }
             if !records.contains(where: { $0.request.id == request.id }) {
@@ -139,26 +132,15 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         }
     }
 
-    func resume(retrying: Bool = false) async {
+    func resume() async {
         do {
             try await load()
             guard let pairing = AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) else { return }
             let previous = records
             let previousReplay = replay
-            expireObsolete(pairing: pairing)
-            var changed = previous.map(\.request.id) != records.map(\.request.id)
+            retireOtherPairings(pairing: pairing)
+            let changed = previous.map(\.request.id) != records.map(\.request.id)
                 || previousReplay.map(\.id) != replay.map(\.id)
-            for index in records.indices where records[index].result == nil {
-                let record = records[index]
-                if record.pairing != pairing || record.request.expiresAt <= Date() {
-                    changed = true
-                    records[index].result = PhoneRequestResult(requestID: record.request.id, status: .expired)
-                } else if record.executing && active?.id != record.request.id {
-                    changed = true
-                    records[index].result = PhoneRequestResult(requestID: record.request.id, status: .failed,
-                        message: "The app closed while handling this request. It was not repeated.")
-                }
-            }
             if changed {
                 let revision = stateRevision
                 do { try await save() } catch {
@@ -169,6 +151,11 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
             if let active, records.first(where: { $0.request.id == active.id })?.result != nil { clearActive() }
             if active == nil, UIApplication.shared.applicationState == .active,
                let record = records.first(where: { $0.result == nil && $0.pairing == pairing }) {
+                if interrupted.contains(record.request.id) {
+                    active = record.request
+                    errorMessage = "The app closed while handling request \(record.request.id). Its outcome is unknown; cancel it to retire the request."
+                    return
+                }
                 let approval: Bool
                 do { approval = try await PhoneLocalSettings.needsApproval(record.request) }
                 catch {
@@ -177,18 +164,12 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
                 }
                 guard active == nil, records.contains(where: { $0.request.id == record.request.id && $0.result == nil }) else { return }
                 active = record.request
-                deadline = Task { [weak self, request = record.request] in
-                    do { try await Task.sleep(for: .seconds(max(0, request.expiresAt.timeIntervalSinceNow))) }
-                    catch { return }
-                    self?.deadline = nil
-                    await self?.complete(request.id, status: .expired)
-                }
                 if record.request.kind.isSettings, !approval {
                     await applySetting(record.request)
                     return
                 }
             }
-            await publishResults(pairing: pairing, retrying: retrying)
+            await publishResults(pairing: pairing)
         } catch { errorMessage = "Phone request storage unavailable: \(error.localizedDescription)" }
     }
 
@@ -198,16 +179,16 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         recoveryQueued = true
         Task {
             defer { self.recoveryQueued = false }
-            await self.resume(retrying: true)
+            await self.resume()
         }
     }
 
-    private func publishResults(pairing: String, retrying: Bool) async {
+    private func publishResults(pairing: String) async {
         guard !publishing else { return }
         publishing = true
         defer { publishing = false }
         let ids = records.filter {
-            $0.pairing == pairing && $0.result != nil && (!retrying || ($0.recoveryAttempts ?? 0) < 3)
+            $0.pairing == pairing && $0.result != nil
         }.prefix(8).map { $0.request.id }
         for id in ids {
             guard AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) == pairing else { return }
@@ -226,10 +207,9 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
                             throw CancellationError()
                         }
                         self.records[index].envelope = message
-                        // The signed envelope is the sole retry payload.
+                        // The signed envelope retains the original delivery identity.
                         self.records[index].attachments = []
                         self.records[index].result = PhoneRequestResult(requestID: id, status: result.status)
-                        if retrying { self.records[index].recoveryAttempts = (self.records[index].recoveryAttempts ?? 0) + 1 }
                         try await self.save()
                     })
                 guard let index = records.firstIndex(where: { $0.request.id == id }) else { continue }
@@ -242,22 +222,21 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
     func complete(_ id: String, status: PhoneRequestResult.Status, values: [String: String] = [:],
                   message: String? = nil, attachments: [MultimodalAttachment] = []) async {
         guard let index = records.firstIndex(where: { $0.request.id == id }), records[index].result == nil else { return }
-        let expired = records[index].request.expiresAt <= Date()
-        records[index].result = PhoneRequestResult(requestID: id, status: expired ? .expired : status,
-            values: expired ? [:] : values, message: message)
-        records[index].attachments = expired ? [] : attachments
+        records[index].result = PhoneRequestResult(requestID: id, status: status, values: values, message: message)
+        records[index].attachments = attachments
         do { try await save() } catch {
             // Retain terminal outcomes for owed settlement; checkpoint failure must not make cancelled work runnable.
             errorMessage = "Could not save phone result: \(error.localizedDescription)"
             return
         }
         if active?.id == id { clearActive() }
+        interrupted.remove(id)
         await resume()
     }
 
+    func isInterrupted(_ request: PhoneRequest) -> Bool { interrupted.contains(request.id) }
+
     private func clearActive() {
-        deadline?.cancel()
-        deadline = nil
         locationManager?.stopUpdatingLocation()
         locationManager?.delegate = nil
         locationManager = nil
@@ -267,7 +246,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
     }
 
     func begin(_ request: PhoneRequest) async -> Bool {
-        guard active?.id == request.id, request.expiresAt > Date(),
+        guard active?.id == request.id,
               let index = records.firstIndex(where: { $0.request.id == request.id }),
               records[index].pairing == AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests),
               records[index].result == nil, !records[index].executing else { return false }
@@ -275,7 +254,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         let revision = stateRevision
         do {
             try await save()
-            return active?.id == request.id && request.expiresAt > Date()
+            return active?.id == request.id
                 && records.contains { $0.request.id == request.id && $0.result == nil && $0.executing
                     && $0.pairing == AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) }
         } catch {
@@ -315,7 +294,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         }
     }
 
-    /// Read the journal for revocation: Cancel/expiry blocks future effects while an already-approved OS prompt may finish.
+    /// Read the journal for revocation; cancellation blocks future effects while an approved OS prompt may finish.
     private func settingAuthorization(requestID: String, pairing: String) -> Bool {
         if let record = records.first(where: { $0.request.id == requestID }) {
             guard record.pairing == pairing else { return false }
@@ -374,7 +353,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
             await complete(request.id, status: .denied, message: "Camera permission is off on this phone.")
             return false
         }
-        return active?.id == request.id && request.expiresAt > Date()
+        return active?.id == request.id
     }
 
     enum PhotoSource: Sendable {
@@ -453,7 +432,9 @@ struct PhoneRequestSheet: View {
             Text(request.kind.isSettings ? settingQuestion
                  : request.kind == .currentLocation ? "Share your current location?"
                  : request.kind == .capturePhoto ? "Take a photo to share." : "Choose a photo to share.")
-            if request.kind.isSettings {
+            if coordinator.isInterrupted(request) {
+                Text("This request was executing when the app closed. Its outcome is unknown. Cancel retires it without repeating its action.")
+            } else if request.kind.isSettings {
                 Text("This changes the setting on this iPhone. Any iOS permission prompt is still yours to answer.")
                 Button("Allow change") { working = true; Task { await coordinator.applySetting(request, approved: true) } }.disabled(working)
             } else if request.kind == .currentLocation {

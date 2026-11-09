@@ -17,7 +17,7 @@ import MacControl
 // Blueprint: | `ClaudeBridgeDebug.swift` | Authenticated organism debug routes using the listener's existing request claim and response latch |
 
 extension ClaudeBridgeRuntime {
-    func handleOrganismDebug(conn: NWConnection, body: Data, path: String) {
+    func handleOrganismDebug(conn: NWConnection, body: Data) {
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             writeJSON(conn, status: 400, obj: ["error": "invalid_json"])
             return
@@ -34,7 +34,6 @@ extension ClaudeBridgeRuntime {
         let workLatch = WorkLatch()
         let workTask = startRequest(conn: conn, latch: workLatch, priority: .utility) { [weak self] _ in
             guard let self else { return }
-            // All paths must share the response latch so work and deadline cannot both reply.
             func respond(_ status: Int, _ obj: [String: Any]) {
                 guard workLatch.claim() else { return }
                 self.writeJSON(conn, status: status, obj: obj)
@@ -118,17 +117,7 @@ extension ClaudeBridgeRuntime {
                 ])
             }
         }
-        guard let workTask else { writeJSON(conn, status: 503, obj: ["error": "server_stopping_or_busy"]); return }
-        workLatch.arm(afterSeconds: Self.readWorkDeadlineSeconds) { [weak self] in
-            guard let self, workLatch.claim() else { return }
-            workTask.cancel()
-            self.writeJSON(conn, status: 504, obj: [
-                "error": "work_timeout",
-                "path": path,
-                "seconds": Self.readWorkDeadlineSeconds,
-                "outcome": "unknown",
-            ])
-        }
+        guard workTask != nil else { writeJSON(conn, status: 503, obj: ["error": "server_stopping_or_busy"]); return }
     }
 
     private static func organismDebugStatusJSON(_ status: OrganismDebugBodyOverrideStatus?) -> Any {

@@ -68,7 +68,11 @@ extension SwiftNativeTurnEngine {
         // Read verbatim history once; fitting selects its tail and positive history limits never cap rows.
         let prior: [ChatMessage]
         let priorStats: SessionHistoryReadStats
-        if historyLimit > 0 {
+        if sessionId == Attention.stream {
+            // The agent's own stream is never replayed: a thought carries its breath and what it attends.
+            prior = []
+            priorStats = SessionHistoryReadStats(mode: "mind_stream")
+        } else if historyLimit > 0 {
             // Select every history region from the same transcript bytes to avoid mixing generations.
             let selected: (prompt: SessionHistoryReadResult, relevance: SessionHistoryReadResult?)
             // Measured inline: the read's closure holds actor state and cannot be sent to the trace.
@@ -153,11 +157,10 @@ extension SwiftNativeTurnEngine {
             throw error
         }
         let base = rawBase
-        var deliveredHistoryIdentities = Set<String>()
         var historyMessages: [LLMMessage] = []
         var historyMessageChars = 0
         var replayedRunIds = Set<String>()
-        var replayedContexts: [SentTurnContext] = []
+        var heldRows = 0
         var historyRowCharacters: [String: Int] = [:]
         var historySnapshot: SessionHistoryTail?
         var contextWindow = "0:"
@@ -167,8 +170,7 @@ extension SwiftNativeTurnEngine {
             budget: historyBudget
            ) {
             let projected = SessionHistoryMessages.project(admission)
-            deliveredHistoryIdentities = projected.historyIdentities
-            replayedContexts = projected.replayedContexts
+            heldRows = admission.heldRows
             historyRowCharacters = projected.rowCharacters
             historySnapshot = SessionHistoryTail(admission, rowCharacters: projected.rowCharacters)
             contextWindow = projected.contextWindow
@@ -185,24 +187,17 @@ extension SwiftNativeTurnEngine {
         trace.setCount("prefix.historyMessageCount", historyMessages.count)
         trace.setCount("prefix.historyMessageChars", historyMessageChars)
         trace.setCount("prefix.replayedTurnCount", replayedRunIds.count)
+        // Admission holds the conversation whole; request fitting reports the rows kept within the input budget.
+        trace.setCount("history.heldRows", heldRows)
+        trace.setCount("history.reachedRows", preparedHistory.count - heldRows)
         trace.setCount("budget.windowTokens", historyBudget.windowTokens ?? 0)
         trace.setFlag("budget.derived", historyBudget.isDerived)
         trace.setCount("budget.memoryBlockChars", historyBudget.memoryBlockChars)
         trace.setCount("budget.recallRowLimit", historyBudget.recallRowLimit)
         // History labels untrusted words without steering the new turn. Only that turn's own restored provenance steers it.
         let receiptStrip = ChatTranscriptEvidenceRendering.recentReceiptStrip(from: prior)
-        deliveredHistoryIdentities.formUnion(receiptStrip?.historyIdentities ?? [])
-        let renderedHistory = await trace.measure(.render) {
-            SessionHistoryPromptRenderer.renderDetailed(
-                renderables: preparedHistory,
-                middleCandidates: preparedHistory,
-                deliveredHistoryIdentities: deliveredHistoryIdentities,
-                userMessage: queryMessage,
-                historyLimit: historyLimit,
-                budget: historyBudget
-            )
-        }
-        let historyParts = [renderedHistory, SessionHistoryPromptRenderer.worldRecord(from: prior), receiptStrip?.text].compactMap { $0 }
+        let receiptIdentities = receiptStrip?.historyIdentities ?? []
+        let historyParts = [SessionHistoryPromptRenderer.worldRecord(from: prior), receiptStrip?.text].compactMap { $0 }
         let historyBlock = historyParts.isEmpty ? nil : historyParts.joined(separator: "\n\n")
         trace.setCount("history.prompt.sourceBytes", priorStats.sourceBytes)
         trace.setCount("history.prompt.bytesRead", priorStats.bytesRead)
@@ -226,7 +221,15 @@ extension SwiftNativeTurnEngine {
             excludedRunID: excludeHistoryRunId,
             replacementUserMessageID: replacementQuestion.withLock { $0 })
         contextWithHistory.historyReplaySpec?.historySnapshot = historySnapshot
-        contextWithHistory.replayedTurnContexts = replayedContexts
+        contextWithHistory.historyReplaySpec?.historyLeads = { heldIdentities in
+            SessionHistoryPromptRenderer.renderDetailed(
+                renderables: preparedHistory,
+                deliveredHistoryIdentities: heldIdentities.union(receiptIdentities),
+                userMessage: queryMessage,
+                historyLimit: historyLimit,
+                budget: historyBudget
+            ).text
+        }
         contextWithHistory.historyContextWindow = contextWindow
         let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
         let facts = try await currentFacts

@@ -314,30 +314,6 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         return snapshot.operations.first { $0.operationId == operationId }
     }
 
-    /// Register before reading: every durable writer, including another store instance or process, wakes settlement. The caller owns the grace, not the
-    /// lifetime of the still-running execution.
-    func waitForCancellationSettlement(operationId: String, until deadline: ContinuousClock.Instant) async throws -> MacControlOperationRecord? {
-        let changes = FileChangeEvents(paths: [path])
-        defer { changes.cancel() }
-        return try await withThrowingTaskGroup(of: MacControlOperationRecord?.self) { group in
-            defer { group.cancelAll() }
-            group.addTask { [self] in
-                for await _ in changes.stream {
-                    try Task.checkCancellation()
-                    let current = try await record(operationId: operationId)
-                    if current?.state != .cancelRequested { return current }
-                }
-                try Task.checkCancellation()
-                return nil
-            }
-            group.addTask {
-                try await Task.sleep(until: deadline, clock: .continuous)
-                return nil
-            }
-            return try await group.next() ?? nil
-        }
-    }
-
     /// Restart cannot retain prior-process execution ownership. Mark interrupted rows terminal without replay; full startup recovery and action-scoped bridge
     /// recovery keep distinct scopes.
     @discardableResult

@@ -31,6 +31,20 @@ extension NativeAgentNotificationActions {
     @MainActor
     static func handle(_ response: Response) async {
         guard response.action != UNNotificationDismissActionIdentifier else { return }
+        // Every click lands in her window: the one that posted it, or the one attached now.
+        if let model = ApplicationLifetime.shared.appModel,
+           response.renderer != nil || (try? BodyFacePresentation.current(model: model)) != nil {
+            do {
+                let target = try response.renderer.map { renderer in
+                    guard let connection = UUID(uuidString: renderer) else { throw FaceWireError.disconnected }
+                    return try BodyFacePresentation.require(connection, model: model)
+                } ?? BodyFacePresentation.current(model: model)
+                let value = NotificationResponse(id: nil, action: response.action, text: response.text, category: response.category,
+                    route: response.route, title: response.title, body: response.body)
+                try await handleFaceNotification(value, model: model, target: target)
+            } catch { ApplicationLifetime.shared.appModel?.setFailureStatus(error, action: "handle the window's notification") }
+            return
+        }
         if response.action == UNNotificationDefaultActionIdentifier {
             if response.category == approvalCategory {
                 _ = ApplicationLifetime.shared.request(.activity(.approvals))

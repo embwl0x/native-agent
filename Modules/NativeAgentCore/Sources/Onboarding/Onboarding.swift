@@ -26,56 +26,66 @@ public struct SwiftNativeOnboardingClient: Sendable {
             // A reset is an operation, not an ambiguous half-onboarded state. Finish its exact manifest before exposing start state so a crash after one rename
             // can never make the wizard exit or resume the completion transaction the reset was cancelling.
             try await reconcilePendingResetLocked()
-            // Any transaction-owned document or completion marker prevents a fresh submit unless a resumable manifest owns it.
-            let fm = FileManager.default
-            let targets = Self.expectedTargetURLs(
-                personaRoot: personaRoot,
-                profilePath: profileJSONPath,
-                dataRoot: dataRoot
-            )
-            let soulPath = targets["soul"]!
-            let voicePath = targets["voice"]!
-            let growthPath = targets["growth"]!
-            let personaPaths = [soulPath, voicePath, growthPath, targets["agents"]!]
-            let onboardedSentinel = targets["sentinel"]!
-            let pending = try Self.loadTransactionIfPresent(
-                at: transactionManifestPath,
-                personaRoot: personaRoot,
-                profilePath: profileJSONPath
-            )
-            let hasExisting = pending != nil
-                || personaPaths.contains { fm.fileExists(atPath: $0.path) }
-                || fm.fileExists(atPath: onboardedSentinel.path)
-            let hasCompletionAnchor = NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
-            // Persona bytes without completion proof require reset; a generator-only USER.md remains fresh state.
-            let hasPartialPersonaState = !hasCompletionAnchor
-                && personaPaths.contains { fm.fileExists(atPath: $0.path) }
-            let profileRepairRequired = pending == nil
-                && hasCompletionAnchor
-                && !fm.fileExists(atPath: profileJSONPath.path)
-            var currentName: String?
-            var profileUnreadable: String?
-            if let pending {
-                currentName = pending.agentName
-            } else if hasExisting && !profileRepairRequired && !hasPartialPersonaState {
-                do { currentName = try PersonaCompiler.compileProfile(dataRoot: dataRoot).name }
-                catch {
-                    profileUnreadable = """
-                        Setup could not read the saved profile: \(error.localizedDescription). The persona documents are intact. Repair \
-                        \(profileJSONPath.path) on the Mac, then check again.
-                        """
-                }
-            }
-            return OnboardingStartResult(
-                hasExisting: hasExisting,
-                currentPersonaName: currentName,
-                abilityOverview: Self.abilityOverview,
-                pendingRecovery: pending != nil,
-                resetRequired: pending == nil && hasPartialPersonaState,
-                profileRepairRequired: profileRepairRequired,
-                profileUnreadable: profileUnreadable
-            )
+            return try inspectOnboardingLocked()
         }
+    }
+
+    /// Read-only presentations cannot finish a pending reset on the person's behalf.
+    @concurrent public func readOnboarding() async throws -> OnboardingStartResult {
+        try await SwiftNativePersistenceCore.withFileLock(transactionManifestPath) {
+            guard try Self.loadResetTransactionIfPresent(at: resetTransactionManifestPath,
+                personaRoot: personaRoot, dataRoot: dataRoot) == nil else {
+                throw OnboardingError.ioFailure("A pending persona reset must settle before its identity can be presented.")
+            }
+            return try inspectOnboardingLocked()
+        }
+    }
+
+    private func inspectOnboardingLocked() throws -> OnboardingStartResult {
+        let fm = FileManager.default
+        let targets = Self.expectedTargetURLs(personaRoot: personaRoot, profilePath: profileJSONPath, dataRoot: dataRoot)
+        guard let soulPath = targets["soul"], let voicePath = targets["voice"], let growthPath = targets["growth"],
+              let agentsPath = targets["agents"], let onboardedSentinel = targets["sentinel"] else {
+            throw OnboardingError.ioFailure("The persona target catalog is incomplete.")
+        }
+        let personaPaths = [soulPath, voicePath, growthPath, agentsPath]
+        let pending = try Self.loadTransactionIfPresent(
+            at: transactionManifestPath,
+            personaRoot: personaRoot,
+            profilePath: profileJSONPath
+        )
+        let hasExisting = pending != nil
+            || personaPaths.contains { fm.fileExists(atPath: $0.path) }
+            || fm.fileExists(atPath: onboardedSentinel.path)
+        let hasCompletionAnchor = NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
+        // Persona bytes without completion proof require reset; a generator-only USER.md remains fresh state.
+        let hasPartialPersonaState = !hasCompletionAnchor
+            && personaPaths.contains { fm.fileExists(atPath: $0.path) }
+        let profileRepairRequired = pending == nil
+            && hasCompletionAnchor
+            && !fm.fileExists(atPath: profileJSONPath.path)
+        var currentName: String?
+        var profileUnreadable: String?
+        if let pending {
+            currentName = pending.agentName
+        } else if hasExisting && !profileRepairRequired && !hasPartialPersonaState {
+            do { currentName = try PersonaCompiler.compileProfile(dataRoot: dataRoot).name }
+            catch {
+                profileUnreadable = """
+                    Setup could not read the saved profile: \(error.localizedDescription). The persona documents are intact. Repair \
+                    \(profileJSONPath.path) on the Mac, then check again.
+                    """
+            }
+        }
+        return OnboardingStartResult(
+            hasExisting: hasExisting,
+            currentPersonaName: currentName,
+            abilityOverview: Self.abilityOverview,
+            pendingRecovery: pending != nil,
+            resetRequired: pending == nil && hasPartialPersonaState,
+            profileRepairRequired: profileRepairRequired,
+            profileUnreadable: profileUnreadable
+        )
     }
     public static let abilityOverview: [AbilityOverviewEntry] = [
         AbilityOverviewEntry(

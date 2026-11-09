@@ -24,24 +24,130 @@ requests offer it alone. The schema is defined in
 | `app {"script":"<JavaScript>"}` | Compose permitted app calls in JavaScriptCore. |
 | `app {"actions":[{…},…]}` | Many calls in one, in order, each re-entering the gate chain as its own app call. Nothing is built on a failure: after a failed or person-waiting step, later changes do not run; later reads still run. The result names the blocking step and reason, skipped changes and reads run after it, with `failed_step`, `not_run:[{index, action}]` and `steps_total` (step indexes start at 1). An action's single-valued argument given a list (`args.handle:[…]`) follows the same law per value: a failed write stops later write values; reads fan out fully. |
 
+A readable, untainted message from the person waiting in this conversation
+hands an `actions` batch back before its next step, including a read. The
+result has `reason: person_arrival`, remaining entries in `unrun`, `next_step`
+(1-based) and all earlier receipts. With no started entries it is `skipped` /
+`not_run`, `effects: none`; otherwise it is `partial` unless an earlier receipt
+failed. That failure keeps the batch failed, its remedy and failure detail;
+failures nested in receipts count too. The hand-back adds the unstarted steps
+without erasing that evidence, and earlier effects stay in their receipts.
+This arrival is not a failed action or a Stop. Running
+calls finish; peers and the agent's own arrivals keep their ordinary boundary
+reading. See [turn admission](ANATOMY_OF_A_TURN.md#1-a-surface-admits-the-turn).
+
 Home names belong under `item`; registry action IDs belong under `action`.
 A home item can change state or send a message immediately. Read its room
 first: home items do not support `preview` or `expected_version`.
+
+`record.read` reads their own committed history through `ExperienceStore`:
+`args:{of:"experiences", id_prefix:"happening:person."}` reads presence happenings;
+`args:{of:"details", source:"attention", kind:"attention.ignite"}` reads attention
+provenance. Experiences also filter by exact `id`, `kind` and `open_only`; details
+by exact `subject`, `subject_prefix`, `kind`, `source` and inclusive ISO `since`.
+Filters combine, prefixes are literal, and both return newest first with a
+positive `limit` (default 20, raised by the caller). `matched_total`, `returned`
+and `has_more` make page coverage explicit. Whole detail JSON rows retain their
+8 MiB store cap; named row gaps make the result partial. Missing storage fails
+without initializing it. [Experience](EXPERIENCE.md#reading-their-own-record) owns
+the fields, order and absence semantics. The action declares `read:true`.
+
+`chat.working_memory {text:"…"}` holds one private choice or unspoken plan in
+the serving conversation, up to 1200 characters. Empty text explicitly clears
+it. They reads it in their live context each turn while it is held; the action's
+receipt contains no choice text. The session is transport-bound, never selected
+by an argument. Nonempty private text must be a single app action; saved script
+source refuses it with that reason. [Turn anatomy](ANATOMY_OF_A_TURN.md#3-nativeagent-prepares-the-working-set-in-parallel)
+owns delivery and privacy. The existing scratch file owns the value; no second
+working-memory store or action schema on the provider wire is added.
+
+`claude.worklog` reads the writer's real `~/.claude/state/claude-worklog.jsonl`
+tail, newest first, off the main actor. Missing, unreadable or malformed source
+returns unavailable with its cause and repair path, never a claim that Claude
+has done no work. The Agents page and action registry advertise this same read.
+
+`app {page:"chat", item:<conversation id>}` reads saved chat and bridge sessions
+and contact conversation ids through their existing owners; it does not select
+the person's conversation. The [conversation contract](session-conversations.md)
+owns resolution, bounded history and reply eligibility. A failed or incomplete
+read part makes the page `partial` while retaining that part's cause; a readable
+page shell never labels a failed conversation read `ok`.
+
+`context.expand` opens an exact `history:<id>` across saved conversations,
+including agent conversations, without pinning it to the serving conversation.
+The shared binder declares `message_id` and `history` as that exact reference:
+it supplies `history:` once and records the interpretation. An accompanying
+`agent` is context for that reference and is consumed with its own interpretation;
+it cannot narrow an exact id. Collisions and unresolved names still refuse.
+Context atom pointers remain limited to the serving turn's offered generation.
+An unreadable transcript remains a named coverage gap, never proof of absence.
 
 For actions, `preview:true` reports proposed effects without performing them.
 Native preflight checks policy and selected targets; authored preview runs live
 reads with writes previewed; resume preview only inspects stopped work.
 `expected_version` can guard against a page changing after it was read.
-The door carries what the app knows: a name the action does not take binds to
-the one missing argument it fits and the result says so in `argument_notes`
-(`took \`ref\` as \`atom_id\``); otherwise unknown keys, invalid arguments and
-stale versions refuse with a remedy. The door's missing or invalid
-action-argument refusals include its `args_schema`, the names it `accepted`
-and an example call. An unknown action's `nearest` suggestions use the named
-page's own actions first; `actions` is the top-level batch argument, while
-`{page, item:"actions"}` reads a page's action list. A failed read's default
-remedy reads its argument schema and reports that the read changed nothing;
-only a change's recovery asks to check what took effect before repeating it.
+At the shared action door, if the schema declares exactly one of `id`, `item`
+and `handle`, and that field is absent while exactly one of the other two is
+supplied, its value binds to the declared field before validation, Trust and
+receipts. Schemas keep their declared names. A supplied declared field, two
+supplied alternatives, or a schema declaring none or several leaves this
+address binding untouched. Authored calls use the same binding at inspection
+and execution, including expressions whose values are not yet known.
+Other unknown arguments bind only when one missing accepted argument fits its
+value and has the action's declared meaning, or is
+the single missing required argument of that type. Two possible targets, a
+collision, null, an undeclared type or any unresolved name leaves the call
+unchanged for admission to refuse. The receipt says `understood message as text`;
+normal validation, Trust and effect gates still judge the bound call. Apart
+from the address binding, open argument maps keep their supplied keys. This
+replaces suggestion-only name correction; the address rule is shared rather
+than a per-action parsing path.
+Argument evidence uses that same binder before redaction: transcript, trace,
+approval and receipt projections see canonical names with secret values removed.
+An unreadable binding contract withholds the arguments and reports its cause.
+Approval replay keeps secret characters only in memory under those same bound names.
+
+Every returned action receipt carries one compact `argument_form` line rendered
+from the exact admitted `args_schema`, including its first call in a turn,
+refusals and folded calls. Names, required markers, types and enum choices come
+from that schema rather than a handwritten action signature.
+The shared door stamps the returned receipt after call handling, so an outer-key
+refusal before argument admission carries the same form as an executed call.
+There is no per-turn copy of the catalog. Script data keeps its original value;
+the line and interpretation stay in its receipt. Invalid arguments carry
+`try_instead` and one proposed `next_call`: an exact call from supplied values
+when it fits, otherwise the closest declared form beside `supplied_args` and
+its schema. Missing values remain explicit placeholders to review before sending;
+advice itself never executes. The door's argument refusals also retain
+`args_schema` and the names it `accepted`. Suggested actions
+list read-only ones first and each names its `effects`, so taking the first
+suggestion never posts, sends or changes anything by accident. Unknown actions
+read the unknown id as intent words (family and verb, such as "chat read" or
+"desk list") and use the same checked semantic action index and ranking owner
+as `find`, ordering the intent matches by semantic similarity before exact page
+names or word overlap. Find's explicit id/page priorities stay as described below.
+The separate spelling-distance ranker is removed. Per-action ranking
+and schema gaps stay named beside usable suggestions; a shared catalog/index or
+query-embedding failure reports its cause and repair rather than word-only advice.
+Cross-field refusals keep their owner's proposed call. `trace.recent` with
+payload `fields` and no turn window proposes reading one completed turn; the
+refused call reads nothing and the agent can change the count or name a turn.
+Stale versions keep their reread remedy. `actions` is the top-level batch argument, while
+`{page, item:"actions"}` reads a page's action list. A malformed batch refusal
+carries `try_instead`: a single call object is wrapped in a list, and shared
+call fields move into its entries when they do not conflict. Supplied values
+and outer preview/version options are retained. Unreadable entries, conflicting
+fields and invalid batch sizes retain the supplied input beside the door's declared
+input schema. A refused entry's advice includes only that entry; earlier calls
+keep their receipts. Each proposed entry still passes its own admission and gates.
+A missing file path's failure names `nearest_existing_ancestor` and carries a
+`remedy.next_call` that runs `files.list` on that verified folder. Missing
+parents are walked to the nearest existing directory; an unreadable ancestor
+stays an explicit `ancestor_lookup_error`, without an invented path. Other
+failed reads use the argument-schema remedy and report that the read changed
+nothing; a change's recovery asks to check what took effect before repeating it.
+File actions, explicit-path `mac.read` document reads and the parts'
+`files.mime` and `files.query` primitives share that missing-path recovery owner.
 
 An action's argument declaration exposes the shape its handler enforces.
 Structured arguments use the owning validator's schema: ability saves and
@@ -57,12 +163,51 @@ unless its declaration explicitly marks it open: `:object*`, or an owner schema
 with `additionalProperties:true` or a schema for map values. Ability-validation
 input names the schema that determines its contents. Ability saves take
 `params` and `reach`; retired `input_schema` and `permissions` arguments refuse.
-Values that truly accept any JSON say why: setting values take
-with `additionalProperties:true` or a schema for map values. `params` may carry
-the input's JSON Schema; ability-validation input names the schema that determines
-their contents. Values that truly accept any JSON say why: setting values take
-their kind from `setting.get`, resume answers belong to the stopped decision,
+`params` accepts description strings and `{type,description?}` declarations,
+or an object schema whose `properties` name those parameters. A string keeps
+its description; its leading type word (`string`, `number`, `integer`, `boolean`,
+`array`/`list`, `object`, also `int`/`bool`), optionally after `optional`, supplies
+the type. Words end at whitespace, commas, colons or parentheses. Without a
+leading type word it is a string parameter. A `?` on the type or the word
+`optional` anywhere in the string marks an optional parameter. For example,
+`int`, `int, default 6000` and `string, page to open` are required; `int?`,
+`optional int, default 6000`, `int (optional)` and `int, optional` are optional
+integers; `optional note to add` is an optional string. Description text does
+not supply a runtime default. An object schema's `required` still governs its
+properties; a required property with an optional declaration is refused.
+Plain type spellings use the same reader; object declarations retain their
+explicit `type` without interpreting their description.
+Parameter schemas retain constraints such as `items` and `enum` through saving
+and run admission; the shared JSON Schema validator checks them. Saving stores
+canonical params and the derived input schema; runs use that stored schema.
+Correcting an existing declaration requires re-saving with explicit params;
+omitted params inherit, and null or an empty map clears them. Values that truly
+accept any JSON say why: setting values take their kind from `setting.get`,
+resume answers belong to the stopped decision,
 and declared `learned`/`choices` are retained metadata with no enforced shape.
+
+Desk writes serialize under the store's lock; changed items retain their
+existing changed-state refusals. Conversations, turns, native operations and
+ability inputs acquire no holds. Only a stopped part-run with a retained
+checkpoint reserves its journaled Desk items until resumed or released.
+Queue edits and closure, Desk mutations, subtree closure and resume check those
+run reservations without acquiring any. A run refusal names its holder,
+`held_since`, `held_until:"resumed or released"`, and a `remedy.next_call`
+previewing that run's resume. Session evidence is included when available.
+The single locked hold editor drops every non-run marker and reservations
+without an open item or retained checkpoint. No clock expires reservations.
+Resume releases its run's markers while keeping the claimed checkpoint through
+execution; a refused or busy resume restores reservations without displacing
+another stopped run. Hold reads and cleanup never discard checkpoint bytes;
+claimed bytes belong to the resuming call until its explicit settlement.
+Reservation bookkeeping failures retain the produced result and owe Desk repair.
+
+The admitted ability entry assembles `native-morning-brief`'s checked source
+packet for `operation:"brief"`; direct calls and its scheduler supply the same
+operation. The scheduler retains consent, occurrence claims and publication.
+Ability JavaScript exceptions carry the ability, version, engine-reported line,
+source expression and cause, with the located message also in `detail` and a
+read/repair call. A missing engine line stays explicitly unavailable.
 
 Mac integration pages expose their `trust.mac_integration_<id>` setting
 through the shared settings projection, alongside the integration's actions.
@@ -96,9 +241,12 @@ verdicts, not network-health checks, and do not change execution admission.
 
 Discovery requires the checked semantic index and embedder; their failures return
 the source cause and repair, with no word-only search. Lookup, page actions,
-policy projection and ranking use one checked inventory. Native parameter-schema
-failures stop discovery and admission rather than replacing the schema with
-display argument text. The always-on description names fixed hot action IDs;
+policy projection and ranking use one checked inventory. A selected action's
+parameter-schema failure appears in `schema_gaps` with its id and cause; its
+healthy siblings still return, including on an exact-id find. `shown_actions`
+counts usable rows; a gap is never evidence of absence. That action's admission
+still refuses, without manufacturing arguments from display text. Shared
+inventory or semantic-index failures still fail the search. The always-on description names fixed hot action IDs;
 their checked schemas and examples arrive through discovery.
 
 Settings propagate unavailable model/account catalogs, Trust/Slack policy, helper
@@ -126,9 +274,18 @@ reports why no fresh page is attached. Sense-watch selection failures report a
 capture error rather than presenting the watch as switched off.
 
 `chat.post` reads the current conversation and optional Telegram route before
-posting. A route-read failure stops the post instead of substituting another
-destination; a genuinely absent Telegram door retains the checked conversation's
-attention policy.
+posting. These are bounded recent reads, independent of total transcript size;
+the [conversation contract](session-conversations.md) owns their bounds and
+field-level evidence gaps. A route-read failure stops the post instead of
+substituting another destination. A Telegram route outside the recent tail is
+unknown, not proof that the door is absent; without a proven Telegram route,
+the post retains the checked conversation's attention policy.
+`chat.post` has no hourly quota: a correction or amendment can reach the person
+immediately through the same action, without a guessed correction classifier or
+a new argument. The speech owner deduplicates identical content within the
+same turn and reconciles uncertain appends at their recorded destination.
+Changed content in that turn has a different content key. Trust, exact-call
+approval, route checks and the person's notification policy still apply.
 
 Senses serve `mac.look`, `mac.read`, `files.read`, `web.read` and browser pages through the same door: named things, addresses, verbs and `via sense …` provenance.
 [Senses](SENSES.md) owns raw/wrong reads, authoring, repair, corner discovery and turn-gated verbs.
@@ -214,8 +371,9 @@ or per-session active-tools store. Installed schema updates apply next turn.
 
 `ToolNameAliases` binds current internal executors to app actions and translates
 only their declared public/internal argument names, such as `path` to `cwd`.
-Retired tool/action spellings, discovery/load names and argument aliases are
-unknown calls. Current internal executors direct callers to their app action;
+Retired tool/action spellings and discovery/load names are unknown calls.
+Argument interpretation belongs to the shared action binding described above.
+Current internal executors direct callers to their app action;
 provider-safe wire names remain a separate transport encoding.
 The single name declaration is
 [`ToolNameAliases.canonical`](../Modules/NativeAgentCore/Sources/ToolRegistry/ToolNameAliases.swift):
@@ -284,6 +442,20 @@ provider selection.
   and `timeout`, respectively. `raw:true` reads the original fetched-text view
   with the same selection; `wrong:true` reads it and offers sense repair guidance
   after success, with optional `why` explaining what was wrong.
+  A successful thin/JavaScript-gated HTTP extraction selects `chrome.navigate`
+  through the same app door with `new_tab:true`, including from workspace.
+  That nested navigation owns the settled page readback. The result says
+  `used_browser:true`, retains HTTP evidence/receipt under `http_read`, and
+  carries Chrome's page or actual blocker. Chrome supplies top-level text only
+  when its served text has more non-whitespace characters than the selected HTTP
+  text, measuring both exact returned strings (including an authored `sense_page`);
+  `text_reader` names `browser` or `http`. Otherwise HTTP text remains at the top,
+  with partial status and Chrome's empty/shorter/unmeasured result or failure in
+  `browser_read`. `used_browser` describes the attempt. Chrome may use the signed-in
+  session; no consent is dismissed. HTTP failures do not select Chrome.
+  Rendered `find` starts at the first matching element (`around` is HTTP-only);
+  Chrome's [read contract](../Extensions/NativeAgentChrome/README.md) owns
+  bounded settlement, overlays, graphics and continuations.
 - `maps.search` accepts `near` separately or splits the query at its first
   `near`, `in` or `around` when `near` is absent/empty, for example
   `query:"coffee near Tampa airport"`. `query_split` reports the original text,
@@ -295,7 +467,8 @@ provider selection.
   `traffic:"not_included"`; this route does not request a traffic-aware ETA.
 - Grow executable abilities with `ability.save`; `ability.enable` keeps a draft
   or turns an ability back on. Run it as `authored.<id>` or its declared
-  `face.action`; read it with `ability.read`. Every ability verb accepts `id`
+  `face.action`; read it with `ability.read`. A part whose header declares
+  `answers` is run only through the door verbs it answers. Every ability verb accepts `id`
   bare or as `authored.<id>` and receipts name the bare id; unknown ids return
   the nearest three available ids. Resume keeps its required `run_id`, with
   optional `id` binding it to that ability before claiming the run. Full Mac
@@ -316,6 +489,19 @@ provider selection.
 `web.search` searches SearXNG and returns its results or an explicit failure with setup or repair guidance. A malformed result or `unresponsive_engines` entry is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
 Cancellation stops the search.
 
+## Where actions come from
+
+An action is declared in one of two places: natively in `AppActions+Declarations.swift`, or by a part's header `answers`
+([manifest spec](skill_manifest_spec.md)). An answered verb keeps its action id, arguments and class; the door registers it on the
+part's `face.page`, admits its args against the declared schema, judges it by its declared class with the Mac integration switch of
+the part's app reach, and runs the part with `{verb, ...args}`. No native schema, alias or route row remains for it, and a native
+declaration of the same id wins until it is deleted. Mail, Notes, Messages, Music and Chrome history are answered by parts
+(`native-mail`, `native-notes`, `native-messages`, `music`, `music-library`, `native-chrome-history`) that they can revise; the stem
+keeps the AppleScript executor and its per-event write checks, Trust and the cards. A verb declared read runs read-confined. A verb a shipped seed
+answers never ranks below that seed's class (send stays send, irreversible stays irreversible), whatever a revision declares. Its Mac
+integration switch gates it as the native verb's did: before any card, at preview and at the part's run, with the person's inline grant request;
+a verb that reads the person's files with no app switch over them needs admitted Full Mac and is refused without a card.
+
 ## Scripts
 
 `AppScriptRunner` binds the door to [`OwnedProgramRunner`](../Modules/NativeAgentCore/Sources/Senses/OwnedProgramRunner.swift) for fresh JavaScriptCore execution with
@@ -323,12 +509,17 @@ Cancellation stops the search.
 No direct filesystem, network, process or timer API is exposed; every nested app call re-enters the same gate chain.
 The callable `app({action, args, preview?, expected_version?})` form and each
 entry of `app({actions:[…]})` carry the same options as the method form's
-second object. `preview:true` on either a batch or an entry dominates; an
+second object. A named method call takes at most those two objects: a supplied nonobject options argument or any surplus argument refuses
+before execution. Static source admission rejects the same known malformed shapes; computed values are checked at the live call.
+`preview:true` on either a batch or an entry dominates; an
 entry can add preview to a live batch but cannot disable a batch preview.
 An entry's `expected_version` overrides the batch's guard and reaches the
 door unchanged.
 
 Every registered action is callable from a script under its ordinary gates.
+Script composition has no effect class of its own: each nested call reaches
+admission with its own class and the held request ceiling. Read-only requests
+can compose reads; any write, send or destructive step is refused before it runs.
 Each write retains its gates and receipt. A call that raises an
 approval card waits for the settled result; a decline throws `AppError` with
 reason `declined`, which the code can catch. `card.request` likewise waits for
@@ -341,8 +532,9 @@ use named actions for its items. Secret arguments still require a single action.
 Settings rows say they are theirs to set both ways; they need no quoted request
 or Trust posture. For other settings on model turns below Full Mac, `because`
 still quotes at least three words of the person's or trusted agent's request,
-unless restoring their previous change. Trust rows retain their existing
-owner-only, Full Mac and lower-only checks.
+unless restoring their previous change. Trust rows keep their owner-only check
+and their direction: a lowering is theirs at any posture, and a raise asks the
+person on a card.
 
 `OwnedProgramRunner` owns source, read and action limits and the shared progress clock: a renewable 60-second no-progress window by default, excluding host waits.
 Its receipt retains completed effects if a later step fails; a script is not
@@ -351,6 +543,14 @@ Stop ends the helper immediately and cancels its host call, then waits for
 the host's actual terminal result. The final journal and receipt retain
 that result, its effects and returned handles even when it arrives after
 Stop. A completed call replays from its saved answer rather than running again.
+Program returns and every journaled step's answer stay whole until the shared
+[result boundary](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool) retains and bounds the
+model view. A long result names its `result_handle` and `next_call`; use
+`result.page` with that handle and the zero-based `page` offset, following
+`next_page` (or `continue:true`). `raw:true` reads exact retained bytes.
+The helper's former 16 KiB return prefix and byte-count-only step results are
+removed. Retention failures are explicit and do not establish the action's
+outcome.
 
 ## Authority and receipts
 
@@ -362,6 +562,34 @@ The forms carry the common case: a read is a safe read; a door action is a read 
 The security profile projects that declaration, and argument policy only narrows it; nothing is inferred from a tool's name.
 The execution result owns its effect verdict; receipts preserve it and the outer door fills only missing metadata.
 
+Ability admission, Trust/consent, input and part gates, wake admission and resume
+refusals use the same dispatch completion writer as executed calls. Their receipts
+keep the owner's reason, checker and remedy; `abilities/state.json` retains that
+evidence in `lastRun` with the refused attempt's own time. Runner provenance prevents
+outer app receipts from counting the same run again. An unavailable identity stays
+unattributed, with its accounting failure visible, rather than selecting another
+ability or version. Home's refused-run rows read this owner directly.
+
+A receipt with `effects:none` and its own failure evidence (`error`,
+`error_code`, `ok:false`, `success:false`, `failed:true`, or other evidence the
+shared classifier reads as failed) gains `status:failed` when the owner has
+not named `status` or `state`. An owner-named status is preserved, including
+`needs_person`, `already_applied`, `already_discarded`, running and waiting
+states. Effects alone and missing terminal evidence establish neither failure
+nor success.
+
+Every tool result delivered to the turn's model passes the same repeat
+annotation owner, including standing-bot turns before their records are kept
+and their feedback is serialized. If the same tool and arguments already
+returned an identical answer in that turn, its receipt adds `repeat:n` and
+`repeat_note`: "Same call, same
+answer as your last n; nothing has changed." The count reads the turn's
+existing dispatch records, including earlier results in the same round; bots
+read their own execution records before keeping the current call.
+Outer dispatcher correlation ids, `ability_run` provenance and the repeat annotation do not change answer
+identity. The call still runs; this information neither refuses nor caps work.
+`tool.receipt.repeat` records the count when the annotation is prepared.
+
 An ability's run receipt uses the broker's recorded per-call `read_only`
 classes, not its declared permissions: an all-read run reports `effect:read`
 and `read_only:true`; an effectful part remains `effect:part`, with
@@ -370,10 +598,25 @@ records observed outcomes, including partial or unknown. `ability.validate`
 is a read with `effect:none`, `effects:none`, and `execution:rehearsed` when
 the rehearsal was reached; it does not execute intercepted effects.
 
-Tools reads the bounded `ability.list` projection, with `runs`, `last_run_at`,
+Make is a registered page: `app {page:"make"}` reads every retained ref,
+newest first, in pages of 25. Follow its `next_call` with `args.offset`;
+`app {page:"make", item:"<ref>"}` reads that ref's versions, paths, prompts
+and provenance. A ref whose metadata is missing or unreadable stays on the
+shelf as an unavailable row; a directory read failure fails the read. An absent
+Make directory reports `read_state:not_created` with no rows. Reads
+use the Make store off the main actor and never create a shelf. `make.read`
+keeps its single-ref meaning (newest when ref is omitted); unknown refs offer
+`try_instead:{page:"make"}`. Make actions and page discovery share the page
+registry.
+
+Tools reads the bounded `ability.list` projection, with `run_counts`, `last_run_at`,
 `count`, `total`, `has_more` and a named `offset` continuation. Full source
 reads continue through `ability.read {id,offset}` (or the named Tools item),
-rather than reconstructing raw result pages. Retained-result recovery names
+rather than reconstructing raw result pages. List and detail share
+`run_counts:{all_versions,current_version}`: lifetime `useCount` and the
+selected file identity's recorded count respectively. `learned.use.scope`
+is `current_version`; its `run_totals` and `rounds_per_use` cover that scope.
+The ambiguous list `runs` field is removed. Retained-result recovery names
 searched, matching, displayed and remaining section counts separately;
 oversized structured sections expand through their named child paths.
 
@@ -422,12 +665,28 @@ reach uses only the operation's declared `path` and, for copy/move,
 `destination`, resolved by execution's file resolver; file contents grant no reach.
 Signed phone turns read the current `macControlPolicy.remote_from_ios_allowed`
 grant, retaining transport verification. Phone and Mac share file-access modes
-`auto`, `read_only`, `workspace`, `full` and `none`: absent phone metadata selects
-Auto, while an empty, whitespace-only or unknown supplied value is refused before
+`auto`, `read_only`, `workspace`, `full` and `none`: phone metadata must include
+`fileAccess`; a missing, empty, whitespace-only or unknown value is refused before
 the turn runs. Phone controls always carry their supplied file-access field,
 including a blank value; serialization never turns invalid input into absence.
 The phone offers Auto, Read only, Workspace and Full Mac. It does not offer
 "No files": the current file gate does not enforce `none` across all file tools.
+An explicit request's `read_only` ceiling reaches canonical Trust admission
+before consent and blocks every effectful tool class, including changes inside
+the agent's own workspace or data, regardless of broader saved permission or
+approved replay. Folded actions and authored calls re-enter that same admission.
+The request binds before expansion and conversation coordination, so a refused
+send cannot leave queued work. Nested dispatch, replay and resume intersect
+ceilings; `none` and `read_only` can hold together without a new wire mode.
+File mutation also reads the ceiling directly from the turn before any write;
+Full Mac connector reach and a part's own-data grant cannot widen it. The request
+issuer must resubmit with write access to change that ceiling.
+The request-file-access refusal producer supplies its remedy: `none` names the
+read grant, `read_only` names a mode permitting changes, and an invalid mode names
+the accepted values. Each remedy points to the originating request's `fileAccess`
+setting (phone: Chat > File access) and requires a new request; every carried
+ceiling must permit the operation. Dispatch, pre-approval and Trust's answer retain
+this same remedy rather than replacing it with generic write-access advice.
 An unreadable Telegram/Slack sender allowlist refuses screen or conversation
 effects with its cause; it never reclassifies the sender as somebody else.
 macOS privacy permission resets always require
@@ -439,6 +698,42 @@ resets, remain. Reading agent words, conversing with agents or instructing them
 does not itself steer a turn or ask for approval. `SecurityCenter` and
 `PeerTurnEffectPolicy` own those decisions. Agents enabled in Trust → Connected agents carry the owner's
 authority on authenticated turns; ordinary Trust and domain checks still apply.
+
+`inbox.approve` and `inbox.deny` answer one exact pending approval id on the
+person's own message from Mac chat, a signed paired-phone chat or an allowlisted
+Telegram sender. `ApprovalExecution.decisionProvenance` reads the current ingress,
+its canonical user row and conversation ownership. Helpers, agent contacts,
+wakes, schedules and every turn carrying peer steering remain `owners_call`,
+including trusted or previously elevated peers. An absent message or unverifiable
+door grants nothing. Putting away a pending approval passes the same authority
+check before declining it. Permanent deletion remains the person's tap, by the
+tool's declared destructive class, never the card's wording. Other levers keep
+their own tap authority. Decisions on a message record `person_message`
+provenance, its session, message id and verifying door; cards and retained history
+name the agent deciding on that message rather than presenting a tap.
+
+The named row must be the exact authorizing message. A message joining a running
+turn keeps its own run and door while the reading turn retains its opener's.
+`ChatTurnSteering` records that join before handing the message to the turn;
+message decisions then refuse because the authorizing message cannot be
+established. Missing or mismatched open-turn evidence refuses the same way.
+The agent never substitutes the opener or the latest row for a joined message.
+Read the card first or ask the person to tap; a fresh message after the running
+turn ends can be answered under its own identity.
+
+Message decisions require a fresh turn that has started only Inbox reads or
+approval-decision calls. The shared canonical dispatch entry marks every other
+call in shared call evidence held on `Turn` before execution, without a list of outside
+tools or inspection of text. Web, mail, files, memory, senses, authored programs,
+scripts and batches therefore close message authority, including failed calls.
+Nested model executions retain that evidence. Missing call evidence and checkpoint resumes also refuse. The refusal says
+to read the card first or ask the person to tap; the agent can answer in a fresh
+message. This restriction belongs to approval authority, not `PeerDataTaint`'s
+initiating-steering policy. Taps retain their verified authority.
+
+Outside text from an earlier turn can still be in the agent's context. A message
+decision is the agent's judgment on the person's authenticated message, not proof
+of the person's intent or proof that outside text had no influence.
 
 `tools.contract` records the actual wire schema count and bytes.
 `turn.terminal` includes `discoveryToolDispatchCount` for executed
@@ -471,14 +766,22 @@ receipts with their census `id` and source `site`.
 
 ### Their calls land
 
-Argument names must match the current action contract. Unknown names refuse
-with that contract and an example; a read does not drop them, and dispatch
-does not infer a different name from spelling, type, value or a nested shape.
+Argument names bind against the current action contract as described above,
+including its single address field. Other unknown names need one declared
+meaning or one missing required argument of the same type; unresolved names
+refuse with that contract, `try_instead` and a proposed `next_call`.
+Advice requiring a changed call points to discovery
+when its proposed arguments would repeat the failed call. A read never drops
+an unresolved argument.
 Desk reads return their current row projection directly; they take no
 `structured` switch. Home, readback and continuation calls use that same
 declared Desk input. Helper references use `id`, and reply lists use `sort`;
 `bot.reply` retains its separate `bot_id` expected-owner or latest-reply
 selector. Saved navigation references reopen through these current readers.
+When a helper selector instead names a saved agent contact, the refusal points
+to `agent.read` with that contact's saved address. For `bot.ask`, it instead
+proposes `agent.message` with that address and the original question as `text`.
+The refusal starts no peer work.
 
 Declared scalar forms normalize exactly: numbers to strings, numeric strings
 to numbers (integers only when exact), `"true"`/`"false"` to booleans, and one

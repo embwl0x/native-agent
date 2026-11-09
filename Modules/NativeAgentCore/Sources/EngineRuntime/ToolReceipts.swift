@@ -6,10 +6,9 @@ import PersistenceCore
 import ToolRegistry
 // Blueprint: | `ToolReceipts.swift` | Frozen tool facts, shared status and exact successful persona-write receipts |
 
-@MainActor
 public extension TranscriptsFacade {
     @discardableResult
-    func prepareToolFold(_ messages: [ChatMessage], expanded: Bool = false) async -> String {
+    @concurrent nonisolated func prepareToolFold(_ messages: [ChatMessage], expanded: Bool = false) async -> String {
         let statuses = messages.map {
             ChatShellToolSummary.status(kind: $0.metadata?.kind, ok: $0.metadata?.ok,
                 resultSummary: $0.metadata?.resultSummary, resultStatus: $0.metadata?.resultStatus,
@@ -111,10 +110,5 @@ public enum ChatShellToolSummary {
         let line = content.split(separator: "\n", omittingEmptySubsequences: true)
             .first.map(String.init) ?? content
         return (line, "Written to \((path as NSString).lastPathComponent) · \(title)")
-    }
-
-    public static func overflowLine(total: Int, shown: Int) -> String? {
-        guard total > shown else { return nil }
-        return "and \(total - shown) more"
     }
 }

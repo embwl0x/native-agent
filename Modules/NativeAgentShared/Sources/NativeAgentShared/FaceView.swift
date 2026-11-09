@@ -1,229 +1,231 @@
 import SwiftUI
-// Blueprint: | `FaceView.swift` | The one renderer of a page's face on the Mac and the iPhone: header, sections by style, rows with time, symbol, tone, value, actions and controls |
+import Accessibility
+import Foundation
+// Blueprint: | `FaceView.swift` | Shared page renderer, adaptive sections and keyboard row navigation |
 
-/// Draws a page. The door passes where links lead (`open`) and the page owner's port (`act`); nothing here knows any page.
+/// Draws a shared face and native levers; its door owns navigation and action execution.
 public struct FaceView: View {
     public let face: PartFace
-    public let open: (String) -> Void
-    public let act: (_ row: String, _ action: String, _ value: String?) -> Void
+    public let levers: [PartFace.Section]
+    public let words: String?
+    public let keyed: [PartFace.Section]
+    private let adapter: any FaceDoor
+    private let leaf: ((PartFace.Block) -> AnyView)?
+    private let rowFilter: ((PartFace.Row) -> Bool)?
+    @State private var localSession: FacePageSession
+    private let retainedSession: FacePageSession?
+    private var session: FacePageSession { retainedSession ?? localSession }
+    @State private var viewer = UUID()
+    /// Rows, controls and action buttons share the page's focus reconciliation and scroll owner.
+    @FocusState private var focus: FaceFocus?
+    @Environment(\.faceInList) private var inList
+    @Environment(\.faceHoldsDocuments) private var holdsDocuments
 
-    public init(face: PartFace, open: @escaping (String) -> Void, act: @escaping (_ row: String, _ action: String, _ value: String?) -> Void) {
-        self.face = face; self.open = open; self.act = act
+    public init(face: PartFace, levers: [PartFace.Section] = [], words: String? = nil, keyed: [PartFace.Section] = [],
+                open: @escaping (String) -> Void, act: @escaping (String, String, String?) async -> Void) {
+        self.init(face: face, levers: levers, words: words, keyed: keyed,
+                  door: ClosureFaceDoor(open: open, act: act), session: FacePageSession(), retaining: false)
+    }
+
+    public init(snapshot: PartFaceSnapshot, title: String, header: Bool = true, open: @escaping (String) -> Void,
+                act: @escaping (String, String, String?) async -> Void) {
+        self.init(snapshot: snapshot, title: title, header: header,
+                  door: ClosureFaceDoor(open: open, act: act), session: FacePageSession(), retaining: false)
+    }
+
+    public init(face: PartFace, levers: [PartFace.Section] = [], words: String? = nil, keyed: [PartFace.Section] = [],
+                door: any FaceDoor, session: FacePageSession, retaining: Bool = true,
+                leaf: ((PartFace.Block) -> AnyView)? = nil, rowFilter: ((PartFace.Row) -> Bool)? = nil) {
+        self.face = face
+        self.levers = levers
+        self.words = words
+        self.keyed = keyed
+        adapter = door
+        self.leaf = leaf
+        self.rowFilter = rowFilter
+        retainedSession = retaining ? session : nil
+        _localSession = State(initialValue: session)
+    }
+
+    public init(snapshot: PartFaceSnapshot, title: String, header: Bool = true, door: any FaceDoor, session: FacePageSession,
+                retaining: Bool = true) {
+        let drawn = snapshot.drawnFace
+        let face = drawn ?? PartFace(sections: [])
+        self.init(face: header ? face : PartFace(sections: face.sections, detail: face.detail), levers: snapshot.levers ?? [],
+                  words: drawn == nil ? snapshot.error?.message ?? title + " is " + snapshot.status.rawValue + "." : nil,
+                  keyed: drawn == nil ? snapshot.keyLevers ?? [] : [], door: door, session: session, retaining: retaining)
+    }
+
+    #if os(iOS)
+    public static let door = "phone"
+    #else
+    public static let door = "mac"
+    #endif
+
+    private func shown(_ sections: [PartFace.Section], scope: String) -> [PartFace.Section] {
+        sections.map { section in
+            var drawn = session.collections.section(section).drawn(on: Self.door)
+            drawn.id = scope + ":" + section.id
+            return drawn
+        }.filter { $0.block != nil || !$0.rows.isEmpty || $0.more != nil || $0.footer?.isEmpty == false }
+    }
+
+    private var sections: [PartFace.Section] {
+        shown(levers, scope: "levers") + shown(keyed, scope: "keyed") + shown(face.sections, scope: "face")
+    }
+
+    private var collectionSources: [PartFace.Section] {
+        (levers + keyed + face.sections).filter { $0.more != nil }
+    }
+
+    private var itemDemands: [FaceReadRequest] {
+        sections.flatMap { section in
+            session.visibleRows(section).compactMap { entry in
+                let row = entry.row
+                guard row.expands == true, session.expanded.contains(.init(section: section.id, row: row.id)) else { return nil }
+                return FaceReadRequest(id: viewer, key: row.id, expectedCall: row.read, revision: section.revision)
+            }
+        }
+    }
+
+    private func itemDoor(_ request: FaceReadRequest) -> any FaceDoor {
+        for section in sections where section.allRows.contains(where: { $0.id == request.key }) {
+            let raw = section.id.split(separator: ":", maxSplits: 1).dropFirst().joined(separator: ":")
+            if let scope = session.collections.scope(section: raw, row: request.key) { return adapter.scoped(to: scope) }
+        }
+        return adapter
+    }
+
+    private var controls: [FaceItemID] {
+        sections.filter { $0.block == nil }.flatMap { section in
+            session.visibleRows(section).map(\.row).filter { $0.control != nil }.map { FaceItemID(section: section.id, row: $0.id) }
+        }
+    }
+
+    private var documents: [PartFace.Block] {
+        sections.filter { $0.folded != true || session.unfolded.contains($0.id) }.compactMap(\.block)
+            .filter { $0.kind == "document" && $0.text == nil }
+            .map { PartFace.Block(key: $0.key, read: $0.read, revision: $0.revision) }
+    }
+
+    private var visibleRows: [FaceItemID] {
+        sections.flatMap { section in
+            if section.block != nil { return [FaceItemID]() }
+            if section.folded == true && !session.unfolded.contains(section.id) { return [FaceItemID]() }
+            return session.visibleRows(filtered(section)).map { FaceItemID(section: section.id, row: $0.row.id) }
+        }
+    }
+
+    private func filtered(_ section: PartFace.Section) -> PartFace.Section {
+        var result = section
+        if let rowFilter, section.id == "face:" + (face.detail?.of ?? "") { result.rows = result.rows.filter(rowFilter) }
+        if face.detail == nil || section.id == "face:" + (face.detail?.of ?? "") {
+            result.rows = result.rows.filter(session.matchesFilter)
+        }
+        return result
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.section) {
-            if face.title?.isEmpty == false || face.line?.isEmpty == false {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                    if let title = face.title, !title.isEmpty { Text(title).font(.largeTitle.weight(.semibold)) }
-                    if let line = face.line, !line.isEmpty { Text(line).font(.title3).foregroundStyle(.secondary) }
-                }
-            }
-            // A section with nothing to show is not drawn: no rows and no footer leave a bare heading.
-            ForEach(face.sections.filter { !$0.rows.isEmpty || $0.footer?.isEmpty == false }) { section in
-                FaceSectionView(section: section, open: open, act: act)
+        #if os(macOS)
+        ScrollViewReader { reader in
+            pageContent.onChange(of: focus) { _, next in
+                if let item = next?.item { reader.scrollTo(item) }
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-struct FaceSectionView: View {
-    let section: PartFace.Section
-    let open: (String) -> Void
-    let act: (String, String, String?) -> Void
-    /// A pill that is a destructive action asks once, as every destructive face action does.
-    @State private var confirming: PartFace.Row?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.eyebrowGap) {
-            if let title = section.title, !title.isEmpty {
-                Text(title.uppercased()).font(.caption.weight(.semibold)).tracking(0.6).foregroundStyle(.secondary)
-            }
-            content
-            if let footer = section.footer, !footer.isEmpty { Text(footer).font(.footnote).foregroundStyle(.secondary) }
+        #else
+        if inList, face.sections.contains(where: { $0.filter != nil }) {
+            pageContent.searchable(text: Binding(get: { session.filter }, set: { session.filter = $0 }))
         }
+        else { pageContent }
+        #endif
     }
 
-    @ViewBuilder private var content: some View {
-        switch section.style ?? .list {
-        case .flow:
-            FaceFlow(spacing: NativeAgentSpacing.sm) {
-                // A pill leads where its row opens, or is the button of its row's one action.
-                ForEach(section.rows) { row in
-                    Button {
-                        if let link = row.open { open(link) } else if let action = row.actions?.first {
-                            if action.role == .destructive { confirming = row } else { act(row.id, action.id, nil) }
-                        }
-                    } label: {
-                        Text(row.title).font(.callout).lineLimit(1).padding(.horizontal, NativeAgentSpacing.md).padding(.vertical, NativeAgentSpacing.xs + 2)
-                            .background(Capsule().fill(.quaternary))
-                    }
-                    .buttonStyle(.plain).disabled(row.open == nil && row.actions?.count != 1)
-                }
-            }
-            .confirmationDialog(confirming.flatMap { $0.actions?.first?.label }.map { $0 + " — " + (confirming?.title ?? "") } ?? "",
-                                isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }), titleVisibility: .visible) {
-                if let row = confirming, let action = row.actions?.first {
-                    Button(action.label, role: .destructive) { act(row.id, action.id, nil); confirming = nil }
-                }
-                Button("Cancel", role: .cancel) { confirming = nil }
-            }
-        case .timeline:
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(section.rows.enumerated()), id: \.element.id) { index, row in
-                    HStack(alignment: .top, spacing: NativeAgentSpacing.md) {
-                        VStack(spacing: 0) {
-                            Circle().fill(FaceTone.color(row.tone)).frame(width: 7, height: 7).padding(.top, 6)
-                            if index < section.rows.count - 1 { Rectangle().fill(.quaternary).frame(width: 1).frame(maxHeight: .infinity) }
-                        }
-                        .frame(width: 7)
-                        FaceRowView(row: row, open: open, act: act).padding(.bottom, NativeAgentSpacing.md)
-                    }
-                }
-            }
-        case .note:
+    private var pageContent: some View {
+        Group {
+            if inList { contents }
+            else { VStack(alignment: .leading, spacing: NativeAgentSpacing.section) { contents } }
+        }
+        .onChange(of: visibleRows) { old, new in reconcile(old: old, new: new) }
+        .onAppear {
+            session.attach(viewer)
+            session.documents.hold(holdsDocuments ? documents : [], by: viewer, door: adapter)
+            holdDemands()
+        }
+        .onChange(of: collectionSources) { _, _ in
+            holdDemands()
+        }
+        .onChange(of: itemDemands) { _, _ in
+            holdDemands()
+        }
+        .onChange(of: holdsDocuments) { _, _ in holdDemands() }
+        .onChange(of: holdsDocuments ? documents : []) { _, demands in
+            session.documents.hold(demands, by: viewer, door: adapter)
+        }
+        .onDisappear {
+            session.documents.release(viewer)
+            session.collections.release(viewer)
+            session.detach(viewer)
+        }
+        .onChange(of: controls) { _, new in
+            if case .control(let item)? = focus, !new.contains(item), visibleRows.contains(item) { focus = .row(item) }
+        }
+        .onChange(of: focus) { _, next in if let item = next?.item { session.selection = item } }
+        #if os(macOS)
+        .background {
+            Button("") { session.showsFilter = true; focus = .filter }
+                .keyboardShortcut("f", modifiers: .command).hidden().accessibilityHidden(true)
+        }
+        #endif
+    }
+
+    private func holdDemands() {
+        session.collections.hold(holdsDocuments ? collectionSources : [], items: holdsDocuments ? itemDemands : [],
+                                 by: viewer, door: adapter, anchor: session.scrollAnchor?.row, itemDoor: itemDoor)
+    }
+
+    @ViewBuilder private var contents: some View {
+        if face.title?.isEmpty == false || face.line?.isEmpty == false {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                ForEach(section.rows) { row in
-                    Text([row.title, row.detail ?? ""].filter { !$0.isEmpty }.joined(separator: " — ")).font(.callout).foregroundStyle(.secondary)
-                }
+                if let title = face.title, !title.isEmpty { Text(title).font(.largeTitle.weight(.semibold)) }
+                if let line = face.line, !line.isEmpty { Text(line).font(.title3).foregroundStyle(.secondary) }
             }
-        case .waiting:
-            HStack(alignment: .top, spacing: NativeAgentSpacing.md) {
-                ProgressView().controlSize(.small)
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                    ForEach(section.rows) { row in Text(row.title).font(.body) }
-                }
-            }
-            .padding(NativeAgentSpacing.lg).frame(maxWidth: .infinity, alignment: .leading).faceCard()
-        case .list, .values:
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(section.rows.enumerated()), id: \.element.id) { index, row in
-                    if index > 0 { Divider() }
-                    FaceRowView(row: row, open: open, act: act, valueRow: section.style == .values)
-                        .padding(.horizontal, NativeAgentSpacing.lg).padding(.vertical, NativeAgentSpacing.rowInsetV)
-                }
-            }
-            .faceCard()
         }
+        if session.showsFilter || face.sections.contains(where: { $0.filter != nil }) {
+            TextField(face.sections.compactMap(\.filter).first ?? "Filter", text: Binding(get: { session.filter }, set: { session.filter = $0 }))
+                .textFieldStyle(.roundedBorder).focused($focus, equals: .filter)
+                .accessibilityLabel(Text("Filter"))
+                .onKeyPress(.escape) { session.showsFilter = false; session.filter = ""; return .handled }
+        }
+        sectionViews(shown(levers, scope: "levers"))
+        if let words, !words.isEmpty { Text(words).foregroundStyle(.secondary).textSelection(.enabled) }
+        sectionViews(shown(keyed, scope: "keyed"))
+        sectionViews(shown(face.sections, scope: "face"))
     }
-}
 
-struct FaceRowView: View {
-    let row: PartFace.Row
-    let open: (String) -> Void
-    let act: (String, String, String?) -> Void
-    var valueRow = false
-    /// A destructive action asks once before its owner is asked; so does a control that names its question.
-    @State private var confirming: PartFace.Action?
-    @State private var pendingSet: String?
-    @State private var draft: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-            HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
-                if let symbol = row.symbol, !symbol.isEmpty {
-                    Image(systemName: symbol).foregroundStyle(FaceTone.color(row.tone)).frame(width: 18)
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
-                        if let at = row.at, let time = FaceTime.short(at) {
-                            Text(time).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
-                        }
-                        Text(row.title).font(valueRow ? .body : .body.weight(.medium))
-                            .foregroundStyle(row.tone == .quiet ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
-                    }
-                    if let detail = row.detail, !detail.isEmpty {
-                        // A row that asks for an answer (attention, with its answers) shows all of what is being decided; other rows stay short.
-                        Text(detail).font(.callout).foregroundStyle(.secondary)
-                            .lineLimit(row.tone == .attention && row.actions?.isEmpty == false ? nil : 4)
-                    }
-                }
-                Spacer(minLength: NativeAgentSpacing.sm)
-                trailing
-            }
-            .modifier(FaceRowOpens(link: row.open, ownsTaps: row.actions?.isEmpty == false || row.control != nil, open: open))
-            if let actions = row.actions, !actions.isEmpty {
-                HStack(spacing: NativeAgentSpacing.sm) {
-                    ForEach(actions) { action in
-                        Button(action.label) {
-                            if action.role == .destructive { confirming = action } else { act(row.id, action.id, nil) }
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(action.role == .destructive ? .red : action.role == .primary ? .accentColor : nil)
-                    }
-                }
-                .confirmationDialog(confirming.map { $0.label + " — " + row.title } ?? "", isPresented: Binding(
-                    get: { confirming != nil }, set: { if !$0 { confirming = nil } }), titleVisibility: .visible) {
-                    if let action = confirming {
-                        Button(action.label, role: .destructive) { act(row.id, action.id, nil); confirming = nil }
-                    }
-                    Button("Cancel", role: .cancel) { confirming = nil }
-                }
-            }
+    private func sectionViews(_ sections: [PartFace.Section]) -> some View {
+        ForEach(sections) { section in
+            FaceSectionView(section: filtered(section), door: adapter, session: session, focus: $focus, move: move, leaf: leaf,
+                            collection: collectionSources.first { section.id == "face:" + $0.id
+                                || section.id == "keyed:" + $0.id || section.id == "levers:" + $0.id })
         }
     }
 
-    @ViewBuilder private var trailing: some View {
-        if let control = row.control {
-            if let text = control.text {
-                TextField(control.placeholder ?? "", text: Binding(get: { draft ?? text }, set: { draft = $0 }))
-                    .textFieldStyle(.roundedBorder).frame(minWidth: 160, maxWidth: 280)
-                    .onSubmit { act(row.id, "set", draft ?? text); draft = nil }
-            } else if let on = control.on {
-                Toggle("", isOn: Binding(get: { on }, set: { set($0 ? "on" : "off", control) })).labelsHidden().toggleStyle(.switch).tint(.accentColor)
-                    .modifier(FaceSetConfirmation(question: control.confirm, pending: $pendingSet) { act(row.id, "set", $0) })
-            } else if let options = control.options {
-                Picker("", selection: Binding(get: { control.selected ?? "" }, set: { set($0, control) })) {
-                    ForEach(options) { Text($0.label).tag($0.id) }
-                }
-                .labelsHidden().fixedSize()
-                .modifier(FaceSetConfirmation(question: control.confirm, pending: $pendingSet) { act(row.id, "set", $0) })
-            }
-        } else if let value = row.value, !value.isEmpty {
-            Text(value).font(.callout.monospacedDigit()).foregroundStyle(row.tone.map(FaceTone.color) ?? .secondary)
-        } else if row.open != nil {
-            Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
-        }
+    private func move(_ item: FaceItemID, _ direction: Int) {
+        let rows = visibleRows
+        guard !rows.isEmpty else { return }
+        let index = rows.firstIndex(of: item)
+        let next = index.map { min(max($0 + direction, 0), rows.count - 1) } ?? 0
+        if let item = rows.dropFirst(next).first { focus = .row(item) }
     }
-}
 
-/// A row with a link opens it when tapped anywhere; a row without one takes no tap, so its switch or choice keeps every touch. A linked
-/// row that holds its own buttons or control opens on a tap beside them, never as one button that would swallow theirs.
-struct FaceRowOpens: ViewModifier {
-    let link: String?
-    let ownsTaps: Bool
-    let open: (String) -> Void
-
-    func body(content: Content) -> some View {
-        if let link, ownsTaps {
-            content.contentShape(Rectangle()).onTapGesture { open(link) }
-        } else if let link {
-            // One button for the whole row: a tap anywhere opens it, and VoiceOver reads it as one.
-            Button { open(link) } label: { content.contentShape(Rectangle()) }.buttonStyle(.plain)
-        } else {
-            content
-        }
-    }
-}
-
-extension FaceRowView {
-    func set(_ value: String, _ control: PartFace.Control) {
-        if control.confirm?.isEmpty == false { pendingSet = value } else { act(row.id, "set", value) }
-    }
-}
-
-/// A control's change waits for the person's yes when the control names a question.
-struct FaceSetConfirmation: ViewModifier {
-    let question: String?
-    @Binding var pending: String?
-    let send: (String) -> Void
-
-    func body(content: Content) -> some View {
-        content.confirmationDialog(question ?? "", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }),
-                                   titleVisibility: .visible) {
-            Button("Change") { if let value = pending { send(value) }; pending = nil }
-            Button("Cancel", role: .cancel) { pending = nil }
+    private func reconcile(old: [FaceItemID], new: [FaceItemID]) {
+        guard let selected = session.selection, !new.contains(selected) else { return }
+        let index = old.firstIndex(of: selected) ?? 0
+        let next = old.dropFirst(index + 1).first { new.contains($0) } ?? new.first
+        session.selection = next
+        if focus?.item == selected { focus = next.map(FaceFocus.row) }
+        if let next, let title = sections.first(where: { $0.id == next.section })?.rows.first(where: { $0.id == next.row })?.title {
+            AccessibilityNotification.Announcement(title).post()
         }
     }
 }
@@ -241,7 +243,6 @@ enum FaceTone {
 }
 
 enum FaceTime {
-    /// A time today reads as its clock time; an older one as its day.
     static func short(_ iso: String) -> String? {
         guard let date = UserDisplayFormatters.parseISOTimestamp(iso) else { return nil }
         return Calendar.current.isDateInToday(date) ? date.formatted(date: .omitted, time: .shortened)
@@ -249,14 +250,7 @@ enum FaceTime {
     }
 }
 
-extension View {
-    func faceCard() -> some View {
-        background(RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous).fill(.background.secondary))
-            .overlay(RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous).strokeBorder(.quaternary))
-    }
-}
-
-/// Pills that wrap to the next line when the row is full.
+/// Pills wrap without exceeding their proposed width.
 struct FaceFlow: Layout {
     var spacing: CGFloat
 
@@ -281,7 +275,6 @@ struct FaceFlow: Layout {
         }
     }
 
-    /// A row never runs past the line: one wider than the line is given the line's width, where its words end in an ellipsis.
     private static func size(of view: LayoutSubview, within width: CGFloat) -> CGSize {
         let ideal = view.sizeThatFits(.unspecified)
         return ideal.width <= width ? ideal : view.sizeThatFits(ProposedViewSize(width: width, height: nil))

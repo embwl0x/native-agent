@@ -106,7 +106,7 @@ extension SwiftNativeProviderRouting {
                 Non-shipped catalogs may be incomplete; creation validates the chosen route. No account or model setting changed.
                 """)])
     }
-    public func configureProvider(id: String, config: JSONValue) async throws -> Provider {
+    public func configureProvider(id: String, config: JSONValue, expectedRevision: String? = nil) async throws -> Provider {
         guard case .object(let body) = config else {
             throw ProviderRoutingError.invalidRequest
         }
@@ -118,7 +118,11 @@ extension SwiftNativeProviderRouting {
         let path = providersDir.appendingPathComponent("\(id).json")
         try FileManager.default.createDirectory(at: providersDir, withIntermediateDirectories: true)
         try await SwiftNativePersistenceCore.withFileLock(path) {
-            _ = try ProviderStateValidation.dataIfPresent(at: path)
+            let current = try ProviderStateValidation.dataIfPresent(at: path)
+            if let expectedRevision, Self.providerConfigurationRevision(current) != expectedRevision {
+                throw WireFailure(code: "provider_conflict", message: "This account changed while editing. Read the account and apply the edit again.",
+                    cause: nil, effects: .none)
+            }
             if id == "xai_oauth_direct" { _ = try XAIOAuthCredentialStore.read(at: path) }
             var entry = try Self.loadProviderStateObjectChecked(
                 at: path,
@@ -195,9 +199,9 @@ extension SwiftNativeProviderRouting {
         // Credential changes refresh authenticated discovery without changing save success; catalog failure remains owned by its cache.
         switch id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "moonshot":
-            _ = await MoonshotModelCatalog.models(dataRoot: dataRoot, refresh: true)
+            _ = await MoonshotModelCatalog.modelsWithFreshness(dataRoot: dataRoot, refresh: true)
         case "openrouter":
-            _ = await OpenRouterModelCatalog.models(dataRoot: dataRoot, refresh: true)
+            _ = await OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot, refresh: true)
         default:
             break
         }
@@ -233,7 +237,9 @@ extension SwiftNativeProviderRouting {
         model: String? = nil,
         reasoningEffort: String? = nil,
         serviceTier: String? = nil,
-        clearOverride: Bool = false
+        clearOverride: Bool = false,
+        expectedRevision: Double? = nil,
+        expectedChatChoice: ProviderTurnChoice? = nil
     ) async throws -> ProviderGroupWriteResult {
         guard ProviderSurfaceGroups.all.contains(group)
             || (group.surfaces.count == 1 && MODEL_SURFACES.contains(group.surfaces[0])) else {
@@ -246,7 +252,8 @@ extension SwiftNativeProviderRouting {
             // Effort/tier-only writes must not pin inherited model/account or other controls.
             seedMissingControls: model != nil || providerID != nil,
             reconcilePinnedModelWithProvider: model == nil && !clearOverride,
-            clearOverride: clearOverride
+            clearOverride: clearOverride,
+            expectedRevision: expectedRevision, expectedChatChoice: expectedChatChoice
         )
     }
     public func saveSurfaceConfiguration(
@@ -279,7 +286,9 @@ extension SwiftNativeProviderRouting {
         reconcilePinnedModelWithProvider: Bool = false,
         clearOverride: Bool = false,
         adoptingConnectedProvider: Bool = false,
-        selectionValidator: (@Sendable (String, String) throws -> Void)? = nil
+        selectionValidator: (@Sendable (String, String) throws -> Void)? = nil,
+        expectedRevision: Double? = nil,
+        expectedChatChoice: ProviderTurnChoice? = nil
     ) async throws -> ProviderGroupWriteResult {
         guard !surfaces.isEmpty, surfaces.allSatisfy(MODEL_SURFACES.contains),
               !clearOverride || !surfaces.contains("chat") else { throw ProviderRoutingError.invalidRequest }
@@ -307,6 +316,19 @@ extension SwiftNativeProviderRouting {
         let transactionPath = surfaceTransactionPath
         return try await SwiftNativePersistenceCore.withFileLock(transactionPath) {
             try await self.reconcilePendingSurfaceConfigurationLocked()
+            if let expectedRevision {
+                let state = try self.checkedPickerStateLocked()
+                let snapshot = try await self.selectionRoutingSnapshot(
+                    surfaces: state.surfaces, active: state.active, revision: state.revision, preview: false)
+                let choice: ProviderTurnChoice?
+                if let preference = snapshot.preferences["chat"], let provider = snapshot.activeProviders["chat"] {
+                    choice = .init(provider: provider, model: preference.model, reasoningEffort: preference.reasoningEffort,
+                                   fast: preference.serviceTier == "priority")
+                } else { choice = nil }
+                guard state.revision == expectedRevision, choice == expectedChatChoice else {
+                    throw ProviderRoutingError.configurationFailed("The Chat choice changed while editing. Read Providers and choose again.")
+                }
+            }
             let originalSurfaces = try Self.loadProviderStateObjectChecked(
                 at: self.surfacesPath,
                 description: "surface preference"
@@ -523,13 +545,6 @@ extension SwiftNativeProviderRouting {
             surfaces: surfaces, activeProviders: active,
             soleConnectedRoute: soleConnectedProviderID(cache: cache),
             configCache: cache, revision: revision, preview: preview
-        )
-    }
-    /// Clear model/account and effort/tier together so inherited routing stays coherent.
-    public func clearSurfaceOverride(surface: String) async throws {
-        try await saveSurfaceConfiguration(
-            surface: surface, model: nil, reasoningEffort: nil,
-            serviceTier: nil, providerId: nil, clearOverride: true
         )
     }
     public func setActiveProvider(surface: String, providerId: String) async throws {

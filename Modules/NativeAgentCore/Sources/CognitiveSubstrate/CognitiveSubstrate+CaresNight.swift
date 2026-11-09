@@ -93,7 +93,7 @@ extension CognitiveSubstrate {
         if carePeopleReadFailure != nil { await refreshCarePeople() }
         let generation = caringAppraisalGeneration
         let candidates = cares.values.filter { $0.fadedAt == nil }
-        // The same warm embedder and exact-text cache as careTouched; never load a second model for night. Cold or unreadable evidence stays owed.
+        // The same warm embedder and exact-text cache as careTouch; never load a second model for night. Cold or unreadable evidence stays owed.
         let vectors: [UUID: [Float]]
         do {
             if let first = candidates.first {
@@ -177,9 +177,9 @@ extension CognitiveSubstrate {
                 cluster. Omit keep to retain its oldest care. Leave merge out when they are different things.
                 """)
         }
-        let pressured = live.filter { Self.careStancePressure($0).count >= 2 }
+        let pressured = live.filter { !Self.careStancePressure($0).isEmpty }
             .sorted { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id.uuidString < $1.id.uuidString }
-        for care in pressured where Self.careStanceHasDays(Self.careStancePressure(care), depth: care.depth) {
+        for care in pressured {
             _ = key(care)
             lines.append("--- STANCE PRESSURE: \(care.id.uuidString): \(care.about) | held: \(care.stance?.text ?? "") ---")
             for (index, entry) in Self.careStancePressure(care).enumerated() {
@@ -191,8 +191,8 @@ extension CognitiveSubstrate {
             }
             lines.append("""
                 If entries point the same way and you confirm changing this stance, add \"stance_changes\": [{\"care\": \"<UUID>\", \"pressure\": [<entry \
-                numbers pointing the same way>], \"stance\": {\"text\": \"...\", \"because\": \"...\", \"unless\": \"...\"}}]. Evidence needs 2 distinct days, \
-                or for life 3 days spanning 14 days. Otherwise hold your stance. Leave the key out when nothing changes.
+                numbers pointing the same way>], \"stance\": {\"text\": \"...\", \"because\": \"...\", \"unless\": \"...\"}}]. Judge the lived evidence, \
+                not its age or repetition count. Leave the key out when nothing changes.
                 """)
         }
         let selfMaterial = selfNightMaterial(keys: &keys, live: Array(live))
@@ -239,8 +239,7 @@ extension CognitiveSubstrate {
             while let next = Self.careEarnedDepth(care.depth, days: moved.count, span: span) {
                 care.record(CognitiveCare.Moment(
                     at: now, moved: 0, by: .her, felt: "deepened", note: "now part of my \(next.rawValue)",
-                    source: night.source, depthChange: .init(from: care.depth, to: next)))
-                care.depth = next
+                    source: night.source, depthChange: .init(from: care.depth, to: next))) { $0.depth = next }
                 deeper = true
                 deepened += 1
             }
@@ -264,6 +263,7 @@ extension CognitiveSubstrate {
         // The agent's reading refers to the exact stories shown before this pass; tonight's new depth/stance entries become material for the agent's next
         // night.
         try await settleSelfKnowledge(night, at: now)
+        try await settleLivedSelf(changed, at: now)
         await recordReceipt(kind: "cares.night", payload: .object([
             "source": .string(night.source),
             "settled": .int(Int64(settled)), "letGo": .int(Int64(letGo)),
@@ -314,8 +314,7 @@ extension CognitiveSubstrate {
         }
         care.record(CognitiveCare.Moment(
             at: now, moved: 0, by: .her, felt: "deepened", note: "now part of my life",
-            source: source, depthChange: .init(from: care.depth, to: .life)))
-        care.depth = .life
+            source: source, depthChange: .init(from: care.depth, to: .life))) { $0.depth = .life }
         care.fadedAt = nil
         cares[id] = care
         markDirty(at: now)
@@ -331,6 +330,8 @@ extension CognitiveSubstrate {
                 let date = NativeTimestampFormat.calendarDay(moment.at)
                 if let change = moment.depthChange {
                     lines.append((moment.at, "\(date): \(care.about) became part of my \(change.to.rawValue)"))
+                } else if moment.stanceChange != nil {
+                    lines.append((moment.at, "\(date): \(moment.note)"))
                 } else if moment.source.hasPrefix("dream_diary/"), moment.felt == "settled" {
                     lines.append((moment.at, "\(date): settled: \(care.about), \(moment.note)"))
                 } else if moment.source.hasPrefix("dream_diary/"), moment.felt == "let it go" {

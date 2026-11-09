@@ -144,36 +144,37 @@ extension SwiftNativeMemoryV2 {
     private func fillOwedMemoryVectors() async throws {
         guard let embedder, let disk = storage else { throw MemoryV2Error.storageUnavailable }
         try checkEmbeddingConvergence()
+        var afterRowID: Int64?
         while true {
-            let owed = try await disk.memoriesOwingVectors(limit: 32, epoch: embedder.embeddingEpoch)
+            let owed = try await disk.memoriesOwingVectors(limit: 32, epoch: embedder.embeddingEpoch, afterRowID: afterRowID)
             try checkEmbeddingConvergence()
-            guard !owed.isEmpty else { return }
+            guard let lastRowID = owed.last?.rowID else { return }
             let batch = try await embedder.embedItemsWithEpoch(owed.map(\.content))
             try checkEmbeddingConvergence()
             guard batch.items.count == owed.count else {
                 throw MemoryV2Error.underlying("embedder returned \(batch.items.count)/\(owed.count) owed outcomes")
             }
-            var moved = 0
             for (row, item) in zip(owed, batch.items) {
                 switch item {
                 case .unembeddable(let reason):
                     if try await disk.recordUnembeddable(MemoryEmbeddingCorpusRow(kind: .memory, id: row.id, content: row.content), epoch: batch.epoch,
                         reason: reason) {
                         nativeLog("[memory-epoch] unembeddable memory %@: %@", row.id, reason)
-                        moved += 1
                     }
                     try checkEmbeddingConvergence()
                 case .vector(let vector):
                     try VectorMath.requireUsable(vector, dimensions: embedder.dimensions)
                     let outcome = try await disk.landOwedVector(id: row.id, content: row.content, vector: vector, epoch: batch.epoch)
                     try checkEmbeddingConvergence()
-                    if case .archived(let reason) = outcome { nativeLog("[memory-epoch] archived %@: %@", row.id, reason) }
-                    if case .superseded = outcome { continue }
-                    moved += 1
+                    switch outcome {
+                    case .landed, .superseded: break
+                    case .archived(let reason): nativeLog("[memory-epoch] archived %@: %@", row.id, reason)
+                    case .unreadable(let reason): nativeLog("[memory-epoch] unreadable owed memory %@: %@", row.id, reason)
+                    }
                 }
             }
-            // Newer writes own unchanged rows and request their own fills.
-            guard moved > 0 else { return }
+            // Visit every row once this pass, including beyond a full unreadable batch. Newer writes request their own fills.
+            afterRowID = lastRowID
         }
     }
 

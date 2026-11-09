@@ -3,16 +3,14 @@ import PersistenceCore
 import os
 // Blueprint: | `AgentJob.swift` | `AgentJob` record, `AgentJobStore` (agents/jobs.json), the `JobRunner` door contract, its refusing stub, `OwnLineRunner` |
 
-/// A piece of the agent's work another whole agent does, or a line of its own. Another agent lives as the agent's organ for the job's length: the agent's
-/// commission wakes it, its envelope bounds it, and what it makes comes back as the agent's; the organ brings its own model and sign-in. The agent's own line
-/// is a turn of the agent's in its own work conversation under the agent's own Trust. Nothing here names, picks or changes a model.
+/// A commission for another agent or the agent's own line, bounded by its envelope and settled with its deliverables and required check.
 public struct AgentJob: Codable, Sendable, Equatable {
     public enum State: String, Codable, Sendable {
         case working
         case needsYou = "needs_you"
         /// The check ran and passed.
         case done
-        /// A deliverable came back with no check set, or with a check that could not run: never `done`.
+        /// A deliverable came back with no check set.
         case delivered
         case failed
         case stopped
@@ -259,8 +257,9 @@ public struct JobDeliverable: Sendable {
     public let artifacts: [URL]
     public let report: String?
     public let model: String?
-    public init(artifacts: [URL], report: String? = nil, model: String? = nil) {
-        self.artifacts = artifacts; self.report = report; self.model = model
+    public let inventoryFailure: String?
+    public init(artifacts: [URL], report: String? = nil, model: String? = nil, inventoryFailure: String? = nil) {
+        self.artifacts = artifacts; self.report = report; self.model = model; self.inventoryFailure = inventoryFailure
     }
 }
 

@@ -1,10 +1,10 @@
 import AuthoredCapabilities
 import AgentWorkspace
 import ChatToolParsing
+import ChatToolRuntime
 import ChatTurnContracts
 import Experiences
 import ChatSessionWork
-import Desk
 import ToolRegistry
 import Foundation
 import CryptoKit
@@ -32,7 +32,7 @@ extension SwiftNativeTurnEngine {
         toolSessionId: String? = nil,
         runId: String? = nil,
         llm: any LLMClient,
-        tools: any ToolDispatchClient,
+        tools: any ExpansionToolDispatchClient,
         preBuiltContext: TurnContext,
         progress: ToolProgress? = nil,
         onDelivery: (@Sendable () async -> Void)? = nil,
@@ -42,7 +42,8 @@ extension SwiftNativeTurnEngine {
         providerAdmission: (@Sendable () async throws -> Void)? = nil,
         turn: Turn, work: ChatTurnWork, call: LLMCall
     ) async throws -> TurnEngineResult {
-        return try await holding(turn.with(\.userText, userMessage)) { turn in
+        let partRounds = AbilityRounds()
+        return try await holding(turn.with(\.userText, userMessage).with(\.abilityRounds, partRounds)) { turn in
         try await holding(work.with(\.senseReads, work.senseReads ?? SenseTurnReads())) { work in
         // Prepared document text and image-only turns need no caption.
         if preBuiltContext.userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -53,6 +54,7 @@ extension SwiftNativeTurnEngine {
             sessionId: toolSessionId ?? sessionId,
             turnId: turn.id
         )
+        let turn = turn.with(\.resultRecoveryScope, recoveryScope)
         var cleanFinish = false
         defer {
             if cleanFinish || Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath), let recoveryScope {
@@ -81,7 +83,7 @@ extension SwiftNativeTurnEngine {
                 case .readOnly: posture = "safe"
                 }
             } catch { posture = "unreadable: " + error.localizedDescription }
-            try await part.deliver([.object([
+            var message: [String: JSONValue] = [
                 "type": .string("message"), "text": .string(gathered.userMessage), "surface": .string(surface),
                 "door": .string(turn.arrivalSurface(authorizing: surface)),
                 "attachments": .array(gathered.imageBlocks.compactMap {
@@ -92,10 +94,17 @@ extension SwiftNativeTurnEngine {
                 "trust": .string(turn.peerSteering?.isTainted == true ? "untrusted" : "trusted"),
                 "steered_by": .array((turn.peerSteering?.checkpointSources ?? []).map(JSONValue.string)),
                 "posture": .string(posture),
-            ])])
+            ]
+            // A thought of the agent's carries what it attends.
+            if let attended = turn.attended { message["attended"] = attended }
+            try await part.deliver([.object(message)])
         } else {
             inFlight = try await part.resume()
         }
+        // The native opening owns whether this is a thought, including on checkpoint replay.
+        let opening = part.log.first?.objectValue?["event"]?.objectValue
+        let call = call.with(\.allowsSilentCompletion, call.allowsSilentCompletion
+            || (opening?["type"] == .string("message") && opening?["attended"]?.objectValue != nil))
         try Task.checkCancellation()
         // The agent's program may act or end before it ever draws power; the agent's system arrives with its first model.call.
         var resolvedTurnContext = part.system.map { gathered.composing($0, tools: part.offeredTools) } ?? gathered
@@ -105,11 +114,16 @@ extension SwiftNativeTurnEngine {
         // Steered messages reach the queue owner as delivered at the same
         // moment instructions do: the round carrying them produced output.
         var steeringOffers: [ChatTurnSteering.Offer] = []
-        var arrivedItems: [ResidentWake.Item] = []
+        var replayedArrivals: Set<String> = []
+        if restarted != nil, let sessionId {
+            replayedArrivals = Set(try part.arrivalIDs().keys)
+            await ChatTurnSteering.shared.restoreReadings(replayedArrivals, sessionId: sessionId)
+        }
         var agentNow = resolvedTurnContext.agentNow
         var lastBreath: String?
-        var breathActs: Set<String> = []
+        var breathActs = resolvedTurnContext.recentLifeActs
         var contextDeliveryOwed = true
+        var cognitiveContextDelivered = false
         var commitPartsDelivery = resolvedTurnContext.partsDelivery
         var cameToMindHeld: Set<ContextAtomID> = []
         func commitDelivery() async throws {
@@ -121,18 +135,21 @@ extension SwiftNativeTurnEngine {
             commitInstructionDelivery = nil
             if contextDeliveryOwed {
                 contextDeliveryOwed = false
+                cognitiveContextDelivered = resolvedTurnContext.cognitiveRuntimeContext
+                    .map { Self.deliveredInput(resolvedTurnContext).contains($0) } == true
                 await resolvedTurnContext.fluidContextTurn?.recordDelivery()
                 await onDelivery?()
                 creditDeliveredMemories(resolvedTurnContext)
                 await announceDeliveredArrivals(in: resolvedTurnContext, sessionID: sessionId)
             }
-            if let root = remPinsDataRoot, !arrivedItems.isEmpty {
-                guard ResidentWake.shared.accept(dataRoot: root, items: arrivedItems) else {
-                    throw ChatOrchestrationError.underlying("Arrival acceptance could not be saved; it remains owed.")
+            guard let sessionId else { return }
+            if !replayedArrivals.isEmpty {
+                guard await ChatTurnSteering.shared.markReplayedDelivered(replayedArrivals, sessionId: sessionId) else {
+                    throw ChatOrchestrationError.underlying("Couldn't commit replayed arrival delivery; its reading remains owed.")
                 }
-                arrivedItems = []
+                replayedArrivals = []
             }
-            guard let sessionId, !steeringOffers.isEmpty else { return }
+            guard !steeringOffers.isEmpty else { return }
             let offers = steeringOffers
             steeringOffers = []
             guard await ChatTurnSteering.shared.markDelivered(offers, sessionId: sessionId) else {
@@ -176,6 +193,16 @@ extension SwiftNativeTurnEngine {
                 telemetry: prefixTelemetry, sink: prefixSink, surface: surface, sessionId: sessionId, runId: runId,
                 userMessageID: replacementUserMessageID, dataRoot: remPinsDataRoot, turn: turn)
         }
+        func settlePartRounds() {
+            do {
+                let store = AbilityStore(dataRoot: remPinsDataRoot ?? defaultDataRoot())
+                for (version, rounds) in try partRounds.take().sorted(by: { ($0.key.id, $0.key.key) < ($1.key.id, $1.key.key) }) {
+                    // The rounds ledger owns repair for its own failed writes; one version's failure does not discard its siblings.
+                    do { try store.recordRounds(id: version.id, version: version.key, rounds: rounds, turn: turn) }
+                    catch { nativeLog("The agent's part %@'s rounds were not recorded: %@", version.id, error.localizedDescription) }
+                }
+            } catch { nativeLog("This turn's ability rounds were not recorded: %@", error.localizedDescription) }
+        }
         do {
         dispatchTrace.setFlag("bookkeepingParallel", true)
         let preparedDispatchTrace = dispatchTrace
@@ -192,15 +219,6 @@ extension SwiftNativeTurnEngine {
                                         observedBy: "transport.dispatch", flags: ["initialRequest": true], turn: turn)
         }
         var conversation: [LLMMessage] = prefixSeed.messages
-        if let root = remPinsDataRoot, let sessionId, try !SessionConversation.checkedIsHelper(sessionId, dataRoot: root),
-           turn.peerSteering?.isTainted != true, [nil, "self"].contains(turn.envelope?.agent) {
-            let moments = try PrimedMoments.take(dataRoot: root)
-            if !moments.isEmpty, let primed = await primedSinceLastTurn(
-                moments, preparedTurn: resolvedTurnContext.fluidContextTurn, turn: turn, held: &cameToMindHeld,
-                sessionId: sessionId, surface: surface) {
-                Self.appendStructuredUserNudge(primed, to: &conversation)
-            }
-        }
         let turnBudget = try ContextBudgetPolicy.resolve(turn: turn, dataRoot: remPinsDataRoot)
         guard let turnWindowTokens = turnBudget.windowTokens else {
             throw ProviderRoutingError.configurationFailed("The admitted model's default window is unavailable.")
@@ -210,18 +228,17 @@ extension SwiftNativeTurnEngine {
         var previousRoundFailed = false
         // Account for the whole turn's model tokens, part rounds and longest repeated call stretch.
         let spent = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Spend())
-        var partRounds: [String: Int] = [:]
         var repeated = (calls: [JSONValue](), call: "", count: 0), longest = (call: "", count: 0)
         // The familiarity nerve fires at most once a turn, and never on a route this turn already met.
         var practiceChecked: Set<String> = [], practiceNoted = false
         func observed(_ result: TurnEngineResult, reason: TurnEngineResult.TerminalReason) -> TurnEngineResult {
             cleanFinish = reason == .replyCompleted || reason == .incomplete
-            return result.observingTerminal(reason: reason, counters: counters)
+            return result.observingTerminal(reason: reason, counters: counters, cognitiveContextDelivered: cognitiveContextDelivered)
         }
         var visibleText = ""
         defer { turn.observation?.record(counters, dispatches: dispatches, reply: visibleText) }
-        var turnInterstitialProse = ""
-        var retainedAnswerProse = ""
+        var retainedProse = ""
+        var workingCommentaryCharacters = 0
         var emittedProviderFirstDelta = false
         var providerCallCount = 0
         var openingAdditionalCharacters = 0
@@ -279,17 +296,20 @@ extension SwiftNativeTurnEngine {
                 if case .success(let file) = await SwiftNativeSecurityCenter.fencedAttachment(
                     path, dataRoot: remPinsDataRoot ?? defaultDataRoot(), turn: turn) { turn.replyChoices?.choose(file.path) }
             }
-            guard let user = rows.first(where: { $0.role == "user" }) else {
+            let replayRows: [ChatMessage]
+            if restarted.hiddenInput != nil {
+                // Its checkpoint owns the input; only receipts belong in transcript replay.
+                replayRows = receipts
+            } else if let user = rows.first(where: { $0.role == "user" }) {
+                replayRows = [user] + receipts
+            } else {
                 throw ChatOrchestrationError.underlying("The resumed turn's saved user message is missing; repair its transcript.")
             }
-            let replay = SessionHistoryMessages.project(messages: [user] + receipts,
+            let replay = SessionHistoryMessages.project(messages: replayRows,
                 historyLimit: max(1, receipts.count + 1), budget: turnBudget)
             visibleText = restarted.keptProse
-            // Preserve the joined receipt count as the offset for subsequent calls.
-            let commentaryCharacters = max(0, restarted.workingCommentaryCharacters)
-            turnInterstitialProse = Self.joinedProse(String(restarted.keptProse.prefix(commentaryCharacters)), "")
-            retainedAnswerProse = String(restarted.keptProse.dropFirst(commentaryCharacters))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            retainedProse = restarted.keptProse
+            workingCommentaryCharacters = min(max(0, restarted.workingCommentaryCharacters), retainedProse.count)
             let resumed = TurnObservation.Kind.restarted(stepsDone: receipts.count,
                 unknownStep: restarted.runningStep == nil ? nil : receipts.count + 1,
                 started: part.uncertain.map { call in
@@ -304,6 +324,7 @@ extension SwiftNativeTurnEngine {
                 return nil
             }.joined(separator: "\n\n")
             Self.appendStructuredUserNudge(receiptText, to: &conversation)
+            for reading in try part.arrivalReadings() { ConversationPrefixSeeding.appendUser(reading, to: &conversation) }
             if !visibleText.isEmpty { await progress?(.delta(visibleText)) }
             if !part.answered.isEmpty { await progress?(.delta(part.answered)) }
             if inFlight {
@@ -321,18 +342,67 @@ extension SwiftNativeTurnEngine {
                 underlying: CancellationError())
         }
 
+        /// Persistence and eligibility stay with steering; the turn log retains each reading for relaunch.
+        func readArrivals(keeping prose: String = "") async throws -> Bool {
+            guard let sessionId, !sessionId.isEmpty else { return false }
+            let offers = try await ChatTurnSteering.shared.drain(sessionId: sessionId, cancelFlagPath: cancelFlagPath)
+            if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { throw stopCarryingPartial() }
+            steeringOffers += offers
+            if !offers.isEmpty, !prose.isEmpty { conversation.append(.assistantText(prose)) }
+            for offer in offers {
+                try part.readArrival(offer)
+                ConversationPrefixSeeding.appendUser(offer.reading, to: &conversation)
+            }
+            return !offers.isEmpty
+        }
+
         /// The stem applies or records observations; the agent's part decides how to go on.
-        func observe(_ kind: TurnObservation.Kind, kept: String = "", applying: Bool = true) async throws {
+        func observe(_ kind: TurnObservation.Kind, kept: String = "", applying: Bool = true, unstarted: [ParsedToolCall] = []) async throws {
             if applying { TurnObservation.apply(kind, kept: kept, to: &conversation, surface: surface, turn: turn) }
             else { TurnObservation.record(kind, kept: kept, surface: surface, turn: turn) }
-            try await part.deliver([.object(["type": .string("observation"), "text": .string(TurnObservation.text(kind))])])
+            var text = TurnObservation.text(kind)
+            if !unstarted.isEmpty {
+                let note = "These proposed calls did not start: " + unstarted.map { $0.name + " (" + $0.id + ")" }.joined(separator: ", ")
+                    + ". Read the person's message before deciding what to do next."
+                if applying { Self.appendStructuredUserNudge(note, to: &conversation) }
+                text += " " + note
+                TurnTraceBus.fireFromContext(kind: "turn.proposalSkipped", surface: surface, payload: .object([
+                    "reason": .string("person_arrival"), "calls": .array(unstarted.map {
+                        .object(["id": .string($0.id), "name": .string($0.name)])
+                    }), "effects": .string("none"),
+                ]), turn: turn)
+            }
+            try await part.deliver([.object(["type": .string("observation"), "text": .string(text)])])
+        }
+        /// Keep rounds in their streamed order; commentary can extend only the leading prefix, never pass an answer.
+        func retainProse(_ prose: String, commentary: Bool = false) {
+            let extendsCommentary = commentary && workingCommentaryCharacters == retainedProse.count
+            retainedProse = Self.joinedProse(retainedProse, prose)
+            if extendsCommentary { workingCommentaryCharacters = retainedProse.count }
         }
         /// Every effect boundary checkpoints the turn with its log.
         func capture(startingCalls: Int = 0,turn: Turn,work: ChatTurnWork) async throws {
             await work.checkpoint?.capture(
-                prose: Self.joinedProse(turnInterstitialProse, retainedAnswerProse),
-                commentaryCharacters: turnInterstitialProse.count, conversation: conversation, log: part.log,
+                prose: retainedProse,
+                commentaryCharacters: workingCommentaryCharacters, conversation: conversation, log: part.log,
                 startingCalls: startingCalls, turn: turn)
+            if !steeringOffers.isEmpty || !replayedArrivals.isEmpty {
+                guard work.checkpoint != nil, let root = remPinsDataRoot, let sessionId,
+                      let saved = try TurnCheckpoint.read(dataRoot: root, sessionId: sessionId, turnId: turn.id),
+                      saved.log == part.log, saved.keptProse == retainedProse else {
+                    throw ChatOrchestrationError.underlying(
+                        "Joined arrivals were not checkpointed; their doors retain them. Repair the turn checkpoint before continuing.")
+                }
+                // The reading is durably owned by this checkpoint; another launch must not resume it through its old checkpoint too.
+                for (run, id) in try part.arrivalIDs() {
+                    if let arrival = try TurnCheckpoint.read(dataRoot: root, sessionId: sessionId, turnId: id) {
+                        guard arrival.runId == run else {
+                            throw ChatOrchestrationError.underlying("The arrival checkpoint changed identity; repair its ownership before continuing.")
+                        }
+                        try arrival.remove(dataRoot: root)
+                    }
+                }
+            }
         }
         var round: (calls: [ParsedToolCall], raw: String, codec: TextMarkerCodec?, boundary: LLMToolBoundaryReason?)?
 
@@ -358,9 +428,6 @@ extension SwiftNativeTurnEngine {
                     "work": .string(emitted || ProviderFailure.report(error)?.work == .ranPartly
                         ? ProviderFailure.WorkState.ranPartly.rawValue : ChatTurnFailure.work(for: error)),
                     "owed": .bool(failure.owner != nil && !failure.personDecides),
-                    "retry_now": .bool(ProviderWire.redialDelay(ProviderFailure.classify(error),
-                        attempt: (error as? ProviderFailure.Diagnostic)?.tries ?? 1) != nil),
-                    "tries": .int(Int64((error as? ProviderFailure.Diagnostic)?.tries ?? 1)),
                     "calls": .array(calls.map { .object(["id": .string($0.id), "name": .string($0.name), "input": .object($0.input)]) })])])
             } catch { throw TurnEngineError.streamInterrupted(partial: visibleText, underlying: failure) }
         }
@@ -388,21 +455,19 @@ extension SwiftNativeTurnEngine {
             }
             // A provider failure or outstanding card leaves completion incomplete; text-only routes must also say the card's copy.
             if part.replied {
-                await bookkeeping.value
-                let reply = Self.joinedProse(turnInterstitialProse, Self.joinedProse(retainedAnswerProse, part.answered))
-                let store = AbilityStore(dataRoot: remPinsDataRoot ?? defaultDataRoot())
-                for (id, rounds) in partRounds.sorted(by: { $0.key < $1.key }) {
-                    // The rounds ledger owns repair for its own failed writes.
-                    do { try store.recordRounds(id: id, rounds: rounds, turn: turn) }
-                    catch { nativeLog("The agent's part %@'s rounds were not recorded: %@", id, error.localizedDescription) }
+                if let stopped = turn.providerRecovery?.stopped {
+                    throw TurnEngineError.streamInterrupted(partial: visibleText, underlying: stopped)
                 }
+                await bookkeeping.value
+                let reply = Self.joinedProse(retainedProse, part.answered)
+                settlePartRounds()
                 let waiting = turn.execution.map { $0.waitingInteraction != nil || $0.waitingForApproval } ?? false
                 let completed = await finishReplyTurn(
                     reply: waiting ? ChatTurnExecution.waitingReply(visible: reply, turn: turn) : reply,
                     ctx: ctx, dispatches: dispatches, startNs: startNs,
                     providerCallCount: providerCallCount,
                     userMessage: userMessage, sessionId: sessionId, surface: surface,
-                    workingCommentaryCharacters: turnInterstitialProse.isEmpty ? nil : turnInterstitialProse.count,
+                    workingCommentaryCharacters: workingCommentaryCharacters == 0 ? nil : workingCommentaryCharacters,
                     completionState: providerFailurePending || waiting ? .incomplete : .completed,
                     afterTurn: !work.thinking && (providerFailurePending || part.afterTurn),
                     took: counters.toolRoundCount == 0 ? nil : Self.took(rounds: counters.providerRoundCount, tokens: spent.withLock { $0.total },
@@ -419,6 +484,11 @@ extension SwiftNativeTurnEngine {
                     visibleText += text
                     part.sent(text)
                 }
+                try await capture(turn: turn, work: work)
+                continue
+            case .string("notebook"):
+                // The turn program's notebook: the settings its weigh reads. The effect runs once; a replay matches it by identity.
+                if case .object(let set)? = effect["set"], let root = remPinsDataRoot { try AttentionNotebook.write(set, dataRoot: root) }
                 try await capture(turn: turn, work: work)
                 continue
             case .string("app"):
@@ -455,6 +525,7 @@ extension SwiftNativeTurnEngine {
                     providerCalls: providerCalls,
                     iterationRawText: ran.raw,
                     ctx: ctx, surface: surface, sessionId: toolSessionId ?? sessionId,
+                    arrivalSessionId: sessionId,
                     tools: tools, progress: progress, conversation: &conversation,
                     dispatches: &dispatches, providerTools: providerTools,
                     cancelFlagPath: cancelFlagPath,
@@ -467,11 +538,7 @@ extension SwiftNativeTurnEngine {
                                                    sessionId: sessionId, surface: surface) {
                     Self.appendStructuredUserNudge(reminded, to: &conversation)
                 }
-                for id in Set(dispatches.dropFirst(roundStart).compactMap({ record -> String? in
-                    if let id = ToolNameAliases.authoredTool(record.ranCall.tool) { return id }
-                    guard record.name == "app", case .string(let action)? = record.input["action"] else { return nil }
-                    return ToolNameAliases.authoredTool(action)
-                })) { partRounds[id, default: 0] += 1 }
+                try partRounds.endRound()
                 if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { throw stopCarryingPartial() }
                 // The practice signal rides this round's last result, so the agent's next thought in this turn carries it.
                 var practice: JSONValue?
@@ -530,13 +597,13 @@ extension SwiftNativeTurnEngine {
                 if case .string(let note)? = effect["note"], !note.isEmpty { Self.appendStructuredUserNudge(note, to: &conversation) }
                 if openingReadOwed {
                     openingReadOwed = false
-                    if ctx.toolSchemas.contains(where: { $0.name == "app" }), let expansion = tools as? ExpansionDispatcher {
+                    if ctx.toolSchemas.contains(where: { $0.name == "app" }) {
                         let looked = await holding(turn.admitting(model: .some(ctx.modelId))) { turn in
                         await holding(work.with(\.preparedContext, ctx.fluidContextTurn)) { work in
                         await holding(turn.with(\.runtime, .init(
                             model: ctx.modelId, surface: surface, personaID: ctx.personaID,
                             providerID: ctx.providerId ?? turn.admission?.provider))) { turn in
-                            await expansion.readAhead(surface: surface, session: toolSessionId ?? sessionId, turn: turn, work: work)
+                            await tools.readAhead(surface: surface, session: toolSessionId ?? sessionId, turn: turn, work: work)
                         } } }
                         if let looked {
                             let text = try ChatSecretRedactor.redactValue(looked).serialize(pretty: false)
@@ -560,20 +627,32 @@ extension SwiftNativeTurnEngine {
             /// The provider yielded text or a call this round; set as it arrives, before any cleanup.
             var emitted = false
             var toolBoundaryReason: LLMToolBoundaryReason?
+            var arrivalCut = false
             var pendingProtocolDelta = ""
             let rawProviderEvents = OSAllocatedUnfairLock<String>(initialState: "")
             let roundBaseVisibleText = visibleText
 
             // Only prose can survive an incomplete stream; none of its calls ran.
             func keepPartial() async -> String {
-                let kept = toolBoundaryReason == .fabricatedResult
-                    ? iterEmittedProse : toolCallCodec.visiblePrefix(in: iterAccumulated)
+                var kept: String
+                if arrivalCut {
+                    let tail = toolCallCodec.visiblePrefix(in: pendingProtocolDelta)
+                    kept = iterEmittedProse + String(tail.dropLast(ToolCallCodec.markerPrefixTailLength(tail)))
+                } else {
+                    kept = toolBoundaryReason == .fabricatedResult
+                        ? iterEmittedProse : toolCallCodec.visiblePrefix(in: iterAccumulated)
+                }
+                // Words the person cut off read as cut off: the sentence stops visibly before the agent's answer.
+                if arrivalCut, let last = kept.last(where: { !$0.isWhitespace }), !".!?…:".contains(last) {
+                    kept = String(kept[..<(kept.lastIndex { !$0.isWhitespace }.map { kept.index(after: $0) } ?? kept.endIndex)]) + "…"
+                }
                 if kept.hasPrefix(iterEmittedProse) {
                     let tail = String(kept.dropFirst(iterEmittedProse.count))
                     if !tail.isEmpty { await progress?(.delta(tail)) }
                 }
                 visibleText = roundBaseVisibleText + kept
-                retainedAnswerProse = Self.joinedProse(retainedAnswerProse, kept)
+                // Words a cut stopped are working, not the answer: they fold above the reply that answers the person.
+                retainProse(kept, commentary: arrivalCut)
                 streamedCalls.removeAll(keepingCapacity: true)
                 pendingProtocolDelta.removeAll(keepingCapacity: true)
                 return kept
@@ -585,32 +664,20 @@ extension SwiftNativeTurnEngine {
                 // Every step after the first carries what changed in the agent elsewhere since its last one, after its reply too.
                 if providerCallCount > 0, let sessionId, !sessionId.isEmpty, let root = remPinsDataRoot, let cursor = agentNow {
                     let at = Date()
-                    let breath = await ChatWorkspaceBinding.breath(turn: turn, invocation: work.invocation, dataRoot: root, scope: sessionId,
-                        peer: cursor.peer, since: cursor.at, shown: breathActs, at: at)
-                    // A read window is new evidence even when it renders alike; only a failed reading's repeat is withheld. Acts are shown once by id.
-                    if let text = breath.text, breath.read || text != lastBreath {
-                        Self.appendStructuredUserNudge(text, to: &conversation)
-                        lastBreath = text
-                        breathActs.formUnion(breath.acts)
-                    }
-                    if breath.read { agentNow = AgentNowCursor(at: at, peer: cursor.peer) }
-                }
-                if let sessionId, !sessionId.isEmpty {
-                    let offers = await ChatTurnSteering.shared.drain(
-                        sessionId: sessionId, cancelFlagPath: cancelFlagPath)
-                    if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
-                        throw CancellationError()
-                    }
-                    steeringOffers += offers
-                    for offer in offers { ConversationPrefixSeeding.appendUser(offer.reading, to: &conversation) }
-                    if let root = remPinsDataRoot, try !SessionConversation.checkedIsHelper(sessionId, dataRoot: root),
-                       turn.peerSteering?.isTainted != true,
-                       [nil, "self"].contains(turn.envelope?.agent),
-                       let arrived = ResidentWake.shared.take(dataRoot: root) {
-                        arrivedItems += arrived.items
-                        Self.appendStructuredUserNudge(arrived.text, to: &conversation)
+                    let peer = try !Self.personContinuityAllowed(root: root, sessionID: sessionId, turn: turn)
+                    if !peer || Self.peerContinuityTurn(turn) {
+                        let breath = await ChatWorkspaceBinding.breath(turn: turn, invocation: work.invocation, dataRoot: root, scope: sessionId,
+                            peer: peer, since: cursor.at, shown: breathActs, at: at)
+                        // A read window is new evidence even when it renders alike; only a failed reading's repeat is withheld. Acts are shown once by id.
+                        if let text = breath.text, breath.read || text != lastBreath {
+                            Self.appendStructuredUserNudge(text, to: &conversation)
+                            lastBreath = text
+                            breathActs.formUnion(breath.acts)
+                        }
+                        if breath.read { agentNow = AgentNowCursor(at: at) }
                     }
                 }
+                _ = try await readArrivals()
                 if sessionId != nil, !(work.prefixTelemetry?.marksRequestShapeUnmeasured == true) {
                     let additional = try ConversationPrefixSeeding.additionalMessages(in: conversation, after: prefixSeed)
                     if providerCallCount == 0 {
@@ -724,6 +791,9 @@ extension SwiftNativeTurnEngine {
                     try await holding(call.with(\.lifetime.dispatched, requestDispatched)) { call in
                     try await holding(call.with(\.purpose, purpose)) { call in
                     try await holding(call.with(\.requestPlan, requestPlan)) { call in
+                    let arrivals = if let sessionId {
+                        await ChatTurnSteering.shared.arrivals(sessionId: sessionId)
+                    } else { AsyncStream<ChatTurnSteering.Offer> { $0.finish() } }
                     let stream = llm.streamMessages(
                         messages: try toolCallCodec.providerMessages(
                             conversation, records: dispatches, schemas: ctx.toolSchemas, turn: turn),
@@ -731,6 +801,8 @@ extension SwiftNativeTurnEngine {
                         model: ctx.modelId,
                         tools: toolCallCodec.requestTools(providerTools.schemas),
                     call: call.with(\.turn, turn))
+                    let merged = TurnRoundEvents(provider: stream, arrivals: arrivals)
+                    defer { merged.cancel() }
                     // Every provider byte is movement, ticked at most once a second for every door's card; this door's own words show themselves.
                     func moved(_ input: LLMStreamCallInput?, words: Bool = false) async {
                         let now = ContinuousClock.now
@@ -742,13 +814,22 @@ extension SwiftNativeTurnEngine {
                         TurnTraceBus.fireFromContext(kind: "stream.tick", payload: .object(tick), turn: turn)
                         if !words { await progress?(.writing(writing)) }
                     }
-                    streaming: for try await event in stream {
+                    roundEvents: for try await incoming in merged.stream {
                         try Task.checkCancellation()
                         if ChatCancelFlag.isRaised(cancelFlagPath) { throw CancellationError() }
-                        // A pending steer cuts the round after retained prose so the next round reads the user's words.
-                        if let sessionId, !sessionId.isEmpty, ChatTurnSteering.hasPending(sessionId) {
-                            toolBoundaryReason = .steered
-                            break streaming
+                        let event: LLMMessageStreamEvent
+                        switch incoming {
+                        case .arrival(let offer):
+                            guard let sessionId,
+                                  await ChatTurnSteering.shared.canHear(offer, sessionId: sessionId, run: turn.run) else { continue }
+                            if try await part.hear(offer),
+                               await ChatTurnSteering.shared.canHear(offer, sessionId: sessionId, run: turn.run) {
+                                arrivalCut = true
+                                merged.cancel()
+                                break roundEvents
+                            }
+                            continue
+                        case .provider(let value): event = value
                         }
                         switch event {
                         case .toolBoundary(let reason):
@@ -814,6 +895,9 @@ extension SwiftNativeTurnEngine {
                 requestCall.session = sessionId
                 requestCall.withinTurnReuse = true
                 requestCall.prefixMeasurement = work.prefixTelemetry
+                requestCall.lifetime.status = { kind, text in
+                    await progress?(.notice(kind: kind, text: text))
+                }
                 requestCall.inspectorThinkingSummarized = InspectorThinkingLane.isEnabledForSurface(surface)
                 try await LLMCallTraceRecorder.$spent.withValue(spent) {
                     try await consumeStream(requestTurn, requestCall)
@@ -838,7 +922,7 @@ extension SwiftNativeTurnEngine {
                 }
                 if ProviderFailure.classify(error) == .malformedResponse {
                     let raw = rawProviderEvents.withLock { $0 }
-                    if !raw.isEmpty { RunawayOutputDetector.writeDiagnostic(raw, reason: "malformed_stream", dataRoot: remPinsDataRoot, call: call) }
+                    if !raw.isEmpty { ProviderOutputDiagnostics.writeDiagnostic(raw, reason: "malformed_stream", dataRoot: remPinsDataRoot, call: call) }
                 }
                 counters.failedProviderAttemptCount += 1
                 // A spent budget's partial is the whole run's ledger, not this round's words.
@@ -846,8 +930,14 @@ extension SwiftNativeTurnEngine {
                    turn.tokenBudget?.exhausted != true {
                     iterAccumulated = partial
                 }
+                if error is ProviderRecovery.Stopped,
+                   try toolCallCodec.roundCalls(streamed: streamedCalls, text: iterAccumulated, schemas: ctx.toolSchemas,
+                       recordShims: false, turn: turn).isEmpty {
+                    _ = await keepPartial()
+                    throw TurnEngineError.streamInterrupted(partial: visibleText, underlying: error)
+                }
                 // A stream cut preserves complete calls for dispatch and continues after retained prose.
-                if ProviderRecoveryPolicy.isRecoverable(error) || ProviderFailure.classify(error) == .malformedResponse,
+                if ProviderRecoveryPolicy.isRecoverable(error),
                    try !toolCallCodec.roundCalls(streamed: streamedCalls, text: iterAccumulated, schemas: ctx.toolSchemas, recordShims: false, turn: turn)
                        .isEmpty
                     || !toolCallCodec.visiblePrefix(in: iterAccumulated).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -867,7 +957,21 @@ extension SwiftNativeTurnEngine {
                 }
                 continue
             }
-            providerFailurePending = false
+            if arrivalCut {
+                // A cut dispatches nothing, even a complete proposal. Only visible prose enters the next wire transcript.
+                let kept = await keepPartial()
+                if !kept.isEmpty { conversation.append(.assistantText(kept)) }
+                try await capture(turn: turn, work: work)
+                let read = try await readArrivals()
+                try await observe(.cut(arrivalRead: read))
+                try await capture(turn: turn, work: work)
+                TurnTraceBus.fireFromContext(kind: "provider.roundCut", surface: surface, payload: .object([
+                    "round": .int(Int64(providerCallCount)), "proseCharacters": .int(Int64(kept.count)),
+                    "arrivalRead": .bool(read), "effects": .string("none"),
+                ]), turn: turn)
+                continue
+            }
+            providerFailurePending = turn.providerRecovery?.stopped != nil
             let iterProse = ToolCallParser.stripProtocolDebris(iterAccumulated)
             let answerText = iterProse.replacingOccurrences(
                 of: #"</?[\p{L}_][\p{L}\p{N}_.:-]*(?:\s[^<>]*)?/?>|<[!?][^>]*>"#, with: "", options: .regularExpression)
@@ -876,15 +980,20 @@ extension SwiftNativeTurnEngine {
                 guard visible.split(whereSeparator: { $0.isWhitespace }).count < 2
                     || (visible.count < 12 && iterProse.contains(where: { "<=>".contains($0) })) else { return }
                 let raw = rawProviderEvents.withLock { $0 }
-                if !raw.isEmpty { RunawayOutputDetector.writeDiagnostic(raw, reason: "suspicious_reply", dataRoot: remPinsDataRoot, call: call) }
+                if !raw.isEmpty { ProviderOutputDiagnostics.writeDiagnostic(raw, reason: "suspicious_reply", dataRoot: remPinsDataRoot, call: call) }
             }
-            if toolBoundaryReason == nil, streamedCalls.isEmpty && !answerText.contains(where: { !$0.isWhitespace }) {
+            if !call.allowsSilentCompletion, toolBoundaryReason == nil,
+               streamedCalls.isEmpty && !answerText.contains(where: { !$0.isWhitespace }) {
                 saveSuspiciousReply()
                 visibleText = roundBaseVisibleText
                 counters.emptyReplyRoundCount += 1
                 try await providerFailed(ProviderFailure.Diagnostic(cause: .malformedResponse,
                     detail: "The provider completed without an answer or a tool call."), emitted: emitted, turn: turn)
                 continue
+            }
+            if call.allowsSilentCompletion, streamedCalls.isEmpty, !answerText.contains(where: { !$0.isWhitespace }) {
+                // A silent end is the thought's whole answer: what the model read was delivered, so its offers settle as consumed.
+                try await commitDelivery()
             }
             let markerCodec = toolCallCodec == .textMarkers
                 ? TextMarkerCodec(schemas: ctx.toolSchemas,
@@ -905,7 +1014,8 @@ extension SwiftNativeTurnEngine {
                     "sha256": .string(SHA256.hash(data: rejectedBytes).map { String(format: "%02x", $0) }.joined()),
                 ]
                 do {
-                    if let file = try RunawayOutputDetector.writeDiagnostic(iterAccumulated, reason: violation.traceType, dataRoot: remPinsDataRoot, call: call)
+                    if let file = try ProviderOutputDiagnostics.writeDiagnostic(iterAccumulated, reason: violation.traceType,
+                        dataRoot: remPinsDataRoot, call: call)
                         .get() {
                         diagnostic["path"] = .string(file.path)
                     }
@@ -944,6 +1054,12 @@ extension SwiftNativeTurnEngine {
                 }
                 // The agent's answer stays in the conversation for whatever the agent's part does next.
                 conversation.append(.assistantText(iterProse))
+                if try await readArrivals() {
+                    // Retain the completed answer before any prose the arrival's next round produces.
+                    retainProse(iterProse)
+                    try await observe(.arrival)
+                    continue
+                }
                 try await part.deliver([.object(["type": .string("model"), "text": .string(iterProse), "calls": .array([])])])
                 continue
             }
@@ -955,7 +1071,12 @@ extension SwiftNativeTurnEngine {
                 await progress?(.delta(pendingProse))
             }
             visibleText = roundBaseVisibleText + iterEmittedProse
-            turnInterstitialProse = Self.joinedProse(turnInterstitialProse, iterEmittedProse)
+            retainProse(iterEmittedProse, commentary: true)
+            if let sessionId, ChatTurnSteering.hasPersonWaiting(sessionId), try await readArrivals(keeping: iterEmittedProse) {
+                round = nil
+                try await observe(.arrival, unstarted: providerCalls)
+                continue
+            }
             round = (providerCalls, toolCallCodec == .textMarkers ? iterAccumulated : iterEmittedProse, markerCodec, toolBoundaryReason)
             let made = providerCalls.map { JSONValue.object(["name": .string($0.name), "input": .object($0.input)]) }
             repeated = made == repeated.calls ? (made, repeated.call, repeated.count + 1) : (made, providerCalls.map { call in
@@ -976,6 +1097,7 @@ extension SwiftNativeTurnEngine {
         return result
         } catch {
             await bookkeeping.value
+            settlePartRounds()
             throw error
         }
         }

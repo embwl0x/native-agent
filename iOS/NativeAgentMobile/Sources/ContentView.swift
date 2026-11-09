@@ -92,10 +92,7 @@ struct ContentView: View {
                 case .settings, .more: .advanced
                 }
                 if before != after, after == .more {
-                    Task {
-                        _ = await sync.refreshCatalogSnapshot()
-                        await sync.refreshSnapshotGroup(.advanced)
-                    }
+                    Task { await sync.refreshSnapshotGroup(.advanced) }
                 }
             }
             .onChange(of: scenePhase) { _, phase in
@@ -126,43 +123,38 @@ struct ContentView: View {
     /// A face's link to a place of the shell: a conversation in Chat, Today's queues and cards, the Desk, the browser. Answers the words for a
     /// place this phone does not have.
     private func followFaceLink(_ link: String) -> String? {
-        guard PartFace.isLink(link), let colon = link.firstIndex(of: ":") else { return "This row has no destination on iPhone." }
-        let kind = String(link[..<colon]), target = String(link[link.index(after: colon)...])
-        switch kind {
-        case "chat":
-            notifiedSessionID = target
+        guard let target = FaceLink(link) else { return "This row has no destination on iPhone." }
+        switch target {
+        case .chat(let session):
+            notifiedSessionID = session
             selection = .chat
-        case "approval":
+        case .approval:
             activityNavigationTarget = .inbox
             selection = .activity
-        case "card":
-            activityCardID = target
+        case .card(let id):
+            activityCardID = id
             selection = .activity
-        case "url":
-            guard let url = URL(string: target) else { return "This link could not be opened." }
+        case .url(let url):
             openURL(url)
-        case "page":
-            let parts = target.split(separator: "/", maxSplits: 1).map(String.init)
-            switch parts[0] {
-            case "today" where parts.count == 2:
-                // Approvals and notes are one Inbox, as on the Mac.
-                guard let section = parts[1] == "approvals" ? .inbox : ActivitySection(rawValue: parts[1]) else {
-                    return "This queue opens on your Mac."
-                }
-                activityNavigationTarget = section
-                selection = .activity
-            case "today":
-                selection = .activity
-            case "desk":
-                selection = .desk
-            case "memory_proposals":
-                activityNavigationTarget = .memoryProposals
-                selection = .activity
-            default:
-                // A page is named by its own face; a page the phone has never read keeps its catalog name.
-                return (sync.faces[parts[0]]?.face?.title ?? QuietToolPage.page(named: parts[0])?.title ?? parts[0]) + " opens on your Mac."
+        case .page("today", let item?):
+            // Approvals and notes are one Inbox, as on the Mac.
+            guard let section = item == "approvals" ? .inbox : ActivitySection(rawValue: item) else {
+                return "This queue opens on your Mac."
             }
-        default:
+            activityNavigationTarget = section
+            selection = .activity
+        case .page("today", nil):
+            selection = .activity
+        case .page("desk", _):
+            selection = .desk
+        case .page("memory_proposals", _):
+            // The Memories face carries what waits to be kept, with Keep and Don't keep on each.
+            opensMemories = true
+            selection = .more
+        case .page(let page, _):
+            // A page is named by its own face; a page the phone has never read keeps its catalog name.
+            return (sync.faces[page]?.face?.title ?? QuietToolPage.page(named: page)?.title ?? page) + " opens on your Mac."
+        case .dream:
             return "This opens on your Mac."
         }
         return nil

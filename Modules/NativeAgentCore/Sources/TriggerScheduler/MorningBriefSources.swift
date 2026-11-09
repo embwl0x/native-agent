@@ -8,7 +8,7 @@ import NotificationInbox
 import Experiences
 // Blueprint: | `MorningBriefSources.swift` | Checked brief sources; unread notes read ForPerson's in-memory inbox |
 
-/// The scheduler supplies checked observations, never a brief or model prompt. Each source says unavailable, ready (possibly empty), or unconfigured.
+/// The ability entry supplies checked observations. Each source says unavailable, ready (possibly empty), or unconfigured.
 public struct MorningBriefSources: Sendable {
     let root: URL
     let now: Date
@@ -19,7 +19,7 @@ public struct MorningBriefSources: Sendable {
         self.worklogPath = worklogPath
     }
 
-    public func packet() async -> JSONValue {
+    @concurrent public func packet() async throws -> JSONValue {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = .autoupdatingCurrent
@@ -27,7 +27,7 @@ public struct MorningBriefSources: Sendable {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .autoupdatingCurrent
         guard let yesterday = calendar.date(byAdding: .day, value: -1, to: calendar.startOfDay(for: now)) else {
-            return .object(["state": .string("unavailable"), "error": .string("brief_calendar_unavailable: cannot determine the previous local day")])
+            throw TriggerSchedulerError.persistenceFailure("brief_calendar_unavailable: cannot determine the previous local day")
         }
         return .object([
             "operation": .string("brief"), "dayLabel": .string(formatter.string(from: now)),

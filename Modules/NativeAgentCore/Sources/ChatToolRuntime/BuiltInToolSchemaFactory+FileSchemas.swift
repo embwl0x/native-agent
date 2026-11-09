@@ -23,7 +23,7 @@ extension BuiltInToolSchemaFactory {
         toolClass: .read, capabilities: ["tool_call"],
         description: """
             Read deeper context by its offered atom id or a history: id from a replayed receipt. Context atoms are pinned to this turn's \
-            generation; history receipts are read from the current conversation.
+            generation; an exact history id reads its saved message across conversations.
             """,
         parametersJSON: (try? JSONValue.object([
             "type": .string("object"),

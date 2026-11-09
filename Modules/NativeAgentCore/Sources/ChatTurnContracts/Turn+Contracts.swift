@@ -3,10 +3,21 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `Turn+Contracts.swift` | `Turn` holds chat admission, execution and sinks; `TurnRows` holds transcript state |
+import os
+// Blueprint: | `Turn+Contracts.swift` | `Turn` holds admission, execution, sinks and sticky message-decision call evidence; `TurnRows` owns rows |
+
+/// Shared by nested executions on the same turn; replacing a model loop cannot erase a started call.
+package final class MessageDecisionCalls: Sendable {
+    private let otherCallStarted = OSAllocatedUnfairLock(initialState: false)
+    package var hasOtherCallStarted: Bool { otherCallStarted.withLock { $0 } }
+    package func noteOtherCallStarted() { otherCallStarted.withLock { if !$0 { $0 = true } } }
+    package init() {}
+}
 
 /// The transcript rows a turn writes as its own, decided by its ingress.
 public struct TurnRows: Sendable, Equatable {
+    /// Only an explicitly hidden arrival supplies this; a missing transcript row never does.
+    public var hiddenInput: TurnCheckpoint.HiddenInput?
     /// What the creating ingress declares its session is; continuations keep the row's kind.
     public var threadKind: ChatThreadKind?
     /// The exact session the ingress owns for kind assignment.
@@ -28,7 +39,6 @@ public struct TurnRows: Sendable, Equatable {
 
 private enum EnvelopePart: TurnPart { static let unset: TurnEnvelope? = nil }
 private enum UserTextPart: TurnPart { static let unset: String? = nil }
-private enum FileAccessPart: TurnPart { static let unset: String? = nil }
 private enum RendersCardsPart: TurnPart { static let unset = false }
 private enum SettingEvidencePart: TurnPart {
     static let unset: (@Sendable (String, JSONValue, JSONValue, String) async -> Bool?)? = nil
@@ -40,6 +50,7 @@ private enum ReplyChoicesPart: TurnPart { static let unset: ReplyChoices? = nil 
 private enum ExecutionPart: TurnPart { static let unset: ChatTurnExecution? = nil }
 private enum PeerSteeringPart: TurnPart { static let unset: PeerDataTaint? = nil }
 private enum NoticesPart: TurnPart { static let unset: (@Sendable (String, String) async -> Void)? = nil }
+private enum MessageDecisionCallsPart: TurnPart { static let unset: MessageDecisionCalls? = nil }
 
 /// A lexical scope over an explicit value. The closure receives what it holds;
 /// no child task or later callback can discover it through ambient state.
@@ -53,6 +64,11 @@ public func holding<Value, Result>(_ value: Value,
 ) rethrows -> Result { try operation(value) }
 
 extension Turn {
+    /// Bound before chat dispatch and carried through derived turns, independently of model execution ledgers.
+    package var messageDecisionCalls: MessageDecisionCalls? {
+        get { self[MessageDecisionCallsPart.self] }
+        set { self[MessageDecisionCallsPart.self] = newValue }
+    }
     /// Only a mounted stream on a card-rendering route can withhold the card's prose.
     public var replyIsTextOnly: Bool {
         !(replyStreamRendersCards && (replyRoute?.rendersInlineCards ?? true))
@@ -75,11 +91,6 @@ extension Turn {
     public var userText: String? {
         get { self[UserTextPart.self] }
         set { self[UserTextPart.self] = newValue }
-    }
-    /// The admitted file-access restriction, carried to the cards it files.
-    public var fileAccess: String? {
-        get { self[FileAccessPart.self] }
-        set { self[FileAccessPart.self] = newValue }
     }
     /// True while a chat UI that draws inline cards consumes the turn as a stream.
     public var replyStreamRendersCards: Bool {

@@ -109,7 +109,10 @@ extension SwiftNativeLoopScheduler {
         let write = Task {
             await previous?.value
             do {
-                try await SwiftNativePersistenceCore.writeJSON(snapshot, to: loopStatePath)
+                let stored = try await SwiftNativePersistenceCore.readJSON(loopStatePath, ifMissing: .null)
+                if stored != snapshot {
+                    try await SwiftNativePersistenceCore.writeJSON(snapshot, to: loopStatePath)
+                }
                 consecutiveFailures[Self.loopStateReceiptId] = 0
             } catch {
                 lastDurableFlushAt = nil
@@ -141,7 +144,7 @@ extension SwiftNativeLoopScheduler {
         await flushLoopState()
     }
 
-    /// Concurrent beats share a flush into the record; scheduling state is never rewritten for a beat.
+    /// Every beat feeds live liveness; only a changed outcome, note, yield or cadence belongs in the durable record.
     func recordPulse(_ pulse: OrganPulse) async {
         do {
             var row: [String: JSONValue] = ["outcome": .string(pulse.outcome.rawValue), "note": .string(pulse.note)]
@@ -161,8 +164,16 @@ extension SwiftNativeLoopScheduler {
                 while !pendingBeats.isEmpty {
                     let batch = pendingBeats
                     pendingBeats = []
-                    do { try await ExperienceStore.at(dataRoot).note(batch) }
-                    catch { nativeLog("BackgroundLoops: organ beats could not be recorded: %@", error.localizedDescription) }
+                    for detail in batch {
+                        do {
+                            try await ExperienceStore.at(dataRoot).note(detail, unless: { existing in
+                                guard let latest = existing.last(where: { $0.kind == "beat" }) else { return false }
+                                return try JSONValue.parse(latest.row) == JSONValue.parse(detail.row)
+                            })
+                        } catch {
+                            nativeLog("BackgroundLoops: organ beat could not be recorded: %@", error.localizedDescription)
+                        }
+                    }
                 }
                 beatWrite = nil
             }

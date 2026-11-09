@@ -22,6 +22,15 @@ extension ChatStore {
     func receiveICloudReply(_ msg: BridgeMessage) async {
         await restorationTask?.value
         guard msg.sender == "mac" else { return }
+        if msg.metadata?["kind"] == "notice", msg.metadata?["steering"] == "true",
+           let index = queuedSends.firstIndex(where: { $0.id.uuidString == msg.correlationID }) {
+            let queued = queuedSends[index]
+            steeringQueuedIDs.remove(queued.id)
+            pausedQueueSessionKeys.insert(queueSessionKey(queued.sessionID))
+            if queued.steeringFailure != msg.text { queuedSends[index].steeringFailure = msg.text }
+            if queueSessionKey(queued.sessionID) == queueSessionKey(selectedSessionID) { errorBanner = msg.text }
+            return
+        }
         if let kind = msg.metadata?["kind"], kind == "steered" || kind == "steer_returned",
            let queued = queuedSends.first(where: { $0.id.uuidString == msg.correlationID }) {
             steeringQueuedIDs.remove(queued.id)
@@ -73,8 +82,7 @@ extension ChatStore {
         if let correlationID = msg.correlationID, resolvedICloudReplyIds.contains(correlationID) {
             return
         }
-        // Nonterminal events only update the conversation on screen, and live is now: a replayed live message for a turn already over (the
-        // records the phone re-reads at launch) never streams or appends an old reply again.
+        // Saved terminal evidence prevents replayed live records from reopening a completed turn.
         let live = msg.metadata?["live"] == "true"
         let elsewhere = Self.cleanSessionID(msg.sessionID).map { incoming in
             Self.cleanSessionID(selectedSessionID).map { $0 != incoming } ?? false
@@ -124,9 +132,9 @@ extension ChatStore {
         let record = pendingId.flatMap { pendingExchanges[$0] }
         let offscreen = record.map { $0.sessionID != Self.cleanSessionID(selectedSessionID) } ?? false
         let placeholderId = pendingId.flatMap {
-            pendingICloudPlaceholders[$0] ?? timedOutPendingIds[$0] ?? record?.placeholderID
+            pendingICloudPlaceholders[$0] ?? retiredPendingPlaceholders[$0] ?? record?.placeholderID
         }
-        let wasLate = pendingId.map { timedOutPendingIds[$0] != nil } ?? false
+        let wasLate = pendingId.map { retiredPendingPlaceholders[$0] != nil } ?? false
         if !offscreen {
             if let pendingId, resolvedICloudReplyIds.contains(pendingId) { return }
             if let incoming = Self.cleanSessionID(msg.sessionID),
@@ -242,16 +250,11 @@ extension ChatStore {
         showsReplyWaitHint = false
     }
 
-    /// How long a live message stays news. Streamed text is cumulative, so a turn still under way always has a fresher one.
-    static let liveIsNow: TimeInterval = 120
-
-    /// A turn this phone already shows, or its own send in flight, receives every live message. Any other live message is history once it
-    /// is older than `liveIsNow` or its conversation already holds the turn's saved reply: the transcript says what happened.
+    /// A saved terminal reply, never elapsed time, establishes that a live turn is history.
     private func liveIsHistory(_ msg: BridgeMessage) -> Bool {
         guard let run = msg.correlationID, liveTurnBubbles[run] == nil, pendingICloudPlaceholders[run] == nil else { return false }
-        if Date().timeIntervalSince(msg.timestamp) > Self.liveIsNow { return true }
         guard let session = Self.cleanSessionID(msg.sessionID) else { return false }
-        return iCloudSyncEngine.shared.chatTranscripts[session]?.records.contains { $0.role == "assistant" && $0.runId == run } ?? false
+        return iCloudSyncEngine.shared.chatTranscripts[session]?.messages.contains { $0.runId == run && $0.isTerminalReply } ?? false
     }
 
     /// Other doors stream by run ID; retain their bubble until the Mac transcript settles it into the saved row.
@@ -259,10 +262,13 @@ extension ChatStore {
         guard let runId = msg.correlationID, !runId.isEmpty else { return }
         let kind = msg.metadata?["kind"]
         let existingBubble = liveTurnBubbles[runId] ?? messages.last {
-            $0.role == .assistant && $0.runId == runId && $0.interaction == nil
+            $0.role == .assistant && $0.runId == runId && $0.matter == nil
         }?.id
         if kind == "text_delta" {
-            let seq = Int(msg.metadata?["seq"] ?? "") ?? 0
+            guard let rawSequence = msg.metadata?["seq"], let seq = Int(rawSequence), seq >= 0 else {
+                errorBanner = "The Mac live reply has no valid sequence. Its saved transcript remains available through Refresh."
+                return
+            }
             setStreamingText(existingBubble, msg.text, correlationID: runId, sequence: seq, live: true)
             return
         }
@@ -356,7 +362,7 @@ extension ChatStore {
                 correlationID: pendingId,
                 message: rejection.userMessage
             )
-            timedOutPendingIds.removeValue(forKey: pendingId)
+            retiredPendingPlaceholders.removeValue(forKey: pendingId)
             return
         }
         failPendingReply(
@@ -409,8 +415,6 @@ extension ChatStore {
             noteEvidencedActivity(correlationID: correlationID, activity: clean)
             streamingHintsByMessageId[placeholderId] = clean
         }
-        pendingTimeouts.removeValue(forKey: correlationID)?.cancel()
-        armTimeout(for: correlationID, placeholderId: placeholderId)
     }
 
     /// Phone deltas require an explicit sequence and an existing placeholder.
@@ -437,7 +441,6 @@ extension ChatStore {
             onTalkReply?(correlationID, text, false, nil)
             noteEvidencedActivity(correlationID: correlationID, activity: nil, partialText: text)
             streamingHintsByMessageId.removeValue(forKey: reply.id)
-            armTimeout(for: correlationID, placeholderId: reply.id)
         }
     }
 
@@ -452,52 +455,10 @@ extension ChatStore {
         return "Typing"
     }
 
-    /// Retire both wait tasks together so late timeout cannot contradict an already shown reply.
-    func cancelReplyWaits(for pendingId: String) {
-        pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
-        if pendingICloudPlaceholders.isEmpty {
-            replyStatusTask?.cancel()
-            replyStatusTask = nil
-        }
-    }
-
-    /// Only a remote terminal settles the exchange; the silence watchdog changes status.
-    func armTimeout(for pendingId: String, placeholderId: UUID) {
-        pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
-        let timeoutNs = iCloudReplyTimeoutSeconds * 1_000_000_000
-        let task = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: timeoutNs)
-            guard !Task.isCancelled, let self else { return }
-            self.fireTimeout(pendingId: pendingId, placeholderId: placeholderId)
-        }
-        pendingTimeouts[pendingId] = task
-    }
-
-    /// Intent waits use this bounded wake interval; chat does not add another reader.
-    static let iCloudReplyNudgeFloorSeconds: TimeInterval = 8
-    static let iCloudReplyStatusDelaySeconds: TimeInterval = 10
-
     func armReplyStatus() {
-        guard replyStatusTask == nil, !pendingICloudPlaceholders.isEmpty else { return }
-        replyStatusTask = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(Self.iCloudReplyStatusDelaySeconds)) }
-            catch { return }
-            guard !Task.isCancelled, let self else { return }
-            self.replyStatusTask = nil
-            guard !self.pendingICloudPlaceholders.isEmpty else { return }
-            self.showsReplyWaitHint = true
-            for correlationID in self.pendingICloudPlaceholders.keys {
-                self.showWaitStatus(correlationID: correlationID)
-            }
-        }
-    }
-
-    /// Silence changes status while preserving the partial answer and observation of the original request.
-    private func fireTimeout(pendingId: String, placeholderId: UUID) {
-        guard pendingICloudPlaceholders[pendingId] != nil else { return }
-        notePendingExchangeSilent(correlationID: pendingId)
-        // Release the composer so the user can speak again while the original bubble remains under observation.
-        releaseLoading(for: placeholderId)
+        guard !pendingICloudPlaceholders.isEmpty else { return }
+        showsReplyWaitHint = true
+        for correlationID in pendingICloudPlaceholders.keys { showWaitStatus(correlationID: correlationID) }
     }
 
     private func failPendingReply(
@@ -508,9 +469,8 @@ extension ChatStore {
         awaitingMacTranscript: Bool = false
     ) {
         pendingICloudPlaceholders.removeValue(forKey: pendingId)
-        cancelReplyWaits(for: pendingId)
         showsReplyWaitHint = false
-        timedOutPendingIds[pendingId] = placeholderId
+        retiredPendingPlaceholders[pendingId] = placeholderId
         streamingHintsByMessageId.removeValue(forKey: placeholderId)
         // Failure retires the placeholder and its sequence tracker, excluding straggler deltas.
         maxDeltaSeqByCorrelation.removeValue(forKey: pendingId)
@@ -524,17 +484,12 @@ extension ChatStore {
         resolvedICloudReplyIds.insert(pendingId)
         if discardRetainedSend { queuedSends.removeAll { $0.id.uuidString == pendingId } }
         let placeholders = [pendingICloudPlaceholders.removeValue(forKey: pendingId),
-                            timedOutPendingIds.removeValue(forKey: pendingId)]
+                            retiredPendingPlaceholders.removeValue(forKey: pendingId)]
         for id in placeholders.compactMap({ $0 }) {
             streamingHintsByMessageId.removeValue(forKey: id)
             releaseLoading(for: id)
         }
-        cancelReplyWaits(for: pendingId)
         maxDeltaSeqByCorrelation.removeValue(forKey: pendingId)
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 5 * 60 * 1_000_000_000)
-            _ = self?.resolvedICloudReplyIds.remove(pendingId)
-        }
     }
 
     func failPlaceholder(id placeholderId: UUID, text: String) {

@@ -8,6 +8,7 @@ import MacControl
 import AttentionRouting
 import AppKit
 import NativeAgentShared
+import SwiftUI
 // Blueprint: | `AppConnectorPlatform.swift` | Voice, notification, Mac control, EventKit and device-sync platform bindings |
 
 /// Connector actions, the integration bridge and Mac control routes must share TrustCenter's policy.
@@ -29,47 +30,64 @@ extension TrustCenterMacControlPolicyProvider {
 
 extension AppConnectorStatusPlatform {
     init() {
-        self.init(subject: { AgentVoice.live.subject }, chooseSharedFolder: {
-            guard NSApp.isActive, NSApp.keyWindow != nil else {
-                throw PartCallError(code: "mac_required", message: "Share a folder on your Mac")
+        self.init(subject: { AgentVoice.live.subject }, chooseSharedFolder: { renderer in
+            let operation = UUID()
+            let reply: FaceReply
+            if let renderer {
+                guard let model = ApplicationLifetime.shared.appModel else { throw FaceWireError.disconnected }
+                let target = try BodyFacePresentation.require(renderer, model: model)
+                reply = try await target.call(.chooseSharedFolder(operation: operation))
+            } else {
+                guard NSApp.isActive, NSApp.keyWindow != nil else {
+                    throw PartCallError(code: "mac_required", message: "Share a folder on your Mac")
+                }
+                reply = try await ConnectorPresentation.chooseSharedFolder(operation: operation)
             }
-            let panel = NSOpenPanel()
-            panel.title = "Share a folder"
-            panel.prompt = "Share Folder"
-            panel.canChooseDirectories = true
-            panel.canChooseFiles = false
-            panel.allowsMultipleSelection = false
-            panel.canCreateDirectories = false
-            panel.resolvesAliases = false
-            let name = NSTextField(string: "")
-            name.placeholderString = "Folder name (leave blank to use its name)"
-            name.setAccessibilityLabel("Shared folder name")
-            let writable = NSButton(checkboxWithTitle: "Let me write to it", target: nil, action: nil)
-            let accessory = NSStackView(views: [name, writable])
-            accessory.orientation = .vertical
-            accessory.alignment = .leading
-            accessory.spacing = 8
-            accessory.frame = NSRect(x: 0, y: 0, width: 360, height: 64)
-            name.widthAnchor.constraint(equalToConstant: 360).isActive = true
-            panel.accessoryView = accessory
-            let response = await panel.begin()
-            try Task.checkCancellation()
-            guard response == .OK else { return nil }
-            guard let folder = panel.url else {
-                throw PartCallError(code: "folder_unavailable", message: "The picker did not return a folder. Choose Share a folder again.")
+            switch reply {
+            case .folder(let selection):
+                guard let selection else {
+                    throw PartCallError(code: "folder_unconfirmed", message: "The folder picker returned no selection.")
+                }
+                return try await SharedFolderGrant.resolve(selection, operation: operation)
+            case .cancelled: return nil
+            case .failed(let failure), .refused(let failure): throw failure
+            default: throw FaceWireError.invalidFeedOrder
             }
-            let label = name.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (label.isEmpty ? folder.lastPathComponent : label, folder.path, writable.state == .on)
-        }, showBrowser: {
-            BrowserWindowController.shared.showWindow()
+        }, showGrokSecureSetup: { peer in
+            guard let model = ApplicationLifetime.shared.appModel else { throw FaceWireError.disconnected }
+            try await BodyFacePresentation.current(model: model).present(.showGrokSetup(contact: peer, operation: UUID()))
+        }, showProviderSetup: { provider, root in
+            guard let model = ApplicationLifetime.shared.appModel,
+                  model.engine.dataRoot.standardizedFileURL == root.standardizedFileURL else { throw FaceWireError.disconnected }
+            try await BodyFacePresentation.current(model: model).present(.showProviderSetup(provider: provider.provider_id, operation: UUID()))
         })
+    }
+}
+
+private enum SharedFolderGrant {
+    @concurrent static func resolve(_ selection: ChosenFolder, operation: UUID) async throws -> (name: String, path: String, writable: Bool) {
+        guard selection.resource.id == operation, selection.resource.writable == selection.writable else {
+            throw PartCallError(code: "folder_grant_invalid", message: "The folder selection does not match its access grant. Choose it again.")
+        }
+        let folder = try BodyFaceResources.resolve(selection.resource)
+        guard folder.isFileURL else {
+            throw PartCallError(code: "folder_grant_invalid", message: "Choose a local folder to share.")
+        }
+        let access = folder.startAccessingSecurityScopedResource()
+        defer { if access { folder.stopAccessingSecurityScopedResource() } }
+        guard try folder.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+            throw PartCallError(code: "folder_grant_invalid", message: "The selected resource is not a folder. Choose a folder again.")
+        }
+        let label = selection.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !label.isEmpty else { throw PartCallError(code: "folder_name_missing", message: "Choose a name for this shared folder.") }
+        return (label, folder.path, selection.writable)
     }
 }
 
 extension AppConnectorActionPlatform {
     init(engine: NativeAgentEngine) {
         self.init(dataRoot: engine.dataRoot, statusPlatform: AppConnectorStatusPlatform(),
-                  router: { .shared }, macAssistant: engine.macIntegration,
+                  macAssistant: engine.macIntegration,
                   notification: { title, body, turn in
                       await NativeAgentNotifications.postMessage(title: title, body: body, router: .shared,
                           turn: turn, deadline: nil).deliveryFields()
@@ -82,8 +100,7 @@ extension MacIntegrationDeliveryActions {
         self.init(
             connectorActions: { ConnectorActions(platform: AppConnectorActionPlatform(engine: .live)) },
             router: { .shared },
-            deviceSync: { NativeAgentEngine.liveDeviceSync },
-            scheduler: { .shared }
+            deviceSync: { NativeAgentEngine.liveDeviceSync }
         )
     }
 }

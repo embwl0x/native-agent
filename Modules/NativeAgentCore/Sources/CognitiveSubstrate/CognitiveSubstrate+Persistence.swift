@@ -12,7 +12,7 @@ extension CognitiveSubstrate {
         // Reject before capturing a snapshot: capture decays and caps the field.
         if forgettingInFlight {
             forgettingDiscarded.append((kind: "snapshot", id: UUID()))
-            forgettingDiscarded.append(contentsOf: affectCheckpoint(at: dependencies.now()).map { (kind: $0.kind, id: $0.id) })
+            forgettingDiscarded.append(contentsOf: affectCheckpoint().map { (kind: $0.kind, id: $0.id) })
             throw CognitiveWriteDiscarded()
         }
         guard !persistenceHealth.writesBlocked else {
@@ -22,19 +22,24 @@ extension CognitiveSubstrate {
         let now = dependencies.now()
         try await persistMaintenanceTransition(
             nodes: field.snapshot(at: now, configuration: configuration),
-            artifacts: affectCheckpoint(at: now), deletedArtifactIDs: [], receipts: [], at: now
+            artifacts: affectCheckpoint(), deletedArtifactIDs: [], receipts: [], at: now
         )
     }
 
-    func affectCheckpoint(at now: Date) -> [CognitiveArtifactWrite] {
-        [CognitiveArtifactWrite(
+    func affectCheckpoint() -> [CognitiveArtifactWrite] {
+        var artifacts = [CognitiveArtifactWrite(
             kind: "affect", id: stableArtifactID("affect"), status: "current",
             score: affect.arousal, payload: affect.toJSON(
                 lastUserPresenceAt: lastUserPresenceAt, lastWarmPresenceAt: lastWarmPresenceAt)
         ), CognitiveArtifactWrite(
             kind: "dream_residue", id: stableArtifactID("dream_residue"), status: "current",
-            score: 0, payload: dreamResidueArtifactPayload(at: now)
-        )]
+            score: 0, payload: dreamResidueArtifactPayload()
+        ), attentionCheckpoint()]
+        if let chosen = affect.chosenRegister {
+            artifacts.append(CognitiveArtifactWrite(kind: "register_choice", id: stableArtifactID("register:" + chosen.moment),
+                status: "recorded", score: 0, payload: chosen.payload))
+        }
+        return artifacts
     }
 
     /// Callers retaining owed work need confirmation, not a best-effort log.
@@ -214,7 +219,6 @@ extension CognitiveSubstrate {
             artifacts: artifacts,
             deletedArtifactIDs: deletedArtifactIDs,
             receipts: receipts,
-            maxNodes: configuration.maximumActiveNodes,
             maxArtifacts: artifactCap(configuration),
             at: now
         )

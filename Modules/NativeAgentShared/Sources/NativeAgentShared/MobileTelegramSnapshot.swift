@@ -3,6 +3,7 @@ import Foundation
 
 /// Credential-free readback of the Mac's Telegram settings and live loop state.
 public struct MobileTelegramSnapshot: Codable, Equatable, Sendable {
+    /// When the rest of this mobile state last changed, not the most recent snapshot read.
     public var observedAt: Double
     public var tokenConfigured: Bool
     public var enabled: Bool
@@ -12,6 +13,7 @@ public struct MobileTelegramSnapshot: Codable, Equatable, Sendable {
     public var model: String
     public var pollerRunning: Bool
     public var pollStatusMessage: String?
+    /// The loop owner's latest successful poll.
     public var lastSuccessfulPollAt: String?
 
     public init(observedAt: Double, tokenConfigured: Bool, enabled: Bool,

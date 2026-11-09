@@ -7,6 +7,7 @@ import ChatToolRuntime
 import TurnTrace
 import ToolRegistry
 import Experiences
+import Transcripts
 // Blueprint: | `SessionTurnDelivery.swift` | Session-owned live delivery and exact-run repair debt |
 
 /// The conversation owns its delivery destination; callers add observers only.
@@ -82,19 +83,29 @@ public enum SessionTurnDelivery {
         }
     }
 
-    static func open(dataRoot: URL, sessionID: String, runID: String, surface: String,turn: Turn) async -> Recipient? {
+    @concurrent private static func conversationDestination(sessionID: String, dataRoot: URL) async throws
+        -> (required: Bool, route: ChatToolSessionContext.ReplyRoute?) {
+        let kind = try SessionConversation.checkedKind(sessionID, dataRoot: dataRoot)
+        if kind == .builder || kind == .agent || kind == .ephemeral { return (false, nil) }
+        return (true, try await HumanConversationReader.readForSessionDelivery(sessionID: sessionID, dataRoot: dataRoot))
+    }
+
+    static func open(dataRoot: URL, sessionID: String, runID: String, surface: String, turn: Turn) async -> Recipient? {
         let (mounted, resolver) = state.withLock {
             ($0.mounts[key(dataRoot, sessionID, runID)]?.recipient, $0.resolvers[dataRoot.standardizedFileURL.path])
         }
         var route = turn.replyRoute ?? turn.envelope?.deliveryRoute
         let recipient: Recipient?
         var unavailable: String?
+        var needsDelivery = true
         do {
             if let mounted { recipient = mounted }
             else {
                 if route == nil || route?.surface == "caller-result" {
                     // Use the conversation's destination, never a caller's result route or an unrelated bridge-authored row.
-                    route = try await HumanConversationReader.readForSessionDelivery(sessionID: sessionID, dataRoot: dataRoot)
+                    let destination = try await conversationDestination(sessionID: sessionID, dataRoot: dataRoot)
+                    needsDelivery = destination.required
+                    route = destination.route
                 }
                 if let route {
                     recipient = try await resolver?.call(Context(dataRoot: dataRoot, sessionID: sessionID, runID: runID,
@@ -108,7 +119,7 @@ public enum SessionTurnDelivery {
             recipient = nil
             unavailable = TurnTraceRedactor.redactText(String(describing: error))
         }
-        if recipient == nil {
+        if recipient == nil && needsDelivery {
             RepairOwed.owe(dataRoot, id: "session-delivery:" + sessionID + ":" + runID, kind: .run,
                 operation: "session.delivery:" + sessionID + ":" + runID, owner: "Conversation delivery",
                 words: "Live delivery is still owed for run \(runID) in conversation \(sessionID). "
@@ -116,11 +127,11 @@ public enum SessionTurnDelivery {
                 lever: "Recover the recorded human destination and deliver the saved answer for this exact run; do not invent a route or repeat its work.")
         }
         do {
-                let turnID = turn.id
+            let turnID = turn.id
             TurnTraceBus.fire(TurnTraceEvent(turnId: turnID, kind: "turn.deliveryAttached",
                 sessionId: sessionID, surface: route?.surface ?? surface, payload: .object([
-                    "runId": .string(runID), "live": .bool(recipient != nil),
-                    "recipient": .string(mounted != nil ? "mounted" : recipient != nil ? "resident" : "unavailable"),
+                    "runId": .string(runID), "live": .bool(recipient != nil), "required": .bool(needsDelivery),
+                    "recipient": .string(mounted != nil ? "mounted" : recipient != nil ? "resident" : needsDelivery ? "unavailable" : "not-needed"),
                     "detail": unavailable.map(JSONValue.string) ?? .null
                 ]), turn: turn))
         }

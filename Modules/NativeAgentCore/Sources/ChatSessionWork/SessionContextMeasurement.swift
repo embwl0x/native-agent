@@ -21,6 +21,8 @@ public struct SessionContextMeasurement: Sendable {
     public let source: String
     public let previousTurnTokens: Int?
     public let turnDeltaTokens: Int?
+    /// Observed head of the last successful request on this route, never a replay selection input.
+    package let previousHistoryContextWindow: String?
     public var hasReceipt: Bool { source != "rendered_history_estimate" }
     let rowCharacters: [String: Int]
 
@@ -69,22 +71,25 @@ public struct SessionContextMeasurement: Sendable {
         let measurement = try await read(rows: [], sessionId: sessionId, model: model,
             providerID: providerID, dataRoot: dataRoot, windowTokens: windowTokens, call: call,
             requestBuilder: { _, _, _ in request })
-        let (total, overflow) = measurement.tokens.addingReportingOverflow(measurement.outputTokens)
-        let fits = !overflow && total <= windowTokens
+        let inputBudget = ContextBudgetPolicy.inputTokens(windowTokens: windowTokens, outputTokens: measurement.outputTokens)
+        let physicalInputLimit = ContextBudgetPolicy.physicalInputTokens(windowTokens: windowTokens, outputTokens: measurement.outputTokens)
+        let fits = measurement.tokens <= physicalInputLimit
         TurnTraceBus.fireFromContext(kind: "context.request.fit", sessionId: sessionId,
             surface: call.surface, payload: .object([
                 "status": .string(fits ? "ready" : "refused"),
                 "inputTokens": .int(Int64(measurement.tokens)),
                 "outputTokens": .int(Int64(measurement.outputTokens)),
                 "windowTokens": .int(Int64(windowTokens)),
+                "inputBudgetTokens": .int(Int64(inputBudget)),
+                "physicalInputLimitTokens": .int(Int64(physicalInputLimit)),
                 "requestCharacters": .int(Int64(request.characters)),
                 "source": .string(measurement.source)
             ]), turn: call.turn)
         guard fits else {
             throw ToolFailureError(
                 """
-                    The built request still exceeds the selected model's context window after fitting (\(measurement.tokens) measured input + \
-                    \(measurement.outputTokens) output allowance; \(windowTokens) available). This request was not sent; replay was not truncated. Reduce the \
+                    The built request still exceeds its physical input limit after fitting (\(measurement.tokens) measured input; \
+                    \(physicalInputLimit) available, \(measurement.outputTokens) output allowance; \(windowTokens) model window). This request was not sent. Reduce the \
                     current input or inspect its retained tool results before continuing.
                     """,
                 effects: .none, owner: "chat/messages/\(sessionId).jsonl", code: "context_window_exceeded", status: .refused, recovery: .repair)
@@ -99,6 +104,7 @@ public struct SessionContextMeasurement: Sendable {
         let requestPlan: Data?
         let previousTurnInputTokens: Int?
         let turnInputDeltaTokens: Int?
+        let historyContextWindow: String?
     }
 
     public static func read(sessionId: String, model: String, providerID: String?,
@@ -184,10 +190,13 @@ public struct SessionContextMeasurement: Sendable {
             charactersPerToken: ratio, source: source,
             previousTurnTokens: calibrated ? receipt?.previousTurnInputTokens : nil,
             turnDeltaTokens: calibrated ? receipt?.turnInputDeltaTokens : nil,
+            previousHistoryContextWindow: matching ? receipt?.historyContextWindow : nil,
             rowCharacters: rowCharacters)
     }
 
-    private static func rendered(_ rows: [JSONValue], windowTokens: Int, outputTokens: Int) throws -> (characters: Int, rows: [String: Int]) {
+    /// The readout sizes the conversation under the same input budget as a live request.
+    private static func rendered(_ rows: [JSONValue], windowTokens: Int,
+                                 outputTokens: Int) throws -> (characters: Int, rows: [String: Int]) {
         let latestUser = rows.lastIndex { $0.objectValue?["role"] == .string("user") }
         var unbounded = Set<String>()
         let renderables = try rows.enumerated().compactMap { index, row -> SessionHistoryPromptRenderer.Renderable? in
@@ -200,7 +209,7 @@ public struct SessionContextMeasurement: Sendable {
             let createdAt = try JSONRow(row).string("createdAt")
             let message = ChatMessage(role: role, content: content, timestamp: createdAt, extras: row)
             guard var rendered = SessionHistoryPromptRenderer.renderable(message) else { return nil }
-            // Current user words are not capped prior history; SentTurnContext owns exact replay after sending.
+            // Current user words are not capped prior history; SentTurnContext keeps the exact sent words after sending.
             if role == "user", rendered.sentContext == nil,
                index == latestUser {
                 unbounded.insert(rendered.historyIdentity)
@@ -209,13 +218,16 @@ public struct SessionContextMeasurement: Sendable {
             return rendered
         }
         guard let admission = try SessionHistoryMessages.admission(renderables: renderables, historyLimit: 1,
-            budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens), unboundedUserIdentities: unbounded) else { return (0, [:]) }
+            budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens),
+            unboundedUserIdentities: unbounded) else { return (0, [:]) }
         var projected = SessionHistoryMessages.project(admission)
-        let inputBudget = Double(max(0, windowTokens - outputTokens)) * ContextBudgetPolicy.transcriptCharactersPerToken
+        let inputBudget = Double(ContextBudgetPolicy.inputTokens(windowTokens: windowTokens, outputTokens: outputTokens))
+            * ContextBudgetPolicy.transcriptCharactersPerToken
         if Double(projected.characters) > inputBudget {
             let tail = SessionHistoryTail(admission, rowCharacters: projected.rowCharacters)
             let halfBudget = SessionHistoryTail.halfBudgetCharacters(windowTokens: windowTokens, outputTokens: outputTokens)
-            for checkpoint in tail.checkpoints(halfBudgetCharacters: halfBudget) {
+            for checkpoint in tail.fittingCheckpoints(halfBudgetCharacters: halfBudget,
+                maximumRetainedCharacters: inputBudget) {
                 projected = tail.project(after: checkpoint)
                 if Double(projected.characters) <= inputBudget { break }
             }

@@ -81,14 +81,13 @@ struct AgentContactPushConfig: Codable, Sendable {
 
     static func destination(_ raw: String) async throws -> Destination {
         let resolution = ContinuationOnce<Result<Destination, Error>>()
-        // getaddrinfo cannot be canceled or joined at the deadline.
+        // DNS owns this wait; silence cannot classify a destination as unsafe.
         DispatchQueue.global(qos: .utility).async {
             resolution.resume(Result { try resolveDestination(raw) })
         }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
-            resolution.resume(.failure(invalid))
-        }
-        return try await resolution.wait().get()
+        return try await withTaskCancellationHandler {
+            try await resolution.wait().get()
+        } onCancel: { resolution.resume(.failure(CancellationError())) }
     }
 
     private static func resolveDestination(_ raw: String) throws -> Destination {
@@ -102,14 +101,28 @@ struct AgentContactPushConfig: Codable, Sendable {
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_flags = AI_ADDRCONFIG
         var head: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, nil, &hints, &head) == 0, let first = head else { throw invalid }
+        let resolved = getaddrinfo(host, nil, &hints, &head)
+        guard resolved == 0 else {
+            let cause = gai_strerror(resolved).map { String(cString: $0) } ?? "resolver code \(resolved)"
+            throw AgentContactFailure(code: -32603,
+                message: "Callback DNS for \(host) failed: \(cause). Repair that destination's DNS before delivering its owed update.")
+        }
+        guard let first = head else {
+            throw AgentContactFailure(code: -32603,
+                message: "Callback DNS for \(host) returned no address. Configure a resolvable destination before delivering its owed update.")
+        }
         defer { freeaddrinfo(first) }
         var addresses: [String] = []
         var pointer: UnsafeMutablePointer<addrinfo>? = first
         while let current = pointer {
             let info = current.pointee
             var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            guard getnameinfo(info.ai_addr, info.ai_addrlen, &buffer, socklen_t(buffer.count), nil, 0, NI_NUMERICHOST) == 0 else { throw invalid }
+            let named = getnameinfo(info.ai_addr, info.ai_addrlen, &buffer, socklen_t(buffer.count), nil, 0, NI_NUMERICHOST)
+            guard named == 0 else {
+                let cause = gai_strerror(named).map { String(cString: $0) } ?? "resolver code \(named)"
+                throw AgentContactFailure(code: -32603,
+                    message: "Callback address for \(host) could not be read: \(cause). Repair its DNS address before delivering the owed update.")
+            }
             let address = String(cString: buffer)
             guard allowed(address, allowHTTP: url.scheme == "http") else { throw invalid }
             addresses.append(address)
@@ -135,47 +148,51 @@ struct AgentContactPushConfig: Codable, Sendable {
         let bytes = withUnsafeBytes(of: &ipv6) { Array($0) }
         if bytes.dropLast().allSatisfy({ $0 == 0 }) && bytes.last == 1 { return true }
         // Only global IPv6 unicast. This also excludes mapped IPv4, ULA, link-local, multicast, unspecified and well-known NAT64 addresses.
-        guard !allowHTTP, bytes[0] & 0xE0 == 0x20 else { return false }
+        var prefix = bytes.makeIterator()
+        guard !allowHTTP, let first = prefix.next(), let second = prefix.next(), let third = prefix.next(), let fourth = prefix.next(),
+              first & 0xE0 == 0x20 else { return false }
         // Reject transition mechanisms that can tunnel to private IPv4.
-        if bytes[0] == 0x20 && bytes[1] == 0x02 { return false }
-        if bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0 && bytes[3] == 0 { return false }
+        if first == 0x20 && second == 0x02 { return false }
+        if first == 0x20 && second == 0x01 && third == 0 && fourth == 0 { return false }
         return true
     }
 
     /// Pin DNS with --resolve while preserving hostname TLS checks. Exclude shell, user curlrc, proxies, redirects, credential argv and response bodies from
     /// callback transport.
-    func deliver(_ payload: Data) async -> Bool {
-        for attempt in 0..<3 {
-            guard !Task.isCancelled else { return false }
-            if attempt > 0 { try? await Task.sleep(for: .seconds(attempt == 1 ? 1 : 2)) }
-            guard !Task.isCancelled else { return false }
-            guard let target = try? await Self.destination(url), !Task.isCancelled else { return false }
-            func quoted(_ value: String) -> String {
-                "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-                    .replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r").replacingOccurrences(of: "\t", with: "\\t") + "\""
-            }
-            let ip = target.address.contains(":") ? "[\(target.address)]" : target.address
-            var config = "url = \(quoted(url))\n"
-            // A literal IPv6 URL already fixes the network destination.
-            if !target.host.contains(":") {
-                config += "resolve = \(quoted("\(target.host):\(target.port):\(ip)"))\n"
-            }
-            config += "header = \(quoted("Content-Type: application/a2a+json"))\n"
-            if let authentication {
-                let header = authentication.scheme + (authentication.credentials.map { " " + $0 } ?? "")
-                config += "header = \(quoted("Authorization: " + header))\n"
-            }
-            if let token { config += "header = \(quoted("X-A2A-Notification-Token: " + token))\n" }
-            config += "data-binary = \(quoted(String(decoding: payload, as: UTF8.self)))\n"
-            do {
-                let result = try await ProcessExecution().run(executable: "/usr/bin/curl",
-                    arguments: ["-q", "--globoff", "--config", "-", "--silent", "--noproxy", "*", "--proto", "=http,https", "--max-redirs", "0",
-                        "--connect-timeout", "3", "--max-time", "10", "--max-filesize", "1024", "--output", "/dev/null", "--write-out", "%{http_code}"],
-                    currentDirectory: nil, environment: ["PATH": "/usr/bin:/bin"],
-                    standardInput: Data(config.utf8), timeoutSeconds: 12, outputByteLimit: 1024)
-                if result.exitCode == 0, (200..<300).contains(Int(result.stdout) ?? 0) { return true }
-            } catch { if Task.isCancelled { return false } }
+    func deliver(_ payload: Data) async throws {
+        try Task.checkCancellation()
+        let target = try await Self.destination(url)
+        try Task.checkCancellation()
+        func quoted(_ value: String) -> String {
+            "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                .replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r").replacingOccurrences(of: "\t", with: "\\t") + "\""
         }
-        return false
+        let ip = target.address.contains(":") ? "[\(target.address)]" : target.address
+        var config = "url = \(quoted(url))\n"
+        // A literal IPv6 URL already fixes the network destination.
+        if !target.host.contains(":") {
+            config += "resolve = \(quoted("\(target.host):\(target.port):\(ip)"))\n"
+        }
+        config += "header = \(quoted("Content-Type: application/a2a+json"))\n"
+        if let authentication {
+            let header = authentication.scheme + (authentication.credentials.map { " " + $0 } ?? "")
+            config += "header = \(quoted("Authorization: " + header))\n"
+        }
+        if let token { config += "header = \(quoted("X-A2A-Notification-Token: " + token))\n" }
+        config += "data-binary = \(quoted(String(decoding: payload, as: UTF8.self)))\n"
+        let result = try await ProcessExecution().run(executable: "/usr/bin/curl",
+            arguments: ["-q", "--globoff", "--config", "-", "--silent", "--noproxy", "*", "--proto", "=http,https", "--max-redirs", "0",
+                "--max-filesize", "1024", "--output", "/dev/null", "--write-out", "%{http_code}"],
+            currentDirectory: nil, environment: ["PATH": "/usr/bin:/bin"],
+            standardInput: Data(config.utf8), timeoutSeconds: nil, outputByteLimit: 1024)
+        guard result.exitCode == 0 else {
+            throw AgentContactFailure(code: -32603,
+                message: "Callback transport exited \(result.exitCode): \(result.stderr). "
+                    + "Acceptance is unknown; inspect the receiver before another delivery.")
+        }
+        guard let status = Int(result.stdout), (200..<300).contains(status) else {
+            throw AgentContactFailure(code: -32603,
+                message: "Callback returned HTTP \(result.stdout). Repair the receiver before requesting another delivery.")
+        }
     }
 }

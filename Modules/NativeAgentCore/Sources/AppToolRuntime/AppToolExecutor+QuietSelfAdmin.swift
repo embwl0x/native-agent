@@ -27,7 +27,22 @@ extension AppToolExecutor {
               case .object(let next) = detail["next_action"],
               next["tool"] == .string("app"),
               case .object(let input) = next["input"] else { return result }
-        let outcome = await run(input)
+        var outcome = await run(input)
+        if input["action"] == nil, case .object(var failure) = outcome,
+           failure["reason"] == .string("app_window_unavailable"),
+           case .string(let behindApp)? = detail["behind_app"] {
+            let next: JSONValue = .object(["tool": .string("app"), "input": .object([
+                "action": .string("mac.look"), "args": .object(["app": .string(behindApp)]),
+            ])])
+            failure["next_call"] = next
+            failure["remedy"] = .object([
+                "kind": .string("correct_route"),
+                "instruction": .string("No window is connected to this process right now. "
+                    + "Make next_call to read \(behindApp), the app behind me."),
+                "next_call": next,
+            ])
+            outcome = .object(failure)
+        }
         // Only a verified navigation keeps its success when its subsequent look fails.
         if input["action"] == nil, case .object(let navigation)? = detail["navigation"], navigation["ok"] == .bool(true) {
             var response = payload
@@ -43,13 +58,14 @@ extension AppToolExecutor {
         response["ok"] = .bool(response["status"] == .string("ok"))
         // Self-window look retains the app behind it so observation does not lose the user's context.
         if case .string(let behind)? = detail["behind"] { response["behind"] = .string(behind) }
+        if case .string(let behindApp)? = detail["behind_app"] { response["behind_app"] = .string(behindApp) }
         return .object(response)
     }
 
     // MARK: - Posture
 
     /// Work and Builder share balanced permissionLevel; outside-workspace writes (deny/ask) distinguish them.
-    /// App settings admission uses ownerOnly/fullMacOnly independently of Mac effects and workspace fences.
+    /// App settings admission uses ownerOnly and each row's direction check independently of Mac effects and workspace fences.
     /// Permission acquisition follows docs/TOOL_LOADING.md#authority-and-receipts.
     public struct QuietPosture: Sendable {
         public let name: String
@@ -118,8 +134,9 @@ extension AppToolExecutor {
     public static func unattachedFailure() -> JSONValue {
         doorRefusal(
             "app_window_unavailable",
-            "The app's own pages are not available in this process — there is no live window to read.",
-            remedy: "correct_arguments", "Call app from the installed app's chat tool chain; supplying a session id cannot attach a live window."
+            "No window is connected to this process right now, so this window-dependent request cannot run.",
+            remedy: "correct_route",
+            "Open NativeAgent's window and repeat this call. To read another app, call app {action:\"mac.look\",args:{app:\"<app name>\"}}."
         )
     }
 
@@ -179,11 +196,52 @@ extension AppToolExecutor {
     // MARK: - Page read
 
     public static func pageReadResult(page: String, fields: [String: JSONValue]) -> JSONValue {
-        .object(fields.merging([
+        var fields = fields
+        let content = fields["content"]?.arrayValue ?? []
+        let settings = fields["settings"]?.arrayValue ?? []
+        let conversation = fields["conversation"]?.objectValue
+        let reads = content + settings + [fields["item"], fields["conversation"],
+                                                  conversation?["session_history"], conversation?["live"]].compactMap { $0 }
+        // Read parts retain their own cause. A readable shell cannot certify failed or incomplete content as an ok page.
+        // A card reports its own lifecycle: a failed card is content read in full, not a part that failed to read.
+        if fields["status"] == .string("ok"), reads.contains(where: { part in
+            guard case .object(let row) = part, row["card"] == nil else { return false }
+            let reply = ToolResult(part)
+            return reply.carriesFailureEvidence || reply.status == "partial"
+                || (row["unavailable"] != nil && row["unavailable"] != .null)
+        }) { fields["status"] = .string("partial") }
+        return .object(fields.merging([
             "page": .string(page),
             "page_read": .bool(true),
             "page_shown_by_this_call": .bool(false),
         ]) { _, receipt in receipt })
+    }
+
+    /// The page's setting rows, one producer for the page read's `settings` list and for an item read of one row (`only`, matched like
+    /// setting.get matches an id): types, choices and notes make setting.set's contract complete, and a row that cannot be read stays listed,
+    /// unavailable, so one row's failure never removes its siblings.
+    @MainActor
+    func pageSettingRows(page: QuietToolPage, host: any QuietToolHost, only item: String? = nil) async throws -> [JSONValue] {
+        var rows: [JSONValue] = []
+        let wanted = item?.lowercased()
+        for setting in try QuietSettings.settings(forPage: page.id, host: host) where wanted == nil || setting.id.lowercased() == wanted {
+            do {
+                if case .object(let listed) = try await setting.catalogRow(host: { self.quietHost() }) {
+                    var row = listed.filter { ["id", "label", "type", "choices", "note", "writable", "owner_only"].contains($0.key) }
+                    if setting.readsAnotherDevice {
+                        row["read_with"] = .object(["action": .string("setting.get"),
+                            "args": .object(["setting": .string(setting.id)])])
+                    } else {
+                        row["value"] = try await setting.read(host)
+                    }
+                    rows.append(.object(row))
+                }
+            } catch {
+                // A row in the list is that setting, unavailable: it keeps its id like its siblings.
+                rows.append(.object(["id": .string(setting.id), "unavailable": Self.settingReadFailure(error, setting: setting)]))
+            }
+        }
+        return rows
     }
 
     /// Setting rows carry types, choices and notes so page reads supply the complete setting.set contract.
@@ -193,42 +251,21 @@ extension AppToolExecutor {
         if requested.lowercased() == "context" { return await presentation.contextReceiptRead(input: input) }
         if requested.lowercased() == "agent_view" { return await presentation.agentViewRead(input: input) }
         let current = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "current"
-        guard let page = current ? presentation.currentPage : presentation.page(named: requested) else {
+        guard let page = current ? presentation.currentPage : await presentation.page(named: requested) else {
             if current {
                 return Self.doorRefusal("app_window_unavailable", "No app window is showing a page right now.",
                     remedy: "select_page", "Read the page index and name a page instead of current.", next: [:])
             }
-            do { return Self.unknownPageFailure(requested, pages: try presentation.pages.map(\.id)) }
+            do { return Self.unknownPageFailure(requested, pages: try await presentation.pages.map(\.id)) }
             catch { return ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none) }
         }
         guard let appModel = quietHost() else { return Self.unattachedFailure() }
 
         let content = await appModel.pageRead(page, turn: turn)
         let posture = await Self.freshQuietPosture()
-        let fullMac = posture?.name == Self.fullMacModeName
-        var settingRows: [JSONValue] = []
-        let settings: [QuietSetting]
-        do { settings = try QuietSettings.settings(forPage: page.id, host: quietHost()) }
+        let settingRows: [JSONValue]
+        do { settingRows = try await pageSettingRows(page: page, host: appModel) }
         catch { return ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none) }
-        for setting in settings {
-            do {
-                if case .object(let listed) = try await setting.catalogRow(fullMac: fullMac, host: { self.quietHost() }) {
-                    var row = listed.filter { ["id", "label", "type", "choices", "note", "writable", "owner_only", "full_mac_only"].contains($0.key) }
-                    if setting.readsAnotherDevice {
-                        row["read_with"] = .object(["action": .string("setting.get"),
-                            "args": .object(["setting": .string(setting.id)])])
-                    } else {
-                        row["value"] = try await setting.read(appModel)
-                    }
-                    if setting.fullMacOnly && !fullMac { row["refusal"] = listed["refusal"] }
-                    settingRows.append(.object(row))
-                }
-            } catch {
-                // A row in the list is that setting, unavailable: it keeps its id like its siblings.
-                settingRows.append(.object(["id": .string(setting.id),
-                    "unavailable": Self.settingReadFailure(error, setting: setting)]))
-            }
-        }
 
         return Self.pageReadResult(page: page.id, fields: [
             "status": .string("ok"),
@@ -251,6 +288,8 @@ extension AppToolExecutor {
         let value: JSONValue
         let request: String?
         let restoresPrevious: Bool
+        /// The person decided this exact call (`QuietSettings.personDecided`).
+        let decided: Bool
         let write: @MainActor @Sendable (any QuietSettingsHost, JSONValue, QuietSettingWrite) async throws -> Void
     }
 
@@ -273,7 +312,7 @@ extension AppToolExecutor {
             do {
                 known = try requestedPage.isEmpty
                     ? QuietSettings.all(host: quietHost())
-                    : QuietSettings.settings(forPage: presentation.page(named: requestedPage)?.id ?? "", host: quietHost())
+                    : QuietSettings.settings(forPage: await presentation.page(named: requestedPage)?.id ?? "", host: quietHost())
             } catch { return refuse(ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none)) }
             return refuse(Self.failure(
                 "unknown_setting",
@@ -285,7 +324,7 @@ extension AppToolExecutor {
             ))
         }
         if !requestedPage.isEmpty,
-           let page = presentation.page(named: requestedPage), page.id != setting.page {
+           let page = await presentation.page(named: requestedPage), page.id != setting.page {
             return refuse(Self.failure(
                 "wrong_page",
                 "That setting lives on a different page.",
@@ -297,8 +336,12 @@ extension AppToolExecutor {
         do { currentValue = try await setting.read(appModel) }
         catch { return refuse(Self.settingReadFailure(error, setting: setting)) }
 
-        // User-owned posture controls remain user-only regardless of session mode or Full Mac.
-        if setting.ownerOnly {
+        // Who decides: the person's own decided call of exactly these arguments (their tap, the phone's signed change, a card they approved)
+        // passes every person-only check below; nothing else does. Posture is what the agent may do, never what the person may.
+        let decided = QuietSettings.personDecided(input.filter { !$0.key.hasPrefix("__") }, turn: turn)
+
+        // The person's controls stay the person's at every posture, Full Mac included.
+        if setting.ownerOnly, !decided {
             return refuse(Self.failure(
                 "owner_only",
                 QuietSettings.ownerOnlyRefusal,
@@ -321,9 +364,10 @@ extension AppToolExecutor {
             }
             request = Self.text(receipt["user_request"])
             restoresPrevious = true
-        } else if !setting.mindOwned, turn.runtime != nil,
+        } else if !setting.mindOwned, !decided,
                   await Self.freshQuietPosture()?.name != Self.fullMacModeName {
-            // Under Full Mac the agent's own dials are its own (owner-only rows refused above); below it a change needs the person's words.
+            // Under Full Mac the agent's own dials are its own (owner-only rows refused above); below it the agent's change, from any of its
+            // turns or parts, needs the person's words.
             request = Self.text(input["because"])
             guard let request, request.split(whereSeparator: \.isWhitespace).count >= 3,
                   let restores = await turn.settingRequestEvidence?(setting.id, input["value"] ?? .null, currentValue, request) else {
@@ -336,7 +380,8 @@ extension AppToolExecutor {
 
         var posture: QuietPosture?
         if !setting.mindOwned {
-            guard let checkedPosture = await Self.freshQuietPosture() else {
+            posture = await Self.freshQuietPosture()
+            if posture == nil, !decided {
                 return refuse(Self.unreadablePostureFailure(extra: [
                     "setting": .string(setting.id),
                     "page": .string(setting.page),
@@ -344,9 +389,8 @@ extension AppToolExecutor {
                     "current_value": currentValue,
                 ]))
             }
-            posture = checkedPosture
         }
-        if let posture, !posture.changesAllowed {
+        if let posture, !posture.changesAllowed, !decided {
             return refuse(Self.failure(
                 "trust_mode_read_only",
                 "\(posture.name) is the posture that changes nothing at all — it is the person's "
@@ -360,20 +404,7 @@ extension AppToolExecutor {
                 ]
             ))
         }
-        // Only Full Mac may lower Trust; raising to Full Mac always requires the person.
-        if setting.fullMacOnly, posture?.name != Self.fullMacModeName {
-            return refuse(Self.failure(
-                "trust_posture_needs_full_mac",
-                QuietSettings.belowFullMacRefusal,
-                extra: [
-                    "trust_mode": .string(posture?.name ?? "unreadable"),
-                    "setting": .string(setting.id),
-                    "page": .string(setting.page),
-                    "requested_value": input["value"] ?? .null,
-                    "current_value": currentValue,
-                ]
-            ))
-        }
+        // A Trust posture row is the agent's to lower at any posture; its own check asks the person for a raise.
         guard let write = setting.write else {
             return refuse(Self.failure(
                 "not_writable",
@@ -395,7 +426,7 @@ extension AppToolExecutor {
             }
         }
         return .success(GatedSetting(setting: setting, host: appModel, posture: posture, value: requestedValue, request: request,
-            restoresPrevious: restoresPrevious, write: write))
+            restoresPrevious: restoresPrevious, decided: decided, write: write))
     }
 
     /// Preview shares every pre-write check; each write rechecks its lower/narrow-only value rule against current state.
@@ -404,9 +435,7 @@ extension AppToolExecutor {
         switch await settingGate(input: input, turn: turn, execution: execution) {
         case .failure(let refusal): return refusal.answer
         case .success(let gated):
-            let admitted = turn.with(\.settingFullMac, gated.posture?.name == Self.fullMacModeName)
-                .with(\.restoresPreviousSetting, gated.restoresPrevious)
-            guard let refused = await gated.setting.check?(gated.host, gated.value, admitted) else { return nil }
+            guard let refused = await gated.setting.check?(gated.host, gated.value, turn) else { return nil }
             return await Self.settingWriteFailure(refused, gated.setting, gated.value, host: gated.host, detail: ["effects": .string("none")])
         }
     }
@@ -450,8 +479,14 @@ extension AppToolExecutor {
             extra["remedy"] = Repair.remedy(owner: owner,
                 nextCall: failure.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }, tap: failure.tap)
         }
-        let code = if case QuietSettingError.users = error { "owners_call" } else { "write_refused" }
-        return failure(code, error.localizedDescription, extra: extra)
+        // A raise of the agent's own reach is the person's: the reply asks for this exact call, and the gate puts it on the person's card.
+        if case QuietSettingError.users = error {
+            var ask = extra
+            ask["status"] = .string("needs_person"); ask["reason"] = .string("owners_call"); ask["effects"] = .string("none")
+            ask["detail"] = .string(error.localizedDescription)
+            return .object(ask)
+        }
+        return failure("write_refused", error.localizedDescription, extra: extra)
     }
 
     /// setting.get reads the same page-owned state and names as setting.set.
@@ -475,15 +510,13 @@ extension AppToolExecutor {
             if setting.kind == .boolean { reply["accepted_values"] = .array([.bool(false), .bool(true)]) }
             let posture = setting.mindOwned ? nil
                 : await Self.freshQuietPosture(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-            if case .object(let catalog) = try await setting.catalogRow(
-                fullMac: posture?.name == Self.fullMacModeName, host: { self.quietHost() }
-            ) {
-                for key in ["choices", "note", "writable", "owner_only", "full_mac_only", "refusal"] {
+            if case .object(let catalog) = try await setting.catalogRow(host: { self.quietHost() }) {
+                for key in ["choices", "note", "writable", "owner_only", "refusal"] {
                     reply[key] = catalog[key]
                 }
             }
             if setting.mindOwned {
-                reply["writable"] = .bool(setting.writable(fullMac: false))
+                reply["writable"] = .bool(setting.writable)
             } else if let posture {
                 if !posture.changesAllowed {
                     reply["writable"] = .bool(false)
@@ -511,21 +544,13 @@ extension AppToolExecutor {
         let before: JSONValue
         do { before = try await setting.read(appModel) }
         catch { return Self.settingReadFailure(error, setting: setting) }
-        // Below Full Mac, the row refuses raises; Full Mac permits them with a decided row for the user.
-        var raise = false
-        if posture?.name == Self.fullMacModeName,
-           case QuietSettingError.users? = await setting.check?(appModel, requestedValue, turn) {
-            raise = true
-        }
         let writeDetail = QuietWriteDetail()
-        let admitted = turn.with(\.settingFullMac, posture?.name == Self.fullMacModeName)
-            .with(\.restoresPreviousSetting, gated.restoresPrevious)
         do {
             if case .object(let receipt) = execution.undoReceipt,
                receipt["new_value"] != (try await setting.read(appModel)) {
                 throw QuietSettingError.unavailable("The setting changed after that receipt. Read its page again. Nothing was written.")
             }
-            try await write(appModel, requestedValue, QuietSettingWrite(turn: admitted, detail: writeDetail))
+            try await write(appModel, requestedValue, QuietSettingWrite(turn: turn, detail: writeDetail))
         } catch {
             // Multi-surface failures report every surface already touched so rollback cannot understate actual reach.
             let touched = writeDetail.take()
@@ -537,11 +562,6 @@ extension AppToolExecutor {
         catch {
             return await Self.settingWriteFailure(error, setting, requestedValue, host: appModel,
                 detail: detail.merging(["effects": .string("unknown")]) { _, new in new })
-        }
-        if raise {
-            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "setting.set \(setting.id)",
-                                   sessionID: input["__session_id"]?.scalarText,
-                                   dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         }
 
         // The tool result is the receipt persisted in the transcript; a second ledger would diverge.
@@ -563,6 +583,11 @@ extension AppToolExecutor {
         if let request = gated.request {
             receipt["user_request"] = .string(request)
             receipt["decided_by"] = .string("agent")
+        }
+        // The person's own change is theirs to change back, on its row; the agent's undo never restores what the person decided.
+        if gated.decided {
+            receipt["decided_by"] = .string("person")
+            receipt["undo_unavailable"] = .string("The person decided this change; changing it back is theirs, on its row.")
         }
         return .object(receipt)
     }

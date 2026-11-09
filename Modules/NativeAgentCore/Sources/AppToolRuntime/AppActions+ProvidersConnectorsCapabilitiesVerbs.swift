@@ -1,0 +1,119 @@
+import Foundation
+import NativeAgentCore
+import PersistenceCore
+// Blueprint: | `AppActions+ProvidersConnectorsCapabilitiesVerbs.swift` | The verbs the rows of Providers, Connectors (Telegram, iPhone, agents) and Capabilities call that no other verb runs; each is a `connections` host verb running the code its row ran |
+
+extension AppActions {
+    /// What a row of the stem's Providers, Connectors and Capabilities pages does where no other verb does it, declared once: the person's
+    /// tap and the agent's call are the same `connections` host call. A lever names why it is the person's, and `asks: false` where no card
+    /// can carry the agent's ask (a sign-in, a key, a pairing, a window or panel on the Mac, a macOS grant in the foreground).
+    static var providersConnectorsCapabilitiesVerbs: [AppAction] {
+        get throws {
+            // An irreversible change writes app data through its tool, as every irreversible row verb declares.
+            let writes: Set<String> = ["app_data_write", "safe_read", "tool_call"]
+            return [
+                AppAction("provider.choose", "providers", "Choose a model group's model, thinking, Fast or Same as Chat",
+                          ["group", "setting:model|thinking|fast|use_chat", "value:any"], subject: ["group", "setting"],
+                          owner: .person("models are the person's picks, on Providers"), tool: "connections", input: verb("provider_choose")),
+                AppAction("provider.codex_session", "providers", "Use, ignore or back up and reset the Codex CLI sign-in found on this Mac",
+                          ["answer:use|ignore|repair"], owner: .person("adopting a sign-in is the person's consent, on Providers", asks: false),
+                          tool: "connections", input: verb("provider_codex_session")),
+
+                AppAction("connector.connect", "connectors", "Connect or reconnect an account on its setup card in chat", ["id"], subject: ["id"],
+                          owner: .person("signing in is the person's, on the connector's setup card", asks: false),
+                          tool: "connections", input: verb("connector_connect")),
+                AppAction("connector.forget_secret", "connectors", "Forget a kept secret", ["name"], subject: ["name"],
+                          owner: .person("only the person can grant it again"), irreversible: true, capabilities: writes,
+                          tool: "connections", input: verb("connector_forget_secret")),
+                AppAction("connector.share_folder", "connectors", "Share a folder, chosen with its access on the Mac",
+                          owner: .person("the person chooses the folder and its access on the Mac", asks: false),
+                          tool: "connections", input: verb("connector_share_folder")),
+
+                AppAction("telegram.refresh", "telegram", "Read Telegram's records again", tool: "connections", input: verb("telegram_refresh"),
+                          read: true),
+                AppAction("telegram.token", "telegram", "Enter or replace the bot token on its key-entry card in chat",
+                          owner: .person("the bot token is the person's to enter, on its key-entry card", asks: false),
+                          tool: "connections", input: verb("telegram_token")),
+                AppAction("telegram.allowlist", "telegram", "Replace the allowed chat or user IDs (numeric IDs separated by commas)",
+                          ["list:chats|users", "value"], subject: ["list"], owner: .person("who may reach the agent on Telegram is the person's"),
+                          tool: "connections", input: verb("telegram_allowlist")),
+                AppAction("telegram.allow_chat", "telegram", "Allow a blocked chat ID", ["chat"], subject: ["chat"],
+                          owner: .person("who may reach the agent on Telegram is the person's"), tool: "connections", input: verb("telegram_allow_chat")),
+                AppAction("telegram.check_sender", "telegram", "Check sender: who messaged the bot appears under Blocked and ignored",
+                          owner: .person("who may reach the agent on Telegram is the person's"), tool: "connections",
+                          input: verb("telegram_check_sender")),
+                AppAction("telegram.choose", "telegram", "Telegram's model (any provider's model ID) or its thinking level",
+                          ["setting:model|think", "value"], subject: ["setting"], owner: .person("Telegram's model is the person's pick"),
+                          tool: "connections", input: verb("telegram_choose")),
+                AppAction("telegram.voice_setup", "telegram", "Set up Telegram voice: speech recognition on the Mac",
+                          owner: .person("macOS asks the person for speech recognition in the foreground", asks: false),
+                          tool: "connections", input: verb("telegram_voice_setup")),
+
+                AppAction("pairing.check_delivery", "pairing", "Check iCloud delivery of the pairing key", tool: "connections",
+                          input: verb("pairing_check_delivery")),
+                AppAction("pairing.pair", "pairing", "Pair a waiting phone", ["id"], subject: ["id"],
+                          owner: .person("the person matches the phone's code and pairs it on the Mac", asks: false),
+                          tool: "connections", input: verb("pairing_pair")),
+                AppAction("pairing.rotate", "pairing", "Regenerate the pairing key; the old key stops working at once",
+                          owner: .person("the person regenerates the pairing key on the Mac", asks: false), irreversible: true,
+                          capabilities: writes, tool: "connections", input: verb("pairing_rotate")),
+                AppAction("pairing.use_here", "pairing", "Use the iPhone with this Mac, disconnecting it from the other one",
+                          owner: .person("moving the iPhone between Macs is the person's, on the Mac", asks: false),
+                          tool: "connections", input: verb("pairing_use_here")),
+
+                AppAction("agent.refresh", "agents", "Read the agent address book again", tool: "connections", input: verb("agent_refresh"),
+                          read: true),
+                AppAction("agent.look", "agents", "Look for agents on this Mac: A2A cards, MCP settings, ACP programs (may run a program's --help)",
+                          owner: .person("looking for agents from Connectors is the person's", instead: "agent.contacts with discover finds them"),
+                          tool: "connections", input: verb("agent_look")),
+                AppAction("agent.ask_in_chat", "agents", "Ask in a new Mac chat to connect, test or disconnect an agent",
+                          ["agent", "ask:connect|test|disconnect"], subject: ["agent"],
+                          owner: .person("it starts a new chat with the person's own ask, on the Mac", instead: "agent.connect and agent.verify",
+                                         asks: false), tool: "connections", input: verb("agent_ask_in_chat")),
+                AppAction("agent.send", "agents", "Send the person's own message to an agent, from a conversation (default: the person's current one)",
+                          ["agent", "value", "session?"], subject: ["agent"],
+                          owner: .person("it sends the person's own words", instead: "agent.message sends yours", asks: false), toolClass: .send,
+                          tool: "connections", input: verb("agent_send")),
+                AppAction("agent.grok_import", "agents", "Read a Grok Bot routine's credentials securely on this Mac", ["agent"], subject: ["agent"],
+                          owner: .person("routine credentials are the person's, read on the Mac", asks: false),
+                          tool: "connections", input: verb("agent_grok_import")),
+                AppAction("agent.grok_paste", "agents", "Paste a Grok Bot routine's credentials in the Mac's secure window", ["agent"],
+                          subject: ["agent"], owner: .person("routine credentials go from the Mac's secure field to the keychain", asks: false),
+                          tool: "connections", input: verb("agent_grok_paste")),
+                AppAction("agent.grok_bot", "agents", "Grok Bot's exact sidebar name for a contact's routine", ["agent", "value"], subject: ["agent"],
+                          owner: .person("setting up a contact's connection is the person's, on Connectors"),
+                          tool: "connections", input: verb("agent_grok_bot")),
+
+                AppAction("capability.check_trust", "capabilities", "Check a capability's trust", ["id"], subject: ["id"],
+                          tool: "connections", input: verb("capability_check_trust")),
+                AppAction("connector.dry_run", "capabilities", "Dry-run a connector action", ["id"], subject: ["id"],
+                          tool: "connections", input: verb("connector_dry_run")),
+                AppAction("native.dry_run", "capabilities", "Dry-run a Mac action", ["id"], subject: ["id"],
+                          tool: "connections", input: verb("native_dry_run")),
+                AppAction("native.run", "capabilities", "Run a Mac action", ["id"], subject: ["id"],
+                          owner: .person("it runs the Mac action as the person's own act"), tool: "connections", input: verb("native_run")),
+                AppAction("improvement.run", "capabilities", "Run the improvement checks", tool: "connections", input: verb("improvement_run")),
+                AppAction("browser.preview", "capabilities", "Browser dry run", tool: "connections", input: verb("browser_preview")),
+                AppAction("browser.cancel", "capabilities", "Cancel a browser run", ["id"], subject: ["id"],
+                          tool: "connections", input: verb("browser_cancel")),
+                AppAction("tools.refresh", "tools", "Read the chat tool list again", tool: "connections", input: verb("tools_refresh"), read: true),
+                AppAction("sense.switch", "capabilities", "Turn a sense version on or off", ["sense_id", "version:int", "value:bool"],
+                          subject: ["sense_id"], owner: .person("turning a sense on or off is the person's consent"),
+                          tool: "connections", input: verb("sense_switch")),
+                AppAction("sense.share", "capabilities", "Share a sense version as a file saved where the person chooses on the Mac",
+                          ["sense_id", "version:int"], subject: ["sense_id"],
+                          owner: .person("sharing a sense exports it to a place the person chooses on the Mac", asks: false),
+                          tool: "connections", input: verb("sense_share")),
+                AppAction("ability.keep", "tools", "Approve an ability's exact waiting version and turn it on", ["id", "version?"], subject: ["id"],
+                          owner: .person("approving a grown ability is the person's", instead: "ability.enable keeps it as yours"),
+                          tool: "connections", input: verb("ability_keep")),
+                AppAction("ability.off", "tools", "Turn an ability off as the person's own off, which stays off until the person turns it on",
+                          ["id"], subject: ["id"], owner: .person("the person's off stays off", instead: "ability.disable turns it off as yours"),
+                          tool: "connections", input: verb("ability_off")),
+                AppAction("skill.build", "skills", "Build a skill in chat: the request started in the Mac's message box",
+                          owner: .person("it starts the person's own request in the Mac's message box", asks: false),
+                          tool: "connections", input: verb("skill_build")),
+            ]
+        }
+    }
+}

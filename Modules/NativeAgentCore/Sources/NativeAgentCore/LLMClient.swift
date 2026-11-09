@@ -180,8 +180,6 @@ public struct LLMStreamCallInput: Sendable, Equatable {
 
 public enum LLMToolBoundaryReason: String, Sendable, Equatable {
     case repeatedBlock, repeatedAction, fabricatedResult, postCallProse, outputLimit, incompleteCall, interrupted
-    /// The person steered mid-reply: the stream was cut at the next delta so their words land now.
-    case steered
     /// The provider's safety layer stopped the reply (stop_reason refusal).
     case refusal
 

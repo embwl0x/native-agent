@@ -23,9 +23,10 @@ import TrustCenter
 import TurnTrace
 import ApprovalTransactions
 import os
-// Blueprint: | `EngineTurnContinuation.swift` | `TurnContinuationRuntime`; Shared admission and reply settlement |
+// Blueprint: | `EngineTurnContinuation.swift` | `TurnContinuationRuntime`: turns a relaunch interrupted resume, settled Desk waits return, reply settlement |
 
-/// Continuations share the admitted turn path; Desk receipts and approval claims retain their own settlement rules.
+/// Turns a relaunch interrupted resume through the admitted turn path; a settled Desk wait returns to its conversation as a `returned` happening; approval
+/// claims keep their own settlement rules.
 public struct TurnContinuationRuntime: Sendable {
     private let dataRoot: URL
     private let engine: NativeAgentEngine
@@ -151,79 +152,108 @@ public struct TurnContinuationRuntime: Sendable {
         }
     }
 
-    public func makeDeskContinuationScheduler() -> DeskContinuationScheduler {
-        return DeskContinuationScheduler(dataRoot: dataRoot,
-            isAllowed: { await UnattendedWork.allowed(dataRoot: dataRoot) },
-            verify: { step, record in
-                // Verify whole-file writes against the checkpoint’s retained content digest.
-                guard step.tool == "write_file", let reference = step.reference,
-                      case .string(let path)? = reference["path"], path.hasPrefix("/"),
-                      case .int(let bytes)? = reference["bytes"], case .string(let digest)? = reference["sha256"],
-                      record.fileAccess != "none", let peerSources = record.peerSources else {
-                    return .unknown("\(step.tool) has no domain verifier")
-                }
-                guard bytes >= 0 else { return .unknown("write_file checkpoint has a negative byte count") }
-                let envelope = try continuationEnvelope(record)
-                _ = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
-                let dispatcher = makeGatedToolDispatchClient(
-                    tools: engine.toolDispatchClient(enforceAppAutonomy: false),
-                    fileAccess: record.fileAccess, dataRoot: dataRoot, verifiedSessionId: record.sessionID)
-                let verification = TurnRequest(message: record.remainingWork, sessionID: record.sessionID,
-                    fileAccess: record.fileAccess, surface: record.surface, envelope: envelope,
-                    verifiedSessionID: .some(record.sessionID), verifiedChatID: .some(envelope.verifiedChatId),
-                    verifiedUserID: .some(envelope.verifiedUserId))
-                let turn = verification.turn().with(\.peerSteering, PeerDataTaint(restoring: peerSources))
-                let invocation = ChatToolInvocation()
-                var offset: Int64 = 0
-                var version: String?
-                var hash = SHA256()
-                while true {
-                    try Task.checkCancellation()
-                    var input: [String: JSONValue] = ["path": .string(path), "max_bytes": .int(200_000),
-                        "offset": .int(offset), "raw": .bool(true)]
-                    if let version { input["version"] = .string(version) }
-                    let receipt = try await dispatcher.dispatch(tool: "read_file", input: input, surface: record.surface, turn: turn, invocation: invocation)
-                    guard case .object(let fields) = receipt else {
-                        return DeskContinuationScheduler.Verdict.unknown("write_file \(path) observation returned no read receipt")
-                    }
-                    guard fields["ok"] == .bool(true) else {
-                        let cause = fields["error"]?.stringValue ?? "read receipt omitted its failure cause"
-                        return .unknown("write_file \(path) could not be observed: \(cause)")
-                    }
-                    guard fields["offset"] == .int(offset),
-                          case .string(let observedVersion)? = fields["version"], !observedVersion.isEmpty,
-                          version == nil || version == observedVersion,
-                          case .int(let total)? = fields["bytes"], total >= 0,
-                          case .bool(let hasMore)? = fields["has_more"],
-                          case .string(let content)? = fields["content"] else {
-                        return .unknown("write_file \(path) observation is incomplete or changed between windows")
-                    }
-                    guard total == bytes else { return .unknown("write_file \(path) byte count does not match the checkpoint") }
-                    let chunk: Data?
-                    if fields["encoding"] == .string("base64") { chunk = Data(base64Encoded: content) }
-                    else { chunk = Data(content.utf8) }
-                    guard let chunk, fields["returned_bytes"] == .int(Int64(chunk.count)) else {
-                        return .unknown("write_file \(path) observation did not preserve the returned bytes")
-                    }
-                    let next = offset.addingReportingOverflow(Int64(chunk.count))
-                    guard !next.overflow, next.partialValue <= total,
-                          hasMore ? (!chunk.isEmpty && next.partialValue < total) : next.partialValue == total else {
-                        return .unknown("write_file \(path) observation has incomplete byte coverage")
-                    }
-                    hash.update(data: chunk)
-                    if !hasMore {
-                        guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == digest else {
-                            return .unknown("write_file \(path) does not match the checkpointed content")
-                        }
-                        return .settled("write_file \(path) matches the checkpointed content digest")
-                    }
-                    offset = next.partialValue
-                    version = observedVersion
-                }
-            },
-            resume: { item, record in
-                try await resumeDeskContinuation(item: item, record: record)
-            })
+    /// A Desk wait settles when every helper it waits on has its receipt. It is work coming back: a `returned` happening to the conversation of the turn
+    /// that waited, whose turn there goes on with the item. A turn that ended interrupted is not a wait: it is blocked where it stopped and never resumed
+    /// on its own; one with a checkpoint of its run is the relaunch's to resume. One item's failure is that item's; its siblings proceed.
+    public func returnSettledDeskWaits() async throws {
+        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
+        var failures: [String] = []
+        for item in try await store.liveState().items.sorted(by: { $0.handle < $1.handle }) {
+            do { try await returnIfSettled(item, store: store) }
+            catch is CancellationError { throw CancellationError() }
+            catch { failures.append("Desk item \(item.alias): \(error.localizedDescription)") }
+        }
+        guard failures.isEmpty else {
+            throw NSError(domain: "NativeAgent.DeskWaits", code: 1, userInfo: [NSLocalizedDescriptionKey: failures.joined(separator: "; ")])
+        }
+    }
+
+    private func returnIfSettled(_ item: DeskItem, store: SwiftNativeDeskStore) async throws {
+        guard var record = item.continuation, !item.requiresOwnerInput, !item.status.isTerminal else { return }
+        let interrupted = record.state == .running ? record.processID != DeskContinuationScope.processID
+            : record.state == .ready && record.reason == "turn_interrupted"
+        guard record.state == .ready || interrupted else { return }
+        let expected = record.revision
+        if interrupted {
+            guard try !checkpointed(record) else { return }
+            record.state = .blocked
+            record.reason = "turn_interrupted"
+            record.revision = UUID().uuidString
+            try await store.setContinuation(item.handle, expectedRevision: expected, record: record)
+            return
+        }
+        var waiting = false
+        var unknown: [String] = []
+        var settled: [DeskContinuation.Step] = []
+        for var step in record.pending {
+            switch try helperReceipt(step) {
+            case .settled(let receipt):
+                step.result = receipt
+                step.owner = nil
+                settled.append(step)
+            case .waiting: waiting = true
+            case .unknown(let why): unknown.append("\(step.tool) \(step.id): \(why)")
+            }
+        }
+        guard unknown.isEmpty else {
+            record.state = .blocked
+            record.reason = "domain_verification_required: " + unknown.prefix(3).joined(separator: ", ")
+            record.revision = UUID().uuidString
+            try await store.setContinuation(item.handle, expectedRevision: expected, record: record)
+            return
+        }
+        guard !waiting else { return }
+        record.settled += settled
+        record.pending = []
+        let shown = (["Remaining work: " + record.remainingWork]
+            + record.settled.suffix(12).map { "\($0.id) \($0.tool): \($0.result ?? "")" }
+            + (record.lastReply.isEmpty ? [] : ["Your last reply: " + String(record.lastReply.prefix(1_000))])).joined(separator: "\n")
+        // A helper's own wait returns to the agent's mind stream: a turn of the agent's inside a helper's session would speak as the helper.
+        let helper = record.helperDefinition != nil
+        let reply: String? = try helper ? nil : JSONValue.object(record.envelope).serialize(pretty: false)
+        let whose = helper ? "A helper's Desk item" : "Your Desk item"
+        // Written before the record lets the wait go, so a quit between the two returns it on the next change, once.
+        await Attention.post(Happening(.returned, subject: "desk:" + item.handle, door: "desk",
+            words: "What \(whose) \(item.alias) (\"\(String(item.title.prefix(80)))\") waited on came back; it is yours to go on with.",
+            once: "desk:" + item.handle + ":" + record.runID, route: helper ? nil : record.sessionID, reply: reply, peers: record.peerSources,
+            shows: shown), dataRoot: dataRoot).value
+        record.state = .complete
+        record.reason = "returned"
+        record.revision = UUID().uuidString
+        try await store.setContinuation(item.handle, expectedRevision: expected, record: record)
+    }
+
+    /// Only a checkpoint of this run assigns its continuation to launch recovery.
+    private func checkpointed(_ record: DeskContinuation) throws -> Bool {
+        guard let session = record.sessionID else { return false }
+        for turn in try TurnCheckpoint.turnIds(dataRoot: dataRoot, sessionId: session) {
+            if try TurnCheckpoint.read(dataRoot: dataRoot, sessionId: session, turnId: turn)?.runId == record.runID { return true }
+        }
+        return false
+    }
+
+    private enum Receipt { case settled(String), waiting, unknown(String) }
+
+    /// A helper's request settles on its own shelf entry; a queued or running one is still waited on. Any other open step has no receipt a wait reads.
+    private func helperReceipt(_ step: DeskContinuation.Step) throws -> Receipt {
+        guard step.owner == "helper" else { return .unknown("its outcome has no receipt this wait can read") }
+        guard let ownerID = step.ownerID, let botID = UUID(uuidString: ownerID),
+              let requestID = step.requestID, let request = UUID(uuidString: requestID) else {
+            return .unknown("helper run has no exact request reference")
+        }
+        let queue = BotRunQueue(dataRoot: dataRoot)
+        guard try queue.presence(bot: botID, requestID: request) == .absent else { return .waiting }
+        if let detail = try queue.refusal(bot: botID, requestID: request) {
+            return .unknown("helper request \(requestID) was refused before execution: \(detail)")
+        }
+        let entry: ShelfEntry
+        do { entry = try ShelfStore(dataRoot: dataRoot).entry(request) }
+        catch StandingBotsError.notFound { return .unknown("helper request \(requestID) has no queued request, live claim, or result") }
+        guard entry.botId == botID, entry.id == request else { throw DeskContinuationError.unsafe }
+        guard entry.runtimeStatus == .completed, !entry.uncertainties.contains("Run receipt pending finalization.") else {
+            return .unknown("helper request \(requestID) ended \(entry.runtimeStatus.rawValue)")
+        }
+        return .settled("helper request \(requestID) completed")
     }
 
     public func resumeTurn(_ checkpoint: TurnCheckpoint, turn parent: Turn? = nil) async throws {
@@ -267,8 +297,9 @@ public struct TurnContinuationRuntime: Sendable {
             }
             journal = DeskContinuationTurn(store: store, record: record, handle: item.handle)
         } else { journal = nil }
-        let turn = request.turn(id: checkpoint.turnId, parent: parent)
+        var turn = request.turn(id: checkpoint.turnId, parent: parent)
             .with(\.peerSteering, PeerDataTaint(restoring: sources))
+        if let ceiling = checkpoint.fileAccessCeiling { turn.fileAccessCeiling = ceiling }
         let response = try await runOwnedContinuation(request, helperDefinition: checkpoint.helperDefinition,
             turn: turn, journal: journal) { turn in
             guard let current = try TurnCheckpoint.read(dataRoot: dataRoot,
@@ -304,81 +335,6 @@ public struct TurnContinuationRuntime: Sendable {
         }
     }
 
-    private func resumeDeskContinuation(item: DeskItem, record: DeskContinuation) async throws {
-        let envelope = try continuationEnvelope(record)
-        guard let peerSources = record.peerSources,
-              let profileName = record.capabilityProfile,
-              let profile = NativeAgentAppChatSurfaceProfile(rawValue: profileName),
-              let surface = text(record.replyRoute, "surface"), !surface.isEmpty else {
-            throw DeskContinuationError.unavailable
-        }
-        _ = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
-        let route = AgentBridgeCompletionRoute(surface: surface, sessionId: record.sessionID,
-            destinationId: text(record.replyRoute, "destinationId"), threadId: text(record.replyRoute, "threadId"),
-            sourceKey: text(record.replyRoute, "sourceKey"), replyTo: text(record.replyRoute, "replyTo"),
-            correlationId: text(record.replyRoute, "correlationId"), requesterUserId: text(record.replyRoute, "requesterUserId"))
-        let journal = DeskContinuationTurn(store: SwiftNativeDeskStore(dataRoot: dataRoot), record: record, handle: item.handle)
-        let parent = Turn(run: record.runID, session: record.sessionID)
-            .with(\.peerSteering, PeerDataTaint(restoring: peerSources)).with(\.verifiedSessionID, record.sessionID)
-            .with(\.envelope, envelope).with(\.fileAccess, record.fileAccess)
-        do {
-            let turn: Turn
-            if record.reason != "reply_ready" {
-                let client = engine.chatClient(profile: profile)
-                let cue = try await engine.tools.withPartDoor(envelope: .native("desk_continuation:" + item.handle + ":" + record.runID),
-                    turn: parent, continuation: journal) { door in
-                    try await DeskContinuationScheduler.prompt(item: item, record: record, dataRoot: dataRoot,
-                        invocation: door.invocation)
-                }
-                let request = followUpRequest(message: cue,
-                    sessionID: record.sessionID, fileAccess: record.fileAccess, surface: record.surface, envelope: envelope,
-                    replyRoute: route.chatToolReplyRoute, pinnedRunID: record.runID)
-                turn = request.turn(parent: parent)
-                try await runDeskContinuationRequest(request, record: record, client: client, journal: journal, turn: turn)
-            } else { turn = parent }
-            let current = await journal.snapshot()
-            guard current.reason == "reply_ready" else { return }
-            guard let live = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items
-                .first(where: { $0.handle == item.handle }), live.status != .canceled else {
-                try await journal.finish(state: .canceled, reply: current.lastReply, reason: "task_canceled")
-                return
-            }
-            guard let cached = current.response else {
-                try await journal.block(reason: "reply_receipt_required")
-                return
-            }
-            let response = try JSONDecoder().decode(ChatResponse.self, from: cached.serializedData(pretty: false))
-            let digest = SHA256.hash(data: try cached.serializedData(pretty: false)).map { String(format: "%02x", $0) }.joined()
-            let delivery = try await settleReply(response: response, route: route, envelope: envelope, turn: turn,
-                settlement: .durable(deliveryID: "desk-continuation.\(current.originRunID).\(item.handle).\(current.resumeCount)",
-                    requestDigest: digest, notifyRequestedResult: true))
-            if delivery == "completed" { try await journal.delivered() }
-            else { try await journal.block(reason: "reply_delivery_\(delivery)") }
-        } catch {
-            let current = await journal.snapshot()
-            if current.state == .running {
-                try await journal.finish(state: Task.isCancelled ? .canceled : .ready,
-                    reply: current.lastReply, reason: current.reason ?? "continuation_interrupted")
-            }
-            throw error
-        }
-    }
-
-    private func runDeskContinuationRequest(_ request: TurnRequest, record: DeskContinuation,
-        client: SwiftNativeChatOrchestrationClient, journal: DeskContinuationTurn, turn: Turn) async throws {
-        do {
-            _ = try await runOwnedContinuation(request, helperDefinition: record.helperDefinition, turn: turn, journal: journal) { turn in
-                try await client.chat(message: request.message, sessionId: request.sessionID, model: request.model,
-                    reasoningEffort: request.reasoningEffort, fileAccess: request.fileAccess, attachments: request.attachments,
-                    persona: request.persona, surface: request.surface, suppressUserAppend: request.suppressUserAppend,
-                    progress: nil, turn: turn, serviceTier: request.serviceTier ?? nil, work: .init(journal: journal))
-            }
-        } catch {
-            if record.surface == "bot" { try await journal.block(reason: "helper_continuation_refused") }
-            throw error
-        }
-    }
-
     private func runOwnedContinuation(_ request: TurnRequest, helperDefinition: JSONValue?,
         turn: Turn, journal: DeskContinuationTurn?,
         operation: @escaping @Sendable (Turn) async throws -> ChatResponse) async throws -> ChatResponse {
@@ -387,9 +343,11 @@ public struct TurnContinuationRuntime: Sendable {
             return try await TurnAdmission.shared.runAlone(dataRoot: dataRoot, sessionID: turn.session, runID: turn.run, turn: turn,
                 operation: operation)
         }
-        guard let saved = helperDefinition,
-              let bot = try? JSONDecoder().decode(BotDefinition.self, from: saved.serializedData(pretty: false)),
-              bot.sessionID == request.sessionID else {
+        guard let saved = helperDefinition else {
+            throw DeskContinuationError.unavailable
+        }
+        let bot = try JSONDecoder().decode(BotDefinition.self, from: saved.serializedData(pretty: false))
+        guard bot.sessionID == request.sessionID else {
             throw DeskContinuationError.unavailable
         }
         let runner = BotRunner(dataRoot: dataRoot, session: engine.standingBotSession(continuation: journal))
@@ -405,17 +363,6 @@ public struct TurnContinuationRuntime: Sendable {
                 peerSources: turn.peerSteering?.checkpointSources ?? [])
         }
         return response
-    }
-
-    private func continuationEnvelope(_ record: DeskContinuation) throws -> TurnEnvelope {
-        guard let saved = TurnEnvelope.fromPersistedMetadata(.object(record.envelope)) else {
-            throw DeskContinuationError.unavailable
-        }
-        return TurnEnvelope(surface: saved.surface, agent: saved.agent,
-            verifiedChatId: saved.verifiedChatId, verifiedUserId: saved.verifiedUserId,
-            commandSignatureVerified: record.commandSignatureVerified,
-            deliveryRoute: saved.deliveryRoute, declaredRemote: record.declaredRemote,
-            answerExperienceID: saved.answerExperienceID)
     }
 
     private func text(_ object: [String: JSONValue], _ key: String) -> String? {

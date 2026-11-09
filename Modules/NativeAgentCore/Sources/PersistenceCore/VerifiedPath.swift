@@ -5,6 +5,46 @@ import CryptoKit
 
 package enum VerifiedPath {
 
+    /// File actions, Mac document reads and part primitives share missing-path recovery; no listing runs on their behalf.
+    package static func missingReadEvidence(_ path: URL) -> [String: JSONValue] {
+        do {
+            let ancestor = try nearestExistingDirectory(above: path)
+            let next: JSONValue = .object(["tool": .string("app"), "input": .object([
+                "action": .string("files.list"), "args": .object(["path": .string(ancestor.path)])])])
+            return ["parent_exists": .bool(ancestor == path.deletingLastPathComponent()),
+                "nearest_existing_ancestor": .string(ancestor.path), "next_call": next,
+                "remedy": .object(["kind": .string("inspect"), "nearest_existing_ancestor": .string(ancestor.path),
+                    "instruction": .string("This path is missing. List its nearest existing folder, \(ancestor.path), and choose a path from that result."),
+                    "next_call": next])]
+        } catch {
+            let instruction = "The nearest existing folder could not be checked: \(error.localizedDescription). Restore access before continuing."
+            return ["ancestor_lookup_error": .string(error.localizedDescription),
+                "remedy": .object(["kind": .string("inspect"), "ancestor_lookup_error": .string(error.localizedDescription),
+                    "instruction": .string(instruction), "next_call": .null])]
+        }
+    }
+
+    /// Only a successful metadata read establishes an ancestor; access and I/O failures remain explicit.
+    private static func nearestExistingDirectory(above path: URL) throws -> URL {
+        var ancestor = path.deletingLastPathComponent()
+        while true {
+            var metadata = stat()
+            if stat(ancestor.path, &metadata) == 0 {
+                if metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) { return ancestor }
+            } else {
+                let code = errno
+                guard code == ENOENT || code == ENOTDIR else {
+                    throw PersistenceCoreError.ioFailure("Could not inspect \(ancestor.path) (errno \(code)).")
+                }
+            }
+            let parent = ancestor.deletingLastPathComponent()
+            guard parent != ancestor else {
+                throw PersistenceCoreError.ioFailure("No existing ancestor directory could be established for \(path.path).")
+            }
+            ancestor = parent
+        }
+    }
+
     package enum Failure: Error {
         case symlinkComponent(String)
         case notFound

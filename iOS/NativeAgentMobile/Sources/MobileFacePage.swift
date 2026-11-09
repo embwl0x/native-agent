@@ -1,24 +1,55 @@
 import SwiftUI
+import Foundation
 import NativeAgentShared
-// Blueprint: | `MobileFacePage.swift` | Any faced page on the phone: the shared FaceView over the face the Mac published, its links followed on the phone (a faced page or a saved run pushed here, every other place through the shell's router), its row actions answered by the page's owner on the Mac |
+import Observation
+// Blueprint: | `MobileFacePage.swift` | Phone page rows, signed document demands and retained action outcomes |
+
+extension FaceActOutcome {
+    /// Pre-dispatch refusals have no effects; a terminal response must carry its owner's effect evidence.
+    static func phoneFailure(_ error: any Error) -> Self {
+        guard let sync = error as? SyncError else { return .interrupted(error) }
+        let effects: FaceEffects
+        switch sync {
+        case .notSetup, .notSigned, .busy, .sendFailed: effects = .none
+        case .macRejected, .unsupported, .responseUnconfirmed, .persistence, .approvalRequired: return .interrupted(error)
+        }
+        return .init(failure: .init(code: "phone_action_refused", message: sync.localizedDescription, cause: nil, effects: effects), effects: effects)
+    }
+}
 
 /// Where a link leads inside the page's own stack: another faced page, or a saved run's detail.
 enum FaceDestination: Hashable {
     case page(String)
     case run(String)
+    case document(page: String, item: String)
+    case item(page: String, item: String)
 
     /// The link's place in this stack, when the phone holds it.
     @MainActor init?(_ link: String) {
-        guard link.hasPrefix("page:") else { return nil }
-        let parts = link.dropFirst("page:".count).split(separator: "/", maxSplits: 1).map(String.init)
+        guard case .page(let page, let item)? = FaceLink(link) else { return nil }
         let sync = iCloudSyncEngine.shared
-        if parts.count == 2, parts[0] == "diagnostics", sync.runs.contains(where: { $0.id == parts[1] }) {
-            self = .run(parts[1])
-        } else if parts.count == 1, sync.faces[parts[0]] != nil {
-            self = .page(parts[0])
+        if let item, page == "diagnostics", sync.runs.contains(where: { $0.id == item }) {
+            self = .run(item)
+        } else if let item, Self.isDocument(page: page, item: item, sync: sync) {
+            self = .document(page: page, item: item)
+        } else if let item, sync.faces[page] != nil {
+            self = .item(page: page, item: item)
+        } else if item == nil, sync.faces[page] != nil {
+            self = .page(page)
         } else {
             return nil
         }
+    }
+
+    @MainActor private static func isDocument(page: String, item: String, sync: iCloudSyncEngine) -> Bool {
+        if ["capabilities", "connectors", "diagnostics"].contains(page) { return true }
+        if page == "memories", let target = MemoriesFaceTarget(row: item) {
+            switch target {
+            case .memory, .rejected: return true
+            case .graph, .upkeep: return false
+            }
+        }
+        return sync.faces[page]?.face?.sections.compactMap(\.block).contains { $0.key == item } == true
     }
 
     @MainActor @ViewBuilder var view: some View {
@@ -26,6 +57,9 @@ enum FaceDestination: Hashable {
         case .page(let page): MobileFacePage(page: page)
         case .run(let id):
             if let run = iCloudSyncEngine.shared.runs.first(where: { $0.id == id }) { RunDetailView(run: run) }
+        case .document(let page, let item):
+            MobileDocumentPage(identity: [page, item], subject: .pageItem(page: page, item: item), title: item)
+        case .item(let page, let item): MobileDemandFacePage(page: page, item: item)
         }
     }
 }
@@ -57,37 +91,25 @@ struct MobileFacePage: View {
     }
 }
 
-/// One page's face as rows of an `AlivePage`: the phone's header carries its title and sentence, so FaceView draws its sections.
-/// A link to a place in this stack is pushed by the host; any other goes to the shell's router. A row's action goes to the page's owner on
-/// the Mac. Its answer, a refusal or the words for a place the phone does not have show where the reader is, as the app's toast.
+/// The shared renderer holds pending work and failures beside the row; accepted work survives navigation.
 struct MobileFaceRows: View {
     let page: String
     let push: (FaceDestination) -> Void
     @Environment(\.faceRouter) private var router
     private let sync = iCloudSyncEngine.shared
+    private var session: FacePageSession { sync.pageSessions.page(page) }
 
     private var title: String { QuietToolPage.page(named: page)?.title ?? page }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        Group {
             if let snapshot = sync.faces[page] {
-                if snapshot.status == .ready, let face = snapshot.face {
-                    // The whole face is one List row; borderless controls keep each touch on the control under it,
-                    // so the List never hands a tap anywhere in the face to the row's first choice.
-                    FaceView(face: PartFace(sections: face.sections), open: open, act: act)
-                        .buttonStyle(.borderless).pickerStyle(.menu)
-                } else {
-                    note(snapshot.error?.message ?? (snapshot.status == .ready
-                        ? title + " has nothing to show from your Mac." : title + " is " + snapshot.status.rawValue + " on your Mac."))
-                }
+                FaceView(snapshot: snapshot, title: title, header: false, door: door, session: session).id(page)
+                    .onAppear { session.notice = { SystemToastCenter.shared.push(success: $0) } }
             } else {
                 note(title + " has not arrived from your Mac yet.")
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .listRowBackground(Color.clear)
-        .listRowInsets(EdgeInsets(top: 4, leading: 4, bottom: 12, trailing: 4))
-        .listRowSeparator(.hidden)
     }
 
     private func note(_ text: String) -> some View {
@@ -100,14 +122,115 @@ struct MobileFaceRows: View {
         else if let words = router.follow(link) { SystemToastCenter.shared.push(info: words) }
     }
 
-    private func act(_ row: String, _ action: String, _ value: String?) {
-        Task {
-            do {
-                let words = try await sync.faceAction(page: page, row: row, action: action, value: value)
-                SystemToastCenter.shared.push(success: words ?? "Done.")
-            } catch {
-                SystemToastCenter.shared.push(error: error.localizedDescription)
-            }
+    private var door: ClosureFaceDoor {
+        MobileRemoteFaceDoor.make(page: page, open: open)
+    }
+}
+
+/// One row of a page's face standing alone: a matter's card in a conversation is its Inbox row. The same FaceView draws it and a tap
+/// goes to the page's owner on the Mac, as on the page itself; every link goes to the shell's router.
+struct MobileFaceRow: View {
+    let page: String
+    let row: PartFace.Row
+    @Environment(\.faceRouter) private var router
+    private let sync = iCloudSyncEngine.shared
+    private var session: FacePageSession { sync.pageSessions.page(page) }
+
+    var body: some View {
+        FaceView(face: PartFace(sections: [.init(id: row.id, style: .list, rows: [row])]), door: door, session: session)
+            .id(page + "/" + row.id)
+            .buttonStyle(.borderless).pickerStyle(.menu)
+            .environment(\.faceInList, false)
+            .environment(\.faceStyle, .phone)
+            .onAppear { session.notice = { SystemToastCenter.shared.push(success: $0) } }
+    }
+
+    private var door: ClosureFaceDoor {
+        MobileRemoteFaceDoor.make(page: page, open: { link in
+            if let words = router.follow(link) { SystemToastCenter.shared.push(info: words) }
+        })
+    }
+}
+
+struct MobileDocumentPage<Identity: Hashable>: View {
+    let identity: Identity
+    let subject: DocumentSubject
+    let title: String
+    var body: some View {
+        AlivePage(title: title, style: .pushed) {
+            FaceDocumentReader(identity: identity, cancellationLabel: "Cancel waiting", waitingOn: "your Mac", presentation: { request in
+                try await iCloudSyncEngine.shared.faceReadPresentation(.init(id: request.id, subject: subject, textOnly: true))
+            })
         }
+    }
+}
+
+@MainActor private enum MobileRemoteFaceDoor {
+    static func make(page: String, open: @escaping (String) -> Void) -> ClosureFaceDoor {
+        let sync = iCloudSyncEngine.shared
+        return ClosureFaceDoor(open: open, cancellationLabel: "Cancel waiting", waitingOn: "your Mac", read: { request in
+            try await sync.faceRead(.init(id: request.id, subject: .pageItem(page: page, item: request.key),
+                                         expectedCall: request.expectedCall, textOnly: true))
+        }, pageRead: { try await sync.faceReadFace(page: page, request: $0) }, releaseFace: { request in
+            do { try await sync.releaseFaceRead(page: page, request: request) }
+            catch { sync.syncError = "The Mac page demand could not be released: " + TurnSecretRedactor.redactDisplayText(error.localizedDescription) }
+        }, scope: { item in make(page: page + "/" + item, open: open) },
+           perform: { await sync.faceOutcome(page: page, submission: $0) })
+    }
+}
+
+private struct MobileDemandFacePage: View {
+    let page: String
+    let item: String
+    @State private var pushed: FaceDestination?
+    @Environment(\.faceRouter) private var router
+    private let sync = iCloudSyncEngine.shared
+
+    var body: some View {
+        AlivePage(title: item) {
+            FaceItemView(item: item, door: door.scoped(to: item), reader: door, session: sync.pageSessions.page(page + "/" + item))
+        }
+        .navigationDestination(item: $pushed) { $0.view }
+        .macSyncErrorBanner()
+    }
+
+    private var door: ClosureFaceDoor {
+        MobileRemoteFaceDoor.make(page: page) { link in
+            if let target = FaceDestination(link) { pushed = target }
+            else if let words = router.follow(link) { SystemToastCenter.shared.push(info: words) }
+        }
+    }
+}
+
+/// A phone page reads its already received values through its own owner, independently of the Mac's action door.
+@MainActor protocol MobileLocalFaceOwner {
+    var waitingOn: String { get }
+    func readFace(_ request: FaceReadRequest) async throws -> PartFace
+    func readText(_ request: FaceReadRequest) async throws -> String
+}
+
+extension MobileLocalFaceOwner {
+    func readText(_ request: FaceReadRequest) async throws -> String {
+        throw PartCallError(code: "local_document_missing", message: "This local page has no document named \(request.key).")
+    }
+}
+
+struct MobileLocalFaceRows: View {
+    let face: PartFace
+    let owner: any MobileLocalFaceOwner
+    let session: FacePageSession
+    var open: (String) -> Void = { _ in }
+
+    var body: some View {
+        FaceView(face: face, door: door, session: session)
+    }
+
+    private var door: ClosureFaceDoor {
+        ClosureFaceDoor(open: open, waitingOn: owner.waitingOn,
+                        read: { try await owner.readText($0) }, pageRead: { try await owner.readFace($0) }, perform: { _ in
+            let failure = WireFailure(code: "local_page_read_only", message: "This page only reads this iPhone's received copy.",
+                                      cause: nil, effects: .none)
+            return FaceActOutcome(failure: failure, effects: .none)
+        })
     }
 }

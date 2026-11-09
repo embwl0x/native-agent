@@ -180,79 +180,7 @@ public enum DoctorReadout {
     }
 }
 
-extension DoctorReadout {
-    public static func categoryID(for id: String) -> String {
-        switch id {
-        case "codex_login", "llm", "codex_login_helper", "live.providers": "Provider"
-        case "live.background_loops", "live.bridges",
-             // Prefix-cache health describes the running app, not stored data.
-             "prompt_prefix_health", "model.shims": "Runtime"
-        // Group cognition separately so missing capsules remain visible as cognition findings.
-        case "subconscious_vitals": "Cognition"
-        case "searxng", "telegram", "connectors", "live.telegram", "live.search": "Connectors"
-        case "storage", "chat_sessions", "session_identity", "persona_engine", "backups", "write_test", "live.memory": "Data"
-        case "tools", "live.tools": "Tools"
-        case "autonomy", "live.autonomy": "Autonomy"
-        default: "Release"
-        }
-    }
-
-    public static func groupedChecks(_ checks: [CheckResult]) -> [(String, [CheckResult])] {
-        let order = [
-            "Provider", "Runtime", "Cognition", "Connectors", "Data", "Tools",
-            "Autonomy", "Release",
-        ]
-        let grouped = Dictionary(grouping: checks, by: { categoryID(for: $0.checkID) })
-        let statusOrder = ["failing", "warning", "healthy", "reading", "off", "not needed", "unclear"]
-        return order.compactMap { key in
-            guard let values = grouped[key], !values.isEmpty else { return nil }
-            return (key, values.sorted {
-                let lhs = statusOrder.firstIndex(of: DoctorPlainCopy.bucket(for: $0.status)) ?? statusOrder.count
-                let rhs = statusOrder.firstIndex(of: DoctorPlainCopy.bucket(for: $1.status)) ?? statusOrder.count
-                return lhs == rhs ? $0.title < $1.title : lhs < rhs
-            })
-        }
-    }
-
-
-}
-
 public enum DoctorPlainCopy {
-    public static func sectionTitle(for group: String) -> String {
-        switch group {
-        case "Provider": "AI provider"
-        case "Runtime": "The app itself"
-        case "Cognition": "Inner state"
-        case "Connectors": "Connected services"
-        case "Data": "Your data"
-        case "Tools": "Tools"
-        case "Autonomy": "Actions I take on my own"
-        case "Release": "Stored data health"
-        default: group
-        }
-    }
-
-    public struct Summary: Equatable {
-        public var healthy = 0
-        public var warning = 0
-        public var failing = 0
-        public var unclear = 0
-        public var reading = 0
-        public var off = 0
-        public var notNeeded = 0
-
-        public var total: Int { healthy + warning + failing + unclear + reading + off + notNeeded }
-
-        public var statusText: String {
-            if failing > 0 { return "failed" }
-            if warning > 0 { return "warn" }
-            if total == 0 { return "unknown" }
-            if unclear > 0 { return "unknown" }
-            if reading > 0 { return "info" }
-            return "ok"
-        }
-    }
-
     /// Readings stay distinct from health verdicts and use the info tint.
     public static func bucket(for status: String) -> String {
         switch status.lowercased() {
@@ -272,49 +200,6 @@ public enum DoctorPlainCopy {
         }
     }
 
-    public static func summarize(_ checks: [CheckResult]) -> Summary {
-        var summary = Summary()
-        for check in checks {
-            switch bucket(for: check.status) {
-            case "healthy": summary.healthy += 1
-            case "warning": summary.warning += 1
-            case "failing": summary.failing += 1
-            case "off": summary.off += 1
-            case "not needed": summary.notNeeded += 1
-            case "reading": summary.reading += 1
-            default: summary.unclear += 1
-            }
-        }
-        return summary
-    }
-
-    public static func headline(for summary: Summary) -> String {
-        if summary.total == 0 { return "No checks have run yet." }
-        if summary.failing > 0 { return "Some parts of the app are not working." }
-        if summary.warning > 0 { return "The app is running, but some parts need attention." }
-        if summary.unclear > 0 { return "The app is running. Some checks came back unclear." }
-        if summary.reading > 0 { return "The app is running. Some checks are readings." }
-        // Inactive parts cannot establish the health of everything.
-        let inactive = [(summary.off, "off"), (summary.notNeeded, "not needed")]
-            .filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
-        return inactive.isEmpty ? "Everything looks healthy." : "Healthy; " + inactive.joined(separator: ", ") + "."
-    }
-
-    public static func detail(for summary: Summary) -> String {
-        guard summary.total > 0 else {
-            return "Press Repair to check everything and fix what is broken."
-        }
-        var parts = ["\(summary.healthy) working"]
-        if summary.warning > 0 { parts.append("\(summary.warning) need attention") }
-        if summary.failing > 0 { parts.append("\(summary.failing) not working") }
-        if summary.unclear > 0 { parts.append("\(summary.unclear) unclear") }
-        if summary.reading > 0 { parts.append("\(summary.reading) readings") }
-        if summary.off > 0 { parts.append("\(summary.off) off") }
-        if summary.notNeeded > 0 { parts.append("\(summary.notNeeded) not needed") }
-        let checked = summary.total == 1 ? "1 area checked" : "\(summary.total) areas checked"
-        return "\(checked): " + parts.joined(separator: ", ") + "."
-    }
-
     /// Humanize loop labels while retaining raw identifiers in Details for diagnosis.
     public static func friendlyLoopName(_ loopId: String) -> String {
         let spaced = loopId
@@ -325,15 +210,5 @@ public enum DoctorPlainCopy {
             .joined(separator: " ")
         guard let first = spaced.first else { return loopId }
         return String(first).uppercased() + spaced.dropFirst()
-    }
-
-    public static func allLoopsHealthyText(count: Int) -> String {
-        count == 1 ? "1 background task is running normally."
-                   : "All \(count) background tasks are running normally."
-    }
-
-    public static func otherLoopsHealthyText(count: Int) -> String {
-        count == 1 ? "1 other background task is running normally."
-                   : "\(count) other background tasks are running normally."
     }
 }

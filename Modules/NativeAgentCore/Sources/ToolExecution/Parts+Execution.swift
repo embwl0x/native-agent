@@ -9,9 +9,12 @@ import TrustCenter
 import ToolRegistry
 import CryptoKit
 import PersonaEngine
+import TriggerScheduler
 // Blueprint: | `Parts+Execution.swift` | pinned calls and pure faces; exact run admission |
 
 extension Parts {
+    private static let faceInputs = NativeAgentSecretRedactor.FaceInputs()
+
     static func revisionFailure(_ code: String, _ detail: String, id: String, version: String? = nil) -> SenseFailure {
         SenseFailure(code: code, message: detail, remedy: Repair.remedy(
             owner: "ability \(id)" + (version.map { " version \($0)" } ?? ""), nextCall: readCall(id), tap: nil,
@@ -37,30 +40,28 @@ extension Parts {
     }
 
     /// Faces run from frozen input outside rendering and have no host effects or notebook access.
-    public func face(id: String, input: JSONValue, version: String, invocation: Invocation) async -> PartCallResult<PartFace> {
-        let result: PartCallResult<JSONValue> = await callValue(id: id, input: Self.maskedForFace(input), projection: true, pinned: version,
+    @concurrent public func face(id: String, input: JSONValue, version: String, invocation: Invocation,
+                                 documentRead: Bool = false) async -> PartCallResult<PartFace> {
+        do {
+            let prepared = try await prepareFace(id: id, input: input)
+            return await face(id: id, input: prepared, version: version, invocation: invocation, documentRead: documentRead)
+        } catch { return .failure(.init(code: error is CancellationError ? "cancelled" : "input_limit", message: error.localizedDescription)) }
+    }
+
+    /// A native door may prepare frozen input before acquiring its action gate. All callers use this same content-keyed masking owner.
+    public func prepareFace(id: String, input: JSONValue) async throws -> NativeAgentSecretRedactor.FaceInput {
+        try await Self.faceInputs.prepare(id: root.standardizedFileURL.path + "\u{0}" + id, input: input)
+    }
+
+    public func face(id: String, input: NativeAgentSecretRedactor.FaceInput, version: String,
+                     invocation: Invocation, documentRead: Bool = false) async -> PartCallResult<PartFace> {
+        let result: PartCallResult<JSONValue> = await callValue(id: id, input: input.value, projection: true, pinned: version,
             invocation: invocation)
         switch result {
         case .failure(let error): return .failure(error)
         case .success(let value):
-            do { return .success(try PartFace.decode(value)) }
+            do { return .success(try PartFace.decode(value, documentRead: documentRead)) }
             catch { return .failure(.init(code: "bad_face", message: error.localizedDescription)) }
-        }
-    }
-
-    /// Mask credential-shaped page data locally so one value cannot prevent the page drawing; direct part calls still refuse credentials.
-    static func maskedForFace(_ value: JSONValue) -> JSONValue {
-        switch value {
-        case .string(let text):
-            let redacted = NativeAgentSecretRedactor.redactText(text)
-            return .string(NativeAgentSecretRedactor.containsAuditSecret(redacted) ? "[REDACTED]" : redacted)
-        case .array(let list): return .array(list.map(maskedForFace))
-        case .object(let fields):
-            return .object(Dictionary(uniqueKeysWithValues: fields.map { key, field in
-                (key, NativeAgentSecretRedactor.isSecretName(key, use: .scriptInput) && field != .null
-                    ? JSONValue.string("[REDACTED]") : maskedForFace(field))
-            }))
-        default: return value
         }
     }
 
@@ -69,23 +70,41 @@ extension Parts {
         invocation: Invocation, as type: Value.Type = Value.self) async -> PartCallResult<Value> {
         do {
             try Task.checkCancellation()
-            guard case .object = input, try input.serializedData(pretty: false).count <= 4 * 1024 * 1024 else {
-                throw SenseFailure(code: "input_limit", message: "part.call input is a JSON object of at most 4 MiB.")
-            }
-            if let path = NativeAgentSecretRedactor.secretPath(input) {
-                throw SenseFailure(code: "secret_in_input", message: "\(path) carries a credential; credentials never enter a part.")
+            if !projection {
+                guard let host = invocation.host, let turn = invocation.execution.turn else {
+                    throw PartError.invalid("An ability needs its originating app door and turn.")
+                }
+                var execution = invocation.execution
+                execution.wake = nil
+                let selected: (id: String, version: String)
+                do {
+                    guard let row = try row(id), let selectedID = Self.string(row, "id") else { throw Self.missing(id) }
+                    guard let version = Self.string(row, "codeFingerprint") else {
+                        throw Self.revisionFailure("state_changed", "Ability \(selectedID) has no selected code fingerprint; its body did not run.",
+                            id: selectedID)
+                    }
+                    selected = (selectedID, version)
+                } catch {
+                    var refusal = Self.fields(ToolHost.failure(error, effects: "none", execution: "not_run"))
+                    refusal["checker"] = .string("part_selection")
+                    // No version was selected. The receipt must not attribute this attempt to a version discovered after this failure.
+                    refusal["accounting_error"] = .string(error.localizedDescription)
+                    let receipt = await host.recordRefusal(.object(refusal),
+                        input: ["action": .string("authored." + Self.referenceID(id)), "args": input, "preview": .bool(preview)],
+                        turn: turn, surface: execution.surface)
+                    return Self.callResult(receipt, as: type)
+                }
+                execution.valueReach = reach.map { .init(id: selected.id, actions: $0.actions, capabilities: $0.capabilities) }
+                // Value calls retain the runner envelope even for a verb whose face presents its business payload.
+                execution.valueIdentity = selected
+                let receipt = await host.perform(["action": .string("authored." + selected.id), "args": input, "preview": .bool(preview)],
+                    execution: execution)
+                try Task.checkCancellation()
+                return Self.callResult(receipt, as: type)
             }
             // Selection precedes the first suspension; a replacement can stop this call, but can never splice its own code into this invocation.
             let version = try AbilityStore.withLock {
                 guard let row = try row(id), let version = Self.string(row, "codeFingerprint") else { throw Self.missing(id) }
-                if let reach {
-                    let selected = try store.load(id: id, digest: version).program
-                    guard Set(selected.dependencies).isSubset(of: reach.actions),
-                          Set(selected.permissions).isSubset(of: reach.capabilities) else {
-                        throw SenseFailure(code: "caller_reach",
-                            message: "The selected part exceeds this caller's action or capability reach; the part did not run.")
-                    }
-                }
                 return version
             }
             guard pinned == nil || pinned == version else {
@@ -94,13 +113,8 @@ extension Parts {
             }
             var invocation = invocation
             invocation.execution.wake = nil
-            let receipt = try await { () async throws -> JSONValue in
-                if projection {
-                    return try await runSelected(id: id, input: input, pinned: version,
-                        preview: false, replay: nil, projection: true, invocation: invocation)
-                }
-                return try await run(id: id, input: input, requiredFingerprint: version, preview: preview, invocation: invocation)
-            }()
+            let receipt = try await runSelected(id: id, input: input, pinned: version,
+                preview: false, replay: nil, projection: true, invocation: invocation)
             try Task.checkCancellation()
             return Self.callResult(receipt, as: type)
         } catch {
@@ -117,12 +131,12 @@ extension Parts {
         if outer["action"] != nil, let result = outer["result"]?.objectValue { receipt = result }
         else { receipt = outer }
         do {
-            guard receipt["status"] == .string("ok"), receipt["returned_note"] == nil,
+            guard receipt["status"] == .string("ok"),
                   receipt["accounting_error"] == nil else {
                 let terminal = Self.fields(receipt["error"] ?? receipt["stopped"] ?? .null)
                 throw PartCallError(code: Self.string(receipt, "reason") ?? Self.string(terminal, "reason") ?? "failed",
-                    message: Self.string(receipt, "detail") ?? Self.string(receipt, "returned_note")
-                        ?? Self.string(receipt, "accounting_error") ?? Self.string(terminal, "message") ?? "The part did not return a complete decision.")
+                    message: Self.string(receipt, "detail") ?? Self.string(receipt, "accounting_error")
+                        ?? Self.string(terminal, "message") ?? "The part did not return a complete decision.")
             }
             let value = receipt["returned"] ?? .null
             return .success(try JSONDecoder().decode(type, from: value.serializedData(pretty: false)))
@@ -151,18 +165,28 @@ extension Parts {
         // What every run did, so the one receipt never denies an earlier run's writes.
         var calls: [JSONValue] = [], changed: [JSONValue] = [], effects: [String] = [], ledgerBytes = 0
         while true {
+            let startedAt = Date()
             let receipt: JSONValue
             do {
                 receipt = try await runSelected(id: id, input: input, pinned: pinned, preview: preview, replay: replay, invocation: invocation)
             }
             catch {
                 var terminal = ToolHost.failure(error, effects: "none", execution: "not_run")
-                if !preview, let version = try? pinned ?? row(id).flatMap({ Self.string($0, "codeFingerprint") }) {
-                    terminal = await abilities.settleRun(id: id, version: version, receipt: terminal, input: nil, turn: invocation.execution.turn)
-                    if runs == 0, let failed = terminal.objectValue?["accounting_error"]?.stringValue { throw PartError.invalid(failed) }
+                var fields = Self.fields(terminal)
+                fields["checker"] = .string("part_admission")
+                terminal = .object(fields)
+                if !preview {
+                    do {
+                        if let version = try pinned ?? row(id).flatMap({ Self.string($0, "codeFingerprint") }) {
+                            terminal = await abilities.settleRun(id: id, version: version, receipt: terminal, input: nil,
+                                turn: invocation.execution.turn, at: startedAt)
+                        }
+                    } catch {
+                        fields["accounting_error"] = .string(error.localizedDescription)
+                        terminal = .object(fields)
+                    }
                 }
                 // A later run that could not start is that run's refusal in the one receipt, beside what the runs before it did; nothing is replayed.
-                guard runs > 0 else { throw error }
                 receipt = terminal
             }
             runs += 1
@@ -222,6 +246,18 @@ extension Parts {
 
     private func runSelected(id: String, input: JSONValue, pinned: String?, preview: Bool, replay: OwnedProgramRunner.Replay?,
         projection: Bool = false, invocation: Invocation) async throws -> JSONValue {
+        var invocation = invocation
+        if !projection {
+            guard case .object = input, try input.serializedData(pretty: false).count <= 4 * 1024 * 1024 else {
+                throw SenseFailure(code: "input_limit", message: "part.call input is a JSON object of at most 4 MiB.", remedy: .object([
+                    "kind": .string("correct_arguments"), "instruction": .string("Pass a JSON object of at most 4 MiB; read the ability's params."),
+                    "next_call": Self.readCall(id)]))
+            }
+            if let path = NativeAgentSecretRedactor.secretPath(input) {
+                throw SenseFailure(code: "secret_in_input", message: "\(path) carries a credential; credentials never enter a part.", remedy: .object([
+                    "kind": .string("correct_arguments"), "instruction": .string("Remove credentials from the part's input; use its gated actions.")]))
+            }
+        }
         guard let host = invocation.host else { throw PartError.invalid("An ability needs the gated app door of a conversation or wake run.") }
         let catalogRevision = try abilities.revision()
         guard let row = try row(id), Self.string(row, "id") == id else { throw Self.missing(id) }
@@ -239,10 +275,19 @@ extension Parts {
         do { candidate = try store.load(id: id, digest: digest) }
         catch { throw Self.revisionFailure("integrity", "Ability \(id) version \(digest) is unreadable: \(error.localizedDescription)", id: id,
             version: digest) }
+        if let reach = invocation.execution.valueReach, reach.id == id {
+            guard Set(candidate.program.dependencies).isSubset(of: reach.actions),
+                  Set(candidate.program.permissions).isSubset(of: reach.capabilities) else {
+                throw SenseFailure(code: "caller_reach",
+                    message: "The selected part exceeds this caller's action or capability reach; the part did not run.",
+                    remedy: Repair.remedy(owner: "the native caller's reach", nextCall: Self.readCall(id), tap: nil,
+                        instruction: "Read the part and revise its declared actions and capabilities to fit this caller's reach before calling it."))
+            }
+        }
+        invocation.execution.valueReach = nil
         let revision = try catalogRevision + host.dependencyRevision(candidate.program.dependencies)
         try await checkAdmission(candidate, row: row)
-        let dependencySnapshot = try checkDependencies(candidate, invocation: invocation)
-        let binding = OwnedProgramRunner.Binding(revision: revision)
+        let dependencySnapshot = try await checkDependencies(candidate, invocation: invocation)
         // Wake runs receive no input, so parameter requirements cannot refuse them.
         if !projection, invocation.execution.wake == nil, let problem = input.schemaProblem(schema: candidate.program.schema) {
             throw SenseFailure(code: "bad_input", message: "Its input: \(problem.words).", remedy: .object([
@@ -250,11 +295,36 @@ extension Parts {
                     "Correct the input to match \(problem.expected); ability.read shows \(id)'s params."),
                 "next_call": Self.readCall(id)]))
         }
-        if !projection, !preview, replay == nil, let refused = await host.admitTool(id, input: Self.fields(input), execution: invocation.execution,
-            effect: nil) {
-            try abilities.recordRun(id: id, version: digest, receipt: refused, turn: invocation.execution.turn)
-            return refused
+        let admittedInvocation = invocation
+        let perform: @Sendable () async throws -> JSONValue = {
+            try await self.runAdmitted(candidate, input: input, revision: revision, dependencySnapshot: dependencySnapshot,
+                preview: preview, replay: replay, projection: projection, host: host, invocation: admittedInvocation)
         }
+        if !projection, !preview {
+            guard let result = await host.admitTool(id, input: Self.fields(input), execution: invocation.execution, effect: perform) else {
+                throw SenseFailure(code: "door_unavailable", message: "The ability's gate returned no execution receipt.")
+            }
+            return result
+        }
+        return try await perform()
+    }
+
+    private func runAdmitted(_ candidate: OwnedProgramStore.Candidate, input suppliedInput: JSONValue,
+        revision: [String], dependencySnapshot selectedSnapshot: JSONValue,
+        preview: Bool, replay: OwnedProgramRunner.Replay?, projection: Bool, host: any OwnedProgramToolHost,
+        invocation: Invocation) async throws -> JSONValue {
+        let id = candidate.id, digest = candidate.digest
+        let startedAt = Date()
+        let dependencySnapshot = if projection { selectedSnapshot } else {
+            try await checkSelected(candidate, pinned: digest, invocation: invocation)
+        }
+        let input: JSONValue
+        if !projection, id == "native-morning-brief", Self.fields(suppliedInput)["operation"] == .string("brief") {
+            let worklog = root.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
+                ? InstallPaths.current.claudeWorklog : nil
+            input = try await MorningBriefSources(root: root, now: Date(), worklogPath: worklog).packet()
+        } else { input = suppliedInput }
+        let binding = OwnedProgramRunner.Binding(revision: revision)
         // A resident ability holds what it starts and opens across its runs, a resumed one included (a resume never replays a primitive call).
         let program: OwnedProgram
         if projection {
@@ -271,11 +341,13 @@ extension Parts {
                 make: { ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id, dataRoot: dataRoot, held: AbilityStore(dataRoot: dataRoot)) },
                 end: { _ = await $0.close() })
             : ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id, dataRoot: dataRoot)
+        // A verb the part answers as a read runs read-confined; the declaration is enforced here, not trusted.
+        let answered = Self.fields(Self.fields(Self.fields(candidate.manifest)["answers"] ?? .null)[Self.string(Self.fields(input), "verb") ?? ""] ?? .null)
         let profile = ToolHost(base: host, candidate: candidate, broker: broker, dataRoot: root, openScreenWatch: invocation.openScreenWatch,
-            projection: projection, preview: preview,
+            projection: projection, preview: preview, readOnly: answered["class"] == .string("read"),
             admission: {
                 try await binding.check(self.abilities.revision() + host.dependencyRevision(candidate.program.dependencies)) {
-                    try await self.checkSelected(candidate, pinned: digest, invocation: invocation)
+                    _ = try await self.checkSelected(candidate, pinned: digest, invocation: invocation)
                 }
             })
         await broker.begin()
@@ -287,6 +359,14 @@ extension Parts {
         let watched = await settle { await broker.finish() }
         if !watched.isEmpty { result["watch"] = watched.count == 1 ? watched[0] : .array(watched) }
         result["ability"] = .string(id); result["version"] = .string(candidate.digest)
+        // Completing JavaScript does not make its explicit decline a successful run. Effects and calls remain the runner's evidence.
+        if result["status"] == .string("ok"), let returned = result["returned"]?.objectValue,
+           returned["status"] == .string("refused") {
+            result["status"] = .string("refused")
+            for key in ["reason", "reasons", "gate_reason", "not_run_status", "detail", "message", "checker", "remedy"] {
+                result[key] = returned[key]
+            }
+        }
         if result["status"] == .string("stopped"), !candidate.program.isStrict {
             let stopped = Self.fields(result["stopped"] ?? .null)
             result["status"] = .string(stopped["not_run_status"] == .string("approval_filed") ? "waiting_approval"
@@ -303,16 +383,22 @@ extension Parts {
                 result["detail"] = .string(words)
             }
         }
+        if !projection, !preview {
+            if result["status"] != .string("ok"), result["checker"] == nil { result["checker"] = .string("part") }
+            return await abilities.settleRun(id: id, version: digest, receipt: .object(result), input: replay == nil ? input : nil,
+                dependencySnapshot: dependencySnapshot, turn: invocation.execution.turn, at: startedAt)
+        }
         return .object(result)
     }
 
-    func checkSelected(_ candidate: OwnedProgramStore.Candidate, pinned: String, invocation: Invocation) async throws {
+    @discardableResult
+    func checkSelected(_ candidate: OwnedProgramStore.Candidate, pinned: String, invocation: Invocation) async throws -> JSONValue {
         guard let row = try row(candidate.id), row["status"] == .string("active"), row["codeFingerprint"] == .string(pinned) else {
             throw Self.revisionFailure("state_changed",
                 "Ability \(candidate.id) version \(pinned) was stopped or replaced; no further calls were admitted.", id: candidate.id, version: pinned)
         }
         try await checkAdmission(candidate, row: row)
-        try checkDependencies(candidate, invocation: invocation)
+        return try await checkDependencies(candidate, invocation: invocation)
     }
 
     /// The one admission, re-verified each run: signed for this exact version and its sealed proof, and the record still selecting it.
@@ -353,7 +439,7 @@ extension Parts {
     }
 
     @discardableResult
-    public func checkDependencies(_ candidate: OwnedProgramStore.Candidate, invocation: Invocation) throws -> JSONValue {
+    public func checkDependencies(_ candidate: OwnedProgramStore.Candidate, invocation: Invocation) async throws -> JSONValue {
         if let action = Self.string(Self.fields(Self.fields(candidate.manifest)["face"] ?? .null), "action"),
            let owner = try invocation.host?.action(action), owner.partID != candidate.id {
             throw Self.revisionFailure("face_action_collision", """
@@ -374,13 +460,13 @@ extension Parts {
                 schema: call.id == "authored." + candidate.id ? candidate.program.schema : nil) else { continue }
             let file = try AbilityStore.File(id: candidate.id, kind: .part, metadata: ["record": candidate.manifest], body: candidate.program.source,
                 pathExtension: "js")
-            throw ToolFailureError("""
-                Call \(call.id) at line \(call.line): \(problem). Revise \(candidate.id) with ability.save, keep the reviewed version, then repeat the \
-                failed operation.
-                """,
-                effects: .none, owner: "ability \(candidate.id) version \(candidate.digest) > line \(call.line) > \(problem)",
-                nextCall: try abilities.repairCall(file), code: "stale_dependency", status: .refused,
-                instruction: "Correct the named call and field against the live schema, then keep the reviewed version. Do not replay observed effects.")
+            let next = try JSONValue.parse(Data(abilities.repairCall(file).utf8))
+            throw SenseFailure(code: "stale_dependency",
+                message: "Call \(call.id) at line \(call.line): \(problem). Revise \(candidate.id) with ability.save, then keep the reviewed version.",
+                remedy: .object(["kind": .string("correct_arguments"),
+                    "owner": .string("ability \(candidate.id) version \(candidate.digest) > line \(call.line) > \(problem)"),
+                    "next_call": next, "try_instead": try await host.callAdvice(call.id, given: given),
+                    "instruction": .string("Correct the named call and field, then keep the reviewed version. Do not replay observed effects.")]))
         }
         var shapes: [String: JSONValue] = [:]
         for action in candidate.program.dependencies { shapes[action] = try host.dependencyShape(action) ?? .null }

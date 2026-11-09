@@ -45,22 +45,6 @@ extension MacFourVerbs {
             return .init(ok: false, text: "interval must be a finite nonnegative number; nothing was sent.",
                 detail: ["error": .string("invalid_interval"), "effects": .string("none")])
         }
-        if context.deadline == nil {
-            do {
-                return try await OperationWaitBudget.withDeadline(
-                    seconds: Double(SwiftNativeMacControl.operationTimeoutSeconds(action: "act", body: [:])),
-                  budget: context.waitBudget) { budget in
-                    let context = context.with(\.deadline, budget.deadline)
-                    return await self.act(verb: rawVerb, target: target, text: text, mode: mode,
-                        to: destination, toApp: destinationApp, seconds: seconds,
-                        repeat: requestedRepeat, interval: interval, holding: holding,
-                        button: button, scrollAmount: scrollAmount, app: app, front: front,
-                        steps: steps, again: again, place: place, turn: turn, context: context)
-                }
-            } catch {
-                return Self.interruptedActReply(error)
-            }
-        }
         if let flowRoot, context.dataRoot != flowRoot {
             return await context.holding(\.dataRoot, flowRoot) { context in
                 await act(verb: rawVerb, target: target, text: text, mode: mode, to: destination,
@@ -268,19 +252,6 @@ extension MacFourVerbs {
         let elapsed = started.duration(to: .now).components
         detail["duration_ms"] = .int(elapsed.seconds * 1000 + elapsed.attoseconds / 1_000_000_000_000_000)
         return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
-    }
-
-    static func interruptedActReply(_ error: Error) -> MacFourVerbsReply {
-        let timedOut = error is OperationWaitBudget.Exceeded
-        return .init(ok: false,
-            text: timedOut
-                ? """
-                    The action timed out and cancellation was requested. Earlier input or changes may have reached the app; completion was not verified. \
-                    Inspect the app before another action.
-                    """
-                : "The action was cancelled. Earlier input or changes may have reached the app; inspect it before another action.",
-            detail: ["error": .string(timedOut ? "timed_out" : "cancelled"),
-                "timed_out": .bool(timedOut), "effects": .string("unknown"), "verification": .string("unverified")])
     }
 
     private func actCore(

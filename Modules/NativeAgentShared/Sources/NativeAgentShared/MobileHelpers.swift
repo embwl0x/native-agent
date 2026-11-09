@@ -75,32 +75,6 @@ public struct MobileHelperRow: Codable, Identifiable, Sendable {
     }
 }
 
-public struct MobileHelperEdit: Codable, Sendable {
-    public var id: UUID?
-    public var revision: Double?
-    public var name = ""
-    public var brief = ""
-    public var provider = ""
-    public var model = ""
-    public var modelPinned: Bool? = false
-    public var think = ""
-    public var fast = false
-    /// Every edit and receipt carries explicit Fast intent; an unsubmitted hidden control must not change it.
-    public var fastIsSet = false
-    public var timing = "manual"
-    public var hours = ""
-    public var cron = ""
-    public var eventSource = "slack"
-    public var eventFilter = ""
-    public var eventKeyword = ""
-    public var tokens = ""
-    public var seconds = ""
-    public var daily = ""
-    public var tell = false
-    public var condition = ""
-    public init() {}
-}
-
 public struct MobileAgentRow: Codable, Identifiable, Sendable, Equatable {
     public var summary: Self {
         var row = self

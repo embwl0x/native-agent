@@ -319,9 +319,10 @@ extension MacFourVerbs {
             }
         }
         // Self-front looks read the agent's own page and name the person's app behind it so callers can look past the app without guessing.
-        let behind = verb == nil ? Self.appBehindMe().map {
+        let behindApp = verb == nil ? Self.appBehindMe() : nil
+        let behind = behindApp.map {
             "NativeAgent (me) is in front; the person's app behind me is \($0): mac.look {app:\"\($0)\"} reads it, with pixels:true for its picture."
-        } : nil
+        }
         return MacFourVerbsReply(
             ok: false,
             text: """
@@ -331,6 +332,7 @@ extension MacFourVerbs {
             detail: ["status": .string("in_process_route"),
                      "execute_in_process": .bool(executable),
                      "behind": behind.map(JSONValue.string) ?? .null,
+                     "behind_app": behindApp.map(JSONValue.string) ?? .null,
                      "next_action": .object(["tool": .string("app"), "input": .object(input)])]
         )
     }
@@ -339,10 +341,9 @@ extension MacFourVerbs {
     static func appBehindMe() -> String? {
         guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] else { return nil }
-        let me = getpid()
         for window in windows {
             guard (window[kCGWindowLayer as String] as? Int) == 0,
-                  let pid = window[kCGWindowOwnerPID as String] as? pid_t, pid != me,
+                  let pid = window[kCGWindowOwnerPID as String] as? pid_t, !PersonOnlyWindows.isOwnProcess(pid),
                   let name = window[kCGWindowOwnerName as String] as? String,
                   !name.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
             return name

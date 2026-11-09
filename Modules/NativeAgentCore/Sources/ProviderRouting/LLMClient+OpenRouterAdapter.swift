@@ -13,14 +13,14 @@ public final class OpenRouterTransport: LLMTransport {
 
     public let providerId: String = "openrouter"
     private let session: URLSession
-    private let endpoint: URL
+    private let endpoint: URL?
     private let apiKeyOverride: String?
     private let dataRootOverride: URL?
     private let telemetry: LLMCallTraceRecorder
 
     public init(
-        session: URLSession = .shared,
-        endpoint: URL = URL(string: "https://openrouter.ai/api/v1/chat/completions")!,
+        session: URLSession = ProviderHTTP.session,
+        endpoint: URL? = URL(string: "https://openrouter.ai/api/v1/chat/completions"),
         apiKeyOverride: String? = nil,
         dataRootOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil
@@ -32,11 +32,6 @@ public final class OpenRouterTransport: LLMTransport {
         self.telemetry = LLMCallTraceRecorder(
             dataRootOverride: telemetryDataRootOverride ?? dataRootOverride
         )
-    }
-
-    /// A 404 is already the answer for this call; the catalog learns it on its own task, so the failure never waits on a discovery request.
-    private static func refreshCatalog(dataRoot: URL, session: URLSession) {
-        Task.detached { _ = await OpenRouterModelCatalog.models(dataRoot: dataRoot, session: session, refresh: true) }
     }
 
     /// Send the exact admitted effort from this route's current catalog.
@@ -77,7 +72,7 @@ public final class OpenRouterTransport: LLMTransport {
             { held in self.streamMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
 
-    /// Preserve images and assistant-tool/result turns on OpenRouter's OpenAI-compatible wire. The stream owns the 404 catalog refresh, as a turn's does.
+    /// Preserve images and assistant-tool/result turns on OpenRouter's OpenAI-compatible wire.
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
@@ -104,6 +99,7 @@ public final class OpenRouterTransport: LLMTransport {
             let task = Task {
                 let startedNs = DispatchTime.now().uptimeNanoseconds
                 do {
+                    guard let endpoint else { throw URLError(.badURL) }
                     guard let key = try keyResolved.get(), !key.isEmpty else {
                         throw LLMError.notConfigured(provider: "openrouter")
                     }
@@ -121,7 +117,7 @@ public final class OpenRouterTransport: LLMTransport {
                     try OpenAITransport.applyTools(to: &body, tools: tools)
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
-                    let bytes: URLSession.AsyncBytes
+                    let bytes: ProviderHTTPBytes
                     let response: URLResponse
                     do {
                         (bytes, response) = try await ProviderWire.open(session, req, call: call)
@@ -130,15 +126,13 @@ public final class OpenRouterTransport: LLMTransport {
                             message: "connection refused: \(endpoint.host ?? "openrouter")"
                         ))
                     }
-                    defer { bytes.task.cancel() }
+                    defer { bytes.cancel() }
                     try await ProviderWire.validateChatCompletions(bytes, response) { status in
                         if status == 404 {
-                            Self.refreshCatalog(dataRoot: dataRoot, session: session)
                             throw LLMError.modelUnavailable(provider: "openrouter", model: model)
                         }
                     }
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter", diagnosticDataRoot: telemetry.diagnosticDataRoot(call: call),
-                        call: call)
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter")
                     try await decoder.consume(
                         SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
                         request: req, providerID: providerId, model: model, idPrefix: "openrouter",

@@ -1,9 +1,8 @@
 import Foundation
 import NativeAgentShared
-import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TelegramPollLoop+Approvals.swift` | `TelegramPollLoop`: shared approval ownership; session journal delivers replies |
+// Blueprint: | `TelegramPollLoop+Approvals.swift` | `TelegramPollLoop`: an allowlisted sender's card answers go to the card's matter's Inbox row |
 
 extension TelegramPollLoop {
     func handleApprovalSlashCommand(
@@ -22,37 +21,14 @@ extension TelegramPollLoop {
             }
             return
         }
+        let resolution = await approvalHandler.act(command, chatId: message.chatId, messageId: nil, fromUserId: message.fromUserId)
+        let reply = TurnSecretRedactor.redactText(resolution.acknowledgement)
         do {
-            let resolution = try await approvalHandler.resolveTelegramApproval(
-                id: command.id,
-                decision: command.decision,
-                choice: nil,
-                chatId: message.chatId,
-                fromUserId: message.fromUserId
-            )
-            try await Self.defaultSendMessage(token, message.destination, resolution.acknowledgement)
-            await recordReceipt(
-                kind: "approval_decision",
-                update: update,
-                message: message,
-                text: text,
-                reply: resolution.acknowledgement
-            )
+            try await Self.defaultSendMessage(token, message.destination, reply)
+            await recordReceipt(kind: "approval_decision", update: update, message: message, text: text, reply: reply)
         } catch {
-            let reply = "Approval update failed: \(TurnSecretRedactor.redactText(String(describing: error)))"
-            do {
-                try await Self.defaultSendMessage(token, message.destination, reply)
-                await recordReceipt(kind: "approval_error", update: update, message: message, text: text, reply: reply)
-            } catch {
-                await recordError(context: "send_approval_error", error: String(describing: error), update: update, message: message, text: text)
-            }
+            await recordError(context: "send_approval_decision", error: String(describing: error), update: update, message: message, text: text)
         }
-    }
-
-    /// A read whose absence is an answer (the card was answered or withdrawn); every other inbox failure still throws.
-    static func approvalIfPresent(_ inbox: SwiftNativeApprovalInbox, _ id: String) async throws -> ApprovalRecord? {
-        do { return try await inbox.get(id) }
-        catch ApprovalInboxError.notFound { return nil }
     }
 
     func handleApprovalCallback(update: TelegramUpdate, callback: JSONValue) async -> Bool {
@@ -65,7 +41,7 @@ extension TelegramPollLoop {
             await Task {
                 do {
                     _ = try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).transition(
-                        updateId: update.updateId, from: [.processing, .queued], to: .completed
+                        updateId: update.updateId, from: [.processing], to: .completed
                     )
                 } catch {
                     await recordError(context: "update_inbox_complete", error: String(describing: error), update: update)
@@ -77,7 +53,7 @@ extension TelegramPollLoop {
             await Task {
                 do {
                     _ = try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).transition(
-                        updateId: update.updateId, from: [.processing, .queued], to: .pending
+                        updateId: update.updateId, from: [.processing], to: .pending
                     )
                 } catch {
                     await recordError(context: "approval_callback_release", error: String(describing: error), update: update)
@@ -131,51 +107,13 @@ extension TelegramPollLoop {
             )
             return true
         }
-        do {
-            let resolution = try await approvalHandler.resolveTelegramApproval(
-                id: parsed.command.id,
-                decision: parsed.command.decision,
-                choice: parsed.command.choice,
-                chatId: parsed.chatId,
-                fromUserId: parsed.fromUserId
-            )
-            await answerRecordedCallback(
-                parsed.callbackId,
-                text: resolution.acknowledgement,
-                context: "approval_callback_answer",
-                update: update
-            )
-            // An approval that settled, or a mirrored card (not an approval record) that was just answered: its buttons are done either way.
-            let record = try await Self.approvalIfPresent(approvalInbox, parsed.command.id)
-            if record == nil || record?.status != "pending" {
-                await terminalizeApprovalKeyboard(
-                    chatId: parsed.chatId, messageId: parsed.messageId,
-                    text: resolution.acknowledgement, update: update
-                )
-            }
-        } catch {
-            let reply = "Approval update failed: \(TurnSecretRedactor.redactText(String(describing: error)))"
-            await answerRecordedCallback(
-                parsed.callbackId,
-                text: reply,
-                context: "approval_callback_error_answer",
-                update: update
-            )
-            // Only an authoritative read can establish absence or settlement.
-            do {
-                let record = try await Self.approvalIfPresent(approvalInbox, parsed.command.id)
-                if record == nil || record?.status != "pending" {
-                    await terminalizeApprovalKeyboard(
-                        chatId: parsed.chatId, messageId: parsed.messageId,
-                        text: record == nil ? "This card was already answered or withdrawn." : reply, update: update
-                    )
-                }
-            } catch {
-                await recordError(context: "approval_callback_readback", error: String(describing: error), update: update)
-                await answerRecordedCallback(parsed.callbackId,
-                    text: "Approval status is unavailable. The card's controls remain until its decision can be read.",
-                    context: "approval_callback_readback_unavailable", update: update)
-            }
+        let resolution = await approvalHandler.act(parsed.command, chatId: parsed.chatId, messageId: parsed.messageId,
+                                                   fromUserId: parsed.fromUserId)
+        let reply = TurnSecretRedactor.redactText(resolution.acknowledgement)
+        await answerRecordedCallback(parsed.callbackId, text: reply, context: "approval_callback_answer", update: update)
+        // A card whose row offers nothing more on Telegram loses its buttons; one whose row could not be read keeps them.
+        if resolution.settled == true {
+            await terminalizeApprovalKeyboard(chatId: parsed.chatId, messageId: parsed.messageId, text: reply, update: update)
         }
         return true
     }

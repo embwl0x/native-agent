@@ -121,26 +121,27 @@ public struct AgentContactJob: Codable, Sendable, Equatable {
         return names
     }
 
-    /// The regular files the agent left directly in the folder. Hidden files, links and `input/` are not the agent's to hand back; a file the wire cannot
-    /// carry is counted.
-    static func fileParts(taskID: String, dataRoot: URL) throws -> (parts: [AgentContactPart], unsent: Int) {
+    /// Retain each readable artifact and name every file whose delivery needs repair.
+    static func fileParts(taskID: String, dataRoot: URL) throws -> (parts: [AgentContactPart], failures: [String]) {
         let entries = try FileManager.default.contentsOfDirectory(at: folder(taskID: taskID, dataRoot: dataRoot),
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-            // Only regular files the agent made: a link would hand back whatever it points at.
-            .filter { entry in
-                guard !entry.lastPathComponent.hasPrefix("."),
-                      let values = try? entry.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return false }
-                return values.isRegularFile == true && values.isSymbolicLink != true
-            }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         var parts: [AgentContactPart] = []
-        var unsent = 0
-        for entry in entries {
-            let mime = UTType(filenameExtension: entry.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
-            let attachment = ChatTurnRuntime.MultimodalAttachment(type: "file", base64: "", mime: mime, name: entry.lastPathComponent, path: entry.path)
-            if let part = try? AgentContactPart.output(attachment, taskID: taskID) { parts.append(part) } else { unsent += 1 }
+        var failures: [String] = []
+        for entry in entries where !entry.lastPathComponent.hasPrefix(".") {
+            do {
+                let values = try entry.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isSymbolicLink != true else { continue }
+                guard let regular = values.isRegularFile else {
+                    throw AgentContactFailure(code: -32603, message: "Regular-file metadata is unavailable")
+                }
+                guard regular else { continue }
+                let mime = UTType(filenameExtension: entry.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+                let attachment = ChatTurnRuntime.MultimodalAttachment(type: "file", base64: "", mime: mime, name: entry.lastPathComponent, path: entry.path)
+                parts.append(try AgentContactPart.output(attachment, taskID: taskID))
+            } catch { failures.append(entry.path + ": " + ((error as? AgentContactFailure)?.message ?? error.localizedDescription)) }
         }
-        return (parts, unsent)
+        return (parts, failures)
     }
 }
 

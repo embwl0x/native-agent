@@ -225,21 +225,16 @@ else
   status INFO "snapshot source" "canonical cache for dataRoot=$DATA_ROOT"
 fi
 if [ -f "$snapshot_path" ]; then
-  if jq empty "$snapshot_path" >/dev/null 2>&1; then
-    generated="$(jq -r '.generatedAt // "unknown"' "$snapshot_path")"
-    ios_posture="$(jq -r '.posture // "unknown"' "$snapshot_path")"
-    ios_proposals="$(jq -r '(.standingViewProposals // []) | length' "$snapshot_path")"
-    snapshot_mtime="$(stat -f '%m' "$snapshot_path" 2>/dev/null || echo 0)"
-    snapshot_age="$(( $(date +%s) - snapshot_mtime ))"
-    if [ "$snapshot_age" -lt 0 ]; then snapshot_age=0; fi
-    if [ "$snapshot_mtime" -gt 0 ] && [ "$snapshot_age" -le 600 ]; then
-      status PASS "organism_living_status" "generatedAt=$generated age=${snapshot_age}s posture=$ios_posture proposals=$ios_proposals"
-    else
-      status WARN "organism_living_status" "stale snapshot generatedAt=$generated age=${snapshot_age}s posture=$ios_posture"
-    fi
+  if jq -e '(.generatedAt | type) == "string" and (.posture | type) == "string"
+      and (.availability | IN("live", "disabled", "unavailable"))' "$snapshot_path" >/dev/null 2>&1; then
+    changed="$(jq -r '.generatedAt' "$snapshot_path")"
+    ios_posture="$(jq -r '.posture' "$snapshot_path")"
+    ios_availability="$(jq -r '.availability' "$snapshot_path")"
+    # The wire Date uses ISO 8601. State age is not Mac liveness; transport presence owns last-seen.
+    status INFO "organism_living_status" "changedAt=$changed posture=$ios_posture availability=$ios_availability; liveness is transport-owned"
     status INFO "snapshot path" "$snapshot_path"
   else
-    status FAIL "organism_living_status" "found but invalid JSON: $snapshot_path"
+    status FAIL "organism_living_status" "found but invalid snapshot state: $snapshot_path"
   fi
 else
   status WARN "organism_living_status" "unavailable at $snapshot_path; no other snapshot is substituted"

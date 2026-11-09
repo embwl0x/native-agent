@@ -9,10 +9,10 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import Synchronization
-// Blueprint: | `ConversationPrefixSeeding.swift` | User-leading deltas, keyframes and exact sent-row metadata |
+// Blueprint: | `ConversationPrefixSeeding.swift` | Public moment context is retained on its sent row; private choices join only live provider input |
 
-/// Every provider shares the same user-leading layout; preserve prior blocks exactly as sent.
-/// A route/window change or missing full block starts a keyframe so paragraph deltas retain a valid base.
+/// Every provider receives history, the private choice, public moment context and the person's words in that order.
+/// Public context is retained once; later turns replay speech and receipts, never either context block.
 enum ConversationPrefixSeeding {
     private struct PreviewKey: Hashable, Sendable {
         let bytes: Data
@@ -33,25 +33,30 @@ enum ConversationPrefixSeeding {
         let currentUserIndex: Int
         let textToolCatalogRidesVolatileBlock: Bool
         let sentContext: SentTurnContext
-        let fullBlockBytes: Int
     }
 
     /// The text lane's session catalog belongs with the changing block, while
     /// its always-on floor remains in the stable system material.
     static func seed(_ ctx: TurnContext, textToolCatalogAppendix: String? = nil) -> Seed {
-        var split = ctx.splittingVolatileBlock(appending: textToolCatalogAppendix ?? "")
-        let full = split.turnVolatileBlock ?? ""
+        // Fitting changes the held bodies. Select their complement anew before measuring or sending this exact request.
+        let historyLeads = ctx.historyReplaySpec?.historyLeads?(Set(ctx.historyRowCharacters.keys))
+        let trailing = [historyLeads, textToolCatalogAppendix].compactMap { $0 }.joined(separator: "\n\n")
+        let split = ctx.splittingVolatileBlock(appending: trailing)
         let request = SessionRequestMessages.seed(history: split.historyMessages,
-            replayed: split.replayedTurnContexts, fullBlock: full, model: split.modelId,
-            provider: split.providerId, window: split.historyContextWindow, userText: split.userMessage,
-            images: split.imageBlocks)
+            block: split.turnVolatileBlock ?? "", model: split.modelId,
+            provider: split.providerId, userText: split.userMessage, images: split.imageBlocks)
         let sent = request.sent
-        split.turnVolatileBlock = sent.block
-        return Seed(context: split, messages: request.messages,
+        var messages = request.messages
+        if !split.privateWorkingMemory.isEmpty, messages.indices.contains(request.currentUserIndex) {
+            let current = messages[request.currentUserIndex]
+            messages[request.currentUserIndex] = LLMMessage(role: current.role,
+                content: [.text(split.privateWorkingMemory)] + current.content)
+        }
+        return Seed(context: split, messages: messages,
             delivery: sent.block.isEmpty ? .none : .userLeadingBlock,
             currentUserIndex: request.currentUserIndex,
             textToolCatalogRidesVolatileBlock: textToolCatalogAppendix != nil,
-            sentContext: sent, fullBlockBytes: full.utf8.count)
+            sentContext: sent)
     }
 
     struct Request: Sendable {
@@ -78,9 +83,11 @@ enum ConversationPrefixSeeding {
             guard let replay = seed.context.historyReplaySpec else {
                 throw ProviderRoutingError.configurationFailed("This conversation's request has no replay builder.")
             }
+            let (additional, overflow) = additionalCharacters.addingReportingOverflow(seed.context.privateWorkingMemory.count)
+            guard !overflow else { throw ProviderRoutingError.configurationFailed("The private context size is not representable.") }
             return SessionContextPlan(replay: replay, currentRunID: runID, currentUserMessageID: userMessageID,
                 systemAndToolsCharacters: LLMMessage.inputCharacters([], system: system, tools: tools ?? []),
-                additionalCharacters: additionalCharacters, model: seed.context.modelId, provider: seed.context.providerId)
+                additionalCharacters: additional, model: seed.context.modelId, provider: seed.context.providerId)
         }
         var measurement: SessionContextRequest {
             get throws { try SessionContextRequest(messages: messages, system: system, tools: tools ?? [],
@@ -226,9 +233,6 @@ enum ConversationPrefixSeeding {
                 }
             },
             volatileBlockChars: seed.context.turnVolatileBlock?.count ?? 0,
-            volatileFullBlockBytes: seed.fullBlockBytes,
-            volatileDeltaBlockBytes: seed.sentContext.block.utf8.count,
-            volatileKeyframe: seed.sentContext.isKeyframe,
             volatileDelivery: seed.delivery.rawValue,
             historyContextWindow: seed.context.historyContextWindow,
             messageCount: seed.messages.count,

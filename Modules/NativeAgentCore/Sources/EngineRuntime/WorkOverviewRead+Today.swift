@@ -20,8 +20,8 @@ import AgentConversations
 import TrustCenter
 import AgentWorkspace
 import TurnTrace
-import Experiences
-// Blueprint: | `WorkOverviewRead+Today.swift` | Frozen Today sources at the experience record's sequence; engine.pages projects today-readout.js |
+import TriggerScheduler
+// Blueprint: | `WorkOverviewRead+Today.swift` | Source-specific Today readings and the off-main owner posting its finished `today-readout` face |
 
 // MARK: - Plain-words formatting
 
@@ -124,31 +124,12 @@ public enum TodayWords {
         return date.formatted(style)
     }
 
-    /// Use the system interval formatter so shared periods remain localized.
-    public static func clockSpan(_ start: Date, _ end: Date, calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
-        guard clock(start, calendar: calendar) != clock(end, calendar: calendar), start < end else {
-            return clock(start, calendar: calendar)
-        }
-        let style = Date.IntervalFormatStyle(date: .omitted, time: .shortened, timeZone: calendar.timeZone)
-        return (start..<end).formatted(style)
-    }
-
     /// Name dates beyond the adjacent week so distant runs cannot look like this week’s weekday.
     public static func weekday(_ date: Date, now: Date = Date(), calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
         let style = Date.FormatStyle(calendar: calendar, timeZone: calendar.timeZone)
         guard abs(date.timeIntervalSince(now)) >= 6.5 * 86_400 else { return date.formatted(style.weekday(.abbreviated)) }
         let sameYear = calendar.component(.year, from: date) == calendar.component(.year, from: now)
         return date.formatted(sameYear ? style.month(.abbreviated).day() : style.month(.abbreviated).day().year())
-    }
-
-    /// Use actual date and hour so early-morning dreams cannot appear as tonight’s.
-    public static func dayWord(_ date: Date, now: Date = Date(), calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
-        if calendar.isDate(date, inSameDayAs: now) {
-            return calendar.component(.hour, from: date) >= 18 ? "Tonight" : "Today"
-        }
-        if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
-           calendar.isDate(date, inSameDayAs: tomorrow) { return "Tomorrow" }
-        return date.formatted(Date.FormatStyle(calendar: calendar, timeZone: calendar.timeZone).weekday(.wide))
     }
 
     /// Remove machine ids and tidy leftover punctuation so routing cannot leak into prose.
@@ -231,23 +212,17 @@ extension WorkOverviewRead {
         return items + notes == onDesk ? (items, notes) : nil
     }
 
-    @MainActor
-    public static func conversationSurfaces(_ sessions: [NativeAgentShared.ChatSession],
-                                            openingLines: ChatShellOpeningLine) -> [String: String] {
+    static func conversationSurfaces(_ sessions: [NativeAgentShared.ChatSession],
+                                     openingLines: [String: ChatShellOpeningLine.OpeningLine]) -> [String: String] {
         let now = Date()
         let calendar = Calendar.autoupdatingCurrent
         return Dictionary(sessions.filter {
             guard ($0.messageCount ?? 0) > 0,
                   let at = TodayWords.parseTimestamp($0.updatedAt ?? $0.createdAt),
                   calendar.isDate(at, inSameDayAs: now) else { return false }
-            return !ChatShellConversationRow.isWorking($0) && !ChatShellConversationRow.isAgentOwn($0, openingLines: openingLines)
+            return !ChatShellConversationRow.isWorking($0) && !ChatShellConversationRow.isAgentOwn($0, reading: openingLines)
         }
             .map { ($0.id, ChatShellConversationRow.surface(for: $0)) }, uniquingKeysWith: { first, _ in first })
-    }
-
-    @MainActor
-    public static func todaySessionIDs(_ engine: NativeAgentEngine) -> [String] {
-        todaySessionIDs(engine.transcripts.sessions)
     }
 
     static func todaySessionIDs(_ sessions: [NativeAgentShared.ChatSession]) -> [String] {
@@ -260,79 +235,143 @@ extension WorkOverviewRead {
 
 }
 
-private struct TodaySource: Sendable {
-    var input: [String: JSONValue] = [:]
-    let epoch: UInt64
-    var owed = false
-    var memoryUnreadable = false
-    var dreamUnavailable = false
-    var unavailable: [String] = []
+private enum TodayFeed: String, CaseIterable, Hashable, Sendable {
+    case clock, approvals, notes, waiting, trials, thinking, moments, dream, schedule, toward, intentions, conversations
+}
 
-    @MainActor
-    static func read(_ engine: NativeAgentEngine, activeSessionID: String) async throws -> TodaySource {
-        // Read the record position before the packet so a later packet cannot be replaced by an older reader.
-        let seq = try await ExperienceStore.at(engine.dataRoot).lastDetailSeq()
-        var source = TodaySource(epoch: UInt64(seq ?? 0))
-        source.input["recordSeq"] = seq.map(JSONValue.int) ?? .null
-        var characterSet = Set<String>()
+private enum TodayChange: Hashable, Sendable {
+    case all
+    case feed(TodayFeed)
+    case index
+    case contacts
+    case transcript(String)
+}
+
+/// A source's finished facts and destinations; a failed source carries its own gap beside its healthy siblings.
+private struct TodaySource: Sendable, Equatable {
+    var input: [String: JSONValue] = [:]
+    /// What each of the face's rows may lead to, by the row's key.
+    var keys: [String: JSONValue] = [:]
+    /// The person's decisions waiting, drawn by the stem beside the face.
+    var levers: [PartFace.Row] = []
+    /// The night's trials, the same section Home draws (`TrialLevers`): the person's Set aside wherever the person is.
+    var trials: PartFace.Section?
+    var owed = false
+    var approvalCount: Int?
+    var waitingCount: Int?
+    var waitingKinds: [WorkOverviewReference.Kind: Int]?
+    var phoneWaiting = false
+    var phoneKnown = false
+    var unavailable: [String] = []
+    /// The earliest instant at which these finished time-dependent facts must be read again.
+    var deadline: Date?
+
+    static func approvals(_ engine: NativeAgentEngine) async -> Self {
+        var source = Self()
+        do {
+            let rows = try await SwiftNativeApprovalInbox(root: engine.dataRoot).list(filter: .all)
+            let approvals = WorkOverviewRead.waitingApprovals(rows)
+            source.approvalCount = approvals.count
+            source.levers = approvals.map { approval in
+                let matter = approval.matter
+                return PartFace.Row(id: "approval:" + approval.id, title: matter.title,
+                    detail: TodayWords.line(matter.summary), tone: .attention, open: "approval:" + approval.id)
+            }
+            source.owed = !approvals.isEmpty
+        } catch {
+            source.unavailable.append("Approvals source unavailable: " + error.localizedDescription)
+            source.owed = true
+        }
+        return source
+    }
+
+    static func notes(_ engine: NativeAgentEngine) async -> Self {
+        var source = Self()
         let now = Date(), calendar = Calendar.autoupdatingCurrent
         func today(_ at: Date) -> Bool { calendar.isDate(at, inSameDayAs: now) }
-        let sessions: [NativeAgentShared.ChatSession]
-        var sessionState = "available"
         do {
-            let path = engine.dataRoot.appendingPathComponent("chat/sessions.json")
-            sessions = try await SwiftNativePersistenceCore.withFileLock(path) {
-                try ChatSessionIndexFile.loadObjectRowsForMutation(at: path).map(NativeAgentShared.ChatSession.init(row:))
+            let items = try await ForPerson.at(engine.dataRoot).inbox()
+            source.input["sourceStates"] = .object(["notes": .string(items.isEmpty ? "empty" : "available")])
+            let asks = items.filter { $0.requiresOwnerInput && !$0.hasLinkedApproval }.sorted { $0.created_at > $1.created_at }
+            let waiting = asks.map { item -> JSONValue in
+                source.keys["card:" + item.id] = .object(["open": .string("card:" + item.id)])
+                return .object(["id": .string("card:" + item.id), "title": .string(item.title), "detail": .string(TodayWords.line(item.summary))])
             }
-            sessionState = sessions.isEmpty ? "empty" : "available"
+            let notes = items.filter { $0.isActivityPending && !$0.isSystemLane }.compactMap { item -> JSONValue? in
+                if let at = TodayWords.parseTimestamp(item.created_at) {
+                    let key = "inbox:" + item.id
+                    // Only native owner job identity may bind a folded group.
+                    let job = item.relatedDelegationID.flatMap { $0.isEmpty ? nil : $0 }
+                    source.keys[key] = .object(["open": .string("card:" + item.id)])
+                    return .object(["key": .string(key), "at": .double(at.timeIntervalSince1970), "today": .bool(today(at)),
+                        "source": .string(item.source), "title": .string(TodayWords.withoutIDs(TodayWords.line(item.title,limit:90))),
+                        "summary": .string(TodayWords.withoutIDs(TodayWords.firstSentence(item.summary))), "job": job.map(JSONValue.string) ?? .null])
+                }
+                source.unavailable.append("Note time unavailable: " + item.id)
+                return nil
+            }
+            source.input["waitingRows"] = .array(waiting)
+            source.input["notes"] = .array(notes)
+            source.owed = !waiting.isEmpty
         } catch {
-            sessions = []
-            sessionState = "unavailable"
-            source.unavailable.append("Conversation source unavailable: " + error.localizedDescription)
+            source.input["sourceStates"] = .object(["notes": .string("unavailable")])
+            source.input["waitingRows"] = .array([])
+            source.input["notes"] = .array([])
+            source.unavailable.append("Notes source unavailable: " + error.localizedDescription)
+            source.owed = true
         }
-        let notesState: String
-        if let error = engine.inbox.loadError {
-            notesState = engine.inbox.items.isEmpty ? "unavailable" : "partial"
-            source.unavailable.append("Notes source unavailable: " + error)
-        } else if !engine.inbox.hasLoadedSnapshot {
-            notesState = "unavailable"
-            source.unavailable.append("Notes source has not been read.")
-        } else { notesState = engine.inbox.items.isEmpty ? "empty" : "available" }
-        source.input["sourceStates"] = .object(["conversations": .string(sessionState), "notes": .string(notesState)])
-        let approvals = WorkOverviewRead.waitingApprovals(engine.approvals.records)
-        let asks = engine.inbox.items.filter { $0.requiresOwnerInput && !$0.hasLinkedApproval }.sorted { $0.created_at > $1.created_at }
-        var waiting = approvals.map { approval -> JSONValue in
-            let title = ApprovalWords.title(action: approval.action, title: approval.title, reason: approval.reason)
-            return .object(["id": .string("approval:" + approval.id), "title": .string(title.isEmpty ? approval.action : title),
-                "detail": .string(TodayWords.line(approval.reason)), "open": .string("approval:" + approval.id)])
+        return source
+    }
+
+    static func waiting(_ engine: NativeAgentEngine) async -> Self {
+        var source = Self()
+        let state = await MainActor.run {
+            (standing: engine.sync.standing, waitingCount: engine.desk.ownerWaitingCount, waitingKinds: engine.desk.ownerWaitingKinds)
         }
-        waiting += asks.map { item in
-            .object(["id": .string("card:" + item.id), "title": .string(item.title),
-                "detail": .string(TodayWords.line(item.summary)), "open": .string("card:" + item.id)])
+        source.waitingCount = state.waitingCount
+        source.waitingKinds = state.waitingKinds
+        source.phoneKnown = state.standing != nil
+        if let phone = state.standing?.waitingLine {
+            source.levers = [PartFace.Row(id: "phone", title: phone, tone: .attention, open: "page:pairing")]
+            source.phoneWaiting = true
         }
-        if let line = engine.sync.standing?.waitingLine {
-            waiting.append(.object(["id": .string("phone"), "title": .string(line), "open": .string("page:pairing")]))
-        }
-        let onDesk = WorkOverviewRead.waitingOnDesk(total: engine.desk.ownerWaitingCount, approvals: approvals.count)
-        let split = WorkOverviewRead.waitingSplit(kinds: engine.desk.ownerWaitingKinds, onDesk: onDesk)
-        let deskCount = split?.items ?? onDesk
-        if deskCount > 0 { source.input["waitingDesk"] = WorkOverviewRead.waitingDeskInput(count: deskCount, split: split.map { ($0.items, 0) }) }
-        source.input["waitingRows"] = .array(waiting)
-        source.owed = !waiting.isEmpty || deskCount > 0
+        source.owed = source.phoneWaiting
+        return source
+    }
+
+    static func trials(_ engine: NativeAgentEngine) async -> Self {
+        var source = Self()
+        let name = await engine.persona.displayName
+        let read = Result { try TrialLevers.read(dataRoot: engine.dataRoot) }
+        source.trials = TrialLevers.section(read, agent: name.isEmpty ? "The agent" : String(name.prefix(40)), now: Date())
+        return source
+    }
+
+    static func thinking(_ engine: NativeAgentEngine) async -> Self {
+        var source = Self()
+        let now = Date()
         do {
             let thinking = try await TurnTraceThinkingReader.shared.read(dataRoot: engine.dataRoot, now: now)
             func counts(_ value: TurnTraceThinkingReader.Counts) -> JSONValue {
                 .object(["calls": .int(Int64(value.calls)), "turns": .int(Int64(value.turns))])
             }
-            source.input["thinking"] = .object(["state": .string("available"), "at": .double(now.timeIntervalSince1970),
+            // Counts describe a day/week, not an event at the moment this packet was read.
+            source.input["thinking"] = .object(["state": .string("available"),
                 "today": counts(thinking.today), "week": counts(thinking.week)])
         } catch {
             source.unavailable.append("Thinking source unavailable: " + error.localizedDescription)
             source.input["thinking"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
         }
-        var moments: [JSONValue] = []
+        return source
+    }
+
+    static func moments(_ engine: NativeAgentEngine) async -> Self {
+        var source = Self()
+        let now = Date(), calendar = Calendar.autoupdatingCurrent
+        func today(_ at: Date) -> Bool { calendar.isDate(at, inSameDayAs: now) }
+        var moments: [JSONValue] = [], unreadable = false
         do {
-            let kept = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: engine.dataRoot).listMemory(kind: MemoryMoments.kind)
+            let kept = try await engine.memory.listMemory(kind: MemoryMoments.kind)
             for record in kept {
                 if let at = TodayWords.parseTimestamp(record.createdAt), today(at) {
                     let quote = TodayWords.plain(record.extras?.objectValue?["quote"]?.stringValue ?? "")
@@ -343,71 +382,68 @@ private struct TodaySource: Sendable {
                             "quote": .string(TodayWords.bounded(body, limit: 200))]))
                     }
                 } else if TodayWords.parseTimestamp(record.createdAt) == nil {
-                    source.memoryUnreadable = true
+                    unreadable = true
                 }
             }
-            source.input["moments"] = .object(["state": .string(source.memoryUnreadable ? "partial" : "available"), "rows": .array(moments)])
+            source.input["moments"] = .object(["state": .string(unreadable ? "partial" : "available"), "rows": .array(moments)])
         } catch {
-            source.memoryUnreadable = true
             source.input["moments"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
         }
+        return source
+    }
+
+    static func dream(_ engine: NativeAgentEngine) async -> Self {
+        var source = Self(), unavailable = false
+        let now = Date(), calendar = Calendar.autoupdatingCurrent
+        func today(_ at: Date) -> Bool { calendar.isDate(at, inSameDayAs: now) }
         do {
-            let diary = try await engine.cognitionView.dreamDiary(limit: 1)
+            let enabled = try await engine.cognitionView.dreamEnabled()
+            let diary = try await engine.cognitionView.readDreamDiary(limit: 1, enabled: enabled)
             if (diary.unreadableEntries ?? 0) > 0 {
-                source.dreamUnavailable = true
+                unavailable = true
                 source.unavailable.append("Dream diary has unreadable entries.")
             }
             if let entry = diary.entries.first {
                 let markdown = entry.text
                 if markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    source.dreamUnavailable = true
+                    unavailable = true
                     source.unavailable.append("Dream entry is empty.")
                 }
                 if let at = TodayWords.parseTimestamp(entry.modifiedAt), today(at) {
                     if let digest = TodayDreamDigest.parse(markdown) {
-                        source.input["dream"] = .object(["state": .string(source.dreamUnavailable ? "partial" : "available"),
-                            "title": .string(digest.title), "mood": .string(digest.mood), "at": .double(at.timeIntervalSince1970),
-                            "open": .string("dream:" + entry.date)])
+                        source.input["dream"] = .object(["state": .string(unavailable ? "partial" : "available"),
+                            "title": .string(digest.title), "mood": .string(digest.mood), "at": .double(at.timeIntervalSince1970)])
+                        source.keys["dream"] = .object(["open": .string("dream:" + entry.date)])
                     } else {
-                        source.dreamUnavailable = true
+                        unavailable = true
                         source.unavailable.append("Dream title unavailable.")
                         source.input["dream"] = .object(["state": .string("unavailable"), "reason": .string("Dream title unavailable.")])
                     }
                 } else if TodayWords.parseTimestamp(entry.modifiedAt) == nil {
-                    source.dreamUnavailable = true
+                    unavailable = true
                     source.input["dream"] = .object(["state":.string("unavailable"),"reason":.string("Dream time unavailable.")])
                 } else { source.input["dream"] = .object(["state": .string("empty")]) }
             } else { source.input["dream"] = .object(["state": .string("empty")]) }
         } catch {
-            source.dreamUnavailable = true
             source.input["dream"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
         }
-        do {
-        let dreamEnabled = try await engine.cognitionView.dreamEnabled()
-        var next: Date?
-        var scheduleUnavailable = false
-        if dreamEnabled {
-            switch await engine.desk.jobsFeed() {
-            case .current(let jobs): next = jobs.filter { $0.kind == "dream" && $0.enabled }.compactMap { TodayWords.parseTimestamp($0.nextRunAt) }.min()
-            case .partial(let jobs, let detail):
-                next = jobs.filter { $0.kind == "dream" && $0.enabled }.compactMap { TodayWords.parseTimestamp($0.nextRunAt) }.min()
-                source.unavailable.append(String(describing: detail))
-                scheduleUnavailable = true
-            case .unavailable(let detail):
-                source.unavailable.append(String(describing: detail)); scheduleUnavailable = true
-            case .sourceAbsent:
-                source.unavailable.append("Dream schedule source absent."); scheduleUnavailable = true
-            }
+        return source
+    }
+
+    static func schedule(_ engine: NativeAgentEngine) async -> Self {
+        var source = Self()
+        let reading = await engine.nextNightReading()
+        source.input["nextDream"] = .object(reading)
+        if reading["state"] == .string("unavailable"), let reason = reading["reason"]?.stringValue {
+            source.unavailable.append(reason)
         }
-        source.input["nextDream"] = .object([
-            "state":.string(next != nil ? "available" : scheduleUnavailable ? "unavailable" : "empty"),
-            "enabled":.bool(dreamEnabled),
-            "at":next.map { .double($0.timeIntervalSince1970) } ?? .null])
-        } catch {
-            source.dreamUnavailable = true
-            source.unavailable.append(error.localizedDescription)
-            source.input["nextDream"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
-        }
+        return source
+    }
+
+    static func toward(_ engine: NativeAgentEngine) async -> Self {
+        var source = Self()
+        let now = Date(), calendar = Calendar.autoupdatingCurrent
+        func today(_ at: Date) -> Bool { calendar.isDate(at, inSameDayAs: now) }
         if let toward = await engine.cognitionView.towardRead() {
             let weekday=toward.dueAt.formatted(Date.FormatStyle(calendar:calendar,timeZone:calendar.timeZone).weekday(.wide))
             source.input["toward"] = .object(["state":.string("available"),"label": .string(TodayWords.line(toward.displayLabel)),
@@ -415,12 +451,17 @@ private struct TodaySource: Sendable {
                 "today":.bool(today(toward.dueAt)),"tomorrow":.bool(calendar.isDateInTomorrow(toward.dueAt)),
                 "weekday":.string(weekday),"at":.double(toward.dueAt.timeIntervalSince1970)])
         } else { source.input["toward"] = .object(["state":.string(engine.cognition == nil ? "unavailable" : "empty")]) }
+        return source
+    }
+
+    static func intentions(_ engine: NativeAgentEngine) async -> Self {
+        var source = Self()
+        let now = Date(), calendar = Calendar.autoupdatingCurrent
         do {
             let state = try await engine.desk.store.liveState()
             let horizon = now.addingTimeInterval(7 * 86_400)
             let intentions = MyQueue.entries(state).compactMap { entry -> JSONValue? in
-                guard MyQueue.migrationReady(entry.step, dataRoot: engine.dataRoot),
-                      entry.step.status != "stopped", !MyQueue.isOver(entry, at: now) else { return nil }
+                guard entry.step.status != "stopped", !MyQueue.isOver(entry, at: now) else { return nil }
                 let next: Date?
                 guard let condition = MyQueue.when(entry) else { return nil }
                 switch condition {
@@ -430,219 +471,448 @@ private struct TodaySource: Sendable {
                 }
                 guard let next, next >= now, next <= horizon,
                       MyQueue.until(entry).endsAt.map({ next < $0 }) ?? true else { return nil }
+                source.deadline = min(source.deadline ?? next, next)
                 let key = "intention:" + entry.item.handle
                 return .object(["key": .string(key), "at": .double(next.timeIntervalSince1970),
-                    "time": .string(ResidentWake.shown(next)), "words": .string(entry.step.words)])
+                    "time": .string(shown(next, now: now, calendar: calendar)), "words": .string(entry.step.words)])
             }
             source.input["intentions"] = .object(["state": .string("available"), "rows": .array(intentions)])
         } catch {
             source.unavailable.append("Intentions source unavailable: " + error.localizedDescription)
             source.input["intentions"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
         }
-        var builders: [JSONValue] = []
-        var loaded: [String: [ChatMessage]] = [:]
-        for id in WorkOverviewRead.todaySessionIDs(sessions) {
-            do {
-                let transcript = try await engine.transcripts.loadTranscript(sessionId: id, cached: true)
-                loaded[id] = transcript.messages
-            } catch { source.unavailable.append("Transcript \(id): \(error.localizedDescription)") }
-        }
-        // Read open-thread rows from the same canonical owner.
-        if !activeSessionID.isEmpty { loaded[activeSessionID] = engine.transcripts.messages(for: activeSessionID) }
-        let surfaces = WorkOverviewRead.conversationSurfaces(sessions, openingLines: engine.transcripts.openingLines)
-        var conversations: [JSONValue] = []
-        for session in sessions {
-            if let end = TodayWords.parseTimestamp(session.updatedAt ?? session.createdAt), today(end),
-               (session.messageCount ?? 0) > 0, let surface = surfaces[session.id] {
-                let began = TodayWords.parseTimestamp(session.createdAt) ?? end
-                var start: Date? = today(began) ? began : nil
-                if session.id == activeSessionID {
-                    let turns = (loaded[session.id] ?? []).compactMap { message -> (Date, Bool)? in
-                        if let at = TodayWords.parseTimestamp(message.createdAt), today(at) {
-                            let human = message.role == "user" && SessionMessageProvenance.make(role: message.role,
-                                source: message.source, hasEnvelope: message.metadata?.envelope != nil,
-                                surface: message.metadata?.envelope?.surface, agent: message.metadata?.envelope?.agent)?.isAutomated != true
-                            return (at,human)
-                        }
-                        return nil
-                    }
-                    if let first = turns.first { start = turns.first(where: { $0.1 })?.0 ?? first.0 }
-                }
-                let key = "conversation:" + session.id
-                conversations.append(.object(["key": .string(key), "surface": .string(surface),
-                    "open": .string("chat:" + session.id), "at": .double((start ?? end).timeIntervalSince1970),
-                    "start":start.map { .double($0.timeIntervalSince1970) } ?? .null,"end":.double(end.timeIntervalSince1970)]))
-            }
-        }
-        // Admit provenance from recorded evidence, never titles or prose.
-        let contacts: [AgentPeerContact]?
-        do { contacts = try AgentPeerStore(dataRoot: engine.dataRoot).list() }
-        catch {
-            contacts = nil
-            source.unavailable.append("Collaboration names unavailable: " + error.localizedDescription)
-        }
-        for (sessionID, messages) in loaded {
-            for message in messages {
-                if (message.sessionId == nil || message.sessionId == sessionID), message.role == "user",
-                   !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   let origin = message.metadata?.origin,
-                   let surface = origin.surface, PeerTurnEffectPolicy.isPeerBridge(surface: surface),
-                   let agent = origin.agent?.trimmingCharacters(in: .whitespacesAndNewlines), !agent.isEmpty,
-                   let contacts,
-                   let at = TodayWords.parseTimestamp(message.createdAt), at <= now, today(at) {
-                    // A peer's reply to the agent's send is authored "agent" and names its one sender in peerSources.
-                    let sourced = Set(([agent] + (origin.peerSources ?? [])).filter { $0.hasPrefix("peer:") })
-                    let peerID = message.metadata?.envelope?.verifiedUserId
-                        ?? (sourced.count == 1 ? sourced.first.map { String($0.dropFirst(5)) } : nil)
-                    let name = peerID.flatMap { id in contacts.first { $0.id == id }?.name }
-                    // A named agent is a proper name; one that did not name itself stays "another agent" mid-sentence.
-                    let display = name ?? (peerID == nil && agent != "agent" ? TodayWords.capitalizedFirst(agent) : "another agent")
-                    let key = "builder:" + sessionID + ":" + message.id
-                    builders.append(.object([
-                        "key": .string(key),
-                        "session": .string(sessionID), "open": .string("chat:" + sessionID),
-                        "agent": .string(TodayWords.line(display, limit: 80)),
-                        "at":.double(at.timeIntervalSince1970)]))
-                }
-            }
-        }
-        let notes = engine.inbox.items.filter { $0.isActivityPending && !$0.isSystemLane }.compactMap { item -> JSONValue? in
-            if let at = TodayWords.parseTimestamp(item.created_at) {
-                let key = "inbox:" + item.id
-                // Only native owner job identity may bind a folded group.
-                let job = item.relatedDelegationID.flatMap { $0.isEmpty ? nil : $0 }
-                return .object(["key": .string(key), "open": .string("card:" + item.id),
-                    "at": .double(at.timeIntervalSince1970), "today": .bool(today(at)),
-                    "source": .string(item.source), "title": .string(TodayWords.withoutIDs(TodayWords.line(item.title,limit:90))),
-                    "summary": .string(TodayWords.withoutIDs(TodayWords.firstSentence(item.summary))), "job": job.map(JSONValue.string) ?? .null])
-            }
-            source.unavailable.append("Note time unavailable: " + item.id)
-            return nil
-        }
-        source.input["conversations"] = .array(conversations
-            .sorted { ($0.objectValue?["key"]?.stringValue ?? "") < ($1.objectValue?["key"]?.stringValue ?? "") })
-        source.input["builders"] = .array(builders.sorted { ($0.objectValue?["key"]?.stringValue ?? "") < ($1.objectValue?["key"]?.stringValue ?? "") })
-        source.input["notes"] = .array(notes)
-        source.input["availability"] = .object(["state": .string(source.unavailable.isEmpty ? "available" : "partial"),
-            "unavailable": .array(source.unavailable.map(JSONValue.string))])
-        func collectCharacters(_ value: JSONValue) {
-            switch value {
-            case .string(let text):
-                for version in [text,TodayWords.plain(text),text.uppercased()] {
-                    for character in version {
-                        let glyph=String(character)
-                        if glyph.utf16.count > 1 { characterSet.insert(glyph) }
-                    }
-                }
-            case .array(let rows): for row in rows { collectCharacters(row) }
-            case .object(let fields): for field in fields.values { collectCharacters(field) }
-            default: break
-            }
-        }
-        for field in source.input.values { collectCharacters(field) }
-        let clusters=characterSet.sorted { lhs,rhs in
-            lhs.utf16.count != rhs.utf16.count ? lhs.utf16.count > rhs.utf16.count : lhs < rhs
-        }
-        source.input["clusters"] = .array(clusters.map(JSONValue.string))
-        try Task.checkCancellation()
         return source
+    }
+
+    /// An intention's next time: the clock alone today, else its day and clock.
+    private static func shown(_ date: Date, now: Date, calendar: Calendar) -> String {
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.timeZone = calendar.timeZone
+        format.dateFormat = calendar.isDate(date, inSameDayAs: now) ? "'at' HH:mm" : "EEE MMM d 'at' HH:mm"
+        return format.string(from: date)
     }
 
 }
 
-/// Feeds the page owner; the face is the only Today model every door reads.
-@MainActor
-@Observable
-public final class TodayReadout {
-    private var readCount = 0
-    public var isReading: Bool { readCount > 0 }
-    @ObservationIgnored private var sourceTask: Task<Void, Never>?
-    @ObservationIgnored private var inboxTask: Task<Void, Never>?
-    @ObservationIgnored private lazy var sourceRead = LatestRead()
-    @ObservationIgnored private var watchedSessions: [String] = []
-    /// The conversation the Mac has open, read live rather than from disk; empty when no door has one open.
-    @ObservationIgnored public var activeSessionID = ""
-    /// What a door that is showing Today also refreshes on each change (the Mac's queues and work status); nil when no door shows it.
-    @ObservationIgnored public var extras: (@MainActor () async -> Void)?
+/// Conversation evidence is prepared once per changed transcript; contact changes only rename the retained evidence.
+private struct TodayConversations: Sendable {
+    private struct Builder: Sendable {
+        let key: String
+        let agent: String
+        let peer: String?
+        let at: Date
+    }
+    private struct Transcript: Sendable {
+        var first: Date?
+        var human: Date?
+        var builders: [Builder] = []
+        var issue: String?
+    }
+    private var sessions: [NativeAgentShared.ChatSession] = []
+    private var openings: [String: ChatShellOpeningLine.OpeningLine] = [:]
+    private var indexIssue: String?
+    private var names: [String: String]?
+    private var namesIssue: String?
+    private var transcripts: [String: Transcript] = [:]
 
-    public nonisolated init() {}
+    var watchedSessions: [String] { WorkOverviewRead.todaySessionIDs(sessions) }
+
+    mutating func read(_ changes: Set<TodayChange>, engine: NativeAgentEngine,
+                       arm: @Sendable ([String]) async -> Void) async throws -> TodaySource {
+        let all = changes.contains(.all)
+        var changed = Set(changes.compactMap { change -> String? in
+            if case .transcript(let id) = change { return id }
+            return nil
+        })
+        if all { transcripts.removeAll() }
+        if all || changes.contains(.index) {
+            do {
+                let path = engine.dataRoot.appendingPathComponent("chat/sessions.json")
+                let current = try await SwiftNativePersistenceCore.withFileLock(path) {
+                    try ChatSessionIndexFile.loadObjectRowsForMutation(at: path).map(NativeAgentShared.ChatSession.init(row:))
+                }
+                let previous = Dictionary(sessions.map { ($0.id, ChatShellOpeningLine.revision(for: $0)) },
+                                          uniquingKeysWith: { first, _ in first })
+                for row in current where previous[row.id] != ChatShellOpeningLine.revision(for: row) { changed.insert(row.id) }
+                sessions = current
+                openings = await engine.transcripts.openingLines.reading
+                indexIssue = nil
+                let selected = Set(watchedSessions)
+                transcripts = transcripts.filter { selected.contains($0.key) }
+            } catch is CancellationError { throw CancellationError() }
+            catch { indexIssue = "Conversation source unavailable: " + error.localizedDescription }
+        }
+        if all || changes.contains(.contacts) {
+            do {
+                names = Dictionary(try AgentPeerStore(dataRoot: engine.dataRoot).list().map { ($0.id, $0.name) },
+                                   uniquingKeysWith: { first, _ in first })
+                namesIssue = nil
+            } catch { namesIssue = "Collaboration names unavailable: " + error.localizedDescription }
+        }
+        if all || changes.contains(.index) { await arm(watchedSessions) }
+        for id in watchedSessions where changed.contains(id) || transcripts[id] == nil {
+            try Task.checkCancellation()
+            guard NativeAgentChatSessionID.normalizedPathComponent(id) == id else {
+                transcripts[id] = Transcript(issue: "Transcript \(id): invalid conversation identity.")
+                continue
+            }
+            do {
+                let began = ContinuousClock.now
+                let reading = try await engine.transcripts.readTranscript(safeSessionId: id, cached: true)
+                transcripts[id] = Self.evidence(reading.messages, session: id)
+                ModuleLog.app("[today-source] feed=transcript duration=\(began.duration(to: .now))", level: .debug)
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                var retained = transcripts[id] ?? Transcript()
+                retained.issue = "Transcript \(id): " + error.localizedDescription
+                transcripts[id] = retained
+            }
+        }
+        return source()
+    }
+
+    private static func evidence(_ messages: [ChatMessage], session: String) -> Transcript {
+        let now = Date(), calendar = Calendar.autoupdatingCurrent
+        var result = Transcript()
+        for message in messages {
+            guard message.sessionId == nil || message.sessionId == session,
+                  let at = TodayWords.parseTimestamp(message.createdAt), at <= now, calendar.isDate(at, inSameDayAs: now) else { continue }
+            if result.first == nil { result.first = at }
+            let automated = SessionMessageProvenance.make(role: message.role, source: message.source,
+                hasEnvelope: message.metadata?.envelope != nil, surface: message.metadata?.envelope?.surface,
+                agent: message.metadata?.envelope?.agent)?.isAutomated == true
+            if result.human == nil, message.role == "user", !automated { result.human = at }
+            guard message.role == "user", !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let origin = message.metadata?.origin, let surface = origin.surface, PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+                  let agent = origin.agent?.trimmingCharacters(in: .whitespacesAndNewlines), !agent.isEmpty else { continue }
+            let sourced = Set(([agent] + (origin.peerSources ?? [])).filter { $0.hasPrefix("peer:") })
+            let peer = message.metadata?.envelope?.verifiedUserId
+                ?? (sourced.count == 1 ? sourced.first.map { String($0.dropFirst(5)) } : nil)
+            result.builders.append(Builder(key: "builder:" + session + ":" + message.id, agent: agent, peer: peer, at: at))
+        }
+        return result
+    }
+
+    private func source() -> TodaySource {
+        var source = TodaySource()
+        if let indexIssue { source.unavailable.append(indexIssue) }
+        if let namesIssue { source.unavailable.append(namesIssue) }
+        source.input["sourceStates"] = .object([
+            "conversations": .string(indexIssue != nil ? "unavailable" : sessions.isEmpty ? "empty" : "available")
+        ])
+        let now = Date(), calendar = Calendar.autoupdatingCurrent
+        let surfaces = WorkOverviewRead.conversationSurfaces(sessions, openingLines: openings)
+        var conversations: [JSONValue] = [], builders: [JSONValue] = []
+        for session in sessions {
+            if let issue = openings[session.id]?.issue { source.unavailable.append("Conversation \(session.id): " + issue) }
+            if let end = TodayWords.parseTimestamp(session.updatedAt ?? session.createdAt), calendar.isDate(end, inSameDayAs: now),
+               (session.messageCount ?? 0) > 0, let surface = surfaces[session.id] {
+                let began = TodayWords.parseTimestamp(session.createdAt) ?? end
+                let reading = transcripts[session.id]
+                let start = reading?.human ?? reading?.first ?? (calendar.isDate(began, inSameDayAs: now) ? began : nil)
+                let key = "conversation:" + session.id
+                source.keys[key] = .object(["open": .string("chat:" + session.id)])
+                conversations.append(.object(["key": .string(key), "surface": .string(surface),
+                    "at": .double((start ?? end).timeIntervalSince1970),
+                    "start": start.map { .double($0.timeIntervalSince1970) } ?? .null, "end": .double(end.timeIntervalSince1970)]))
+            }
+        }
+        for (id, reading) in transcripts.sorted(by: { $0.key < $1.key }) {
+            if let issue = reading.issue { source.unavailable.append(issue) }
+            guard namesIssue == nil, let names else { continue }
+            for builder in reading.builders {
+                let display = builder.peer.flatMap { names[$0] }
+                    ?? (builder.peer == nil && builder.agent != "agent" ? TodayWords.capitalizedFirst(builder.agent) : "another agent")
+                source.keys[builder.key] = .object(["open": .string("chat:" + id)])
+                builders.append(.object(["key": .string(builder.key), "session": .string(id),
+                    "agent": .string(TodayWords.line(display, limit: 80)), "at": .double(builder.at.timeIntervalSince1970)]))
+            }
+        }
+        func ordered(_ rows: [JSONValue]) -> JSONValue {
+            .array(rows.sorted { ($0.objectValue?["key"]?.stringValue ?? "") < ($1.objectValue?["key"]?.stringValue ?? "") })
+        }
+        source.input["conversations"] = ordered(conversations)
+        source.input["builders"] = ordered(builders)
+        return source
+    }
+}
+
+/// Today lives with its sources; doors only draw the last face it posted.
+public actor TodayReadout {
+    private weak var engine: NativeAgentEngine?
+    private var sources: [TodayFeed: TodaySource] = [:]
+    private var conversations = TodayConversations()
+    private var pending: Set<TodayChange> = []
+    private var reading: Task<Void, Never>?
+    private struct Watch: Sendable {
+        let paths: Set<URL>
+        let task: Task<Void, Never>
+    }
+    private var watches: [TodayChange: Watch] = [:]
+    private var observing = false
+    private var tokens: [ObservationNotifications] = []
+    private var inboxTask: Task<Void, Never>?
+    private var cognitionTask: Task<Void, Never>?
+    private var personaTask: Task<Void, Never>?
+    private var intentionsDeadline: Task<Void, Never>?
+
+    public init() {}
 
     deinit {
-        sourceTask?.cancel()
+        reading?.cancel()
+        watches.values.forEach { $0.task.cancel() }
+        tokens.forEach { $0.cancel() }
         inboxTask?.cancel()
+        cognitionTask?.cancel()
+        personaTask?.cancel()
+        intentionsDeadline?.cancel()
     }
 
-    /// Today is read by its owner from launch, at every change of what it reads, for every door; no door's view starts it. A change in
-    /// today's conversations re-arms the watch over their transcripts.
-    public func start(engine: NativeAgentEngine) {
-        stop()
+    public func start(engine: NativeAgentEngine) async {
+        guard self.engine == nil else { return }
+        self.engine = engine
+        pending.insert(.all)
         let root = engine.dataRoot
-        watchedSessions = WorkOverviewRead.todaySessionIDs(engine)
-        let transcripts = watchedSessions.compactMap {
-            NativeAgentChatSessionID.normalizedPathComponent($0)
-                .map { root.appendingPathComponent("chat/messages/\($0).jsonl") }
-        }
-        let refresh: @MainActor @Sendable () async -> Void = { [weak self, weak engine] in
-            guard let self, let engine else { return }
-            await self.extras?()
-            await self.refresh(engine, activeSessionID: self.activeSessionID)
-        }
-        // What is for the person lives in memory (ForPerson); its changes wake Today, never a file watch.
-        inboxTask = Task {
-            let debouncer = StoreReloadDebouncer(delay: .milliseconds(250)) { await refresh() }
-            await debouncer.setVisible(true)
-            for await _ in await ForPerson.at(root).changes() {
-                guard !Task.isCancelled else { break }
-                await debouncer.signal()
+        let changes = await ForPerson.at(root).changes()
+        inboxTask = Task { [weak self] in
+            for await _ in changes {
+                guard !Task.isCancelled else { return }
+                await self?.changed(.feed(.notes))
             }
-            await debouncer.cancel()
         }
-        sourceTask = Task {
-            await EventDeadlinePhysiology.refreshOnChanges(paths: [
-                root.appendingPathComponent("workflows/approvals/requests.json"),
-                root.appendingPathComponent("memory/memory.sqlite"),
-                root.appendingPathComponent("memory/memory.sqlite-wal"),
-                root.appendingPathComponent("trust/policy.json"),
-                root.appendingPathComponent("scheduler/jobs.json"),
-                root.appendingPathComponent("desk/desk_ops.jsonl"),
-                root.appendingPathComponent("desk/desk_ops_base.json"),
-                root.appendingPathComponent("dream_diary", isDirectory: true),
-                root.appendingPathComponent("chat/sessions.json"),
-                root.appendingPathComponent("chat/messages", isDirectory: true),
-            ] + transcripts, notifications: [.NSSystemTimeZoneDidChange, .NSCalendarDayChanged,
-                .turnTraceTerminalPersisted, AbilityStore.didChange]) { [weak self, weak engine] in
-                await refresh()
-                guard let self, let engine else { return }
-                if WorkOverviewRead.todaySessionIDs(engine) != self.watchedSessions { self.start(engine: engine) }
+        cognitionTask = Task { [weak self, cognitionView = engine.cognitionView] in
+            for await _ in await cognitionView.changes() {
+                guard !Task.isCancelled else { return }
+                await self?.changed(.feed(.toward))
+            }
+        }
+        personaTask = Task { @MainActor [weak self, persona = engine.persona] in
+            let changes = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            defer { changes.continuation.finish() }
+            var previous: String?
+            var iterator = changes.stream.makeAsyncIterator()
+            while !Task.isCancelled {
+                // Arm the next publication before yielding; unrelated profile changes only rearm the name observation.
+                let name = withObservationTracking { persona.displayName } onChange: { changes.continuation.yield(()) }
+                if previous != name {
+                    previous = name
+                    await self?.changed(.feed(.trials))
+                }
+                guard await iterator.next() != nil else { return }
+            }
+        }
+        let notificationChanges: [Notification.Name: TodayChange] = [
+            .NSSystemTimeZoneDidChange: .all, .NSCalendarDayChanged: .all, .NSSystemClockDidChange: .all,
+            .turnTraceTerminalPersisted: .feed(.thinking),
+            TranscriptsFacade.sessionIndexDidChange: .index,
+            ConnectorFaceChange.phone: .feed(.waiting)
+        ]
+        // Notifications carry invalidations only; non-Sendable notification objects never enter the actor.
+        tokens = notificationChanges.map { name, change in
+            ObservationNotifications(names: [name]) { [weak self] in Task { await self?.changed(change) } }
+        }
+        await rewatch([])
+        observing = true
+        changed(.all)
+    }
+
+    /// Owner publications that have no distinct persisted path (Desk's waiting counts) invalidate their dependent facts.
+    func waitingChanged() { changed(.feed(.waiting)) }
+
+    private func changed(_ change: TodayChange) {
+        pending.insert(change)
+        guard observing, let engine, reading == nil else { return }
+        reading = Task { [weak self] in
+            guard let self else { return }
+            await self.drain(engine)
+        }
+    }
+
+    /// Exact file identities, selected diary entries and symlink chains are held by the shared source observation.
+    private func rewatch(_ sessions: [String]) async {
+        guard let engine else { return }
+        let root = engine.dataRoot
+        let fields: [(TodayChange, [String])] = [
+            (.feed(.approvals), ["workflows/approvals/requests.json"]),
+            (.feed(.trials), ["abilities/state.json"]),
+            (.feed(.moments), ["memory/memory.sqlite", "memory/memory.sqlite-wal"]),
+            (.feed(.schedule), ["trust/policy.json", "mind/rhythm.json", "cognition/user_turn.json",
+                                "experiences/experiences.sqlite", "experiences/experiences.sqlite-wal"]),
+            (.feed(.dream), ["trust/policy.json", "dream_diary/"]),
+            (.feed(.intentions), ["desk/desk_ops.jsonl", "desk/desk_ops_base.json"]),
+            (.index, ["chat/sessions.json"]),
+            (.contacts, ["agents/peers.json"])
+        ]
+        var selected = Dictionary(uniqueKeysWithValues: fields.map { change, paths in
+            (change, Set(paths.map { root.appendingPathComponent($0).standardizedFileURL }))
+        })
+        for id in sessions {
+            guard let safe = NativeAgentChatSessionID.normalizedPathComponent(id) else { continue }
+            selected[.transcript(id)] = [root.appendingPathComponent("chat/messages/\(safe).jsonl").standardizedFileURL]
+        }
+        for (change, paths) in selected where watches[change]?.paths != paths {
+            let observation = await EventDeadlinePhysiology.readEvents(paths: Array(paths), directoryFiles: engine.pageDirectoryFiles,
+                                                                       fileReading: engine.pageFileReading)
+            let previous = watches[change]
+            let task = Task { [weak self] in
+                for await _ in observation.stream {
+                    guard !Task.isCancelled else { break }
+                    await self?.changed(change)
+                }
+                await observation.cancel()
+            }
+            watches[change] = Watch(paths: paths, task: task)
+            previous?.task.cancel()
+        }
+        for change in watches.keys where selected[change] == nil { watches.removeValue(forKey: change)?.task.cancel() }
+    }
+
+    /// An in-flight read finishes; all intervening edges form one next read of the latest source state.
+    private func drain(_ engine: NativeAgentEngine) async {
+        defer { reading = nil }
+        while !pending.isEmpty, !Task.isCancelled {
+            var changes = pending
+            pending.removeAll()
+            if sources[.conversations] == nil { changes.formUnion([.index, .contacts]) }
+            var feeds = Set(changes.compactMap { change -> TodayFeed? in
+                if case .feed(let feed) = change { return feed }
+                return nil
+            })
+            if changes.contains(.all) { feeds.formUnion(TodayFeed.allCases) }
+            feeds.formUnion(TodayFeed.allCases.filter { sources[$0] == nil })
+            feeds.insert(.clock)
+            if changes.contains(.index) || changes.contains(.contacts) || changes.contains(where: {
+                if case .transcript = $0 { return true }; return false
+            }) { feeds.insert(.conversations) }
+            do {
+                let sequence = try await ExperienceStore.at(engine.dataRoot).lastDetailSeq()
+                guard let epoch = UInt64(exactly: sequence ?? 0) else {
+                    throw PartCallError(code: "invalid_sequence", message: "Today's record position is invalid.")
+                }
+                var changed = false
+                for feed in TodayFeed.allCases where feeds.contains(feed) {
+                    try Task.checkCancellation()
+                    let began = ContinuousClock.now
+                    let source: TodaySource
+                    switch feed {
+                    case .clock:
+                        source = TodaySource(input: ["hour": .int(Int64(Calendar.autoupdatingCurrent.component(.hour, from: Date())))])
+                    case .approvals: source = await TodaySource.approvals(engine)
+                    case .notes: source = await TodaySource.notes(engine)
+                    case .waiting: source = await TodaySource.waiting(engine)
+                    case .trials: source = await TodaySource.trials(engine)
+                    case .thinking: source = await TodaySource.thinking(engine)
+                    case .moments: source = await TodaySource.moments(engine)
+                    case .dream: source = await TodaySource.dream(engine)
+                    case .schedule: source = await TodaySource.schedule(engine)
+                    case .toward: source = await TodaySource.toward(engine)
+                    case .intentions:
+                        source = await TodaySource.intentions(engine)
+                        intentionsDeadline?.cancel()
+                        intentionsDeadline = source.deadline.map { deadline in
+                            Task { [weak self] in
+                                do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
+                                catch { return }
+                                await self?.changed(.feed(.intentions))
+                            }
+                        }
+                    case .conversations:
+                        var conversations = self.conversations
+                        source = try await conversations.read(changes, engine: engine) { [weak self] sessions in
+                            await self?.rewatch(sessions)
+                        }
+                        self.conversations = conversations
+                    }
+                    let differs = sources[feed] != source
+                    ModuleLog.app("[today-source] feed=\(feed.rawValue) duration=\(began.duration(to: .now)) changed=\(differs)", level: .debug)
+                    if differs {
+                        sources[feed] = source
+                        changed = true
+                    }
+                }
+                try Task.checkCancellation()
+                let published = await engine.pages.snapshots["today"]
+                guard changed || published?.status == .unavailable else { continue }
+                let packet = packet(epoch: epoch)
+                let began = ContinuousClock.now
+                await engine.pages.sourceChanged(id: "today-readout", page: "today", epoch: packet.epoch, input: packet.facts,
+                    owed: packet.owed, levers: packet.levers.isEmpty ? nil : packet.levers, bound: true)
+                ModuleLog.app("[today-source] feed=projection duration=\(began.duration(to: .now)) pending=\(pending.count)", level: .debug)
+            } catch is CancellationError { return }
+            catch {
+                let current = await engine.pages.snapshots["today"]
+                await engine.pages.sourceChanged(id: "today-readout", page: "today", epoch: current?.sourceEpoch ?? 0, input: .object([:]),
+                    unavailable: error.localizedDescription, owed: current?.owed ?? false, levers: current?.levers, bound: true)
             }
         }
     }
 
-    public func stop() {
-        sourceTask?.cancel()
-        sourceTask = nil
-        inboxTask?.cancel()
-        inboxTask = nil
-    }
-
-    public func refresh(_ engine: NativeAgentEngine, activeSessionID: String) async {
-        readCount += 1
-        defer { readCount -= 1 }
-        let epoch = engine.pages.snapshots["today"]?.sourceEpoch ?? 0
-        var packet: Result<TodaySource, Error>?
-        await sourceRead.read({
-            do { return Result<TodaySource, Error>.success(try await TodaySource.read(engine, activeSessionID: activeSessionID)) }
-            catch { return .failure(error) }
-        }, publish: { packet = $0 })
-        guard let packet, !Task.isCancelled else { return }
-        switch packet {
-        case .success(let source):
-            await engine.pages.sourceChanged(id: "today-readout", page: "today", epoch: source.epoch,
-                input: .object(source.input), owed: source.owed)
-        case .failure(let error):
-            if error is CancellationError { return }
-            // A failed record read publishes only its cause, never an empty day.
-            await engine.pages.publish(page: "today", epoch: epoch) { throw error }
+    private func packet(epoch: UInt64) -> PartFaces.Packet {
+        var input: [String: JSONValue] = [:], keys: [String: JSONValue] = [:], states: [String: JSONValue] = [:]
+        var levers: [PartFace.Row] = [], trials: PartFace.Section?, owed = false, gaps: [String] = []
+        for feed in TodayFeed.allCases {
+            guard let source = sources[feed] else { continue }
+            for (field, value) in source.input where field != "sourceStates" { input[field] = value }
+            if let values = source.input["sourceStates"]?.objectValue { states.merge(values) { _, new in new } }
+            keys.merge(source.keys) { _, new in new }
+            levers += source.levers
+            if let section = source.trials { trials = section }
+            owed = owed || source.owed
+            gaps += source.unavailable
         }
+        let waiting = sources[.waiting]
+        let total = waiting?.waitingCount
+        let approvals = sources[.approvals]?.approvalCount
+        let phoneWaiting = waiting?.phoneWaiting == true
+        let notesKnown = states["notes"].map { $0 == .string("available") || $0 == .string("empty") } == true
+        var readable = total != nil && approvals != nil && notesKnown && waiting?.phoneKnown == true
+        let count: JSONValue
+        if let total {
+            let sum = total.addingReportingOverflow(phoneWaiting ? 1 : 0)
+            if sum.overflow || sum.partialValue < 0 {
+                count = .null
+                readable = false
+                gaps.append("Waiting count unavailable: the owner's count is outside its valid range.")
+            } else { count = .int(Int64(sum.partialValue)) }
+        } else { count = .null }
+        input["waiting"] = .object(["count": count, "readable": .bool(readable)])
+        if let total, let approvals {
+            let onDesk = WorkOverviewRead.waitingOnDesk(total: total, approvals: approvals)
+            let split = WorkOverviewRead.waitingSplit(kinds: waiting?.waitingKinds, onDesk: onDesk)
+            let count = split?.items ?? onDesk
+            if count > 0 {
+                input["waitingDesk"] = WorkOverviewRead.waitingDeskInput(count: count, split: split.map { ($0.items, 0) })
+                keys["desk"] = .object(["open": .string("page:desk")])
+                owed = true
+            }
+        }
+        input["sourceStates"] = .object(states)
+        input["availability"] = .object(["state": .string(gaps.isEmpty ? "available" : "partial"),
+                                         "unavailable": .array(gaps.map(JSONValue.string))])
+        var characters = Set<String>()
+        func collect(_ value: JSONValue) {
+            switch value {
+            case .string(let text):
+                for version in [text, TodayWords.plain(text), text.uppercased()] {
+                    for character in version where String(character).utf16.count > 1 { characters.insert(String(character)) }
+                }
+            case .array(let rows): rows.forEach(collect)
+            case .object(let fields): fields.values.forEach(collect)
+            default: break
+            }
+        }
+        input.values.forEach(collect)
+        let clusters = characters.sorted { left, right in
+            left.utf16.count != right.utf16.count ? left.utf16.count > right.utf16.count : left < right
+        }
+        input["clusters"] = .array(clusters.map(JSONValue.string))
+        for (key, open) in [("approvals", "page:today/approvals"), ("inbox", "page:today/inbox"),
+                            ("rem", "page:today/cognitionProposals")] {
+            keys[key] = .object(["open": .string(open)])
+        }
+        input["keys"] = .object(keys)
+        let decisions = levers.isEmpty ? [] : [PartFace.Section(id: "decisions", title: "Your decisions", style: .list, rows: levers)]
+        return PartFaces.Packet(facts: .object(input), epoch: epoch, levers: decisions + [trials].compactMap { $0 }, owed: owed)
     }
 }

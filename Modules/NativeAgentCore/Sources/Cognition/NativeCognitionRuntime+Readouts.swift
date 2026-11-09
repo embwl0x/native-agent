@@ -60,7 +60,7 @@ extension NativeCognitionRuntime {
         let read = await substrate.frozenRead(at: inspectFixedAt)
         let configuration = read.configuration
         // One nonconsuming inspection supplies mode and cold preview; live previews mirror the last delivered capsule.
-        let inspectRequest = requestWithOrganismProjection(
+        let inspectRequest = await requestWithOrganismProjection(
             CognitiveCapsuleRequest(
                 surface: "chat",
                 userMessage: lastInjectedCapsule?.userMessage ?? "observatory preview",

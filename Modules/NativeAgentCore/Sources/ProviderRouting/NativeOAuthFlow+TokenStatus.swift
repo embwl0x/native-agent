@@ -2,13 +2,9 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `NativeOAuthFlow+TokenStatus.swift` | adapter-owned sign-in verdicts |
+// Blueprint: | `NativeOAuthFlow+TokenStatus.swift` | Adapter-owned sign-in verdicts and off-UI credential deletion, CLI consent and confirmed repair |
 
 extension NativeOAuthFlow {
-    public enum CodexCLISessionOffer: Equatable, Sendable {
-        case available(email: String?, alreadyDeclined: Bool)
-        case unavailable(reason: String)
-    }
     /// Deletion failures must remain visible even when the credential lock cannot be acquired.
     private static func removeCredentialFile(at path: URL) -> Bool {
         do {
@@ -27,7 +23,7 @@ extension NativeOAuthFlow {
     }
 
     /// Sign-out succeeds only when every owned credential file is confirmed gone; lock and delete failures remain failures.
-    public static func clearTokens(providerId: String, dataRoot: URL? = nil) -> Bool {
+    @concurrent public nonisolated static func clearTokens(providerId: String, dataRoot: URL? = nil) async -> Bool {
         let root = dataRoot ?? PersistenceCore.defaultDataRoot()
         return signInAttempts.clear(providerId: providerId, dataRoot: root) {
             clearTokensAfterRetiringSignIn(providerId: providerId, dataRoot: root)
@@ -49,7 +45,7 @@ extension NativeOAuthFlow {
             }
             // Sign-out revokes this root's CLI-session adoption while preserving the shared CLI file.
             if ChatGPTTransport.cliAdoptionConsent(dataRoot: root) == .allowed,
-               !recordCodexCLISessionDecision(allow: false, source: "sign_out", dataRoot: root) {
+               !persistCodexCLISessionDecision(allow: false, source: "sign_out", dataRoot: root) {
                 removed = false
             }
             return removed
@@ -262,10 +258,16 @@ extension NativeOAuthFlow {
 
     /// Consent writes target the selected root; failure returns false and leaves the offer unaccepted.
     @discardableResult
-    public static func recordCodexCLISessionDecision(
+    @concurrent public nonisolated static func recordCodexCLISessionDecision(
         allow: Bool,
         source: String,
         dataRoot: URL? = nil
+    ) async -> Bool {
+        persistCodexCLISessionDecision(allow: allow, source: source, dataRoot: dataRoot)
+    }
+
+    private static func persistCodexCLISessionDecision(
+        allow: Bool, source: String, dataRoot: URL?
     ) -> Bool {
         do {
             try ChatGPTTransport.recordCLIAdoptionConsent(
@@ -278,17 +280,12 @@ extension NativeOAuthFlow {
     }
 
     /// Called only after the Providers UI's destructive confirmation. Core byte-preserves and verifies the backup before removing the authority.
-    public static func repairCodexCLISessionConsent(dataRoot: URL? = nil) throws -> URL {
+    @concurrent public nonisolated static func repairCodexCLISessionConsent(dataRoot: URL? = nil) async throws -> URL {
         try ChatGPTTransport.backupAndResetCorruptCLIAdoptionConsent(dataRoot: dataRoot)
     }
 }
 
 extension NativeOAuthFlow {
-    public struct SignInStatus: Equatable, Sendable {
-        public let isSignedIn: Bool
-        public let detail: String?
-        public let error: String?
-    }
 
     /// The Providers face sends sign-in through the account's protected connection card.
     public static func signInControl(providerID: String, dataRoot: URL) -> String? {
@@ -296,17 +293,17 @@ extension NativeOAuthFlow {
         return "Providers → Accounts → " + SwiftNativeProviderRouting.displayName(for: providerID) + " → Sign in"
     }
 
-    public static func signInStatus(providerID: String, dataRoot: URL) -> SignInStatus {
+    public static func signInStatus(providerID: String, dataRoot: URL) -> ProviderSignInStatus {
         do {
             guard let health = try NativeOAuthFlow.credentialHealth(providerId: providerID, dataRoot: dataRoot) else {
-                return SignInStatus(isSignedIn: false, detail: nil, error: nil)
+                return ProviderSignInStatus(isSignedIn: false, detail: nil, error: nil)
             }
-            return SignInStatus(isSignedIn: health.configured,
+            return ProviderSignInStatus(isSignedIn: health.configured,
                 detail: NativeOAuthFlow.signInStatusDetail(providerId: providerID, health: health), error: nil)
         } catch CocoaError.fileReadNoSuchFile {
-            return SignInStatus(isSignedIn: false, detail: "No saved sign-in. Sign in through Providers.", error: nil)
+            return ProviderSignInStatus(isSignedIn: false, detail: "No saved sign-in. Sign in through Providers.", error: nil)
         } catch {
-            return SignInStatus(isSignedIn: false, detail: nil,
+            return ProviderSignInStatus(isSignedIn: false, detail: nil,
                 error: """
                     \(providerID) credentials are unavailable: \(ProviderFailure.diagnosticDescription(error)). Repair the saved credential before \
                     reconnecting.

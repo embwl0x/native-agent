@@ -71,7 +71,8 @@ extension SwiftNativeChatOrchestrationClient {
             try await holding(turn.with(\.execution, ChatTurnExecution())) { turn in
                 try await engine.executeTurnWithStreamingToolLoop(surface: surface, userMessage: text(last),
                     toolSessionId: turn.verifiedSessionID, llm: client,
-                    tools: tools, preBuiltContext: context, fileAccess: turn.fileAccess ?? "auto", turn: turn, work: work, call: call)
+                    tools: ExpansionDispatcher(inner: tools, dataRoot: root, session: turn.verifiedSessionID, work: work),
+                    preBuiltContext: context, fileAccess: turn.fileAccess ?? "auto", turn: turn, work: work, call: call)
             } } } } } } } } } }
             produced = result
             guard result.completionState == .completed else {
@@ -144,7 +145,7 @@ extension SwiftNativeChatOrchestrationClient {
                 userMessage: attachmentInput.userMessage,
                 personaOverride: persona,
                 imageBlocks: imageBlocks,
-                sessionID: nil,
+                sessionID: verifiedSessionId,
              turn: turn, work: work)
             let cognitiveProjection = try await prepareCognitiveTurnProjection(
                 surface: surface,
@@ -255,7 +256,7 @@ extension SwiftNativeChatOrchestrationClient {
             )
         }
         await result.afterReply?.start()
-        return ChatResponse(
+        let response = ChatResponse(
             runId: runId,
             model: result.modelUsed,
             requestedModel: modelOverride.isEmpty ? nil : modelOverride,
@@ -268,6 +269,10 @@ extension SwiftNativeChatOrchestrationClient {
             providerCallCount: result.providerCallCount,
             terminalState: result.resolvedTerminalReason(dataRoot: dataRoot).state
         )
+        if result.cognitiveContextDelivered, response.terminalState == .completed, !response.isSilentCompletion {
+            await settle { [self] in await self.commitRepliedCognitiveTurnProjection(pendingProjectionCommit) }
+        }
+        return response
     }
 
     /// Keep the canonical partial-output error carriers instead of translating

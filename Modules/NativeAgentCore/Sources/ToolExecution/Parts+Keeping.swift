@@ -40,10 +40,11 @@ extension Parts {
         return fullMac ? nil : "Below Full Mac, keeping an ability is the owner's"
     }
 
-    /// Admission signs the selected version's sealed proof; the keeper attribution records who authorized it.
-    func admit(id: String, digest: String, by: String, ownerAuthorized: Bool = false, invocation: Invocation) async throws {
+    /// Admission signs the selected version's sealed proof; the keeper attribution records who authorized it. Returns the trial this keep closed.
+    @discardableResult
+    func admit(id: String, digest: String, by: String, ownerAuthorized: Bool = false, invocation: Invocation) async throws -> JSONValue? {
         let candidate = try store.load(id: id, digest: digest)
-        try checkDependencies(candidate, invocation: invocation)
+        try await checkDependencies(candidate, invocation: invocation)
         let signer = SwiftNativeManifestSigner(dataRoot: root)
         let key = try await signer.loadOrCreateSigningKey()
         let proof = try store.proof(candidate, key: key)
@@ -73,6 +74,9 @@ extension Parts {
             row["promotedAt"] = .string(stamp); row["updatedAt"] = .string(stamp)
             rows[index] = .object(row); value = .array(rows)
         }
+        // This version is now current, so a trial of a version in neither slot closes. The keep stands either way: a failed record write owes
+        // its own repair through AbilityStore's accounting, which raises it before throwing, and the next reconcile closes it.
+        return try? abilities.changeTrial(id: id, .reconcile(by: by == "user" ? "person" : "agent"), turn: invocation.execution.turn)
     }
 
     private enum KeepPlan {
@@ -279,6 +283,8 @@ extension Parts {
                     if try abilities.read(id: id) == nil { try abilities.remove(id: id, turn: turn) } else { try abilities.remove(id: id, slot: .next,
                         turn: turn) }
                 }
+                // A trial of the discarded draft closes; the discard stands either way, as a failed record write owes its own repair.
+                _ = try? abilities.changeTrial(id: id, .reconcile(by: ownerAuthorized ? "person" : "agent"), turn: turn)
                 return (true, "\(name)'s waiting version was discarded.", fields)
             }
             if let refusal = Self.overrideRefusal(row, name: name, fullMac: fullMac, ownerAuthorized: ownerAuthorized) { return (false, refusal, fields) }

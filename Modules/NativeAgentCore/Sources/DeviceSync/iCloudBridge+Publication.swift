@@ -39,10 +39,8 @@ extension iCloudBridge {
             guard let deviceTransport, speaksToPhone else { return false }
             let generation = setupGeneration
             do {
-                guard let encoded = try PairingSecret.existingSecretBase64(),
-                      let secret = Data(base64Encoded: encoded), secret.count == 32 else {
-                    throw DeviceSyncError.notConfigured
-                }
+                let secret = try await sync.storage.perform { try PairingSecret.requireExistingSecret() }
+                guard generation == setupGeneration, speaksToPhone else { continue }
                 let snapshot = try await sync.host.providerCatalogSnapshot()
                 guard generation == setupGeneration, speaksToPhone else { continue }
                 let catalog = NAProviderCatalogStatus(
@@ -95,17 +93,16 @@ extension iCloudBridge {
         shouldPublish: @MainActor () -> Bool = { true }
     ) async -> [NAMobileSnapshotGroup: DeviceSyncError]? {
         guard let deviceTransport, speaksToPhone, !groups.isEmpty else { return nil }
+        let generation = setupGeneration
         var failures: [NAMobileSnapshotGroup: DeviceSyncError] = [:]
         for group in NAMobileSnapshotGroup.allCases where groups.contains(group) {
             do {
-                guard let encoded = try PairingSecret.existingSecretBase64(),
-                      let secret = Data(base64Encoded: encoded), secret.count == 32 else {
-                    throw DeviceSyncError.notConfigured
-                }
+                let secret = try await sync.storage.perform { try PairingSecret.requireExistingSecret() }
+                guard generation == setupGeneration, speaksToPhone, shouldPublish() else { return nil }
                 guard let value = try await MobileSnapshotBuilder.shared.status(
                     group: group, directory: snapshotDirectory, committed: committed
                 ) else { throw DeviceSyncError.underlying(message: "Snapshot \(group.rawValue) is absent; it was not published.") }
-                guard shouldPublish() else { return nil }
+                guard generation == setupGeneration, speaksToPhone, shouldPublish() else { return nil }
                 if lastPublishedMobileSnapshotStatus[group]?.pairing == secret,
                    lastPublishedMobileSnapshotStatus[group]?.value == value {
                     continue
@@ -115,11 +112,11 @@ extension iCloudBridge {
                     value: value,
                     pairingSecret: secret
                 )
-                guard shouldPublish() else { return nil }
+                guard generation == setupGeneration, speaksToPhone, shouldPublish() else { return nil }
                 lastPublishedMobileSnapshotStatus[group] = (secret, value)
                 await recordSendResult(operation: group.statusKey)
             } catch {
-                guard shouldPublish() else { return nil }
+                guard generation == setupGeneration, speaksToPhone, shouldPublish() else { return nil }
                 failures[group] = error as? DeviceSyncError ?? .underlying(message: error.localizedDescription)
                 await recordSendResult(operation: group.statusKey, error: error)
                 // Revoke suppression for a group known absent on the phone so its next attempt cannot skip publication.
@@ -143,11 +140,12 @@ extension iCloudBridge {
         guard let deviceTransport, speaksToPhone else { return .ineligible }
         let generation = setupGeneration
         do {
-            guard let encoded = try PairingSecret.existingSecretBase64(),
-                  let secret = Data(base64Encoded: encoded) else { return .failed }
+            let secret = try await sync.storage.perform { try PairingSecret.requireExistingSecret() }
+            guard isSetUp, generation == setupGeneration, speaksToPhone else { return .ineligible }
             try await deviceTransport.setPresence(pairingSecret: secret)
-            guard isSetUp, generation == setupGeneration else { return .ineligible }
+            guard isSetUp, generation == setupGeneration, speaksToPhone else { return .ineligible }
             await recordSendResult(operation: "presence")
+            nativeLog("[iCloudBridge] Mac presence accepted")
             return .published
         } catch {
             guard isSetUp, generation == setupGeneration else { return .ineligible }
@@ -191,10 +189,7 @@ extension iCloudBridge {
             return false
         }
 
-        let delivery: ICloudKVSProgressDeliveryResult = await withCKTimeout(
-            "iCloudBridge.sendKVSChatProgress",
-            seconds: 3
-        ) { () -> ICloudKVSProgressDeliveryResult in
+        let delivery = await Task.detached(priority: .utility) { () -> ICloudKVSProgressDeliveryResult in
             let kvs = NSUbiquitousKeyValueStore.default
             let existingKeys = Set(kvs.dictionaryRepresentation.keys)
             let admission = ICloudKVSProgressWriteAdmission.assess(
@@ -202,11 +197,14 @@ extension iCloudBridge {
                 progressKey: key
             )
             guard admission.isAllowed else { return .blocked(admission) }
+            if kvs.data(forKey: key) == data { return .unchanged }
             kvs.set(data, forKey: key)
             return kvs.synchronize() ? .synchronized : .synchronizeFailed
-        } ?? .timedOut
+        }.value
 
         switch delivery {
+        case .unchanged:
+            return true
         case .synchronized:
             lastSyncAt = Date()
             syncStatus = "Progress sent via iCloud KVS"
@@ -222,10 +220,8 @@ extension iCloudBridge {
                 snapshot.inboxResponseKeyCount,
                 detail
             )
-        case .synchronizeFailed, .timedOut:
-            syncStatus = delivery == .timedOut
-                ? "iCloud KVS progress timed out"
-                : "iCloud KVS progress sync failed"
+        case .synchronizeFailed:
+            syncStatus = "iCloud KVS progress sync failed"
             nativeLog("[iCloudBridge] KVS progress sync did not complete msg=%@", correlationID)
         }
         return false
@@ -239,7 +235,7 @@ extension iCloudBridge {
         metadata: [String: String],
         secret: Data
     ) throws -> BridgeMessage {
-        var compactMetadata = metadata.mapValues { String($0.prefix(240)) }
+        var compactMetadata = metadata.mapValues { String(TurnSecretRedactor.redactText($0).prefix(240)) }
         compactMetadata["ephemeral"] = "true"
         compactMetadata["transport"] = compactMetadata["transport"] ?? "icloud"
         compactMetadata["source"] = compactMetadata["source"] ?? "mac"
@@ -247,7 +243,7 @@ extension iCloudBridge {
         let unsigned = BridgeMessage.make(
             id: id,
             sender: "mac",
-            text: String(text.prefix(240)),
+            text: String(TurnSecretRedactor.redactText(text).prefix(240)),
             sessionID: sessionID,
             correlationID: correlationID,
             metadata: compactMetadata

@@ -2,7 +2,7 @@
 
 import Foundation
 
-struct PushReceiptEntry: Codable, Identifiable {
+struct PushReceiptEntry: Codable, Identifiable, Sendable {
     let receivedAt: Date
     let source: String
     let screen: String
@@ -13,7 +13,7 @@ struct PushReceiptEntry: Codable, Identifiable {
 }
 
 enum PushReceiptLedger {
-    struct Reading {
+    struct Reading: Sendable {
         var entries: [PushReceiptEntry]
         var failure: String?
     }

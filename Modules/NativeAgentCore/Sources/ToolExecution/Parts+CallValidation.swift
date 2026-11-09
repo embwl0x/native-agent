@@ -35,8 +35,12 @@ extension Parts {
         for call in calls.literal {
             if call.primitive, primitives.contains(call.spelling) { continue }
             if let given = call.given, let problem = try host.callProblem(call.id, given: given, schema: call.id == "authored." + id ? selfSchema : nil) {
-                throw Self.revisionFailure("stale_dependency",
+                var failure = Self.revisionFailure("stale_dependency",
                     "Call \(call.id) at line \(call.line): \(problem). Correct this call with ability.save, then keep the reviewed version.", id: id)
+                var remedy = failure.remedy?.objectValue ?? [:]
+                remedy["try_instead"] = try await host.callAdvice(call.id, given: given)
+                failure.remedy = .object(remedy)
+                throw failure
             }
             guard checked.insert(call.id).inserted else { continue }
             guard try shape(call.id) != nil else {
@@ -67,12 +71,12 @@ extension Parts {
         return .object(shapes.filter { actions.contains($0.key) })
     }
 
-    private func unknownCall(_ action: String, line: Int? = nil, host: any OwnedProgramToolHost) async throws -> ToolFailureError {
-        let nearest = try await host.nearestActions(action)
-        let suggestion = nearest.isEmpty ? "Use app find to choose a current action." : "Nearest real actions: \(nearest.joined(separator: ", "))."
-        return ToolFailureError("Unknown action \(action)\(line.map { " at line \($0)" } ?? ""). \(suggestion) Nothing was saved.",
-            argumentPath: "actions", accepted: "current app action ids and existing authored abilities", effects: .none,
-            nextCall: ToolFailureError.call("app", ["find": .string(action)]), code: "unknown_dependency", status: .refused,
-            instruction: "Correct the named call or declaration with ability.save using a real action.", recovery: .correctArguments)
+    private func unknownCall(_ action: String, line: Int? = nil, host: any OwnedProgramToolHost) async throws -> SenseFailure {
+        SenseFailure(code: "unknown_dependency",
+            message: "Unknown action \(action)\(line.map { " at line \($0)" } ?? ""). try_instead names current action shapes. Nothing was saved.",
+            remedy: .object(["kind": .string("correct_arguments"), "instruction": .string(
+                "Correct the named call or declaration with ability.save using a real action."),
+                "next_call": .object(["tool": .string("app"), "input": .object(["find": .string(action)])]),
+                "try_instead": try await host.callAdvice(action, given: nil)]))
     }
 }

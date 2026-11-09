@@ -283,6 +283,14 @@ extension CognitiveSubstrate {
         if !context.careWakes.isEmpty {
             do {
                 try await foldCareWake(context, judgments: judgments, seq: seq, momentID: momentID)
+                if configuration.enabled, context.mindEpoch == mindEpoch {
+                    if affect.lived < seq {
+                        holdRegister(appraisal?.chosenRegister, for: event, moment: momentID)
+                        affect.lived = seq
+                        markDirty(at: dependencies.now())
+                    }
+                    if configuration.persistenceEnabled { try await persistAffectAndNodes() }
+                }
             } catch { fold.saved = false }
             return fold
         }
@@ -310,6 +318,7 @@ extension CognitiveSubstrate {
             if affect.lived < seq {
                 updated = applyAffectFromEvent(event, precomputedAppraisal: weighted,
                                                precomputedWarmthBoost: weighted.warmthBoost)
+                holdRegister(appraisal.chosenRegister, for: event, moment: momentID)
                 affect.lived = seq
                 // A late fold never moves a newer presence anchor backward.
                 if weighted.warmthBoost > 0 {

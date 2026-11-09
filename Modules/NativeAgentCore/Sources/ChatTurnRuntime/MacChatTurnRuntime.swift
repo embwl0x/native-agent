@@ -1,5 +1,4 @@
 import Foundation
-import CoreGraphics
 import AgentWorkspace
 import Observation
 import NativeAgentShared
@@ -8,8 +7,7 @@ import Transcripts
 import PersistenceCore
 // Blueprint: | `MacChatTurnRuntime.swift` | Canonical Mac admission, lifecycle and preview state |
 
-/// Admission and lifecycle authority for Mac chat. Presentation facades
-/// observe this same state; no second lifecycle is retained.
+/// Admission and lifecycle authority for Mac chat. The face receives finished values; operational waiters observe reservations and tasks.
 @MainActor
 @Observable
 public final class MacChatTurnRuntime {
@@ -32,14 +30,14 @@ public final class MacChatTurnRuntime {
         return try await TurnAdmission.shared.runAlone(dataRoot: dataRoot, sessionID: sessionID, turn: turn, operation: operation)
     }
 
-    public nonisolated static let streamProgressCoalesceSeconds: TimeInterval = 1.0
     public nonisolated let dataRoot: URL
     @ObservationIgnored public var activityDidChange: (@MainActor () -> Void)?
+    @ObservationIgnored public var faceDidChange: (@MainActor () -> Void)?
     public var busySessions: Set<String> = [] {
-        didSet { if busySessions != oldValue { activityDidChange?() } }
+        didSet { if busySessions != oldValue { activityDidChange?(); faceDidChange?() } }
     }
-    public var streamingSessions: Set<String> = [] {
-        didSet { if streamingSessions != oldValue { activityDidChange?() } }
+    @ObservationIgnored public var streamingSessions: Set<String> = [] {
+        didSet { if streamingSessions != oldValue { activityDidChange?(); faceDidChange?() } }
     }
     public var tasks: [String: Task<Void, Never>] = [:]
     public var taskGenerations: [String: Int] = [:]
@@ -54,20 +52,18 @@ public final class MacChatTurnRuntime {
         busySessions.insert(sessionId)
         return nextTaskGeneration
     }
-    public var replyingSessions: Set<String> = [] {
-        didSet { if replyingSessions != oldValue { activityDidChange?() } }
+    @ObservationIgnored public var replyingSessions: Set<String> = [] {
+        didSet { if replyingSessions != oldValue { activityDidChange?(); faceDidChange?() } }
     }
-    public var screenPreviewBySession: [String: MacChatScreenPreview] = [:]
-    public var lifecycleBySession: [String: MacChatTurnLifecycleState] = [:] {
-        didSet {
-            let settled = Set(lifecycleBySession.compactMap { $0.value.replyTextSettled ? $0.key : nil })
-            if settled != replyTextSettledSessions { replyTextSettledSessions = settled }
-        }
+    @ObservationIgnored public var screenPreviewBySession: [String: TurnFace.Preview] = [:] {
+        didSet { if screenPreviewBySession != oldValue { faceDidChange?() } }
     }
-    /// Observe settled-text changes separately from 1 Hz lifecycle progress so transcript views need not rerender on every progress tick.
-    public private(set) var replyTextSettledSessions: Set<String> = []
-    @ObservationIgnored public var activeTurnIDsBySession: [String: String] = [:]
-    @ObservationIgnored public var streamProgressAppliedAt: [String: (turnId: String, at: Date)] = [:]
+    @ObservationIgnored public var lifecycleBySession: [String: MacChatTurnLifecycleState] = [:] {
+        didSet { if lifecycleBySession != oldValue { faceDidChange?() } }
+    }
+    @ObservationIgnored public var activeTurnIDsBySession: [String: String] = [:] {
+        didSet { if activeTurnIDsBySession != oldValue { faceDidChange?() } }
+    }
     @ObservationIgnored public var lifecycleStore: MacChatTurnLifecycleStore
     public var pendingStopWrites: [String: Task<Void, Never>] = [:]
     public var pendingStopWriteGenerations: [String: Int] = [:]
@@ -137,7 +133,8 @@ public final class MacChatTurnRuntime {
     @discardableResult
     public func requestStop(
         sessionId: String,
-        revokeDriverControl: (@MainActor @Sendable () async -> Void)? = nil
+        revokeDriverControl: (@MainActor @Sendable () async -> Void)? = nil,
+        didWrite: (@MainActor @Sendable (Result<Void, Error>) -> Void)? = nil
     ) -> Task<Void, Never> {
         let activeTask = tasks[sessionId]
         // A reservation still reading admission data has no task to cancel.
@@ -161,10 +158,16 @@ public final class MacChatTurnRuntime {
                 }
             }
             await previousWrite?.value
-            try? await stop(sessionId: sessionId)
+            let result: Result<Void, Error>
+            do { try await stop(sessionId: sessionId); result = .success(()) }
+            catch { result = .failure(error) }
             if pendingStopWriteGenerations[sessionId] == generation {
                 pendingStopWrites[sessionId] = nil
                 pendingStopWriteGenerations[sessionId] = nil
+            }
+            if let didWrite { didWrite(result) }
+            else if case .failure(let error) = result {
+                SystemToastCenter.shared.push(error: "Stop could not be saved: " + error.localizedDescription, autoDismissAfter: nil)
             }
         }
         pendingStopWrites[sessionId] = write
@@ -199,30 +202,5 @@ public final class MacChatTurnRuntime {
             let content = existing.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? $0 : $0 + "\n" + requested } ?? requested
             try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(content.utf8), to: flagPath)
         }
-    }
-}
-
-/// Preview is transient display only; receipts retain effect truth and no frame becomes memory.
-/// Capture already downscales and masks secrets; presentation must not reinterpret what may be shown.
-public struct MacChatScreenPreview: @unchecked Sendable {
-    /// Missing capture permission, locked screens and refusals may update the caption without supplying a frame.
-    public let image: CGImage?
-    public let caption: String
-    public let updatedAt: Date
-
-    /// Show a pane only when both caption and frame exist.
-    public var isShowable: Bool {
-        image != nil && !caption.isEmpty
-    }
-
-    /// Nil update fields preserve the previous value so caption-only actions retain their window evidence.
-    public static func merged(
-        _ previous: MacChatScreenPreview?,
-        update: MacScreenPreviewUpdate
-    ) -> MacChatScreenPreview? {
-        let image = update.image ?? previous?.image
-        let caption = update.caption ?? previous?.caption ?? ""
-        guard image != nil || !caption.isEmpty else { return nil }
-        return MacChatScreenPreview(image: image, caption: caption, updatedAt: update.at)
     }
 }

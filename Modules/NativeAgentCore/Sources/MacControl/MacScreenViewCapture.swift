@@ -203,7 +203,7 @@ public struct SystemMacVisualObstructionProbe: Sendable {
         return [MacVisualObstruction(ownerPID: hit, ownerName: name, coverage: 1, frame: frame)]
     }
 
-    /// System-wide hits may enter this app’s SwiftUI AX tree, so run them on the main AX lane.
+    /// System-wide hits share the dedicated AX thread, leaving this app's window free to answer Accessibility.
     static func hitPID(x: Double, y: Double) -> Int32? {
         #if canImport(ApplicationServices)
         MacAXExecutionLane.sync {
@@ -314,6 +314,12 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
 
     private static func windowImage(_ window: SCWindow, maxPixelWidth: Int? = nil, context: MacOperationContext) async throws -> MacScreenShot {
         try Task.checkCancellation()
+        guard let owner = window.owningApplication else {
+            throw MacScreenCaptureFailure.operationFailed("window capture", "The window's process identity is unavailable; read the app again.")
+        }
+        guard !PersonOnlyWindows.isOwnProcess(owner.processID) else {
+            throw MacScreenCaptureFailure.operationFailed("window capture", "NativeAgent's own window is person-only; use page.screenshot.")
+        }
         let capture = MacImageCapture(windows: SystemMacVisualObstructionProbe.windows().filter {
             $0.number == Int(window.windowID)
         })
@@ -447,7 +453,9 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         // Exclude the pointer overlay so captures show the underlying scene.
         let filter = SCContentFilter(
             display: display,
-            excludingWindows: content.windows.filter { PersonOnlyWindows.contains(number: Int($0.windowID)) }
+            excludingWindows: content.windows.filter {
+                PersonOnlyWindows.isOwnProcess($0.owningApplication?.processID) || PersonOnlyWindows.contains(number: Int($0.windowID))
+            }
         )
         let configuration = SCStreamConfiguration()
         configuration.sourceRect = localRect

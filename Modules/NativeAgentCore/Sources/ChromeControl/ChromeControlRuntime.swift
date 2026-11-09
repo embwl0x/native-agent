@@ -87,6 +87,8 @@ public enum ChromeControlEffect: String, Sendable, CaseIterable {
     case navigate
     case snapshot = "page.snapshot.read"
     case look = "page.look"
+    /// Local Screen pane only; never an agent-facing action or image slot.
+    case preview = "page.preview"
     case click = "page.element.click"
     case fill = "page.element.fill"
     case type = "page.element.type"
@@ -103,7 +105,7 @@ public enum ChromeControlEffect: String, Sendable, CaseIterable {
 
     var mayChangeExternalState: Bool {
         switch self {
-        case .attach, .snapshot, .look, .wait: false
+        case .attach, .snapshot, .look, .preview, .wait: false
         default: true
         }
     }
@@ -527,7 +529,7 @@ public actor ChromeControlRuntime {
                   version.utf8.count <= 128, ChromeExtensionFiles.components(version) != nil else {
                 throw ChromeControlRuntimeError.handshakeRejected("the extension returned an invalid attach greeting.")
             }
-            let tabs = await next.tabs()
+            guard let tabs = await next.tabs() else { throw ChromeControlRuntimeError.disconnected }
             guard installation == installationGeneration, generation == listenerGeneration,
                   connectingChannel === next, await transportAvailable(),
                   installation == installationGeneration, generation == listenerGeneration,
@@ -547,6 +549,12 @@ public actor ChromeControlRuntime {
                 if case .string(let at)? = error["at"] { facts.extensionErrorAt = at }
             }
             facts.extensionVersion = version
+            if let attempt = extensionReload, attempt.pending,
+               case .object(let evidence)? = result["reloadEvidence"], evidence["reloadId"] == .string(attempt.id),
+               evidence["runningVersion"] == .string(version),
+               case .int(let attempts)? = evidence["attempts"], (1...2).contains(attempts) {
+                extensionReload?.attempts = Int(attempts)
+            }
             facts.extensionCode = if case .string(let code)? = result["codeDigest"], code.count == 16,
                                      code.allSatisfy(\.isHexDigit) { code } else { nil }
             facts.extensionSeenAt = Date()
@@ -574,14 +582,14 @@ public actor ChromeControlRuntime {
             let running = facts.extensionCode, folder = extensionFiles?.code
             if browserPID != attempt.browserPID || browserPID.flatMap({ ChromeHostIdentity.processBirthStamp($0) }) != attempt.browserBirthStamp {
                 finishExtensionReload(phase: "failed", after: version, folderCode: folder, reason: "The reconnect came from a different Chrome process.")
-            } else if acceptedExtensionMatchesFolder == false {
+            } else if acceptedExtensionMatchesShipped == false {
                 finishExtensionReload(phase: "stale", after: version, afterCode: running, folderCode: folder,
                     reason: """
                         Reloaded, but the running version/code (\(version) / \(running ?? "unavailable")) does not match the registered folder at the \
                         shipped version (\(extensionFiles?.diskVersion ?? "unavailable") / \(folder ?? "unavailable"), shipped \(attempt.shipped), at \
                         \(attempt.path).
                         """)
-            } else if acceptedExtensionMatchesFolder == true, let running {
+            } else if acceptedExtensionMatchesShipped == true, let running {
                 let evidence = "; running and folder code both report \(running) (before: \(attempt.beforeCode ?? "none reported"))"
                 finishExtensionReload(phase: "succeeded", after: version, afterCode: running, folderCode: folder,
                     reason: "Reload verified by the extension's accepted reconnect and running version" + evidence + ".")

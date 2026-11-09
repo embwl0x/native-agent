@@ -16,6 +16,7 @@ import AuthoredCapabilities
 import NativeAgentShared
 import Studio
 import Transcripts
+import DreamREMCycle
 // Blueprint: | `NativeCognitionRuntime+TurnPresentation.swift` | `NativeCognitionRuntime`. |
 
 extension NativeCognitionRuntime {
@@ -45,7 +46,7 @@ extension NativeCognitionRuntime {
             canonicalAffect: canonicalAffect,
             fixedAt: fixedAt
         )
-        let capsuleRequest = requestWithOrganismProjection(
+        let capsuleRequest = await requestWithOrganismProjection(
             request,
             projection: organism.projection,
             toward: organism.toward,
@@ -93,16 +94,25 @@ extension NativeCognitionRuntime {
         }
     }
 
+    public func commitReplyFeeling(_ projection: CognitionAtTurn, request: CognitiveCapsuleRequest) async {
+        guard request.resolvedTurnKind == .live, request.mode == .inject,
+              let commit = projection.capsulePresentationCommit else { return }
+        await enterDoor()
+        defer { leaveDoor() }
+        await substrate.applyReplyFeelingCommit(commit)
+    }
+
     func requestWithOrganismProjection(
         _ request: CognitiveCapsuleRequest,
         projection initialProjection: OrganismReadout,
         toward: OrganismTowardRead? = nil,
         at fixedAt: Date
-    ) -> CognitiveCapsuleRequest {
+    ) async -> CognitiveCapsuleRequest {
         var projection = initialProjection
         // Render horizon before neutral-body early return because prediction-ledger anticipation is independent of chemistry.
         var request = request
         request.toward = toward
+        request.sleepDream = await savedSleepDreamReading(at: fixedAt)
         guard !projection.isNeutral else { return request }
         // Suppress unchanged lines only for real injections; inspections must show state without consuming cadence.
         // Set the surfaced marker at confirmed delivery so previews or absent capsules cannot consume the window.
@@ -116,6 +126,18 @@ extension NativeCognitionRuntime {
         var copy = request
         copy.organismProjection = projection
         return copy
+    }
+
+    private func savedSleepDreamReading(at fixedAt: Date) async -> CognitiveSleepDreamReading? {
+        do {
+            let admission = try await ExperienceStore.at(dataRoot).details(.init(sources: [Attention.detailSource], subjects: ["night"],
+                kinds: [Attention.nightKind], through: fixedAt, limit: 1, newestFirst: true)).first
+            guard let admission else { return nil }
+            let completion = try FileBackedDreamDiary.savedCompletion(dataRoot: dataRoot, since: admission.at, through: fixedAt)
+            return .init(beganAt: admission.at, completion: completion)
+        } catch {
+            return .init(beganAt: nil, failure: error.localizedDescription)
+        }
     }
 
     public nonisolated static func bodyLine(inCapsuleDynamicContext dynamicContext: String) -> String? {

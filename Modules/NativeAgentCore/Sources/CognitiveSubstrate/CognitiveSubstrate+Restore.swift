@@ -186,7 +186,10 @@ extension CognitiveSubstrate {
             rows["disposition"] = [dispositionArtifactPayload(at: disposition.updatedAt)]
         }
         if residentRestoreIsAuthoritative || !dreamResidueClaims.isEmpty || dreamResidue != nil {
-            rows["dream_residue"] = [dreamResidueArtifactPayload(at: now)]
+            rows["dream_residue"] = [dreamResidueArtifactPayload()]
+        }
+        if residentRestoreIsAuthoritative || attentionLanding != nil {
+            rows["attention_landing"] = [attentionCheckpoint().payload]
         }
         if residentRestoreIsAuthoritative || !associationSuppressions.isEmpty || dispositionUndo != nil {
             rows["mind_ledger"] = [mindLedgerArtifactPayload(at: now, undoEntry: dispositionUndo)]
@@ -252,13 +255,14 @@ extension CognitiveSubstrate {
         try await store.commitMaintenance(
             nodes: field.snapshot(at: now, configuration: configuration),
             artifacts: artifacts, deletedArtifactIDs: deletedIDs, receipts: [],
-            maxNodes: configuration.maximumActiveNodes, maxArtifacts: artifactCap(configuration), at: now
+            maxArtifacts: artifactCap(configuration), at: now
         )
     }
 
     private func restoreArtifactFamilyLoads() -> [CognitiveArtifactFamilyLoad] {
         [
             CognitiveArtifactFamilyLoad(key: "affect", kindPrefix: "affect", limit: 1),
+            CognitiveArtifactFamilyLoad(key: "attention_landing", kindPrefix: "attention_landing", limit: 1, whole: true),
             CognitiveArtifactFamilyLoad(
                 key: "capsule_presentation",
                 kindPrefix: "capsule_presentation",
@@ -315,6 +319,10 @@ extension CognitiveSubstrate {
                     detail: "family was absent from the SQLite restore bundle"
                 )
             }
+            if family.key == "attention_landing", payloads.count > 1 {
+                throw CognitivePersistenceError.invalidRestoreArtifact(family: family.key, index: 1,
+                    detail: "more than one unfinished field application was stored")
+            }
             for (index, payload) in payloads.enumerated() {
                 if ["episode", "schema_proposal", "developmental_timeline", "reflection_receipt", "capsule_presentation",
                     "affect", "disposition", "dream_residue", "mind_ledger", "emotional_consolidation"].contains(family.key) {
@@ -368,6 +376,9 @@ extension CognitiveSubstrate {
     private func validRestorePayload(_ payload: JSONValue, family: String) -> Bool {
         guard case .object(let object) = payload else { return false }
         switch family {
+        case "attention_landing":
+            guard let pending = object["pending"] else { return false }
+            return pending == .null || AttentionLanding(payload: pending) != nil
         case "affect":
             return dateValue(object["updatedAt"]) != nil
         case "capsule_presentation":
@@ -377,7 +388,7 @@ extension CognitiveSubstrate {
                 && object["valence"]?.numberValue(coercingStrings: false, finiteOnly: true) != nil
                 && validDreamClaims(object["dreamNights"])
         case "dream_residue":
-            return dateValue(object["updatedAt"]) != nil && validDreamClaims(object["claimKeys"])
+            return validDreamClaims(object["claimKeys"])
         case "emotional_consolidation":
             return dateValue(object["ranAt"]) != nil
         case "mind_ledger":
@@ -417,6 +428,9 @@ extension CognitiveSubstrate {
 
         verificationNodeMayExist = field.peekNodes().contains { $0.turnKind == .verification }
         restoreAffect(from: payloads("affect"))
+        if let pending = payloads("attention_landing").first?.objectValue?["pending"], pending != .null {
+            attentionLanding = AttentionLanding(payload: pending)
+        } else { attentionLanding = nil }
         restoreCapsulePresentation(from: payloads("capsule_presentation"))
         restoreDisposition(from: payloads("disposition"))
         restoreEmotionalConsolidation(from: payloads("emotional_consolidation"))

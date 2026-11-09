@@ -18,7 +18,6 @@ import Observation
 import PersistenceCore
 import Research
 import TriggerScheduler
-import SchedulerExecution
 import ApprovalInbox
 import NativeAgentShared
 import NotificationInbox
@@ -40,18 +39,9 @@ public final class DeskFacade {
     public private(set) var hasLoadedWorkflows = false
     @ObservationIgnored var capabilitiesDidChange: (@MainActor @Sendable () async -> Void)?
 
-    public private(set) var jobs: [ScheduledJob] = []
-    public private(set) var jobsFeedState: SchedulerJobsFeedState?
-    @ObservationIgnored private lazy var jobsRead = LatestRead()
-    private var jobsRefresh = LivingStatusRefreshCoalescer()
-    @ObservationIgnored private var jobsRefreshTask: Task<SchedulerJobsFeedState, Never>?
-    public var isRefreshingJobs: Bool { jobsRefresh.isRefreshing }
-
-    public func watchJobs() async {
-        await EventDeadlinePhysiology.refreshOnChanges(paths: [jobsPath], debounceDelay: .milliseconds(100)) {
-            _ = await self.refreshJobs()
-        }
-    }
+    public private(set) var times: [OneClock.Time] = []
+    public private(set) var timesFeedState: ClockFeedState?
+    @ObservationIgnored private lazy var timesRead = LatestRead()
     public private(set) var researchRuns: [ResearchLabRun] = []
     @ObservationIgnored private lazy var researchRead = LatestRead()
     public private(set) var researchRunsLoaded = false
@@ -93,7 +83,6 @@ public final class DeskFacade {
         didSet { if faceItem != oldValue { faceDidChange?() } }
     }
     @ObservationIgnored var faceDidChange: (@MainActor () -> Void)?
-    @ObservationIgnored var faceActionInFlight = false
     @ObservationIgnored public var faceRequest: (@MainActor (DeskFaceRequest) throws -> String)?
     private var availableOverview: WorkOverview? {
         guard let overview = page.overview, overview.unavailable.isEmpty else { return nil }
@@ -191,114 +180,31 @@ public final class DeskFacade {
         clockTask?.cancel()
         deadlineTask?.cancel()
         refreshTask?.cancel()
-        jobsRefreshTask?.cancel()
     }
 
-    // MARK: schedule
+    // MARK: the clock
 
-    public nonisolated var jobsPath: URL {
-        dataRoot
-            .appendingPathComponent("scheduler", isDirectory: true)
-            .appendingPathComponent("jobs.json")
-    }
+    /// The clock's owners the Desk draws on its timer: inbox briefs, part schedules and scheduled reads. A helper's time is drawn with
+    /// its helper; a moment with its MY QUEUE step.
+    nonisolated static let timerOwners = [SwiftNativeTriggerScheduler.clockOwner, "part", "watch", "scan"]
 
-    /// Missing or damaged state cannot claim an empty schedule; use the canonical scheduler’s next-run decoration.
-    public func jobsFeed() async -> SchedulerJobsFeedState {
-        await jobsRead.read({ await self.readJobsFeed() }) { feed in
-            jobsFeedState = feed
-            switch feed {
-            case .current(let rows), .partial(let rows, _): jobs = rows
-            case .sourceAbsent, .unavailable: break
-            }
+    /// What is on the one clock for the Desk's timer, read from the clock itself; an unreadable clock is unavailable, never an empty timer.
+    @discardableResult
+    public func timesFeed() async -> ClockFeedState {
+        await timesRead.read({ await self.readTimes() }) { feed in
+            timesFeedState = feed
+            if case .current(let rows) = feed { times = rows }
         }
     }
 
-    private nonisolated func readJobsFeed() async -> SchedulerJobsFeedState {
+    private nonisolated func readTimes() async -> ClockFeedState {
         do {
-            guard let rows = try await SwiftNativeTriggerScheduler(root: dataRoot).listJobsIfPresent() else {
-                return .sourceAbsent
-            }
-
-            var jobs: [ScheduledJob] = []
-            var rejectedRows = 0
-            jobs.reserveCapacity(rows.count)
-            for row in rows {
-                do {
-                    jobs.append(try ScheduledJob(row: row))
-                } catch {
-                    rejectedRows += 1
-                }
-            }
-            return rejectedRows == 0 ? .current(jobs) : .partial(jobs, rejectedRows: rejectedRows)
+            var rows: [OneClock.Time] = []
+            for owner in Self.timerOwners { rows += try await OneClock.at(dataRoot).times(owner: owner) }
+            return .current(rows.sorted { $0.next < $1.next })
         } catch {
             return .unavailable(error.localizedDescription)
         }
-    }
-
-    public func listJobs() async throws -> [ScheduledJob] {
-        switch await jobsFeed() {
-        case .current(let jobs):
-            return jobs
-        case .sourceAbsent:
-            throw SchedulerJobsFeedError.sourceAbsent
-        case .partial(_, let rejectedRows):
-            throw SchedulerJobsFeedError.partial(rejectedRows: rejectedRows)
-        case .unavailable(let detail):
-            throw SchedulerJobsFeedError.unavailable(detail)
-        }
-    }
-
-    @discardableResult
-    public func refreshJobs() async -> SchedulerJobsFeedState? {
-        if jobsRefresh.requestRefresh() {
-            jobsRefreshTask = Task {
-                var feed = await jobsFeed()
-                while !Task.isCancelled, jobsRefresh.completePass() {
-                    feed = await jobsFeed()
-                }
-                jobsRefresh.cancel()
-                jobsRefreshTask = nil
-                return feed
-            }
-        }
-        // Joining requests wait for their trailing read, never the previously retained feed.
-        return await jobsRefreshTask?.value
-    }
-
-    public func setJobEnabled(id: String, enabled: Bool) async throws -> ScheduledJob {
-        let writer = makeSchedulerJobWriter(dataRoot: dataRoot)
-        let result = try await writer.setJobEnabled(jobId: id, enabled: enabled)
-        // Commit before readback; pre-commit reads must not publish afterward.
-        jobsRead.write {}
-        guard case .object(let object) = result, let row = object["job"] else {
-            throw SchedulerJobsFeedError.unavailable("scheduler pause/resume returned no job")
-        }
-        let saved = try ScheduledJob(row: row)
-        jobsRead.write {
-            if let index = jobs.firstIndex(where: { $0.id == saved.id }) { jobs[index] = saved }
-        }
-        return saved
-    }
-
-    public func ensureNightlyReflection(scheduler: SchedulerDueJobRunner) async throws -> NightlyReflectionJobOutcome {
-        let prior: [ScheduledJob]
-        do {
-            prior = try await listJobs()
-        } catch SchedulerJobsFeedError.sourceAbsent {
-            // Only explicit creation may repair absence; damage remains unavailable.
-            prior = []
-        }
-        // Explicit re-enable clears cancellation, unlike passive bootstrap.
-        let resolved = try await scheduler.ensureDefaultCycleJobs(now: Date(), reactivateCancelled: true).nightlyDream
-        // Retain the feed until readback without admitting pre-commit reads.
-        jobsRead.write {}
-        let id = try ScheduledJob(row: resolved).id
-        let refreshed = try await listJobs()
-        guard let after = refreshed.first(where: { $0.id == id }) else {
-            return .failed("the canonical scheduler job was not persisted")
-        }
-        if let before = prior.first(where: { $0.id == id }) { return before == after ? .alreadyPresent : .repaired }
-        return .added
     }
 
     // MARK: research
@@ -319,26 +225,11 @@ public final class DeskFacade {
         })
     }
 
-    public func recordResearchRun(_ run: ResearchLabRun) {
-        researchRead.write {
-            researchRuns.removeAll { $0.id == run.id }
-            researchRuns.insert(run, at: 0)
-        }
-    }
-
     /// Damaged research history fails its read without replacing retained rows or original bytes.
     public nonisolated func listResearchRuns() async throws -> [ResearchLabRun] {
         try await SwiftNativeResearchClient(dataRoot: dataRoot).researchLabRuns()
     }
 }
-
-public enum NightlyReflectionJobOutcome: Equatable, Sendable {
-    case added
-    case alreadyPresent
-    case repaired
-    case failed(String)
-}
-
 
 extension DeskFacade {
     /// The stores whose writes refresh the Desk page.
@@ -347,12 +238,15 @@ extension DeskFacade {
             SwiftNativeDeskStore(dataRoot: dataRoot).opsPath,
             SwiftNativeDeskStore(dataRoot: dataRoot).basePath,
             SwiftNativeApprovalInbox(root: dataRoot).approvalsPath,
-            jobsPath,
+            dataRoot.appendingPathComponent("clock/times.json"),
+            dataRoot.appendingPathComponent("mind/rhythm.json"),
+            dataRoot.appendingPathComponent("cognition/user_turn.json"),
             AgentJobStore(dataRoot: dataRoot).fileURL,
             dataRoot.appendingPathComponent("bots/definitions", isDirectory: true),
-            dataRoot.appendingPathComponent("bots/runner-jobs.json"),
+            dataRoot.appendingPathComponent("bots/missed-runs.json"),
             DeskNagConfigStore(dataRoot: dataRoot).configPath,
-            StudioWanderLane.statePath(dataRoot: dataRoot),
+            dataRoot.appendingPathComponent("experiences/experiences.sqlite"),
+            dataRoot.appendingPathComponent("experiences/experiences.sqlite-wal"),
             dataRoot.appendingPathComponent("trust/policy.json"),
         ]
     }
@@ -389,51 +283,7 @@ extension DeskFacade {
     /// Publish one complete retained revision; never store a parallel presentation snapshot.
     private func readRevision() async -> DeskPageSnapshot {
         await boardRead.read {
-            await bindLiveUpdates()
-            var snapshot = await Task.detached(priority: .userInitiated) {
-                DeskPageSnapshot(read: await self.readBoard())
-            }.value
-            // Rescan after arming the parent to cover directories created during watch setup.
-            await bindLiveUpdates()
-            _ = await refreshJobs()
-            let dataRoot = self.dataRoot
-            do {
-                let timing = try await bots.effectiveSchedule()
-                snapshot.missedBots = try await Task.detached(priority: .userInitiated) {
-                    try DeskMissedBot.load(root: dataRoot, timing: timing)
-                }.value
-                if timing.unattended {
-                    snapshot.timedBots = try await Task.detached(priority: .userInitiated) {
-                        try DeskTimedBot.load(root: dataRoot, timing: timing)
-                    }.value
-                }
-            } catch {
-                snapshot
-                    .botScheduleError = "Helper schedules could not be read: \(error.localizedDescription). Repair the saved helper definitions and schedules."
-            }
-            snapshot.now = Date()
-            do { snapshot.nagConfig = try await DeskNagConfigStore(dataRoot: dataRoot).loadChecked() }
-            catch { snapshot
-                .nagConfigError = "Reminder settings are unavailable: \(error.localizedDescription). Repair the saved reminder settings before changing them." }
-            let hour: StudioWanderLane.TraceEntry?
-            do {
-                hour = try await Self.residentHour(dataRoot: dataRoot)
-                snapshot.wanderHour = DeskWanderHourPresentation.state(installed: true, entry: hour, now: snapshot.now)
-            } catch {
-                hour = nil
-                snapshot.wanderHour = .line(text: "The wander hour’s saved state is unavailable.", symbol: "exclamationmark.triangle")
-            }
-            let hourExpiry = hour.flatMap { UserDisplayFormatters.parseISOTimestamp($0.at) }
-                .map { DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: snapshot.now) }
-            snapshot.jobs = jobs
-            snapshot = await Task.detached(priority: .userInitiated) { [snapshot] in
-                var snapshot = snapshot
-                snapshot.plan = DeskSequencing.compute(DeskState(items: snapshot.boardItems, generatedTs: ""), now: snapshot.now)
-                snapshot.rows = DeskPageContent.project(snapshot: snapshot, now: snapshot.now, nags: snapshot.nagConfig,
-                    timedBots: snapshot.timedBots, jobStamps: snapshot.jobs.compactMap(\.nextRunAt), hourExpiry: hourExpiry)
-                return snapshot
-            }.value
-            return snapshot
+            await buildRevision()
         } publish: { snapshot in
             page = snapshot
             faceDidChange?()
@@ -446,6 +296,44 @@ extension DeskFacade {
                 }
             }
         }
+    }
+
+    /// The complete page revision is built away from the observable owner; only watch lifecycle, clock publication and the final snapshot
+    /// publication hop back. Every store read and row calculation runs here.
+    @concurrent nonisolated private func buildRevision() async -> DeskPageSnapshot {
+        await bindLiveUpdates()
+        var snapshot = DeskPageSnapshot(read: await readBoard())
+        // Rescan after arming the parent to cover directories created during watch setup.
+        await bindLiveUpdates()
+        _ = await timesFeed()
+        snapshot.times = await times
+        do {
+            let timing = try await bots.effectiveSchedule()
+            snapshot.missedBots = try DeskMissedBot.load(root: dataRoot, timing: timing)
+            if timing.unattended { snapshot.timedBots = try DeskTimedBot.load(root: dataRoot, timing: timing) }
+        } catch {
+            snapshot.botScheduleError = "Helper schedules could not be read: \(error.localizedDescription). Repair the saved helper definitions and schedules."
+        }
+        snapshot.now = Date()
+        do { snapshot.nagConfig = try await DeskNagConfigStore(dataRoot: dataRoot).loadChecked() }
+        catch {
+            snapshot.nagConfigError = "Reminder settings are unavailable: \(error.localizedDescription). "
+                + "Repair the saved reminder settings before changing them."
+        }
+        let hour: StudioWanderLane.ThoughtReading?
+        do {
+            hour = try await Self.residentHour(dataRoot: dataRoot)
+            snapshot.wanderHour = DeskWanderHourPresentation.state(installed: true, entry: hour)
+        } catch {
+            hour = nil
+            snapshot.wanderHour = .line(text: "My hour’s thought record is unavailable.", symbol: "exclamationmark.triangle")
+        }
+        let hourExpiry = hour.flatMap { UserDisplayFormatters.parseISOTimestamp($0.at) }
+            .map { DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: snapshot.now) }
+        snapshot.plan = DeskSequencing.compute(DeskState(items: snapshot.boardItems, generatedTs: ""), now: snapshot.now)
+        snapshot.rows = DeskPageContent.project(snapshot: snapshot, now: snapshot.now, nags: snapshot.nagConfig,
+            timedBots: snapshot.timedBots, jobStamps: snapshot.times.map { NativeTimestampFormat.fractionalZulu($0.next) }, hourExpiry: hourExpiry)
+        return snapshot
     }
 
     public func signalRefresh() async { await debouncer.signal() }
@@ -505,43 +393,16 @@ extension DeskFacade {
     }
 
 }
-// MARK: - The schedule feed
+// MARK: - The clock feed
 
-public enum SchedulerJobsFeedState: Equatable, Sendable {
-    case current([ScheduledJob])
-    case partial([ScheduledJob], rejectedRows: Int)
-    case sourceAbsent
+public enum ClockFeedState: Equatable, Sendable {
+    case current([OneClock.Time])
     case unavailable(String)
 
     public var failureDetail: String? {
         switch self {
-        case .current:
-            nil
-        case .partial(let rows, let rejectedRows):
-            """
-                Schedule is partially unavailable: \(rejectedRows) malformed \(rejectedRows == 1 ? "row" : "rows") were withheld; \(rows.count) valid \
-                \(rows.count == 1 ? "row remains" : "rows remain").
-                """
-        case .sourceAbsent:
-            "Schedule source is absent. No job count is available until scheduler/jobs.json is created."
-        case .unavailable(let detail):
-            "Schedule source is unavailable: \(detail)"
-        }
-    }
-}
-public enum SchedulerJobsFeedError: LocalizedError, Sendable {
-    case sourceAbsent
-    case partial(rejectedRows: Int)
-    case unavailable(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .sourceAbsent:
-            "Schedule source is absent. No job count is available."
-        case .partial(let rejectedRows):
-            "Schedule has \(rejectedRows) malformed \(rejectedRows == 1 ? "row" : "rows")."
-        case .unavailable(let detail):
-            "Schedule source is unavailable: \(detail)"
+        case .current: nil
+        case .unavailable(let detail): "The clock's times are unavailable: \(detail)"
         }
     }
 }
@@ -604,9 +465,9 @@ public enum DeskActionResultReader {
 }
 
 extension DeskFacade {
-    public nonisolated static func residentHour(dataRoot: URL) async throws -> StudioWanderLane.TraceEntry? {
+    public nonisolated static func residentHour(dataRoot: URL) async throws -> StudioWanderLane.ThoughtReading? {
         guard await NativeCognitionRuntime.studioWanderIsInstalled(dataRoot: dataRoot) else { return nil }
-        return try await StudioWanderLane.loadState(dataRoot: dataRoot).trace.last
+        return try await StudioWanderLane.latestThought(dataRoot: dataRoot)
     }
 }
 
@@ -707,8 +568,8 @@ public struct DeskTaskStart: Sendable {
 
 extension NativeAgentEngine {
     /// A Desk task starts a line of the agent's carrying that item; its ending wakes the agent's own work conversation, where the agent settles the item.
-    public static func submitDeskTask(title: String, objective: String, project: String = "Tasks") async throws -> DeskTaskStart {
-        let root = PersistenceCore.defaultDataRoot()
+    public static func submitDeskTask(title: String, objective: String, project: String = "Tasks",
+                                      dataRoot root: URL = PersistenceCore.defaultDataRoot()) async throws -> DeskTaskStart {
         let store = SwiftNativeDeskStore(dataRoot: root)
         let item = try await store.createItem(kind: .project, project: project, title: String(title.prefix(160)),
             summary: String(objective.prefix(600)))

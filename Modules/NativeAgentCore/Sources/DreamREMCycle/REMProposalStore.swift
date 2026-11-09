@@ -413,10 +413,8 @@ public struct REMProposalStore: Sendable {
             }
             let appended = try await REMGrowthWriter.appendApprovedLesson(personaRoot: personaRoot, proposalText: row.proposalText)
             for item in graduating {
-                if try await storage.memory(id: item.id)?.lifecycle != MemoryLifecycle.graduated {
-                    _ = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: self.dataRoot).updateMemory(
-                        id: item.id, update: .object(["lifecycle": .string(MemoryLifecycle.graduated)]), context: context)
-                }
+                try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: self.dataRoot).graduateMemory(
+                    id: item.id, reviewedContent: item.quote, context: context)
             }
             let approved = try await self.applyApproval(proposalId: proposalId)
             return LessonApplication(row: approved, growthAppended: appended, stale: false)

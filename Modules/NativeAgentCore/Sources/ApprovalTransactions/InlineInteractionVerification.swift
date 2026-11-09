@@ -28,8 +28,27 @@ import Browser
 import NotificationInbox
 // Blueprint: | `InlineInteractionVerification.swift` | Canonical owners alone confirm completion. |
 extension InlineInteractionResolver {
+    /// Provider publication and launch recovery re-read the transcript and canonical auth owner. No tap, saved draft or missing row settles an ask.
+    public static func settleProviderRequests(dataRoot: URL) async {
+        guard platform != nil else { return }
+        let rows: [InboxItemRecord]
+        do { rows = try await ForPerson.at(dataRoot).inbox() }
+        catch {
+            recordControlFailure("provider-requests", dataRoot: dataRoot, error: error)
+            return
+        }
+        for row in rows where row.source == InlineInteractionDelivery.source {
+            do {
+                let pointer = try InlineInteractionDelivery.Pointer(item: row)
+                guard let card = try await interaction(id: pointer.interactionID, sessionID: pointer.sessionID, dataRoot: dataRoot),
+                      card.kind == .apiKey, card.secret == nil, card.state.isOpen || card.state.isRetryable else { continue }
+                _ = await completeIfVerified(id: card.id, sessionID: pointer.sessionID, dataRoot: dataRoot)
+            } catch { recordControlFailure(row.id, dataRoot: dataRoot, error: error) }
+        }
+    }
+
     // Re-read canonical owners after controls close so cancellation cannot masquerade as success.
-    enum Verification {
+    enum Verification: Sendable {
         case success(InlineInteraction.Outcome)
         case failure(String)
     }
@@ -39,6 +58,10 @@ extension InlineInteractionResolver {
         id: String,
         sessionID: String,
         expectedRevision: Int? = nil,
+        selection: String? = nil,
+        scope: InlineInteraction.Scope? = nil,
+        includeRetryable: Bool = false,
+        checkMail: Bool = true,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> Bool {
         let current: InlineInteraction
@@ -50,11 +73,12 @@ extension InlineInteractionResolver {
             recordControlFailure(id, dataRoot: dataRoot, error: error)
             return false
         }
-        guard current.state.isOpen else { return current.state.isTerminal }
+        guard current.state.isOpen || (current.state.isRetryable && (includeRetryable || (current.kind == .apiKey && current.secret == nil)))
+        else { return current.state.isTerminal }
         if let expectedRevision, current.revision != expectedRevision { return true }
         guard !Task.isCancelled else { return false }
         guard case .success(let outcome) = await verify(
-            current, selection: current.target, scope: nil, dataRoot: dataRoot
+            current, selection: selection ?? current.target, scope: scope, dataRoot: dataRoot, checkMail: checkMail
         ) else { return false }
         do {
             return try await finish(current, verification: .success(outcome), sessionID: sessionID,
@@ -68,24 +92,21 @@ extension InlineInteractionResolver {
             return false
         }
     }
-    /// Project confirmed owner state without writing or resuming; choices stay with controls and Mail reads existing readiness.
-    public static func liveProjection(
+    /// Before an ask is filed, already-satisfied setup needs no card. Saved cards are read as saved and complete only through the resolver.
+    public static func verifiedSetupSummary(
         _ interaction: InlineInteraction,
         dataRoot: URL
-    ) async -> InlineInteraction {
-        switch interaction.state {
-        case .pending, .running, .failed, .declined: break
-        default: return interaction
-        }
+    ) async -> String? {
+        guard interaction.state.isOpen, interaction.continuationFailure == nil else { return nil }
         switch interaction.kind {
         case .connector, .permission, .apiKey, .capability: break
-        default: return interaction
+        default: return nil
         }
         guard case .success(let outcome) = await verify(
             interaction, selection: interaction.target, scope: nil, dataRoot: dataRoot,
             checkMail: false
-        ) else { return interaction }
-        return interaction.settled(outcome, at: interaction.settledAt ?? interaction.createdAt)
+        ) else { return nil }
+        return outcome.summary
     }
     static func verify(
         _ interaction: InlineInteraction,
@@ -124,26 +145,27 @@ extension InlineInteractionResolver {
                 return .success(.init(selection: "iphone", summary: "iPhone can approve"))
             }
             // Read derived connector auth state so a rejected saved token cannot count as connected.
-            let target = InlineInteractionRegistry.canonicalConnectorID(interaction.target)
+            let target = ConnectorSetup.canonicalID(interaction.target)
             let records: [InlineInteractionConnectorStatus]
             do { records = try await platform.connectorRecords(root: dataRoot) }
             catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
             guard let record = records.first(where: {
-                InlineInteractionRegistry.canonicalConnectorID($0.id) == target
+                ConnectorSetup.canonicalID($0.id) == target
             }) else {
                 return .failure("\(interaction.title) isn't in Connectors on this Mac.")
             }
             // Telegram configuration proves a saved enabled bot; only a successful poll proves health.
+            let name = await Task.detached { InlineInteractionRegistry.connectorDisplayName(target, dataRoot: dataRoot) }.value
             guard record.authState == "connected"
                 || (target == "telegram" && record.authState == "configured" && record.healthStatus != "disabled")
             else {
                 return .failure(
-                    "\(InlineInteractionRegistry.connectorDisplayName(target, dataRoot: dataRoot)) still isn't connected."
+                    "\(name) still isn't connected."
                 )
             }
             return .success(.init(
                 selection: target,
-                summary: "\(InlineInteractionRegistry.connectorDisplayName(target, dataRoot: dataRoot)) connected"
+                summary: "\(name) connected"
             ))
         case .permission:
             // Verify the entire chain against each capability's owner; integration axes and Trust categories have separate stores.
@@ -159,9 +181,10 @@ extension InlineInteractionResolver {
                 }
                 if InlineInteractionRegistry.isMacControlCategory(capability) {
                     do {
-                    if try !InlineInteractionRegistry.macControlCategoryAllowed(
-                        capability, dataRoot: dataRoot
-                    ) {
+                    let allowed = try await Task.detached {
+                        try InlineInteractionRegistry.macControlCategoryAllowed(capability, dataRoot: dataRoot)
+                    }.value
+                    if !allowed {
                         missing.append(capability)
                     }
                     } catch { return .failure(error.localizedDescription) }
@@ -251,35 +274,19 @@ extension InlineInteractionResolver {
                 scope: .persistent
             ))
         case .apiKey where interaction.secret != nil:
-            let name = String(interaction.target.dropFirst("secret:".count))
-            let kept: Keyring.Entry?
-            do { kept = try Keyring.entry(name) } catch {
-                return .failure("The keyring could not be read, so whether \(name) is kept is unknown. Try again.")
-            }
-            if interaction.secret?.remove == true {
-                return kept == nil ? .success(.init(selection: interaction.target, summary: "\(name) removed"))
-                    : .failure("\(name) is still kept.")
-            }
-            guard let ask = interaction.secret, Keyring.granted(name, hosts: ask.hosts, programs: ask.programs),
-                  let kept, kept.at >= interaction.createdAt else {
-                return .failure("\(name) isn't kept yet.")
-            }
-            return .success(.init(selection: interaction.target,
-                                  summary: "\(name) kept \u{00B7} for \(ask.line)" + (kept.account.map { " \u{00B7} account \($0)" } ?? "")))
+            // The checked credential and executable identities never visit MainActor; only the credential-free verification returns.
+            return await Task.detached { verifySecret(interaction) }.value
         case .apiKey:
-            // Providers readiness, through key or sign-in, must confirm connection; rejected keys cannot settle.
+            // Readiness belongs to the requested account. Another account cannot satisfy an unchanged API-key route.
             let target = InlineInteractionRegistry.canonicalProviderID(interaction.target)
-            let doors = [target] + [InlineInteractionRegistry.providerSignIn(for: target)?.oauthProviderID]
-                .compactMap { $0 }
             let providers: [InlineInteractionProviderStatus]
-            do { providers = try await platform.providers() }
+            do { providers = try await platform.providers(root: dataRoot) }
             catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
-            let rows = doors.compactMap { id in providers.first { $0.providerID == id } }
-            guard let first = rows.first else {
+            guard let provider = providers.first(where: { $0.providerID == target }) else {
                 return .failure("No provider named \(interaction.target).")
             }
-            guard let provider = rows.first(where: \.eligible) else {
-                return .failure("\(first.displayName) still isn't ready.")
+            guard provider.eligible, provider.authState == "ready" else {
+                return .failure("\(provider.displayName)'s saved connection is not verified yet. Test the connection in Providers on the Mac.")
             }
             let model = provider.defaultModel ?? provider.firstModel
             return .success(.init(
@@ -316,5 +323,25 @@ extension InlineInteractionResolver {
         case .unknown:
             return .failure("This build doesn't know that kind of request.")
         }
+    }
+
+    private nonisolated static func verifySecret(_ interaction: InlineInteraction) -> Verification {
+        let name = String(interaction.target.dropFirst("secret:".count))
+        let kept: Keyring.Entry?
+        do { kept = try Keyring.entry(name) }
+        catch { return .failure("The keyring could not be read, so whether \(name) is kept is unknown. Try again.") }
+        if interaction.secret?.remove == true {
+            return kept == nil ? .success(.init(selection: interaction.target, summary: "\(name) removed"))
+                : .failure("\(name) is still kept.")
+        }
+        guard let ask = interaction.secret, let kept, kept.at >= interaction.createdAt else {
+            return .failure("\(name) isn't kept yet.")
+        }
+        do {
+            guard try Keyring.granted(kept, hosts: ask.hosts, programs: ask.programs) else {
+                return .failure("\(name)'s requested destinations are not granted yet.")
+            }
+        } catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
+        return .success(.init(selection: interaction.target, summary: "\(name) kept \u{00B7} for \(ask.line)"))
     }
 }

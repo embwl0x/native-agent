@@ -2,7 +2,7 @@ import SwiftUI
 import Foundation
 import NativeAgentShared
 import UIKit
-// Blueprint: | `AliveControls.swift` | Status lights, actions, search, glass controls and haze swatches |
+// Blueprint: | `AliveControls.swift` | Status lights, search, glass controls and haze swatches |
 
 /// Reserve haze for presence, work and decisions; unreachable Macs use grey.
 struct AliveStatusDot: View {
@@ -24,60 +24,6 @@ struct AliveStatusDot: View {
     }
 }
 
-// MARK: - States and actions
-
-struct AliveWaitingDot: View {
-    @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        let color = HazeColor(stored: colorRaw).control(dark: colorScheme == .dark, labelled: false)
-        Circle()
-            .fill(color)
-            .frame(width: 8, height: 8)
-            .shadow(color: color.opacity(0.6), radius: 4)
-            .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
-            .accessibilityHidden(true)
-    }
-}
-
-/// Empty, unpaired and syncing states offer at most one recovery action.
-struct AliveCalmState: View {
-    let title: String
-    let line: String
-    var actionTitle: String? = nil
-    var actionHint: String? = nil
-    var showsProgress = false
-    var action: (() -> Void)? = nil
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                if showsProgress { ProgressView().controlSize(.small) }
-                Text(title)
-                    .font(.system(.title2, design: .serif))
-                    .foregroundStyle(AlivePalette.text)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Text(line)
-                .font(.body)
-                .lineSpacing(3)
-                .foregroundStyle(AlivePalette.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if let actionTitle, let action {
-                Button(actionTitle, action: action)
-                    .alivePrimaryButton()
-                    .accessibilityHint(actionHint ?? "")
-                    .padding(.top, 8)
-            }
-        }
-        .padding(22)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .aliveCard()
-        .accessibilityElement(children: .contain)
-    }
-}
-
 extension View {
     /// The primary action uses the deep haze shade so its white label clears 5:1.
     func alivePrimaryButton() -> some View {
@@ -87,39 +33,6 @@ extension View {
     /// Keep secondary actions neutral so the primary action retains emphasis.
     func aliveSecondaryButton() -> some View {
         buttonStyle(.bordered).buttonBorderShape(.capsule).tint(AlivePalette.text)
-    }
-}
-
-struct AliveActionRow<Content: View>: View {
-    @Environment(\.dynamicTypeSize) private var typeSize
-    @ViewBuilder var content: () -> Content
-
-    var body: some View {
-        ViewThatFits(in: .horizontal) {
-            if !typeSize.isAccessibilitySize {
-                HStack(spacing: 8) { content() }
-                    .fixedSize(horizontal: true, vertical: false)
-            }
-            VStack(alignment: .leading, spacing: 8) { content() }
-        }
-        .labelStyle(.titleOnly)
-        .font(.subheadline.weight(.semibold))
-        .controlSize(.regular)
-    }
-}
-
-/// Reserve the haze wash for the selected segment.
-struct AliveSegmentedPicker<Value: Hashable>: View {
-    @Binding var selection: Value
-    let options: [Value]
-    let title: (Value) -> String
-
-    var body: some View {
-        Picker("", selection: $selection) {
-            ForEach(options, id: \.self) { Text(title($0)).tag($0) }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
     }
 }
 

@@ -240,11 +240,6 @@ extension AppModel {
         try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMacIntegrationPreset(preset, currentPolicy: currentPolicy)
     }
 
-    func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue] = [:]) async throws -> ConnectorActionReceipt {
-        try await engine.runConnectorAction(id: id, dryRun: dryRun, input: input,
-            origin: "mac_ui:connector_action:" + id, platform: AppConnectorActionPlatform(engine: engine))
-    }
-
     func saveMacControlPolicy(
         _ policy: MacControlPolicyWireSnapshot,
         comparedTo baseline: MacControlPolicyWireSnapshot,
@@ -270,6 +265,16 @@ extension AppModel {
             action: action, body: body,
             notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn
         )
+    }
+
+    func macControlRead(action: String, operation: UUID) async throws -> CommittedResult {
+        let reply = try await engine.faceActs.handle(.runMacControl(.init(action: action,
+            arguments: ["operationId": .string(operation.uuidString)], checking: true)))
+        guard case .committed(let result) = reply else {
+            throw WireFailure(code: "workbench_read_unconfirmed", message: "The Mac control owner did not return its operation state.",
+                cause: nil, effects: .unknown)
+        }
+        return result
     }
 
 }

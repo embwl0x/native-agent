@@ -38,6 +38,17 @@ extension AttentionRouter {
     /// The person is at the Mac when their own input says so; unknown is not here (the phone still gets it).
     public static func atMac() -> Bool { MacPersonInput.presence()?.here == true }
 
+    /// A known window supplies both the hold and its release time; unavailable preferences supply neither verdict.
+    public static func quietHoursEnd(at date: Date, dataRoot: URL) throws -> Date? {
+        guard let window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot),
+              window.contains(hour: Calendar.current.component(.hour, from: date)) else { return nil }
+        guard let end = window.end(after: date) else {
+            throw ToolFailureError("The quiet-hours end could not be resolved. Repair the system calendar before releasing held notifications.",
+                effects: .none, owner: "user_prefs.json", code: "quiet_hours_end_unavailable", recovery: .repair)
+        }
+        return end
+    }
+
     /// An unreadable window holds: no interruption is admitted on unknown preferences (checkedRead records the owner failure).
     public static func inQuietHours(at date: Date, dataRoot: URL, calendar: Calendar = .current) -> Bool {
         do {

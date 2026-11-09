@@ -11,9 +11,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
     public enum TerminalState: String, Sendable, Codable {
         case completed, stopped, interrupted, waiting, failed
     }
-    /// Per-string payload cap, except for model-call receipts.
+    /// Per-string payload cap, except for model-call receipts and the first-class feeling frame.
     public static let maxPayloadStringChars = 2000
-    /// Serialized row ceiling includes the envelope. Model-call receipts use traceMaximumBytes to preserve cache-prefix evidence.
+    /// Ordinary row budget includes the envelope; model calls and full feeling frames share the detail owner's larger row ceiling.
     public static let maxPayloadBytes = 12 * 1024
     // Keep hostile envelope metadata from consuming the space reserved for the frozen context.snapshot scalar manifest.
     private static let maxEnvelopeFieldUTF8Bytes = 480
@@ -138,8 +138,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
         self.payload = boundedPayload
     }
 
-    /// Bound row size while retaining lifecycle fields, an explicit clipped preview, original byte count and digest. Model-call telemetry needs its larger byte
-    /// budget to preserve evidence.
+    /// Bound previews while retaining lifecycle fields, byte count and digest. Model receipts and the full feeling field keep their own evidence.
     static func boundPayload(
         _ value: JSONValue,
         turnId: String,
@@ -150,8 +149,20 @@ public struct TurnTraceEvent: Sendable, Equatable {
         destinationId: String? = nil,
         threadId: String? = nil
     ) -> JSONValue {
-        let byteLimit = kind == "llm.call" ? JSONLLineCaps.traceMaximumBytes : maxPayloadBytes
-        let leafBound = kind == "llm.call" ? value : value.mapStrings(boundString)
+        let byteLimit = rowByteLimit(kind: kind, payload: value)
+        let summaryThreshold = kind == "llm.call" ? byteLimit : maxPayloadBytes
+        let leafBound: JSONValue
+        if kind == "llm.call" {
+            leafBound = value
+        } else if kind == "context.snapshot", case .object(let fields) = value {
+            var bounded: [String: JSONValue] = [:]
+            for (key, field) in fields {
+                bounded[key] = key == "feelingFrame" ? field : field.mapStrings(boundString)
+            }
+            leafBound = .object(bounded)
+        } else {
+            leafBound = value.mapStrings(boundString)
+        }
         guard (try? JSONValue.object(ordinaryEnvelope(
                 payload: leafBound,
                 turnId: turnId,
@@ -161,7 +172,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 surface: surface,
                 destinationId: destinationId,
                 threadId: threadId
-              )).serializedData(pretty: false).count + 1).map({ $0 > byteLimit }) == true,
+              )).serializedData(pretty: false).count + 1).map({ $0 > summaryThreshold }) == true,
               let serialized = try? leafBound.serializedData(pretty: false) else {
             return leafBound
         }
@@ -180,6 +191,10 @@ public struct TurnTraceEvent: Sendable, Equatable {
             ),
         ]
         if case .object(let object) = leafBound {
+            if kind == "context.snapshot", let frame = object["feelingFrame"] {
+                // The complete paragraph has its own place; preview and cue bounds cannot clip or evict it.
+                summary["feelingFrame"] = frame
+            }
             // Canonical model-call receipts retain every scalar measurement when larger structured metadata forces preview summarization.
             if kind == "llm.call" {
                 for (key, field) in object {
@@ -193,7 +208,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 "schema", "phase", "status", "name", "tool", "stage",
                 "milestone", "provider", "model", "resultClass",
                 "durationMs", "elapsedMs", "inputTokens", "outputTokens",
-                "argKeys", "shown", "receipt", "parentId", "automaticOrigin", "cacheMarkers",
+                "argKeys", "shown", "receipt", "result_recovery", "parentId", "automaticOrigin", "cacheMarkers",
                 // Preserve context scalar integrity facts when large previews are summarized so rows stay queryable despite sorted-key truncation.
                 "containsCognitiveSubstrate", "cognitiveCapsuleBytes", "cognitiveCue",
                 "toolSchemaCount", "toolSchemaParameterBytes",
@@ -259,8 +274,15 @@ public struct TurnTraceEvent: Sendable, Equatable {
             }
             summary.removeValue(forKey: key)
         }
-        // Four 512-byte envelope caps leave the scalar manifest and integrity fields below 12 KiB; preserve that reserved evidence intact.
+        // The ordinary scalar manifest fits its reserved budget; the full feeling field retains its separate place.
         return .object(summary)
+    }
+
+    private static func rowByteLimit(kind: String, payload: JSONValue) -> Int {
+        if kind == "llm.call" || (kind == "context.snapshot" && payload.objectValue?["feelingFrame"] != nil) {
+            return JSONLLineCaps.traceMaximumBytes
+        }
+        return maxPayloadBytes
     }
 
     static func ordinaryEnvelope(
@@ -363,9 +385,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
             && destinationId.map(Self.boundEnvelopeString) == destinationId
             && threadId.map(Self.boundEnvelopeString) == threadId
         if physicalByteCount > 0,
-              physicalByteCount <= (kind == "llm.call" ? JSONLLineCaps.traceMaximumBytes : Self.maxPayloadBytes),
+              physicalByteCount <= Self.rowByteLimit(kind: kind, payload: payload),
               envelopeIsCanonical,
-              kind == "llm.call" || !Self.hasOversizedStringLeaf(payload) {
+              kind == "llm.call" || !Self.hasOversizedStringLeaf(payload, kind: kind) {
             self.init(
                 canonicalTurnId: turnId,
                 ts: ts,
@@ -392,14 +414,16 @@ public struct TurnTraceEvent: Sendable, Equatable {
         diagnostic = obj.filter { ["id", "title", "status", "createdAt", "transitionId"].contains($0.key) }
     }
 
-    private static func hasOversizedStringLeaf(_ value: JSONValue) -> Bool {
+    private static func hasOversizedStringLeaf(_ value: JSONValue, kind: String? = nil) -> Bool {
         switch value {
         case .string(let string):
             return string.count > maxPayloadStringChars
         case .array(let values):
-            return values.contains(where: hasOversizedStringLeaf)
+            return values.contains { hasOversizedStringLeaf($0) }
         case .object(let values):
-            return values.values.contains(where: hasOversizedStringLeaf)
+            return values.contains { key, child in
+                !(kind == "context.snapshot" && key == "feelingFrame") && hasOversizedStringLeaf(child)
+            }
         case .null, .bool, .int, .double:
             return false
         }

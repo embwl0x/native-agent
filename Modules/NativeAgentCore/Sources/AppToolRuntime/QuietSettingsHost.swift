@@ -14,7 +14,6 @@ public protocol QuietSettingsHost: AnyObject {
     var personality: PersonalityProfile? { get }
     var personalityError: String? { get }
     var dreamError: String? { get }
-    var makeShelfFault: String? { get }
     var chatModel: String { get set }
     var chatReasoningEffort: String { get set }
     var chatFastMode: Bool { get set }

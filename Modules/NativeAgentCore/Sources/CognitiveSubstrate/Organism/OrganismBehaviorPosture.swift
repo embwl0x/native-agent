@@ -168,6 +168,10 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         predictionSummary: OrganismPredictionSummary
     ) -> [String] {
         var out: [String] = [defaultDirective]
+        for pain in bodySchema.handPain {
+            let cause = pain.cause.isEmpty ? "cause not recorded in the tool receipt" : pain.cause
+            out.append("My hand hurts: \(pain.act) — \(cause)")
+        }
         if bodySchema.providerPathRequiresCaution || bodySchema.toolPathRequiresCaution || predictionSummary.strategyCaution >= 0.18 {
             out.append("After provider or tool brittleness, verify before retrying or saying the work is done.")
         }

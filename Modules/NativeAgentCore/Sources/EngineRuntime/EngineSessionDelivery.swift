@@ -54,7 +54,7 @@ private final class MacSessionReply {
             bubble = row.id
             engine.transcripts.appendMessage(row, to: sessionID)
             engine.turns.streamingSessions.insert(sessionID)
-            engine.turns.streamingBubbleIds[sessionID] = row.id
+            engine.turns.setStreamingBubbleID(row.id, for: sessionID)
         }
         text += delta
         engine.turns.streamingTexts[sessionID] = text
@@ -63,9 +63,9 @@ private final class MacSessionReply {
 
     func finish() async {
         func releasePresentation() {
-            if let bubble, engine.turns.streamingBubbleIds[sessionID] == bubble {
+            if let bubble, engine.turns.streamingBubbleID(for: sessionID) == bubble {
                 engine.turns.streamingSessions.remove(sessionID)
-                engine.turns.streamingBubbleIds[sessionID] = nil
+                engine.turns.setStreamingBubbleID(nil, for: sessionID)
                 engine.turns.streamingTexts[sessionID] = nil
             }
         }

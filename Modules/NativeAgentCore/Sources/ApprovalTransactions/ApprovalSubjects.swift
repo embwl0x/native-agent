@@ -28,36 +28,6 @@ extension ApprovalExecution {
         }
     }
 
-    func applyApprovedSelfImprovement(from rec: ApprovalRecord, turn: Turn?) async {
-        guard rec.action == "self_improvement.apply", rec.status == "resolved", rec.decision == "approved" else { return }
-        await performPartApprovalExecution(rec) {
-            guard case .object(let payload) = rec.payload,
-                  case .object(let apply)? = payload["apply"],
-                  case .string(let op)? = apply["op"],
-                  case .string(let target)? = apply["target"], !target.isEmpty else {
-                return Self.notDone("self-improvement card requires an operation and target")
-            }
-            var outcome: [String: JSONValue] = ["op": .string(op), "target": .string(target)]
-            switch op {
-            case "disable_skill":
-                let turn = await approvedEffectTurn(from: rec)
-                try await effects.disableSkill(name: target, turn: turn)
-            case "enable_skill":
-                let digest: String?
-                switch apply["reviewedDigest"] {
-                case .string(let value)? where !value.isEmpty: digest = value
-                case nil, .null?: digest = nil // Markdown-only guidance has no executable digest.
-                default: return Self.notDone("the card has no valid reviewed digest")
-                }
-                let turn = await approvedEffectTurn(from: rec)
-                try await effects.enableSkill(name: target, reviewedDigest: digest, turn: turn)
-                outcome["reviewedDigest"] = digest.map(JSONValue.string) ?? .null
-            default: return Self.notDone("unknown self-improvement operation: \(op)")
-            }
-            return .init(action: .object(outcome), detail: "self-improvement \(op) applied")
-        }
-    }
-
     func applyResolvedREMProposal(from rec: ApprovalRecord) async {
         guard rec.action == "rem.proposal", rec.status == "resolved", let decision = rec.decision else { return }
         await Self.performDomainApprovalExecution(rec, dataRoot: dataRoot) {
@@ -74,7 +44,7 @@ extension ApprovalExecution {
                 }
                 // The resolved card applies durable lesson evidence; no live turn or sense read owns this reconciliation.
                 let application = try await store.applyApprovedLesson(proposalId: proposalID, expectedProposalText: reviewedText,
-                    context: MemoryWriteContext(turn: nil, senseReads: nil))
+                    context: MemoryWriteContext(turn: nil, senseReads: nil, telling: nil))
                 if application.stale {
                     return .init(action: .object(["op": .string("rem_proposal_stale"), "proposalId": .string(proposalID), "error": .string("stale")]),
                         detail: "Standing lesson stale — its source correction changed before application. Nothing was added to GROWTH or graduated.")

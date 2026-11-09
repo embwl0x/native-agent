@@ -5,7 +5,7 @@ import CryptoKit
 import AppIntents
 import SwiftUI
 import Observation
-// Blueprint: | `iCloudSyncEngine+SnapshotReading.swift` | Replica freshness, bounded checked reads, whole-document decoding and read health |
+// Blueprint: | `iCloudSyncEngine+SnapshotReading.swift` | Local CloudKit cache reads, strict document decoding and per-file read health |
 
 /// Keep health with the read that produced it.
 enum SnapshotReadHealth: Equatable, Sendable {
@@ -52,8 +52,7 @@ extension iCloudSyncEngine {
     }
 
     nonisolated static func loadSnapshotArrayOnly<T: Decodable & Sendable>(named filename: String, in dir: URL) async -> SnapshotReading<[T]> {
-        do { guard try await awaitCurrentVersion(of: dir.appendingPathComponent(filename)), !Task.isCancelled else { return (nil, nil) } }
-        catch { return (nil, .readFailed(reason: error.localizedDescription)) }
+        guard !Task.isCancelled else { return (nil, nil) }
         do {
             let result: SnapshotReading<[T]> = try await VolumeIO.run {
                 let read = loadSnapshotData(named: filename, in: dir)
@@ -72,16 +71,15 @@ extension iCloudSyncEngine {
     }
 
     nonisolated static func loadSnapshotObjectOnly<T: Decodable & Sendable>(named filename: String, in dir: URL) async -> SnapshotReading<T> {
-        do { guard try await awaitCurrentVersion(of: dir.appendingPathComponent(filename)), !Task.isCancelled else { return (nil, nil) } }
-        catch { return (nil, .readFailed(reason: error.localizedDescription)) }
+        guard !Task.isCancelled else { return (nil, nil) }
         do {
             let result: SnapshotReading<T> = try await VolumeIO.run {
                 let read = loadSnapshotData(named: filename, in: dir)
                 guard let data = read.value else { return (nil, read.health) }
                 let decoder = JSONDecoder()
                 decoder.dateDecodingStrategy = .iso8601
-                guard let value = try? decoder.decode(T.self, from: data) else { return (nil, .unreadable) }
-                return (value, .fine)
+                do { return (try decoder.decode(T.self, from: data), .fine) }
+                catch { return (nil, .readFailed(reason: error.localizedDescription)) }
             }
             return Task.isCancelled ? (nil, nil) : result
         } catch is CancellationError { return (nil, nil) }
@@ -119,45 +117,6 @@ extension iCloudSyncEngine {
                 """))
         }
         return (data, .fine)
-    }
-
-    nonisolated static func awaitCurrentVersion(
-        of url: URL,
-        timeout: TimeInterval = 2.5
-    ) async throws -> Bool {
-        guard !Task.isCancelled else { return false }
-        let fm = FileManager.default
-        let isUbiquitous = fm.isUbiquitousItem(at: url)
-        guard isUbiquitous else { return true }
-        try fm.startDownloadingUbiquitousItem(at: url)
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            guard !Task.isCancelled else { return false }
-            let values = try url.resourceValues(
-                forKeys: [.ubiquitousItemDownloadingStatusKey]
-            )
-            guard let status = values.ubiquitousItemDownloadingStatus else {
-                throw SyncError.persistence("iCloud did not provide the snapshot download status. Refresh after checking iCloud connectivity.")
-            }
-            if acceptsSnapshotReplica(
-                isUbiquitous: isUbiquitous,
-                hasCurrentVersion: status == .current
-            ) {
-                return true
-            }
-            do { try await Task.sleep(for: .seconds(min(0.15, max(0, deadline.timeIntervalSinceNow)))) }
-            catch { return false }
-        }
-        NSLog("[iCloudSync] snapshot %@ still not current after %.1fs — retaining last proven value", url.lastPathComponent, timeout)
-        return false
-    }
-
-    /// Require current iCloud replicas; local roots are authoritative at their URL.
-    nonisolated static func acceptsSnapshotReplica(
-        isUbiquitous: Bool,
-        hasCurrentVersion: Bool?
-    ) -> Bool {
-        !isUbiquitous || hasCurrentVersion == true
     }
 
     /// Coordinate reads to avoid torn bytes; failures preserve publication and report their cause.

@@ -1,117 +1,138 @@
+import AuthoredCapabilities
 import Desk
 import Foundation
 import NativeAgentShared
-// Blueprint: | `DeskFaceActions.swift` | Desk face actions return to the existing tool router, pursuit veto owner and mounted Mac editors |
+import PersistenceCore
+// Blueprint: | `DeskFaceActions.swift` | Desk's Mac-only places (editors, palette, clipboard, the item shown) as links its rows open, and the owner code behind desk.refresh, desk.remind and desk.veto |
 
-/// Text entry and Mac navigation stay with the mounted window; the face owns the request, never another write path.
+/// What the Mac's mounted Desk view opens: an editor, the palette, research, or the clipboard. Nothing here runs through a door.
 public enum DeskFaceRequest: Sendable {
-    case findItem, newTask, schedule, research
+    case findItem, newTask, research
     case note(String), reply(String), copy(String)
 }
 
-@MainActor extension NativeAgentEngine {
-    @MainActor func deskAct(row: String, action: String, value: String?) async throws -> String? {
-        guard !desk.faceActionInFlight else {
-            throw PartCallError(code: "in_flight", message: "A Desk action is still being answered. Wait for its result.")
-        }
-        desk.faceActionInFlight = true
-        defer { desk.faceActionInFlight = false }
-        let snapshot = await desk.loadPage()
-        let face = deskFace(snapshot)
-        guard let offered = face.sections.flatMap(\.rows).first(where: { $0.id == row }),
-              offered.actions?.contains(where: { $0.id == action }) == true || (action == "set" && offered.control != nil) else {
-            throw PartCallError(code: "stale_row", message: "This Desk row no longer offers that action. Refresh the Desk.")
-        }
-        if row == "desk-selection", action == "board" { desk.faceItem = nil; return nil }
-        if row == "desk:" + action {
-            switch action {
-            case "refresh":
-                _ = await desk.refreshPage()
-                return "Desk readings refreshed; any unavailable sources are named on the page."
-            case "new-task": return try deskRequest(.newTask)
-            case "find-item": return try deskRequest(.findItem)
-            case "schedule": return try deskRequest(.schedule)
-            case "research": return try deskRequest(.research)
-            default: throw deskActionUnavailable()
-            }
-        }
-        if action == "inspect", row.hasPrefix("execution:") {
-            desk.faceItem = row
-            return nil
-        }
-        if action == "copy-reference", let handle = desk.faceItem,
-           let item = snapshot.items.first(where: { $0.handle == handle }),
-           let ref = item.refs.first(where: { "ref:" + $0.refId == row }) {
-            switch DeskRefAffordance.action(for: ref) {
-            case .open(let text, _), .copy(let text, _): return try deskRequest(.copy(text))
-            }
-        }
-        if action == "set" {
-            guard value == "on" || value == "off" else {
-                throw PartCallError(code: "invalid_value", message: "A reminder switch needs on or off.")
-            }
-            let on = value == "on"
-            if row == "nag:global" { return try await deskPerform(.nagGlobal(on: on)) }
-            if let lane = DeskNagPanelModel.lanes(items: snapshot.boardItems, config: snapshot.nagConfig)
-                .first(where: { "nag:project:" + $0.project == row }) {
-                return try await deskPerform(.nagProject(project: lane.project, on: on))
-            }
-            if let item = snapshot.boardItems.first(where: { "nag:item:" + $0.handle == row }) {
-                return try await deskPerform(.nagItem(handle: item.handle, on: on))
-            }
-        }
-        if row == "nag:mute" || row == "nag:" + action {
-            switch action {
-            case "unmute": return try await deskPerform(.nagUnmute)
-            case "mute:indefinitely": return try await deskPerform(.nagMute(until: nil))
-            default:
-                if action.hasPrefix("mute:"), let preset = DeskDeferPreset(rawValue: String(action.dropFirst("mute:".count))) {
-                    return try await deskPerform(.nagMute(until: preset.day(from: snapshot.now)))
-                }
-            }
-        }
-        let handle = row == "item-action:" + action ? desk.faceItem : row
-        guard let item = snapshot.boardItems.first(where: { $0.handle == handle }), !item.status.isTerminal else {
-            throw deskActionUnavailable()
-        }
-        switch action {
-        case "reply": return try deskRequest(.reply(DeskPageContent.draft(about: item)))
-        case "note": return try deskRequest(.note(item.handle))
-        case "close": return try await deskPerform(.closeIfCurrent(handle: item.handle,
-            outcome: DeskQuickAction.deskCloseOutcome, expectedUpdatedAt: value ?? item.updatedAt))
-        case "unpark": return try await deskPerform(.defer_(handle: item.handle, until: nil))
-        case "veto":
-            let outcome = await desk.vetoHandler.veto(item.handle)
-            _ = await desk.refreshPage()
-            switch outcome {
-            case .completed: return "Pursuit vetoed and closed."
-            case .alreadyVetoed: return "Pursuit was already vetoed."
-            case .inFlight: throw PartCallError(code: "in_flight", message: "That veto is still being written.")
-            case .failed(let detail): throw PartCallError(code: "veto_failed", message: detail)
-            }
+/// Where a Desk row's Mac-only link leads, read from the Desk as it stands: something the Mac's Desk view opens, or the item it shows
+/// (nil: the board).
+public enum DeskFaceOpening: Sendable {
+    case request(DeskFaceRequest)
+    case show(String?)
+}
+
+/// The Mac-only places a Desk row opens, each the item of its link (`page:desk/<item>`). A Desk item's handle (`desk_…`) is never one.
+enum DeskMacPlace: Equatable {
+    case newTask, findItem, research, board
+    case note(String), reply(String), copy(String), inspect(String)
+
+    init?(item: String) {
+        switch item {
+        case "new-task": self = .newTask
+        case "find-item": self = .findItem
+        case "research": self = .research
+        case "board": self = .board
         default:
-            if action.hasPrefix("defer:"), let preset = DeskDeferPreset(rawValue: String(action.dropFirst("defer:".count))) {
-                return try await deskPerform(.defer_(handle: item.handle, until: preset.day(from: snapshot.now)))
+            let parts = item.split(separator: ":", maxSplits: 1).map(String.init)
+            guard parts.count == 2, !parts[1].isEmpty else { return nil }
+            switch parts[0] {
+            case "note": self = .note(parts[1])
+            case "reply": self = .reply(parts[1])
+            case "copy": self = .copy(parts[1])
+            case "execution": self = .inspect(item)
+            default: return nil
             }
-            throw deskActionUnavailable()
         }
     }
 
-    private func deskRequest(_ request: DeskFaceRequest) throws -> String {
-        guard let host = desk.faceRequest else {
-            throw PartCallError(code: "mac_window_unavailable", message: "Open Desk on the Mac to use this editor or clipboard action.")
+    var link: String {
+        let item = switch self {
+        case .newTask: "new-task"
+        case .findItem: "find-item"
+        case .research: "research"
+        case .board: "board"
+        case .note(let handle): "note:" + handle
+        case .reply(let handle): "reply:" + handle
+        case .copy(let ref): "copy:" + ref
+        case .inspect(let row): row
         }
-        return try host(request)
+        return "page:desk/" + item
+    }
+}
+
+@MainActor extension NativeAgentEngine {
+    /// What a Desk row's Mac-only link asks of the Mac's Desk view, read from the Desk as it stands; nil when the item is not such a place
+    /// (a Desk item's handle, which the page opens). A place whose item or reference is gone throws.
+    public func deskOpening(item: String) async throws -> DeskFaceOpening? {
+        guard let place = DeskMacPlace(item: item) else { return nil }
+        let gone = PartCallError(code: "action_unavailable", message: "That is no longer on the Desk. Read the Desk again; nothing opened.")
+        let snapshot = await desk.loadPage()
+        switch place {
+        case .newTask: return .request(.newTask)
+        case .findItem: return .request(.findItem)
+        case .research: return .request(.research)
+        case .board: return .show(nil)
+        case .inspect(let row):
+            guard snapshot.agentJobs.items.contains(where: { WorkOverviewRead.row(for: $0, now: snapshot.now).id == row }) else { throw gone }
+            return .show(row)
+        case .note(let handle), .reply(let handle):
+            guard let item = snapshot.boardItems.first(where: { $0.handle == handle }), !item.status.isTerminal else { throw gone }
+            if case .note = place { return .request(.note(item.handle)) }
+            return .request(.reply(DeskPageContent.draft(about: item)))
+        case .copy(let refID):
+            guard let handle = desk.faceItem, let item = snapshot.items.first(where: { $0.handle == handle }),
+                  let ref = item.refs.first(where: { $0.refId == refID }) else { throw gone }
+            switch DeskRefAffordance.action(for: ref) {
+            case .open(let text, _), .copy(let text, _): return .request(.copy(text))
+            }
+        }
     }
 
-    private func deskPerform(_ action: DeskQuickAction) async throws -> String {
-        let outcome = await DeskToolDispatchRouter(dataRoot: dataRoot).perform(action)
+    func deskRefresh() async -> String {
         _ = await desk.refreshPage()
-        guard outcome.ok else { throw PartCallError(code: "desk_action_unconfirmed", message: outcome.message) }
-        return outcome.message
+        return "Desk readings refreshed; any unavailable sources are named on the page."
     }
 
-    private func deskActionUnavailable() -> PartCallError {
-        .init(code: "action_unavailable", message: "That action is not available on this Desk row. Refresh the Desk.")
+    /// A reminder switch: every project (global), one project, or one Desk item, written through the reminder settings' owner.
+    func deskRemind(_ input: [String: JSONValue]) async throws -> String {
+        guard case .bool(let on)? = input["value"] else {
+            throw PartCallError(code: "invalid_value", message: "A reminder switch takes value true or false; nothing changed.")
+        }
+        let id = input["scope_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let store = DeskNagConfigStore(dataRoot: dataRoot)
+        let named: String
+        switch input["scope_kind"]?.stringValue {
+        case "global":
+            _ = try await store.update { $0.settingGlobal(on) }
+            named = "every project"
+        case "project":
+            guard !id.isEmpty else { throw PartCallError(code: "invalid_input", message: "A project's switch needs scope_id, its name.") }
+            _ = try await store.update { $0.settingScope(kind: .project, id: id, enabled: on) }
+            named = "project " + id
+        case "item":
+            guard let item = await desk.loadPage().boardItems.first(where: { $0.handle == id }) else {
+                throw PartCallError(code: "invalid_input", message: "An item's switch needs scope_id, the handle of an item on the Desk board.")
+            }
+            _ = try await store.update { $0.settingScope(kind: .item, id: item.handle, enabled: on) }
+            named = "desk." + item.alias
+        default:
+            throw PartCallError(code: "invalid_input", message: "scope_kind is global, project or item; nothing changed.")
+        }
+        _ = await desk.refreshPage()
+        return "Reminders \(on ? "on" : "off") for \(named)."
+    }
+
+    /// The person's Veto closes an open pursuit through the pursuit veto owner.
+    func deskVeto(_ input: [String: JSONValue]) async throws -> String {
+        let handle = input["handle"]?.stringValue ?? ""
+        guard let item = await desk.loadPage().boardItems.first(where: { $0.handle == handle }), !item.status.isTerminal,
+              DeskBoardLayout.isPursuitLaneItem(item), item.pursuit != nil else {
+            throw PartCallError(code: "action_unavailable", message: "That is not an open pursuit on the Desk board; nothing was vetoed.")
+        }
+        let outcome = await desk.vetoHandler.veto(item.handle)
+        _ = await desk.refreshPage()
+        switch outcome {
+        case .completed: return "Pursuit vetoed and closed."
+        case .alreadyVetoed: return "Pursuit was already vetoed."
+        case .inFlight: throw PartCallError(code: "in_flight", message: "That veto is still being written.")
+        case .failed(let detail): throw PartCallError(code: "veto_failed", message: detail)
+        }
     }
 }

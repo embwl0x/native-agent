@@ -52,11 +52,14 @@ public actor BodyNerve {
         let read: OrganBody?
         do { read = try await OrganBody.read() }
         catch {
-            // Unread, nothing is felt, owed or settled; the next beat reads the body again.
-            nativeLog("Body nerve: the organ record could not be read: %@", error.localizedDescription)
+            await RepairOwed.owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .run,
+                operation: Self.recordOperation, owner: "mind.body",
+                words: "The organ record could not be read: \(error.localizedDescription).",
+                lever: "Read mind.body and repair its named record; the next body beat reads it again.").value
             return
         }
         guard let body = read else { return }
+        await RepairOwed.settle(dataRoot, operation: Self.recordOperation, evidence: .init(source: "mind.body", id: "read")).value
         guard var memory = load() else { return }
         let settled = memory.owed.intersection(completed)
         completed = []
@@ -133,6 +136,7 @@ public actor BodyNerve {
     }
 
     static let memoryOperation = "body.nerve.memory"
+    static let recordOperation = "body.nerve.record"
 
     static func operation(_ organ: String) -> String { "organ:" + organ }
 }

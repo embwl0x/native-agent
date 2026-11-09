@@ -7,7 +7,7 @@ import PersistenceCore
 // Read saved planning templates under the registry lock without seeding defaults; approvals retain their own owner.
 
 extension SavedWorkflows {
-    /// Capabilities uses the same checked rows so malformed workflow data cannot become healthy metadata.
+    /// Checked rows: malformed workflow data cannot become healthy metadata.
     public func listWorkflowRecords() async throws -> [WorkflowRecord] {
         try await listWorkflows().map(WorkflowRecord.init(row:))
     }
@@ -101,10 +101,6 @@ public final class SavedWorkflows: Sendable {
             try Self.projectedRegistry(Self.readWorkflowRegistry(registryPath))
         }
         return try await SwiftNativePersistenceCore.withFileLock(registryPath, body)
-    }
-
-    package static func readProjection(dataRoot: URL) throws -> [JSONValue] {
-        try projectedRegistry(readWorkflowRegistry(dataRoot.appendingPathComponent("workflows/registry.json")))
     }
 
     private static func projectedRegistry(_ saved: [[String: JSONValue]]) throws -> [JSONValue] {

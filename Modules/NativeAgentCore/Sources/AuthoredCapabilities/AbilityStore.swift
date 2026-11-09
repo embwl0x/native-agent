@@ -25,7 +25,7 @@ public struct AbilityStore: Sendable {
     nonisolated(unsafe) private static var walked: Set<String> = []
     nonisolated(unsafe) private static var depth = 0
     static let statistics: Set<String> = ["uses", "useCount", "lastUsedAt", "lastRunVersion", "lastRun",
-        "lastCleanVersion", "runs", "corrections", "unavailableReason"]
+        "lastCleanVersion", "runs", "corrections", "unavailableReason", "trial", "trials"]
     static let obsolete: Set<String> = ["versionOwners", "bodyPath", "activePath", "proposalPath", "quarantinePath",
         "rollbackCounterparts", "versionValidation", "builtIn", "registryPath", "sourceRoot", "versions", "previousVersion",
         "failuresInARow", "lastCleanDigest", "seeded", "validation_evidence", "candidate_validation_evidence", "candidateReview", "keepReview"]
@@ -83,6 +83,15 @@ public struct AbilityStore: Sendable {
         }
         let suffix = slot == .current ? "" : slot == .previous ? ".prev" : ".next"
         return id + suffix + "." + pathExtension
+    }
+    /// The parts that are pages of the agent's own, by part id: each active part whose face is `{projection:true, page:"<id>"}` with an id
+    /// no app page, alias, room or tab has (a part whose page is an app page is placed there, never that page), with its page.
+    public func pageParts() throws -> [(part: String, page: String)] {
+        try files(kind: .part, includeProposals: false).sorted { $0.id < $1.id }.compactMap { file in
+            guard file.record["status"] == .string("active"), let face = file.part["face"]?.objectValue, face["projection"] == .bool(true),
+                  case .string(let page)? = face["page"], AppDoorNames.ownPageRefusal(page) == nil else { return nil }
+            return (file.id, page)
+        }
     }
     public func read(id: String, slot: Slot = .current) throws -> File? {
         try Self.withLock {
@@ -360,19 +369,27 @@ public struct AbilityStore: Sendable {
         }
         return ToolFailureError.call("app", ["action": .string(action), "args": .object(args)])
     }
+    /// A part wrote its notebook (object: the part id); a page drawn from that notebook reads it again.
+    public static let notebookDidChange = Notification.Name("NativeAgent.partNotebookDidChange")
     /// Notebook mutations share the deletion lock; backup includes notebooks except news/ledger, while export/sharing/sync exclude them.
     package static let notebookValueBytes = 16_384
     package static func notebookPath(dataRoot: URL, id: String) -> URL {
         dataRoot.appendingPathComponent("senses/\(id)/state.json")
     }
     package static func notebook(dataRoot: URL, id: String, setting: Bool, value: JSONValue,
+                               writing: () -> Void = {},
                                failure: (String, String) -> any Error) throws -> JSONValue {
         guard !id.isEmpty, id != ".", id != "..", !id.contains("/"), !id.contains("\\") else {
             throw failure("bad_state", "Part notebook id is invalid.")
         }
-        return try notebook(notebookPath(dataRoot: dataRoot, id: id), key: "part", setting: setting, value: value, failure: failure)
+        var changed = false
+        let result = try notebook(notebookPath(dataRoot: dataRoot, id: id), key: "part", setting: setting, value: value,
+            writing: { changed = true; writing() }, failure: failure)
+        if changed { NotificationCenter.default.post(name: notebookDidChange, object: id) }
+        return result
     }
     package static func notebook(_ notebook: URL, key: String, setting: Bool, value: JSONValue,
+                               writing: () -> Void = {},
                                failure: (String, String) -> any Error) throws -> JSONValue {
         try withLock {
             guard notebook.resolvingSymlinksInPath().path == notebook.standardizedFileURL.path else {
@@ -392,10 +409,12 @@ public struct AbilityStore: Sendable {
             guard try JSONEncoder().encode(value).count <= notebookValueBytes else {
                 throw failure("state_limit", "Sense notebook values must be at most 16 KiB.")
             }
+            guard state[key] != value else { return .null }
             state[key] = value
             let data = try JSONEncoder().encode(state)
             guard data.count <= 65_536 else { throw failure("state_limit", "Sense notebook exceeds 64 KiB.") }
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: notebook)
+            writing()
             return .null
         }
     }

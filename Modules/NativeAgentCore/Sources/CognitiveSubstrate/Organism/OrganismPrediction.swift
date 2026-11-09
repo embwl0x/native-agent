@@ -325,6 +325,7 @@ public enum OrganismPredictiveBody {
         adjustBodyConfidence(kind, by: 0.08 * i, in: &ledger.bodyConfidence)
         ledger.peripheralUncertainty = lower(ledger.peripheralUncertainty, by: kind == .phoneDelivery ? 0.10 * i : 0.02 * i)
         ledger.strategyCaution = lower(ledger.strategyCaution, by: 0.08 * i * release)
+        guard OrganismProspectiveAffect.carriesFeeling(kind) else { return }
         chemicalState.confidence = raise(chemicalState.confidence, by: 0.03 * i * release)
         chemicalState.vigilance = lower(chemicalState.vigilance, by: 0.04 * i * release)
         chemicalState.urgency = lower(chemicalState.urgency, by: 0.04 * i * release)
@@ -341,17 +342,10 @@ public enum OrganismPredictiveBody {
         switch kind {
         case .phoneDelivery:
             ledger.peripheralUncertainty = raise(ledger.peripheralUncertainty, by: 0.12 * i)
-            chemicalState.vigilance = raise(chemicalState.vigilance, by: 0.015 * i)
         case .toolCompletion:
             ledger.strategyCaution = raise(ledger.strategyCaution, by: 0.18 * i)
-            chemicalState.vigilance = raise(chemicalState.vigilance, by: 0.08 * i)
-            chemicalState.urgency = raise(chemicalState.urgency, by: 0.05 * i)
-            chemicalState.confidence = lower(chemicalState.confidence, by: 0.04 * i)
         case .providerCompletion:
             ledger.strategyCaution = raise(ledger.strategyCaution, by: 0.12 * i)
-            chemicalState.vigilance = raise(chemicalState.vigilance, by: 0.10 * i)
-            chemicalState.urgency = raise(chemicalState.urgency, by: 0.04 * i)
-            chemicalState.confidence = lower(chemicalState.confidence, by: 0.05 * i)
         case .approvalResolution:
             ledger.strategyCaution = raise(ledger.strategyCaution, by: 0.08 * i)
             chemicalState.vigilance = raise(chemicalState.vigilance, by: 0.025 * i)

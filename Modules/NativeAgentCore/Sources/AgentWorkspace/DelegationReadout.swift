@@ -17,19 +17,7 @@ import ChatToolParsing
 
 /// Keep raw timestamp strings so malformed values remain visible instead of silently becoming null.
 public struct DelegationReadout: Sendable, Equatable {
-    public var replyOwed: Bool { ["owed", "sent_unconfirmed"].contains(deliveryOutcome ?? "") }
-
-    public enum StallBasis: String, Sendable {
-        case deadline
-        case stallSeconds = "stall_seconds"
-        /// Settled jobs cannot be stalled.
-        case terminal
-        /// Missing deadline and stall threshold means unknown timing, even though `stalled` is false.
-        case none
-        case deliveryStall = "delivery_stall"
-        case rolloutIdle = "rollout_idle"
-        case recordedStall = "recorded_stall"
-    }
+    public var replyOwed: Bool { CodexCompletionReadout.replyIsOwed(deliveryOutcome) }
 
     public var id: String
     /// Use the accepted dispatch identity for motor settlement; an internal reply-job ID must not close another action.
@@ -65,8 +53,8 @@ public struct DelegationReadout: Sendable, Equatable {
     public var completedAt: String?
     /// Elapsed time requires a recorded start; nil retains unknown timing.
     public var elapsedSeconds: Int?
-    public var stalled: Bool
-    public var stallBasis: StallBasis
+    /// A delivery record past `owed` is settled evidence, whatever its execution fields say.
+    public var deliverySettled: Bool
     /// Only the record's explicit deliveryLost field can prove loss.
     public var deliveryLost: Bool?
     /// Receipt or reconciled settlement; retained files alone never prove loss.
@@ -84,20 +72,12 @@ public struct DelegationReadout: Sendable, Equatable {
     public var deliveryReceiptVersion: String? = nil
 
     var recencyKey: Date?
-    /// Schedule the exact future stall crossing without creating another workflow field.
-    var stallDeadline: Date?
-
-    func stalled(at now: Date) -> Bool {
-        stallBasis == .recordedStall || (stallDeadline.map { now >= $0 } ?? stalled)
-    }
 
     public func toJSON(includeReplyText: Bool = false) -> JSONValue {
         var obj: [String: JSONValue] = [
             "id": .string(id),
             "source": .string(source),
             "agent": .string(agent),
-            "stalled": .bool(stalled),
-            "stall_basis": .string(stallBasis.rawValue),
         ]
         // Omit absent fields: missing evidence must not be presented as a finding through explicit null.
         func put(_ key: String, _ value: String?) {
@@ -136,7 +116,7 @@ public struct DelegationReadout: Sendable, Equatable {
     /// Keep lifecycle truth in progress rows; reserve duplicate provenance and timestamps for `detail=full`.
     public func toCompactJSON() -> JSONValue {
         let fields: Set<String> = [
-            "id", "agent", "stalled", "stall_basis", "topic_slug", "motor_owner_id", "desk_handle",
+            "id", "agent", "topic_slug", "motor_owner_id", "desk_handle",
             "state", "status", "run_status", "last_liveness", "completed_at", "completion_text_head", "execution_error", "record_kind",
             "conversation_id", "delivery_outcome", "elapsed_seconds",
         ]

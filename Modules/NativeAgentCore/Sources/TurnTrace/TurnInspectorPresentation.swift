@@ -1,67 +1,9 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `TurnInspectorPresentation.swift` | Shared Inspector rows and bounded redacted details |
+import NativeAgentShared
+// Blueprint: | `TurnInspectorPresentation.swift` | Inspector grouping and bounded redacted row preparation from persisted evidence |
 
-/// Rendered status for one row's status dot / chip color. Derived from the event's payload (`status` / `phase` fields), never from raw content.
-public enum InspectorRowStatus: String, Equatable, Sendable {
-    case ok
-    case failed
-    case running
-    case neutral
-
-    public var themeStatus: String {
-        switch self {
-        case .ok: return "ok"
-        case .failed: return "fail"
-        case .running: return "warn"
-        case .neutral: return "info"
-        }
-    }
-}
-
-/// Reuse redacted event previews; presentation must not derive or emit new content.
-public struct InspectorEventRow: Identifiable, Equatable, Sendable {
-    public let id: String
-    public let kind: String
-    public let ts: Date
-    public let status: InspectorRowStatus
-    public let title: String
-    public let durationMs: Int?
-    public let isExpandable: Bool
-    /// Only pretty-print details already bounded and redacted at emission.
-    public let detailLines: [DetailLine]
-
-    public struct DetailLine: Identifiable, Equatable, Sendable {
-        // Unique labels preserve row identity and expansion state across recomputation.
-        public var id: String { label }
-        public let label: String
-        public let value: String
-    }
-
-    public var kindChip: String {
-        if let dot = kind.firstIndex(of: ".") {
-            return String(kind[kind.index(after: dot)...])
-        }
-        return kind
-    }
-}
-
-/// Group from shared evidence so newest-first cards retain chronological rows.
-public struct InspectorTurnCard: Identifiable, Equatable, Sendable {
-    public let id: String
-    public let surface: String?
-    public let sessionId: String?
-    public let rows: [InspectorEventRow]
-    /// Earliest timestamp controls newest-started-turn order.
-    public let startedAt: Date
-    public let lastAt: Date
-
-    public let eventCount: Int
-    public let wallMs: Int
-    public let llmTokens: Int?
-    public let ttftMs: Int?
-}
-
+/// Prepare rows from the event's bounded, redacted payload.
 public enum TurnInspectorGrouping {
 
     public static func group(_ events: [TurnTraceEvent]) -> [InspectorTurnCard] {

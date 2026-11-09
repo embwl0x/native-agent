@@ -3,7 +3,7 @@ import Foundation
 import SwiftUI
 import NativeAgentShared
 
-// Blueprint: | `AppShellMenuPresentation.swift` | `NavigateMenuPresentation`, `MenuBarStatusPresentation`: Rail-derived shortcuts and one status line |
+// Blueprint: | `AppShellMenuPresentation.swift` | `NavigateMenuPresentation`, `MenuBarStatusPresentation`: Rail-derived shortcuts and one status line; `ShellRailRow`: the rail's rows in layout order, a page of the agent's own among them |
 
 /// Derive Navigate order and labels from SidebarItem.rail so numbered shortcuts always match the visible rail.
 enum NavigateMenuPresentation {
@@ -39,15 +39,34 @@ enum MenuBarStatusPresentation {
     }
 }
 
+/// One row of the Advanced rail, in the layout's order: an app page, the divider, or a page of the agent's own by its id.
+enum ShellRailRow: Hashable {
+    case item(SidebarItem)
+    case divider
+    case page(String)
+}
+
 extension SidebarItem {
-    /// Read layout order from the rail so Navigate shortcuts and palette pages follow the visible rows.
-    static func rail(_ layout: SurfaceLayoutAvailability) -> [SidebarItem?] {
+    /// Read layout order from the rail so the rail, Navigate shortcuts and palette pages follow the visible rows.
+    static func railRows(_ layout: SurfaceLayoutAvailability) -> [ShellRailRow] {
         layout.contentNames("rail", profile: SimpleViewMode.advanced).filter { name in
             // An unreadable layout cannot override the user's Helpers switch.
             layout.failure == nil || name != "bots"
                 || (UserDefaults.standard.object(forKey: "uiBotsShelfPreview") as? Bool) != false
-        }.map { name in
-            QuietPages.all.first { $0.id == name && $0.tab == nil }?.item
+        }.map { name -> ShellRailRow in
+            if let page = SurfaceLayout.ownPage("rail", name) { return .page(page) }
+            return QuietPages.all.first { $0.id == name }.map { ShellRailRow.item($0.item) } ?? .divider
+        }
+    }
+
+    /// The rail's app pages and its divider (nil); a page of the agent's own is the rail's alone.
+    static func rail(_ layout: SurfaceLayoutAvailability) -> [SidebarItem?] {
+        railRows(layout).flatMap { row -> [SidebarItem?] in
+            switch row {
+            case .item(let item): [item]
+            case .divider: [nil]
+            case .page: []
+            }
         }
     }
 }

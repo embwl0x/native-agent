@@ -56,61 +56,17 @@ extension CognitiveSubstrate {
         let nodes = field.peekNodes()
         let recent = nodes.filter {
             let age = now.timeIntervalSince($0.lastActivatedAt)
-            return age >= 0 && age <= Self.appraisalEvidenceWindow
+            return $0.turnKind.contributesToLivedState && $0.kind != .toolObservation && $0.kind != .providerHealth
+                && age >= 0 && age <= Self.appraisalEvidenceWindow
         }
 
         var a = SemanticAppraisal()
 
         let outcomeSign = Double(event.terminalOutcomePolarity)
-        // Tool outcome polarity reads status text, never mood-colored stamped valence.
-        let toolObs = recent.filter { $0.kind == .toolObservation }
-            .sorted { $0.lastActivatedAt < $1.lastActivatedAt }
-        func outcome(_ node: CognitiveNode) -> Int {
-            if case .string(let rawKind)? = node.metadata["eventKind"],
-               let kind = CognitiveEventKind(rawValue: rawKind) {
-                switch kind {
-                case .toolSucceeded: return 1
-                case .toolFailed, .providerFailure: return -1
-                case .toolStarted, .toolCancelled: return 0
-                default: break
-                }
-            }
-            if case .string(let rawVerification)? = node.metadata["verification"] {
-                switch rawVerification.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-                case "satisfied", "verified", "succeeded": return 1
-                case "failed", "rejected", "blocked": return -1
-                default: break
-                }
-            }
-            if case .string(let rawStatus)? = node.metadata["status"] {
-                switch rawStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-                case "completed", "done", "succeeded", "ok": return 1
-                case "failed", "blocked": return -1
-                case "cancelled", "canceled", "pending", "running", "queued": return 0
-                default: break
-                }
-            }
-            // A summary cannot attest an effect. Untyped evidence stays unknown.
-            return 0
-        }
-        let lastNegativeAt = toolObs.last(where: { outcome($0) < 0 })?.lastActivatedAt
-        let lastPositiveAt = toolObs.last(where: { outcome($0) > 0 })?.lastActivatedAt
-        let unresolvedRecentFailure: Double
-        if let neg = lastNegativeAt {
-            unresolvedRecentFailure = (lastPositiveAt.map { $0 > neg } ?? false) ? 0 : 1
-        } else {
-            unresolvedRecentFailure = 0
-        }
-        let repairEvidence: Double = {
-            guard let neg = lastNegativeAt, let pos = lastPositiveAt else { return 0 }
-            return pos > neg ? 1 : 0
-        }()
-        // Resolution needs this event's words or a fresh positive tool outcome.
+        // Operational receipts cannot appraise a later exchange; lived stakes arrive through its words and touched cares.
         let lexicalResolution = text.pressure < 0
         a.resolutionEvidence = min(1, (lexicalResolution ? 0.7 : 0)
-            + ((lastPositiveAt.map { now.timeIntervalSince($0) < 10 * 60 } ?? false) ? 0.5 : 0)
             + (event.isPositiveTerminalOutcome ? 0.6 : 0))
-        a.effortEvidence = min(1, Double(toolObs.count) / 6.0)
 
         let kindBase: Double
         switch event.kind {
@@ -137,11 +93,9 @@ extension CognitiveSubstrate {
         a.goalRelevance = (0.45 * event.importance + 0.30 * kindBase
             + 0.20 * continuity + 0.10 * careHit).clamped01()
 
-        let relief = (event.kind == .toolSucceeded && unresolvedRecentFailure == 0 && repairEvidence > 0) ? 1.0 : 0.0
         a.worldviewStance = touchedCares.first(where: { $0.stance != nil })?.charge(at: now).clampedSigned() ?? 0
         a.worldviewConflict = max(0, -a.worldviewStance)
         a.goalCongruence = (0.45 * outcomeSign + 0.75 * text.valence
-            + 0.25 * relief - 0.25 * unresolvedRecentFailure
             + Self.appraisalWorldviewStanceCongruenceGain * a.worldviewStance).clampedSigned()
 
         switch event.kind {
@@ -154,19 +108,11 @@ extension CognitiveSubstrate {
         case .organismResolutionFelt: a.selfAgency = 0.35
         }
 
-        // Recency-weighted subject/kind similarity measures whether this was seen lately.
-        var similarity = 0.0
-        for node in recent where !isSelfEvidence(node) {
-            let sameSubject = "\(node.subjectReference.type):\(node.subjectReference.id)" == subjectKey
-            let sameSession = event.sessionId != nil && node.metadata["sessionId"] == event.sessionId.map(JSONValue.string)
-            guard sameSubject || sameSession else { continue }
-            let age = max(0, now.timeIntervalSince(node.lastActivatedAt))
-            similarity = max(similarity, pow(0.5, age / (15 * 60)) * (sameSubject ? 1.0 : 0.6))
-        }
-        a.novelty = (1 - similarity).clamped01()
+        // Tags and bodily curiosity read the same topic evidence; sharing a session does not make a subject familiar.
+        a.novelty = topicNovelty(at: now)
 
         let capacity = 1 - 0.6 * post.uncertainty - 0.4 * post.taskPressure
-        a.copingPotential = ((capacity * 2 - 1) * 0.7 + repairEvidence * 0.3).clampedSigned()
+        a.copingPotential = ((capacity * 2 - 1) * 0.7).clampedSigned()
 
         let isLiveChat = event.kind == .userMessageReceived || event.kind == .userCorrection
         let userRecent = lastUserPresenceAt.map { now.timeIntervalSince($0) < 30 * 60 } ?? false

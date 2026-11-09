@@ -88,20 +88,27 @@ public final class ManagedProcess: @unchecked Sendable {
         }
         let reapDescendants = reapDescendantsOnExit
         DispatchQueue.global(qos: .utility).async { [self, group] in
+            do { try ProcessExitObservation.wait(pid: group.pid) }
+            catch {
+                group.recordFailure("Child exit observation failed: \(error.localizedDescription)")
+                announce()
+                return
+            }
             var info = siginfo_t()
             var result: Int32
-            var stopped = false
-            // Darwin's waitid also answers WEXITED for a stopped child and WNOWAIT repeats it; end and expiry stop the group before the kill. A stop is not an
-            // exit: look again until the leader is a zombie.
             repeat {
                 result = waitid(P_PID, id_t(group.pid), &info, WEXITED | WNOWAIT)
-                stopped = result == 0 && (info.si_code == CLD_STOPPED || info.si_code == CLD_TRAPPED)
-                if stopped { Thread.sleep(forTimeInterval: 0.005) }
-            } while stopped || (result == -1 && errno == EINTR)
-            if result == -1 {
-                group.recordFailure("Child exit observation failed: \(POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO).localizedDescription)")
+            } while result == -1 && errno == EINTR
+            guard result == 0 else {
+                group.recordFailure("Child exit read failed: \(NSError(domain: NSPOSIXErrorDomain, code: Int(errno)).localizedDescription)")
                 announce()
-                return // The owner is retained; unavailable observation cannot permit reaping or another PID signal.
+                return
+            }
+            guard info.si_pid == group.pid,
+                  info.si_code == CLD_EXITED || info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED else {
+                group.recordFailure("Child exit state could not be read after its kernel exit event. The waitable leader remains owned.")
+                announce()
+                return
             }
             state.withLock { $0.exited = true; $0.status = info.si_status }
             let settled = (!reapDescendants && !group.terminationRequested) || group.closeExitedGroup()
@@ -146,6 +153,41 @@ private final class NSLockedState<Value>: @unchecked Sendable {
     init(_ value: Value) { self.value = value }
     func withLock<T>(_ body: (inout Value) -> T) -> T {
         lock.withLock { body(&value) }
+    }
+}
+
+/// Register before checking identity so an exit between observation and parking cannot be lost.
+private enum ProcessExitObservation {
+    static func wait(pid: pid_t, isCurrent: () throws -> Bool = { true }) throws {
+        guard pid > 0 else { throw POSIXError(.EINVAL) }
+        let descriptor = kqueue()
+        guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { _ = Darwin.close(descriptor) }
+        guard fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        var registration = kevent(ident: UInt(pid), filter: Int16(EVFILT_PROC),
+                                  flags: UInt16(EV_ADD | EV_ENABLE | EV_ONESHOT | EV_RECEIPT),
+                                  fflags: UInt32(NOTE_EXIT), data: 0, udata: nil)
+        var event = kevent()
+        let registered = kevent(descriptor, &registration, 1, &event, 1, nil)
+        guard registered >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard registered == 1, event.flags & UInt16(EV_ERROR) != 0 else {
+            throw NSError(domain: "NativeAgent.ProcessExit", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "The kernel did not acknowledge the process-exit observation."])
+        }
+        if event.data == Int(ESRCH) { return }
+        guard event.data == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: event.data) }
+        guard try isCurrent() else { return }
+        var observed: Int32
+        repeat { observed = kevent(descriptor, nil, 0, &event, 1, nil) }
+        while observed == -1 && errno == EINTR
+        guard observed >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard observed == 1, event.filter == Int16(EVFILT_PROC), event.ident == UInt(pid),
+              event.fflags & UInt32(NOTE_EXIT) != 0, event.flags & UInt16(EV_ERROR) == 0 else {
+            throw NSError(domain: "NativeAgent.ProcessExit", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "The kernel returned an invalid process-exit event."])
+        }
     }
 }
 
@@ -233,7 +275,8 @@ public final class OwnedProcessGroup: @unchecked Sendable {
         var pid: pid_t = 0
         let result = args.withUnsafeBufferPointer { args in
             env.withUnsafeBufferPointer { env in
-                posix_spawn(&pid, executable, &actions, &attributes, args.baseAddress!, env.baseAddress!)
+                guard let arguments = args.baseAddress, let environment = env.baseAddress else { return EINVAL }
+                return posix_spawn(&pid, executable, &actions, &attributes, arguments, environment)
             }
         }
         try checked(result)
@@ -272,14 +315,13 @@ public final class OwnedProcessGroup: @unchecked Sendable {
         onFailure?()
     }
 
-    /// A bounded checked group observation must establish that every remaining member is exited before the caller may release its waitable leader. Unavailable
-    /// inspection or a surviving member retains the leader/PGID.
+    /// Every member must exit before the caller may release its waitable leader and PGID.
     public func closeExitedGroup() -> Bool {
         guard send(SIGKILL) else { return false }
         return verifyStoppedGroup()
     }
 
-    /// SIGKILL itself is not terminal proof. This bounded observation also covers a leader that never reaches waitid's exited state.
+    /// SIGKILL is a request; kernel exit events establish that the group stopped.
     public func observeStop() {
         let start = lock.withLock { () -> Bool in
             guard !stopObservationStarted, !reaped else { return false }
@@ -291,19 +333,18 @@ public final class OwnedProcessGroup: @unchecked Sendable {
     }
 
     private func verifyStoppedGroup() -> Bool {
-        let deadline = DispatchTime.now() + .milliseconds(500)
         do {
             while true {
-                let settled = try lock.withLock { () throws -> Bool in
-                    if reaped { return true }
-                    return try !hasLiveGroupMembers()
+                let members = try lock.withLock { () throws -> [GroupMember] in
+                    if reaped { return [] }
+                    return try liveGroupMembers()
                 }
-                if settled { return true }
-                guard DispatchTime.now() < deadline else {
-                    recordFailure("Process group \(pid) still has live members after SIGKILL. Termination is incomplete; the waitable leader remains owned.")
-                    return false
+                if members.isEmpty { return true }
+                for member in members {
+                    try ProcessExitObservation.wait(pid: member.pid) {
+                        try self.isCurrent(member)
+                    }
                 }
-                Thread.sleep(forTimeInterval: 0.005)
             }
         } catch {
             recordFailure("Process group \(pid) termination could not be verified: \(error.localizedDescription). The waitable leader remains owned.")
@@ -312,6 +353,30 @@ public final class OwnedProcessGroup: @unchecked Sendable {
     }
 
     private func hasLiveGroupMembers() throws -> Bool {
+        try !liveGroupMembers().isEmpty
+    }
+
+    private struct GroupMember {
+        let pid: pid_t
+        let startedSeconds: UInt64
+        let startedMicroseconds: UInt64
+    }
+
+    private func isCurrent(_ member: GroupMember) throws -> Bool {
+        var info = proc_bsdinfo()
+        let expected = Int32(MemoryLayout<proc_bsdinfo>.size)
+        errno = 0
+        let read = proc_pidinfo(member.pid, PROC_PIDTBSDINFO, 0, &info, expected)
+        if read == 0, errno == ESRCH { return false }
+        guard read == expected else {
+            throw NSError(domain: "NativeAgent.ProcessExit", code: 3, userInfo: [NSLocalizedDescriptionKey:
+                "Could not inspect process \(member.pid): proc_pidinfo returned \(read) of \(expected) bytes (errno \(errno))."])
+        }
+        return info.pbi_pgid == UInt32(pid) && info.pbi_status != UInt32(SZOMB)
+            && info.pbi_start_tvsec == member.startedSeconds && info.pbi_start_tvusec == member.startedMicroseconds
+    }
+
+    private func liveGroupMembers() throws -> [GroupMember] {
         var capacity = 16
         while capacity <= 16_384 {
             var pids = [pid_t](repeating: 0, count: capacity)
@@ -321,6 +386,7 @@ public final class OwnedProcessGroup: @unchecked Sendable {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             if Int(used) >= pids.count * MemoryLayout<pid_t>.stride { capacity *= 2; continue }
+            var members: [GroupMember] = []
             for member in pids.prefix(Int(used) / MemoryLayout<pid_t>.stride) where member > 0 {
                 var info = proc_bsdinfo()
                 let expected = Int32(MemoryLayout<proc_bsdinfo>.size)
@@ -329,29 +395,36 @@ public final class OwnedProcessGroup: @unchecked Sendable {
                 if read == 0, errno == ESRCH { continue }
                 guard read == expected else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
                 guard info.pbi_pgid == UInt32(pid) else { continue }
-                // BSD's SZOMB is the kernel's exited, not-yet-reaped state.
-                if info.pbi_status != UInt32(SZOMB) { return true }
+                if info.pbi_status != UInt32(SZOMB) {
+                    members.append(GroupMember(pid: member, startedSeconds: info.pbi_start_tvsec,
+                                               startedMicroseconds: info.pbi_start_tvusec))
+                }
             }
-            return false
+            return members
         }
         throw POSIXError(.EOVERFLOW)
     }
 
     /// Call only after waitid established exit, or after the ACP owner closed its group. The one leader stays waitable until all group signals end.
     public func reapExitedLeader() {
+        do { try ProcessExitObservation.wait(pid: pid) { self.lock.withLock { !self.reaped } } }
+        catch {
+            recordFailure("Process group leader \(pid) exit could not be observed: \(error.localizedDescription). It remains owned.")
+            return
+        }
         lock.withLock {
             guard !reaped else { return }
             var info = siginfo_t()
             var observed: Int32
-            // A closed group's leader is exiting: sample until it is waitable, as the group closure samples (5ms, 500ms).
-            let deadline = ContinuousClock.now + .milliseconds(500)
-            while true {
-                repeat { observed = waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) }
-                while observed == -1 && errno == EINTR
-                if observed != 0 || info.si_pid == pid || ContinuousClock.now >= deadline { break }
-                Thread.sleep(forTimeInterval: 0.005)
+            repeat { observed = waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT) }
+            while observed == -1 && errno == EINTR
+            guard observed == 0 else {
+                let cause = NSError(domain: NSPOSIXErrorDomain, code: Int(errno)).localizedDescription
+                recordFailure("Process group leader \(pid) exit read failed: \(cause). It remains owned.")
+                return
             }
-            guard observed == 0, info.si_pid == pid else {
+            guard info.si_pid == pid,
+                  info.si_code == CLD_EXITED || info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED else {
                 recordFailure("Process group leader \(pid) has no checked exit observation. Termination remains incomplete; it was not reaped.")
                 return
             }
@@ -359,7 +432,8 @@ public final class OwnedProcessGroup: @unchecked Sendable {
             var result: pid_t
             repeat { result = waitpid(pid, &status, 0) } while result == -1 && errno == EINTR
             guard result == pid else {
-                recordFailure("Process group leader \(pid) could not be reaped: \(POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO).localizedDescription)")
+                let cause = NSError(domain: NSPOSIXErrorDomain, code: Int(errno)).localizedDescription
+                recordFailure("Process group leader \(pid) could not be reaped: \(cause)")
                 return
             }
             reaped = true

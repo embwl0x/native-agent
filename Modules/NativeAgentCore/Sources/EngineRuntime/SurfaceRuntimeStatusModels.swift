@@ -14,7 +14,7 @@ public struct NotificationRuntimeStatus: Codable, Hashable {
     }
 }
 
-public struct BrowserRuntimeStatus: Codable, Hashable {
+public struct BrowserRuntimeStatus: Codable, Hashable, Sendable {
     public var status: String
     public var sourcePath: String?
     public var screenshotPath: String?

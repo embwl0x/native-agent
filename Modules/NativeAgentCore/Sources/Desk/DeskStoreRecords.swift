@@ -15,7 +15,6 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case archiveRefusedStanding(handle: String)
     case archiveRefusedNonTerminalSelf(handle: String, status: DeskStatus)
     case archiveRefusedUnresolvedContinuation(handle: String)
-    case archiveRefusedPendingMigration(handle: String)
     case queueCreationRequiresQueuePath
     case pursuitCapReached(openCount: Int)
     case pursuitFieldMissing(reason: String)
@@ -66,8 +65,6 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: cannot archive \(handle) — item is not terminal (status \(status.rawValue)); close it first"
         case .archiveRefusedUnresolvedContinuation(let handle):
             return "desk: cannot archive \(handle) — its continuation has unfinished steps; verify them through their domains first"
-        case .archiveRefusedPendingMigration(let handle):
-            return "desk: cannot archive \(handle) while its scheduled-intention migration is unfinished; repair the launch migration first"
         case .queueCreationRequiresQueuePath:
             return "desk: use queue.add to add a step to my queue so its readiness and origin are preserved"
         case .pursuitCapReached(let openCount):

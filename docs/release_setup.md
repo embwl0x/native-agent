@@ -78,6 +78,11 @@ About, introspection and the authenticated bridge; they cannot write a launch
 stamp or establish exact-source proof. Command-line processes carry no
 reconstructed app identity.
 
+`script/build_inputs.txt` covers the repository-owned build inputs, including
+module source descendants through `:(glob)Modules/*/Sources/**`. The content
+identity reads their working bytes without changing the person's Git index;
+assembly checks that identity before and after compilation.
+
 The updater distinguishes an absent notice, a valid newer offer, known stale
 display state and unreadable evidence. It clears known stale state or a fresh
 Sparkle no-update/skip result; malformed bytes remain preserved with a Settings

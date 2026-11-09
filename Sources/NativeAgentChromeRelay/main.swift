@@ -1,5 +1,8 @@
 import Darwin
+import Dispatch
 import Foundation
+import CoreServices
+import os
 import NativeAgentChromeRelayCore
 import PersistenceCore
 
@@ -16,6 +19,7 @@ private enum RelayError: Error, LocalizedError {
     case browserSignature(ChromeHostIdentity.SigningFailure)
     case originRefused
     case missingCredential
+    case listenerWatch(String)
 
     var errorDescription: String? {
         switch self {
@@ -35,6 +39,7 @@ private enum RelayError: Error, LocalizedError {
         case .browserSignature(let failure): return failure.localizedDescription
         case .originRefused: return "argv does not carry the registered extension origin."
         case .missingCredential: return "The app listener credential is missing or unreadable."
+        case .listenerWatch(let cause): return "Listener publication could not be observed: " + cause
         }
     }
 
@@ -49,6 +54,7 @@ private enum RelayError: Error, LocalizedError {
         case .socketCreation: return "socket creation"
         case .socketConnection: return "socket connection"
         case .duplicateDescriptor: return "socket descriptor duplication"
+        case .listenerWatch: return "listener publication observation"
         }
     }
 }
@@ -136,17 +142,14 @@ private func readHelloAck(descriptor: Int32) throws -> String {
     return generation
 }
 
-/// Retry a refused connection once only if a changed secret proves the app relaunched; report every other refusal.
+/// A successful connection admits the greeting; every greeting authenticates that listener.
 private func connectAndGreet(
     socketPath: String,
     parentEvidence: ChromeHostIdentity.ParentEvidence
 ) throws -> Int32 {
-    var attempt = 0
+    var followedCredentialChange = false
     while true {
-        attempt += 1
-        // Read the secret before dialing: it is written before the socket binds, so a later read could name a successor listener.
-        let token = handshakeToken(socketPath: socketPath)
-        let descriptor = try connectUnixSocket(path: socketPath)
+        let (descriptor, token) = try awaitSocket(path: socketPath)
         // Connect before requiring credentials so socket failures retain their diagnostics even without a token.
         guard let token else {
             Darwin.close(descriptor)
@@ -169,7 +172,8 @@ private func connectAndGreet(
         } catch {
             _ = Darwin.shutdown(descriptor, SHUT_RDWR)
             Darwin.close(descriptor)
-            guard attempt == 1, handshakeToken(socketPath: socketPath) != token else { throw error }
+            guard !followedCredentialChange, handshakeToken(socketPath: socketPath) != token else { throw error }
+            followedCredentialChange = true
             diagnostic("NativeAgent.app relaunched during the greeting; redialing once. Last greeting failure: \(error.localizedDescription)")
         }
     }
@@ -304,12 +308,12 @@ private func run() throws {
     completion.semaphore.wait()
     _ = Darwin.shutdown(socketDescriptor, SHUT_RDWR)
     if browserPID > 1, getppid() == browserPID,
-       let stale = goneListener(path: socketPath, accepted: acceptedListener, appPID: appPID) {
+       goneListener(path: socketPath, accepted: acceptedListener, appPID: appPID) != nil {
         var on: Int32 = 1
         _ = setsockopt(socketDescriptor, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
         for descriptor in [socketDescriptor, readDescriptor] { _ = fcntl(descriptor, F_SETFD, FD_CLOEXEC) }
-        diagnostic("NativeAgent.app closed its listener; waiting for the next one.")
-        if awaitSocket(path: socketPath, replacing: stale), let executable = CommandLine.arguments.first, executable.hasPrefix("/") {
+        diagnostic("NativeAgent.app closed its listener; reconnecting waits on an accepting listener; closing Chrome cancels the wait.")
+        if let executable = CommandLine.arguments.first, executable.hasPrefix("/") {
             execv(executable, CommandLine.unsafeArgv)
             diagnostic("could not restart for NativeAgent.app's new listener (errno \(errno)).")
         }
@@ -337,25 +341,80 @@ private func goneListener(path: String, accepted: ChromeHostIdentity.FileIdentit
     } catch { return nil }
 }
 
-/// Directory events follow token/socket publication without polling; stop waiting if the directory disappears.
-private func awaitSocket(path: String, replacing stale: ChromeHostIdentity.FileIdentity?) -> Bool {
-    let directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
-    let descriptor = open(directory, O_EVTONLY | O_CLOEXEC)
-    guard descriptor >= 0 else { return false }
+private final class ListenerEvents: Sendable {
+    let path: String
     let changed = DispatchSemaphore(value: 0)
-    let source = DispatchSource.makeFileSystemObjectSource(
-        fileDescriptor: descriptor, eventMask: [.write, .delete, .rename], queue: .global()
-    )
-    source.setEventHandler { changed.signal() }
-    source.setCancelHandler { close(descriptor) }
-    source.resume()
-    defer { source.cancel() }
-    // Watch first, then look, so a listener bound in between is not missed.
-    while ChromeHostIdentity.FileIdentity(path: path).map({ $0 == stale }) ?? true {
-        guard access(directory, F_OK) == 0 else { return false }
-        changed.wait()
+    let failure = OSAllocatedUnfairLock<String?>(initialState: nil)
+
+    init(path: String) { self.path = path }
+
+    func receive(count: Int, paths: UnsafeMutableRawPointer, flags: UnsafePointer<FSEventStreamEventFlags>) {
+        let eventPaths = UnsafeBufferPointer(start: paths.assumingMemoryBound(to: UnsafePointer<CChar>.self), count: count)
+        let eventFlags = UnsafeBufferPointer(start: flags, count: count)
+        let lost = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
+            | kFSEventStreamEventFlagUnmount)
+        for (eventPath, eventFlag) in zip(eventPaths, eventFlags) {
+            if eventFlag & lost != 0 {
+                failure.withLock { $0 = "Socket file observation lost its events or watched directory." }
+                changed.signal()
+            } else if String(cString: eventPath) == path {
+                changed.signal()
+            }
+        }
     }
-    return true
+}
+
+/// File creation and metadata events reopen a refused dial, including the producer's chmod after listen on the same inode.
+private func awaitSocket(path: String) throws -> (descriptor: Int32, token: String?) {
+    let socketURL = URL(fileURLWithPath: path)
+    let directory = socketURL.deletingLastPathComponent().resolvingSymlinksInPath().path
+    let browserPID = getppid()
+    guard browserPID > 1 else {
+        throw RelayError.listenerWatch("The browser parent has exited.")
+    }
+    let events = ListenerEvents(path: URL(fileURLWithPath: directory).appendingPathComponent(socketURL.lastPathComponent).path)
+    var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(events).toOpaque(), retain: { info in
+        guard let info else { return nil }
+        _ = Unmanaged<ListenerEvents>.fromOpaque(info).retain()
+        return info
+    }, release: { info in
+        if let info { Unmanaged<ListenerEvents>.fromOpaque(info).release() }
+    }, copyDescription: nil)
+    let options = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot
+        | kFSEventStreamCreateFlagNoDefer)
+    guard let stream = FSEventStreamCreate(nil, { _, info, count, paths, flags, _ in
+        let eventPaths: UnsafeMutableRawPointer? = paths
+        if let info, let eventPaths {
+            Unmanaged<ListenerEvents>.fromOpaque(info).takeUnretainedValue().receive(count: count, paths: eventPaths, flags: flags)
+        }
+    }, &context, [directory] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0, options) else {
+        throw RelayError.listenerWatch("Socket file observation could not be created.")
+    }
+    FSEventStreamSetDispatchQueue(stream, DispatchQueue.global(qos: .utility))
+    defer { FSEventStreamInvalidate(stream); FSEventStreamRelease(stream) }
+    guard FSEventStreamStart(stream) else { throw RelayError.listenerWatch("Socket file observation could not start.") }
+    defer { FSEventStreamStop(stream) }
+    let browser = DispatchSource.makeProcessSource(identifier: browserPID, eventMask: .exit, queue: .global())
+    browser.setEventHandler { events.changed.signal() }
+    browser.resume()
+    defer { browser.cancel() }
+    var waiting = false
+    // Arm before connecting so both bind and the same socket's post-listen metadata event are retained.
+    while true {
+        guard getppid() == browserPID else { throw RelayError.listenerWatch("The browser parent exited while waiting.") }
+        guard access(directory, F_OK) == 0 else { throw RelayError.listenerWatch("The socket directory is unavailable (errno \(errno)).") }
+        if let failure = events.failure.withLock({ $0 }) { throw RelayError.listenerWatch(failure) }
+        // The secret precedes bind; reading it after connect could name a successor listener.
+        let token = handshakeToken(socketPath: path)
+        do { return (try connectUnixSocket(path: path), token) }
+        catch RelayError.socketConnection(let code) where code == ENOENT || code == ECONNREFUSED {
+            if !waiting {
+                diagnostic("app listener not accepting (errno \(code)); waiting on socket file events; closing Chrome cancels the wait.")
+                waiting = true
+            }
+        }
+        events.changed.wait()
+    }
 }
 
 do {

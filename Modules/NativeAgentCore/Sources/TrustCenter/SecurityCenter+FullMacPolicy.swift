@@ -1,18 +1,13 @@
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SecurityCenter+FullMacPolicy.swift` | Origin-aware Full Mac admission and driven-agent launch ceilings |
+// Blueprint: | `SecurityCenter+FullMacPolicy.swift` | Origin-aware Full Mac admission and driven-agent launch permission |
 
 extension SwiftNativeSecurityCenter {
     /// Full Mac follows the saved policy without a timer.
     static func fullMacActive(policy: [String: JSONValue]) -> Bool {
         PermissionLaw.posture(policy) == .fullMac
-    }
-
-    /// The local operator has one admission for every native action. Read checked saved authority at presentation time; never retain a grant.
-    public nonisolated static func localFullMacYoloAdmitted(dataRoot: URL) -> Bool {
-        do { return fullMacActive(policy: try SwiftNativeTrustCenter(dataRoot: dataRoot).loadSavedPolicyChecked()) }
-        catch { return false }
     }
 
     /// Concrete origin proof and readable saved policy are both required; a surface label cannot confer Full Mac authority.
@@ -47,20 +42,6 @@ extension SwiftNativeSecurityCenter {
         turn: Turn?
     ) async -> DrivenAgentLaunchPermission {
         let authority = await fullMacYoloAuthority(origin: origin, turn: turn)
-        switch authority.state {
-        case .admitted: return .fullMac
-        case .inactive, .untrustedOrigin: return .restricted
-        case .explicitlyBlocked, .unavailable: return .denied(reason: authority.reason)
-        }
-    }
-
-    /// Cap queued launches by the lower of current Mac posture and their admitted stamp.
-    public func drivenAgentLaunchCeiling() async -> DrivenAgentLaunchPermission {
-        let snapshot: TrustPolicyAuthorizationSnapshot
-        do { snapshot = try await trustCenter.loadAuthorizationSnapshotChecked() }
-        catch { return .denied(reason: "saved trust policy is unavailable: \(error.localizedDescription)") }
-        let authority = Self.fullMacYoloAuthority(
-            originAssessment: OriginAssessment(trusted: true, reason: "the Mac's own posture", isRemote: false), snapshot: snapshot)
         switch authority.state {
         case .admitted: return .fullMac
         case .inactive, .untrustedOrigin: return .restricted

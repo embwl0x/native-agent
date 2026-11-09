@@ -78,7 +78,7 @@ extension CognitiveSQLiteStore {
                 throw MomentReadFailure.malformed("meaning_json: meant row has no meaning")
             }
         }
-        return try CognitiveLivedMoment(
+        var moment = try CognitiveLivedMoment(
             id: row.decode(forColumn: "id"), life: row.decode(forColumn: "life"), kind: kind,
             livedAt: Date(timeIntervalSince1970: row.decode(forColumn: "lived_at")),
             acceptedAt: Date(timeIntervalSince1970: row.decode(forColumn: "accepted_at")),
@@ -86,6 +86,10 @@ extension CognitiveSQLiteStore {
             mindEpoch: UInt64(max(0, mind)), bodyEpoch: UInt64(max(0, body)),
             input: input,
             meaning: meaning)
+        let parts: JSONValue? = try decoded(JSONValue.self, row.decode(forColumn: "parts_json"), column: "parts_json")
+        guard case .object(let values) = parts else { throw MomentReadFailure.malformed("parts_json: expected an object") }
+        moment.recovery = values["recovery"]
+        return moment
     }
 
     private struct MomentRead: Sendable {
@@ -182,6 +186,51 @@ extension CognitiveSQLiteStore {
         return moments
     }
 
+    public func saveMomentRecovery(_ id: String, recovery: JSONValue) async throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let text = String(decoding: try encoder.encode(recovery), as: UTF8.self)
+        try await dbQueue.write { db in
+            try db.execute(sql: """
+                UPDATE lived_moments SET parts_json = json_set(parts_json, '$.recovery', json(?))
+                WHERE id = ? AND state IN ('owed', 'meant')
+                AND json_extract(parts_json, '$.recovery') IS NOT json(?)
+                """, arguments: [text, id, text])
+            guard try String.fetchOne(db, sql: "SELECT json_extract(parts_json, '$.recovery') FROM lived_moments WHERE id = ?",
+                                      arguments: [id]) == text else {
+                throw MomentReadFailure.malformed("Recovery checkpoint was not retained for " + id)
+            }
+        }
+    }
+
+    public func momentRouteAnswer(_ route: String) async throws -> String? {
+        try await dbQueue.read { db in
+            try String.fetchOne(db, sql: """
+                SELECT json_extract(parts_json, '$.answerID') FROM lived_moments
+                WHERE json_extract(parts_json, '$.answeredRoute') = ?
+                ORDER BY json_extract(parts_json, '$.answerOrder') DESC LIMIT 1
+                """, arguments: [route])
+        }
+    }
+
+    public func recordMomentAnswer(_ id: String, route: String) async throws {
+        let answer = UUID().uuidString
+        try await dbQueue.write { db in
+            let previous = try Int64.fetchOne(db, sql: """
+                SELECT COALESCE(MAX(CAST(json_extract(parts_json, '$.answerOrder') AS INTEGER)), 0) FROM lived_moments
+                """)
+            guard let previous, previous >= 0, previous < Int64.max else {
+                throw MomentReadFailure.malformed("Route answer order is outside storage range")
+            }
+            try db.execute(sql: """
+                UPDATE lived_moments SET parts_json = json_set(parts_json,
+                    '$.answeredRoute', ?, '$.answerID', ?, '$.answerOrder', ?)
+                WHERE id = ?
+                """, arguments: [route, answer, previous + 1, id])
+            guard db.changesCount == 1 else { throw MomentReadFailure.malformed("Missing answered moment " + id) }
+        }
+    }
+
     public func saveMoment(_ moment: CognitiveLivedMoment) async throws {
         let input = try Self.encoded(moment.input)
         let meaning = try Self.encoded(moment.meaning)
@@ -199,7 +248,7 @@ extension CognitiveSQLiteStore {
         try await dbQueue.write { db in
             try db.execute(sql: """
                 UPDATE lived_moments SET state = ?, input_json = NULL, meaning_json = NULL,
-                    reason = ?, updated_at = ?
+                    parts_json = json_remove(parts_json, '$.recovery'), reason = ?, updated_at = ?
                 WHERE id = ? AND state NOT IN (?, ?)
                 """, arguments: [state.rawValue, reason, Date().timeIntervalSince1970, id,
                                  CognitiveMomentState.lived.rawValue, CognitiveMomentState.refused.rawValue])

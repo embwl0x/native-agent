@@ -11,6 +11,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     case codexCLISessionExpired
     case rateLimited(retryAfter: Int?)
     case quotaExceeded(retryAfter: Int?)
+    case billingNotConfigured
     case overloaded
     case contextTooLong
     case network
@@ -40,6 +41,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                 The account's allowance or billing limit was reached; no reset time was supplied. \
                 Check its usage and billing before another request.
                 """
+        case .billingNotConfigured: return "Billing is not set up for this account. Set it up at the provider before another request."
         case .overloaded: return "The model is busy; try again in a moment."
         case .contextTooLong: return "The conversation is too long; start a new chat or shorten your message."
         case .network: return "The connection was interrupted; check your internet connection and try again."
@@ -55,10 +57,12 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         }
     }
 
-    /// Known HTTP statuses are authoritative; other refusals may describe quota or context limits.
+    /// Explicit billing-setup evidence names the account fault; otherwise known HTTP statuses are authoritative.
     public static func http(status: Int, detail: String = "", retryAfter: Int? = nil) -> Self {
+        if billingNotConfigured(detail) { return .billingNotConfigured }
         switch status {
         case 401: return .authExpired
+        case 402: return .quotaExceeded(retryAfter: retryAfter)
         case 429: return quotaExceeded(detail) ? .quotaExceeded(retryAfter: retryAfter) : .rateLimited(retryAfter: retryAfter)
         case 413: return .contextTooLong
         case 408: return .network
@@ -71,7 +75,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
             if rateLimitWording(detail) { return .rateLimited(retryAfter: retryAfter) }
             if modelUnavailable(detail) { return .modelUnavailable }
             if modelRefusal(detail) { return .refused }
-            if status == 403 { return .authExpired }
+            if authenticationRejected(detail) { return .authExpired }
             return .requestRejected
         }
     }
@@ -90,12 +94,12 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
 
     public static func wire(_ detail: String, fallback: Self = .requestRejected) -> Self {
         let text = detail.lowercased()
+        if billingNotConfigured(text) { return .billingNotConfigured }
         if contextOverflow(text) { return .contextTooLong }
         if let status = Self.httpStatusCode(inDescription: text), status >= 400 {
             return http(status: status, detail: text)
         }
-        if ["invalid_api_key", "invalid authentication", "authentication_error", "unauthorized", "token expired", "expired token", "invalid token"]
-            .contains(where: text.contains) {
+        if authenticationRejected(text) {
             return .authExpired
         }
         if quotaExceeded(text) { return .quotaExceeded(retryAfter: nil) }
@@ -115,16 +119,27 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         return fallback
     }
 
+    private static func authenticationRejected(_ detail: String) -> Bool {
+        let text = detail.lowercased()
+        return ["invalid_api_key", "invalid authentication", "authentication_error", "unauthorized", "token expired", "expired token", "invalid token"]
+            .contains(where: text.contains)
+    }
+
     private static func modelRefusal(_ detail: String) -> Bool {
         let text = detail.lowercased()
         return text == "refusal" || text.hasPrefix("refusal ")
             || ["stop_reason=refusal", "content_filter", "content_policy_violation"].contains(where: text.contains)
     }
 
+    private static func billingNotConfigured(_ detail: String) -> Bool {
+        detail.lowercased().contains("billing_not_configured")
+    }
+
     private static func quotaExceeded(_ detail: String) -> Bool {
         let text = detail.lowercased()
         return ["usage exhausted", "usage is exhausted", "out of extra usage", "quota exceeded", "insufficient_quota", "usage limit", "credit balance",
-            "billing limit", "quota_exceeded", "spending limit"].contains(where: text.contains)
+            "billing limit", "quota_exceeded", "spending limit", "billing_error", "payment_required"]
+            .contains(where: text.contains)
     }
 
     private static func rateLimitWording(_ detail: String) -> Bool {
@@ -203,17 +218,17 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
             case .underlying(let detail): return wire(detail, fallback: .malformedResponse)
             }
         }
-        if let error = error as? URLError { return error.code == .cancelled ? nil : .network }
+        if error is URLError { return .network }
         return nil
     }
 
     /// Admission means this request had begun a provider response.
     static func normalize(_ error: Error, admitted: Bool = false) -> Error {
-        if error is CancellationError || (error as? URLError)?.code == .cancelled { return CancellationError() }
+        if error is CancellationError || ((error as? URLError)?.code == .cancelled && Task.isCancelled) { return CancellationError() }
         if admitted, let diagnostic = error as? Diagnostic {
             return Diagnostic(cause: diagnostic.cause, detail: diagnostic.detail,
                               deadlineExpired: diagnostic.deadlineExpired, admitted: true,
-                              repair: diagnostic.repair, tries: diagnostic.tries)
+                              repair: diagnostic.repair, tries: diagnostic.tries, retryAfter: diagnostic.retryAfter)
         }
         if error is any ProviderFailureWrapping { return error }
         // Output truncation carries partial prose; routing/configuration failures retain their repair identity rather than becoming a transport failure.
@@ -241,20 +256,24 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         public let repair: ToolFailureError?
         /// Dial count records wire-owned redelivery so surfaces do not replay it.
         public let tries: Int
+        /// Only a provider's explicit delay paces a reconnect; absence supplies no clock.
+        public let retryAfter: Int?
         public init(cause: ProviderFailure, detail: String, deadlineExpired: Bool = false, admitted: Bool = false,
-                    repair: ToolFailureError? = nil, tries: Int = 1) {
+                    repair: ToolFailureError? = nil, tries: Int = 1, retryAfter: Int? = nil) {
             self.cause = cause
             self.detail = String(ContextSecretContentPolicy.redactedFragment(detail).prefix(4096))
             self.deadlineExpired = deadlineExpired
             self.admitted = admitted
             self.repair = repair
             self.tries = tries
+            self.retryAfter = retryAfter
         }
         public var errorDescription: String? { repair?.message ?? cause.errorDescription }
         public var providerFailureCause: Error { cause }
     }
 
     public static func diagnosticDescription(_ error: Error) -> String {
+        if let stopped = error as? ProviderRecovery.Stopped { return stopped.localizedDescription }
         if let error = error as? Diagnostic { return error.detail }
         if let wrapper = error as? any ProviderFailureWrapping {
             return diagnosticDescription(wrapper.providerFailureCause)
@@ -281,6 +300,11 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     /// local health; existing repairs keep their identity.
     public static func repair(_ error: Error, provider: String, model: String, surface: String,
                               dataRoot: URL, id: String, evidence: [Experience.Ref] = [], call: LLMCall) -> ToolFailureError {
+        if let stopped = error as? ProviderRecovery.Stopped {
+            return ToolFailureError(stopped.localizedDescription, effects: .unknown, code: "provider_connection_stopped",
+                status: .failed, instruction: "Keep produced output and completed steps. Resolve the reported cause before starting another turn.",
+                recovery: .terminal)
+        }
         if let carried = (error as? Diagnostic)?.repair { return carried }
         if error is CancellationError || (error as? URLError)?.code == .cancelled {
             return ToolFailureError("""
@@ -356,6 +380,9 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                     let wait = seconds.map { "The provider supplied a wait of \($0) seconds. " } ?? "No reset time was supplied. "
                     instruction = wait
                         + "Check this account's allowance and billing before another request; inspect the selected account with setting.get \(group)_account."
+                case .billingNotConfigured?:
+                    code = "provider_billing_not_configured"
+                    instruction = Self.billingNotConfigured.localizedDescription
                 case .outputLimit?:
                     code = "provider_output_limit"
                     instruction = "Keep any partial output and request only the missing portion; inspect model choices with setting.get \(group)_model."

@@ -187,6 +187,7 @@ extension SwiftNativeTurnEngine {
         budget: ContextBudgetPolicy.Resolved
     ) -> [(hit: MemoryRecallHit, line: String)] {
         guard !recalled.isEmpty else { return [] }
+        let trust = MemoryDataProvenance.reading(recalled.map(\.extras))
         let resolved = budget
         var used = 0
         var rows: [(hit: MemoryRecallHit, line: String)] = []
@@ -203,7 +204,7 @@ extension SwiftNativeTurnEngine {
                 : full
             let marker = recalledMemoryMarker(hit)
             let line = MemoryDataProvenance.presentation(
-                marker.isEmpty ? "- \(bounded)" : "- \(bounded) \(marker)", metadata: hit.extras)
+                marker.isEmpty ? "- \(bounded)" : "- \(bounded) \(marker)", metadata: hit.extras, trust: trust)
             // Only derived budgets cap aggregate size, always admitting the first row; floor rows keep provenance.
             if resolved.isDerived, !rows.isEmpty,
                used + line.count > resolved.memoryBlockChars { break }
@@ -318,7 +319,7 @@ extension SwiftNativeTurnEngine {
     nonisolated static func renderPersonaPrompt(
         compiledPersonaPrompt: String,
         requiredDocuments: [RequiredDocument],
-        userMemoryCore: [String]?,
+        userMemoryCore: [String],
         surfaceGuidance: String
     ) -> String {
         // Join before trimming to preserve the compiler's document separators.

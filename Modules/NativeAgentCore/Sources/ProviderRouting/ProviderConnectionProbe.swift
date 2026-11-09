@@ -1,28 +1,25 @@
 import Foundation
+import Synchronization
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `ProviderConnectionProbe.swift` | Native probe capabilities and request-bound OAuth credential evidence; API-key connection probes |
 
-/// One probe's last transport attempt, including a token renewed after 401. Only a fingerprint is retained; readiness never supplies request evidence.
-public final class OAuthProbeCredential: @unchecked Sendable {
-    private let lock = NSLock()
-    private var sent: String?
+/// One probe's sent-credential fingerprint; readiness never supplies request evidence.
+public final class OAuthProbeCredential: Sendable {
+    private let sent = Mutex<String?>(nil)
 
     public init() {}
 
     public var fingerprint: String? {
-        lock.lock()
-        defer { lock.unlock() }
-        return sent
+        sent.withLock { $0 }
     }
 
     func sending(_ request: URLRequest) {
         guard let authorization = request.value(forHTTPHeaderField: "Authorization"),
               authorization.hasPrefix("Bearer ") else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        sent = LLMProviderStatusFeed.fingerprint(String(authorization.dropFirst("Bearer ".count)))
+        let fingerprint = LLMProviderStatusFeed.fingerprint(String(authorization.dropFirst("Bearer ".count)))
+        sent.withLock { $0 = fingerprint }
     }
 }
 public extension SwiftNativeProviderRouting {
@@ -36,6 +33,7 @@ public extension SwiftNativeProviderRouting {
              ("openai_oauth_direct", "oauth"?), ("anthropic_oauth_direct", "oauth"?), ("xai_oauth_direct", "oauth"?):
             return .oauth
         case ("openai", nil), ("anthropic", nil), ("moonshot", nil), ("kimi-code", nil), ("openrouter", nil),
+             ("meta", nil), ("meta", "api_key"?),
              ("openai", "api_key"?), ("anthropic", "api_key"?), ("moonshot", "api_key"?), ("kimi-code", "api_key"?), ("openrouter", "api_key"?):
             return .apiKey
         default: return .unsupported
@@ -65,16 +63,16 @@ public extension SwiftNativeProviderRouting {
 
         // Hashed before anything is sent: the verdict belongs to exactly this key.
         let credential = LLMProviderStatusFeed.fingerprint(apiKey)
-        func failed(_ failure: ProviderFailure, model: String?, evidence: String,
+        func failed(_ failure: ProviderFailure?, model: String?, evidence: String,
                     meaning: String? = nil) -> NativeAgentShared.ProviderTestResult {
             NativeAgentShared.ProviderTestResult(
                 provider_id: id, status: "error", tested: true, response: nil, model_used: model, detail: evidence,
                 error: failure == .authExpired ? LLMProviderStatusFeed.keyRejected
-                    : evidence + " — " + (meaning ?? failure.errorDescription ?? "the check failed"),
-                cause: failure.encoded, credential: credential)
+                    : evidence + " — " + (meaning ?? failure?.errorDescription ?? "the check failed"),
+                cause: failure?.encoded, credential: credential)
         }
         // Only invalid-credential evidence rejects a key. An unexplained 403 neither proves nor rejects it; quota and rate limits retain their own causes.
-        func refused(_ code: Int, _ body: Data, model: String?, ms: Int) -> NativeAgentShared.ProviderTestResult {
+        func refused(_ code: Int, _ body: Data, model: String?, ms: String) -> NativeAgentShared.ProviderTestResult {
             let detail = String(ProviderFailure.wireDetail(body).replacingOccurrences(of: apiKey, with: "[redacted]").prefix(160))
             let evidence = "HTTP \(code) after \(ms)ms" + (detail.isEmpty ? "" : ": " + detail)
             guard code == 403 else { return failed(ProviderFailure.http(status: code, detail: detail), model: model, evidence: evidence) }
@@ -95,17 +93,18 @@ public extension SwiftNativeProviderRouting {
             req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
             req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             req.setValue("application/json", forHTTPHeaderField: "content-type")
-            req.timeoutInterval = 20
-            req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            req.timeoutInterval = .infinity
+            req.httpBody = try JSONSerialization.data(withJSONObject: [
                 "model": probeModel,
                 "max_tokens": 1,
                 "messages": [["role": "user", "content": "ping"]],
             ])
             let start = Date()
             do {
-                let (body, response) = try await URLSession.shared.data(for: req)
-                let ms = Int(Date().timeIntervalSince(start) * 1000)
-                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                let (body, response) = try await ProviderHTTP.session.data(for: req)
+                let ms = String(format: "%.0f", Date().timeIntervalSince(start) * 1000)
+                guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+                let code = http.statusCode
                 if (200..<300).contains(code) {
                     return NativeAgentShared.ProviderTestResult(
                         provider_id: id, status: "ok", tested: true,
@@ -117,7 +116,7 @@ public extension SwiftNativeProviderRouting {
             } catch {
                 try Task.checkCancellation()
                 if error is CancellationError { throw error }
-                return failed(ProviderFailure.classify(error) ?? .network, model: nil,
+                return failed(ProviderFailure.classify(error), model: nil,
                               evidence: error.localizedDescription.replacingOccurrences(of: apiKey, with: "[redacted]"))
             }
         }
@@ -126,9 +125,11 @@ public extension SwiftNativeProviderRouting {
         // below can carry it.
         let modelsEndpoint: URL? = switch id {
         case "moonshot": MoonshotModelCatalog.endpoint
+        case "meta": URL(string: "https://api.meta.ai/v1/models")
         case "anthropic": URL(string: "https://api.anthropic.com/v1/models")
         case "openrouter": URL(string: "https://openrouter.ai/api/v1/key")
-        default: URL(string: "https://api.openai.com/v1/models")
+        case "openai": URL(string: "https://api.openai.com/v1/models")
+        default: nil
         }
         guard let modelsEndpoint else { throw URLError(.badURL) }
         var req = URLRequest(url: modelsEndpoint)
@@ -139,18 +140,18 @@ public extension SwiftNativeProviderRouting {
         } else {
             req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
-        req.timeoutInterval = 15
+        req.timeoutInterval = .infinity
         let start = Date()
         do {
-            let (body, response) = try await URLSession.shared.data(for: req)
-            let ms = Int(Date().timeIntervalSince(start) * 1000)
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let (body, response) = try await ProviderHTTP.session.data(for: req)
+            let ms = String(format: "%.0f", Date().timeIntervalSince(start) * 1000)
+            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+            let code = http.statusCode
             if (200..<300).contains(code) {
                 var catalogDetail = ""
                 if id == "moonshot" {
                     let models = try MoonshotModelCatalog.parseModelsResponse(body)
-                    guard !models.isEmpty else { throw LLMError.invalidResponse(status: code) }
-                    let result = await MoonshotModelCatalog.ttlCache.publish(
+                    let result = await MoonshotModelCatalog.cache.publish(
                         ModelCatalogFetch(models: models, isComplete: true), credential: apiKey, dataRoot: dataRoot)
                     if case .failure(let failure) = result, !failure.superseded {
                         catalogDetail = "; catalog not saved: \(failure.reason)"
@@ -166,7 +167,7 @@ public extension SwiftNativeProviderRouting {
         } catch {
             try Task.checkCancellation()
             if error is CancellationError { throw error }
-            return failed(ProviderFailure.classify(error) ?? .network, model: nil,
+            return failed(ProviderFailure.classify(error), model: nil,
                           evidence: error.localizedDescription.replacingOccurrences(of: apiKey, with: "[redacted]"))
         }
     }

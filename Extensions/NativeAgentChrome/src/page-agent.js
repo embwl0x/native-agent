@@ -1,7 +1,7 @@
 (() => {
-  // A repeated attach or concurrent manifest injection replaces the reader
-  // coherently, including its observers, timers and trusted-input listeners.
-  globalThis.__nativeAgentPageAgent?.();
+  const existing = globalThis.__nativeAgentPageAgent;
+  if (existing?.isActive?.()) return;
+  existing?.();
   const snapshots = new Map();
   const inputTargets = new Map();
   let scrollObservation = null;
@@ -11,28 +11,41 @@
   const allocatedFragments = new Set();
   let documentLinkTargets = new WeakMap();
   const activeRuns = new Set();
+  const frameReadWaits = new Set();
+  let disposed = false;
   const cancelledActions = new Set();
   let domGeneration = 0;
   // Coalesce mutation bursts in the page. This is a publication cadence, not
   // an action deadline: continuous changes still deliver one notice per turn.
   const CHANGE_DEBOUNCE_MS = 250;
+  // A content check walks the page. Mutations ask for one, and checks are spaced
+  // so the reader takes at most a twentieth of the page's time however fast it changes.
+  const CONTENT_CHECK_SHARE = 20;
+  let contentCheckTimer = null;
+  let contentCheckCost = 0;
   let observedTab = null;
   let changeTimer = null;
+  let contentPresent = false;
+  let contentPresentAt = null;
+  let routeContentRoots = null;
+  let routeEntryId = window.navigation.currentEntry?.id;
   const inputBindings = [];
 
   for (const [kind, input] of [["pointerdown", "pointer"], ["keydown", "keyboard"], ["wheel", "scroll"], ["touchstart", "touch"]]) {
     const listener = (event) => {
       if (event.isTrusted !== true) return;
-      // Consume only the keydown armed by this exact admitted action.
+      // The sender arms this keydown on the exact focused host before dispatch.
+      // Closed roots hide that host from the window's retargeted event path.
       if (kind === "keydown") for (const target of inputTargets.values()) {
         const expected = target.expectedKeydown;
-        if (expected && event.composedPath().includes(target.host) && performance.now() < target.expiresAt
+        if (expected && activeElement() === target.host && performance.now() < target.expiresAt
           && Object.keys(expected).every(key => event[key] === expected[key])) {
           target.expectedKeydown = null;
           return;
         }
       }
       inputTargets.clear();
+      for (const wait of [...frameReadWaits]) wait.finish({ known: false, cancelled: true });
       stopChangeStream();
       snapshots.clear();
       scrollObservation = null;
@@ -44,10 +57,16 @@
   }
 
   const MUTATION_SCOPE = { subtree: true, childList: true, attributes: true, characterData: true };
-  // Observe open shadow roots entered by the walker as well as the document.
+  // Observe shadow roots entered by the walker as well as the document.
   // A MutationObserver retains every root it observes strongly.
   const observedShadowRoots = new Set();
-  const domObserver = new MutationObserver((records) => {
+  const domObserver = new MutationObserver(records => pageMutated(records));
+  function pageMutated(records, arrived = true) {
+    if (arrived && routeContentRoots) for (const record of records) {
+      if (record.type === "characterData") routeContentRoots.add(record.target);
+      for (const node of record.addedNodes) routeContentRoots.add(node);
+    }
+    contentCheckDue();
     queuePageChange();
     domGeneration += 1;
     const invalidatedSnapshotIds = [...snapshots.keys()];
@@ -70,7 +89,7 @@
         retainedNavigationNodes,
       });
     }
-  });
+  }
   domObserver.observe(document, MUTATION_SCOPE);
 
   function stopChangeStream() {
@@ -140,10 +159,11 @@
       switch (message.type) {
         case "nativeagent.page.observe":
           startChangeStream(message);
-          result = { observing: observedTab !== null,
-            ready: document.readyState !== "loading", url: location.href };
+          announcePageContent();
+          result = { observing: observedTab !== null, ...arrivalEvidence() };
           break;
         case "nativeagent.page.tab.invalidated":
+          for (const wait of [...frameReadWaits]) wait.finish({ known: false, cancelled: true });
           for (const target of inputTargets.values()) { target.expectedKeydown = null; target.invalidated = true; }
           if (observedTab?.tabId === message.tabId) stopChangeStream();
           if (scrollObservation?.tabId === message.tabId) scrollObservation = null;
@@ -153,10 +173,14 @@
           for (const [id, snapshot] of snapshots) {
             if (snapshot.tabId === message.tabId) snapshots.delete(id);
           }
+          // Only an ended ownership sends this. Her reader stops costing the page at once;
+          // it still answers an input's settlement, and a new ownership replaces it.
+          retire();
           result = { invalidated: true };
           break;
         case "nativeagent.page.action.cancel":
           cancelledActions.add(message.requestId);
+          for (const wait of [...frameReadWaits]) if (wait.actionId === message.requestId) wait.finish({ known: false });
           const inputTarget = inputTargets.get(message.requestId);
           if (inputTarget) inputTarget.expectedKeydown = null;
           if (cancelledActions.size > 128) cancelledActions.delete(cancelledActions.values().next().value);
@@ -164,10 +188,10 @@
           result = { cancelled: true };
           break;
         case "nativeagent.page.snapshot":
-          result = createSnapshot(message);
+          result = readFrameSnapshot(message);
           break;
         case "nativeagent.page.document":
-          result = documentEvidence();
+          result = documentEvidence(message.scope);
           break;
         case "nativeagent.page.click":
           result = clickNode(message);
@@ -236,20 +260,32 @@
     return false;
   };
   chrome.runtime.onMessage.addListener(messageListener);
+  window.addEventListener("message", frameReadingListener);
   const runtime = chrome.runtime;
-  const teardown = () => {
-    document.removeEventListener("DOMContentLoaded", announcePageReady);
+  const retire = () => {
+    disposed = true;
+    for (const wait of [...frameReadWaits]) wait.finish({ known: false });
+    window.removeEventListener("message", frameReadingListener);
+    document.removeEventListener("DOMContentLoaded", announceDocumentParsed);
+    window.removeEventListener("load", announceDocumentParsed);
+    window.navigation.removeEventListener("currententrychange", announcePageRoute);
     stopChangeStream();
+    clearTimeout(contentCheckTimer);
+    contentCheckTimer = null;
     domObserver.disconnect();
     observedShadowRoots.clear();
     snapshots.clear();
-    inputTargets.clear();
     scrollObservation = null;
     for (const [kind, listener] of inputBindings) window.removeEventListener(kind, listener, { capture: true });
     for (const run of activeRuns) stopRun(run, "tab_not_owned");
+  };
+  const teardown = () => {
+    retire();
+    inputTargets.clear();
     // An invalidated extension context has already lost its runtime listener.
     if (runtime.id) runtime.onMessage.removeListener(messageListener);
   };
+  teardown.isActive = () => !disposed && Boolean(runtime.id);
   globalThis.__nativeAgentPageAgent = teardown;
 
   // A reloaded or updated extension orphans this copy: its runtime is gone and
@@ -260,28 +296,235 @@
     catch { teardown(); }
   }
 
-  // document_start installs the reader before the new page's headings exist.
-  // Announce readiness from the document's own lifecycle, so navigation news
-  // reads its content rather than an empty document still being parsed.
-  function announcePageReady() {
-    notifyHost({ type: "nativeagent.page.ready", url: location.href });
+  function contentCheckDue() {
+    if (contentCheckTimer !== null) return;
+    contentCheckTimer = setTimeout(() => {
+      contentCheckTimer = null;
+      announcePageContent();
+    }, Math.max(CHANGE_DEBOUNCE_MS, contentCheckCost * CONTENT_CHECK_SHARE));
   }
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", announcePageReady, { once: true });
-  else announcePageReady();
 
-  function documentEvidence() {
+  function announcePageContent(force = false) {
+    if (disposed) return;
+    const hadContent = contentPresent;
+    const checkStarted = performance.now();
+    contentPresent = !pageReadiness("main_content").busy;
+    contentCheckCost = performance.now() - checkStarted;
+    if (!contentPresent) contentPresentAt = null;
+    else if (contentPresentAt === null) contentPresentAt = performance.timeOrigin + performance.now();
+    if (force !== true && contentPresent === hadContent) return;
+    notifyHost({ type: "nativeagent.page.ready", ...arrivalEvidence() });
+  }
+
+  function arrivalEvidence() {
+    return { url: location.href, contentPresent, contentPresentAt };
+  }
+
+  // The installed reader and the content it can see are separate evidence.
+  // Mutation delivery does not depend on visibility or animation frames.
+  function announceDocumentParsed() { announcePageContent(true); }
+  function announcePageRoute() {
+    const pending = domObserver.takeRecords();
+    routeEntryId = window.navigation.currentEntry?.id;
+    routeContentRoots = new WeakSet();
+    contentPresent = false;
+    contentPresentAt = null;
+    if (pending.length) pageMutated(pending, false);
+    notifyHost({ type: "nativeagent.page.ready", ...arrivalEvidence() });
+  }
+  window.navigation.addEventListener("currententrychange", announcePageRoute);
+  document.addEventListener("DOMContentLoaded", announceDocumentParsed, { once: true });
+  window.addEventListener("load", announceDocumentParsed, { once: true });
+  queueMicrotask(() => announcePageContent(true));
+
+  function documentEvidence(scope = "page") {
     if (document.contentType === "application/pdf" || (!normalizedText(document.body?.innerText ?? "")
       && document.querySelector('embed[type="application/pdf"], object[type="application/pdf"]'))) return { kind: "pdf", status: "unread" };
-    return { kind: document.contentType.startsWith("image/") ? "image" : "dom" };
+    const content = pageReadiness(scope);
+    return { kind: document.contentType.startsWith("image/") ? "image" : "dom",
+      ...content };
+  }
+
+  function pageReadiness(scope) {
+    if (!document.body) return { busy: true, busyReason: "The document body has not arrived." };
+    // DOMContentLoaded/load do not mean a script shell has rendered. Discover
+    // its shadow roots before the first snapshot, and observe hydration there.
+    const overlayFor = readingOverlayOwner();
+    const { candidates } = readingScopeWalk("main_content", { overlayFor });
+    // Header labels, search fields, a logo and a Personalize button do not
+    // prove a feed has rendered. Read the actual prose, including shadow roots.
+    const prose = candidates.filter(element => !overlayFor(element) && !insideNavigation(element)
+      && !inPageChrome(element) && isPageContentElement(element) && isVisible(element)
+      && !isSecureReadField(element))
+      // Filter each rendered text run before joining: enclosing containers
+      // must not bring their excluded controls' labels back into the stamp.
+      .map(element => normalizedText(inlineText(element, null, node => !isReadinessControlText(node) && !isHeadingText(node)
+        && isRouteContent(node))
+        .map(part => part.text).join("")))
+      .filter(Boolean).slice(0, 256);
+    // Qualifying prose proves content presence, not completion of later script-rendered content.
+    // A loaded document also admits one block or a visible control.
+    const content = candidates.filter(element => !overlayFor(element) && !insideNavigation(element) && !inPageChrome(element)
+      && isVisible(element));
+    // The page's own loading indicator in its content says it is still filling in.
+    if (content.some(element => element.matches("progress, [role=progressbar]"))) {
+      return { busy: true, busyReason: `The ${scope} shows its own loading indicator; the page is still filling in.` };
+    }
+    const blocks = prose.filter(text => text.length >= 30).length;
+    const loaded = document.readyState === "complete";
+    const controls = loaded && content.some(element => element.matches("input:not([type=hidden]), textarea, select, button"));
+    if (blocks < 3 && !(loaded && (blocks >= 1 || controls))) {
+      return { busy: true, busyReason: `The ${scope} has ${blocks} readable block${blocks === 1 ? "" : "s"} so far; the page is still filling in.` };
+    }
+    // The stamp tracks filtered prose; an explicit page.wait can observe its stability.
+    return { busy: false, contentStamp: contentKey(prose.join("\n").slice(0, 32_000)) };
+  }
+
+  function isRouteContent(node) {
+    if (routeContentRoots === null) return true;
+    for (let current = node; current; current = current.assignedSlot ?? current.parentNode ?? current.host) {
+      if (routeContentRoots.has(current)) return true;
+    }
+    return false;
+  }
+
+  function isReadinessControlText(node, { includeComplementary = true } = {}) {
+    // Follow rendered ancestry through slots and shadow hosts as well as light
+    // DOM: a control's nested label is still control text. Article links outside
+    // navigation remain prose, including headings nested inside those links.
+    for (let current = node.assignedSlot ?? node.parentElement; current;
+      current = current.assignedSlot ?? composedParent(current)) {
+      if (current.matches("button, input, select, textarea, option, label, summary, menu, img, canvas, svg") || current.isContentEditable
+        || (current.getAttribute("role") ?? "").trim().split(/\s+/).some(role =>
+          ["button", "checkbox", "combobox", "listbox", "menu", "menubar", "menuitem", "menuitemcheckbox", "menuitemradio",
+            "option", "radio", "scrollbar", "searchbox", "slider", "spinbutton", "switch", "tab", "textbox", "treeitem",
+            "img", "graphics-document"].includes(role))
+        || (includeComplementary ? insideNavigation(current) : current.matches("nav, [role=navigation]"))
+        || inPageChrome(current)) return true;
+    }
+    return false;
+  }
+
+  // A page's title or section headings render before its content (x.com shows "Home" over an empty timeline): they are not content.
+  function isHeadingText(node) {
+    for (let current = node.assignedSlot ?? node.parentElement; current; current = current.assignedSlot ?? composedParent(current)) {
+      if (/^h[1-6]$/.test(current.localName) || current.getAttribute("role") === "heading") return true;
+    }
+    return false;
+  }
+
+  function contentKey(text) {
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index++) hash = Math.imul(hash ^ text.charCodeAt(index), 16777619);
+    return `${text.length}:${hash >>> 0}`;
+  }
+
+  function inPageChrome(element) {
+    for (let current = element; current; current = composedParent(current)) {
+      if (["header", "footer"].includes(current.localName) || ["banner", "contentinfo"].includes(current.getAttribute?.("role"))) return true;
+      if (current.localName === "main" || current.getAttribute?.("role") === "main") return false;
+    }
+    return false;
+  }
+
+  // Readiness and capture select the same semantic regions, navigation and overlays.
+  function readingScopeWalk(scope, { target = window, viewportRoot = null, position = null,
+    overlayFor = readingOverlayOwner(), maximum = 5_000 } = {}) {
+    if (!["page", "main_content"].includes(scope)) throw pageError("invalid_snapshot_scope", "Read the page or its semantic main content.");
+    languageNavigationCache = new WeakMap();
+    let walk = readingElementWalk([viewportRoot ?? document.body], target, maximum, position, overlayFor);
+    pruneObservedShadowRoots();
+    observeShadowRoots(walk.shadowRoots);
+    const modalSelector = "dialog, [role=dialog][aria-modal=true], [role=alertdialog][aria-modal=true]";
+    const modalRoots = new Set([document, ...walk.shadowRoots]);
+    let modals = [...new Set([...modalRoots].flatMap(root => [...root.querySelectorAll(modalSelector)]))]
+      .filter((element) => isVisible(element) && isModal(element));
+    const regionSelector = "main, article, [role=main], [role=feed], [role=article], [role=document], [itemprop~=articleBody]";
+    const regions = [...document.querySelectorAll(regionSelector), ...walk.elements,
+      ...walk.shadowRoots.flatMap(root => [...root.querySelectorAll(regionSelector)])];
+    if (viewportRoot) for (let parent = composedParent(viewportRoot); parent; parent = composedParent(parent)) regions.push(parent);
+    const mainRegions = [...new Set(regions)].filter((element) => isVisible(element)
+      && element.matches("main, [role=main], [role=feed]"));
+    const articleRegions = [...new Set(regions)].filter((element) => isVisible(element)
+      && element.matches("article, [role=article], [role=document], [itemprop~=articleBody]"));
+    const bodies = articleRegions.filter(element => !articleRegions.some(other => other !== element && withinElement(element, other)));
+    const mainContentAvailable = mainRegions.length > 0 || bodies.length > 0;
+    const contentRegions = mainRegions.length ? mainRegions : bodies.length ? bodies : [document.body].filter(Boolean);
+    // Scope and viewport priority apply before either the walk or row budget.
+    if (scope === "main_content" && !viewportRoot) {
+      const roots = [...new Set([...contentRegions, ...modals, ...walk.elements.map(overlayFor).filter(Boolean)])];
+      walk = readingElementWalk(roots, target, maximum, position, overlayFor);
+      observeShadowRoots(walk.shadowRoots);
+      for (const root of walk.shadowRoots) modalRoots.add(root);
+      modals = [...new Set([...modalRoots].flatMap(root => [...root.querySelectorAll(modalSelector)]))]
+        .filter((element) => isVisible(element) && isModal(element));
+    }
+    // A long sidebar must not spend the content budget before the article.
+    const candidates = scope === "page" ? walk.elements : walk.elements.filter((element) =>
+      overlayFor(element) || modals.some((modal) => withinElement(element, modal))
+      || (contentRegions.some((region) => withinElement(element, region)) && !insideNavigation(element)));
+    return { walk, candidates, modals, mainContentAvailable };
+  }
+
+  // Resolve the actual embedding element by Window identity, including a
+  // cross-origin frame. No URL/name guess is an embedding proof. Only layout
+  // classification crosses this page message; it carries no action authority.
+  async function frameReadingListener(event) {
+    const request = event.data;
+    if (disposed || request?.type !== "nativeagent.frame.reading" || typeof request.nonce !== "string"
+      || request.nonce.length > 64 || event.source === window) return;
+    const roots = [document, ...observedShadowRoots];
+    const frame = roots.flatMap(root => [...root.querySelectorAll("iframe, frame")])
+      .find(element => element.contentWindow === event.source);
+    if (!frame) {
+      event.source.postMessage({ type: "nativeagent.frame.reading.reply", nonce: request.nonce,
+        known: false, overlay: false, cause: "The parent could not find this frame's embedding element." }, "*");
+      return;
+    }
+    const ancestor = await embeddingOverlay(request.actionId);
+    if (disposed || ancestor.cancelled || !frame.isConnected) return;
+    const overlay = Boolean(readingOverlayOwner()(frame)) || ancestor.overlay === true;
+    event.source.postMessage({ type: "nativeagent.frame.reading.reply", nonce: request.nonce,
+      known: overlay || ancestor.known, overlay, cause: ancestor.cause }, "*");
+  }
+
+  function embeddingOverlay(actionId) {
+    if (window === window.top) return Promise.resolve({ known: true, overlay: false });
+    return new Promise(resolve => {
+      const nonce = crypto.randomUUID();
+      const wait = { actionId, finish };
+      function finish(evidence) {
+        if (!frameReadWaits.delete(wait)) return;
+        window.removeEventListener("message", received);
+        resolve(evidence);
+      }
+      function received(event) {
+        const reply = event.data;
+        if (event.source !== parent || reply?.type !== "nativeagent.frame.reading.reply" || reply.nonce !== nonce
+          || typeof reply.known !== "boolean" || typeof reply.overlay !== "boolean") return;
+        finish({ known: reply.known, overlay: reply.overlay, cause: reply.cause });
+      }
+      frameReadWaits.add(wait);
+      window.addEventListener("message", received);
+      parent.postMessage({ type: "nativeagent.frame.reading", nonce, actionId }, "*");
+    });
+  }
+
+  async function readFrameSnapshot(message) {
+    const embedding = await embeddingOverlay(message.actionId);
+    if (disposed) throw pageError("tab_not_owned", "The page reader was replaced before capture.");
+    if (cancelledActions.has(message.actionId)) throw pageError("action_cancelled", "The read was cancelled before capture.");
+    if (embedding.cancelled) throw pageError("tab_not_owned", "The tab was released before capture.");
+    return createSnapshot({ ...message, embedding });
   }
 
   function createSnapshot(message) {
     // Authored anchors and section labels are evidence of this capture only.
     documentLinkTargets = new WeakMap();
-    const maxNodes = clampInteger(message.maxNodes, 1, 500, 120);
-    const maxTextChars = clampInteger(message.maxTextChars, 1, 50_000, 12_000);
+    // Background supplies the protocol owner's resolved limits.
+    const maxNodes = message.maxNodes;
+    const maxTextChars = message.maxTextChars;
     const readingScope = message.scope ?? "page";
-    if (!["page", "main_content"].includes(readingScope)) throw pageError("invalid_snapshot_scope", "Read the page or its semantic main content.");
     const snapshotId = crypto.randomUUID();
     const elementByNodeId = new Map();
     const actionNodeIds = new Map();
@@ -291,6 +534,7 @@
     const nodeIdByElement = new Map();
     const nodes = [];
     const truncationReasons = [];
+    if (!message.embedding.known) truncationReasons.push("frame_overlay_unavailable");
     let pageMoved = Boolean(message.readCursor && (message.readCursor.frameURL ?? message.readCursor.url) !== location.href);
     const viewportObservationId = message.readCursor?.viewportObservationId;
     const observation = viewportObservationId && scrollObservation?.id === viewportObservationId
@@ -305,44 +549,30 @@
       pageMoved = true;
       cursor = null;
     }
-    languageNavigationCache = new WeakMap();
-    let walk = readingElementWalk([viewportRoot ?? document.body], target, 5_000, cursor?.position);
+    const overlayFor = readingOverlayOwner(message.embedding.overlay === true);
+    const readLayer = message.readLayer;
+    const startPosition = cursor?.position ?? (readLayer === "overlay" ? {
+      overlay: true, scrollX: view.scrollX, scrollY: view.scrollY,
+      distance: 0, y: -Number.MAX_SAFE_INTEGER, x: -Number.MAX_SAFE_INTEGER,
+      flow: [0, 0, -Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER], ordinal: 0,
+    } : null);
+    let { walk, candidates, modals, mainContentAvailable } = readingScopeWalk(readingScope,
+      { target, viewportRoot, position: cursor?.anchor ? null : startPosition, overlayFor, maximum: 20_000 });
+    const modalNames = new Map(modals.map(modal => [modal, modalName(modal)]));
+    candidates = candidates.filter(element => Boolean(overlayFor(element)) === (readLayer === "overlay"));
+    if (message.identityOnly) candidates = [];
     const viewportChanged = observation ? viewportChange(observation.before, captureViewport(observation.target)) : null;
-    pruneObservedShadowRoots();
-    observeShadowRoots(walk.shadowRoots);
-    const modalSelector = "dialog, [role=dialog][aria-modal=true], [role=alertdialog][aria-modal=true]";
-    const modalRoots = new Set([document, ...walk.shadowRoots]);
-    let modals = [...new Set([...modalRoots].flatMap(root => [...root.querySelectorAll(modalSelector)]))]
-      .filter((element) => isVisible(element) && isModal(element));
-    const regionSelector = "main, article, [role=main], [role=article], [role=document], [itemprop~=articleBody]";
-    const regions = [...document.querySelectorAll(regionSelector), ...walk.elements,
-      ...walk.shadowRoots.flatMap(root => [...root.querySelectorAll(regionSelector)])];
-    if (observation) for (let parent = composedParent(viewportRoot); parent; parent = composedParent(parent)) regions.push(parent);
-    const mainRegions = [...new Set(regions)].filter((element) => isVisible(element)
-      && (element.tagName?.toLowerCase() === "main" || element.getAttribute?.("role") === "main"));
-    const articleRegions = [...new Set(regions)].filter((element) => isVisible(element)
-      && element.matches("article, [role=article], [role=document], [itemprop~=articleBody]"));
-    const bodies = articleRegions.filter(element => !articleRegions.some(other => other !== element && withinElement(element, other)));
-    const mainContentAvailable = mainRegions.length > 0 || bodies.length > 0;
-    const contentRegions = mainRegions.length ? mainRegions : bodies.length ? bodies : [document.body].filter(Boolean);
-    // Scope and viewport priority apply before either the walk or row budget.
-    if (readingScope === "main_content" && !viewportRoot) {
-      const roots = [...new Set([...contentRegions, ...modals])];
-      walk = readingElementWalk(roots, target, 5_000, cursor?.position);
-      observeShadowRoots(walk.shadowRoots);
-      for (const root of walk.shadowRoots) modalRoots.add(root);
-      modals = [...new Set([...modalRoots].flatMap(root => [...root.querySelectorAll(modalSelector)]))]
-        .filter((element) => isVisible(element) && isModal(element));
-    }
-    // Scope before spending the node/text budget. A long visible sidebar must
-    // not consume all available evidence before the adjacent article. The
-    // shadow walk cap, redaction, and modal action checks still apply. Scroll
-    // reads all begin in the current viewport and then reach nearby material.
-    let candidates = readingScope === "page" ? walk.elements : walk.elements.filter((element) =>
-      modals.some((modal) => withinElement(element, modal))
-      || (contentRegions.some((region) => withinElement(element, region)) && !insideNavigation(element)));
     // A continuation is a place in the rendered page, never a DOM address.
     // Recycled/removed rows simply leave whatever is now beyond that place.
+    if (cursor?.anchor) {
+      const anchor = candidates.find(element => elementIdentities.get(element) === cursor.anchor.identity
+        && readingAnchorKey(element) === cursor.anchor.key);
+      if (anchor) {
+        const position = walk.positions.get(anchor);
+        if (compareReadingPosition(position, cursor.position) !== 0) pageMoved = true;
+        cursor = { ...cursor, position };
+      } else pageMoved = true;
+    }
     if (cursor?.position) candidates = candidates.filter(element => compareReadingPosition(walk.positions.get(element), cursor.position) >= 0);
     const continuedElement = cursor?.position && candidates.find(element => compareReadingPosition(walk.positions.get(element), cursor.position) === 0);
     if (cursor?.position && !continuedElement) pageMoved = true;
@@ -350,7 +580,18 @@
       if (continuedElement?.tagName.toLowerCase() === "select") candidates = [continuedElement];
       else { pageMoved = true; cursor = null; }
     }
-    const readAt = (element, offsets = {}) => ({ position: walk.positions.get(element),
+    const find = message.find ?? cursor?.find;
+    let found = false;
+    if (find) {
+      const needle = normalizedText(find).toLocaleLowerCase();
+      const index = candidates.findIndex(element => isVisible(element) && !isSecureReadField(element)
+        && normalizedText(snapshotText(element) || accessibleName(element, "")).toLocaleLowerCase().includes(needle));
+      found = index >= 0;
+      candidates = found ? candidates.slice(index) : [];
+    }
+    const readAt = (element, offsets = {}) => ({ position: walk.positions.get(element), readLayer,
+      anchor: readingAnchor(element),
+      ...(find && !found ? { find } : {}),
       ...(observation ? { viewportObservationId: observation.id } : {}), name: sectionName, ...offsets });
     const glyphCounts = fragmentedTextGlyphCounts(candidates);
     const collapsedText = new Set();
@@ -397,23 +638,32 @@
       const rect = element.getBoundingClientRect();
       const role = element.getAttribute("role") ?? implicitRole(element);
       const blockedByModal = modals.length > 0 && (modals.length !== 1 || !withinElement(element, modals[0]));
+      const blockingDialogs = blockedByModal ? modals.filter(modal => !withinElement(element, modal))
+        .map(modal => modalNames.get(modal)).filter(Boolean) : [];
       const actions = snapshotActions(element, role, blockedByModal);
       let parent = composedParent(element);
       while (parent && !nodeIdByElement.has(parent)) parent = composedParent(parent);
       nodes.push({
         nodeId, elementIdentity: elementIdentities.get(element), elementPath: stableElementPath(element),
+        readAnchor: readingAnchor(element), readLayer,
         addressFragment: readableElementFragment(element, presentation.sectionName),
         parentNodeId: parent ? nodeIdByElement.get(parent) : null,
         kind: elementKind(element), role, ...readingStructure(element), value: safeValue(element),
+        overlay: Boolean(overlayFor(element)),
+        ...(!message.embedding.known ? { overlayUnknown: true } : {}),
         level: headingLevel(element), visible: true,
         states: {
           disabled: isEffectivelyDisabled(element), checked: ariaBoolean(element, "aria-checked", "checked"),
           selected: ariaBoolean(element, "aria-selected", "selected"),
           expanded: nullableAriaBoolean(element.getAttribute("aria-expanded")), editable: isEditable(element), blockedByModal,
+          ...(blockingDialogs.length ? { blockingDialogs } : {}),
         },
         actions, url: safeURL(element), scrollable: actions.includes("scroll"),
         bounds: { x: finite(rect.x), y: finite(rect.y), width: Math.max(0, finite(rect.width)), height: Math.max(0, finite(rect.height)) },
         ...presentation,
+        ...(selectInfo && isSecureReadField(element) ? {
+          select: { ...selectInfo, options: selectInfo.options.map(option => ({ ...option, selected: null })) },
+        } : {}),
       });
       for (const action of actions) {
         if (!actionNodeIds.has(action)) actionNodeIds.set(action, new Set());
@@ -433,11 +683,16 @@
       const fragmented = element.children.length > 0 && glyphCounts.get(element) >= 2 && !element.closest("pre, code");
       const linksByPath = new Map();
       const runs = fragmented ? [] : inlineText(element, linksByPath);
-      const fullText = fragmented ? normalizedText(visibleFragmentedText(element)) : snapshotText(element, runs);
+      const fullText = isSecureReadField(element) ? "" : fragmented ? normalizedText(visibleFragmentedText(element)) : snapshotText(element, runs);
       let textOffset = element === continuedElement ? (cursor?.textOffset ?? 0) : 0;
       if (textOffset > fullText.length) { pageMoved = true; textOffset = 0; }
       let text = fullText.slice(textOffset);
       let name = bounded(accessibleName(element, text), 500);
+      if (kind === "image") {
+        const box = element.getBoundingClientRect();
+        const visual = ["canvas", "svg"].includes(element.localName) ? "chart/graphic" : "image";
+        name = `${name} (${visual}, ${Math.round(box.width)} × ${Math.round(box.height)} CSS px)`;
+      }
       // Layout wrappers repeat the entire feed at every nesting level. Keep
       // semantic containers and controls, and preserve direct/leaf text instead.
       if (!fragmented && !text && isRedundantLayoutWrapper(element, kind)) continue;
@@ -445,6 +700,9 @@
       if (fragmented && !text) continue;
       if (!name && !text && kind === "other") continue;
       const heading = sectionHeading(element);
+      if (nodes.length && nodes[nodes.length - 1].overlay !== Boolean(overlayFor(element))) {
+        sectionStart = null; paragraphStart = null; paragraph = null;
+      }
       if (heading) { sectionName = bounded(heading, 160); sectionStart = checkpoint(element); }
       const block = readingBlock(element);
       if (block !== paragraph) { paragraph = block; paragraphStart = checkpoint(element); }
@@ -573,7 +831,8 @@
       for (const part of group.inline) if (part.elementPath) representedLinks.add(part.elementPath);
       if (nextRead) break;
     }
-    if (!cursor?.elementOnly && !nextRead && walk.nextElement
+    if (!message.identityOnly && !cursor?.elementOnly && !nextRead && walk.nextElement
+      && Boolean(overlayFor(walk.nextElement)) === (readLayer === "overlay")
       && (!cursor?.position || compareReadingPosition(walk.positions.get(walk.nextElement), cursor.position) > 0)) {
       const nextSection = bounded(sectionHeading(walk.nextElement) || sectionName, 160);
       if (!foldAtBoundary()) nextRead = readAt(walk.nextElement, { textOffset: 0, name: nextSection });
@@ -584,10 +843,10 @@
     // followed by buttons, without a separate text leaf for that prose.
     const rawSummary = nodes.length ? nodes.filter(node => !node.inlineProof)
       .map((node) => node.text || node.name).filter(Boolean).join("\n")
-      : (!document.body?.children?.length ? normalizedText(document.body?.innerText ?? "") : "");
+      : (!find && !document.body?.children?.length ? normalizedText(document.body?.innerText ?? "") : "");
     const summaryText = bounded(rawSummary, maxTextChars);
     if (summaryText.length < rawSummary.length) truncationReasons.push("text_limit");
-    const documentInfo = documentEvidence();
+    const documentInfo = documentEvidence(readingScope);
     const snapshot = {
       snapshotId,
       tabId: message.tabId,
@@ -603,6 +862,8 @@
         scope: "rendered_dom_only",
       },
       reading: { scope: readingScope, mainContentAvailable,
+        overlayKnown: message.embedding.known,
+        ...(find ? { find: { text: find, matched: found, walkLimited: walk.truncated } } : {}),
         sections: [...new Set(nodes.filter(node => !node.inlineProof).map(node => node.sectionName).filter(Boolean))],
         fromViewport: true, pageMoved, viewportObservationId: observation?.id ?? null,
         ...(observation ? { viewportChanged } : {}) },
@@ -619,6 +880,8 @@
         nodeCount: nodes.length,
         truncated: truncationReasons.length > 0,
         truncationReasons: [...new Set(truncationReasons)],
+        gaps: message.embedding.known ? [] : [{ code: "frame_overlay_unavailable",
+          message: message.embedding.cause }],
       },
       nodes,
       readMore: nextRead ? { url: location.href, ...nextRead, name: bounded(normalizedText(nextRead.name || "Remaining page"), 160) } : null,
@@ -629,13 +892,13 @@
     };
     if (message.passive === true) {
       for (const [id, previous] of snapshots) {
-        if (previous.passive === true) snapshots.delete(id);
+        if (previous.passive === true && previous.captureId !== message.captureId) snapshots.delete(id);
       }
-    } else snapshots.clear();
+    } else if (![...snapshots.values()].some(previous => previous.captureId === message.captureId)) snapshots.clear();
     snapshots.set(snapshotId, {
       tabId: message.tabId, domGeneration, elementByNodeId, actionNodeIds, identityByNodeId,
-      navigationProofs, selectProofs, capturedAt: Date.now(), pageURL: location.href,
-      passive: message.passive === true,
+      navigationProofs, selectProofs, modals, capturedAt: Date.now(), pageURL: location.href,
+      passive: message.passive === true, captureId: message.captureId,
     });
     return snapshot;
   }
@@ -709,7 +972,7 @@
 
   function activeElement() {
     let active = document.activeElement;
-    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    for (let nested = elementShadowRoot(active)?.activeElement; nested; nested = elementShadowRoot(active)?.activeElement) active = nested;
     return active;
   }
 
@@ -1156,6 +1419,7 @@
   }
 
   function snapshotText(element, runs = null) {
+    if (isSecureReadField(element)) return "";
     // Visible inline runs keep offscreen feed text out of container prose.
     const kind = elementKind(element);
     if (!isPageContentElement(element) || kind === "image") return "";
@@ -1170,22 +1434,23 @@
   }
 
   // Inline runs keep DOM order and each link's structural address.
-  function inlineText(element, linkTargets) {
+  function inlineText(element, linkTargets, includeText = () => true) {
     const parts = [];
     const preformatted = isPreformatted(element);
     function visit(parent, link = null, code = false) {
       for (const child of parent.childNodes ?? []) {
         if (child.nodeType === 3) {
+          if (!includeText(child)) continue;
           if (link) linkTargets?.set(stableElementPath(link), link);
           parts.push({ text: child.textContent ?? "", ...(link ? { elementPath: stableElementPath(link), href: safeURL(link) } : {}), ...(code ? { code: true } : {}) });
         }
         else if (child.nodeType === 1) {
-          if (!isPageContentElement(child)) continue;
+          if (!isPageContentElement(child) || isSecureReadField(child)) continue;
           if (elementKind(child) === "image") continue;
           if (insideNavigation(child) && !insideNavigation(element)) continue;
           if (child.tagName === "BR") { parts.push({ text: preformatted ? "\n" : " " }); continue; }
           const style = getComputedStyle(child);
-          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) continue;
+          if (style.display === "none" || style.visibility === "hidden" || transparent(child, style)) continue;
           if (isTextClipped(child, style)) continue;
           if (preformatted || ["inline", "inline-block", "inline-flex", "contents"].includes(style.display)) visit(child, child.tagName === "A" ? child : link, code || child.tagName === "CODE");
         }
@@ -1215,14 +1480,14 @@
     // unless structure proves that it contains clipped or navigation copies.
     const navigational = insideNavigation(element);
     if (![...element.querySelectorAll("*")].some(child => isTextClipped(child)
-      || Number(getComputedStyle(child).opacity) === 0 || (insideNavigation(child) && !navigational))) {
+      || transparent(child, getComputedStyle(child)) || (insideNavigation(child) && !navigational))) {
       return element.innerText ?? element.textContent ?? "";
     }
     return [...element.childNodes].map(child => {
       if (child.nodeType === 3) return child.textContent ?? "";
       if (child.nodeType !== 1 || !isPageContentElement(child) || elementKind(child) === "image") return "";
       const style = getComputedStyle(child);
-      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0
+      if (style.display === "none" || style.visibility === "hidden" || transparent(child, style)
         || isTextClipped(child, style) || (insideNavigation(child) && !insideNavigation(element))) return "";
       if (child.tagName === "BR") return "\n";
       const value = visibleControlText(child);
@@ -1250,7 +1515,7 @@
       if (elementKind(element) !== "other" || element.getAttribute("role")
         || ["PRE", "CODE"].includes(element.tagName)
         || element.getAttribute("aria-label") || element.getAttribute("aria-labelledby")
-        || element.shadowRoot || element.tagName.toLowerCase() === "slot" || !(element instanceof HTMLElement)
+        || elementShadowRoot(element) || element.tagName.toLowerCase() === "slot" || !(element instanceof HTMLElement)
         || element.isContentEditable || isKeypressable(element, "")
         || isScrollable(element) || element.draggable === true) continue;
       const children = Array.from(element.children);
@@ -1267,6 +1532,7 @@
   }
 
   function visibleFragmentedText(element) {
+    if (isSecureReadField(element)) return "";
     const raw = Array.from(element.childNodes).map((node) => {
       if (node.nodeType === 3) return node.textContent ?? "";
       if (node.nodeType === 1 && node.tagName === "BR") return "\n";
@@ -1286,11 +1552,24 @@
     const proof = action === "click" ? retained?.navigationProofs.get(nodeId) : null;
     const allowNavigation = proof && navigationProofMatches(proof, retained);
     const snapshot = allowNavigation ? retained : requireSnapshot(snapshotId);
+    const element = snapshot.elementByNodeId.get(nodeId);
+    if (!element?.isConnected) throw pageError("node_stale", "The snapshot node is no longer attached.");
+    if (action !== "wait") {
+      if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
+      const modals = snapshot.domGeneration === domGeneration ? snapshot.modals
+        : composedElementWalk(document.body).elements.filter(candidate => isVisible(candidate) && isModal(candidate));
+      const blocking = modals.filter(modal => isVisible(modal) && !withinElement(element, modal));
+      if (blocking.length) {
+        const names = blocking.map(modalName).filter(Boolean);
+        throw pageError("modal_target_required", names.length
+          ? `Blocked by the modal dialog ${names.map(name => `"${name}"`).join(", ")}. Nothing was sent.`
+          : "Blocked by a modal dialog. Nothing was sent.");
+      }
+      requireEnabledNode(element, action);
+    }
     if (!snapshot.actionNodeIds.get(action)?.has(nodeId)) {
       throw pageError("node_not_actionable", `The snapshot node did not advertise a ${action} action.`);
     }
-    const element = snapshot.elementByNodeId.get(nodeId);
-    if (!element?.isConnected) throw pageError("node_stale", "The snapshot node is no longer attached.");
     if (snapshot.domGeneration !== domGeneration) {
       const walk = composedElementWalk(document.body);
       if (walk.truncated || walk.elements.some((candidate) => isVisible(candidate) && isModal(candidate))) {
@@ -1371,7 +1650,7 @@
     if (["input", "textarea"].includes(tag)) return "input";
     if (tag === "select") return "select";
     if (tag === "option") return "option";
-    if (tag === "img" || role === "img") return "image";
+    if (["img", "canvas", "svg"].includes(tag) || role === "img" || role === "graphics-document") return "image";
     if (["ul", "ol"].includes(tag)) return "list";
     if (tag === "li") return "listitem";
     if (tag === "article" || role === "article") return "article";
@@ -1435,7 +1714,7 @@
     for (let current = element; current; current = composedParent(current)) {
       if (!isPageContentElement(current) || current.hidden || current.getAttribute("aria-hidden") === "true") return "";
       const style = getComputedStyle(current);
-      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return "";
+      if (style.display === "none" || style.visibility === "hidden" || transparent(current, style)) return "";
     }
     const role = element.getAttribute("role");
     if (role === "presentation" || role === "none") return "";
@@ -1445,11 +1724,21 @@
       || (element.getAttribute("width") === "1" && element.getAttribute("height") === "1"))) return "";
     // An explicitly empty alt is decorative unless ARIA supplies its name.
     const ariaNamed = element.hasAttribute("aria-label") || element.hasAttribute("aria-labelledby");
-    if (!ariaNamed && !element.getAttribute("alt")) return "";
+    if (!ariaNamed && element.hasAttribute("alt") && !element.getAttribute("alt")) return "";
     // A failed image's browser replacement is not article content. An
     // authored caption is captured independently, including on its link.
     if (element.tagName === "IMG" && element.complete && element.naturalWidth === 0) return "";
-    return normalizedText(elementAccessibleName(element, ""));
+    const authored = normalizedText(elementAccessibleName(element, ""));
+    if (authored) return authored;
+    const figure = element.closest("figure");
+    const caption = figure?.querySelector("figcaption");
+    const captionName = caption && isVisible(caption) ? bounded(normalizedText(snapshotText(caption)), 500) : "";
+    if (captionName) return captionName;
+    const nearby = [element.previousElementSibling, element.nextElementSibling]
+      .find(sibling => sibling && isVisible(sibling) && !isSecureReadField(sibling) && sibling.matches("figcaption, h1, h2, h3, h4, p, [role=heading]"));
+    const nearbyName = nearby ? bounded(normalizedText(snapshotText(nearby)), 500) : "";
+    if (nearbyName) return nearbyName;
+    return ["canvas", "svg"].includes(element.localName) ? "Unlabelled chart/graphic" : "Unlabelled image";
   }
 
   function sectionHeading(element) {
@@ -1550,8 +1839,14 @@
 
   function safeValue(element) {
     if (!("value" in element)) return null;
-    if (element.tagName.toLowerCase() === "input" && element.type?.toLowerCase() === "password") return null;
+    if (isSecureReadField(element)) return null;
     return bounded(String(element.value ?? ""), 500);
+  }
+
+  // One read verdict for the model's snapshot and the local copy shown in Screen.
+  function isSecureReadField(element) {
+    const autocomplete = (element.getAttribute("autocomplete") ?? "").toLowerCase();
+    return isPasswordField(element) || autocomplete.includes("password") || autocomplete.includes("cc-");
   }
 
   function safeURL(element) {
@@ -1565,14 +1860,22 @@
 
   function isVisible(element) {
     const style = getComputedStyle(element);
-    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+    if (style.display === "none" || style.visibility === "hidden" || transparent(element, style)) return false;
     const rect = element.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0 || isTextClipped(element, style)) return false;
     for (let parent = composedParent(element); parent; parent = composedParent(parent)) {
       const parentStyle = getComputedStyle(parent);
-      if (Number(parentStyle.opacity) === 0 || isTextClipped(parent, parentStyle)) return false;
+      if (transparent(parent, parentStyle) || isTextClipped(parent, parentStyle)) return false;
     }
     return true;
+  }
+
+  // Opacity 0 held by an unfinished fade (ESPN fades its whole page in) is content appearing, not hidden: Chrome does not run
+  // a hidden tab's animations, so the fade never ends there.
+  function transparent(element, style) {
+    if (Number(style.opacity) !== 0) return false;
+    return !element.getAnimations().some(animation => animation.playState !== "finished"
+      && animation.effect?.getKeyframes().some(frame => "opacity" in frame));
   }
 
   function isTextClipped(element, style = getComputedStyle(element)) {
@@ -1623,6 +1926,58 @@
     }
     return ["dialog", "alertdialog"].includes(element.getAttribute("role"))
       && element.getAttribute("aria-modal") === "true";
+  }
+
+  function modalName(element) {
+    const heading = [...element.querySelectorAll("h1, h2, h3, h4, h5, h6, [role=heading]")].find(isVisible);
+    return bounded(normalizedText(accessibleName(element, snapshotText(heading ?? element))), 160);
+  }
+
+  // One capture-local classification serves the walk, scope and row labels.
+  // Coverage is geometry, never a guess from cookie/banner words. Reading
+  // behind a cover grants no action through it: modal checks stay unchanged.
+  function readingOverlayOwner(embeddedOverlay = false) {
+    const owners = new WeakMap();
+    function owner(element) {
+      if (!element) return null;
+      if (owners.has(element)) return owners.get(element);
+      const ancestor = composedParent(element);
+      const inherited = ancestor ? owner(ancestor) : embeddedOverlay ? element : null;
+      const role = element.getAttribute("role"), style = getComputedStyle(element);
+      const box = element.getBoundingClientRect();
+      const width = Math.max(0, Math.min(innerWidth, box.right) - Math.max(0, box.left));
+      const height = Math.max(0, Math.min(innerHeight, box.bottom) - Math.max(0, box.top));
+      // Scroll-locking a body's layout does not turn the whole article into
+      // the dialog covering it. The embedding frame can still be an overlay.
+      const covering = element !== document.body && element !== document.documentElement
+        && style.position === "fixed" && width > 0 && height > 0
+        && (width * height >= innerWidth * innerHeight * 0.15
+          || (width >= innerWidth * 0.5 && height >= 24)
+          || (height >= innerHeight * 0.5 && width >= 80));
+      const result = inherited || (((covering && coversPageContent(element)) || ["dialog", "alertdialog"].includes(role)
+        || element.localName === "dialog") && isVisible(element) ? element : null);
+      owners.set(element, result);
+      return result;
+    }
+    return owner;
+  }
+
+  function coversPageContent(element) {
+    const box = element.getBoundingClientRect();
+    const left = Math.max(0, box.left), right = Math.min(innerWidth, box.right);
+    const top = Math.max(0, box.top), bottom = Math.min(innerHeight, box.bottom);
+    const root = element.getRootNode();
+    // A fixed feed can be the page's layout. It is a cover only when the
+    // browser's actual stack exposes other page content underneath it.
+    return [0.25, 0.5, 0.75].some(fraction => {
+      const x = left + (right - left) * fraction, y = top + (bottom - top) * fraction;
+      const stack = root.elementsFromPoint(x, y);
+      const cover = stack.findIndex(candidate => withinElement(candidate, element));
+      return cover >= 0 && stack.slice(cover + 1).some(candidate => candidate !== document.body
+        && candidate !== document.documentElement && !withinElement(candidate, element) && !withinElement(element, candidate)
+        && !insideNavigation(candidate) && !inPageChrome(candidate) && isVisible(candidate)
+        && (elementShadowRoot(candidate) || normalizedText(snapshotText(candidate))));
+    });
   }
 
   function withinElement(element, ancestor) {
@@ -1742,27 +2097,45 @@
   }
 
   function compareReadingPosition(left, right) {
-    for (const key of ["distance", "y", "x", "ordinal"]) {
-      const difference = left[key] - right[key];
+    const layer = Number(left.overlay === true) - Number(right.overlay === true);
+    if (layer) return layer;
+    for (let index = 0; index < Math.min(left.flow.length, right.flow.length); index++) {
+      const difference = left.flow[index] - right.flow[index];
       if (difference) return difference;
     }
-    return 0;
+    return left.flow.length - right.flow.length || left.ordinal - right.ordinal;
+  }
+
+  function readingAnchorKey(element) {
+    return contentKey(snapshotText(element) + "\n" + (safeURL(element) ?? ""));
+  }
+
+  function readingAnchor(element) {
+    if (!elementIdentities.has(element)) elementIdentities.set(element, crypto.randomUUID());
+    return { identity: elementIdentities.get(element), key: readingAnchorKey(element) };
   }
 
   // Expand the nearest layout branches first. Offscreen feed rows cannot
   // exhaust the walk before the viewport is reached. On continuation, the
   // already-read prefix does not spend the next window's walk budget. Still
   // descend through it: overflowing children can occupy an unread position.
-  function readingElementWalk(roots, target, maximum = 5_000, startPosition = null) {
+  function readingElementWalk(roots, target, maximum = 5_000, startPosition = null, overlayFor = () => null) {
     const view = readingViewport(target), heap = [], entries = [], shadowRoots = [];
     const seen = new Set(), coincident = new Map(), positions = new Map();
     let sequence = 0;
+    const geometry = box => ({
+      distance: Math.max(0, view.top - box.bottom, box.top - view.bottom)
+        + Math.max(0, view.left - box.right, box.left - view.right),
+      y: finite(box.top - view.top + view.scrollY), x: finite(box.left - view.left + view.scrollX),
+    });
+    const columnPrefix = readingColumnPrefixes(geometry, overlayFor);
     const position = element => {
-      const box = element.getBoundingClientRect();
+      const place = geometry(element.getBoundingClientRect());
+      const complementary = insideNavigation(element) || inPageChrome(element);
       return { scrollX: view.scrollX, scrollY: view.scrollY,
-        distance: Math.max(0, view.top - box.bottom, box.top - view.bottom)
-          + Math.max(0, view.left - box.right, box.left - view.right),
-        y: finite(box.top - view.top + view.scrollY), x: finite(box.left - view.left + view.scrollX), ordinal: 0 };
+        ...(overlayFor(element) ? { overlay: true } : {}),
+        ...(complementary ? { complementary: true } : {}),
+        ...place, flow: [...columnPrefix(element), Number(complementary), place.distance, place.y, place.x], ordinal: 0 };
     };
     const compare = (a, b) => compareReadingPosition(a.position, b.position) || a.order - b.order;
     const offer = element => {
@@ -1796,7 +2169,8 @@
     let next = null;
     while (heap.length) {
       const entry = take(), element = entry.element;
-      const key = [entry.position.distance, entry.position.y, entry.position.x].join(":");
+      const key = [entry.position.overlay === true, entry.position.complementary === true,
+        ...entry.position.flow].join(":");
       entry.position.ordinal = coincident.get(key) ?? 0;
       coincident.set(key, entry.position.ordinal + 1);
       if (!startPosition || compareReadingPosition(entry.position, startPosition) >= 0) {
@@ -1804,16 +2178,90 @@
         if (entries.length >= maximum) { next = entry; break; }
         entries.push(entry);
       }
-      if (!isPageContentElement(element)) continue;
-      if (element.shadowRoot) {
-        shadowRoots.push(element.shadowRoot);
-        Array.from(element.shadowRoot.children).forEach(offer);
+      if (!isPageContentElement(element) || elementKind(element) === "image") continue;
+      const shadow = elementShadowRoot(element);
+      if (shadow) {
+        shadowRoots.push(shadow);
+        Array.from(shadow.children).forEach(offer);
       }
       Array.from(element.children ?? []).forEach(offer);
     }
     entries.sort(compare);
     return { elements: entries.map(entry => entry.element),
       positions, shadowRoots, truncated: Boolean(next), nextElement: next?.element, sectionName: "" };
+  }
+
+  // Geometry identifies sibling columns, not site names or landmark roles.
+  // Their shared place in the page precedes the prose-ranked column and its
+  // own positions. That same key travels with a fold, so more finishes a
+  // column rather than returning to rows beside it at the same height.
+  function readingColumnPrefixes(geometry, overlayFor) {
+    const prefixes = new WeakMap(), groups = new WeakMap(), prose = new WeakMap();
+    function proseSize(root) {
+      if (prose.has(root)) return prose.get(root);
+      const stack = [root];
+      let size = 0, visited = 0;
+      while (stack.length && visited++ < 2_000 && size < 32_000) {
+        const element = stack.pop();
+        if (!isPageContentElement(element) || overlayFor(element) || element.matches("nav, [role=navigation]")
+          || inPageChrome(element) || isSecureReadField(element)) continue;
+        if (isVisible(element)) for (const node of element.childNodes) {
+          if (node.nodeType === 3 && !isReadinessControlText(node, { includeComplementary: false })) size += normalizedText(node.textContent ?? "").length;
+        }
+        stack.push(...Array.from(element.children), ...Array.from(elementShadowRoot(element)?.children ?? []));
+      }
+      prose.set(root, size);
+      return size;
+    }
+    function columns(parent) {
+      if (groups.has(parent)) return groups.get(parent);
+      const children = [...Array.from(parent.children ?? []), ...Array.from(elementShadowRoot(parent)?.children ?? [])];
+      const candidates = children.filter(element => !overlayFor(element) && isVisible(element))
+        .map(element => ({ element, box: element.getBoundingClientRect() }))
+        .filter(({ box }) => box.width >= 80 && box.height >= 120);
+      const ranks = new Map(), remaining = new Set(candidates);
+      // A long, vertically stacked list shares one horizontal strip and has
+      // no beside pair. Establish that in one pass before considering pairs.
+      if (candidates.length < 2 || Math.max(...candidates.map(item => item.box.left)) + 4
+        < Math.min(...candidates.map(item => item.box.right))) {
+        groups.set(parent, ranks);
+        return ranks;
+      }
+      const beside = (a, b) => (a.box.right <= b.box.left + 4 || b.box.right <= a.box.left + 4)
+        && Math.min(a.box.bottom, b.box.bottom) - Math.max(a.box.top, b.box.top)
+          >= Math.max(80, Math.min(a.box.height, b.box.height) * 0.5);
+      for (const first of candidates) {
+        if (!remaining.delete(first)) continue;
+        const group = [first];
+        for (let index = 0; index < group.length; index++) for (const other of remaining) {
+          if (beside(group[index], other)) { remaining.delete(other); group.push(other); }
+        }
+        if (group.length < 2) continue;
+        const box = { left: Math.min(...group.map(item => item.box.left)), right: Math.max(...group.map(item => item.box.right)),
+          top: Math.min(...group.map(item => item.box.top)), bottom: Math.max(...group.map(item => item.box.bottom)) };
+        const place = geometry(box);
+        // Vertically stacked siblings beside one rail are one column, too.
+        const lanes = [];
+        for (const item of group.sort((a, b) => a.box.left - b.box.left)) {
+          let lane = lanes.find(lane => Math.min(lane.right, item.box.right) - Math.max(lane.left, item.box.left)
+            >= Math.min(lane.right - lane.left, item.box.width) * 0.5);
+          if (!lane) { lane = { left: item.box.left, right: item.box.right, items: [], prose: 0 }; lanes.push(lane); }
+          lane.items.push(item); lane.prose += proseSize(item.element);
+          lane.left = Math.min(lane.left, item.box.left); lane.right = Math.max(lane.right, item.box.right);
+        }
+        lanes.sort((a, b) => b.prose - a.prose || a.left - b.left);
+        lanes.forEach((lane, rank) => lane.items.forEach(({ element }) => ranks.set(element, [0, place.distance, place.y, place.x, rank])));
+      }
+      groups.set(parent, ranks);
+      return ranks;
+    }
+    return function prefix(element) {
+      if (prefixes.has(element)) return prefixes.get(element);
+      const parent = composedParent(element);
+      const value = parent ? [...prefix(parent), ...(columns(parent).get(element) ?? [])] : [];
+      prefixes.set(element, value);
+      return value;
+    };
   }
 
   function composedElementWalk(root, maximum = 5_000) {
@@ -1825,9 +2273,10 @@
       const element = stack.pop();
       if (!isPageContentElement(element)) continue;
       result.push(element);
-      if (element.shadowRoot) shadowRoots.push(element.shadowRoot);
+      const shadow = elementShadowRoot(element);
+      if (shadow) shadowRoots.push(shadow);
       const descendants = [
-        ...Array.from(element.shadowRoot?.children ?? []),
+        ...Array.from(shadow?.children ?? []),
         ...Array.from(element.children ?? []),
       ];
       for (let index = descendants.length - 1; index >= 0; index -= 1) stack.push(descendants[index]);
@@ -1841,6 +2290,11 @@
     return root?.host ?? null;
   }
 
+  // Web components' closed roots contain rendered content just like open roots.
+  function elementShadowRoot(element) {
+    return element instanceof HTMLElement ? chrome.dom.openOrClosedShadowRoot(element) : null;
+  }
+
   // A structural address is independent of snapshot budgets and row numbers.
   // Include shadow boundaries and same-tag sibling positions so repeated
   // captures can focus the same place without granting action authority.
@@ -1851,7 +2305,9 @@
       for (let sibling = current.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
         if (sibling.localName === current.localName && sibling.namespaceURI === current.namespaceURI) ordinal++;
       }
-      parts.unshift(`${encodeURIComponent(current.namespaceURI ?? "")}:${encodeURIComponent(current.localName)}[${ordinal}]`);
+      // Most of the read's transport went on this URL repeated at every depth, three times a node: X's text stopped at 8 KB of a 1 MB read.
+      const space = current.namespaceURI === "http://www.w3.org/1999/xhtml" ? "" : `${encodeURIComponent(current.namespaceURI ?? "")}:`;
+      parts.unshift(`${space}${encodeURIComponent(current.localName)}[${ordinal}]`);
       if (current.parentElement) current = current.parentElement;
       else {
         const root = current.getRootNode();

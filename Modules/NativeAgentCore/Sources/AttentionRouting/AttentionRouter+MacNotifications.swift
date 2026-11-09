@@ -110,15 +110,16 @@ public enum NativeAgentNotifications {
             state.stopped = true
             state.watch?.cancel()
             state.watch = nil
+            for post in state.posts.values { post.cancel() }
         }
     }
 
     /// Bind reply routing when posting so a later visible conversation cannot receive another turn's answer.
     public static func postMessage(title: String, body: String, soundName: String? = nil, router: AttentionRouter,
-                                   turn: Turn?, deadline: ContinuousClock.Instant?) async -> NativeAgentNotificationPostResult {
+                                   turn: Turn?, deadline _: ContinuousClock.Instant?) async -> NativeAgentNotificationPostResult {
         let id = "mac_notify:" + UUID().uuidString.lowercased()
-        guard !Task.isCancelled, deadline.map({ ContinuousClock.now < $0 }) != false else {
-            return .from(.notDelivered(reason: "The notification's admission deadline ended"), id: id)
+        guard !Task.isCancelled else {
+            return .from(.notDelivered(reason: "The notification was cancelled before admission"), id: id)
         }
         let finished = ContinuationOnce<NativeAgentNotificationPostResult>()
         let task = Task {
@@ -127,29 +128,41 @@ public enum NativeAgentNotifications {
                     open: turn?.verifiedSessionID.map { "chat:" + $0 },
                     evidence: soundName.map { [.init(source: soundEvidence, id: $0)] } ?? [])
                 let outcome = try await router.tell(matter, reach: .pinned(.mac, from: nil), turn: turn)
+                if let post = outcome.macPost {
+                    finished.resume(post)
+                    return
+                }
                 guard let verdict = outcome.destinationOutcomes["mac"] else {
                     finished.resume(.from(.notDelivered(reason: "The matter has no Mac door"), id: id))
                     return
                 }
-                finished.resume(.from(verdict, id: id, held: outcome.deferredForQuietHours))
+                finished.resume(.from(verdict, id: id))
+            } catch let failure as MacNotificationSettlementFailure {
+                finished.resume(failure.result)
             } catch {
-                finished.resume(.from(.unknown(sent: false, reason: error.localizedDescription), id: id))
+                finished.resume(.from(.unknown(sent: true, reason: error.localizedDescription), id: id))
             }
         }
-        let ceiling = ContinuousClock.now.advanced(by: .seconds(5))
-        let until = deadline.map { min($0, ceiling) } ?? ceiling
-        return await finished.wait(budget: .init(deadline: until), cancellingWith: .from(.unknown(sent: false,
-            reason: "The matter's Mac delivery is still pending"), id: id),
-            onCancel: { if ContinuousClock.now < until { task.cancel() } })
+        return await finished.wait(cancellingWith: .from(.unknown(sent: true,
+            reason: "Waiting on the matter's Mac delivery was cancelled; its door retains the outcome"), id: id),
+            onCancel: { task.cancel() })
     }
 
-    public static func post(title: String, body: String, userInfo: [String: String] = [:], deadline: ContinuousClock.Instant?) {
+    public static func post(title: String, body: String, userInfo: [String: String] = [:], deadline _: ContinuousClock.Instant?) {
         delivery.withLock { state in
             guard !state.stopped else { return }
             let id = UUID()
             state.posts[id] = Task {
-                let result = await postAndReport(title: title, body: body, userInfo: userInfo, deadline: deadline)
-                if let error = result.error { nativeLog("notification %@: %@", result.identifier, error) }
+                let result = await postAndReport(title: title, body: body, userInfo: userInfo, deadline: nil)
+                if let error = result.error {
+                    let failed = Experience(id: "macos.notification:" + result.identifier, kind: .act,
+                        outcome: .init(domain: "macos.notifications", status: result.status,
+                            effects: result.posted ? .occurred : result.status == "unknown" ? .unknown : .none),
+                        face: .init(words: error, artifacts: []))
+                    await ExperienceStore.record(PersistenceCore.defaultDataRoot(), failed.id) { store in
+                        _ = try await store.begin(failed)
+                    }.value
+                }
                 _ = delivery.withLock { $0.posts.removeValue(forKey: id) }
             }
         }
@@ -161,20 +174,21 @@ public enum NativeAgentNotifications {
         body: String,
         userInfo: [String: String] = [:],
         soundName: String? = nil,
-        deadline: ContinuousClock.Instant?
+        deadline _: ContinuousClock.Instant?
     ) async -> NativeAgentNotificationPostResult {
-        await banner(title: title, body: body, userInfo: userInfo, soundName: soundName, identifier: UUID().uuidString.lowercased(),
-                     deadline: deadline)
+        await banner(title: title, body: body, userInfo: userInfo, soundName: soundName, identifier: UUID().uuidString.lowercased())
     }
 
-    /// One post, joined for at most five seconds; an OS callback that lands later is still the post's own (the router settles its door from it).
+    /// The OS callback owns the post's verdict and durable receipt; cancelling observation cannot retract an accepted banner.
     static func banner(title: String, body: String, userInfo: [String: String], soundName: String? = nil, identifier: String,
-                       dataRoot: URL = PersistenceCore.defaultDataRoot(),
-                       deadline outerDeadline: ContinuousClock.Instant? = nil) async -> NativeAgentNotificationPostResult {
+                       dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> NativeAgentNotificationPostResult {
+        guard !Task.isCancelled else {
+            return .from(.notDelivered(reason: "The banner was cancelled before admission"), id: identifier)
+        }
         let finished = ContinuationOnce<NativeAgentNotificationPostResult>()
         let operation = UUID()
         let task: Task<Void, Never>? = delivery.withLock { state in
-            guard !state.stopped, !Task.isCancelled else { return nil }
+            guard !state.stopped else { return nil }
             let task = Task {
                 var info = userInfo
                 info["eventId"] = info["eventId"] ?? identifier
@@ -197,13 +211,17 @@ public enum NativeAgentNotifications {
                         return
                     }
                 }
-                let result = await postAccepted(title: title, body: body, userInfo: info, soundName: sound, identifier: identifier)
+                var result = await postAccepted(title: title, body: body, userInfo: info, soundName: sound, identifier: identifier)
                 if result.posted, userInfo["eventId"] == identifier {
-                    await settle {
+                    let recorded: Result<Void, Error> = await settle {
                         do {
                             try await ForPerson.at(dataRoot).accepted(identifier, .mac,
                                 evidence: .init(source: "macos/notifications", id: identifier))
-                        } catch { nativeLog("Mac banner %@ receipt unavailable: %@", identifier, error.localizedDescription) }
+                            return .success(())
+                        } catch { return .failure(error) }
+                    }
+                    if case .failure(let error) = recorded {
+                        result = result.receiptUnavailable(error)
                     }
                 }
                 finished.resume(result)
@@ -213,11 +231,9 @@ public enum NativeAgentNotifications {
             return task
         }
         guard let task else { return .from(.notDelivered(reason: "Engine shutdown; banner not admitted"), id: identifier) }
-        let ceiling = ContinuousClock.now.advanced(by: .seconds(5))
-        let deadline = outerDeadline.map { min($0, ceiling) } ?? ceiling
-        return await finished.wait(budget: .init(deadline: deadline), cancellingWith: .from(.unknown(sent: false,
-                reason: "Native notification outcome is still pending"), id: identifier),
-                onCancel: { if ContinuousClock.now < deadline { task.cancel() } })
+        return await finished.wait(cancellingWith: .from(.unknown(sent: true,
+                reason: "Waiting on macOS notification acceptance was cancelled; OS acceptance remains unconfirmed"), id: identifier),
+                onCancel: { task.cancel() })
     }
 
     public static func notificationSettings() async -> UNNotificationSettings {

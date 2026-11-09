@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import ProviderRouting
 import MacIntegration
 import MacControl
 // Blueprint: | `SwiftToolDispatcher+InlineInteraction.swift` | `SwiftToolDispatcher`: `impl_request_interaction` |
@@ -264,7 +265,10 @@ extension SwiftToolDispatcher {
             let only = input["only"] == .bool(true)
             let stops = only ? keptHosts.filter { !hosts.contains($0) } + keptPrograms.filter { !programs.contains($0) }.map { "program " + $0 } : []
             // Expired, revoked or unwanted: replace asks again; the kept value stays until the new one is.
-            if input["replace"] != .bool(true), stops.isEmpty, Keyring.granted(name, hosts: hosts, programs: programs) {
+            let granted: Bool
+            do { granted = try kept.map { try Keyring.granted($0, hosts: hosts, programs: programs) } ?? false }
+            catch { return failed("unavailable", error.localizedDescription) }
+            if input["replace"] != .bool(true), stops.isEmpty, granted {
                 return .object(["status": .string("ok"), "already_done": .bool(true), "effects": .string("none"),
                     "summary": .string("Secret \(name) is already kept for \((hosts + programs.map { "program " + $0 }).joined(separator: ", "))"
                         + "\(kept?.account.map { " (account \($0))" } ?? ""); no card is needed. "

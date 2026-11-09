@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -6,6 +7,7 @@ import ProviderRouting
 import ChatTurnContracts
 import ChatSessionWork
 import ChatToolParsing
+import ChatToolRuntime
 import Transcripts
 import ToolRegistry
 import TurnTrace
@@ -13,7 +15,7 @@ import Dispatcher
 import PersonaEngine
 import AgentWorkspace
 import os
-// Blueprint: | `StandingBotModel.swift` | `Expansion.withTurn`; Helper-owned measured replay and paragraph deltas |
+// Blueprint: | `StandingBotModel.swift` | `Expansion.withTurn`; Helper-owned measured conversation replay |
 
 extension SwiftNativeChatOrchestrationClient {
     func runStandingBot(_ bot: BotDefinition, message: String, choice: ProviderTurnChoice,
@@ -33,10 +35,11 @@ extension SwiftNativeChatOrchestrationClient {
         let choices = ReplyChoices()
         let turn = turn.with(\.execution, execution).with(\.replyChoices, choices).with(\.run, run)
             .with(\.session, bot.sessionID).with(\.userText, message).with(\.fileAccess, fileAccess)
+        return try await ProviderToolResultPage.holding(turn: turn, sessionId: bot.sessionID) { turn in
         let envelope = turn.envelope
         let deliverySurface = turn.replyRoute?.surface ?? "bot"
         let taint = turn.peerSteering
-        let dispatcher = makeTracedGatedDispatcher(fileAccess: fileAccess, verifiedSessionId: bot.sessionID,work: work)
+        let dispatcher = await makeTracedGatedDispatcher(fileAccess: fileAccess, verifiedSessionId: bot.sessionID, work: work)
         let schemas = try await dispatcher.listAvailableToolSchemas(named: ["app"], turn: turn, surface: "bot")
         let codec = try ToolCallCodec.forProvider(choice.provider)
         let providerNames = ProviderToolNameMap(schemas)
@@ -70,7 +73,6 @@ extension SwiftNativeChatOrchestrationClient {
             throw ProviderRoutingError.configurationFailed("The helper model's default window is unavailable.")
         }
         var messages: [LLMMessage] = []
-        var replayedContexts: [SentTurnContext] = []
         var historyRowCharacters: [String: Int] = [:]
         var historySnapshot: SessionHistoryTail?
         var contextWindow = "0:"
@@ -78,7 +80,6 @@ extension SwiftNativeChatOrchestrationClient {
             messages: rows, historyLimit: historyLimit, budget: historyBudget) {
             let projected = SessionHistoryMessages.project(admitted)
             messages = projected.messages
-            replayedContexts = projected.replayedContexts
             historyRowCharacters = projected.rowCharacters
             historySnapshot = SessionHistoryTail(admitted, rowCharacters: projected.rowCharacters)
             contextWindow = projected.contextWindow
@@ -106,7 +107,6 @@ extension SwiftNativeChatOrchestrationClient {
             imageBlocks: input.imageBlocks, historyMessages: messages,
             turnReach: TurnReach())
             .composing(SystemPromptSegments(stable: system, dynamic: contactThread), tools: nil)
-        context.replayedTurnContexts = replayedContexts
         context.historyContextWindow = contextWindow
         context.historyRowCharacters = historyRowCharacters
         context.historyReplaySpec = SessionReplaySpec(historyLimit: historyLimit,
@@ -135,7 +135,6 @@ extension SwiftNativeChatOrchestrationClient {
         modelCall.withinTurnReuse = true
         modelCall.prefixMeasurement = prefix
         let call = modelCall
-        let savedUserMessageID = replacingUserID
         let roundPrefix = OSAllocatedUnfairLock(initialState: (context, seed))
         let execute: @Sendable (Turn, LLMCall, ChatTurnWork) async throws -> BotTurnReply = { [self] turn, call, work in
             try await BotTurnRunner.run(bot: bot, messages: seed.messages, system: layout.system,
@@ -149,10 +148,6 @@ extension SwiftNativeChatOrchestrationClient {
                     let nextContext = try await self.fitSessionRequest(previousContext, codec: codec,
                         additionalMessages: encoded, sessionId: bot.sessionID, surface: "bot", runId: run, progress: progress, turn: turn)
                     let nextRequest = try ConversationPrefixSeeding.request(nextContext, codec: codec, turn: turn).appending(additional)
-                    if nextContext.historyContextWindow != previousContext.historyContextWindow {
-                        await nextRequest.seed.sentContext.persist(sessionID: bot.sessionID, runID: run,
-                            userMessageID: savedUserMessageID, dataRoot: self.dataRoot)
-                    }
                     roundPrefix.withLock { $0 = (nextContext, nextRequest.seed) }
                     let measure: @Sendable ([LLMMessage]) async throws -> SessionContextMeasurement = { candidate in
                         let wire = try codec.providerMessages(candidate, records: records, schemas: schemas, turn: turn)
@@ -213,9 +208,8 @@ extension SwiftNativeChatOrchestrationClient {
                     if let refusal = SwiftNativeTurnEngine.modelCallRefusal(
                         name: CanonicalToolNameDispatcher.canonical(call.name), input: call.input,
                         providerTools: providerNames) {
-                        result = refusal
-                        ChatToolDispatchTracer.traceUndispatched(turn: turn, tool: call.name, input: call.input,
-                            surface: "bot", result: refusal)
+                        result = await ChatToolDispatchTracer.traceUndispatched(turn: turn, tool: call.name, input: call.input,
+                            surface: "bot", result: refusal, dataRoot: dataRoot)
                     } else {
                         do {
                             result = try await holding(work.with(\.imageSink, sink)) { work in
@@ -226,9 +220,13 @@ extension SwiftNativeChatOrchestrationClient {
                         catch is CancellationError { throw CancellationError() }
                         catch { result = ChatToolOutcome.failure(error: error, tool: call.name) }
                     }
-                    let reply = ToolResult(result)
+                    // Use the same model-receipt owner as resident turns before keeping this call in the turn's records.
+                    let translated = ToolNameAliases.appCallPointers(result)
+                    let reply = ToolResult(SwiftNativeTurnEngine.repeatedReceipt(translated, name: call.name, input: call.input,
+                        priorDispatches: execution.toolRecords, appDoor: true))
+                    SwiftNativeTurnEngine.traceRepeatedReceipt(reply.payload, original: translated, tool: call.name, turn: turn)
                     let ran = ToolNameAliases.ranCall(call.name, input: call.input)
-                    execution.keepTools([ToolDispatchRecord(id: call.id, name: call.name, input: call.input, ranCall: ran, result: result)])
+                    execution.keepTools([ToolDispatchRecord(id: call.id, name: call.name, input: call.input, ranCall: ran, result: reply.payload)])
                     let saved = await settle { () -> Result<Void, Error> in
                         do {
                             try await holding(turn.with(\.envelope, envelope)) { turn in
@@ -243,7 +241,7 @@ extension SwiftNativeChatOrchestrationClient {
                         } catch { return .failure(error) }
                     }
                     try saved.get()
-                    await progress?(.toolResult(name: call.name, output: result))
+                    await progress?(.toolResult(name: call.name, output: reply.payload))
                     return (reply.payload, sink?.finish(success: ChatToolOutcome.outputLooksSuccessful(reply.payload,
                         verdict: reply.outcome) && !Task.isCancelled) ?? [])
                 }, waiting: { result in
@@ -297,6 +295,6 @@ extension SwiftNativeChatOrchestrationClient {
                 }
             }
         }
-        } } }
+        } } } }
     }
 }

@@ -184,33 +184,11 @@ extension SwiftNativeTelegramBot {
         var afterReplySent: (@Sendable () -> Void)?
         let reply = try await { () async throws -> String? in
         switch command.definition.handler {
-        case .status:
-            // Programmatic status reports the selected model and connection; the poll loop owns live-turn status.
-            let s = try await self.getStatus()
-            let up = (s.enabled ?? false) && (s.tokenConfigured ?? false)
-            guard let partFace else { return "Telegram progress part unavailable: the originating app door is not bound." }
-            let model: String? = try await telegramPlainModelPhrase()
-            let approvals = await approvalStatus(destination: destination)
-            let face = await TelegramProgressFace(dataRoot: dataRoot, call: partFace)
-            let reply = await face.text(input: .object([
-                "kind": .string("connection"), "connected": .bool(up),
-                "model": .object(["status": .string(model == nil ? "unavailable" : "available"),
-                    "phrase": model.map(JSONValue.string) ?? .null]),
-                "approvals": approvals
-            ]), row: "status")
-            await face.close()
-            return reply + (up && model == nil ? " Next-turn model is unavailable." : "")
-                + (up && approvals.objectValue?["status"] == .string("unavailable")
-                ? " Approval status is unavailable; check the pending buttons or Desk in the Mac app." : "")
         case .new:
             let sessionId = try await TelegramSessionStore(dataRoot: dataRoot).startNewSession(destination: destination)
             return "Started new Telegram conversation: \(sessionId)"
         case .session:
             return try await dispatchSessionCommand(args: args, destination: destination)
-        case .stop:
-            return "No Telegram turn is running for this chat."
-        case .retry:
-            return "Retry is handled by the live Telegram poll loop."
         case .sessions:
             let sessions = try await TelegramSessionStore(dataRoot: dataRoot)
                 .recentSessions(destination: destination, fromUserId: fromUserId, limit: 8)
@@ -339,7 +317,8 @@ extension SwiftNativeTelegramBot {
             )
             afterReplySent = outcome.afterReplySent
             return outcome.reply
-        case .approve, .deny:
+        case .status, .stop, .retry, .approve, .deny:
+            // The poll loop answers these before dispatch; none reaches here.
             return nil
         }
         }()

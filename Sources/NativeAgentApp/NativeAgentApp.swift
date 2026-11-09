@@ -12,6 +12,7 @@ import Privacy
 import SchedulerExecution
 import Foundation
 import AttentionRouting
+import Experiences
 import ChromeControl
 import Cognition
 import CognitiveSubstrate
@@ -79,7 +80,9 @@ final class NativeAgentHotkeyBootstrap {
                 stopCapture: { await voice.stopListeningResult() },
                 discardCapture: { voice.discardListening() },
                 submitTurn: { transcript in
-                    await appModel.sendChat(transcript, attachments: voice.attachment.map { [$0] } ?? [])
+                    // The spoken turn goes to the conversation the window shows.
+                    let shown = (try? BodyFacePresentation.current(model: appModel))?.scene?.selectedSession
+                    return await appModel.sendChat(transcript, attachments: voice.attachment.map { [$0] } ?? [], sessionId: shown)
                 },
                 reportUnavailable: { message in
                     appModel.statusText = "Voice input unavailable: \(message)"
@@ -94,10 +97,6 @@ final class NativeAgentHotkeyBootstrap {
         }
         hotkeyManager.onOpenWindow = {
             Task { @MainActor in
-                NSApp.activate()
-                NSApp.windows
-                    .first { $0.identifier?.rawValue.contains("main") == true }?
-                    .makeKeyAndOrderFront(nil)
                 ApplicationLifetime.shared.request(.sidebar(.chat))
             }
         }
@@ -233,10 +232,6 @@ struct AppBackgroundWorkHost: EngineBackgroundWorkHost {
 struct NativeAgentApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var coordinator = ApplicationLifetime.shared
-    @State private var updateController = UpdateController.shared
-    @AppStorage("nativeagent.darkMode") private var preferDarkAppearance = true
-    @State private var appearance = AppearanceController.shared
-    @AppStorage(HazeColor.key) private var hazeRaw = HazeColor.defaultValue.rawValue
 
     init() {
         // CoreGraphics reads the preference at process startup, so changes require relaunch.
@@ -260,7 +255,22 @@ struct NativeAgentApp: App {
         SensesAssembly.install(dataRoot: dataRoot)
         await NativeAgentEngine.installBotProviderCheck()
         let appModel = AppModel()
-
+        let settingsActs = BodySettingsActHandler(appModel: appModel)
+        settingsActs.configure()
+        do { try await appModel.engine.faceActs.installPlatform(settingsActs) }
+        catch {
+            appModel.setFailureStatus(error, action: "install the body settings owner")
+            return false
+        }
+        // The window is its own process; her body never draws one.
+        do {
+            try AppDelegate.installFaceProcess(dataRoot: dataRoot, source: appModel.engine.face,
+                handler: appModel.engine.faceActs, services: settingsActs)
+            try await AppDelegate.openFaceWindow()
+        } catch {
+            appModel.setFailureStatus(error, action: "open the window")
+            AppDelegate.presentFaceUnavailable(error)
+        }
 
         MacWorkContinuation.capture = { text, taskReference in
             await appModel.captureMacWorkContinuation(text, taskReference: taskReference)
@@ -289,84 +299,6 @@ struct NativeAgentApp: App {
     }
 
     var body: some Scene {
-        // Window keeps the main scene single-instance across open requests.
-        Window("NativeAgent", id: ApplicationLifetime.mainSceneID) {
-            Group {
-                if let appModel = coordinator.appModel {
-                    MainWindowContent().environment(appModel)
-                } else {
-                    Color.clear
-                }
-            }
-                .navigationTitle(coordinator.appModel?.agentAddressName ?? "NativeAgent")
-                .preferredColorScheme(appearance.colorScheme)
-                .tint(HazeColor(stored: hazeRaw).windowTint(dark: appearance.colorScheme == .dark))
-                .onChange(of: preferDarkAppearance, initial: true) { _, dark in
-                    appearance.setPreferDark(dark)
-                }
-                .frame(minWidth: 1040, minHeight: 680)
-                .onOpenURL { url in
-                    if url.scheme == "nativeagent", url.host == "oauth" {
-                        _ = NativeOAuthFlow.handleCallbackURL(url)
-                    }
-                }
-        }
-        .windowStyle(.hiddenTitleBar)
-        .commands {
-            ChatFocusedCommands()
-            if let appModel = coordinator.appModel { ShellViewCommands(appModel: appModel) }
-            CommandGroup(after: .appInfo) {
-                Button(updateController.menuTitle) {
-                    updateController.checkForUpdates()
-                }
-            }
-            CommandGroup(after: .appInfo) {
-                Button("Refresh status") {
-                    Task { await coordinator.appModel?.refreshAll() }
-                }
-                .disabled(coordinator.appModel == nil)
-                .keyboardShortcut("r", modifiers: [.command])
-            }
-            // Route Command-comma to the main Settings page so there is only one settings owner.
-            CommandGroup(replacing: .appSettings) {
-                Button("Settings…") { SettingsLink.open(.settings) }
-                    .keyboardShortcut(",", modifiers: .command)
-            }
-            CommandGroup(after: .windowList) {
-                Button("Browser") {
-                    BrowserWindowController.shared.showWindow()
-                }
-                .disabled(coordinator.appModel == nil)
-                .keyboardShortcut("b", modifiers: [.command, .option])
-            }
-            CommandMenu("Navigate") {
-                Button("Command palette…") {
-                    NotificationCenter.default.post(name: .openCommandPaletteRequest, object: nil)
-                }
-                .keyboardShortcut("k", modifiers: .command)
-                Divider()
-                // Derive shortcuts from rail order so navigation cannot drift into a second list.
-                if let appModel = coordinator.appModel {
-                    ForEach(NavigateMenuPresentation.entries(appModel.engine.layout.availability)) { entry in
-                        Button(entry.title) {
-                            ApplicationLifetime.shared.request(.sidebar(entry.item))
-                        }
-                        .keyboardShortcut(entry.shortcut.map {
-                            KeyboardShortcut(KeyEquivalent($0), modifiers: .command)
-                        })
-                    }
-                    if let failure = appModel.engine.layout.availability.failure {
-                        Text(failure.localizedDescription)
-                    }
-                }
-                Button("Knowledge graph") { ApplicationLifetime.shared.request(.sidebar(.knowledge)) }
-                Divider()
-                Button("Approvals") { ApplicationLifetime.shared.request(.activity(.approvals)) }
-                    .keyboardShortcut("a", modifiers: [.command, .shift])
-                Button("Inbox") { ApplicationLifetime.shared.request(.activity(.inbox)) }
-                    .keyboardShortcut("i", modifiers: [.command, .shift])
-            }
-        }
 
         MenuBarExtra("NativeAgent", systemImage: "brain.head.profile") {
             MenuBarOpenButton()
@@ -390,18 +322,15 @@ struct NativeAgentApp: App {
             Divider()
             Button("Restart app", systemImage: "arrow.triangle.2.circlepath") {
                 AppRelaunch.relaunchApp(
-                    terminate: {
-                        RunLoop.main.perform(inModes: [.common]) {
-                            MainActor.assumeIsolated { NSApplication.shared.terminate(nil) }
-                        }
-                    },
+                    terminate: AppDelegate.terminateFromRunLoop,
                     onSpawnFailure: {
                         ModuleLog.app("[relaunch] failed to spawn relaunch helper for %@: %@", Bundle.main.bundlePath, "\($0)")
                     })
             }
             Divider()
             if let appModel = coordinator.appModel {
-                Text(MenuBarStatusPresentation.line(statusText: appModel.statusText, health: appModel.engine.doctor.health))
+                Text(MenuBarStatusPresentation.line(statusText: appModel.statusText,
+                    health: appModel.face.slot(.counts).select("health", as: CountsFace.self) { $0?.statuses.health }))
             }
         }
 
@@ -410,32 +339,48 @@ struct NativeAgentApp: App {
             systemImage: "record.circle",
             isInserted: activityCaptureIndicatorBinding
         ) {
-            ActivityCaptureMenuBarContent()
+            if let appModel = coordinator.appModel { ActivityCaptureMenuBarContent(appModel: appModel) }
         }
     }
 
     /// MenuBarExtra requires a writable binding; ignore writes so its recording indicator cannot disappear while capture continues.
     private var activityCaptureIndicatorBinding: Binding<Bool> {
         Binding(
-            get: { coordinator.appModel?.engine.activityWatch.isCapturing == true },
+            get: {
+                coordinator.appModel?.face.slot(.counts).select("capture.recording", as: CountsFace.self) {
+                    $0?.statuses.capture?.isCapturing
+                } == true
+            },
             set: { _ in }
         )
     }
 }
 
 private struct ActivityCaptureMenuBarContent: View {
-    private var controller: ActivityWatchController { NativeAgentEngine.live.activityWatch }
+    let appModel: AppModel
+
+    private var capture: ActivityCaptureFace? {
+        appModel.face.slot(.counts).select("capture", as: CountsFace.self) { $0?.statuses.capture }
+    }
 
     var body: some View {
-        Text("Recording which apps you use — app name and duration"
-             + (controller.policy.captureTitles && !controller.policy.appNameOnlyMode
-                ? ", plus window titles." : ", no window titles."))
+        if let capture {
+            switch capture.availability {
+            case .reading: Text("Reading the activity capture policy…")
+            case .unavailable(let issue): Text("Activity capture policy is unavailable. \(issue)")
+            case .available:
+                Text("Recording which apps you use — app name and duration"
+                    + (capture.capturesTitles ? ", plus window titles." : ", no window titles."))
+            }
+        } else {
+            Text("Waiting for activity capture status…")
+        }
         Divider()
         Button("Stop recording", systemImage: "stop.circle") {
-            Task { await controller.setCaptureEnabled(false) }
+            Task { await appModel.engine.activityWatch.setCaptureEnabled(false) }
         }
         Button("Activity settings…", systemImage: "gear") {
-            SettingsLink.open(.trust, tab: TrustTab.features.rawValue)
+            SettingsLink.open(.trust)
         }
     }
 }
@@ -543,20 +488,8 @@ private struct AppDeviceSyncPlatform: EngineDeviceSyncPlatform {
         }
         return AppQuietSettingsHost(appModel)
     }
-    @MainActor var oauthPlatform: any NativeOAuthPlatformPort.Type { NativeOAuthPlatform.self }
+    @MainActor var oauthPlatform: any NativeOAuthPlatformPort.Type { BodyOAuthPlatform.self }
     @MainActor func adoptProvider(_ id: String) async { await ApplicationLifetime.shared.appModel?.adoptProviderForBlankSurfaces(id) }
-    func inboxAction(_ id: String, action: String) async throws {
-        // DeviceSync admits this signed phone command without a turn or device id in this port.
-        let turn = TurnRequest(message: "", sessionID: nil, surface: "ios",
-            envelope: TurnEnvelope(surface: "ios")).turn()
-        try await InboxCardActions.perform(id, action: action,
-            dataRootOverride: nil, turn: turn,
-            effects: AppInboxCardActionEffects(inbox: NativeAgentEngine.live.inbox))
-    }
-    @MainActor func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String] {
-        try await InteractionCardDelivery.answer(payload: payload, actionID: actionID, clientID: clientID,
-                                                dataRoot: PersistenceCore.defaultDataRoot())
-    }
     @MainActor func runMacControl(path: String, bodyData: Data, turn: Turn, context: MacOperationContext) async throws -> JSONValue {
         try await TrustCenterMacControlPolicyProvider.run(path: path, bodyData: bodyData,
             dataRoot: PersistenceCore.defaultDataRoot(), turn: turn, context: context)
@@ -585,26 +518,28 @@ extension AttentionRouter {
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { await router.watch() }
                 group.addTask {
-                    do { _ = try await AttentionRouter.release(dataRoot: root, router: router, retrying: true) }
-                    catch { ModuleLog.app("Delivery at launch remains owed: %@", error.localizedDescription) }
+                    await releaseDelivery("launch", root: root, router: router)
+                    guard !Task.isCancelled else { return }
                     for await up in NetworkSense.changes where up {
                         guard !Task.isCancelled else { return }
-                        do { _ = try await AttentionRouter.release(dataRoot: root, router: router, retrying: true) }
-                        catch { ModuleLog.app("Delivery after network return remains owed: %@", error.localizedDescription) }
+                        await releaseDelivery("network", root: root, router: router)
                     }
                 }
                 group.addTask {
                     var previous: JSONValue?
-                    do { previous = try deliveryConfiguration(root) }
-                    catch { ModuleLog.app("Delivery configuration unavailable: %@", error.localizedDescription) }
+                    do { previous = try await readDeliveryConfiguration(root) }
+                    catch { await recordDeliveryFailure("configuration", operation: "attention.delivery.configuration",
+                                                       cause: error.localizedDescription, root: root) }
                     for await _ in doors {
                         guard !Task.isCancelled else { return }
                         do {
-                            let current = try deliveryConfiguration(root)
+                            let current = try await readDeliveryConfiguration(root)
                             guard current != previous else { continue }
                             previous = current
-                            _ = try await AttentionRouter.release(dataRoot: root, router: router, retrying: true)
-                        } catch { ModuleLog.app("Delivery after configuration change remains owed: %@", error.localizedDescription) }
+                            await releaseDelivery("configuration", root: root, router: router)
+                        } catch is CancellationError { return }
+                        catch { await recordDeliveryFailure("configuration", operation: "attention.delivery.configuration",
+                                                           cause: error.localizedDescription, root: root) }
                     }
                 }
                 await group.waitForAll()
@@ -612,6 +547,44 @@ extension AttentionRouter {
         })
         return router
     }()
+
+    @concurrent nonisolated private static func releaseDelivery(_ phase: String, root: URL, router: AttentionRouter) async {
+        do {
+            _ = try await AttentionRouter.release(dataRoot: root, router: router, retrying: true)
+            await RepairOwed.settle(root, operation: "attention.delivery.release",
+                                   evidence: .init(source: "attention.delivery", id: UUID().uuidString.lowercased())).value
+        } catch is CancellationError { return }
+        catch { await recordDeliveryFailure(phase, operation: "attention.delivery.release", cause: error.localizedDescription, root: root) }
+    }
+
+    @concurrent nonisolated private static func readDeliveryConfiguration(_ root: URL) async throws -> JSONValue {
+        let configuration = try deliveryConfiguration(root)
+        await RepairOwed.settle(root, operation: "attention.delivery.configuration",
+                               evidence: .init(source: "attention.delivery.configuration", id: UUID().uuidString.lowercased())).value
+        return configuration
+    }
+
+    @concurrent nonisolated private static func recordDeliveryFailure(_ phase: String, operation: String, cause: String, root: URL) async {
+        let owner = "attention.delivery"
+        let words = "Delivery failed during " + phase + "; effects are unknown. Delivery remains owed: "
+            + TurnSecretRedactor.redactDisplayText(cause)
+            + ". Inspect the named door or experience store and reconcile unknown deliveries before sending again."
+        await ExperienceStore.record(root, "repair:" + operation) { store in
+            let open = try await RepairOwed.openDebt(store, operation: operation, owner: owner)
+            let id = open?.id ?? ("attention.delivery." + phase + ":" + UUID().uuidString.lowercased())
+            let face = Experience.Face(words: words, artifacts: [],
+                                       row: .init(id: id, title: "Delivery needs repair", detail: words, tone: .failed), from: owner)
+            if let open {
+                try await store.append([.face(face)], to: open.id)
+            } else {
+                let failed = Experience(id: id, kind: .message, cause: ["attention.delivery." + phase],
+                    face: face, addressedTo: ["person", "self"], owes: ["repair": .init(to: "self")],
+                    claims: RepairDebt(owner: owner, operation: operation, lever: words).claims
+                        + [.init(claim: "Delivery attempt failed; effects unknown.", evidence: [])])
+                _ = try await store.begin(failed)
+            }
+        }.value
+    }
 
     /// Observe door identity, excluding registration heartbeats and work-activity updates.
     private static func deliveryConfiguration(_ root: URL) throws -> JSONValue {
