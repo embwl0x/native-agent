@@ -25,6 +25,7 @@ public struct MacChatTurnActivity: Sendable, Equatable {
     public let delegateDisplayName: String?
     public let outcome: TurnPresentationActivity.Outcome?
     public let occurredAt: Date
+    /// The call a use starts or a result ends; results meet their use by this name in arrival order.
     public let callName: String?
 }
 
@@ -99,7 +100,7 @@ public enum MacChatTurnActivityBoundary {
 
     /// Stopped and unconfirmed results carry no outcome: neither is a success
     /// nor a failure, and their words already say which they are.
-    private static func toolResult(
+    static func toolResult(
         name: String,
         result: ChatToolOutcome.ExactResultClass,
         identity: MacChatTurnIdentity,
@@ -120,7 +121,7 @@ public enum MacChatTurnActivityBoundary {
             delegateDisplayName: nil,
             outcome: outcome,
             occurredAt: instant,
-            callName: nil
+            callName: name
         )
     }
 

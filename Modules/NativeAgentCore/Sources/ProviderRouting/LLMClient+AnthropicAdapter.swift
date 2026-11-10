@@ -20,7 +20,7 @@ public final class AnthropicTransport: LLMTransport {
     let firstPartyAnthropicToolContract: Bool
     let telemetry: LLMCallTraceRecorder
     /// Thinking replay is memory-only and bounded by tool-call identity.
-    let thinkingLedger = ToolCallReplayLedger<[AnthropicThinkingBlock]>()
+    let thinkingLedger = ToolCallReplayLedger<AnthropicThinkingRecord>()
 
     /// Meta's opaque reasoning uses the same Messages blocks and tool-call ledger as Anthropic.
     var replaysThinking: Bool { firstPartyAnthropicToolContract || providerId == "meta" }

@@ -897,7 +897,8 @@ Meta's pay-as-you-go API-key route offers Muse Wonder 1.0 and Muse Spark 1.3
 through the shared Anthropic-format Messages transport, native streamed tools,
 client-side text/tool history and low/medium/high/xhigh effort controls. Returned
 thinking blocks replay across tool rounds through the shared bounded in-memory
-ledger; they are not persisted in conversation history. Providers, onboarding and the iPhone read the same shipped catalog
+ledger, only while the model, system, tools and earlier messages are the ones that
+produced them; they are not persisted in conversation history. Providers, onboarding and the iPhone read the same shipped catalog
 and checked routing; keys are entered on
 the Mac. See [Meta setup and limits](USER_GUIDE.md#meta-model-api).
 

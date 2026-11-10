@@ -81,7 +81,11 @@ private struct MakeVersionPage: View {
                     return AnyView(Text("This preview does not match its owner's current resource grant.").foregroundStyle(.red))
                 })
             }.padding(12)
-        }.modifier(FaceObservation(demand: .key(key)))
+        }
+        // A picture fitted to the width gets shorter as the page narrows. A scroll bar that takes width would then appear, narrow the
+        // page, stop being needed, hide, and be needed again without end; this page scrolls without one.
+        .scrollIndicators(.never)
+        .modifier(FaceObservation(demand: .key(key)))
     }
 
     private var door: ClosureFaceDoor {

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import NativeAgentShared
 import NativeAgentCore
 import os
@@ -504,6 +505,13 @@ public final class SwiftNativeLLMClient: LLMClient {
                 let requestBytes = LLMMessage.inputBytes(messages, system: system, tools: tools ?? [])
                 let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
                 recorded.withLock { $0.requestBytes = requestBytes }
+                // What the provider's prefix cache sees, without the words: the scope and the request's first 2k and 8k bytes, hashed.
+                let front = Data(((system ?? "") + messages.flatMap(\.content).compactMap { block -> String? in
+                    if case .text(let text) = block { return text }; return nil
+                }.joined()).utf8)
+                let requestFront = [Data((call.session ?? "").utf8), front.prefix(2_000), front.prefix(8_000)]
+                    .map { SHA256.hash(data: $0).prefix(4).map { String(format: "%02x", $0) }.joined() }.joined(separator: ":")
+                recorded.withLock { $0.requestFront = requestFront }
                 do {
                     if !call.requestShapeUnmeasured, call.conversationRequest {
                         recorded.withLock {

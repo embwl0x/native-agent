@@ -153,7 +153,10 @@ final class PipeFaceClient: FaceClient {
                             if case .closeRenderer = call {
                                 await end(FaceWireError.disconnected, bodyGone: true)
                             }
-                        } catch { await end(error) }
+                        } catch {
+                            // A call the body cancelled owes no reply; its cancellation is that call's end, never the connection's.
+                            if !Task.isCancelled { await end(error) }
+                        }
                         calls.removeValue(forKey: id)
                     }
                 case .act, .reply: throw FaceWireError.invalidFeedOrder

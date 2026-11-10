@@ -185,10 +185,11 @@ public actor MacChatTurnTranscriptProofReader {
             let canceled = try strictBoolean(metadata["cancelled"])
             switch receipt.responsePersistence {
             case "persisted" where !partial && !canceled:
-                // Persisted answers include provider failures and pending cards, so need completion evidence.
-                switch metadata["completionState"] {
-                case .string("completed")?: return .completed
-                case .string("incomplete")?: return .incomplete
+                // Persisted answers include provider failures and pending cards, so need completion evidence. A row that carries the
+                // turn's settled terminal state is read by it, as the live lifecycle is: a reply that ended on a pending card is waiting.
+                switch (metadata["terminalState"], metadata["completionState"]) {
+                case (.string("completed")?, .string("completed")?), (nil, .string("completed")?): return .completed
+                case (_, .string?): return .incomplete
                 default: return .absent
                 }
             case "failed" where !partial && !canceled:

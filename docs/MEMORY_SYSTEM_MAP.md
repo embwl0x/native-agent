@@ -58,11 +58,10 @@ owner evidence rather than labeling the refusal an attempted write.
 | `PersistenceCore/MemoryRoot.swift`, `MemoryV2/MemoryDataProvenance.swift` | The current root type, union and lines; each write adds its root with the steer read from roots. |
 | `MemoryV2/MemoryStorage+Proposals.swift`, `MemoryStorage+Tombstones.swift` | Proposal acceptance/rejection and suppression of rejected or forgotten content. |
 | `MemoryV2/MemoryStorage+Recall.swift`, `MemoryRecallScoring.swift` | Cached recall candidates and vector/lexical scoring. Raw BM25 mathematics are shared with earlier-session snippets; memory normalizes by the maximum and weights at one standard deviation of the query's dense similarities (`lexicalBoostWeight`). Each caller owns tokenization, its candidate cohort and ranking. |
-| `MemoryV2/MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live journal-only interpretation: User's own turns judge now unless a complete-no-op claim stands; other recorded turns stay owed for a batch. Writes meaning before applying and keeps facts by operation identity. Keeps trusted facts, stages the rest. Deferral and labels follow [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation). |
-| `MemoryV2/AdaptiveMemoryPromoter+Recovery.swift` | The same promoter's owed-turn recovery on its live serialization tail: replay from the complete recorded carriers (`carriedSources`), with answered decisions separate and Trust read live; missing completeness retains the recorded checkpoint plus an unknown boundary. Fair retries and bounded wake/idle/night batches with judgment settlement. |
-| `MemoryV2/AfterTurnMemorySurprise.swift`, `AfterTurnSurpriseLedger.swift` | The agent's own learned complete no-op prediction (language-independent warm-vector precedents, keyed by agent, memory model and detector), stable precedent claims and their labelled record; `NativeAgentCore/Expectation.swift` owns Wilson-bound cost standing. See [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation). |
-| `ChatTurnRuntime/MindMemoryManager.swift` | At most one shared model interpretation per turn, returning memories, affect, a caring judgment, what moved their (cares), optional reply promises and person-quoted settlements against shown open moments, or one call for a batch of owed turns (the rules once, one section per turn; a missing section stays owed); its checked route key scopes the prediction record. Promise matching runs separately only for uncaptured candidates, without person words. |
-| `MemoryV2/AdaptiveMemoryPromises.swift` | Files [promises](INTENTIONS.md#promises-they-makes) and person-quoted settlements on the canonical Desk. |
+| `MemoryV2/MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live journal-only interpretation: User's own turns are judged at once; other recorded turns stay owed and are judged alone when they are idle. Writes meaning before applying and keeps facts by operation identity. Keeps trusted facts, stages the rest. Deferral follows [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation). |
+| `MemoryV2/AdaptiveMemoryPromoter+Recovery.swift` | The same promoter's owed-turn recovery on its live serialization tail: replay from the complete recorded carriers (`carriedSources`), with answered decisions separate and Trust read live; missing completeness retains the recorded checkpoint plus an unknown boundary. Fair retries and wake/idle/night drains that judge one owed moment at a time, with judgment settlement. |
+| `ChatTurnRuntime/MindMemoryManager.swift` | At most one shared model interpretation per turn, returning memories, affect, caring, cares, optional reply promises and evidence-backed done/let-go settlements (person words, act or delivered reply) against shown open moments. One prompt for every moment, its unchanging text first so the provider caches it. Its route key identifies the provider wait of an owed moment. Promise matching runs separately only for uncaptured candidates, without settlement authority. |
+| `MemoryV2/AdaptiveMemoryPromises.swift` | Reads turn-owned successful dispatch evidence; files [promises](INTENTIONS.md#promises-they-makes) and checked done/let-go settlements on the canonical Desk. |
 | `MemoryV2/KnowledgeGraph+MemoryIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: ordered per-memory entity, edge and support projection into the shared SQLite database. |
 | `MemoryV2/KnowledgeGraph+StudioRelations.swift`, `KnowledgeGraph+GrowthDistillation.swift`, `KnowledgeGraph+SQLite.swift` | Studio journal and REM/GROWTH eviction graph sources, preserved by memory rebuilds; checked canonical SQLite reads. |
 | `MemoryV2/MemoryV2+EmbeddingRuntime.swift`, `MemoryStorage+EmbeddingEpoch.swift` | Embedding convergence and persistent derived action-vector fill/lookup for AppToolRuntime. |
@@ -286,12 +285,14 @@ incoming message, available reply, bounded existing/pending memories and the
 speaker's name. Bridge peers are named as peers. Helper-owned turns use their
 own runner; the agent's own work (`builder`, the mind stream among it) skips resident memory
 interpretation except for a [thought about a care](SUBCONSCIOUS.md#a-thought-about-a-care), read only
-against its named care, only the agent's side, in the existing deferred batch.
+against its named care, only the agent's side, as an owed moment judged when they are idle.
+Any turn without an incoming message (their own work, returns, approval
+continuations, ephemeral turns) that completed an act while a MY QUEUE moment was
+open is judged for settlement alone (`settlesOnly`: no memories, promises or cares;
+see [lived moments](SUBCONSCIOUS.md#lived-moments)).
 Session ownership comes from the [recorded row](session-conversations.md),
 never an ID prefix.
 The model follows [judgment routing](COGNITION_WIRING.md#shared-after-turn-interpretation).
-The [shared interpretation contract](COGNITION_WIRING.md#shared-after-turn-interpretation)
-owns surprise-ledger cost accounting.
 
 The interpretation returns fact decisions, affect deltas, a caring judgment and,
 when their cares are shown, what moved their (see [Moments are care story](#moments-are-care-story)).
@@ -315,12 +316,16 @@ without re-judgment or invented evidence. The current saved meaning requires its
 Model replies may omit that optional section or supply []; a malformed present
 section refuses interpretation with its exact cause. Refolding revalidates saved
 promises against the recorded reply and leaves invalid promises meant. Model
-replies require `settled` with shown moment handles and exact quotes from recorded
-person words, wherever spoken; malformed settlements leave interpretation owed.
-Older saved meanings without `settled` read as none. Settlement uses this shared
+replies and saved meanings require `settled` with shown moment handles, explicit
+done/let-go outcomes, reasons and exact evidence. Recorded person words can
+complete or release work; this turn's successful non-preview act receipts can
+prove completion across conversations; their delivered reply can prove only a deed
+that is itself saying something to the person. The [intention contract](INTENTIONS.md#promises-they-makes)
+owns the act bounds, self-wake admission limit and evidence checks. Missing or
+malformed settlements leave interpretation owed. Settlement uses this shared
 interpretation, never another model call; its saved result closes through
-`MyQueue.finish` after checked Desk revision and terminal evidence reads. A learned
-no-op defers settlement with interpretation until the owed batch judges it. Model
+`MyQueue.finish` after checked Desk revision and terminal evidence reads. A turn left
+owed defers settlement with interpretation until its owed judgment. Model
 statements over the 200-character bound are refused, never clipped into a different
 claim. Confidence is a finite numeric 0...1 value in interpretation, proposal
 acceptance and REM replies; missing or malformed saved proposal confidence refuses
@@ -365,8 +370,8 @@ Whether a memory is a plan for a moment is meaning, judged by the same
 after-turn call that writes it. Each memory decision may name `due`, an
 ISO-8601 local date-time, only for something the person or they plans or has
 committed to do at a time; a date something was said or happened is not a
-plan. The prompt carries the exchange's local clock, retained on held-turn
-recovery. An offset identifies the instant directly; an unzoned date-time
+plan. The prompt carries the exchange's local clock, retained when an owed moment
+is judged later. An offset identifies the instant directly; an unzoned date-time
 uses the Mac's local time zone.
 An absent, unparseable or past value supplies no date. The resolved instant
 survives decision reconciliation and is checked again before staging.
@@ -416,7 +421,7 @@ an unfinished retirement keeps the moment meant. An unreadable
 fact store leaves an unjudged row owed; a staging failure keeps the row meant,
 lived again later. With the fact lane disabled no facts are asked, and the row
 is lived once its fold lands.
-Drain scheduling, deferral, batching, fair retries and cancellation follow
+Drain scheduling, deferral, fair retries and cancellation follow
 the [shared interpretation contract](COGNITION_WIRING.md#shared-after-turn-interpretation).
 
 The lived-moment journal is the queue; a turn the journal cannot record owes
@@ -535,7 +540,6 @@ vocabulary IDs representable by the model's Int32 input. Damaged vocabularies
 surface the model-load error; special-token IDs are never manufactured.
 The resident tokenizer stops after proving window overflow, finishing each word
 before clipping; complete-text embedding reuses its admitted IDs and masks.
-The no-op predictor embeds covered pieces in batches of at most sixteen under one epoch.
 Download byte ranges bound their length by the remaining archive bytes before
 addition, including descriptors at the Int64 byte-length limit.
 Recall/relation limits are capped before multiplication; snapshot page capacity

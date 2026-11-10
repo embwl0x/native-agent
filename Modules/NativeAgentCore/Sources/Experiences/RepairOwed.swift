@@ -49,7 +49,10 @@ public enum RepairOwed {
                              claims: RepairDebt(owner: owner, operation: operation, lever: lever, nextCall: nextCall, tap: tap).claims)
         met.addressedTo = [tap == nil ? "self" : "person"]
         if let open = try await openDebt(store, operation: operation, owner: owner) {
-            try await store.append([.evidence(.init(source: "repeat", id: met.id))], to: open.id)
+            // Open debt always says the current cause: a repeat that fails differently replaces the words Doctor and the agent read.
+            var events: [ExperienceStore.Change] = [.evidence(.init(source: "repeat", id: met.id))]
+            if open.face?.words != words { events.append(.face(.init(words: words, artifacts: []))) }
+            try await store.append(events, to: open.id)
         } else {
             try await store.begin(met)
         }

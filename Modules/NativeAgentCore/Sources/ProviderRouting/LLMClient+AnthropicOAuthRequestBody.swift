@@ -25,6 +25,10 @@ extension AnthropicOAuthTransport {
     /// global.
     static var ephemeralCacheControl: [String: Any] { ["type": "ephemeral", "ttl": "1h"] }
 
+    /// The current message's now-block is sent once and never replayed, so what lies past the previous boundary is read again only by this turn's
+    /// own later rounds: a five-minute entry, written at the lower price. It is the last marker, so longer-before-shorter ordering holds.
+    static var turnCacheControl: [String: Any] { ["type": "ephemeral", "ttl": "5m"] }
+
     /// The seeding owner binds the current user index for the whole loop. Calls without a seeded turn have no cross-turn boundary to mark.
     static func currentTurnUserIndex(_ messages: [LLMMessage], call: LLMCall) -> Int? {
         if let bound = call.currentUserIndex,
@@ -35,29 +39,29 @@ extension AnthropicOAuthTransport {
         return nil
     }
 
-    /// Current and previous user/assistant boundaries share one lifetime for cross-turn reuse. System messages never receive cache_control; changing
-    /// context stays on its user turn.
+    /// The previous boundary is read by the next turn and keeps the one-hour lifetime; the current boundary is read only inside this turn and
+    /// takes five minutes. System messages never receive cache_control; changing context stays on its user turn.
     static func addConversationCacheControls(
         _ messages: inout [[String: Any]],
         previousBoundaryIndex: Int?,
         currentBoundaryIndex: Int?
     ) {
-        func mark(_ index: Int) {
+        func mark(_ index: Int, _ control: [String: Any]) {
             // The marker goes on the last block that carries something: never an empty text block.
             guard messages.indices.contains(index),
                   messages[index]["role"] as? String != "system",
                   var content = messages[index]["content"] as? [[String: Any]],
                   let at = content.lastIndex(where: { $0["type"] as? String != "text" || !(($0["text"] as? String) ?? "").isEmpty })
             else { return }
-            content[at]["cache_control"] = ephemeralCacheControl
+            content[at]["cache_control"] = control
             messages[index]["content"] = content
         }
         if let previousBoundaryIndex,
            previousBoundaryIndex != currentBoundaryIndex {
-            mark(previousBoundaryIndex)
+            mark(previousBoundaryIndex, ephemeralCacheControl)
         }
         if let currentBoundaryIndex {
-            mark(currentBoundaryIndex)
+            mark(currentBoundaryIndex, turnCacheControl)
         }
     }
 

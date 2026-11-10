@@ -417,7 +417,8 @@ extension AgentScreen {
         }
         if !workspace.previewing { AgentNamed.shared.keep(dataRoot, names, room: name, scope: scope) }
         return screen([name, item["display_status"]?.stringValue ?? ""],
-            [section("ITEM", [item["title"], item["summary"], item["blocked_reason"]].compactMap { $0?.stringValue }.map { clip($0, 160) }), section("NOTES",
+            [section("ITEM", [item["title"], item["summary"], item["blocked_reason"]].compactMap { $0?.stringValue }.map { clip($0, 160) }),
+             section("INTENTION", intentionLines(item["intention"])), section("NOTES",
                 notes), section("PARTS", parts)],
             verbs: [(name + ".note", "add a note (text)"), (name + ".done", "mark it done"), (name + ".status", "set its status (text)")] + verbs,
                 back: "Back: home · desk.")
@@ -439,14 +440,30 @@ extension AgentScreen {
         let parked = split.parked.isEmpty ? []
             : ["\(split.parked.count) · untouched \(split.quietDays ?? DeskParking.quietDays)d+ · app {page:\"home\", find:\"<words>\"} finds one"]
         let owed = await owedRows(dataRoot, person: person, now: now)
+        let plan = DeskSequencing.compute(state, now: now)
+        let intentions = MyQueue.entries(state).filter { $0.item.project == MyQueue.project }.flatMap {
+            intentionLines(MyQueue.readout($0, in: state, plan: plan.byHandle[$0.item.handle]))
+        }
         return freshness(world) + "\n" + screen(["DESK", "\(split.active.count) active", "\(split.parked.count) parked"] + state.boardCountSummary.components(
             separatedBy: "; ")
                 + (split.waiting.isEmpty ? [] : ["\(split.waiting.count) wait on \(person)"]),
             [section("OWED", owed.agent), section("WAITING", owed.person + rows(split.waiting, 5)), section("ACTIVE", rows(split.active, 10)), section("PARKED",
                 parked),
+             section("MY QUEUE", intentions),
              section("ACTIONS", ["desk.wait {handle, on:\"<person>\", note?} · on:\"owner\" waits on the owner",
                  "ledger.list is the shared task ledger, a separate list from this Desk"])],
             verbs: [("desk.N", "open an item"), ("desk.N.note", "add a note (text)"), ("desk.N.done", "mark one done"), ("desk.add", "add work (form)")])
+    }
+
+    private static func intentionLines(_ value: JSONValue?) -> [String] {
+        guard let value else { return [] }
+        guard case .object(let row) = value, let name = row["name"]?.stringValue,
+              let words = row["words"]?.stringValue, let filed = row["filed_at"]?.stringValue,
+              let condition = row["when"]?.stringValue, case .array(let waits)? = row["waits_on"] else {
+            return ["Intention details unavailable; read desk.read for the current record."]
+        }
+        return [name + " · " + words, "  filed " + filed + " · condition " + condition]
+            + waits.compactMap { $0.stringValue.map { "  waits on " + $0 } }
     }
 
     // MARK: Helpers

@@ -14,12 +14,16 @@ A reference refresh containing only other evidence retains the captured step.
 Attaching a captured step updates the row's title to the same words and peer
 provenance used for a newly filed step and its approval follow-up.
 `queue.update` changes
-named fields; `queue.done` and `queue.drop` settle it by its exact handle or
-number. Words never select a different step. A committed closure keeps its
+named fields; `queue.done` and `queue.drop` settle it by hand, by its exact handle
+or number. A step also closes by itself when the after-turn judgment sees its
+deed ([Intentions](INTENTIONS.md#promises-they-makes)), in any conversation and
+in turns with no incoming message, their own stream and lines included; nothing they are shown teaches closing one by
+hand. Words never select a different step. A committed closure keeps its
 receipt if checkpoint cleanup fails, with the cleanup cause in
-`settlement_failures`. Repeating `queue.done`, `queue.drop` or `queue.update`
-against a terminal step returns `already_done` or `already_dropped` with its
-saved completion time and evidence, without changing it. Live steps supply
+`settlement_failures`. Repeating `queue.done` on a done step, or `queue.drop`
+on a dropped one, is granted as `no_change` with its saved completion time and
+evidence. Any other call against a terminal step is refused as `already_done`
+or `already_dropped` with the same evidence, without changing it. Live steps supply
 their outcome, notes and refs; archived steps, looked up by exact handle,
 supply their outcome, retained refs, decisions and artifacts. The archive
 does not retain visible numbers or notes. An unknown id remains `not_found`;
@@ -80,6 +84,12 @@ valid blocker or defer strings.
 `desk.work_log` selects a pursuit receipt or an ordinary item's note under the
 Desk store's own lock, without retrying through another tool after a failure.
 
+The default `desk.read` includes board rows and open MY QUEUE intentions in one
+paged list; `place` keeps the two distinguishable. Board counts and the open
+intention count remain separate. The agent's Desk page shows the same queue
+with each intention's name, words, filing time and outstanding waits.
+[Intentions](INTENTIONS.md#their-words-for-it) owns that readout.
+
 With `include_archived:true`, `archives` contains its own paged `items`,
 `limit`, `offset`, `total`, `count`, and `has_more`. Its initial offset is the
 ordinary `offset`; `next_archive_read` carries the separate `archived_offset`
@@ -135,7 +145,7 @@ the status token for a top-level item still at `watch`, so a new plan reads
 `plan` there while its structured status remains `watch`.
 
 `on` also accepts an observed Desk handle/number or experience id (a card,
-message, reply delivery or repair), or a nonempty list of those dependency
+including the `approval:<id>` its Home row shows, message, reply delivery or repair), or a nonempty list of those dependency
 ids. These waits retain automatic release when the named conditions settle.
 The wait action has its own typed guide. Unknown identifier-shaped conditions
 are refused; a single person's name is a person wait. `note` explains either

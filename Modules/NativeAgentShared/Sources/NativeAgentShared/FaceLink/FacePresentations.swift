@@ -603,14 +603,49 @@ public struct OnboardingFace: FaceValue {
 }
 
 public struct ContextReceiptFace: FaceValue {
+    public enum State: Codable, Sendable, Equatable {
+        case waiting(on: String), ready, noTurn, outsideSearch, unavailable(WireFailure)
+    }
+    public struct Part: Codable, Sendable, Equatable, Identifiable {
+        public enum ID: String, Codable, Sendable {
+            case system, fed, memory, tools, history, message, images, toolRounds
+        }
+        public enum Measurement: String, Codable, Sendable { case estimated, measured }
+        public var id: ID
+        public var name: String
+        public var tokens: Int?
+        public var count: Int?
+        public var measurement: Measurement
+        public var detail: String?
+        public init(id: ID, name: String, tokens: Int?, count: Int?, measurement: Measurement, detail: String?) {
+            self.id = id
+            self.name = name
+            self.tokens = tokens
+            self.count = count
+            self.measurement = measurement
+            self.detail = detail
+        }
+    }
     public var session: String
     public var turnId: String?
+    /// Text rows serve the composer's quiet reading; the visual face uses typed parts.
     public var rows: [PartFace.Row]
-    public var state: FaceReadState
-    public init(session: String, turnId: String? = nil, rows: [PartFace.Row], state: FaceReadState) {
+    public var parts: [Part]
+    public var totalTokens: Int?
+    public var windowTokens: Int?
+    public var model: String?
+    public var ranAt: Date?
+    public var state: State
+    public init(session: String, turnId: String? = nil, rows: [PartFace.Row], parts: [Part] = [],
+                totalTokens: Int? = nil, windowTokens: Int? = nil, model: String? = nil, ranAt: Date? = nil, state: State) {
         self.session = session
         self.turnId = turnId
         self.rows = rows
+        self.parts = parts
+        self.totalTokens = totalTokens
+        self.windowTokens = windowTokens
+        self.model = model
+        self.ranAt = ranAt
         self.state = state
     }
 }

@@ -213,12 +213,14 @@ public struct PartFace: Codable, Sendable, Equatable {
         public var rows: [Row]?
         public var expands: Bool?
         public var read: Call?
+        /// In progress now: drawn with a small spinner until it ends.
+        public var running: Bool?
         public init(id: String, title: String, detail: String? = nil, value: String? = nil, at: String? = nil, symbol: String? = nil,
                     tone: Tone? = nil, open: String? = nil, actions: [Action]? = nil, control: Control? = nil,
-                    rows: [Row]? = nil, expands: Bool? = nil, read: Call? = nil) {
+                    rows: [Row]? = nil, expands: Bool? = nil, read: Call? = nil, running: Bool? = nil) {
             (self.id, self.title, self.detail, self.value, self.at) = (id, title, detail, value, at)
             (self.symbol, self.tone, self.open, self.actions, self.control) = (symbol, tone, open, actions, control)
-            self.rows = rows; self.expands = expands; self.read = read
+            self.rows = rows; self.expands = expands; self.read = read; self.running = running
         }
         public var descendants: [Row] { [self] + (rows ?? []).flatMap(\.descendants) }
     }

@@ -350,13 +350,26 @@ public actor CognitiveSQLiteStore {
     /// Forget the agent's transient mind: nodes, artifacts and receipts go, and the mind's forgetting epoch moves in the SAME transaction (it lives outside
     /// what this deletes). Returns the new epoch.
     @discardableResult
-    public func clear() async throws -> UInt64 {
+    public func clear(at: Date) async throws -> UInt64 {
         try await dbQueue.write { db -> UInt64 in
             try db.execute(sql: "DELETE FROM cognitive_nodes")
             try db.execute(sql: "DELETE FROM cognitive_artifacts")
             try db.execute(sql: "DELETE FROM cognitive_receipts")
+            // When this forgetting happened, beside its epoch: words said before it belong to the mind that is gone.
+            try db.execute(sql: """
+                INSERT INTO cognitive_epochs (domain, epoch) VALUES (?, ?)
+                ON CONFLICT(domain) DO UPDATE SET epoch = excluded.epoch
+                """, arguments: [Self.mindClearedDomain, Int64(at.timeIntervalSince1970 * 1000)])
             return try Self.bumpEpoch(db, domain: "mind")
         }
+    }
+
+    static let mindClearedDomain = "mind.cleared_ms"
+
+    /// When the mind was last forgotten; the distant past before its first forgetting.
+    public func loadMindClearedAt() async throws -> Date {
+        let ms = try await loadEpoch(Self.mindClearedDomain)
+        return ms == 0 ? .distantPast : Date(timeIntervalSince1970: Double(ms) / 1000)
     }
 
     private struct ArtifactPruneRow {

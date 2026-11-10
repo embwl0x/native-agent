@@ -24,7 +24,9 @@ struct SimpleAgentCard: View {
 
         init?(_ turn: TurnFace?) {
             guard let turn else { return nil }
-            if turn.phase == .waiting || turn.phase == .retrying || turn.phase == .blocked, let detail = turn.card?.detail {
+            // A running step, a wait and a block say what she is doing in the box's own words.
+            if turn.steps.contains(where: \.isRunning) || turn.phase == .waiting || turn.phase == .retrying || turn.phase == .blocked,
+               let detail = turn.card?.detail {
                 (text, waiting) = (detail, turn.card?.approval?.isActionable == true)
             } else if turn.isWorking, turn.phase == .delegation, let partner = turn.card?.delegateName, !partner.isEmpty {
                 (text, waiting) = ("Working · with \(partner)", false)

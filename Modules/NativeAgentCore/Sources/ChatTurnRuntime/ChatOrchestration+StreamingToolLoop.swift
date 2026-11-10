@@ -21,7 +21,7 @@ import Senses
 import TrustCenter
 import os
 import NativeAgentShared
-// Blueprint: | `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody` (the stem's loop: delivers the message's facts (text, door, who, verified id, trust, steering, posture), runs the agent's turn part's effects, hands it each event with each result's declared effect, logs at every host-call boundary; the agent's own `app` calls run once as their own dispatch round through the same door and gates, and a turn may act or end before any model call; the turn returns at `reply.end` and `after`, and nothing of the agent's runs after it); before a fresh message’s opening model call, mind/authority practice may supply one gated standing read as `already_looked`; after each tool round the familiarity nerve meets the turn's landed hand-work action ids (or one call repeated 3+ rounds) through `FamiliarLines` (`practice: `), and on a later meeting no active ability's recorded route covers it puts `practice` on the round's last result once a turn, traced as `practice.keep`; `joinedProse`; `provider.roundOutput` counts safe prose and tool calls per parsed round; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; a `provider_failure` event carries the failure's work state and whether repair is owed; the person's turn is measured as it goes (model rounds, its own calls' tokens, minutes, the longest stretch of one round's calls repeated for `took`): `took` is the after-turn line, and each part called records its rounds |
+// Blueprint: | `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody` (the stem's loop: delivers the message's facts (text, door, who, verified id, trust, steering, posture), runs the agent's turn part's effects, hands it each event with each result's declared effect (and, for a round's one deed whose call asked for `then_say`, its standing words as `say`), logs at every host-call boundary; the agent's own `app` calls run once as their own dispatch round through the same door and gates, and a turn may act or end before any model call; the turn returns at `reply.end` and `after`, and nothing of the agent's runs after it); before a fresh message’s opening model call, mind/authority practice may supply one gated standing read as `already_looked`; after each tool round the familiarity nerve meets the turn's landed hand-work action ids (or one call repeated 3+ rounds) through `FamiliarLines` (`practice: `), and on a later meeting no active ability's recorded route covers it puts `practice` on the round's last result once a turn, traced as `practice.keep`; `joinedProse`; `provider.roundOutput` counts safe prose and tool calls per parsed round; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; a `provider_failure` event carries the failure's work state and whether repair is owed; the person's turn is measured as it goes (model rounds, its own calls' tokens, minutes, the longest stretch of one round's calls repeated for `took`): `took` is the after-turn line, and each part called records its rounds |
 
 extension SwiftNativeTurnEngine {
     func executeContinuationTurnBody(
@@ -236,6 +236,16 @@ extension SwiftNativeTurnEngine {
             return result.observingTerminal(reason: reason, counters: counters, cognitiveContextDelivered: cognitiveContextDelivered)
         }
         var visibleText = ""
+        // The words she streams read as the kept reply does (`joinedProse`): words that follow a call start a new paragraph.
+        var liveLast: Character?
+        var liveBreakOwed = false
+        func live(_ text: String) async {
+            guard !text.isEmpty else { return }
+            if liveBreakOwed, let last = liveLast, !last.isNewline, text.first?.isNewline == false { await progress?(.delta("\n\n")) }
+            liveBreakOwed = false
+            liveLast = text.last
+            await progress?(.delta(text))
+        }
         defer { turn.observation?.record(counters, dispatches: dispatches, reply: visibleText) }
         var retainedProse = ""
         var workingCommentaryCharacters = 0
@@ -325,8 +335,8 @@ extension SwiftNativeTurnEngine {
             }.joined(separator: "\n\n")
             Self.appendStructuredUserNudge(receiptText, to: &conversation)
             for reading in try part.arrivalReadings() { ConversationPrefixSeeding.appendUser(reading, to: &conversation) }
-            if !visibleText.isEmpty { await progress?(.delta(visibleText)) }
-            if !part.answered.isEmpty { await progress?(.delta(part.answered)) }
+            if !visibleText.isEmpty { await live(visibleText) }
+            if !part.answered.isEmpty { await live(part.answered) }
             if inFlight {
                 var event: [String: JSONValue] = ["type": .string("resumed"),
                     "text": .string(TurnObservation.text(resumed)), "steps": .int(Int64(receipts.count))]
@@ -480,7 +490,8 @@ extension SwiftNativeTurnEngine {
             switch effect["effect"] {
             case .string("reply.stream"):
                 if case .string(let text)? = effect["text"], !text.isEmpty {
-                    await progress?(.delta(text))
+                    liveBreakOwed = true
+                    await live(text)
                     visibleText += text
                     part.sent(text)
                 }
@@ -561,6 +572,12 @@ extension SwiftNativeTurnEngine {
                     event["waiting"] = record.flatMap { Self.waitingOn($0.result) }
                     event["effect"] = record.flatMap { Self.landedEffect($0.result) }.map(JSONValue.string)
                     if item.offset == ran.calls.count - 1 { event["practice"] = practice }
+                    // A deed alone in its round, whose own call asked for closing words, carries them when they stand; an answer cannot supply them.
+                    if ran.calls.count == 1, case .array? = call.input["actions"], case .string? = call.input["then_say"],
+                       case .object(let said)? = reply?.payload.objectValue?["then_say"], said["stands"] == .bool(true),
+                       case .string(let words)? = said["words"] {
+                        event["say"] = .string(words)
+                    }
                     return .object(event)
                 })
                 continue
@@ -631,6 +648,7 @@ extension SwiftNativeTurnEngine {
             var pendingProtocolDelta = ""
             let rawProviderEvents = OSAllocatedUnfairLock<String>(initialState: "")
             let roundBaseVisibleText = visibleText
+            liveBreakOwed = true
 
             // Only prose can survive an incomplete stream; none of its calls ran.
             func keepPartial() async -> String {
@@ -648,7 +666,7 @@ extension SwiftNativeTurnEngine {
                 }
                 if kept.hasPrefix(iterEmittedProse) {
                     let tail = String(kept.dropFirst(iterEmittedProse.count))
-                    if !tail.isEmpty { await progress?(.delta(tail)) }
+                    if !tail.isEmpty { await live(tail) }
                 }
                 visibleText = roundBaseVisibleText + kept
                 // Words a cut stopped are working, not the answer: they fold above the reply that answers the person.
@@ -778,8 +796,9 @@ extension SwiftNativeTurnEngine {
                     }
                 }
                 let requestPlan: Data?
+                // A plan names the saved user row it is rebuilt from; a hidden input has none.
                 if call.conversationRequest, !(work.prefixTelemetry?.marksRequestShapeUnmeasured == true),
-                   let runId, sessionId != nil {
+                   turn.rows.hiddenInput == nil, let runId, sessionId != nil {
                     requestPlan = try ConversationPrefixSeeding.Request(seed: prefixSeed,
                         system: wireSystem.prompt, segments: wireSystem.segments,
                         tools: toolCallCodec.requestTools(providerTools.schemas))
@@ -839,7 +858,7 @@ extension SwiftNativeTurnEngine {
                                 let prose = toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta)
                                 if !prose.isEmpty {
                                     iterEmittedProse += prose
-                                    await progress?(.delta(prose))
+                                    await live(prose)
                                 }
                                 pendingProtocolDelta.removeAll(keepingCapacity: true)
                             }
@@ -862,7 +881,7 @@ extension SwiftNativeTurnEngine {
                             let safe = toolCallCodec.releasableProse(holding: &pendingProtocolDelta)
                             if !safe.isEmpty {
                                 iterEmittedProse += safe
-                                await progress?(.delta(safe))
+                                await live(safe)
                                 await moved(nil, words: true)
                             } else if !delta.isEmpty {
                                 await moved(nil)
@@ -1050,7 +1069,7 @@ extension SwiftNativeTurnEngine {
                     continue
                 }
                 if !pendingProtocolDelta.isEmpty {
-                    await progress?(.delta(toolCallCodec.visiblePrefix(in: pendingProtocolDelta)))
+                    await live(toolCallCodec.visiblePrefix(in: pendingProtocolDelta))
                 }
                 // The agent's answer stays in the conversation for whatever the agent's part does next.
                 conversation.append(.assistantText(iterProse))
@@ -1068,7 +1087,7 @@ extension SwiftNativeTurnEngine {
                 ? "" : toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta)
             if !pendingProse.isEmpty {
                 iterEmittedProse += pendingProse
-                await progress?(.delta(pendingProse))
+                await live(pendingProse)
             }
             visibleText = roundBaseVisibleText + iterEmittedProse
             retainProse(iterEmittedProse, commentary: true)

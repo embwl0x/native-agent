@@ -1,4 +1,5 @@
 import Foundation
+import ChatTurnRuntime
 import CognitiveSubstrate
 import Experiences
 import MemoryV2
@@ -47,8 +48,11 @@ extension NativeCognitionRuntime {
         await substrate.adoptRecentDoses(await organismKernel.recentDoses())
         // Finish interrupted folds before opening ordinary admission.
         await refoldCutMoments()
+        await admitOwedMomentsAgain()
         leaveDoor()
         guard !isFlushedForTermination else { return }
+        // Never gates admission on the experience store.
+        Task { await self.settleReadRepairsAlreadyPaid() }
         await restoreProviderVitalsSnapshot()
         await startApprovalLifecycleObservationIfNeeded()
         let wakeAt = now()
@@ -213,12 +217,11 @@ extension NativeCognitionRuntime {
         )
     }
 
-    /// Journal identity follows session plus incoming message so redelivery cannot duplicate a moment.
-    /// Failure to record leaves repair owed; an unrecorded turn cannot fold.
+    /// Journal identity is the turn's `momentID`. A moment judged for settlement alone has no mind share: it is recorded facts-only, with no
+    /// admission. Failure to record leaves repair owed; an unrecorded turn cannot fold.
     func recordOwedMoment(_ turn: CognitiveMomentTurn) async -> String? {
         await bootstrap()
-        guard let messageId = turn.messageId, !messageId.isEmpty else { return nil }
-        let id = CognitiveLivedMoment.turnID(sessionId: turn.sessionId, messageId: messageId)
+        guard let id = turn.momentID else { return nil }
         guard let cognitiveStore else {
             await noteMomentUnrecorded(id, why: "the cognition store is unavailable")
             return nil
@@ -228,12 +231,16 @@ extension NativeCognitionRuntime {
             await noteMomentUnrecorded(id, why: "the data root's life is unreadable: \(error.localizedDescription)")
             return nil
         }
+        let settlesOnly = turn.settlesOnly == true
         var deferred: CognitiveDeferredTurnRecord?
+        let held: CognitiveDeferredTurnRecord?
+        if !settlesOnly, let origin = turn.origin { held = await substrate.deferredTurnRecord(origin: origin) }
+        else { held = nil }
+        // A turn whose held entry is gone (a restart between its row and its reply) is admitted again from its saved row.
         let admission: CognitiveDeferredTurnRecord?
-        if let origin = turn.origin { admission = await substrate.deferredTurnRecord(origin: origin) }
-        else { admission = nil }
+        if let held { admission = held } else if !settlesOnly, !turn.isCareWake { admission = await readmission(turn) } else { admission = nil }
         let current = await substrate.forgettingEpochs()
-        if turn.isCareWake {
+        if turn.isCareWake, let messageId = turn.messageId {
             // A care wake owes care reading from its captured arrival and reply, not an ordinary incoming-word appraisal.
             let event = CognitiveEvent(id: id, kind: .userMessageReceived,
                 subject: CognitiveSubjectReference(type: "turn", id: messageId),
@@ -243,7 +250,8 @@ extension NativeCognitionRuntime {
             deferred = CognitiveDeferredTurnRecord(event: event, caring: nil,
                 mindEpoch: admission?.mindEpoch ?? current.mind, bodyEpoch: admission?.bodyEpoch ?? current.body)
         } else { deferred = admission }
-        let factsOnly = !(await substrate.configurationSnapshot()).enabled
+        let enabled = await substrate.configurationSnapshot().enabled
+        let factsOnly = settlesOnly || !enabled
         let livedAt = turn.occurredAt ?? deferred?.event.occurredAt ?? now()
         let moment = CognitiveLivedMoment(
             id: id, life: life, kind: "turn", livedAt: livedAt, acceptedAt: now(), state: .owed,
@@ -251,7 +259,7 @@ extension NativeCognitionRuntime {
             input: CognitiveMomentInput(turn: turn, deferred: deferred, factsOnly: factsOnly ? true : nil))
         do {
             try await cognitiveStore.recordMoment(moment)
-            if let admission { await substrate.releaseDeferredTurn(admission) }
+            if let held { await substrate.releaseDeferredTurn(held) }
             return id
         } catch {
             await noteMomentUnrecorded(id, why: String(describing: error))
@@ -264,12 +272,18 @@ extension NativeCognitionRuntime {
         await bootstrap()
         guard let cognitiveStore, var row = await readMoment(id),
               row.state == .owed || row.state == .meant else {
+            if Task.isCancelled { throw CancellationError() }
             throw LivedMomentPreparationFailure.local("The recorded moment is unavailable for context preparation.")
         }
         if row.input?.factsOnly == true {
             throw LivedMomentPreparationFailure.record("A facts-only moment has no cognition context to prepare.")
         }
+        do { try await admitAgain(&row, store: cognitiveStore) } catch {
+            await noteMomentReadFailed(id, why: "re-read admission not saved: \(error)")
+            throw LivedMomentPreparationFailure.local("The turn's admission could not be saved: \(error.localizedDescription)")
+        }
         guard let record = row.input?.deferred else {
+            if Task.isCancelled { throw CancellationError() }
             await noteMomentReadFailed(id, why: "ordinary turn context is unavailable")
             throw LivedMomentPreparationFailure.record("The recorded turn context is unavailable; repair its input.")
         }
@@ -293,7 +307,37 @@ extension NativeCognitionRuntime {
                 throw LivedMomentPreparationFailure.local("The caring request could not be saved: \(error.localizedDescription)")
             }
         }
+        // A prepared moment proves its journal read: any read repair it owed is paid.
+        RepairOwed.settle(dataRoot, operation: "cognition.moment.read:" + id, evidence: .init(source: "lived_moments", id: id))
         return context
+    }
+
+    /// A moment recorded without its admission is admitted again from its saved row, stamped with the moment's own epochs.
+    private func admitAgain(_ row: inout CognitiveLivedMoment, store: CognitiveSQLiteStore) async throws {
+        guard row.input?.deferred == nil, row.input?.factsOnly != true, let turn = row.input?.turn, !turn.isCareWake,
+              var record = await readmission(turn) else { return }
+        record.mindEpoch = row.mindEpoch
+        record.bodyEpoch = row.bodyEpoch
+        row.input?.deferred = record
+        try await store.saveMoment(row)
+    }
+
+    /// At opening, before ordinary admission: an owed moment waiting on its record gains its admission, and that changed input ends its wait.
+    func admitOwedMomentsAgain() async {
+        guard let cognitiveStore, let rows = await readMoments(states: [.owed]) else { return }
+        for var row in rows {
+            do { try await admitAgain(&row, store: cognitiveStore) }
+            catch { await noteMomentReadFailed(row.id, why: "re-read admission not saved: \(error)") }
+        }
+    }
+
+    /// A turn's admission read again from its saved user row, for a turn whose held entry the substrate no longer has.
+    private func readmission(_ turn: CognitiveMomentTurn) async -> CognitiveDeferredTurnRecord? {
+        guard let messageId = turn.messageId, !messageId.isEmpty,
+              let event = await SwiftNativeChatOrchestrationClient.savedUserRowEvent(
+                dataRoot: dataRoot, sessionId: turn.sessionId, messageId: messageId),
+              turn.runId == nil || event.metadata["runId"] == turn.runId.map(JSONValue.string) else { return nil }
+        return await substrate.admission(of: event)
     }
 
     /// Persist meaning before applying it so interrupted folds can resume without another model judgment.
@@ -520,6 +564,8 @@ extension NativeCognitionRuntime {
             guard let row = try await cognitiveStore.loadMoment(id) else { return nil }
             return try await checkedMeaning(row)
         } catch {
+            // A cancelled read failed nothing; the moment stays owed and owes no repair.
+            if error is CancellationError || Task.isCancelled { return nil }
             await noteMomentReadFailed(id, why: String(describing: error))
             return nil
         }
@@ -534,6 +580,7 @@ extension NativeCognitionRuntime {
             }
             return result
         } catch {
+            if error is CancellationError || Task.isCancelled { return nil }
             await noteMomentReadFailed("journal", why: String(describing: error))
             return nil
         }
@@ -546,6 +593,21 @@ extension NativeCognitionRuntime {
             operation: "cognition.moment.read:" + id, owner: "cognition",
             words: "Journal read or preparation failed for \(id); no mind settlement is proven: \(why)",
             tap: "Settings → Doctor")
+    }
+
+    /// A moment that lived was read, and a journal that reads has been read: neither owes a read repair.
+    /// Paid at opening, because settlement is a queued write that a quit can lose.
+    private func settleReadRepairsAlreadyPaid() async {
+        guard let cognitiveStore, let open = try? await ExperienceStore.at(dataRoot).open() else { return }
+        let prefix = "cognition.moment.read:"
+        for operation in Set(open.filter(RepairOwed.isOwed).compactMap { RepairDebt($0).operation })
+        where operation.hasPrefix(prefix) {
+            let id = String(operation.dropFirst(prefix.count))
+            let read: Bool
+            if id == "journal" { read = await readMoments(states: [.owed, .meant]) != nil }
+            else { read = (try? await cognitiveStore.loadMoment(id))?.state == .lived }
+            if read { RepairOwed.settle(dataRoot, operation: operation, evidence: .init(source: "lived_moments", id: id)) }
+        }
     }
 }
 

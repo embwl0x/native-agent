@@ -143,21 +143,44 @@ extension ExperienceStore {
         try readRecorded { try Self.selectDetails(query, in: $0, counting: true) }
     }
 
-    private static func selectDetails(_ query: DetailQuery, in db: Database,
-                                      counting: Bool = false) throws -> (total: Int, items: [Detail]) {
+    /// The distinct strings one JSON path holds across the committed details a query matches, where each `holding` path holds exactly that JSON
+    /// (`"\"end\""`, `"false"`) and each `lacking` path is absent. SQLite answers from the rows; none is decoded here. A store not yet written holds
+    /// none, and reading never initializes it.
+    public nonisolated func recordedDetailValues(_ query: DetailQuery, at value: String, holding: [String: String] = [:],
+                                                 lacking: [String] = []) throws -> [String] {
+        guard let found = Self.conditions(query) else { return [] }
+        do { _ = try FileManager.default.attributesOfItem(atPath: path.path) }
+        catch CocoaError.fileReadNoSuchFile { return [] }
+        var clauses = found.clauses, arguments = found.arguments
+        clauses.append("json_type(row, ?) = 'text'")
+        arguments += [value]
+        for (key, json) in holding.sorted(by: { $0.key < $1.key }) {
+            clauses.append("(row -> ?) = ?")
+            arguments += [key, json]
+        }
+        for key in lacking {
+            clauses.append("json_type(row, ?) IS NULL")
+            arguments += [key]
+        }
+        let sql = "SELECT DISTINCT json_extract(row, ?) FROM detail WHERE " + clauses.joined(separator: " AND ")
+        return try readRecorded { try String.fetchAll($0, sql: sql, arguments: StatementArguments([value]) + arguments) }
+    }
+
+    /// A query's conditions and their arguments; nil when an empty list in it matches nothing.
+    private static func conditions(_ query: DetailQuery) -> (clauses: [String], arguments: StatementArguments)? {
         var clauses: [String] = [], arguments = StatementArguments()
         if let sources = query.sources {
-            guard !sources.isEmpty else { return (0, []) }
+            guard !sources.isEmpty else { return nil }
             clauses.append("source IN (" + Array(repeating: "?", count: sources.count).joined(separator: ",") + ")")
             arguments += StatementArguments(sources)
         }
         if let subjects = query.subjects {
-            guard !subjects.isEmpty else { return (0, []) }
+            guard !subjects.isEmpty else { return nil }
             clauses.append("subject IN (" + Array(repeating: "?", count: subjects.count).joined(separator: ",") + ")")
             arguments += StatementArguments(subjects)
         }
         if let kinds = query.kinds {
-            guard !kinds.isEmpty else { return (0, []) }
+            guard !kinds.isEmpty else { return nil }
             clauses.append("kind IN (" + Array(repeating: "?", count: kinds.count).joined(separator: ",") + ")")
             arguments += StatementArguments(kinds)
         }
@@ -169,6 +192,13 @@ extension ExperienceStore {
         if let through = query.through { clauses.append("at <= ?"); arguments += [through.timeIntervalSince1970] }
         if let after = query.after { clauses.append("seq > ?"); arguments += [after] }
         if let before = query.before { clauses.append("seq < ?"); arguments += [before] }
+        return (clauses, arguments)
+    }
+
+    private static func selectDetails(_ query: DetailQuery, in db: Database,
+                                      counting: Bool = false) throws -> (total: Int, items: [Detail]) {
+        guard let found = conditions(query) else { return (0, []) }
+        let clauses = found.clauses, arguments = found.arguments
         let matching = clauses.isEmpty ? "" : " WHERE " + clauses.joined(separator: " AND ")
         let total: Int
         if counting {
@@ -218,6 +248,7 @@ extension ExperienceStore {
         CREATE INDEX IF NOT EXISTS detail_source_at ON detail(source, at);
         CREATE INDEX IF NOT EXISTS detail_subject ON detail(subject, seq);
         CREATE INDEX IF NOT EXISTS detail_kind_at ON detail(kind, at);
+        CREATE INDEX IF NOT EXISTS detail_kind_seq ON detail(kind, seq);
         CREATE INDEX IF NOT EXISTS detail_at ON detail(at);
         CREATE UNIQUE INDEX IF NOT EXISTS detail_once ON detail(once) WHERE once IS NOT NULL;
         CREATE INDEX IF NOT EXISTS experience_kind_at ON experience(kind, at);

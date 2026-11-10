@@ -85,7 +85,8 @@ package enum ProviderToolResultPage {
             var fields = reference
             if includeSections {
                 let result = await ProviderToolResultRecoveryStore.shared.page(
-                    handle: receipt.handle, page: 0, sessionId: sessionId, turnId: turnId, query: "")
+                    handle: receipt.handle, page: 0, sessionId: sessionId, turnId: turnId, query: "",
+                    pages: ProviderToolResultRecoveryStore.usualSectionPages)
                 guard case .object(let page) = result, ToolResult(result).said("completed") else {
                     return View(content: try result.serialize(pretty: false), recovery: recovery, failed: true)
                 }
@@ -185,6 +186,8 @@ package actor ProviderToolResultRecoveryStore {
         let pageByteOffsets: [Int]
         let sectionBudget: Int
         let version: JSONValue?
+        /// The retained answer's own continuation of its source, apart from page position.
+        let source: JSONValue?
         let createdAt: Date
         let sectionProjection: [(value: JSONValue, text: String, bytes: Int)]
         var sectionPages: (query: String, pages: [[JSONValue]], counts: [Int])?
@@ -277,6 +280,21 @@ package actor ProviderToolResultRecoveryStore {
 
         let now = Date()
         let version = fields["version"]
+        // An answer that said its source has more keeps that call beside every page: paging the answer never reaches the rest of the source.
+        // Only an action of the app's own door is named: its next is that action's whole argument set, which another tool's cursor is not.
+        var continues: JSONValue?
+        if let action = fields["action"],
+           let answer = [fields["result"]?.objectValue, fields].compactMap({ $0 }).first(where: { $0["has_more"] == .bool(true) }),
+           case .object(let next)? = answer["next"] {
+            let input: JSONValue = .object(["action": action, "args": .object(next)])
+            continues = .object([
+                "detail": .string("""
+                    These pages hold only the part of its source this answer returned; the source continues past it, and paging never reaches \
+                    the rest. Read on with next_call.
+                    """),
+                "next_call": .object(["tool": .string("app"), "input": input]),
+            ])
+        }
         let entry = Entry(
             handle: handle,
             toolName: toolName,
@@ -289,6 +307,7 @@ package actor ProviderToolResultRecoveryStore {
             pageByteOffsets: pageByteOffsets,
             sectionBudget: sectionBudget,
             version: version,
+            source: continues,
             createdAt: now,
             sectionProjection: sections
         )
@@ -302,14 +321,52 @@ package actor ProviderToolResultRecoveryStore {
         )
     }
 
+    /// A section read with no `pages` joins this many: a section page is half of what a plain read has always shown.
+    package static let usualSectionPages = 2
+
     package func page(
         handle: String,
         page: Int,
         sessionId: String?,
         turnId: String?,
-        query: String? = nil
+        query: String? = nil,
+        pages: Int = 1
     ) -> JSONValue {
         var result = readPage(handle: handle, page: page, sessionId: sessionId, turnId: turnId, query: query)
+        // A read of several pages joins them in order while the whole answer stays within what one answer holds. Each mode's page size
+        // differs, so the body is measured, never assumed: that measure alone sets how many pages one answer carries.
+        if pages > 1, case .object(var answer) = result, ToolResult(result).said("completed") {
+            let body = query == nil ? "content" : "sections"
+            func bytes(_ value: JSONValue?) -> Int { (try? (value ?? .null).serialize(pretty: false).utf8.count) ?? .max }
+            // The body may fill what one answer holds less everything else the answer carries, with 1,000 bytes for what it gains below.
+            let budget = ProviderToolResultPage.defaultMaxUTF8Bytes - 1_000 - max(0, bytes(result) - bytes(answer[body]))
+            func int(_ key: String) -> Int { if case .int(let value)? = answer[key] { Int(value) } else { 0 } }
+            var used = bytes(answer[body]), read = 1
+            while read < pages, case .int(let next)? = answer["next_page"] {
+                let more = readPage(handle: handle, page: Int(next), sessionId: sessionId, turnId: turnId, query: query)
+                guard case .object(var joined) = more, ToolResult(more).said("completed") else { return more }
+                let added = bytes(joined[body])
+                guard added <= budget - used else { break }
+                used += added
+                if case .string(let head)? = answer[body], case .string(let tail)? = joined[body] { joined[body] = .string(head + tail) }
+                if case .array(let head)? = answer[body], case .array(let tail)? = joined[body] { joined[body] = .array(head + tail) }
+                for count in ["page_bytes", "displayed_sections"] {
+                    if case .int(let head)? = answer[count], case .int(let tail)? = joined[count] { joined[count] = .int(head + tail) }
+                }
+                answer = joined
+                read += 1
+            }
+            answer["pages_read"] = .int(Int64(read))
+            // `page` is where this answer starts, as it was asked; `pages_read` and `next_page` say how far it went.
+            let last = int("page")
+            answer["page"] = .int(Int64(page))
+            if query != nil {
+                let detail = Self.sectionsDetail(first: page, last: last, count: int("page_count"), raw: int("raw_page_count"),
+                    displayed: int("displayed_sections"), matching: int("matching_sections"), remaining: int("remaining_sections"))
+                answer["detail"] = .string(detail)
+            }
+            result = .object(answer)
+        }
         let reply = ToolResult(result)
         if let scope = Scope(sessionId: sessionId, turnId: turnId),
            case .object(var object) = result, reply.said("completed"), reply.status == object["status"]?.stringValue {
@@ -319,15 +376,17 @@ package actor ProviderToolResultRecoveryStore {
             readCursors[scope] = ReadCursor(handle: handle, nextPage: next, query: query)
             object["full_result_retained"] = .bool(true)
             object["version"] = entries[handle]?.version
+            var args: [String: JSONValue] = ["continue": .bool(true), "result_handle": .string(handle)]
+            if pages > 1 { args["pages"] = .int(Int64(pages)) }
             object["next_call"] = next == nil ? .null : .object(["tool": .string("app"), "input": .object([
-                "action": .string("result.page"), "args": .object(["continue": .bool(true), "result_handle": .string(handle)])])])
+                "action": .string("result.page"), "args": .object(args)])])
             result = .object(object)
         }
         return result
     }
 
     /// Continue the exact last read in this turn, preserving its query/mode. Before the first read only an unambiguous retained result is selected.
-    package func continueReading(handle: String?, sessionId: String?, turnId: String?) -> JSONValue {
+    package func continueReading(handle: String?, sessionId: String?, turnId: String?, pages: Int = 1) -> JSONValue {
         cleanupExpired(now: Date())
         guard let scope = Scope(sessionId: sessionId, turnId: turnId) else {
             return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("missing_result_scope"),
@@ -335,15 +394,17 @@ package actor ProviderToolResultRecoveryStore {
         }
         if let cursor = readCursors[scope], handle == nil || handle == cursor.handle {
             guard let next = cursor.nextPage else {
-                return .object(["status": .string("completed"), "result_handle": .string(cursor.handle),
+                var end: [String: JSONValue] = ["status": .string("completed"), "result_handle": .string(cursor.handle),
                     "has_more": .bool(false), "reading_complete": .bool(true),
                     "full_result_retained": .bool(true), "next_call": .null,
                     "recovery_only": .bool(true),
                     "verification_scope": .string("retained_tool_response_not_external_outcome"),
                     "original_result_class": .string(entries[cursor.handle]?.resultClass.rawValue ?? "unknown"),
-                    "detail": .string("You reached the end of this retained result. No operation was repeated.")])
+                    "detail": .string("You reached the end of this retained result. No operation was repeated.")]
+                end["source_continues"] = entries[cursor.handle]?.source
+                return .object(end)
             }
-            return page(handle: cursor.handle, page: next, sessionId: sessionId, turnId: turnId, query: cursor.query)
+            return page(handle: cursor.handle, page: next, sessionId: sessionId, turnId: turnId, query: cursor.query, pages: pages)
         }
         let candidates = entries.values.filter { $0.scope == scope && (handle == nil || $0.handle == handle) }
             .sorted { $0.createdAt < $1.createdAt }
@@ -362,7 +423,7 @@ package actor ProviderToolResultRecoveryStore {
                     : "Several results are retained. Choose result_handle once; subsequent continue reads keep its position."),
             ])
         }
-        return page(handle: entry.handle, page: 0, sessionId: sessionId, turnId: turnId, query: "")
+        return page(handle: entry.handle, page: 0, sessionId: sessionId, turnId: turnId, query: "", pages: pages)
     }
 
     private func unavailable(handle: String, reason: String, sessionId: String?) -> JSONValue {
@@ -382,6 +443,16 @@ package actor ProviderToolResultRecoveryStore {
             "remedy": .object(["kind": .string("inspect"),
                 "instruction": .string("Read the retained receipt with next_call; missing output never authorizes repeating a write."),
                 "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("trace.recent"), "args": .object(args)])])])])
+    }
+
+    /// Pages are named by the same zero-based numbers the `page` argument and `next_page` use.
+    private static func sectionsDetail(first: Int, last: Int, count: Int, raw: Int, displayed: Int, matching: Int, remaining: Int) -> String {
+        let shown = first == last ? "Page \(first) displays" : "Pages \(first) through \(last) display"
+        return """
+            \(shown) \(displayed) of \(matching) matching sections, of \(count) section pages numbered from 0; \(remaining) sections \
+            remain after this. Paths and line numbers identify positions in this retained response only; unread source content was not \
+            searched. Continue with next_call. raw=true reads the original response bytes instead, in \(raw) raw pages of their own.
+            """
     }
 
     private func readPage(
@@ -417,7 +488,7 @@ package actor ProviderToolResultRecoveryStore {
                 row["raw_last_page"] = .int(Int64(max(0, entry.pageByteOffsets.lastIndex(where: { $0 < end }) ?? 0)))
                 return .object(row)
             }
-            return .object([
+            var answer: [String: JSONValue] = [
                 "status": .string("completed"),
                 "original_result_class": .string(entry.resultClass.rawValue),
                 "recovery_only": .bool(true),
@@ -432,12 +503,11 @@ package actor ProviderToolResultRecoveryStore {
                 "has_more": .bool(page + 1 < pages.count),
                 "next_page": page + 1 < pages.count ? .int(Int64(page + 1)) : .null,
                 "raw_page_count": .int(Int64(max(1, entry.pageByteOffsets.count - 1))),
-                "detail": .string("""
-                    Page \(page + 1) of \(pages.count) displays \(sections.count) of \(matching) matching sections; \(remaining) remain after this \
-                    page. Paths and line numbers identify positions in this retained response only; unread source content was not searched. \
-                    Continue with next_call. raw=true reads the original response bytes.
-                    """),
-            ])
+                "detail": .string(Self.sectionsDetail(first: page, last: page, count: pages.count,
+                    raw: max(1, entry.pageByteOffsets.count - 1), displayed: sections.count, matching: matching, remaining: remaining)),
+            ]
+            answer["source_continues"] = entry.source
+            return .object(answer)
         }
         let pageCount = max(1, entry.pageByteOffsets.count - 1)
         guard page >= 0, page < pageCount else {
@@ -467,7 +537,7 @@ package actor ProviderToolResultRecoveryStore {
         }
         let hasMore = page + 1 < pageCount
         let nextPage: JSONValue = hasMore ? .int(Int64(page + 1)) : .null
-        return .object([
+        var answer: [String: JSONValue] = [
             "status": .string("completed"),
             "original_result_class": .string(entry.resultClass.rawValue),
             "recovery_only": .bool(true),
@@ -482,7 +552,9 @@ package actor ProviderToolResultRecoveryStore {
             "content": .string(content),
             "has_more": .bool(hasMore),
             "next_page": nextPage,
-        ])
+        ]
+        answer["source_continues"] = entry.source
+        return .object(answer)
     }
 
     package func remove(scope: Scope) {
@@ -519,6 +591,29 @@ package actor ProviderToolResultRecoveryStore {
 
 extension SwiftToolDispatcher {
     package func impl_tool_result_page(turn: Turn, input: [String: JSONValue]) async -> JSONValue {
+        func whole(_ given: JSONValue?, absent: Int) -> Int? {
+            switch given ?? .null {
+            case .null, .bool(false): return absent
+            case .int(let value): return Int(exactly: value)
+            case .double(let value): return Int(exactly: value)
+            case .string(let value):
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? absent : Int(trimmed)
+            default: return nil
+            }
+        }
+        // A plain section read shows what it always has, now two pages of it; raw pages are read one at a time unless more are asked for.
+        guard let pages = whole(input["pages"], absent: input["raw"] == .bool(true) ? 1 : ProviderToolResultRecoveryStore.usualSectionPages), pages >= 1 else {
+            return .object([
+                "status": .string("failed"),
+                "effects": .string("none"),
+                "reason": .string("invalid_pages"),
+                "recovery_hint": .string("""
+                    Set pages to a whole number from 1, or omit it for the usual read. Keep result_handle, query and raw unchanged; do not rerun the \
+                    original operation.
+                    """),
+            ])
+        }
         if input["continue"] == .bool(true) {
             // Continue owns the position, even when a page is also supplied.
             let blank: (JSONValue?) -> Bool = {
@@ -535,7 +630,7 @@ extension SwiftToolDispatcher {
             let handle = input["result_handle"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
             return await ProviderToolResultRecoveryStore.shared.continueReading(
                 handle: handle?.isEmpty == false ? handle : nil,
-                sessionId: ChatToolSessionInjection.explicitSessionId(in: input), turnId: turn.id)
+                sessionId: ChatToolSessionInjection.explicitSessionId(in: input), turnId: turn.id, pages: pages)
         }
         guard case .string(let handle)? = input["result_handle"], !handle.isEmpty else {
             return .object([
@@ -545,17 +640,7 @@ extension SwiftToolDispatcher {
                 "recovery_hint": .string("Copy result_handle from the earlier bounded_tool_result response in this turn."),
             ])
         }
-        let page: Int?
-        switch input["page"] ?? .null {
-        case .null, .bool(false): page = 0
-        case .int(let value): page = Int(exactly: value)
-        case .double(let value): page = Int(exactly: value)
-        case .string(let value):
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            page = trimmed.isEmpty ? 0 : Int(trimmed)
-        default: page = nil
-        }
-        guard let page, page >= 0 else {
+        guard let page = whole(input["page"], absent: 0), page >= 0 else {
             return .object([
                 "status": .string("failed"),
                 "effects": .string("none"),
@@ -571,7 +656,8 @@ extension SwiftToolDispatcher {
             page: page,
             sessionId: ChatToolSessionInjection.explicitSessionId(in: input),
             turnId: turn.id,
-            query: input["raw"] == .bool(true) ? nil : (input["query"]?.stringValue ?? "")
+            query: input["raw"] == .bool(true) ? nil : (input["query"]?.stringValue ?? ""),
+            pages: pages
         )
     }
 }

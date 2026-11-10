@@ -460,6 +460,9 @@ public struct CodexCompletionLifecycle: Sendable {
                 }
                 continue
             }
+            // A delivered answer is revisited only to settle its route's journal. A door on this Mac keeps none, so delivered is its end:
+            // revisiting it would read the asking conversation whole, every pass, for every answer ever delivered.
+            if row.status == "delivered", route.kind == .local || route.kind == .callerResult { continue }
             RepairOwed.settle(dataRoot, operation: "completion.route:" + row.id,
                 evidence: .init(source: "codex-completion-lifecycle", id: row.id))
             let answer = ChatResponse.answerOnly(response.output, workingCommentaryCharacters: response.workingCommentaryCharacters)

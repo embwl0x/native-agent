@@ -259,6 +259,8 @@ public enum ChatToolOutcome {
         "saved", "updated", "sent", "delivered", "configured", "already_configured",
         "connected", "disconnected", "replied", "read",
         "reviewed", "withdrawn", "archived", "recorded", "no_change",
+        // The workspace facade's admission: its selected reads and sends end under their own names.
+        "prepared",
     ]
 
     package static let failureStatuses: Set<String> = [
@@ -302,14 +304,13 @@ public enum ChatToolOutcome {
         return ExactResultClass(rawValue: original)
     }
 
-    /// Every projection shares this classification; missing, pending, partial and ambiguous evidence stays unknown.
+    /// Every projection shares this classification; pending, partial and ambiguous evidence stays unknown.
     public static func exactResultClass(_ output: JSONValue) -> ExactResultClass {
         exactResultClass(output, inspectWrappedResult: true)
     }
 
     private static func exactResultClass(_ output: JSONValue, inspectWrappedResult: Bool) -> ExactResultClass {
-        // Direct scalar and array results establish dispatch completion; null carries no terminal evidence. Object envelopes still require status/error
-        // evidence.
+        // A returned value is the call's answer: a scalar, an array, or an object that names no ending of its own. Null carries no terminal evidence.
         guard case .object(let object) = output else {
             return output == .null ? .unknown : .succeeded
         }
@@ -364,7 +365,9 @@ public enum ChatToolOutcome {
         if completed || object["ok"] == .bool(true) || object["success"] == .bool(true)
             || object["outcome"] == .string("succeeded") || object["execution"] == .string("executed") { return .succeeded }
         if numericExitCode(object["exit_code"]) == 0 { return .succeeded }
-        return .unknown
+        // Plain data with no ending named and no effect left unseen. An unfamiliar status word still proves nothing.
+        let namesAnEnding = ["status", "state", "outcome", "verification", "original_result_class"].contains { object[$0] != nil }
+        return namesAnEnding ? .unknown : .succeeded
     }
 
     private static func numericExitCode(_ value: JSONValue?) -> Double? {

@@ -134,20 +134,11 @@ extension AppModel {
             return (true, "Sign-in removed.", nil)
         } catch { return (false, error.localizedDescription, error.localizedDescription) }
     }
-}
 
-/// Result payload for the existing result envelope; the body attests the credential binding.
-struct ProviderProbeReply: Codable, Sendable {
-    let result: ProviderTestResult
-    let credentialReady: Bool
-    let credentialMatches: Bool
-}
-
-extension AppModel {
-    func testProviderConnection(_ request: ProviderTestRequest) async throws -> ProviderProbeReply {
-        guard case .result(let value) = try await checkedFaceAct(.testProvider(request)) else {
-            throw PartCallError(code: "probe_unconfirmed", message: "The provider returned no connection-test result.")
+    func testProviderConnection(_ request: ProviderTestRequest) async throws -> ProviderTestReply {
+        guard case .providerTest(let probe) = try await checkedFaceAct(.testProvider(request)) else {
+            throw FaceActionFeedback.unexpected("a provider-test result")
         }
-        return try JSONDecoder().decode(ProviderProbeReply.self, from: JSONEncoder().encode(value))
+        return probe
     }
 }

@@ -38,9 +38,12 @@ without closing the link. Act cancellation stops execution; its terminal reply
 runs through `settle` with unknown effects preserved. EOF, malformed framing or
 envelope correlation, pipe failure and owner shutdown end the connection.
 The body and face share `diagnostics/FaceLink.log`, with PID and role on each
-line. Body failures retain code, message and cause; disconnect records precede
-cleanup. Frame receipts name epoch, sequence and barriers, and cancellation
-records name their target request. Failure details are credential-redacted.
+line. The record is the recent past: the write that takes it past 32 MiB copies it
+to `diagnostics/FaceLink.previous.log` (replacing the earlier one) and truncates it,
+under a lock every write shares, so no line is lost or lands in the copy. Body
+failures retain code, message and cause; disconnect records precede cleanup.
+Frame receipts name epoch, sequence and barriers, and cancellation records name
+their target request. Failure details are credential-redacted.
 The face draws failed automatic receipts in its inline window status without tearing
 down its feed. Refresh and observation cancellation caused by a departing view
 settles without status or toast feedback. Active observation failures appear in

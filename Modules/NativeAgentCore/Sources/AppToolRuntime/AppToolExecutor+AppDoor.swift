@@ -44,6 +44,10 @@ extension AppToolExecutor {
     public static let doorDoctor = "Doctor (app {page:\"diagnostics\", item:\"doctor\"})"
     /// Keys beginning with __ belong to the gate chain.
     static let doorKeys: Set<String> = ["page", "item", "action", "args", "actions", "preview", "expected_version", "find", "script"]
+    /// A batch step's own keys: what must come back, its name for found, and whether it puts back what the deed moved.
+    static let doorStepKeys: Set<String> = ["expect", "as", "cleanup"]
+    /// The deed's own keys beside actions, and on no other form: the agent's closing words and the slots they take from what came back.
+    static let doorDeedKeys: Set<String> = ["then_say", "with"]
     static func doorText(_ value: JSONValue?) -> String {
         value?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
@@ -71,12 +75,13 @@ extension AppToolExecutor {
         }
         guard (1...AppScriptRunner.actionLimit).contains(list.count) else { return try shape() }
         let shared = input.filter {
-            !$0.key.hasPrefix("__") && !["actions", "preview", "expected_version"].contains($0.key) && $0.value != .null
+            !$0.key.hasPrefix("__") && !["actions", "preview", "expected_version"].contains($0.key) && !doorDeedKeys.contains($0.key)
+                && $0.value != .null
         }
         var calls: [JSONValue] = []
         for entry in list {
             guard case .object(var call) = entry,
-                  call.keys.allSatisfy({ doorKeys.contains($0) || $0.hasPrefix("__") }),
+                  call.keys.allSatisfy({ doorKeys.contains($0) || doorStepKeys.contains($0) || $0.hasPrefix("__") }),
                   shared.allSatisfy({ call[$0.key] == nil || call[$0.key] == .null || call[$0.key] == $0.value }) else {
                 return try shape()
             }
@@ -88,7 +93,7 @@ extension AppToolExecutor {
             calls.append(.object(call))
         }
         var call: [String: JSONValue] = ["actions": .array(calls)]
-        for key in ["preview", "expected_version"] { call[key] = input[key] }
+        for key in ["preview", "expected_version", "then_say", "with"] { call[key] = input[key] }
         return .object(call)
     }
     /// Door refusals precede execution and name the correcting call.
@@ -573,8 +578,10 @@ extension AppToolExecutor {
                     execution: execution), as: page.id)
             }
         }
-        // Other keys app does not take still fail loudly.
-        let stray = input.keys.filter { !Self.doorKeys.contains($0) && !$0.hasPrefix("__") }.sorted()
+        // Other keys app does not take still fail loudly; a deed key sent as null was omitted.
+        for key in Self.doorDeedKeys where input[key] == .null { input.removeValue(forKey: key) }
+        let deed = input["actions"] != nil && input["actions"] != .null
+        let stray = input.keys.filter { !Self.doorKeys.contains($0) && !(deed && Self.doorDeedKeys.contains($0)) && !$0.hasPrefix("__") }.sorted()
         if !stray.isEmpty {
             if stray.count == 1, action.isEmpty, let key = stray.first, let value = input[key],
                let correction = try await Self.doorActionCorrection(key, input: input.merging(["args": value]) { _, value in value }, turn: turn) {
@@ -582,19 +589,21 @@ extension AppToolExecutor {
             }
             return Self.doorRefusal("unknown_key",
                 "app takes no \(stray.joined(separator: ", ")). Its keys are page, item, action, args, actions, preview, "
-                + "expected_version, find and script; an action's own arguments go inside args. Nothing was read or done.",
+                + "expected_version, find and script, and then_say and with beside actions; an action's own arguments go inside args. "
+                + "Nothing was read or done.",
                 remedy: "correct_arguments", "Call app again with only those keys; {} lists the pages.",
                 next: [:], extra: ["unrecognised": .array(stray.map(JSONValue.string)),
-                                   "valid": .array(Self.doorKeys.sorted().map(JSONValue.string))])
+                                   "valid": .array((deed ? Self.doorKeys.union(Self.doorDeedKeys) : Self.doorKeys).sorted().map(JSONValue.string))])
         }
         // Strict providers represent omitted optional fields with null.
         if let entries = input["actions"], entries != .null {
             let beside = input.filter { $0.key != "actions" && $0.value != .null }
             guard case .array(let list) = entries,
-                  beside.keys.allSatisfy({ $0.hasPrefix("__") || ["preview", "expected_version"].contains($0) }) else {
+                  beside.keys.allSatisfy({ $0.hasPrefix("__") || ["preview", "expected_version"].contains($0) || Self.doorDeedKeys.contains($0) }) else {
                 let advice = try Self.doorBatchAdvice(entries, input: input)
                 return Self.doorRefusal("invalid_actions",
-                    "actions is a list of app calls ({action, args}, {page}, {item}) and takes only preview and expected_version beside it. Nothing was run.",
+                    "actions is a list of app calls ({action, args}, {page[, item]} or {item}, each may add expect, as and cleanup) "
+                    + "and takes only preview, expected_version, then_say and with beside it. Nothing was run.",
                     remedy: "correct_arguments", "Use try_instead's actions call, or its declared shape with your supplied values.",
                     next: advice.objectValue, extra: ["try_instead": advice])
             }

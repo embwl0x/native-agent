@@ -150,8 +150,7 @@ private struct ProviderConfigEditor: View {
             if submission.action == "test" {
                 let reply = try await appModel.protectedFormAct(.testProvider(.init(id: provider.provider_id,
                     authMode: mode, secret: secret, displayedRevision: try revision())))
-                guard case .result(let value) = reply else { throw unconfirmed() }
-                let probe = try JSONDecoder().decode(ProviderFormProbe.self, from: JSONEncoder().encode(value))
+                guard case .providerTest(let probe) = reply else { throw unconfirmed() }
                 let result = probe.result
                 let words: String
                 if result.tested {
@@ -178,10 +177,4 @@ private struct ProviderConfigEditor: View {
     private func unconfirmed() -> WireFailure {
         .init(code: "provider_reply_unconfirmed", message: "The account owner did not confirm this operation.", cause: nil, effects: .unknown)
     }
-}
-
-private struct ProviderFormProbe: Decodable {
-    let result: ProviderTestResult
-    let credentialReady: Bool
-    let credentialMatches: Bool
 }

@@ -254,6 +254,13 @@ extension FileSystemActions {
                     : ["place": .string(resolved.path), "show": .string("material")])])])
             return .object(refusal)
         }
+        // A line selection reads lines, the same window files.excerpt serves; it is never dropped for a byte read.
+        if ["start_line", "max_lines"].contains(where: { (input[$0] ?? .null) != .null }) {
+            guard offset == 0, !hasExplicitMaxBytes, !explicitlyRaw else {
+                return errResult("start_line and max_lines read lines; offset, max_bytes and raw are byte-mode arguments.", code: "bad_input")
+            }
+            return fileExcerpt(input, ctx)
+        }
         let window: (data: Data, totalBytes: Int, version: String, byteLimit: Int)
         do {
             window = try readFileWindow(
@@ -268,12 +275,17 @@ extension FileSystemActions {
         if ctx.readOptions.metadataOnly {
             return .object(["ok": .bool(true), "path": .string(resolved.path), "bytes": .int(Int64(window.totalBytes))])
         }
-        let nextOffset = offset + window.data.count
+        // A text window the file continues past ends at its last newline, so windows join whole lines; a window without one stays whole.
+        var data = window.data
+        if !explicitlyRaw, offset + data.count < window.totalBytes, let newline = data.lastIndex(of: 0x0A) {
+            data = Data(data[...newline])
+        }
+        let nextOffset = offset + data.count
         let hasMore = nextOffset < window.totalBytes
         let content: String
-        if explicitlyRaw { content = window.data.base64EncodedString() }
+        if explicitlyRaw { content = data.base64EncodedString() }
         else {
-            guard let decoded = String(data: window.data, encoding: .utf8) else {
+            guard let decoded = String(data: data, encoding: .utf8) else {
                 return errResult("This text window contains invalid UTF-8. Request files.read with raw:true for exact bytes as base64.", code: "invalid_utf8")
             }
             content = decoded
@@ -286,7 +298,7 @@ extension FileSystemActions {
             "offset": .int(Int64(offset)),
             "read_mode": .string("bytes"),
             "max_bytes": .int(Int64(window.byteLimit)),
-            "returned_bytes": .int(Int64(window.data.count)),
+            "returned_bytes": .int(Int64(data.count)),
             "truncated": .bool(hasMore),
             "has_more": .bool(hasMore),
             "content": .string(content),
@@ -296,7 +308,7 @@ extension FileSystemActions {
         }
         // Guarded replacement needs the whole-file hash; the paging version identifies only the cursor.
         if offset == 0, !hasMore {
-            result["content_sha256"] = .string(SHA256.hash(data: window.data).map { String(format: "%02x", $0) }.joined())
+            result["content_sha256"] = .string(SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined())
         }
         result["version"] = .string(window.version)
         if hasMore {

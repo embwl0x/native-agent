@@ -109,8 +109,10 @@ failures. Retired tool names run nothing; there is nothing to load or unload.
   chosen file. The copied Chat restores the body's startup selection before
   observing a transcript, and its composer holds the canonical per-session
   provider reader. Chat, detached conversations, Shotgun, context receipts and
-  dictation join observation release before replacement. The copied Advanced
-  shell reserves the reading room before expanding the saved Work width;
+  dictation join observation release before replacement. The body also joins a
+  releasing key's source task before admitting a reader from a reopened view,
+  checking cancellation and the connection before sharing or starting its source.
+  The copied Advanced shell reserves the reading room before expanding the saved Work width;
   the conversation list keeps its fixed width and chat accepts its allotted
   width without shifting its inset chrome over the list. Work's divider starts
   at its drawn width and saves only a changed drag. Offscreen drawing

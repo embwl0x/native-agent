@@ -79,7 +79,7 @@ extension Parts {
             "effects": .string("occurred"), "version": .string(revised.bodyDigest),
             "weighs": .bool(source.contains("function weigh(")),
             "detail": .string("""
-                Your turn program is revised and on from your next step, on trial: the night judges it per turn against the kept version in \
+                Your turn program is revised and on from your next turn, on trial: the night judges it per turn against the kept version in \
                 turn.prev.js; ability.save {id:\"turn\", set_aside:true, why} saves that version forward. A step that throws swaps back to it and \
                 sets the trial aside; a weigh that fails leaves what it weighs waiting and tells you.
                 """)]
@@ -168,7 +168,7 @@ extension Parts {
                 "effects": .string("occurred"), "version": .string(forward.bodyDigest), "previous": .string(kept.bodyDigest),
                 "set_aside": .string(current.bodyDigest), "weighs": .bool(forward.body.contains("function weigh(")),
                 "detail": .string("""
-                    Your turn program's trial is set aside: the kept version \(keptKey) is saved forward and on from your next step, and stays in \
+                    Your turn program's trial is set aside: the kept version \(keptKey) is saved forward and on from your next turn, and stays in \
                     turn.prev.js; the version set aside is not kept.
                     """)]
             // The files are the act: the trial closes as set aside once the kept version is current, and a failure to record that is reported.

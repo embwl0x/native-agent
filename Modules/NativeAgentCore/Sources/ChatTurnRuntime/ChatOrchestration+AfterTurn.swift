@@ -18,7 +18,7 @@ extension SwiftNativeTurnEngine {
         let toolDispatches: [TurnEngineResult.ToolDispatchRecord]
         let sessionId: String?
         let surface: String
-        let repliedAt: Date
+        let repliedAt: Date?
         let turn: Turn
         let work: ChatTurnWork
         let bus: TurnTraceBus?
@@ -32,6 +32,7 @@ extension SwiftNativeTurnEngine {
         surface: String,
         took: String? = nil,
         afterReply held: AfterReply? = nil,
+        replied: Bool = true,
         turn: Turn,
     work: ChatTurnWork) -> AfterReply {
         var origin = turn.afterTurnOrigin
@@ -43,7 +44,7 @@ extension SwiftNativeTurnEngine {
         let pending = PendingMemoryPromotion(
             userMessage: userMessage, assistantMessage: assistantMessage,
             toolDispatches: toolDispatches, sessionId: sessionId, surface: surface,
-            repliedAt: Date(), turn: turn.with(\.afterTurnOrigin, origin), work: work, bus: TurnTraceContext.bus)
+            repliedAt: replied ? Date() : nil, turn: turn.with(\.afterTurnOrigin, origin), work: work, bus: TurnTraceContext.bus)
         let held = held ?? afterReply {}
         held.beforeStart { await self.recordMemoryPromotion(pending) }
         return held
@@ -139,30 +140,14 @@ extension SwiftNativeTurnEngine {
                 "savedCorrectionCount": Int64(observation.savedCorrectionCount),
                 "pendingCorrectionCount": Int64(observation.pendingCorrectionCount),
                 "failedCorrectionCount": Int64(observation.failedCorrectionCount),
-                "surpriseObservedTurns": Int64(observation.surprise?.agreement.turns ?? 0),
-                "surpriseWouldDefer": Int64(observation.surprise?.agreement.wouldDefer ?? 0),
-                "surpriseChangedOnPrediction": Int64(observation.surprise?.agreement.changedOnPrediction ?? 0),
-                "surpriseIncompletePredictions": Int64(observation.surprise?.agreement.incompletePredictions ?? 0),
-                "surpriseTries": Int64(observation.surprise?.check.tries ?? 0),
-                "surpriseHits": Int64(observation.surprise?.check.hits ?? 0),
             ],
             flags: [
                 "configured": true,
                 "outcomeReported": true,
-                "surpriseLedgerReadable": observation.surprise?.agreement.ledgerReadable ?? false,
-                "surpriseStanding": observation.surprise?.check.standing == true,
-                "surpriseDeferred": observation.surprise?.deferred == true,
             ],
             labels: [
                 "semanticExtraction": observation.extraction.semanticStatus.rawValue,
                 "interpretationFailure": observation.extraction.failure?.interpretationFailure.rawValue ?? "none",
-                "surpriseVerdict": observation.surprise?.check.verdict.rawValue ?? "unreported",
-                "surpriseEvidence": observation.surprise?.check.reason ?? "unreported",
-                "surpriseAgent": observation.surprise?.check.scope?.agent ?? "unreported",
-                "surpriseDetector": String(observation.surprise?.check.scope?.detector ?? 0),
-                "surpriseRule": observation.surprise?.check.rule ?? "none",
-                "surpriseLowerBound": String(observation.surprise?.check.lowerBound ?? 0),
-                "surpriseCostBar": String(observation.surprise?.check.costBar ?? 1),
                 "failureReason": observation.extraction.failure?.reason.rawValue ?? "none",
                 "recoveryAction": observation.extraction.failure?.recovery ?? "none",
                 "memoryModel": observation.extraction.failure?.model ?? "unreported",

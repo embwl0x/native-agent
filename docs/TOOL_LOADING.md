@@ -22,7 +22,70 @@ requests offer it alone. The schema is defined in
 | `app {"action":"find","args":{"what":"<words>"}}` | The same discovery reader; `query` is an alternative to `what`. |
 | `app {"action":"<id>","args":{…}}` | Run one registered action. |
 | `app {"script":"<JavaScript>"}` | Compose permitted app calls in JavaScriptCore. |
-| `app {"actions":[{…},…]}` | Many calls in one, in order, each re-entering the gate chain as its own app call. Nothing is built on a failure: after a failed or person-waiting step, later changes do not run; later reads still run. The result names the blocking step and reason, skipped changes and reads run after it, with `failed_step`, `not_run:[{index, action}]` and `steps_total` (step indexes start at 1). An action's single-valued argument given a list (`args.handle:[…]`) follows the same law per value: a failed write stops later write values; reads fan out fully. |
+| `app {"actions":[{…},…]}` | Many calls in one, in order, each re-entering the gate chain as its own app call. Nothing is built on a surprise: after a step that fails, waits on the person, or does not come back as they said, later changes do not run; later reads still run. The result names the blocking step and reason, skipped changes and what ran after it, with `stopped_at:{step, as, because}` (`because` is `failed`, `waiting` or `surprise`), `failed_step` when the step failed or waits, `not_run:[{step, as, action, because}]` (`because` is `stopped` for a change after the stop, `found_not_there` for a step whose `found` could not be resolved) and `steps_total`; each receipt carries its `step` and its `as` name (steps count from 1). `then_say` and `with` beside `actions` carry their closing words (below). An action's single-valued argument given a list (`args.handle:[…]`) follows the same law per value: a failed write stops later write values; reads fan out fully. |
+
+A step in `actions` may carry three keys of its own beside its call. They are
+read by the batch and never reach the action.
+
+- `expect` is what must come back, as a shape laid over the step's result.
+  Text is met by containing it, whatever the case; a number or true/false by
+  equality; `null` by nothing being there (missing, null or empty);
+  `{exactly: v}` by the whole value; `{not: shape}` by the shape not being
+  met. An object is met field by field and a list by each entry being met by
+  some element. A bare string over the whole result is looked for in
+  every value the action returned: not in field names, not in the receipt's
+  own bookkeeping (`action`, `status`, `execution`, `effect`, `read_only`,
+  `irreversible`), and not in a value that is only one of the step's own
+  arguments said back; a named field is looked at as it is. A step that ran
+  and is not as expected stops the deed as a failure does: the batch is not
+  `ok`, `stopped_at.because` is `surprise`, and
+  `surprise: [{place, expected, found}]` shows what was actually at each
+  place. A step that runs after the stop is not judged, and its receipt says
+  so (`expect: "not judged: …"`).
+- `{found: "<step>.<path>"}` as an argument value, at any depth, takes that
+  value from an earlier step's result before the step runs. The step is its
+  1-based number or its `as` name; the path walks object keys and zero-based
+  list positions; the step alone gives the whole result. Values pass whole;
+  gluing text is a script's work. A reference that cannot be resolved (no
+  such earlier step, a step that did not run or failed, a path not there)
+  means the step does not run and the deed stops there, its receipt naming
+  what was at the deepest place reached.
+- `as` names a step for `found`. Names are unique, not empty, not all digits
+  and hold no dot, or the whole batch is refused before anything runs.
+- `cleanup: true` marks a step that puts back what the deed moved. It runs
+  after a stop, through its own gates, unless its own `found` cannot be
+  resolved, which is the case when the step that moved the thing never ran.
+  What ran after a stop is listed with each cleanup marked as one, and
+  each step that did not land said so.
+
+"The result" in both is what a script receives from the same call: the
+action's answer without the echoed arguments, guidance and provenance. Their own
+arguments are therefore never matched. Under `preview`, a step that was only
+described has no result: its `expect` is not judged, which its receipt says,
+and a `found` into it cannot be resolved.
+
+Their closing words stand when every step ran, was expected and held, nothing
+in it is beyond undoing, and nothing else arrived. `then_say` beside
+`actions` is those words, as text; `with` beside it maps each slot name to
+`{found: "<step>.<path>"}`. Both are keys of the `actions` form only; on any
+other form they are unknown keys. Before anything runs, the batch is refused
+(`invalid_actions`) when `then_say` is not non-empty text, when `with` comes
+without `then_say`, or when a `with` value is anything but one `found`. Given
+`then_say`, the result always carries `then_say`, set by the batch itself and
+never by a step's payload: `{stands: true, words}` with each `{name}` that
+`with` names replaced by its value, or `{stands: false, because}`, one plain
+sentence naming the first thing that failed. They stand only when the batch
+was not a preview and no step was only previewed; its status is `ok` (every
+step has a receipt and landed fully, nothing stopped, waited or was handed
+back); every step carried an `expect`; no receipt, nor any call a script step made, says `irreversible: true`;
+no message from the person is waiting at the end; and every slot resolves,
+through the same `found` as a step's argument, to a value: a number,
+true/false, or one line of text of at most 120 characters. A list, an
+object, null, longer or multi-line text, or a reference not there means the
+words do not stand. Braces naming nothing in `with` stay as written. The
+shipped turn says standing words and ends with no further model call when
+that one call was the round's only call and asked for them itself
+([turn anatomy](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool)).
 
 A readable, untainted message from the person waiting in this conversation
 hands an `actions` batch back before its next step, including a read. The
@@ -246,8 +309,28 @@ parameter-schema failure appears in `schema_gaps` with its id and cause; its
 healthy siblings still return, including on an exact-id find. `shown_actions`
 counts usable rows; a gap is never evidence of absence. That action's admission
 still refuses, without manufacturing arguments from display text. Shared
-inventory or semantic-index failures still fail the search. The always-on description names fixed hot action IDs;
-their checked schemas and examples arrive through discovery.
+inventory or semantic-index failures still fail the search.
+
+The always-on description ends with their hand: the verbs a hand is born knowing
+(`AppActions.bornKnowing`) together with every native action their own mind has
+done in what their record still holds, in one alphabetical list, each written
+as its `id(args)` form from the current admitted schema (`*` marks a required
+argument), the form every receipt's `argument_form` carries. Their own mind's
+calls are the top-level `tool.dispatch` rows that ended `ok` and `succeeded`,
+not as a preview, with no `parentId` and no `automaticOrigin`; the record keeps
+those rows for its two-week detail horizon, and that horizon is the window:
+no second number is kept here. A verb they stops using fades from their hand at a later launch. Only
+native actions this release admits enter it: authored ability names, removed
+verbs and ids that do not resolve do not, and an action whose schema does not
+render is left out. The
+record is read once per process, when the door is first built (the engine
+builds it as it is made, off the main thread, and launch waits for the engine,
+so their hand is whole before anything asks for it), by one SQLite query over the record
+(`TurnTracePersistLane.doneVerbs`); the description then stays byte-identical
+for the life of the process, as the provider's cached prefix and the registered
+descriptor require. A newborn agent's hand is what it was born knowing; an
+unreadable record or an unrendered verb is traced as `app.hand` and never fails
+a turn. Checked schemas and examples still arrive through discovery.
 
 Settings propagate unavailable model/account catalogs, Trust/Slack policy, helper
 definitions, shelf and trigger reads. Thinking levels come only from the selected
@@ -548,6 +631,9 @@ Program returns and every journaled step's answer stay whole until the shared
 model view. A long result names its `result_handle` and `next_call`; use
 `result.page` with that handle and the zero-based `page` offset, following
 `next_page` (or `continue:true`). `raw:true` reads exact retained bytes.
+`pages` says how many pages to read in one answer, from that offset; the
+answer joins them in order, says `pages_read` and where the reading stands,
+and holds only as many as one inline result can carry.
 The helper's former 16 KiB return prefix and byte-count-only step results are
 removed. Retention failures are explicit and do not establish the action's
 outcome.

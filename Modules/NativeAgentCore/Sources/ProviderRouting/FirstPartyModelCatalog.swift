@@ -106,6 +106,8 @@ public enum FirstPartyModelCatalog {
             supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true, usesResponses: true),
         .init(id: gpt6AstraModelID, name: "GPT-6-Astra", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
             supportedReasoningEfforts: publicGPT6AstraEfforts, supportsFast: true, usesResponses: true),
+        .init(id: "gpt-6-luna", name: "GPT-6-Luna", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true, usesResponses: true),
     ]
 
     public static let anthropicModels: [FirstPartyModelDescriptor] = [
@@ -118,6 +120,9 @@ public enum FirstPartyModelCatalog {
         .init(id: "claude-haiku-5-5", name: "Claude Haiku 5.5", contextLength: 1_000_000, defaultReasoningEffort: "medium",
             supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true),
         .init(id: "claude-opus-4-8", name: "Claude Opus 4.8", contextLength: 1_000_000, defaultReasoningEffort: "high",
+            supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true),
+        // Fable 5.2 keeps Fable 5.1's request contract and rejects a replayed thinking block whose system, tools or earlier messages changed.
+        .init(id: "claude-fable-5-2", name: "Claude Fable 5.2", contextLength: 1_000_000, defaultReasoningEffort: "high",
             supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true),
         // Fable 5.1 allows 128K output and requires adaptive thinking without explicit budgets, forced tools or prefill.
         .init(id: "claude-fable-5-1", name: "Claude Fable 5.1", contextLength: 1_000_000, defaultReasoningEffort: "high",

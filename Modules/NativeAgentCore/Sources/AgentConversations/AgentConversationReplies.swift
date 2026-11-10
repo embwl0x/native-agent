@@ -51,12 +51,50 @@ extension AgentConversationStore {
     }
 
     /// The return's owner supplies its caller: a queued refusal belongs to that send, not the active exchange. Once per key.
+    @discardableResult
     package static func returnNews(_ row: AgentConversationRecord, scope: String, once: String, words: String,
-                                   peers: [String]?, dataRoot: URL) {
+                                   peers: [String]?, dataRoot: URL, deliveryReceipt: Bool = false) -> Task<Void, Never> {
         let door = row.agent.hasPrefix("peer:") ? "contact:" + String(row.agent.dropFirst(5)) : row.agent
         let happening = Happening(.returned, subject: "conversation:" + row.id, door: door, words: words, once: once,
             route: scope, peers: peers)
-        Task.detached { await ContactReturns.shared.post(happening, dataRoot: dataRoot) }
+        return Task.detached { await ContactReturns.shared.post(happening, dataRoot: dataRoot, deliveryReceipt: deliveryReceipt) }
+    }
+
+    /// Held acceptance survives replies and ledger pruning. The attention record owns whether its news already arrived.
+    static func noteHeldDeliveries(_ rows: [AgentConversationRecord], dataRoot: URL) async {
+        let record = ExperienceStore.at(dataRoot)
+        for row in rows where row.agent.hasPrefix("peer:") {
+            var accepted = Experience.Obligation(to: "agent:" + row.agent)
+            accepted.phase = .accepted
+            accepted.evidence = .init(source: "agents/conversations", id: row.id)
+            for (send, obligations) in row.settledObligations ?? [:] where obligations["accept"] == accepted {
+                let once = "delivered:" + send
+                do {
+                    if try await record.experience("happening:" + once) != nil {
+                        await RepairOwed.settle(dataRoot, operation: "agent.return:" + once,
+                            evidence: .init(source: "experience", id: "happening:" + once)).value
+                        continue
+                    }
+                    let messages = try ContactThread.lines(dataRoot: dataRoot, owner: String(row.agent.dropFirst(5)))
+                        .filter { $0.sendID == send && $0.mine }
+                    guard messages.count == 1, let message = messages.first else {
+                        throw Failure(message: "Delivered message \(send) has no unique canonical send row; restore its contact transcript.")
+                    }
+                    guard !message.byPerson else { continue }
+                    await returnNews(row, scope: row.scopeSessionID, once: once, words: row.name + " has your note",
+                        peers: [row.agent], dataRoot: dataRoot, deliveryReceipt: true).value
+                    if try await record.experience("happening:" + once) != nil {
+                        await RepairOwed.settle(dataRoot, operation: "agent.return:" + once,
+                            evidence: .init(source: "experience", id: "happening:" + once)).value
+                    }
+                } catch {
+                    await RepairOwed.owe(dataRoot, id: "happening:" + once, kind: .message,
+                        evidence: [.init(source: "agents/conversations", id: row.id)], operation: "agent.return:" + once,
+                        owner: "agents/conversations.json", words: "Delivery news is still owed: " + error.localizedDescription,
+                        lever: "Repair this send's named evidence, then publish its committed acceptance; do not resend the note.").value
+                }
+            }
+        }
     }
 
     /// A collected remote answer belongs to an inline waiter before it can become a separate turn. Serialized with the waiter's deadline release.
@@ -332,8 +370,9 @@ extension AgentConversationStore {
             if written {
                 for item in taken {
                     guard let i = rows.firstIndex(where: { $0.id == item.row }),
-                          rows[i].exchanges?.contains(where: { $0.id == item.exchange && $0.status == "delivered" }) == true else { continue }
-                    // Keep acceptance after the host takes the message; its answer arrives separately.
+                          let exchange = ((rows[i].exchanges ?? []) + (rows[i].releasing ?? [])).first(where: { $0.id == item.exchange }),
+                          exchange.status == "delivered" || exchange.reply != nil else { continue }
+                    // Response-written evidence accepts the send without replacing an answer that settled first.
                     var accepted = Experience.Obligation(to: "agent:" + rows[i].agent)
                     accepted.phase = .accepted
                     accepted.evidence = .init(source: "agents/conversations", id: rows[i].id)
@@ -534,16 +573,24 @@ extension AgentConversationStore {
 actor ContactReturns {
     static let shared = ContactReturns()
     /// A helper conversation cannot receive an agent turn that speaks as the helper.
-    func post(_ happening: Happening, dataRoot: URL) async {
+    func post(_ happening: Happening, dataRoot: URL, deliveryReceipt: Bool = false) async {
         var happening = happening
         do {
-            if try SessionConversation(dataRoot: dataRoot, includingArchived: true).isHelper(happening.route) { happening.route = nil }
+            let conversations = try SessionConversation(dataRoot: dataRoot, includingArchived: true)
+            if deliveryReceipt {
+                guard let kind = conversations.kind(happening.route) else {
+                    throw AgentConversationStore.Failure(message: "The delivery receipt's sending conversation is unavailable; restore its session record.")
+                }
+                // A receipt for the agent's answer goes to the agent's own stream, never back to the contact as a new question.
+                if kind == .agent { happening.route = nil }
+            }
+            if conversations.isHelper(happening.route) { happening.route = nil }
         } catch {
             RepairOwed.owe(dataRoot, id: happening.id, kind: .message,
                 evidence: [.init(source: "agents/conversations", id: String(happening.subject.dropFirst("conversation:".count)))],
                 operation: "agent.return:" + happening.once, owner: "conversation destination",
                 words: "Contact return \(happening.once) is still owed: " + error.localizedDescription,
-                lever: "Repair the named conversation's session evidence, then return its retained reply; do not resend the message.")
+                lever: "Repair the named conversation's session evidence, then publish its retained news; do not resend the message.")
             return
         }
         await Attention.post(happening, dataRoot: dataRoot).value

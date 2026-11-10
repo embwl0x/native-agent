@@ -108,19 +108,24 @@ public struct MacChatTurnCardModel: Sendable, Equatable, Codable {
     public let thinkingSince: Date?
     /// When reply text arrives alone, retain the duration spent thinking.
     public let thoughtFor: TimeInterval?
+    /// While a step runs: her title once it has run `TurnFace.longStepAfter` ("<name> is still on it").
+    public let longStepTitle: String?
 
-    /// Use the same three timestamps for projection and live readout so their seconds cannot disagree.
+    /// Use the same timestamps for projection and live readout so their seconds cannot disagree.
     public struct Clock: Equatable, Sendable, Codable {
         public let startedAt: Date
         public let endedAt: Date?
         public let lastMovementAt: Date
         public let isTerminal: Bool
+        /// The running step's start, while one runs: the clock reads that step's time, and a running step is movement.
+        public let stepStartedAt: Date?
 
-        public init(startedAt: Date, endedAt: Date?, lastMovementAt: Date, isTerminal: Bool) {
+        public init(startedAt: Date, endedAt: Date?, lastMovementAt: Date, isTerminal: Bool, stepStartedAt: Date? = nil) {
             self.startedAt = startedAt
             self.endedAt = endedAt
             self.lastMovementAt = lastMovementAt
             self.isTerminal = isTerminal
+            self.stepStartedAt = stepStartedAt
         }
 
         /// Quantize to whole seconds so token-rate movement cannot re-render unchanged text.
@@ -130,18 +135,19 @@ public struct MacChatTurnCardModel: Sendable, Equatable, Codable {
         }
 
         public func elapsed(at instant: Date) -> TimeInterval {
-            Self.wholeSeconds((endedAt ?? instant).timeIntervalSince(startedAt))
+            Self.wholeSeconds((endedAt ?? instant).timeIntervalSince(stepStartedAt ?? startedAt))
         }
 
+        /// A running step is never "no movement"; between steps, quiet is read from the last movement.
         public func secondsSinceMovement(at instant: Date) -> TimeInterval? {
-            isTerminal ? nil : Self.wholeSeconds(instant.timeIntervalSince(lastMovementAt))
+            isTerminal || stepStartedAt != nil ? nil : Self.wholeSeconds(instant.timeIntervalSince(lastMovementAt))
         }
     }
 
     public init(identity: MacChatTurnIdentity, phase: TurnPresentationPhase, title: String, detail: String?,
                 delegateName: String?, tone: Tone, symbolName: String, isTerminal: Bool, showsLiveIndicator: Bool,
                 cancellationPending: Bool, approval: MacChatTurnCardApproval?, clock: Clock,
-                thinkingSince: Date?, thoughtFor: TimeInterval?) {
+                thinkingSince: Date?, thoughtFor: TimeInterval?, longStepTitle: String? = nil) {
         self.identity = identity
         self.phase = phase
         self.title = title
@@ -156,6 +162,7 @@ public struct MacChatTurnCardModel: Sendable, Equatable, Codable {
         self.clock = clock
         self.thinkingSince = thinkingSince
         self.thoughtFor = thoughtFor
+        self.longStepTitle = longStepTitle
     }
 
     /// Settled cards without decisions must be inert; live approvals remain clickable.
@@ -211,6 +218,8 @@ public enum MacChatTurnCardFormat {
 /// One conversation's finished status. Missing feed input remains unknown; only owner events replace it.
 public struct TurnFace: FaceValue {
     public static let movementNoticeAfter: TimeInterval = 20
+    /// A step that has run this long is a long step: the box says so, and that nothing is stuck.
+    public static let longStepAfter: TimeInterval = 30
     public let sessionID: String
     public let turnID: String?
     public let activeTurnID: String?
@@ -252,11 +261,20 @@ public struct TurnFace: FaceValue {
         self.approvalStatus = approvalStatus
     }
 
-    public struct Step: Sendable, Equatable, Codable {
+    /// One step of the turn, one identity from its start to its end. Only her acts (calls) are steps; a wait is a state of the turn.
+    public struct Step: Sendable, Equatable, Codable, Identifiable {
         public enum Outcome: String, Sendable, Equatable, Codable { case ok, refused, failed }
+        /// Its turn and its number there, the same while it runs and after it ends.
+        public let id: String
         public let text: String
         public let outcome: Outcome?
-        public init(text: String, outcome: Outcome?) { self.text = text; self.outcome = outcome }
+        /// Started and not yet ended, in a turn still running.
+        public let isRunning: Bool
+        /// When it started; a face draws its elapsed time from this, never from a posted tick.
+        public let startedAt: Date
+        public init(id: String, text: String, outcome: Outcome?, isRunning: Bool, startedAt: Date) {
+            self.id = id; self.text = text; self.outcome = outcome; self.isRunning = isRunning; self.startedAt = startedAt
+        }
     }
 
     /// Masked image bytes cross with the caption; a failed encoding is visible without retaining a previous frame.

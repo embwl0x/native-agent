@@ -528,8 +528,8 @@ else unknown); a prepared act is made. `record` is `tries`/`hits` since the
 last change, the lifetime counts, `unknown`, `misses` in a row, `changes`, how
 often the stem ran (`delivered`), previewed (`prepared`) or withheld it, and
 `costs`, the stem's own run times in seconds. Standing arithmetic belongs to
-[`Expectation`](../Modules/NativeAgentCore/Sources/NativeAgentCore/Expectation.swift),
-shared with after-turn claims; Expansion's practice owner measures its costs;
+[`Expectation`](../Modules/NativeAgentCore/Sources/NativeAgentCore/Expectation.swift);
+Expansion's practice owner measures its costs;
 nothing in the file is a setting. Only a missing file starts empty; unreadable, invalid or unsupported records remain byte-preserved and unavailable.
 Expansion diagnostics expose the cause; activity cannot replace the record.
 The one coalescing writer acknowledges a save only after the durable byte owner

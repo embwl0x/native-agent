@@ -397,8 +397,11 @@ extension SwiftNativeChatOrchestrationClient {
         }
         // The accepted message owns its incoming appraisal even without a saved answer; a reply that captured a promotion already owns that appraisal.
         if !promotionStarted {
+            // A turn that failed, stopped or could not save its reply has no reply that reached anyone.
+            var replied = false
+            if case .success = outcome, case .success = settled { replied = true }
             let afterReply = await engine.deferMemoryPromotion(userMessage: message, assistantMessage: observation.partialReply,
-                toolDispatches: observation.toolDispatches, sessionId: resolvedSession, surface: surface, turn: turn,work: work)
+                toolDispatches: observation.toolDispatches, sessionId: resolvedSession, surface: surface, replied: replied, turn: turn,work: work)
             await afterReply.start()
         }
         return settled

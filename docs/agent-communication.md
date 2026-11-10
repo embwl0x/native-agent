@@ -717,6 +717,35 @@ sender's wait for the contact's answer, regardless of the original transport.
 Repeated settlement writes nothing and wakes no observers unless an exchange
 or its acceptance obligation actually changes.
 
+Committed held-send acceptance returns one `returned` happening through the
+same contact-news owner as refusals and replies: “<contact> has your note”,
+under `delivered:<send-id>`. It reads the store's retained acceptance obligation,
+not the current receipt's status: a reply may already have advanced that status.
+If the reply settles before the response-written callback, that callback commits
+acceptance without replacing the reply's status or words.
+The canonical send row identifies a person's own send, which starts no agent
+turn. No message words enter the delivery happening. The attention record owns
+its once-key; saves and launch restoration re-offer committed acceptance,
+including dropped records, without another delivery-state copy or sent marker.
+Pruned exchanges retain their acceptance obligation, and the transcript retains
+the send's authorship. Missing or unreadable evidence owes repair for that send;
+it never means delivered or not delivered. A failed response write leaves the
+send held and creates no delivery news. A contact that never calls leaves the
+note held, with the existing read/Stop levers and no clock deciding its outcome.
+
+When the asking turn has ended, the receipt follows the existing return to its
+recorded conversation; a known archived conversation keeps that destination.
+A missing session record leaves the news owed with its repair, without guessing
+another conversation. Helper-owned and contact-owned conversations receive
+delivery receipts in the agent's own mind stream: receipt of their answer opens no
+contact reply turn and cannot generate another held answer by itself. Human
+conversation returns carry the recipient peer's steering stamp and use ordinary
+turn admission, so they cannot join an untainted person turn. Delivery and reply
+keep separate once-keys (`delivered:<send-id>` and `reply:<send-id>`); delivery
+reports receipt alone, never an owed-answer verdict. An inline or bridge reply
+keeps its existing reply path and suppression rules. Re-offering receipt after
+a reply or restart cannot undo the reply or tell receipt twice.
+
 News that reaches a contact conversation after its turn ended runs in that
 conversation. `AgentContactHeldAnswer.hold` also accepts an answer without an
 open turn: it saves the send before appending a held exchange, under

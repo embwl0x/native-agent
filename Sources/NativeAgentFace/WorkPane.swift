@@ -256,15 +256,44 @@ struct WorkPane: View {
 // MARK: - Steps
 
 /// Derive step outcomes from tool results, not terminal reasons; an approval draws only as its conversation's row, never here.
+/// The line and the rows each read their own part of the turn, so a tick of the line never redraws a row.
 struct WorkPaneSteps: View {
+    let sessionId: String
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.section) {
+                WorkPaneStepsLine(sessionId: sessionId)
+                WorkPaneStepRows(sessionId: sessionId)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, NativeAgentShellLayout.roomGutter)
+            .padding(.bottom, NativeAgentShellLayout.roomGutter)
+        }
+    }
+}
+
+/// What she is doing now, read alone: it changes as often as she moves.
+private struct WorkPaneStepsLine: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
 
     var body: some View {
-        ScrollView {
-            FaceView(face: WorkPaneFace.steps(appModel.turnFace(for: sessionId)), open: { _ in }, act: { _, _, _ in })
-                .padding(.horizontal, NativeAgentShellLayout.roomGutter)
-                .padding(.bottom, NativeAgentShellLayout.roomGutter)
+        Text(appModel.turnPart("stepsLine", for: sessionId, WorkPaneFace.stepsLine))
+            .font(.title3).foregroundStyle(.secondary)
+    }
+}
+
+/// The steps, read alone: they redraw only when a step starts or ends, and each keeps its row by its id.
+private struct WorkPaneStepRows: View {
+    let sessionId: String
+    @Environment(AppModel.self) private var appModel
+    @State private var session = FacePageSession()
+
+    var body: some View {
+        let steps = appModel.turnPart("steps", for: sessionId) { $0?.steps ?? [] }
+        if !steps.isEmpty {
+            FaceView(face: WorkPaneFace.steps(steps), door: ReadOnlyFaceDoor(), session: session)
         }
     }
 }
@@ -301,6 +330,8 @@ struct WorkPaneScreen: View {
                 .padding(.horizontal, NativeAgentShellLayout.roomGutter)
                 .padding(.bottom, NativeAgentShellLayout.roomGutter)
             }
+            // The picture is fitted to the width, so a scroll bar that takes width would appear and hide without end; none is drawn.
+            .scrollIndicators(.never)
         } else {
             Text("When I drive the Mac or the browser, what I see shows here.")
                 .font(ShellType.label)

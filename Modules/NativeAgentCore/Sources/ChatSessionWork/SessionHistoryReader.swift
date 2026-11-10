@@ -111,9 +111,9 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
 }
 
 public struct SessionHistoryReadResult: Sendable {
-    public let messages: [ChatMessage]
-    public let stats: SessionHistoryReadStats
-    public let contextStatistics: (totalChars: Int, messageCount: Int)
+    public fileprivate(set) var messages: [ChatMessage]
+    public fileprivate(set) var stats: SessionHistoryReadStats
+    public fileprivate(set) var contextStatistics: (totalChars: Int, messageCount: Int)
 
     public init(messages: [ChatMessage], stats: SessionHistoryReadStats, contextStatistics: (totalChars: Int, messageCount: Int) = (0, 0)) {
         self.messages = messages
@@ -471,7 +471,7 @@ public actor SessionHistoryReader {
         return unread ? SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "read_failed")) : result
     }
 
-    private func transcriptPath(for safeId: String, transcriptURL: URL?) throws -> URL {
+    package nonisolated func transcriptPath(for safeId: String, transcriptURL: URL?) throws -> URL {
         let path = transcriptURL ?? dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
@@ -486,6 +486,43 @@ public actor SessionHistoryReader {
                 NSLocalizedDescriptionKey: "That conversation's file is outside the folders conversations live in. Its data was left unchanged."])
         }
         return path
+    }
+
+    /// Extend a complete, unfiltered prefix with complete lines; stats describe the whole selected revision, not just this read's IO.
+    package nonisolated static func appendCompleteMessages(
+        from data: Data, sourceBytes: Int64, to history: inout SessionHistoryReadResult
+    ) throws {
+        guard let text = String(data: data, encoding: .utf8) else {
+            history = SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(
+                mode: "invalid_encoding", sourceBytes: sourceBytes, bytesRead: sourceBytes))
+            return
+        }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        let previous = history.stats
+        let decoded = decodeMessages(from: lines, excludingRunId: nil, startingLine: previous.linesRead)
+        let malformed = try adding(previous.malformedRowCount, decoded.malformedRowCount)
+        let invalidShape = try adding(previous.invalidShapeRowCount, decoded.invalidShapeRowCount)
+        let damaged = malformed > 0 || invalidShape > 0
+        if damaged { history.messages.removeAll() }
+        else { history.messages.append(contentsOf: decoded.messages) }
+        history.contextStatistics = (
+            try adding(history.contextStatistics.totalChars, decoded.contextStatistics.totalChars),
+            try adding(history.contextStatistics.messageCount, decoded.contextStatistics.messageCount))
+        history.stats = SessionHistoryReadStats(
+            mode: damaged ? "damaged_history" : "full",
+            sourceBytes: sourceBytes, bytesRead: sourceBytes,
+            linesRead: try adding(previous.linesRead, lines.count),
+            decodedCount: history.messages.count,
+            malformedRowCount: malformed, invalidShapeRowCount: invalidShape,
+            damageEvidence: Array((previous.damageEvidence + decoded.damageEvidence).prefix(8)),
+            excludedByRunId: try adding(previous.excludedByRunId, decoded.excludedByRunId),
+            returnedCount: history.messages.count, truncated: false)
+    }
+
+    private nonisolated static func adding(_ left: Int, _ right: Int) throws -> Int {
+        let sum = left.addingReportingOverflow(right)
+        guard !sum.overflow else { throw CocoaError(.fileReadTooLarge) }
+        return sum.partialValue
     }
 
     private nonisolated func relevanceMessagesWithStats(
@@ -706,6 +743,7 @@ public actor SessionHistoryReader {
         from lines: [String],
         excludingRunId: String?,
         excludingAwaitingConsumption: Bool = false,
+        startingLine: Int = 0,
         decode: (String) -> DecodedRow = SessionHistoryReader.decodeRow
     ) -> (
         messages: [ChatMessage],
@@ -730,7 +768,8 @@ public actor SessionHistoryReader {
             contextStatistics.messageCount += decoded.contextStatistics.messageCount
             func recordDamage() {
                 guard damageEvidence.count < 8 else { return }
-                damageEvidence.append("selected row \(position + 1) sha256 " + SHA256.hash(data: Data(line.utf8)).map { String(format: "%02x", $0) }.joined())
+                damageEvidence.append("selected row \(startingLine + position + 1) sha256 "
+                    + SHA256.hash(data: Data(line.utf8)).map { String(format: "%02x", $0) }.joined())
             }
             guard let parsed = decoded.value else { malformedCount += 1; recordDamage(); continue }
             guard case .object(let obj) = parsed else { invalidShapeCount += 1; recordDamage(); continue }

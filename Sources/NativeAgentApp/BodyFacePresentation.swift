@@ -160,7 +160,7 @@ struct BodyFacePresentation: QuietToolPresentationPort {
                 case .failed(let issue): throw PartCallError(code: "providers_unavailable", message: issue)
                 }
                 let choice = await model.engine.providers.refreshSession(session)
-                if let issue = choice.error { throw PartCallError(code: "chat_choice_unavailable", message: issue) }
+                if choice.choice == nil, let issue = choice.error { throw PartCallError(code: "chat_choice_unavailable", message: issue) }
                 try await model.engine.providers.deliverFaces()
                 _ = try await transcripts.handle(.openTranscriptReader(.init(session: session, presentation: "chat",
                     geometry: .init(reader: reader, width: 1280, scale: 1, viewportHeight: height), openingParagraphCount: 120)))

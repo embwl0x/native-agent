@@ -382,7 +382,7 @@ authority-separated practice across model changes. Field-free situations
 keep the verb, argument names and status; the first call also keeps its wake.
 The [manifest](skill_manifest_spec.md#expansion-a-part-is-a-prediction) owns its record and delivery contract;
 `Expectation` in `NativeAgentCore/Expectation.swift` owns confidence, withholding
-and cost standing for Expansion and after-turn claims; Expansion's practice
+and cost standing for Expansion; Expansion's practice
 owner measures its costs. [Surprise](SURPRISE.md) records the shared law and
 each caller's existing confidence policy.
 Turn-start predictions remain unmeasured on the installed app; `expansion.check` rows supply that evidence.

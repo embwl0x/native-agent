@@ -239,6 +239,7 @@ public enum FaceActReply: Codable, Sendable {
     case artifact(ArtifactGrant)
     case makeExportChoice(MakeExportChoice)
     case provider(ProviderSettingsFace)
+    case providerTest(ProviderTestReply)
     case trust(TrustSettingsFace)
     case persona(PersonaSettingsFace)
     case card(CardActionResult)

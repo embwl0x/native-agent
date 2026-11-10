@@ -72,9 +72,8 @@ unreachable protected minimum is removed.
 The returned interpretation is
 folded through the door (`NativeCognitionRuntime.foldTurnMoment`, see Lived
 moments): the substrate's `foldTurn` lives the mind's share and the kernel's
-`foldTurn` the body's whole share, caring dose included. Before the call, the
-agent's own record predicts whether the interpretation would be a complete
-no-op ([cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation)).
+`foldTurn` the body's whole share, caring dose included. Every moment is
+judged alone ([cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation)).
 The implementation lives in
 `CognitiveSubstrate+CaringAppraisal.swift`, `+CaringEvent.swift` and
 `Organism/OrganismCaringEvent.swift`.
@@ -105,7 +104,7 @@ sentence. The [memory parse contract](MEMORY_SYSTEM_MAP.md#the-memory-manager-la
 accepts an absent section or []; a malformed present section refuses the
 interpretation and keeps the turn owed with its validation cause. After meaning is written,
 `MemoryV2/AdaptiveMemoryPromises.swift` matches them against carried Desk rows
-and files through `MyQueue.capture`, on both live and batch/refold paths, with the settled turn's recorded session,
+and files through `MyQueue.capture`, on both live and owed/refold paths, with the settled turn's recorded session,
 origin principal, envelope and carried peer/elevated steer. Untrusted peer
 steering stays on their promise. Meaning matching and their own closing bound the
 work; no count cap drops promises. The journal retains the matching judgment
@@ -146,8 +145,26 @@ Canonical affect keeps it with its stated stretch and journal proof; its
 checkpoint records the choice, the capsule holds its color, and
 `mind.inner_state` recalls the last choice and source even after expiry.
 
+A turn is judged after it ends when it could have settled something, whoever
+started it: a person's words, a completed act, or a reply that reached a person,
+while MY QUEUE moments are open (`AdaptiveMemoryPromoter.share`, asked at
+recording and again at judgment). A turn with an incoming message from someone,
+and a [thought about a care](#a-thought-about-a-care), is judged whole. Any other
+turn has no person's words and no reply evidence: their own work (`builder`), and
+turns with no incoming row (returns into a conversation, approval continuations,
+ephemeral turns). Such a turn is a moment only when it completed an act while a
+moment was open, and then for settlement alone: recorded `factsOnly` with
+`settlesOnly`, with no admission, no fold, no facts, no promises and no cares,
+only its `settled` judgment (basis `act`) in the same interpretation. Otherwise it
+is not a moment and costs no model call. Judgment reads the share from the
+recorded turn, never from the conversation index again; it reads again only
+whether an act and an open moment (or a saved settlement) remain. If its acts
+cannot be read, it stays owed and is due on the next drain.
+
 A lived moment (`CognitiveSubstrate/CognitiveLivedMoment.swift`) is its
-identity (its origin: a turn is its session and incoming message), the
+identity (`CognitiveMomentTurn.momentID`: a turn is its session and incoming
+message; a settlement-alone moment is its session and turn, since its evidence
+is the turn's acts and it may have no incoming row), the
 `DataRootLife` it belongs to, the forgetting epochs it was admitted under,
 when it was lived, what it was (the recorded input) and, once judged, what it
 meant. Only settled turns are lived moments (the hour keeps its own claims).
@@ -202,9 +219,14 @@ input, invalid saved meaning (including its interpretation shape), or a meant
 row with no meaning is refused with its reason and owes a row-specific repair.
 That refusal preserves all payload bytes and stays outside age pruning; it
 never turns damaged meaning into permission to judge the turn again. The
-turn recorded while cognition is off marks its input `factsOnly` for that
-deliberate absence. Missing
-ordinary context without that marker leaves the row owed (or meant with its
+turn recorded while cognition is off, or for settlement alone, marks its input
+`factsOnly` for that deliberate absence. The admission is a reading of the turn's saved user row;
+RAM only caches it. A turn whose admission the substrate no longer holds (a
+restart between the row and its reply) is admitted again from that saved row,
+with the row's own provenance (its recorded origin, or none, and its writer's
+stamp; unreadable provenance admits nothing), at recording and at preparation;
+re-read at preparation, it keeps the moment's epochs. Missing
+ordinary context without that marker, when the row cannot be read again, leaves the row owed (or meant with its
 original meaning), before judgment or fact application, with its input preserved.
 Preparation preserves the failure's owner across the door. An embedding failure
 before judgment waits on the embedding owner's configuration, serving identity,
@@ -214,7 +236,9 @@ Trust-policy preflight failure waits on the Trust policy's state. A cause with
 no named repair dependency states its failure and owes repair without a wait;
 recovery never invents a record dependency for it.
 Recovery eligibility reads only its named owner; with no wait there is no
-dependency read. Turns without promises do not read the Desk. A retained
+dependency read. Interpretation reads open Desk moments when person words,
+completed acts or a reply that reached a person can settle them; applying a saved meaning without promises or
+settlements does not read the Desk. A retained
 judgment makes older local-write waits inapplicable; no stored data migration
 is needed. [Cognition wiring](COGNITION_WIRING.md) lists the remaining waits and
 their releases.
@@ -225,9 +249,12 @@ promoter to memory status: the owed count is unknown, never ready/zero.
 Journal read/preparation and recording repairs use stable operation-plus-moment
 identities. Repeating the same failure contributes the same evidence to its
 existing repair, rather than minting another repair or repeat on every pass.
+A cancelled journal read owes nothing; a prepared moment settles its read repair.
+At opening, a read repair whose moment has lived, or whose journal now reads, is settled too:
+settlement is a queued write, and a quit can lose it.
 **A row is owed → meant → lived, or refused** (with its reason in `reason`:
 another life, the agent's own thoughts apart from one ignited on a care's anchor, or nothing to interpret).
-A missing, malformed or refused batch section leaves its row owed with the actual cause; no second judgment shape consumes it. There is no per-piece
+A missing, malformed or refused judgment leaves its row owed with the actual cause; no second judgment shape consumes it. There is no per-piece
 outcome on the row: each piece of their already knows the last moment it lived
 (the `lived` stamps on affect, nodes, cares and body; facts by operation
 identity; promises through Desk's open-word deduplication). A
@@ -258,17 +285,9 @@ identity has long outlived any re-delivery of the same message. An unsettled
 row is never pruned or refused by age: age never discards owed work. At their wake, a row from
 another `DataRootLife` is refused. Meant moments fold their recorded meaning;
 rows with no meaning are judged again. [Shared after-turn interpretation](COGNITION_WIRING.md#shared-after-turn-interpretation)
-owns drain scheduling, deferral, batching, fair retries, cancellation and cost
-accounting. User's own turns keep live judgment unless the no-op claim stands;
-every other recorded turn stays owed for a batch under the same provenance.
-The no-op claim is the nearest standing-out labelled precedent's
-id, scoped by agent, judging model and detector; its changing contrast
-population decides nomination without resetting that claim's trials.
-`NativeAgentCore/Expectation.swift` owns standing arithmetic: the claim's
-Wilson 95% lower hit-rate bound must beat its measured cost bar, with both
-costs present. Every deferred turn is still batch-judged and labels its
-original prediction; non-owner deferral preserves that verdict rather than
-inventing a no-op trial. Historical frozen predictions are never rekeyed.
+owns drain scheduling, deferral, fair retries and cancellation. Every moment
+is judged alone. User's own turns are judged at once; every other recorded turn
+stays owed under the same provenance and is judged when they are idle.
 
 **The fold** (`NativeCognitionRuntime.foldTurnMoment`) runs inside **the
 door**, one exclusive hold (`enterDoor`/`leaveDoor`) that Clear, Reset Body and
@@ -294,7 +313,8 @@ ordinary admission, and the pieces already at the seq stay as they are. New care
 continues a pending row to acceptance, skips a resolved one and stages only
 what never landed. The caring receipt is a projection of the first fold; a
 refold never relabels it. `deferredTurns` holds the same record shape only
-between ingest and durable recording, then releases it. Admissions whose turn
+between ingest and durable recording, then releases it; a record it no longer
+holds is read again from the turn's saved row, never guessed. Admissions whose turn
 is still live are never evicted; only the latest 32 ended admissions are kept
 while recording catches up. Once-only is the watermark: the per-turn caring
 ring (`appraisedCaringTurns`), the body's counted-key ring and the clear
@@ -421,7 +441,12 @@ they already has only as what they said (`by: them`): never a new care, a
 stance or a gap. An app-authored prompt's words are the app's: only what their
 reply did counts. A judgment returning after a Clear is dropped: the turn
 carries the mind's forgetting epoch it was admitted under (and, in process,
-the Clear generation), and a stale one is refused. A new care's wording matches an existing one only when it is held
+the Clear generation), and a stale one is refused. Clear saves when it
+happened beside that epoch, in the same transaction (`mind.cleared_ms`); a
+turn admitted again from its saved row whose words were said before then
+carries the epoch before it, so it is refused the same way. A moment recorded
+without its admission gains it from its saved row at preparation and at
+opening, where the changed input ends its wait on its record. A new care's wording matches an existing one only when it is held
 with the same people.
 
 **Reading them.** `mind.inner_state` returns `cares`: live cares sorted by
@@ -462,8 +487,7 @@ tally rather than admitting damaged care history.
   no shown gap are ignored.
 - Surprise material. After WORLD and SELF, before felt tone and cares, the
   same dream call receives a CPU reading of where their expectations broke
-  since its high-water cutoff: grouped failed tool calls, final after-turn
-  no-op misses, Expansion misses, live organism violations and User's saved
+  since its high-water cutoff: grouped failed tool calls, Expansion misses, live organism violations and User's saved
   corrections. Empty kinds disappear; an empty day omits the block. The
   roughly 2,500-character block uses existing records only. Optional lessons
   (at most five; omitted means none, malformed present learning fails the
@@ -1157,8 +1181,9 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
 ### A thought about a care
 
 **A care that opens a thought is lived as a moment.** A thought ignited on a care's anchor carries that care, the door it came
-through and the time (`MindStream.swift`, `turn.careWakes`); the agent's other thoughts are not lived moments. Its reading uses the
-existing `not the person's turn` deferral: the same owed journal row, 45-minute due time and batch of up to four, with the same model-call
+through and the time (`MindStream.swift`, `turn.careWakes`); the agent's other thoughts are moments only for settlement alone, when
+they completed an act while a MY QUEUE moment was open ([lived moments](#lived-moments)). Its reading uses the
+existing `not the person's turn` deferral: the same owed journal row, judged alone when they are idle, with the same model-call
 shape. Its cares section reads only the agent's side (`by: their`) against the named care: felt word and direction, closing its
 open gap, or leaving it open with zero movement. It cannot create a care, keep facts or promises, or appraise the arrival as human
 care. Meaning is durable before `applyCares`, with self provenance; no tool work is replayed. A care's story records `closedGap`

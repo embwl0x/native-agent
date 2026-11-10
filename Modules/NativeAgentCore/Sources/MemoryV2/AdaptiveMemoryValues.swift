@@ -20,7 +20,7 @@ public struct AdaptiveCandidate: Sendable, Equatable {
 }
 public enum MemorySemanticExtractionStatus: String, Sendable {
     case unavailable, disabled, emptyInput, succeeded, failed, timedOut, unreported, skipped
-    /// Predicted a complete no-op with standing: left owed, judged in a batch.
+    /// Not the person's turn: left owed, judged when she is idle.
     case deferred
 }
 /// Payload-free evidence, not a claim that an extracted candidate is true.
@@ -45,14 +45,7 @@ public struct AdaptiveMemoryObservation: Sendable {
     public let savedCorrectionCount: Int
     public let pendingCorrectionCount: Int
     public let failedCorrectionCount: Int
-    /// The agent's own complete no-op prediction for this turn, its standing, and whether the turn was deferred (left owed) instead of judged now.
-    public var surprise: AfterTurnSurpriseObservation?
     var stagingFailed = false
-    /// Judgment and cost evidence for complete surprise labels; nil when no judgment ran.
-    var judged: AfterTurnInterpretation?
-    var factsAsked = false
-    var providerSeconds: Double = 0
-    var batchInput: MemoryBatchInput?
     init(
         proposals: [ProposalRecord],
         extraction: AdaptiveExtractionReport,

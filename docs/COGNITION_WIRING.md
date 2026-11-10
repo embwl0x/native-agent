@@ -71,9 +71,8 @@ flowchart TD
     E --> BUS["SomaticSignalBus"]
     BUS --> O["OrganismKernel"]
     T --> J["Owed recording awaited at settlement"]
-    J --> N["After-turn complete no-op prediction"]
-    N --> A["Shared after-turn interpretation"]
-    N -->|standing no-op: left owed| B["Batch judgment of owed moments (idle, wake, night)"]
+    J -->|User's own turn| A["Shared after-turn interpretation"]
+    J -->|any other turn: left owed| B["Owed moments judged one at a time (idle, wake, night)"]
     B --> A
     A --> Q["Memory proposals"]
     Q -->|trusted acceptance or review| M
@@ -97,7 +96,7 @@ flowchart TD
 | Happening → attention | Every source posts through `Experiences/Attention.swift`; committed readback precedes intake. `Cognition/NativeCognitionRuntime+Attention.swift` opens owed ones in `Agents/MindStream.swift` and admits serial weigh/land/record/claim batches. | Complete retained weigh/ignition/return records own membership. Missing provenance refuses a claim with repair owed; failed thoughts retain their drive and payload through the same admission ([Subconscious](SUBCONSCIOUS.md#attention)). |
 | Persisted turn → cognitive event | `ChatTurnRuntime/ChatOrchestrationClient+LivedObservations.swift` → `Cognition/NativeCognitionRuntime.observe`. | Redacted evidence and explicit turn kind/origin; exact replay does not repeat state changes. |
 | Cognitive event → body | `CognitiveSubstrate/Organism/OrganismSignalBus.swift` → `CognitiveSomaticSignals` → `OrganismKernel.ingest`. | Bounded metadata; debug/verification and body-originated resolution events are excluded. |
-| Shared interpretation → facts, affect, caring, cares, promises and settlements | `MemoryV2/MemoryV2+AdaptivePromoter.swift` calls `ChatTurnRuntime/MindMemoryManager.swift`; callbacks installed by `NativeCognitionRuntime.refreshConfiguration` finish cognition processing and apply cares (`CognitiveSubstrate+Cares.swift`); `AdaptiveMemoryPromises.swift` files their promises and saved settlements through MY QUEUE. | [Non-owner turns and standing complete-no-op predictions defer interpretation; the recorded turn remains owed](#shared-after-turn-interpretation). Lane switches, origin matching, candidate screening, proposal review, caring encounter admission, care provenance and carried queue steering still apply. |
+| Shared interpretation → facts, affect, caring, cares, promises and settlements | `MemoryV2/MemoryV2+AdaptivePromoter.swift` calls `ChatTurnRuntime/MindMemoryManager.swift`; callbacks installed by `NativeCognitionRuntime.refreshConfiguration` finish cognition processing and apply cares (`CognitiveSubstrate+Cares.swift`); `AdaptiveMemoryPromises.swift` files their promises and saved settlements through MY QUEUE. | [Turns that are not User's own defer interpretation; the recorded turn remains owed and is judged alone when they are idle](#shared-after-turn-interpretation). Lane switches, origin matching, candidate screening, proposal review, caring encounter admission, care provenance and carried queue steering still apply. |
 | Turn start / a call's result → expected reads (Expansion) | `ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` asks before the opening model call; `ExpansionDispatcher.swift` is the outermost node of `makeGatedToolDispatchClient`. | Mind/authority practice, prediction, gated delivery and closure follow the [manifest contract](skill_manifest_spec.md#expansion-a-part-is-a-prediction). |
 | Memory → selected context | `ContextFlow/NativeMemoryContextProjection.swift` → Context selector → prepared turn. | Record disclosure, lifecycle eligibility, selection and character budgets. |
 | Body + substrate → capsule/posture | `NativeCognitionRuntime.prepareTurnProjection` → substrate frozen capsule preparation. | Body and horizon share one frozen value and instant; the preparing request survives for the successful delivery commit, even with an empty capsule. Unshown cues never count as presented. |
@@ -109,104 +108,81 @@ flowchart TD
 
 Ordinary lived user turns defer their conversational affect interpretation in
 `CognitiveSubstrate+Ingest.swift`. After the turn,
-`AdaptiveMemoryPromoter` first asks the agent's own record for a prediction,
-then judges now or leaves the recorded turn owed as described below.
+`AdaptiveMemoryPromoter` judges the recorded turn now or leaves it owed as
+described below.
 `MindMemoryJudgment.interpret` is asked at most once for
-fact decisions, affect, caring, cares, optional promises and person-quoted settlements; a lived moment is
+fact decisions, affect, caring, cares, optional promises and evidence-backed intention outcomes; a lived moment is
 a care movement, not a separate section. The available reply supplies context; affect and
 caring judge the incoming speaker's words. The English-only novelty gate
 (`AfterTurnNoveltyGate`, its sentence shapes and 0.65 threshold) is deleted:
 facts are asked of every turn with a reply.
 
-**The prediction** (`MemoryV2/AfterTurnMemorySurprise.swift`,
-`AfterTurnSurpriseLedger.swift`) is whether the turn's interpretation would be
-a COMPLETE no-op: no memory kept or changed, no affect beyond noise, no caring
-moment, no care moved, no promise made or settled. It is language-independent: the
-incoming words, the reply and the work line are split on Unicode scalar boundaries and bisected
-until the resident tokenizer covers every piece, then embedded in batches of
-at most sixteen under the checked epoch; anything not fully covered, a cold
-embedder or an unkeyed memory model is `unsure`. Its precedents are the
-agent's own labelled turns in the same scope (agent, the model that judges,
-detector version). `MindMemoryJudgment.judgmentRoute` inherits the bound call's
-model and provider when present, otherwise uses Memory when configured, else Chat.
-`predictionModelKey` reads that same route without changing the request, keyed with
-its surface as reported by `AfterTurnInterpretation.judgingKey`.
-The nearest precedent nominates only when it stands past
-chance (`VectorMath.chanceBar(.action)`), and its claim is the labelled
-precedent's id alone (`fingerprint([best.id])`). Changing the contrast
-population still changes nomination, but no longer resets the same
-precedent's trials. The former precedent-plus-population identity prevented
-trials from accumulating as examples changed. Comparisons cover the newest
-256 examples within 65,536 chunk pairs (16 chunks per side at that population;
-the retained ledger's p90 was 9); larger inputs remain `unsure`.
-The claim earns standing only by `NativeAgentCore/Expectation.swift`'s cost law:
-the Wilson 95% lower bound of that claim's no-op hit rate must beat
-c_miss / (c_miss + c_hit), c_hit the mean provider-service seconds of this
-scope's live judgments, c_miss the longest wait a wrong prediction imposed
-(before any, the live judgments' own delay). The assumptions are stated in
-the code: independent future turns resembling the labelled past, per-claim,
-per-look bounds, retaining the 95% interval without simultaneous or repeated-look
-correction. Both costs are required. Existing frozen predictions keep their
-original keys; there is no retrospective rekeying. **The label:** every judged
-turn, live or batch, labels the
-record from what the judgment said (memories, affect, caring, cares, promises including settlements; complete
-when all five channels were measured and its facts were asked and readable), under the model that judged it: a
-label's scope is that model's key, so a turn predicted for one model and
-judged by another never calibrates the first's claim. A refold of a recorded
-meaning labels nothing.
+**One moment, one judgment, stillest first.** Every moment is judged alone,
+by one prompt (`Resources/prompts/turn-interpretation.md`, assembled by
+`MindMemoryJudgment.prompt`). The judgment's unchanging text comes first, so
+the provider caches it: the frame, the rules, the relay rules and the reply
+shape (with the cares shape when cares are shown), then the form's own rules
+(cares, a care wake's cares, or settlement alone). Everything about this
+moment follows: the cares shown, the speaker, the facts switch, the exchange
+time and zone, relay and caring eligibility, existing, pending and forgotten
+memories, the prior exchange, prior encounters, the incoming words, the reply,
+the work line and the settlement input. `MindMemoryJudgment.judgmentRoute`
+inherits the bound call's model and provider when present, otherwise uses
+Memory when configured, else Chat.
 
-**Deferral: an owed moment left owed.** Durable recording is awaited at
+**Owed moments: User's at once, the rest when they are idle.** Durable recording is awaited at
 transcript settlement before releasing the reply (sleep joins accepted
 recordings; only interpretation rides the tail). User's own turn means no peer
 `speaker`, not a `standingAgent`, and a session whose recorded kind is their
 conversation (`SessionConversation.kind` through `conversationKind`, including
-archived rows, has `isPersonConversation == true`). Their turns keep live judgment
-unless the complete-no-op claim has standing. Every other recorded turn is
-left owed for a batch, irrespective of the prediction: peer and standing-agent
-turns, helper sessions and any other session not proven the person's. The agent's own
+archived rows, has `isPersonConversation == true`). Their turns are judged at
+once. Every other recorded turn is left owed: peer and standing-agent turns,
+helper sessions and any other session not proven the person's. The agent's own
 thoughts (the mind stream) remain excluded except for a
 [thought about a care](SUBCONSCIOUS.md#a-thought-about-a-care): only its named
-care, only the agent's side; that thought takes this same deferred batch path.
+care, only the agent's side; that thought takes this same owed path.
 
-Both deferrals leave the same row `owed` (no new state, no queue) and record
-`deferred: true` in the same ledger. A non-owner turn records reason
-`not the person's turn` while preserving the actual prediction verdict, scope, claim,
-vectors and calibration. It does not manufacture a `.nothingNew` trial:
-agreement and trial counting still use the actual no-op verdict. Its
-`mind.why` outcome is `deferred: not the person's turn; left owed for a batch`, distinct
-from the standing-no-op outcome.
-A deferred row is eligible when live work releases the interpretation owner; no elapsed batching delay runs. The drain judges owed rows in
-batches of up to four (`MemoryManagerLane.batchLimit`) in one model call
-(`MindMemoryJudgment.interpretBatch`): rules once, each turn's request under its
-recorded provenance, one section per id. `replayRecorded` restores the saved
-speaker, complete recorded carriers (`carriedSources`), answered decisions
-(`elevatedSources`), envelope and origin before the
-same `interpretMemoryManager` prepares each `MemoryBatchInput` (request,
-`AfterTurnContext`, facts switch). `interpretBatch` uses the same per-turn
-prompt and parser as live judgment; the context retains the saved event's
-source class and peer metadata. Trust is read live from the complete current `carriedSources` record;
-missing provenance leaves the row owed with its cause and repair lever. Old checkpoints never substitute for the current record.
-`recordBatchJudgments` writes each usable
-meaning (`meant`) before any apply. Refolding replays that recorded provenance
-through the same care fold and its `PeerTrust` gate: an untrusted peer can move
-only an existing care as `by: them`, never create a care or change a stance or
-gap. No separate batch trust rule is needed.
+A left-owed row stays `owed` (no new state, no queue); its `mind.why` outcome
+is `deferred: not the person's turn; left owed, judged when they are idle`.
+An owed row is eligible when live work releases the interpretation owner or the
+last turn window closes (a turn's own promotion can finish while its window is
+still open, so the closing edge drains too); no elapsed delay runs. The drain takes the oldest owed moment not in flight and not
+already tried in this drain and judges it alone, with the same `interpret`
+call (purpose `memory_held`). `replayRecorded` restores the saved speaker,
+complete recorded carriers (`carriedSources`), answered decisions
+(`elevatedSources`), envelope and origin before the same
+`interpretMemoryManager` prepares its request and `AfterTurnContext`; the
+context retains the saved event's source class and peer metadata. Trust is read
+live from the complete current `carriedSources` record; missing provenance
+leaves the row owed with its cause and repair lever. Old checkpoints never
+substitute for the current record. Its meaning is written (`meant`) before any
+apply, then folded. Refolding replays that recorded provenance through the same
+care fold and its `PeerTrust` gate: an untrusted peer can move only an existing
+care as `by: them`, never create a care or change a stance or gap. Its
+`mind.why` outcome is `judged while they was idle`, or `left owed:` with the
+actual failure.
 
-The optional promises section uses that same per-turn parser and saved meaning.
-The shared live or batch interpretation receives the person's recorded incoming
-words and open moment handles and returns `settled` beside memories and promises.
-Settlement requires no extra model call. A standing no-op defers it with the
-interpretation; no settlement is judged on that turn. Current replies require
-the array; a saved older meaning without it reads as none. Unavailable open
+The optional promises section uses that same parser and saved meaning.
+The shared interpretation receives the person's recorded incoming
+words, this turn's completed acts, whether their reply reached a person and open
+moment handles, and returns `settled` beside memories and promises.
+Settlement requires no extra model call. A turn left owed defers it with the
+interpretation. Current replies require
+the array, as do saved meanings. Missing outcomes and evidence have no default. Unavailable open
 moments leave interpretation owed rather than supplying an empty list.
 `AdaptiveMemoryPromoter.applyPromises` reads those saved settlements and matches
 only remaining promise candidates against their fresh open carried Desk through
 `capturePromises`, which receives no person words: restatements update their row,
-bursts combine, and Desk housekeeping creates no work. Exact quoted settlements
-close unchanged moments
-through the `queue.done` closure owner, without a card; peer, self, page and
-assistant words supply no settlement authority. Recorded person words apply
-wherever spoken, including groups and channels, without a conversation-kind read.
+bursts combine, and Desk housekeeping creates no work. Evidence-backed settlements
+close unchanged moments through `MyQueue.finish`, without a card: done completes
+the row and let-go cancels it. Recorded person words apply wherever spoken,
+including groups and channels, without a conversation-kind read. The turn's own
+successful non-preview dispatch receipts can prove completion across conversations;
+their delivered reply can prove only a deed that is itself saying something to the
+person, on a moment that ends once. Peer, self, page and assistant words grant no
+person authority. The
+[intention contract](INTENTIONS.md#promises-they-makes) owns the act bounds,
+evidence checks and self-wake admission limit.
 Retained judgments replay from canonical terminal evidence, and invalid
 judgments or failed closures stay owed.
 Canonical `DeskStep.promiseCaptures` identities survive closure and archive;
@@ -222,28 +198,20 @@ captured groups stay inert on partial replay. Any filing failure remains owed. T
 
 Returned replies are validated and usable meanings persisted through `settle`,
 even if Stop or sleep arrived as the call returned; unfinished provider work
-is cancelled and stays owed. Missing, malformed, repeated or refused sections leave their rows owed with the actual failure.
+is cancelled and stays owed. A missing, malformed or refused section leaves its row owed with the actual failure.
 Dependency/basis changes admit another judgment; neither a single-item retry nor elapsed time consumes the obligation.
-A failed call or meaning write likewise leaves its rows owed.
-Only a judgment writes the ledger: `AfterTurnSurpriseLedger.label` takes a
-judged turn's channels and scores the original prediction under the model
-that judged, preserving its deferred flag. An attempt that judged nothing
-writes no ledger row; it shows once in `mind.why` and the row stays owed. Never-deferred rows count as
-recovery, so their batch cost does not measure live c_hit; a deferred miss's
-wait to its label measures c_miss. Service seconds use a monotonic stopwatch
-around the judgment call alone (a batch shares that duration across its rows),
-excluding meaning storage, folding, embedding and proposal acceptance.
-Prediction-to-label wall time is the separate delay cost.
+A failed call or meaning write likewise leaves its row owed.
 Recovery uses the live observation tail, admitting each pass only while no live
 observation is waiting (idle drains also require idle). A pass folds one
-recorded meaning or judges one batch, continuing through due work while idle
+recorded meaning or judges one moment, continuing through due work while idle
 until no pass progresses. A failed call, write or fold retries on the next drain;
 a successful interpretation write advances into folding in the same drain.
 A model wait retains its typed cause and dependency
 in `lived_moments.parts_json`.
 The ChatTurnRuntime memory manager forms the route key with MemoryV2's public,
 length-delimited fingerprint function.
-Cancellation leaves work due on the next drain and creates no dependency wait;
+Cancellation leaves work due on the next drain and creates no dependency wait
+or repair;
 returned interpretation and matching judgments still settle into retained work.
 Eligibility reads only the dependency named by the saved wait; a row without a
 wait reads none. Application with no promises, saved settlements or retained
@@ -269,32 +237,15 @@ Produced matching and interpretation judgments are kept
 until their writes land. Local journal, Desk and fold writes with retained work
 have no dependency wait: they retry once on the next drain without a model call.
 Journal failure holds unpersisted work in memory and owes repair.
-`memory.held` records all batch moment ids, and its model call carries
-the first recorded parent; explicit recall carries its requesting turn.
+An owed moment's model call carries its recorded turn; explicit recall carries
+its requesting turn.
 Night joins any drain already in flight, then continues through that same
 owner before the dream reads their day. Only the caller that starts a drain
 cancels it and joins its settlement; joining another caller's flight leaves
 that shared work running.
-`mind.why` lane `interpretation` reports the outcome and standing;
-`memory.promotion` carries the live prediction and `surpriseDeferred`.
+`mind.why` lane `interpretation` reports the outcome.
 The retired held-file executor, separate drain result/row-presence flags,
 per-pass judgment budget and lapse-derived deadline are removed.
-
-One append-only `memory/after_turn_surprise.jsonl` (version 3, detector 3) under the
-memory owner's data root keeps each turn's prediction, label, provider
-seconds and failure; older-version rows stay on disk and never grant standing, and a corrupt row or a current-version row that does not decode makes the whole record unreadable, so nothing stands on incomplete evidence.
-It contains no conversation or memory prose (precedent vectors only, bounded).
-A turn's vectors are written once, on its prediction row; its label row omits
-them and the reader takes them from that prediction.
-Rows written before promises were asked retain an unknown promise outcome and
-are incomplete. They supply neither complete precedents nor no-op trials,
-hits or dream-miss labels; a missing channel never becomes "no promise".
-Current judgments explicitly label all five channels; the promise channel is
-changed for either new promises or settlements. Retained ledger bytes
-and frozen rule identities are not rewritten.
-Diagnostics → Inspector's `memory.promotion` shows the prediction, its
-standing (lower bound against cost bar), predicted no-ops, those that changed
-something and those not yet labelled.
 
 Care selection, interpretation and provenance follow [Subconscious — Cares](SUBCONSCIOUS.md#cares).
 `NativeCognitionRuntime.foldTurnMoment` folds the recorded interpretation into
@@ -306,7 +257,11 @@ Its optional plan dates feed the horizon alongside Desk deferrals; identity,
 display and compatibility follow [plan dates](MEMORY_SYSTEM_MAP.md#plan-dates).
 Helper-owned turns use their own runner, and the agent's own work (`builder`, the mind stream among it) skips
 resident memory interpretation except for the named-care reading of a
-[thought about a care](SUBCONSCIOUS.md#a-thought-about-a-care). Peer speakers are named rather than treated
+[thought about a care](SUBCONSCIOUS.md#a-thought-about-a-care) and the
+settlement-alone judgment that any turn without an incoming message gets when it
+completed an act while a MY QUEUE moment was open
+([lived moments](SUBCONSCIOUS.md#lived-moments)): the same interpretation, keeping
+only its `settled`. Peer speakers are named rather than treated
 as the person; [session rows](session-conversations.md) decide ownership,
 never ID prefixes. Unavailable interpretation and a successful abstention remain
 different outcomes.

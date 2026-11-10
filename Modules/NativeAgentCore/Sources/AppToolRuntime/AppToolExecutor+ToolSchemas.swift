@@ -1,6 +1,9 @@
+import AgentWorkspace
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
+import TurnTrace
 // Blueprint: | `AppToolExecutor+ToolSchemas.swift` | `AppToolExecutor`, `appToolSchemas`; Lazy door schema avoids registry initialization cycles |
 
 extension AppToolExecutor {
@@ -10,7 +13,41 @@ extension AppToolExecutor {
     }
 
     private static let nonDoorSchemas = makeAppToolSchemas(includeDoor: false)
+    /// Built once per process: the description is part of the provider's cached prefix, and registered descriptors must never change.
     private static let doorSchemas = makeAppToolSchemas(includeDoor: true)
+
+    /// Her hand, alphabetical, each verb in its one-line form from the current admitted schema: what a hand is born knowing and every native
+    /// action her own mind has done in what her record still holds. Read when the door is first built (the engine builds it as it is made,
+    /// off the main thread, and launch waits for the engine). A verb this release does not admit, or whose schema does not render, is not in her hand; an unread record or an unrendered
+    /// verb is traced as `app.hand`.
+    static func handForms() -> [String] {
+        var ids = Set(AppActions.bornKnowing)
+        var gaps: [String: JSONValue] = [:]
+        do {
+            let done = try TurnTracePersistLane().doneVerbs()
+            ids.formUnion(done.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        } catch { gaps["record"] = .string(error.localizedDescription) }
+        var forms: [String] = []
+        do {
+            let native = try Dictionary(AppActions.seedActions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            for id in ids.sorted() {
+                guard let action = native[id] else { continue }
+                do {
+                    guard let schema = try AppActions.discovery(action).objectValue?["args_schema"] else {
+                        gaps[id] = .string("no admitted args_schema")
+                        continue
+                    }
+                    forms.append(try ToolSignature.call(id, schema.serializedData(pretty: false)))
+                } catch { gaps[id] = .string(error.localizedDescription) }
+            }
+        } catch { gaps["catalog"] = .string(error.localizedDescription) }
+        if !gaps.isEmpty {
+            let at = Date()
+            TurnTraceBus.fire(TurnTraceEvent(kind: "app.hand", title: "Her hand", status: "partial", payload: .object(gaps),
+                createdAt: NativeTimestampFormat.plainZulu(at), ts: at, turn: nil))
+        }
+        return forms
+    }
 
     private static func makeAppToolSchemas(includeDoor: Bool) -> [LLMToolSchema] {
 
@@ -33,7 +70,7 @@ extension AppToolExecutor {
         let snapshotDefault = "Optional; defaults to this tab's last-read page."
 
         let door: [LLMToolSchema] = !includeDoor ? [] : [
-            // Pages and actions travel in results to bound prompt mass; only release-static hot actions enter the door description.
+            // Pages and actions travel in results to bound prompt mass; only her hand (handForms, read once per process) enters the door description.
             LLMToolSchema(
                 name: "app",
                 toolClass: .read, capabilities: ["app_data_write", "safe_read", "tool_call"],
@@ -60,8 +97,9 @@ extension AppToolExecutor {
                     + """
                         One action uses app {action:\"files.read\",args:{path:\"README.md\"}}. Put its arguments inside args; page selects a reader, not an \
                         action id. find always discovers actions, including with page:\"home\"; use work.context {query} or chat.search {query} for saved \
-                        work and history. These action ids need no guide read:\u{20}
-                        """ + AppActions.hotActionIDs.joined(separator: "; ") + ".",
+                        work and history. These are yours to call straight, in the form shown, * marking a required argument; find is for \
+                        anything not here:\u{20}
+                        """ + handForms().joined(separator: "; ") + ".",
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("page", ToolSchema.strSchema("A page id from {}, such as inbox, chat or providers.")),
@@ -80,10 +118,27 @@ extension AppToolExecutor {
                             AppScriptRunner.actionLimit))),
                                          ("description", .string("""
                                              Many calls in one, in order: each {action, args}, {page[, item]} or {item}, so several pages or items are one \
-                                             call. Every one runs and reports itself with its own receipt; preview and expected_version beside it apply to \
-                                             each, a write's new version passing to the next on its page. Steps are independent: one step's result never \
-                                             reaches the next; to feed one call's output into another, use script.
+                                             call, and a whole deed you already know is one call. Each reports itself with its own receipt. Nothing is built \
+                                             on a surprise: after a step that fails, waits on the person, or does not come back as you said, later changes do \
+                                             not run and later reads still do; the result names that step, what was there, and what did not run. A step may \
+                                             add expect, what must come back, as a shape laid over its result: text is met by containing it, a number or \
+                                             true/false by equality, null by nothing being there (missing, null or empty), {exactly: v} by the whole value, {not: shape} by the shape \
+                                             not being met; a bare string is looked for in what came back, never in your own arguments. An argument value \
+                                             {found: "2.rows.0.id"} takes that value from step 2's result (steps count from 1; or name a step with as: "list" \
+                                             and write list.rows.0.id); a value that is not there stops the deed at that step. cleanup: true marks a step that \
+                                             puts back what the deed moved; it runs even after a stop. preview and expected_version beside it apply to each, a \
+                                             write's new version passing to the next on its page. then_say beside it carries your closing words. To compute \
+                                             on a result or glue text, use script.
                                              """))])),
+                        ("then_say", ToolSchema.strSchema("""
+                            With actions: your closing words. When every step ran, had an expect that held, and none is beyond undoing, they are said and \
+                            the turn ends without a read-back; otherwise the result says why they did not stand.
+                            """)),
+                        ("with", ToolSchema.obj([("type", .string("object")),
+                                      ("description", .string("""
+                                          With then_say: fills its {name} slots, each name: {found: "<step>.<path>"} taking a short value (a number, \
+                                          true/false or one line of text) from what came back.
+                                          """))])),
                         ("preview", ToolSchema.boolSchema("""
                             With action or script: report proposed effects without performing them; authored reads run live, resume only inspects. Native \
                             preflight reports checks, would_card and approver. Script previews describe only calls reached.

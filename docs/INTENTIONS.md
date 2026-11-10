@@ -21,7 +21,7 @@ with optional weekday (for example `Sun Nov 1 at 06:00`), `every <five-field cro
 minutes|hours|days`, or a recurring schedule object as `when`. The stored
 clock rhythm uses `IntentionClock`; it is not a new store or a `moments`
 array. An omitted rhythm end is `standing`; a single moment defaults to
-`once`. Conditions in words remain theirs to close with `queue.done`.
+`once`. A condition in words closes when the after-turn judgment sees it met.
 The system date reader interprets local words in the Mac's zone; accepted
 moments persist as absolute ISO timestamps. An incomplete match, a range or
 a repeated local clock time refuses with the supplied text and its reading;
@@ -254,27 +254,75 @@ stay unavailable or meant for repair, never settle as an empty judgment. The
 Cancellation creates no failure wait. A matching judgment returned before Stop
 is retained through settlement and files on the next drain without rematching.
 
-The shared after-turn interpretation, live or batched, receives their open moments
-with their handles and the person's own recorded incoming words. Beside memories
-and promises it returns `settled` ids with exact quotes when the person says the
-work is done
-or already happened, tells their to drop it, or tells their to stop raising it.
-Only recorded person-origin words on this turn supply that authority, wherever
-they were spoken, including channels and groups; conversation kind is not read.
-Peer, helper and self turns supply none. Their reply, a page, a card or another
-speaker's quoted words cannot settle work. No confirmation card is made.
-The model judges meaning; native validation requires an exact incoming quote,
-a shown open moment id, and no kept capture targeting that same id.
-No answer closes nothing; malformed or incomplete judgment stays owed. Current
-model replies require `settled`; saved older interpretations without that field
-read as none. A learned no-op deferral runs no interpretation or settlement on
-that turn; the owed batch can judge it later. Settlement adds no model call.
-An unavailable open-moment read leaves interpretation owed, never an empty Desk.
-Settlements use `MyQueue.finish`, the same closure as `queue.done`, with a reason
-quoting the person's words and identifying this recorded turn. The Desk checks
+A promise closes because their body saw the deed; they never files the closing.
+The shared after-turn interpretation, at once or when owed, receives open moments
+across conversations, the person's recorded incoming words, this turn's
+completed acts and whether their reply reached a person (`reply_delivered`).
+Each `settled` entry names the shown handle, `outcome:done|let_go`,
+`basis:person_words|act|reply`, an exact evidence quote and the model's reason.
+Person-origin words can say work is done or release it, wherever spoken,
+including channels and groups. Letting go closes as `canceled`, never `done`.
+Peer and self words grant no person authority; their reply, a page or a card
+cannot supply it. Their delivered reply proves only its own saying: `reply` is
+`done` only, needs `reply_delivered`, quotes their reply on this turn exactly (the
+same check their promise sources use) and settles only a moment that ends once
+whose deed is saying something to this person (telling, answering, reminding,
+reporting back, asking); a rhythm or standing step is never ended by one
+saying. A reply that says other work was done is a claim, not proof of it.
+`reply_delivered` is true only when the recorded turn's reply settled
+(`repliedAt`; a failed or stopped turn records none), is not empty (a chosen
+silence), went out on a local route where saving it is delivering it
+(`AgentBridgeCompletionRoute.Kind.local`: the app's own chat), answers the
+person or their own moment rather than a peer or standing agent, and sits in a
+direct or channel conversation (never their own stream or a peer's). A surface
+that posts after the after-turn work starts (Slack, Telegram, the phone) has no
+delivered fact at judgment, so its reply settles nothing; person words and acts
+still settle there. A repeating or standing moment is done only when its work
+is finished for good, never by one occurrence's act; when it is, it closes for
+good, as `queue.done` closes it. An act can prove only `done`: its exact `act_id` must name
+a successful non-preview closing dispatch from this recorded turn. The quote
+must occur in its result or receipt, not just its intended arguments.
+The model judges whether the result fulfills the specific promise, including
+its target, scope and delivery. Similar work, accepted requests, failed or
+refused acts, unknown effects and missing evidence do not prove fulfillment.
+No keyword matcher or second settlement call makes that judgment.
+
+The act read uses the trace owner's `tool.dispatch` records under the turn id,
+including nested calls, using whatever completed receipts are recorded so far.
+No `tool.dispatch.closed` record is required: joined arrivals and other turns
+without one still receive the same interpretation of their incoming words.
+Missing acts supply no evidence and never hold those words unjudged. An unavailable
+read is disclosed as `completed_acts_unavailable` and traced through
+`memory.promise.evidence`; interpretation proceeds with the words' own authority.
+No clock chooses an outcome. An unreadable sibling
+detail is reported by `memory.promise.evidence` and supplies no evidence; usable
+siblings proceed. Arguments retain the trace's existing preview, the result
+contributes at most 1,024 characters with an explicit shortening flag, and the
+owner's compact receipt remains alongside it. No history is added to these acts.
+Only references, the evidence quote and the reason persist in the saved judgment;
+the owner is read again before an act-based closure writes. Person chats and
+peer turns carry their own acts. Care-bearing self wakes also settle work from
+their acts; their interpretation prompt asks for no new promises from the thought,
+as before. Application preserves the returned promise judgment. Any turn without
+an incoming message from someone (their own stream and lines, returns, approval
+continuations, ephemeral turns) is a moment only when it completed an act while a
+moment was open, judged for settlement alone with basis `act`
+([lived moments](SUBCONSCIOUS.md#lived-moments)); with no completed act it is not
+a moment and costs no model call.
+
+No evidence closes nothing; malformed or incomplete judgment stays owed.
+Both model and saved interpretations require `settled`; missing outcomes or
+evidence have no default. A turn left owed runs no interpretation or
+settlement at once; its owed judgment does, when they are idle. An unavailable
+open-moment read leaves interpretation owed, never an empty Desk.
+Settlements use `MyQueue.finish`, the same closure as `queue.done` or `queue.drop`,
+with the reason, outcome, evidence quote and recorded turn; act reasons also name
+the dispatch receipt id. A `settled` trace names its basis (`person_words`, `act`
+or `reply`), never the quote. The Desk checks
 the judged row's `updatedAt` before closing it, so newer work is kept. A closed
 resume step also releases its saved run through that shared closure owner.
-The ordinary Desk status operation can reopen it. The judgment is retained
+`desk.read {handle}` exposes that reason; `desk.set_status {handle,status:"todo"}`
+reopens a live terminal row, subject to the existing parent and hold rules. The judgment is retained
 before writing; replay recognizes its exact terminal reason in live or archived
 Desk evidence rather than closing or recreating work again. Missing evidence
 never means settled, and one failed settlement leaves usable siblings proceeding.
@@ -288,7 +336,7 @@ that intent despite different wording or session, and creates only when none
 holds it. Desk housekeeping (tidying, merging, collapsing or closing their own
 rows) is an act on those rows or nothing, never another step. Only substantive
 work in a mixed sentence is kept. No word-overlap rule or guard list judges
-intent. Live reflection and later batch reflection/refolding use this same
+intent. Live reflection and later owed reflection/refolding use this same
 path. A fresh match sees earlier landings; refolding reuses its retained
 matching judgment and reads landing identities before filing.
 
@@ -324,7 +372,7 @@ archived refs before judging, so a landed promise cannot be recreated because
 another channel stayed owed and its row was subsequently closed. A missing
 identity supplies no semantic verdict; remaining candidates still need the
 filing judgment. Capturing a promise never merges or closes existing rows;
-only the person's quoted settlement in the saved interpretation closes one.
+only an evidence-backed settlement in the saved interpretation closes one.
 
 Meaning matching and their own closing bound inferred work; there is no count cap.
 An unreadable Desk/archive, invalid judgment or incomplete provenance leaves the
@@ -345,14 +393,11 @@ The judgment must classify every candidate exactly once; missing groups never
 mean ignored. `memory.promise` traces report `matching`, `ignored`, `added`,
 `updated`, `reused`, `already_captured`, `settled`, `already_settled` or `failed`; landings name their Desk id.
 A provider that never settles leaves matching open until its terminal event or
-cancellation; no clock chooses an outcome. Promises and settlements share the
-changed promise channel in the complete-no-op label. Retained labels that never
-measured promises stay
-unknown, not empty; [Cognition wiring](COGNITION_WIRING.md) owns that contract.
+cancellation; no clock chooses an outcome.
 
 - **Timing.** On User's turns a promise is filed as soon as the turn's
-  reflection runs. On other turns (agents, wakes, helpers) reflection runs in
-  the quiet batch when live work releases the interpretation owner. No elapsed batching delay runs; unavailable judgment or
+  reflection runs. On other turns (agents, wakes, helpers) reflection runs
+  alone, in their quiet, when live work releases the interpretation owner. No elapsed delay runs; unavailable judgment or
   incomplete recorded provenance leaves the moment owed. A queue refusal preserves the promise obligation with its actual cause.
 - **Already kept.** Explicit filings from the turn are part of the same open
   Desk input. The filing judgment recognizes them by intent and preserves their
@@ -431,11 +476,12 @@ occurrences. A stored moment is never reinterpreted in another year.
 |---|---|
 | `once` | After it comes up and they acts. Default for everything except rhythms |
 | a time | At that time ("until 9 pm Nov 4"), with no cancel job |
-| their words | They checks them each time it comes up ("until User answers") and closes it with `queue.done` |
+| their words | Checked each time it comes up ("until User answers"); it closes when the after-turn judgment sees them met |
 | standing | Rhythms only, set explicitly (the office check-in). Ends only on `queue.drop` |
 
 Elapsed inactivity does not close an intention. MY QUEUE expires only an explicit
-`until` time; acting, `queue.done` or `queue.drop` closes it through its owner.
+`until` time; a deed the after-turn judgment sees, or `queue.drop`, closes it through
+its owner (`queue.done` stays their free act, untaught).
 
 ## Arrival and pacing
 
@@ -458,8 +504,9 @@ Elapsed inactivity does not close an intention. MY QUEUE expires only an explici
   steps appear only in the changing moment packet, never appended to a person's
   or peer's words. `MyQueueReady.forTurn` marks matching steps `due now`;
   reading them neither runs nor closes them. A dedicated step's thought keeps
-  its own `MyQueueReady.line` opening and completion instructions: do it now when
-  safe, reversible and allowed, report completion, or name what it waits on.
+  its own `MyQueueReady.line` opening: do it now when safe, reversible and
+  allowed, it closes by itself once the work is seen done, or `desk.wait` holds
+  it on what it needs. No line teaches closing a row by hand.
   Trust and posture still judge every act; the words grant no authority.
 - Every turn carries
   `# What I mean to do (mine; I do what's safe now, and raise one only when it's done, it needs someone, or I'm asked)`
@@ -469,8 +516,8 @@ Elapsed inactivity does not close an intention. MY QUEUE expires only an explici
   field one line and at most 140 characters. The section is absent when empty.
   A due line reads
   `- desk.N · due now · <head> <rest>` with the whole `MyQueueReady.line`,
-  uncapped, including fixed `say` words and completion/wait instructions.
-  The desk.N is there so what they are shown they can finish: `queue.done`/`queue.drop`
+  uncapped, including fixed `say` words and the wait instruction.
+  The desk.N names what they are shown; `queue.drop` (and `queue.done`, untaught)
   take it as `id` — or the step's own words, when exactly one open step has
   those words (or, failing that, contains them); several matches refuse and name them.
   The carried line that brings a step back (`You meant to …`) and home's MY QUEUE
@@ -526,6 +573,16 @@ Elapsed inactivity does not close an intention. MY QUEUE expires only an explici
   `action:null` drops the habit, `say:null` clears fixed words, `until:null`
   clears its ending to once, and `when:null` clears its moment to `next_turn`.
 - `queue.done {id, reason?}`, `queue.drop {id, reason?}`, `queue.list`.
+- The default `desk.read` includes board work and open MY QUEUE intentions in
+  one paged list; its agent page shows the same queue separately from the board.
+  `place` distinguishes `board` from `MY QUEUE`; each intention carries `name`,
+  full `words`, `filed_at`, its recorded `when` and current `waits_on`.
+  `liveItemCount`/`topLevelItemCount` count the board; `openIntentionCount` counts
+  open MY QUEUE intentions, and `board_counts` says both. Exact, query and
+  complete-record reads retain that intention detail. Archives remain explicit reads.
+  Waits use the Desk's effective dependencies. A released signal/news condition
+  and a clock time already reached are absent from `waits_on`; `when` retains
+  the filed condition. Missing release evidence leaves its wait visible.
 - `schedule.*` schedules reads (watches, proactive scans); intentions use `queue.*`. Today's "Ahead"
   reads at most five next clock moments within seven days, plus the existing
   dream and horizon rows. "Waiting for: User here / news about X" remains design.

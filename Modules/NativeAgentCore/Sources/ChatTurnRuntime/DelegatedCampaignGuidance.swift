@@ -14,10 +14,9 @@ enum DelegatedCampaignGuidance {
         """
 
     static let deskConvergence = """
-        - DESK: Close an exact item on the person's explicit instruction, recording that instruction without claiming the work happened. Otherwise \
-        close or set its status in the same turn only when fresh canonical evidence independently proves that exact outcome; attach the evidence with \
-        app desk.close or desk.set_status. Similar titles, completed execution or unattributed commits are insufficient. Without exact mapping and \
-        independent proof, keep it open and name the missing evidence.
+        - DESK: An exact item ends on the person's explicit instruction, which records that instruction without claiming the work happened, or when \
+        fresh canonical evidence independently proves that exact outcome. Similar titles, completed execution or unattributed commits are \
+        insufficient. Without exact mapping and independent proof, it stays open; name the missing evidence.
         """
 
     static let rendered = acceptedFinding + "\n" + deskConvergence + "\n" + authorityCheckpoint

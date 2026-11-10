@@ -9,7 +9,7 @@ import TurnTrace
 import PersistenceCore
 import DreamREMCycle
 import Desk
-// Blueprint: | `MindMemoryManager.swift` | `MindMemoryJudgment` struct; `predictionModelKey` (the record's key for the model the judgment runs on, read without changing the request; the interpretation reports the same model), `interpret` (with cares, optional reply-grounded promises and person-quoted settlements against shown open moments), `interpretBatch` (owed turns in one call, the same parser and rules once, one section per turn; a missing section stays owed), candidate-only `capturePromises`, `appraiseCares`, `relevantRecallIDs`; incremental ranked evidence and catalog-budgeted relevance batches; `AfterTurnMemoryFailure` preserves output limits, request rejections and refusals with distinct recovery |
+// Blueprint: | `MindMemoryManager.swift` | One judgment per moment, evidence-backed intention outcomes, promise matching and recall |
 
 public struct MindMemoryJudgment: MemoryManaging {
     private let makeLLMClient: @Sendable (PrivateWorkContextAssembly) -> any LLMClient
@@ -448,17 +448,10 @@ public struct MindMemoryJudgment: MemoryManaging {
         }
     }
 
-    /// Only a resolved judgment model can supply a prediction key; unknown judges establish no standing.
-    public func predictionModelKey() async -> String? {
-        guard let route = try? await Self.judgmentRoute() else { return nil }
-        let judging = route.model
-        return AfterTurnInterpretation.judgingKey(surface: route.surface, model: judging)
-    }
-
     /// The account is the route's provider id, so switching accounts for the same model changes the key.
     public func judgmentRouteKey() async -> String? {
         guard let route = try? await Self.judgmentRoute() else { return nil }
-        return AfterTurnMemorySurprise.fingerprint([route.surface, route.admission.providerId ?? "", route.model])
+        return MemoryManagerLane.fingerprint([route.surface, route.admission.providerId ?? "", route.model])
     }
 
     private static func judgmentRoute() async throws -> JudgmentRoute {
@@ -505,7 +498,7 @@ public struct MindMemoryJudgment: MemoryManaging {
 
     public func interpret(_ request: MemoryManagerRequest, context: AfterTurnContext?,
                           factsEnabled: Bool, call: LLMCall) async throws -> AfterTurnInterpretation? {
-        guard !request.userMessage.isEmpty else { return nil }
+        // Whether a turn is judged is decided before this call; empty incoming words are judged like any other.
         let route = try await Self.judgmentRoute()
         let prompt = try Self.prompt(request, context: context, factsEnabled: factsEnabled)
         let system = try completionPolicy("turn-interpretation", section: "system")
@@ -587,22 +580,27 @@ public struct MindMemoryJudgment: MemoryManaging {
         if let choice = affect.chosenRegister {
             guard request.assistantMessage.contains(choice.source) else { throw failed(.invalidAffect) }
         }
-        let memories: [MemoryManagerDecision]
-        do { memories = try MemoryManagerLane.parse(memoriesValue) }
-        catch { throw route.failed(.invalidMemories, recovery: String(describing: error)) }
+        // A turn judged for settlement alone keeps only what it settled.
+        var memories: [MemoryManagerDecision] = []
+        if !request.settlesOnly {
+            do { memories = try MemoryManagerLane.parse(memoriesValue) }
+            catch { throw route.failed(.invalidMemories, recovery: String(describing: error)) }
+        }
         var cares: [CognitiveCareJudgment] = []
-        if let shown = context?.cares, !shown.isEmpty {
+        if !request.settlesOnly, let shown = context?.cares, !shown.isEmpty {
             guard let parsed = CognitiveCareJudgment.parse(object["cares"], shown: shown) else { throw failed(.invalidCares) }
             cares = context?.careWakes.isEmpty == false ? parsed.filter {
                 guard $0.by == .her, case .existing = $0.target else { return false }
                 return true
             } : parsed
         }
-        let promises: [MemoryManagerPromise]
-        do { promises = try MemoryManagerPromise.parse(object["promises"], reply: request.assistantMessage) }
-        catch { throw route.failed(.invalidMemories, recovery: "Invalid promises section: \(error)") }
+        var promises: [MemoryManagerPromise] = []
+        if !request.settlesOnly {
+            do { promises = try MemoryManagerPromise.parse(object["promises"], reply: request.assistantMessage) }
+            catch { throw route.failed(.invalidMemories, recovery: "Invalid promises section: \(error)") }
+        }
         guard let rows = object["settled"] as? [[String: Any]] else {
-            throw route.failed(.missingSections, recovery: "settled must be an array of person-quoted settlements.")
+            throw route.failed(.missingSections, recovery: "settled must be an array of evidence-backed outcomes.")
         }
         var settled: [MemoryManagerSettlement] = []
         var settledIDs: Set<String> = []
@@ -610,11 +608,39 @@ public struct MindMemoryJudgment: MemoryManaging {
             guard let id = row["id"] as? String, let item = request.openMoments.first(where: { $0.handle == id }),
                   MyQueue.entry(item) != nil, settledIDs.insert(id).inserted,
                   let source = row["source"] as? String, !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  request.personWords.contains(source) else {
+                  let outcomeText = row["outcome"] as? String,
+                  let outcome = MemoryManagerSettlement.Outcome(rawValue: outcomeText),
+                  let reason = row["reason"] as? String, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw route.failed(.invalidMemories,
-                    recovery: "Settlement requires one shown open moment id and an exact quote from this turn's person_words.")
+                    recovery: "Settlement requires one shown open moment id, done or let_go, a reason and exact evidence from this turn.")
             }
-            settled.append(MemoryManagerSettlement(id: id, updatedAt: item.updatedAt, source: source))
+            let evidence: MemoryManagerSettlement.Evidence
+            switch row["basis"] as? String {
+            case "person_words":
+                guard request.personWords.contains(source), row["act_id"] == nil else {
+                    throw route.failed(.invalidMemories, recovery: "Person settlement requires an exact person_words quote and no act_id.")
+                }
+                evidence = .personWords(source)
+            case "act":
+                guard outcome == .done, let actID = row["act_id"] as? String,
+                      let act = request.completedActs.first(where: { $0.id == actID }), act.contains(source) else {
+                    throw route.failed(.invalidMemories, recovery: "Act settlement requires done and exact evidence from a shown completed act_id.")
+                }
+                evidence = .act(id: actID, source: source)
+            case "reply":
+                // Saying it is the deed only for a moment that ends once; a rhythm or standing step outlives one saying.
+                guard outcome == .done, request.replyDelivered, row["act_id"] == nil,
+                      MemoryManagerPromise.quoted(source, in: request.assistantMessage),
+                      let step = MyQueue.entry(item)?.step, step.rhythm == nil, MyQueue.Until(step.until) != .standing else {
+                    throw route.failed(.invalidMemories,
+                        recovery: "Reply settlement requires done, a delivered reply, its exact quote, no act_id and a moment that ends once.")
+                }
+                evidence = .reply(source)
+            default:
+                throw route.failed(.invalidMemories,
+                    recovery: "Settlement basis must be person_words, act or reply; unknown evidence leaves work open.")
+            }
+            settled.append(MemoryManagerSettlement(id: id, updatedAt: item.updatedAt, outcome: outcome, evidence: evidence, reason: reason))
         }
         return AfterTurnInterpretation(memories: memories, affect: affect, caring: caring,
                                        cares: cares,
@@ -622,73 +648,7 @@ public struct MindMemoryJudgment: MemoryManaging {
                                        appAuthored: request.appAuthored, model: route.model, surface: route.surface)
     }
 
-    /// Batch exchanges under their exact IDs; missing, malformed or duplicate sections leave only their own rows owed.
-    public func interpretBatch(_ inputs: [MemoryBatchInput]) async throws -> [AfterTurnInterpretation?] {
-        guard let first = inputs.first, inputs.count <= MemoryManagerLane.batchLimit else { throw AfterTurnInterpretationFailure.envelope }
-        let route = try await Self.judgmentRoute()
-        let prompt = try Self.interpretationRules + "\n"
-            + completionPolicy("held-turn-batch", section: "prompt")
-            + inputs.enumerated().map { index, input in
-                try "Exchange id=\(index)\n" + Self.prompt(input.request, context: input.context,
-                                                       factsEnabled: input.factsEnabled, includeRules: false)
-            }.joined(separator: "\n\n")
-        let text = try await judgedText(prompt: prompt,
-            system: try completionPolicy("held-turn-batch", section: "system"),
-            purpose: "memory_held", route: route, call: first.call)
-        return try await Self.settledObject(text: text, route: route) { object -> [AfterTurnInterpretation?] in
-            guard let replies = object["turns"] as? [Any] else { throw route.failed(.missingSections) }
-            // Every repeated id is ambiguous, even if one section is malformed.
-            let sections = Dictionary(grouping: replies.compactMap { element -> (id: String, value: Any)? in
-                // The id is the exchange's number, however the reply spells it ("0" or 0).
-                guard let reply = element as? [String: Any],
-                      let id = (reply["id"] as? String) ?? (reply["id"] as? NSNumber).flatMap({ Int(exactly: $0.doubleValue) }).map(String.init)
-                else { return nil }
-                return (id, reply["interpretation"] ?? NSNull())
-            }, by: \.id)
-            return inputs.enumerated().map { index, input in
-                guard let matches = sections[String(index)], matches.count == 1,
-                      let value = matches.first?.value as? [String: Any] else {
-                    // Say what came back instead, so a missing section names its cause.
-                    TurnTraceBus.fireFromContext(kind: "memory.interpretation.missing", payload: .object([
-                        "batch_index": .int(Int64(index)), "sections": .int(Int64(replies.count)),
-                        "returned_ids": .array(replies.map { .string(String(describing: ($0 as? [String: Any])?["id"] ?? "none")) }),
-                    ]), turn: nil)
-                    return nil
-                }
-                do { return try Self.parseInterpretation(value, request: input.request, context: input.context, route: route) }
-                catch {
-                    let cause = (error as? AfterTurnMemoryFailure)?.recovery ?? String(describing: error)
-                    TurnTraceBus.fireFromContext(kind: "memory.interpretation.refused", payload: .object([
-                        "batch_index": .int(Int64(index)), "cause": .string(cause),
-                    ]), turn: nil)
-                    return nil // Only this section stays owed; usable siblings proceed.
-                }
-            }
-        }
-    }
-
-    /// Use the same cares parser for one contiguous conversation stretch so its once-only reading stays consistent.
-    public func appraiseCares(conversation: String, speaker: String,
-                              shown: [CognitiveCareLine]) async throws -> [CognitiveCareJudgment] {
-        guard !shown.isEmpty else { return [] }
-        let route = try await Self.judgmentRoute()
-        let prompt = try completionPolicy("care-appraisal", section: "prompt", arguments: [
-            speaker,
-            conversation,
-            Self.caresSection(shown),
-            Self.caresShape
-        ])
-        let system = try completionPolicy("care-appraisal", section: "system")
-        let text = try await judgedText(prompt: prompt, system: system, purpose: "memory_interpret", route: route)
-        return try await Self.settledObject(text: text, route: route) { object in
-            guard let cares = CognitiveCareJudgment.parse(object["cares"], shown: shown) else {
-                throw route.failed(.invalidCares)
-            }
-            return cares
-        }
-    }
-
-    /// Absent cares leave other prompt sections unchanged; present cares are data, followed by their interpretation guidance.
+    /// Absent cares leave other prompt sections unchanged; present cares are their interpretation guidance, followed by the data.
     static func caresSection(_ shown: [CognitiveCareLine], careWake: Bool = false) throws -> String {
         guard !shown.isEmpty else { return "" }
         return try completionPolicy("turn-interpretation", section: careWake ? "care-wake-cares" : "cares", arguments: [
@@ -697,11 +657,6 @@ public struct MindMemoryJudgment: MemoryManaging {
     }
 
     static let caresShape = #""cares":[{"care":"c2|new","about":null,"between":false,"moved":0.0,"by":"them|her|world","felt":"...","note":"...","open":null,"closes":false,"stance":null or {"text":"...","because":"...","wouldChangeMind":"..."}}]"#
-
-    /// Share interpretation rules between single-turn and batch prompts.
-    static var interpretationRules: String {
-        get throws { try completionPolicy("turn-interpretation", section: "rules") }
-    }
 
     private static func deskRows(_ open: [DeskItem]) -> [JSONValue] {
         open.map { item in
@@ -712,14 +667,17 @@ public struct MindMemoryJudgment: MemoryManaging {
                 row["words"] = .string(step.words)
                 row["when"] = .string(step.when)
                 if let card = step.card { row["card"] = .string(card) }
+                if let until = step.until { row["until"] = .string(until) }
                 if let source = step.source { row["source"] = .string(source) }
             }
             return .object(row)
         }
     }
 
+    /// What never changes between calls comes first, so the provider caches it: the frame, the rules, the reply shape, then the form's own rules.
+    /// Everything about this moment follows.
     static func prompt(_ request: MemoryManagerRequest, context: AfterTurnContext?,
-                       factsEnabled: Bool, includeRules: Bool = true) throws -> String {
+                       factsEnabled: Bool) throws -> String {
         let existing = request.existing.map {
             "[\($0.id)] \($0.content)" + ($0.kind == "correction" ? " (correction)" : "")
                 + ($0.correctionSubject.map { " (subject: \($0))" } ?? "")
@@ -733,15 +691,22 @@ public struct MindMemoryJudgment: MemoryManaging {
         clock.timeZone = .current
         let exchangeTime = request.occurredAt ?? context?.event.occurredAt ?? Date()
         let settlementInput = try JSONValue.object(["person_words": .string(request.personWords),
-            "open_moments": .array(Self.deskRows(request.openMoments))]).serialize(pretty: false)
+            "open_moments": .array(Self.deskRows(request.openMoments)),
+            "completed_acts": .array(request.completedActs.map(\.record)),
+            "completed_acts_unavailable": request.completedActsUnavailable.map(JSONValue.string) ?? .null,
+            "reply_delivered": .bool(request.replyDelivered)]).serialize(pretty: false)
         return try completionPolicy("turn-interpretation", section: "prompt", arguments: [
+            completionPolicy("turn-interpretation", section: "rules"),
+            MemoryKindStamp.writerKinds.joined(separator: "|"),
+            shown.isEmpty ? "" : "," + Self.caresShape,
+            request.settlesOnly ? completionPolicy("turn-interpretation", section: "settlement-alone")
+                : Self.caresSection(shown, careWake: context?.careWakes.isEmpty == false),
             request.personName ?? "the person",
             request.appAuthored ? completionPolicy("turn-interpretation", section: "app-authored") : request.standingAgent
                 ? completionPolicy("turn-interpretation", section: "standing-agent") : ".",
             String(factsEnabled),
             clock.string(from: exchangeTime),
             TimeZone.current.identifier,
-            includeRules ? Self.interpretationRules : "",
             String(context?.caring?.relayed ?? false),
             String(context?.caring != nil),
             existing,
@@ -753,10 +718,7 @@ public struct MindMemoryJudgment: MemoryManaging {
             request.userMessage,
             request.assistantMessage,
             request.took.map { $0 + "\n" } ?? "",
-            Self.caresSection(shown, careWake: context?.careWakes.isEmpty == false),
             completionPolicy("turn-interpretation", section: "settlement-input", arguments: [settlementInput]),
-            MemoryKindStamp.writerKinds.joined(separator: "|"),
-            shown.isEmpty ? "" : "," + Self.caresShape
         ])
     }
 }

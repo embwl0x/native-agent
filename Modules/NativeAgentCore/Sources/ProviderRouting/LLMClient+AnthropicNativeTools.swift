@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import NativeAgentCore
 // Use the shared SSE framer rather than interpreting transport lines here.
@@ -7,7 +8,7 @@ import PersistenceCore
 // API-key transports carry native tools; OAuth transports use text markers. Omit tool_choice; strict tool definitions require first-party closed schemas.
 // Dispatch every tool_use block and return its results in one user message. Tool inputs are parsed JSON; a textless response with tool calls is valid.
 
-/// Exact provider thinking and signature replay, held together in memory for the tool-calling turn; never rendered or persisted as conversation content.
+/// Exact provider thinking and signature, held together in memory; never rendered or persisted as conversation content.
 struct AnthropicThinkingBlock: Sendable, Equatable {
     let type: String
     /// Redacted blocks carry no readable thinking text.
@@ -52,6 +53,12 @@ struct AnthropicThinkingBlock: Sendable, Equatable {
     }
 }
 
+/// Thinking with the digest of the request that produced it: model, system, tools and every message. The provider accepts it back only in that conversation.
+struct AnthropicThinkingRecord: Sendable {
+    let blocks: [AnthropicThinkingBlock]
+    let conversation: Data
+}
+
 /// Memory-only replay payloads keyed by every sibling tool-call ID, evicted in insertion order.
 actor ToolCallReplayLedger<Payload: Sendable> {
     private var byToolUseID: [String: Payload] = [:]
@@ -73,6 +80,11 @@ actor ToolCallReplayLedger<Payload: Sendable> {
             if let blocks = byToolUseID[id] { return blocks }
         }
         return nil
+    }
+
+    func forget(callIDs: [String]) {
+        for id in callIDs { byToolUseID.removeValue(forKey: id) }
+        order.removeAll { byToolUseID[$0] == nil }
     }
 }
 
@@ -282,26 +294,11 @@ extension AnthropicTransport {
         }
     }
 
-    /// The API rejects empty content arrays. Signed thinking must replay in original order before assistant text and calls or thinking-required models
-    /// reject the next round.
-    static func nativeAnthropicMessages(
-        _ messages: [LLMMessage],
-        thinkingReplay: [String: [AnthropicThinkingBlock]] = [:]
-    ) throws -> [[String: Any]] {
+    /// The API rejects empty content arrays.
+    static func nativeAnthropicMessages(_ messages: [LLMMessage]) throws -> [[String: Any]] {
         var out: [[String: Any]] = []
         for m in messages {
             var blocks: [[String: Any]] = []
-            if m.role == .assistant, !thinkingReplay.isEmpty {
-                let ids = m.content.compactMap { block -> String? in
-                    if case .toolUse(let id, _, _) = block { return id }
-                    return nil
-                }
-                for id in ids {
-                    guard let recorded = thinkingReplay[id] else { continue }
-                    blocks.append(contentsOf: recorded.map(\.wireBlock))
-                    break
-                }
-            }
             for block in m.content {
                 // Native messages omit empty text while retaining replay order.
                 if case .text(let text) = block, text.isEmpty { continue }
@@ -319,16 +316,52 @@ extension AnthropicTransport {
     }
 
     /// Omit tool_choice: auto is the default and forced tools are rejected by thinking-required models. Prompt guidance cannot alter schema authority.
+    /// Signed thinking replays before its assistant message's text and calls, and only while the model, system, tools and every earlier message are the
+    /// ones that produced it; seen anywhere else it is forgotten, so a block once left out never returns.
     func makeNativeToolsBody(
         messages: [LLMMessage],
         system: String?,
         model: String,
         tools: [LLMToolSchema],
         stream: Bool, call: LLMCall
-    ) async throws -> [String: Any] {
-        let replay = await thinkingReplayMap(for: messages)
-        let encoded = try messages.enumerated().compactMap { index, message -> (Int, [String: Any])? in
-            try Self.nativeAnthropicMessages([message], thinkingReplay: replay).first.map { (index, $0) }
+    ) async throws -> (body: [String: Any], conversation: Data) {
+        // Omit empty tool declarations because their presence can select tool mode; native call/result encoding still applies.
+        let wireTools = tools.isEmpty ? [] : try Self.nativeToolsArray(
+            tools,
+            strict: firstPartyAnthropicToolContract,
+            cacheBreakpoint: firstPartyAnthropicToolContract
+        )
+        let systemBlocks = Self.makeSystemBlocks(system, segments: call.systemSegments,
+            cacheEligible: call.session != nil, cacheControl: systemCacheControl)
+        // Cache markers are outside what thinking is bound to.
+        var conversation = SHA256()
+        conversation.update(data: try JSONSerialization.data(withJSONObject: [
+            "model": model,
+            "system": (systemBlocks ?? []).compactMap { $0["text"] as? String },
+            "tools": wireTools.map { $0.filter { $0.key != "cache_control" } },
+        ] as [String: Any], options: [.sortedKeys]))
+        var encoded: [(Int, [String: Any])] = []
+        var forgotten = 0
+        for (index, message) in messages.enumerated() {
+            guard var wire = try Self.nativeAnthropicMessages([message]).first else { continue }
+            let plain = try JSONSerialization.data(withJSONObject: wire, options: [.sortedKeys])
+            let ids = message.role == .assistant && replaysThinking ? message.content.compactMap { block -> String? in
+                if case .toolUse(let id, _, _) = block { return id }
+                return nil
+            } : []
+            if let record = await thinkingLedger.payload(forAny: ids) {
+                if Data(conversation.finalize()) == record.conversation {
+                    wire["content"] = record.blocks.map(\.wireBlock) + (wire["content"] as? [[String: Any]] ?? [])
+                } else {
+                    await thinkingLedger.forget(callIDs: ids)
+                    forgotten += 1
+                }
+            }
+            conversation.update(data: plain)
+            encoded.append((index, wire))
+        }
+        if forgotten > 0 {
+            nativeLog("%@", "\(providerId) thinking: \(forgotten) recorded round(s) left behind; the conversation before them changed (\(model))")
         }
         var body: [String: Any] = [
             "model": model,
@@ -336,18 +369,8 @@ extension AnthropicTransport {
             "messages": encoded.map { $0.1 },
         ]
         if stream { body["stream"] = true }
-        // Omit empty tool declarations because their presence can select tool mode; native call/result encoding still applies.
-        if !tools.isEmpty {
-            body["tools"] = try Self.nativeToolsArray(
-                tools,
-                strict: firstPartyAnthropicToolContract,
-                cacheBreakpoint: firstPartyAnthropicToolContract
-            )
-        }
-        if let systemBlocks = Self.makeSystemBlocks(system, segments: call.systemSegments,
-            cacheEligible: call.session != nil, cacheControl: systemCacheControl) {
-            body["system"] = systemBlocks
-        }
+        if !wireTools.isEmpty { body["tools"] = wireTools }
+        if let systemBlocks { body["system"] = systemBlocks }
         if firstPartyAnthropicToolContract {
             let usesPrefix = system.map { call.systemSegments?.reassembles(into: $0) == true } ?? false
             AnthropicOAuthTransport.cacheConversationPrefix(&body, sourceMessages: messages,
@@ -355,25 +378,7 @@ extension AnthropicTransport {
         }
         if firstPartyAnthropicToolContract { try FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model, call: call) }
         try applyThinkingControls(to: &body, model: model, call: call)
-        return body
-    }
-
-    /// Replay follows the provider's Messages contract, independently of first-party tool strictness and cache markers.
-    func thinkingReplayMap(
-        for messages: [LLMMessage]
-    ) async -> [String: [AnthropicThinkingBlock]] {
-        guard replaysThinking else { return [:] }
-        var map: [String: [AnthropicThinkingBlock]] = [:]
-        for m in messages where m.role == .assistant {
-            let ids = m.content.compactMap { block -> String? in
-                if case .toolUse(let id, _, _) = block { return id }
-                return nil
-            }
-            guard !ids.isEmpty,
-                  let blocks = await thinkingLedger.payload(forAny: ids) else { continue }
-            for id in ids { map[id] = blocks }
-        }
-        return map
+        return (body, Data(conversation.finalize()))
     }
 
     // MARK: - Response parsing
@@ -426,9 +431,10 @@ extension AnthropicTransport {
         tools: [LLMToolSchema],
         continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation, call: LLMCall
     ) async throws {
-        var req = try request(body: await makeNativeToolsBody(
+        let (body, conversation) = try await makeNativeToolsBody(
             messages: messages, system: system, model: model, tools: tools, stream: true, call: call
-        ))
+        )
+        var req = try request(body: body)
         req.setValue("text/event-stream", forHTTPHeaderField: "accept")
 
         let requestStartNs = DispatchTime.now().uptimeNanoseconds
@@ -482,7 +488,8 @@ extension AnthropicTransport {
                     ["type": "tool_use", "id": call.id, "name": call.name, "input": input]
                 ])
                 if replaysThinking, !thinkingBlocks.isEmpty {
-                    await thinkingLedger.record(thinkingBlocks, callIDs: calls.map(\.id))
+                    await thinkingLedger.record(
+                        AnthropicThinkingRecord(blocks: thinkingBlocks, conversation: conversation), callIDs: calls.map(\.id))
                 }
                 committed = true
                 for call in calls { continuation.yield(.toolCall(call)) }

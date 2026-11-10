@@ -400,6 +400,17 @@ public struct ProviderTestRequest: Codable, Sendable, Equatable {
     }
 }
 
+public struct ProviderTestReply: Codable, Sendable {
+    public var result: ProviderTestResult
+    public var credentialReady: Bool
+    public var credentialMatches: Bool
+    public init(result: ProviderTestResult, credentialReady: Bool, credentialMatches: Bool) {
+        self.result = result
+        self.credentialReady = credentialReady
+        self.credentialMatches = credentialMatches
+    }
+}
+
 public struct CardIdentity: Codable, Sendable, Equatable {
     public var card: String
     public var session: String

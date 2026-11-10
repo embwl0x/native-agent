@@ -151,7 +151,7 @@ struct FaceSectionView: View {
     private func rowView(_ row: PartFace.Row) -> some View {
         FaceRowView(row: row, item: FaceItemID(section: section.id, row: row.id), door: rowDoor(row),
                     session: session, focus: focus, move: move, sectionStyle: section.style ?? .list,
-                    waiting: section.style == .waiting && section.rows.first?.id == row.id,
+                    waiting: (section.style == .waiting && section.rows.first?.id == row.id) || row.running == true,
                     connectsTimeline: section.style == .timeline && section.rows.last?.id != row.id)
             .listRowInsets(style.insets)
             .id(FaceItemID(section: section.id, row: row.id))

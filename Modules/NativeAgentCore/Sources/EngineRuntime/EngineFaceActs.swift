@@ -103,9 +103,7 @@ public actor EngineFaceActs: FaceActHandler {
         do {
             let reply = try await dispatch(act)
             switch reply {
-            case .result(let value):
-                if case .testProvider = act { return .result(Self.redactedValue(value, act: act)) }
-                return reply
+            case .providerTest(let probe): return .providerTest(Self.redacted(probe, act: act))
             case .failed(let failure): return .failed(Self.redacted(failure, act: act))
             case .refused(let failure): return .refused(Self.redacted(failure, act: act))
             case .committed(var result):
@@ -148,6 +146,7 @@ public actor EngineFaceActs: FaceActHandler {
             return .acknowledged
         case .observe(let id, let demand):
             guard !disconnecting else { throw FaceWireError.disconnected }
+            let connection = sink
             guard observationKeys[id] == nil, platformObservations[id] == nil else {
                 throw Self.failure("observation_exists", "That observation is already open.")
             }
@@ -177,8 +176,17 @@ public actor EngineFaceActs: FaceActHandler {
             case .deskPalette, .agentScreen, .sessionSearch: source = demand
             default: source = .key(key)
             }
+            while let observation = observations[key], observation.readers.isEmpty {
+                try Task.checkCancellation()
+                await observation.task.value
+                if observations[key]?.task == observation.task { observations.removeValue(forKey: key) }
+            }
+            try Task.checkCancellation()
+            guard !disconnecting, sink == connection else { throw FaceWireError.disconnected }
+            guard observationKeys[id] == nil, platformObservations[id] == nil else {
+                throw Self.failure("observation_exists", "That observation is already open.")
+            }
             if var observation = observations[key] {
-                guard !observation.readers.isEmpty else { throw Self.failure("observation_releasing", "This presentation is still releasing its reader.") }
                 guard observation.demand == source else {
                     throw Self.failure("observation_query_changed", "Close the previous search before changing its query.")
                 }

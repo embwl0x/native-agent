@@ -8,15 +8,88 @@ import NativeAgentShared
 import PersistenceCore
 import TurnTrace
 
-// Blueprint: | `AdaptiveMemoryPromises.swift` | `AdaptiveMemoryPromoter.applyPromises`: candidate-only promise matching and saved interpretation settlements under recorded turn authority |
+// Blueprint: | `AdaptiveMemoryPromises.swift` | `AdaptiveMemoryPromoter`: which turns are moments and of what share, turn-owned completed acts, promise matching and evidence-backed closure |
 
 extension AdaptiveMemoryPromoter {
+    /// Read this turn's completed receipts so far, including nested calls; dispatch closure is not required.
+    static func completedActs(_ turn: CognitiveMomentTurn, dataRoot: URL) async throws -> [MemoryManagerAct] {
+        guard let id = turn.turnId, !id.isEmpty else {
+            throw ToolFailureError("The recorded turn has no id for its act evidence; repair its input.", effects: .none)
+        }
+        let read = try await TurnTracePersistLane(dataRootOverride: dataRoot).events(
+            .init(subjects: [id], kinds: ["tool.dispatch"]))
+        var acts: [MemoryManagerAct] = []
+        var seen: Set<String> = []
+        for event in read.events where event.kind == "tool.dispatch" {
+            guard let payload = event.payload.objectValue, payload["phase"] == .string("end"),
+                  payload["status"] == .string("ok"), let receipt = payload["receipt"]?.objectValue,
+                  receipt["resultClass"] == .string("succeeded"), receipt["preview"] == .bool(false),
+                  let actID = receipt["id"]?.stringValue, let action = receipt["action"]?.stringValue,
+                  seen.insert(actID).inserted else { continue }
+            var record: [String: JSONValue] = ["id": .string(actID), "action": .string(action),
+                "status": .string("ok"), "result_class": .string("succeeded")]
+            record["arguments"] = payload["args"]
+            record["receipt"] = receipt["resultReceipt"]
+            if let result = payload["result"]?.stringValue {
+                record["result"] = .string(String(result.prefix(1024)))
+                record["result_shortened"] = .bool(result.count > 1024)
+            }
+            acts.append(MemoryManagerAct(id: actID, record: .object(record)))
+        }
+        if read.unreadable > 0 {
+            TurnTraceBus.fire(TurnTraceEvent(turnId: id, kind: "memory.promise.evidence", sessionId: turn.sessionId,
+                surface: turn.surface, payload: .object(["unreadable": .int(Int64(read.unreadable)),
+                    "reason": .string("Unreadable act details cannot settle promises; readable siblings remain evidence.")]), turn: nil))
+        }
+        return acts
+    }
+
+    /// What share of the after-turn judgment a moment has: whole (meaning, cares, facts, promises and settlement) or settlement alone.
+    enum MomentShare: Sendable { case whole, settlement }
+
+    /// A turn is judged after it ends when it could have settled something, whoever started it: a person's words, a completed act, or a reply
+    /// that reached a person, while moments are open. A turn with an incoming message from someone, and a care wake, are judged whole. Any other
+    /// turn (her own work, or a turn with no incoming row: a return, an approval continuation, an ephemeral turn) has no person's words and no
+    /// reply evidence, so only a completed act while a MY QUEUE moment is open can settle anything: it is judged for settlement alone, and
+    /// otherwise it is not a moment. Recording asks this of the turn; judgment asks it of the recorded share. `settles` is read only when not whole.
+    func share(whole: Bool, settles: () async -> Bool) async -> MomentShare? {
+        guard !whole else { return .whole }
+        return await settles() ? .settlement : nil
+    }
+
+    /// Whether the turn completed an act (as `completedActs` reads it) while a MY QUEUE moment was open. Its dispatch receipts are flushed before
+    /// they are read. An unavailable read supplies no evidence, as it does in the judgment.
+    func actedWhileOpen(_ turn: CognitiveMomentTurn, dataRoot: URL) async -> Bool {
+        do {
+            if let id = turn.turnId { try await (TurnTraceContext.bus ?? .shared).flush(turnId: id) }
+            guard !(try await Self.completedActs(turn, dataRoot: dataRoot)).isEmpty else { return false }
+            return try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items.contains { MyQueue.entry($0) != nil }
+        } catch {
+            TurnTraceBus.fire(TurnTraceEvent(turnId: turn.turnId ?? turn.sessionId, kind: "memory.promise.evidence",
+                sessionId: turn.sessionId, surface: turn.surface,
+                payload: .object(["unavailable": .string(error.localizedDescription)]), turn: nil))
+            return false
+        }
+    }
+
     /// Authority is the recorded speaker on this turn, wherever the words were spoken, never a conversation-kind lookup.
     static func settlementWords(_ turn: CognitiveMomentTurn) -> String {
         guard turn.originPrincipal == "person", turn.standingAgentName == nil,
               let envelope = TurnEnvelope.fromPersistedMetadata(turn.envelope), envelope.agent == nil,
               MemoryDataProvenance.author(surface: turn.surface, peer: false) == "user" else { return "" }
         return turn.asked
+    }
+
+    /// The agent's reply on this turn reached a person: spoken (not a chosen silence or a failed turn) on a local route, where saving the reply
+    /// is delivering it (a surface that posts afterwards, such as Slack, Telegram or the phone, has no delivered fact here yet), in a conversation
+    /// with people (not its own stream or a peer's), answering the person or its own moment rather than a peer or a standing agent.
+    func replyDelivered(_ turn: CognitiveMomentTurn) async -> Bool {
+        guard turn.repliedAt != nil, !turn.assistant.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              turn.standingAgentName == nil, turn.originPrincipal == "person" || turn.originPrincipal == "self",
+              let envelope = TurnEnvelope.fromPersistedMetadata(turn.envelope),
+              AgentBridgeCompletionRoute.Kind(surface: envelope.replyRoute.surface) == .local,
+              let kind = await conversationKind(turn.sessionId) else { return false }
+        return kind == .direct || kind == .channel
     }
 
     struct PromiseFailure: Error, Sendable {
@@ -79,7 +152,7 @@ extension AdaptiveMemoryPromoter {
             return await failed("No recorded carriedSources provenance supplies their authority; repair the recorded turn.", cause: .record)
         }
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        func trace(_ status: String, id: String? = nil, reason: String? = nil) {
+        func trace(_ status: String, id: String? = nil, reason: String? = nil, basis: String? = nil) {
             var payload: [String: JSONValue] = ["moment": .string(momentID), "status": .string(status)]
             if status == "matching" {
                 payload["basis"] = .object([
@@ -89,6 +162,7 @@ extension AdaptiveMemoryPromoter {
             }
             if let id { payload["id"] = .string(id) }
             if let reason { payload["reason"] = .string(reason) }
+            if let basis { payload["basis"] = .string(basis) }
             TurnTraceBus.fire(TurnTraceEvent(turnId: turn.turnId ?? momentID, kind: "memory.promise",
                 sessionId: turn.sessionId, surface: turn.surface,
                 destinationId: envelope?.replyRoute.destinationId, threadId: envelope?.replyRoute.threadId,
@@ -112,7 +186,7 @@ extension AdaptiveMemoryPromoter {
             if Self.isCancellation(error) {
                 return .failure(PromiseFailure(cause: nil, words: "The Desk read was cancelled; the work remains due."))
             }
-            trace("failed")
+            trace("failed", reason: error.localizedDescription)
             return await failed(error.localizedDescription, owner: "MyQueue", cause: .desk,
                                 wait: saved.captures == nil && !promises.isEmpty)
         }
@@ -147,12 +221,12 @@ extension AdaptiveMemoryPromoter {
                     if Self.isCancellation(error) {
                         return .failure(PromiseFailure(cause: nil, words: "Promise matching was cancelled."))
                     }
-                    trace("failed")
+                    trace("failed", reason: error.localizedDescription)
                     return await failed(error.localizedDescription, owner: "MemoryManagerPromise", cause: .provider)
                 }
                 await answered(momentID, route: matchingBasis?.route, door: door)
             }
-            captures = matched + interpretation.settled.map { .settled(id: $0.id, updatedAt: $0.updatedAt, source: $0.source) }
+            captures = matched + interpretation.settled.map { .settled($0) }
             saved.captures = captures
             saved.identities = identities
             saved.wait = nil
@@ -171,33 +245,71 @@ extension AdaptiveMemoryPromoter {
         }
         var filings: [MyQueue.PromiseFiling] = []
         var failure: PromiseFailure?
+        var actEvidence: Result<[MemoryManagerAct], Error>?
         for capture in captures {
             switch capture {
             case .ignore: trace("ignored")
-            case .settled(let id, let updatedAt, let source):
-                guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, personWords.contains(source) else {
-                    return await failed("A retained settlement has no exact quote from this turn's person_words.", cause: .record)
+            case .settled(let settlement):
+                let id = settlement.id, updatedAt = settlement.updatedAt
+                let basis: String
+                switch settlement.evidence {
+                case .personWords(let source):
+                    guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, personWords.contains(source) else {
+                        return await failed("A retained settlement has no exact quote from this turn's person_words.", cause: .record)
+                    }
+                    basis = "person_words: \"" + source + "\""
+                case .act(let actID, let source):
+                    basis = "act " + actID + " (detail, turn " + (turn.turnId ?? momentID) + "): \"" + source + "\""
+                case .reply(let source):
+                    guard settlement.outcome == .done, MemoryManagerPromise.quoted(source, in: turn.assistant) else {
+                        return await failed("A retained settlement has no exact quote from this turn's reply.", cause: .record)
+                    }
+                    basis = "reply: \"" + source + "\""
                 }
-                let why = "Settled from the person's words in this turn (" + momentID + "): \"" + source + "\""
+                let dropped = settlement.outcome == .letGo
+                let status: DeskStatus = dropped ? .canceled : .done
+                let finalStatus: ArchiveFinalStatus = dropped ? .canceled : .done
+                let why = settlement.outcome.rawValue + ": " + settlement.reason + " (" + momentID + "; " + basis + ")"
                 do {
-                    if let item = terminal.first(where: { $0.handle == id && $0.status == .done && $0.summary == why }) {
+                    if let item = terminal.first(where: { $0.handle == id && $0.status == status && $0.summary == why }) {
                         guard let step = item.step else { throw ToolFailureError("The settled row has no saved step.", effects: .none) }
                         try MyQueue.releaseFinishedRun(words: step.words, store: store)
                         trace("already_settled", id: "desk." + item.alias, reason: why)
-                    } else if let item = archived.first(where: { $0.handle == id && $0.finalStatus == .done && $0.summary == why }) {
+                    } else if let item = archived.first(where: { $0.handle == id && $0.finalStatus == finalStatus && $0.summary == why }) {
                         guard let words = item.refs.compactMap({ ref -> String? in
                             if case .step(let step) = ref.kind { return step.words }; return nil
                         }).last else { throw ToolFailureError("The settled archive has no saved step.", effects: .none) }
                         try MyQueue.releaseFinishedRun(words: words, store: store)
                         trace("already_settled", id: id, reason: why)
                     } else {
+                        if case .act(let actID, let source) = settlement.evidence {
+                            do {
+                                let reading: Result<[MemoryManagerAct], Error>
+                                if let kept = actEvidence { reading = kept }
+                                else {
+                                    do { reading = .success(try await Self.completedActs(turn, dataRoot: dataRoot)) }
+                                    catch { reading = .failure(error) }
+                                    actEvidence = reading
+                                }
+                                let acts = try reading.get()
+                                guard settlement.outcome == .done,
+                                      let act = acts.first(where: { $0.id == actID }), act.contains(source) else {
+                                    throw ToolFailureError("The retained completed act evidence is unavailable; work stays open.", effects: .none)
+                                }
+                            } catch {
+                                failure = PromiseFailure(cause: .record, words: error.localizedDescription)
+                                trace("failed", id: id, reason: error.localizedDescription)
+                                _ = await failed(error.localizedDescription, owner: "TurnTrace", cause: .record, wait: false)
+                                continue
+                            }
+                        }
                         guard let item = open.first(where: { $0.handle == id }), item.updatedAt == updatedAt,
                               let entry = MyQueue.entry(item) else { throw MyQueue.Superseded() }
                         if let conflict = try await store.runHold(id) {
                             throw ToolFailureError(try conflict.refusal(entry.name).serialize(pretty: false), effects: .none)
                         }
-                        try await MyQueue.finish(entry, dropped: false, why: why, store: store)
-                        trace("settled", id: entry.name, reason: why)
+                        try await MyQueue.finish(entry, dropped: dropped, why: why, store: store)
+                        trace("settled", id: entry.name, reason: why, basis: settlement.evidence.basis)
                     }
                 } catch {
                     failure = PromiseFailure(cause: .desk, words: error.localizedDescription)
@@ -224,7 +336,7 @@ extension AdaptiveMemoryPromoter {
                 case .success(let landing): trace(landing.change.rawValue, id: landing.id)
                 case .failure(let error):
                     failure = PromiseFailure(cause: .desk, words: error.localizedDescription)
-                    trace("failed")
+                    trace("failed", reason: error.localizedDescription)
                     _ = await failed(error.localizedDescription, owner: "MyQueue", cause: .desk, wait: false)
                 }
             }
@@ -232,7 +344,7 @@ extension AdaptiveMemoryPromoter {
             if Self.isCancellation(error) {
                 return .failure(PromiseFailure(cause: nil, words: "Promise filing was cancelled; the retained judgment remains due."))
             }
-            trace("failed")
+            trace("failed", reason: error.localizedDescription)
             return await failed(error.localizedDescription, owner: "MyQueue", cause: .desk, wait: false)
         }
         if failure == nil {

@@ -696,6 +696,9 @@ extension AppActions {
                   input: verb("done"), argumentNames: ["reason": ["evidence", "summary"]], versionExempt: true),
         AppAction("queue.drop", "desk", "Drop a MY QUEUE step", ["id", "reason?"], subject: ["id"],tool: "my_queue",
                   input: verb("drop"), versionExempt: true),
+        // Her turn frame names queue.list for the steps it does not show.
+        .fold("desk_read", "desk", id: "queue.list", "Read MY QUEUE: every open step with its handle, words and moment",
+              ["limit?:int", "offset?:int"], input: ["query": .string(MyQueue.project)], read: true),
         // Owed repair settles only when its operation works again or an explicit reason releases it.
         AppAction("repair.let_go", "desk", """
             Let go of something you owe (a repair on your home's OWED line, or a reply no door can carry), saying why. \
@@ -991,7 +994,7 @@ extension AppActions {
         .fold("chat_reply", "chat"),
         .fold("tool_result_page", "*", """
             Page a long result retained this turn without rerunning its action; continue:true resumes the last read and ignores page; omit continue to select \
-            page/query/raw
+            page/query/raw; source_continues names the call that reads a source past the part its answer held
             """, read: true),
 
         // Each Mac verb re-enters its own gate so accessibility, MacAttention and saved levels still apply; mac/guided owns the act guide.
@@ -1046,8 +1049,9 @@ extension AppActions {
         ([surface, about] + blocks.map { $0.name + " " + $0.shows }).joined(separator: " ")
     }.joined(separator: " ") + " " + SurfaceLayout.profilesAbout
 
-    /// Named in `app`'s own description, so a cold call needs no read first. Static: it changes only at a release.
-    public static let hotActionIDs = ["undo", "time.now", "context.expand", "mind.inner_state", "agent.introspect", "ability.list",
+    /// What every agent's hand is born knowing. Her hand in `app`'s own description is these and every native action her own mind has done
+    /// (`AppToolExecutor.handForms`).
+    public static let bornKnowing = ["undo", "time.now", "context.expand", "mind.inner_state", "agent.introspect", "ability.list",
                              "ability.read", "trace.recent", "desk.read", "memory.recall", "memory.commit",
                              "bot.reply", "agent.contacts", "agent.message", "agent.read", "agent.connect",
                              "agent.jobs", "mail.recent",

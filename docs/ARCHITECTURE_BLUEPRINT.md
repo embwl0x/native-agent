@@ -272,7 +272,7 @@ execution backoff remain with the loop scheduler (`SwiftNativeLoopScheduler`).
 ## Source Map Convention
 
 Directory labels are repository-relative; table filenames are directory-relative.
-| `SettingsDock.swift` | Nonactivating Settings card; off-main grant snapshots retain probe causes; closes on grant, Settings quit or Close |
+Ordinary sources own one `// Blueprint: <table row>` line directly after imports
 (at the top without imports), using their comment syntax; commentless files stay
 hand-kept outside generated regions. Bundled `Resources/abilities/*.js` rows derive
 from the JSON header's kind/id and `record.description` or following comment text;
@@ -1000,7 +1000,7 @@ Directory: `Modules/NativeAgentCore/Sources/AppToolRuntime/`
 | `AppActions+TrustSettingsVerbs.swift` | The verbs Trust's and Settings' rows call beyond `setting.set` and the existing backup, history and grant verbs: the Mac's own buttons, each the person's lever where it needs the person at the Mac |
 | `AppChatToolDispatcher.swift` | `withAuthoredProgramHost`; Gated dispatch and settled-result observation |
 | `AppDoorActions.swift` | Shared admission, previews and typed receipts; accepted matters supply the call's knock count |
-| `AppDoorPrograms.swift` | Ordered gated calls; failed/waiting steps bar changes, not independent reads |
+| `AppDoorPrograms.swift` | Ordered gated calls; a failed, waiting or unexpected step bars later changes, not reads or cleanups; their `then_say` stands only when the deed came back wholly as said |
 | `AppDoorReading.swift` | Home/page/item/find reads; call-fit census independent of admission |
 | `AppScriptRunner.swift` | Gated program host, live contracts and shared normalization |
 | `AppToolExecutor+AppDoor.swift` | `app`, `visible`, `undo`; App dispatch, version recovery and action-owned undo |
@@ -1380,7 +1380,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatToolRuntime/`
 | `ToolApproval.swift` | PreApprovalToolValidating contract and SwiftToolDispatcher refusal/proposal wording before approval admission |
 | `ToolArguments.swift` | Checked admission; lossless normalization; explicit tool operation and app-door dependencies |
 | `ToolCausalBoundary.swift` | `ToolCausalBoundary` enum; `hasCanonicalMotorOwner`, `motorReference` |
-| `ToolResultSections.swift` | `ToolResultSections`, `pages`; lossless paging; verdict before bulk; raw oversized atoms |
+| `ToolResultSections.swift` | `ToolResultSections`, `pages`; lossless paging; small fields before bulk; raw oversized atoms |
 | `Turn+ChatTools.swift` | `Turn` holds approved model override, image-generation admission and Make evidence |
 | `VisualContinuity.swift` | `VisionLiveSceneSnapshot`, `SwiftToolDispatcherFourVerbLiveScene`; bounded motion and occlusion |
 | `WindowObservation.swift` | `SwiftToolDispatcherFourVerbPerceptionSource`; masked capture; visual recognition; live preview |
@@ -1433,7 +1433,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `ChatOrchestration+Intentions.swift` | `SwiftNativeTurnEngine`; Bounded live intentions from their owner |
 | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`; `fireAssemblyStageEvent` |
 | `ChatOrchestration+Streaming.swift` | `TurnStreamEvent`; Transient display, never terminal evidence |
-| `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody` (the stem's loop: delivers the message's facts (text, door, who, verified id, trust, steering, posture), runs the agent's turn part's effects, hands it each event with each result's declared effect, logs at every host-call boundary; the agent's own `app` calls run once as their own dispatch round through the same door and gates, and a turn may act or end before any model call; the turn returns at `reply.end` and `after`, and nothing of the agent's runs after it); before a fresh message’s opening model call, mind/authority practice may supply one gated standing read as `already_looked`; after each tool round the familiarity nerve meets the turn's landed hand-work action ids (or one call repeated 3+ rounds) through `FamiliarLines` (`practice: `), and on a later meeting no active ability's recorded route covers it puts `practice` on the round's last result once a turn, traced as `practice.keep`; `joinedProse`; `provider.roundOutput` counts safe prose and tool calls per parsed round; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; a `provider_failure` event carries the failure's work state and whether repair is owed; the person's turn is measured as it goes (model rounds, its own calls' tokens, minutes, the longest stretch of one round's calls repeated for `took`): `took` is the after-turn line, and each part called records its rounds |
+| `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody` (the stem's loop: delivers the message's facts (text, door, who, verified id, trust, steering, posture), runs the agent's turn part's effects, hands it each event with each result's declared effect (and, for a round's one deed whose call asked for `then_say`, its standing words as `say`), logs at every host-call boundary; the agent's own `app` calls run once as their own dispatch round through the same door and gates, and a turn may act or end before any model call; the turn returns at `reply.end` and `after`, and nothing of the agent's runs after it); before a fresh message’s opening model call, mind/authority practice may supply one gated standing read as `already_looked`; after each tool round the familiarity nerve meets the turn's landed hand-work action ids (or one call repeated 3+ rounds) through `FamiliarLines` (`practice: `), and on a later meeting no active ability's recorded route covers it puts `practice` on the round's last result once a turn, traced as `practice.keep`; `joinedProse`; `provider.roundOutput` counts safe prose and tool calls per parsed round; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; a `provider_failure` event carries the failure's work state and whether repair is owed; the person's turn is measured as it goes (model rounds, its own calls' tokens, minutes, the longest stretch of one round's calls repeated for `took`): `took` is the after-turn line, and each part called records its rounds |
 | `ChatOrchestration+ToolDispatch.swift` | Offered-call admission; deadlines end only the wait |
 | `ChatOrchestration+ToolLoop.swift` | `TurnContext`; `withToolSchemas`; `finishReplyTurn`; `.completed` |
 | `ChatOrchestration+TurnEngine.swift` | SwiftNativeTurnEngine actor dependencies and retained task lifetimes |
@@ -1491,7 +1491,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `MacChatTurnRuntime.swift` | Canonical Mac admission, lifecycle and preview state |
 | `MacChatTurnStreamSettlement.swift` | Joined Mac/helper stream settlement |
 | `MacChatTurnTranscriptProofReader.swift` | `MacChatTurnLifecycleRestartRepair`; Bounded exact terminal proof |
-| `MindMemoryManager.swift` | `MindMemoryJudgment` struct; `predictionModelKey` (the record's key for the model the judgment runs on, read without changing the request; the interpretation reports the same model), `interpret` (with cares, optional reply-grounded promises and person-quoted settlements against shown open moments), `interpretBatch` (owed turns in one call, the same parser and rules once, one section per turn; a missing section stays owed), candidate-only `capturePromises`, `appraiseCares`, `relevantRecallIDs`; incremental ranked evidence and catalog-budgeted relevance batches; `AfterTurnMemoryFailure` preserves output limits, request rejections and refusals with distinct recovery |
+| `MindMemoryManager.swift` | One judgment per moment, evidence-backed intention outcomes, promise matching and recall |
 | `ModuleLogging.swift` | `nativeLog`: module-local `ModuleLog` category for ChatTurnRuntime diagnostics |
 | `NaturalExpressionGuidance.swift` | `NaturalExpressionGuidance.isSocialServe`; User-authored head classification |
 | `OutcomeTissueV2.swift` | `ResponseOutcomeObservationV2`: `make` |
@@ -2630,12 +2630,10 @@ Directory: `Modules/NativeAgentCore/Sources/MemoryV2/`
 <!-- BEGIN GENERATED BLUEPRINT: Modules/NativeAgentCore/Sources/MemoryV2/ -->
 | File | Owns |
 |---|---|
-| `AdaptiveMemoryFacts.swift` | shared interpretation with recorded person words and open moments, deferred judgment and durable fact/fold settlement |
-| `AdaptiveMemoryPromises.swift` | `AdaptiveMemoryPromoter.applyPromises`: candidate-only promise matching and saved interpretation settlements under recorded turn authority |
+| `AdaptiveMemoryFacts.swift` | shared interpretation with person words, completed acts, reply delivery and open moments; durable fact/fold settlement |
+| `AdaptiveMemoryPromises.swift` | `AdaptiveMemoryPromoter`: which turns are moments and of what share, turn-owned completed acts, promise matching and evidence-backed closure |
 | `AdaptiveMemoryPromoter+Recovery.swift` | `AdaptiveMemoryPromoter`: event-owned owed-turn recovery with recorded provenance |
 | `AdaptiveMemoryValues.swift` | Adaptive candidates, extraction evidence, observation and shared hygiene vocabulary |
-| `AfterTurnMemorySurprise.swift` | `AfterTurnMemorySurprise`: complete-no-op prediction under learned standing |
-| `AfterTurnSurpriseLedger.swift` | `AfterTurnSurpriseLedger`, `Expectation`: labelled predictions and measured cost standing |
 | `EmbeddingModelDownload.swift` | `EmbeddingModelDownload`: checked resumable installation and convergence |
 | `KnowledgeGraph+CanonicalRebuild.swift` | `SwiftNativeKnowledgeGraphIndexer`, `rebuildMemoryDerivedGraphFromCanonicalStore`, `reconcileMemoryIndexFingerprints` |
 | `KnowledgeGraph+ContextRelations.swift` | Bounded typed entity relations with disclosure and provenance evidence |
@@ -2681,7 +2679,7 @@ Directory: `Modules/NativeAgentCore/Sources/MemoryV2/`
 | `MemoryV2+FoundationModels.swift` | `OnDeviceClassification`: exact category prompt and reply parsing |
 | `MemoryV2+KindBackfill.swift` | Approved canonical category writes; the approval is the one matter the person sees and its owner draws its face |
 | `MemoryV2+KindStamp.swift` | `MemoryKindStamp`, `writerKinds`, `personKinds`: shared kind vocabulary and conservative defaults |
-| `MemoryV2+MemoryManager.swift` | `MemoryManagerLane`, `MemoryManagerPromise`, `MemoryManagerSettlement`: grounded decisions, reviewed targets, promises and saved person-quoted settlements |
+| `MemoryV2+MemoryManager.swift` | Grounded decisions, promise candidates and evidence-backed intention outcomes |
 | `MemoryV2+Moments.swift` | `MemoryMoments`: moment-row classification and recall origin |
 | `MemoryV2+PolicyGate.swift` | `MemoryPolicyGate`: checked saved memory authority |
 | `MemoryV2+Proposals.swift` | `SwiftNativeMemoryV2`: `propose`, `acceptProposal`, `supersedingAcceptance` |
@@ -2747,7 +2745,7 @@ Directory: `Modules/NativeAgentCore/Sources/NativeAgentCore/`
 | `ToolFailureAndEffects.swift` | Owner-supplied failures, remedies and declared effects |
 | `Turn.swift` | `Turn`: one identity handed to everything serving it; `TurnPart` keys each owner's state |
 | `TurnDeadline.swift` | `OperationDeadlines`, `TurnDeadline`, `TurnBodyLifetime`: work ceilings and owned settlement |
-| `TurnPresentation.swift` | `TurnPresentationReducer`: bounded lifecycle evidence without payloads |
+| `TurnPresentation.swift` | `TurnPresentationReducer`: bounded lifecycle evidence without payloads; only their acts are steps, each one identity from start to end |
 | `TurnTokenBudget.swift` | `TurnTokenBudget` class; `take`, `beginRequest` |
 | `UserMDAutogenMarkers.swift` | `UserMDAutogenMarkers`, `promptByteCap`: markers and picture bound |
 | `UserMessageIntentSignals.swift` | `UserMessageIntentSignals`: lexical signals grant no effect authority |
@@ -3486,7 +3484,7 @@ Directory: `Modules/NativeAgentShared/Sources/NativeAgentShared/`
 | `FaceContracts.swift` | Typed body–face requests, effects and optional field settlement without changing installed-phone enums |
 | `FaceEnvelope.swift` | Complete typed act/call vocabulary and correlated replies on the body–face pipe |
 | `FaceLink.swift` | Ordered asynchronous binary property-list framing over parent/child pipe handles |
-| `FaceLinkLog.swift` | Body and face append-only link record; correlation identities and redacted failures exclude payloads |
+| `FaceLinkLog.swift` | Body and face link record of the recent past, turned over at 32 MiB; identities and redacted failures, no payloads |
 | `FacePresentations.swift` | Finished renderer feed values; read state distinguishes waiting, known empty and unavailable |
 | `FaceValueRegistry.swift` | Stable wire names for every Shared face value; unknown or ambiguous names fail decoding |
 | `SecureCardFace.swift` | Protected card entry fields and controls projected by the interaction owner without secret values |

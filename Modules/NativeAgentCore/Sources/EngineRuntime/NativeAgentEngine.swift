@@ -230,6 +230,9 @@ public final class NativeAgentEngine: Sendable {
         let trace = TurnInspectorFeed(dataRootOverride: dataRoot, feed: face)
         self.trace = trace
         if hasBody { Task { await trace.start() } }
+        // Her hand is read from her record when the door is first built. Launch builds the engine off the main thread and waits for it, so the
+        // door is built here: her hand is whole before anything can ask for it.
+        if hasBody { _ = AppToolExecutor.appToolSchemas() }
         self.contextFlow = contextFlow
         let cognition = body?.cognition
         self.cognition = cognition

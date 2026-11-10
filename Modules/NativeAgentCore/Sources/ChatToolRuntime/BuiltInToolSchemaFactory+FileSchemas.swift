@@ -70,12 +70,17 @@ extension BuiltInToolSchemaFactory {
                             records with line positions and full-source coverage, in source order. Pages fit 24000 serialized bytes; a larger \
                             single record is refused, never split. Continue only with next; max_bytes and offset are byte-mode arguments.
                             """)),
-                        ("start_line", ToolSchema.intSchema("Search continuation's 1-based source line; omit initially and copy next unchanged.")),
-                        ("max_lines", ToolSchema.intSchema("Matching lines per search page, default 80, capped at 240.")),
+                        ("start_line", ToolSchema.intSchema("""
+                            1-based source line. Without query it reads lines from here instead of a byte window; with query it is the search \
+                            continuation, omitted initially. Continue either with next unchanged.
+                            """)),
+                        ("max_lines", ToolSchema.intSchema("""
+                            Lines per read without query, or matching lines per search page with query; default 80, capped at 240.
+                            """)),
                         ("max_bytes", ToolSchema.intSchema("""
                             Optional source byte window: capped at 200,000 bytes; long handoff Markdown defaults to 12,000 bytes when omitted. This \
                             is a file-read limit, not a one-response guarantee: large results are delivered through result.page. UTF-8 characters \
-                            stay whole; use at least 4 bytes to ensure progress.
+                            stay whole, and a text window the file continues past ends at its last newline; use at least 4 bytes to ensure progress.
                             """)),
                         ("offset", ToolSchema.intSchema("""
                             Byte offset, default 0. Continue with returned next arguments; positive offsets require version and a UTF-8 boundary.

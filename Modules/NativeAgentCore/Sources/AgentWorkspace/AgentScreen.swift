@@ -285,7 +285,7 @@ package enum AgentScreen {
         "Open: app {item:\"desk.4\"} or {item:\"mail\"}; text/fields: args. Also: windows, people, conversations, arrivals, work, mac.",
         "Face links page:home/<item> open with app {page:\"home\", item:\"<item>\"}; "
             + "page:desk/<handle> with app {page:\"desk\", item:<handle>}.",
-        "Job rows: agent.read {job:<row id without job:>}. Queue: queue.done / queue.drop {id:<row id>}.",
+        "Job rows: agent.read {job:<row id without job:>}. Queue: a step closes by itself once its work is seen done; queue.drop {id:<row id>} lets one go.",
         "Blocked steps: desk.wait {handle:<page:desk handle>, on:<card, message or debt id>}. Peer elevation: Trust > Connected agents.",
         "Repair: repair.let_go {id:<row id>, reason}.",
         "Find: app {page:\"home\", find:\"…\"}.",

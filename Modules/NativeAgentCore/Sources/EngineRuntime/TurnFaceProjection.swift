@@ -48,9 +48,10 @@ actor TurnFaceProjection {
             let busy = input.busy.contains(session) && !settled
             let streams = input.streaming.contains(session) && !settled
             if streams { streaming.insert(session) }
+            // Each step (one of her acts) keeps its turn's identity for it from start to end; the one running now is a row like the rest.
             var steps: [TurnFace.Step] = []
             for activity in turn?.activities ?? [] where !activity.phase.isTerminal {
-                guard let detail = activity.detail, steps.last?.text != detail else { continue }
+                guard let state, let detail = activity.detail else { continue }
                 let outcome: TurnFace.Step.Outcome?
                 switch activity.outcome {
                 case .ok: outcome = .ok
@@ -58,15 +59,17 @@ actor TurnFaceProjection {
                 case .failed: outcome = .failed
                 case nil: outcome = nil
                 }
-                steps.append(.init(text: detail, outcome: outcome))
+                steps.append(.init(id: state.identity.turnId + "#" + String(activity.id), text: detail, outcome: outcome,
+                                   isRunning: activity.runningCall != nil && !state.presentation.isTerminal, startedAt: activity.occurredAt))
             }
-            let current = turn.flatMap { $0.isTerminal ? nil : $0.writing?.line ?? $0.currentAction }
-            if let current, steps.last?.text == current { steps.removeLast() }
+            // While a step runs, that step is what she is doing on every line.
+            let doing = turn?.runningStep?.detail
+            let current = turn.flatMap { $0.isTerminal ? nil : doing ?? $0.writing?.line ?? $0.currentAction }
             let liveLine = turn.map { $0.currentAction ?? ($0.streamedTextLength > 0 ? "Writing the reply" : "Thinking") }
             let preview = input.previews[session]
             let waiting = turn?.phase == .waiting || turn?.phase == .retrying
-            let what = waiting ? turn?.currentAction
-                : preview?.imageError ?? (preview?.isShowable == true ? preview?.caption : turn?.currentAction)
+            let what = waiting && doing == nil ? turn?.currentAction
+                : preview?.imageError ?? (preview?.isShowable == true ? preview?.caption : doing ?? turn?.currentAction)
             let value = TurnFace(
                 sessionID: session, turnID: state?.identity.turnId, activeTurnID: input.active[session], phase: turn?.phase,
                 isInFlight: inFlightSessions.contains(session),

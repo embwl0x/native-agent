@@ -71,9 +71,12 @@ placement, within the four-marker budget after tools and system; the previous
 marker sits at the boundary before the current user message. With one block
 per message, the boundary the last request marked is always two blocks behind
 the next request's previous marker, however many tool rows a turn had. Native
-encoding maps boundaries past omitted empty messages. Every Anthropic cache
-marker uses the shared one-hour lifetime on both API-key and OAuth routes;
-placement is separate from lifetime. OpenAI's Responses/Codex routes, Kimi Code
+encoding maps boundaries past omitted empty messages. A marker's lifetime is
+how long its bytes can be read again, on both API-key and OAuth routes: the
+tools, system and previous-boundary markers are read by later turns and last
+one hour; the current-boundary marker covers the now-block, which is sent once
+and read only by this turn's own later rounds, so it lasts five minutes and is
+written at the lower price. OpenAI's Responses/Codex routes, Kimi Code
 and other providers receive the same layout. Actual cache hits remain provider
 evidence, not a guarantee: route/window changes, existing tool or image
 projections, provider retention and other request changes can limit reuse.
@@ -174,6 +177,11 @@ Dropped rows stay on disk and remain reachable through existing transcript reads
 and recall. Regenerate applies its original-question boundary before deriving
 checkpoints, never including future rows. Saved-plan and uncalibrated readouts
 use the same checkpoint mechanism over their one transcript observation.
+A plan names the saved user row it is rebuilt from, so a turn whose input is
+hidden (a delivery or wake with no user row) saves none and the last plan
+stands. A readout that cannot be built is the meter's own failure, shown on the
+meter: it never refuses a Chat control change or the Chat page while the choice
+itself is read.
 
 Within one turn, `TurnToolResultPointers` visits oldest tool-result bodies only
 when the complete request exceeds the physical limit. It delegates retention

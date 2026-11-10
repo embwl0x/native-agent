@@ -394,52 +394,14 @@ struct FaceRowView: View {
     }
 }
 
-/// Independent words avoid constructing every possible prefix of a long title.
+/// One line, cut by the system at its tail. A plain Text is measured once and cached, so a title as long as a whole prompt costs the
+/// same as a short one however deeply its row is nested; only the part a line could ever show is handed over.
 private struct FaceWordTitle: View {
     let title: String
 
     var body: some View {
-        FaceTitleLine {
-            ForEach(Array(title.split(whereSeparator: \.isWhitespace).enumerated()), id: \.offset) { _, word in Text(word).fixedSize() }
-            Text(" ").fixedSize()
-            Text("…")
-        }
-        .clipped().accessibilityElement(children: .ignore).accessibilityLabel(Text(title))
-    }
-}
-
-private struct FaceTitleLine: Layout {
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let words = subviews.dropLast(2)
-        let space = subviews.dropLast().last?.sizeThatFits(.unspecified).width ?? 0
-        let sizes = words.map { $0.sizeThatFits(.unspecified) }
-        let width = sizes.reduce(CGFloat.zero) { $0 + $1.width } + CGFloat(max(0, words.count - 1)) * space
-        let height = sizes.map(\.height).max() ?? subviews.last?.sizeThatFits(.unspecified).height ?? 0
-        return CGSize(width: min(width, proposal.width ?? width), height: height)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let words = subviews.dropLast(2)
-        let space = subviews.dropLast().last?.sizeThatFits(.unspecified).width ?? 0
-        let ellipsis = subviews.last?.sizeThatFits(.unspecified) ?? .zero
-        let total = words.reduce(CGFloat.zero) { $0 + $1.sizeThatFits(.unspecified).width }
-            + CGFloat(max(0, words.count - 1)) * space
-        let limit = total > bounds.width ? bounds.maxX - ellipsis.width : bounds.maxX
-        var x = bounds.minX
-        var clipped = false
-        for word in words {
-            let size = word.sizeThatFits(.unspecified)
-            if !clipped, x + size.width <= limit {
-                word.place(at: CGPoint(x: x, y: bounds.minY), proposal: ProposedViewSize(size))
-                x += size.width + space
-            } else {
-                clipped = true
-                word.place(at: CGPoint(x: bounds.maxX + 1, y: bounds.minY), proposal: ProposedViewSize(size))
-            }
-        }
-        subviews.dropLast().last?.place(at: CGPoint(x: bounds.maxX + 1, y: bounds.minY), proposal: .zero)
-        subviews.last?.place(at: CGPoint(x: clipped ? max(bounds.minX, x - space) : bounds.maxX + 1, y: bounds.minY),
-                             proposal: ProposedViewSize(ellipsis))
+        Text(title.prefix(400)).lineLimit(1).truncationMode(.tail)
+            .accessibilityLabel(Text(title))
     }
 }
 

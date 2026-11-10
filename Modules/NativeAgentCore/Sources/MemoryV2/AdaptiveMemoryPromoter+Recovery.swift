@@ -136,7 +136,7 @@ extension AdaptiveMemoryPromoter {
         case .embedding:
             guard let state = await memory?.embeddingRuntimeSnapshot() else { return basis }
             // Usage timestamps do not repair inference. Configuration, serving identity and reloads do.
-            basis.embedding = AfterTurnMemorySurprise.fingerprint([
+            basis.embedding = MemoryManagerLane.fingerprint([
                 state.requestedBackend, state.effectiveBackend, state.modelId, String(state.dimensions),
                 state.embeddingEpoch ?? "", String(state.coreMLResourcesAvailable), String(state.coreMLLoaded),
                 String(state.modelLoadable), state.lastLoadError ?? "", state.lastLoadedAt ?? "",
@@ -189,13 +189,13 @@ extension AdaptiveMemoryPromoter {
         await drainOwedRows(door: door, isIdle: heldDrainIsIdle)
     }
 
-    /// Before the dream reads the day, drain due moments from this root in batches while yielding to live work.
+    /// Before the dream reads the day, drain due moments from this root one at a time while yielding to live work.
     public func drainOwedAtNight(dataRoot: URL) async {
         guard let door, door.dataRoot.standardizedFileURL == dataRoot.standardizedFileURL else { return }
         await drainOwedRows(door: door, isIdle: heldDrainIsIdle, joining: true)
     }
 
-    /// Recovery shares the live tail and yields between passes as soon as live work arrives. A pass folds one meaning or judges up to four rows.
+    /// Recovery shares the live tail and yields between passes as soon as live work arrives. A pass folds one meaning or judges one moment.
     private func drainOwedRows(door: LivedMomentDoor, isIdle: (@Sendable () async -> Bool)?,
                                joining: Bool = false) async {
         // Night is a barrier before the dream reads the agent's day. Join a shared flight without taking its ownership, then continue through this owner.
@@ -236,7 +236,7 @@ extension AdaptiveMemoryPromoter {
         }
     }
 
-    /// Replay under recorded provenance: fold one meaning or judge one bounded batch. Meaning is saved before folding; already-lived pieces remain inert.
+    /// Replay under recorded provenance: fold one meaning or judge one moment alone. Meaning is saved before folding; already-lived pieces remain inert.
     @discardableResult
     private func askOwedMoments(memory: SwiftNativeMemoryV2, door: LivedMomentDoor,
                                attempted: inout Set<String>) async -> Bool {
@@ -258,11 +258,8 @@ extension AdaptiveMemoryPromoter {
                 due.append(row)
             }
         }
-        var owed: [(moment: CognitiveLivedMoment, turn: CognitiveMomentTurn)] = []
         for moment in due {
             guard !Task.isCancelled, !stopped else { return false }
-            // Rows beyond the bounded batch are left for this drain's next pass.
-            if owed.count == MemoryManagerLane.batchLimit { break }
             guard moment.kind == "turn", let turn = moment.input?.turn else {
                 attempted.insert(moment.id)
                 oweRecoveryRepair(moment.id, cause: "The owed moment has no recorded turn input.", door: door)
@@ -305,33 +302,16 @@ extension AdaptiveMemoryPromoter {
                 oweRecoveryRepair(moment.id, cause: "The recorded meaning is unreadable.", door: door)
                 continue
             }
-            if let stored {
-                attempted.insert(moment.id)
-                await foldOwed(moment, turn: turn, meaning: stored, memory: memory, door: door)
-                return true
+            // The oldest owed moment is judged alone, its meaning stored and folded; the rest wait for the next pass.
+            attempted.insert(moment.id)
+            if stored == nil, memoryManager == nil {
+                oweRecoveryRepair(moment.id, cause: "The memory judgment owner is unavailable.", door: door)
+                continue
             }
-            owed.append((moment, turn))
+            await settleOwed(moment, turn: turn, meaning: stored, memory: memory, door: door)
+            return true
         }
-        guard !owed.isEmpty else { return false }
-        guard let memoryManager else {
-            for entry in owed { oweRecoveryRepair(entry.moment.id, cause: "The memory judgment owner is unavailable.", door: door) }
-            return false
-        }
-        let judged = Array(owed.prefix(MemoryManagerLane.batchLimit))
-        for entry in judged { attempted.insert(entry.moment.id) }
-        await judgeOwedBatch(judged, manager: memoryManager, memory: memory, door: door)
-        // A newly durable interpretation advances to its one fold attempt now. Failed writes/calls stay attempted until the next drain.
-        for entry in judged {
-            if let after = await door.moment(entry.moment.id), after.state == .meant {
-                attempted.remove(entry.moment.id)
-            }
-        }
-        return true
-    }
-
-    /// Use the same recorded-turn surprise key as the live memory manager.
-    private static func ledgerTurn(_ turn: CognitiveMomentTurn, moment: String) -> String {
-        turn.turnId ?? turn.runId ?? turn.messageId ?? moment
+        return false
     }
 
     func waitForChange(_ id: String, since basis: OwedBasis?, cause: OwedCause, words: String) async {
@@ -356,10 +336,10 @@ extension AdaptiveMemoryPromoter {
         } catch { oweRecoveryRepair(id, cause: error.localizedDescription, door: door) }
     }
 
-    /// Refold recorded meaning under its recorded provenance; local writes remain due on the next drain.
-    private func foldOwed(_ moment: CognitiveLivedMoment, turn: CognitiveMomentTurn,
-                          meaning: AfterTurnInterpretation,
-                          memory: SwiftNativeMemoryV2, door: LivedMomentDoor) async {
+    /// Judge an owed moment alone, or refold its recorded meaning, under its recorded provenance; local writes remain due on the next drain.
+    private func settleOwed(_ moment: CognitiveLivedMoment, turn: CognitiveMomentTurn,
+                            meaning: AfterTurnInterpretation?,
+                            memory: SwiftNativeMemoryV2, door: LivedMomentDoor) async {
         inFlightMoments.insert(moment.id)
         let result = await replayRecorded(moment, turn: turn, memory: memory, meaning: meaning)
         inFlightMoments.remove(moment.id)
@@ -367,12 +347,24 @@ extension AdaptiveMemoryPromoter {
         // Done means the ROW is settled. Unsaved local shares retry without another interpretation.
         let after = await door.moment(moment.id)
         let unfinished = after.map { $0.state != .lived && $0.state != .refused } ?? true
+        if meaning == nil {
+            Self.whyInterpretation(turn: turn.turnId ?? turn.runId ?? turn.messageId ?? moment.id, session: turn.sessionId,
+                surface: turn.surface, route: TurnEnvelope.fromPersistedMetadata(turn.envelope)?.replyRoute,
+                outcome: !unfinished ? ([.skipped, .emptyInput].contains(result.extraction.semanticStatus)
+                        ? "settled with nothing to judge" : "judged while she was idle")
+                    : after?.meaning != nil ? "judged while she was idle; its fold remains owed"
+                    : "left owed: " + (result.extraction.failure?.localizedDescription ?? "no judgment was made; due on the next drain"),
+                heldTurn: nil)
+        }
         guard result.extraction.failure != nil || result.stagingFailed || unfinished else {
             recoveries[moment.id] = nil
             RepairOwed.settle(door.dataRoot, operation: "memory.moment_recovery:" + moment.id,
                 evidence: .init(source: "cognition/cognition.sqlite", id: moment.id))
             return
         }
+        // An unjudged moment that named its wait, or kept its judgment for the next drain, owes no repair.
+        if meaning == nil, let after, after.meaning == nil, let saved = try? checkpoint(after),
+           saved.wait != nil || saved.judgment != nil { return }
         // Promise matching records its own dependency. A fold/write itself needs no model call.
         oweRecoveryRepair(moment.id, cause: result.extraction.failure?.localizedDescription ?? "The fold remains owed; due on the next drain.", door: door)
     }
@@ -407,121 +399,7 @@ extension AdaptiveMemoryPromoter {
                 userMessage: turn.user, assistantMessage: turn.assistant,
                 sessionId: turn.sessionId, surface: turn.surface, origin: turn.origin,
                 turnId: turn.turnId, standingAgent: turn.standingAgentName != nil,
-                momentID: moment.id, turn: recoveryTurn, senseReads: nil, storedMeaning: meaning, collect: meaning == nil)
-        }
-    }
-
-    /// One call, one section per row; retained judgments retry their writes on the next drain.
-    private func judgeOwedBatch(_ rows: [(moment: CognitiveLivedMoment, turn: CognitiveMomentTurn)],
-                                manager: any MemoryManaging, memory: SwiftNativeMemoryV2,
-                                door: LivedMomentDoor) async {
-        var inputs: [(moment: CognitiveLivedMoment, turn: CognitiveMomentTurn, input: MemoryBatchInput, basis: OwedBasis?)] = []
-        for (moment, turn) in rows {
-            guard !Task.isCancelled, !stopped else { break }
-            inFlightMoments.insert(moment.id)
-            let prepared = await replayRecorded(moment, turn: turn, memory: memory)
-            if let input = prepared.batchInput {
-                let basis = await readBasis(moment, cause: .provider, door: door)
-                inputs.append((moment, turn, input, basis))
-            } else {
-                // Only the failing owner may name a wait; an unclassified failure owes repair and remains due.
-                inFlightMoments.remove(moment.id)
-                guard !Task.isCancelled, prepared.extraction.failure?.reason != .cancelled else { break }
-                let after = await door.moment(moment.id)
-                if let after, after.state != .lived, after.state != .refused {
-                    do {
-                        if try checkpoint(after).wait == nil {
-                            oweRecoveryRepair(moment.id,
-                                cause: prepared.extraction.failure?.localizedDescription
-                                    ?? "Preparation returned \(prepared.extraction.semanticStatus.rawValue) without a model input or named dependency.",
-                                door: door)
-                        }
-                    } catch { oweRecoveryRepair(moment.id, cause: error.localizedDescription, door: door) }
-                }
-            }
-        }
-        defer { for entry in inputs { inFlightMoments.remove(entry.moment.id) } }
-        guard !inputs.isEmpty, !Task.isCancelled, !stopped else { return }
-        let root = await memory.surpriseDataRoot()
-        let started = ProcessInfo.processInfo.systemUptime
-        var providerSeconds = 0.0
-        var replies: [AfterTurnInterpretation?] = []
-        var failure: String?
-        var cancelled = false
-        if let first = inputs.first {
-            TurnTraceBus.fire(TurnTraceEvent(turnId: first.input.call.turn?.id ?? first.moment.id, kind: "memory.held",
-                sessionId: first.turn.sessionId, surface: first.turn.surface,
-                payload: .object(["moments": .array(inputs.map { .string($0.moment.id) })]), turn: first.input.call.turn))
-        }
-        do {
-            replies = try await manager.interpretBatch(inputs.map(\.input))
-            providerSeconds = max(0, ProcessInfo.processInfo.systemUptime - started)
-        } catch {
-            failure = error.localizedDescription
-            cancelled = Self.isCancellation(error)
-        }
-        // The provider answered on the route this attempt was asked under: rows whose call failed there are due again.
-        if failure == nil, let first = inputs.first {
-            await answered(first.moment.id, route: first.basis?.route, door: door)
-        }
-        let share = providerSeconds / Double(inputs.count)
-        let wasCancelled = cancelled || Task.isCancelled
-        // A returned judgment is produced work. Validate its target contracts, write meaning and label it outside cancellation before releasing it.
-        await settle { [inputs, replies, failure, wasCancelled] in
-            await self.recordBatchJudgments(inputs, replies: replies, failure: failure, cancelled: wasCancelled,
-                                           share: share, root: root, door: door)
-        }
-    }
-
-    /// Only a judgment writes a ledger row; an attempt that judged nothing shows once in `mind.why` and leaves the row owed.
-    private func recordBatchJudgments(
-        _ inputs: [(moment: CognitiveLivedMoment, turn: CognitiveMomentTurn, input: MemoryBatchInput, basis: OwedBasis?)],
-        replies: [AfterTurnInterpretation?], failure: String?, cancelled: Bool, share: Double, root: URL?,
-        door: LivedMomentDoor
-    ) async {
-        for (index, entry) in inputs.enumerated() {
-            let id = entry.moment.id
-            var basis = entry.basis
-            if failure == nil {
-                basis = await readBasis(entry.moment, cause: .provider, door: door)
-            }
-            let turnKey = Self.ledgerTurn(entry.turn, moment: id)
-            let reply = (replies.indices.contains(index) ? replies[index] : nil)
-                .map { MemoryManagerLane.resolvingTargets($0, request: entry.input.request) }
-            let outcome: String
-            var check: AfterTurnMemorySurprise?
-            if let reply, let meaning = Self.encodedMeaning(reply), await door.meant(id, meaning) {
-                recoveries[id] = nil
-                outcome = "judged in a batch of \(inputs.count)"
-                if let root {
-                    check = await AfterTurnSurpriseLedger.shared.label(dataRoot: root, session: entry.turn.sessionId,
-                        turn: turnKey, surface: entry.turn.surface,
-                        channels: AfterTurnChannelOutcome(interpretation: reply, factsAsked: entry.input.factsEnabled),
-                        providerSeconds: share, judgedBy: reply.judgingKey).check
-                }
-            } else if let reply {
-                var saved: RecoveryCheckpoint
-                do { saved = try checkpoint(entry.moment) }
-                catch { oweRecoveryRepair(id, cause: error.localizedDescription, door: door); continue }
-                saved.judgment = reply
-                saved.wait = nil
-                do { try await keepCheckpoint(id, saved, door: door) }
-                catch { oweRecoveryRepair(id, cause: error.localizedDescription, door: door) }
-                outcome = "left owed: its judgment could not be written to the agent's journal"
-            } else if cancelled {
-                outcome = "left owed: the batch call was cancelled; due on the next drain"
-            } else if let failure {
-                outcome = "left owed: the batch call failed (\(failure))"
-                await waitForChange(id, since: basis, cause: .provider, words: failure)
-            } else {
-                outcome = "left owed: the batch reply has no usable section for this recorded turn"
-                await waitForChange(id, since: basis, cause: .provider,
-                                    words: "The batch reply has no usable section for this recorded turn.")
-            }
-            Self.whyInterpretation(turn: turnKey, session: entry.turn.sessionId,
-                surface: entry.turn.surface,
-                route: TurnEnvelope.fromPersistedMetadata(entry.turn.envelope)?.replyRoute,
-                outcome: outcome, check: check, heldTurn: entry.input.call.turn)
+                momentID: moment.id, turn: recoveryTurn, senseReads: nil, storedMeaning: meaning, held: true)
         }
     }
 

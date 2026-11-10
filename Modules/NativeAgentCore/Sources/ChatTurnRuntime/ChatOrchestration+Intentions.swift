@@ -129,7 +129,7 @@ extension SwiftNativeTurnEngine {
             case .time(let date): until = MyQueue.shown(date)
             case .words(let words): until = words
             }
-            // Carry the item's name so the shown work can be finished with `queue.done`.
+            // Carry the item's name so the shown work can be named; its deed, once seen, closes it.
             return "- " + row.entry.name + " · " + Self.intentionLine(row.entry.step.words) + " · " + Self.intentionLine(row.moment)
                 + " · until " + Self.intentionLine(until)
         }

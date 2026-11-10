@@ -60,6 +60,8 @@ public actor CognitiveSubstrate {
     /// The durable forgetting epochs (see `AfterTurnContext.mindEpoch`). The mind's lives in `cognitive_epochs`, read at restore and bumped by Clear in the
     /// transaction that empties the store; the body's lives in its own file and is pushed here by the runtime (`adoptBodyEpoch`).
     var mindEpoch: UInt64 = 0
+    /// When Clear last moved `mindEpoch`, kept beside it: a turn admitted again from words said before then carries the epoch before it.
+    var mindClearedAt = Date.distantPast
     var bodyEpoch: UInt64 = 0
     /// Kernel revision prevents older body epochs from replacing newer adopted state.
     var bodyEpochRevision: UInt64?
@@ -397,6 +399,7 @@ public actor CognitiveSubstrate {
         forgettingDiscarded.removeAll()
         var supersededStages = unsavedStages.subtracting(["mind.self", "mind.self.read"])
         let epoch: UInt64
+        let clearedAt: Date
         do {
             // Repair claims survive relaunch; RAM is not their owner. Read before deleting anything, so an unavailable ledger cannot leave a successful Clear
             // with debts it never learned about.
@@ -408,7 +411,8 @@ public actor CognitiveSubstrate {
                 let stage = String(operation.dropFirst("cognition.persist:".count))
                 if stage != "mind.self", stage != "mind.self.read", stage != "clear" { supersededStages.insert(stage) }
             }
-            epoch = try await store.clear()
+            clearedAt = dependencies.now()
+            epoch = try await store.clear(at: clearedAt)
         } catch {
             // A failed Clear owes one repair for discarded writes; mark affect/nodes dirty and let each other owner save its current state at its next write.
             oweFailedClear(forgettingDiscarded, error: error)
@@ -419,6 +423,7 @@ public actor CognitiveSubstrate {
         }
         clearResidentState()
         mindEpoch = epoch
+        mindClearedAt = clearedAt
         for stage in supersededStages {
             unsavedStages.remove(stage)
             RepairOwed.settle(conversationDataRoot, operation: "cognition.persist:" + stage,

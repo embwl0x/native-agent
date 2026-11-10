@@ -450,8 +450,8 @@ extension SwiftToolDispatcher {
         let note = try deskMetadataString(input, "note")
         for id in ids {
             if let item = try Self.deskMatches(id, in: state, field: "on").first { blockers.append(item.handle); continue }
-            // A card answers to its bare id too (its experience is `interaction:<id>`).
-            var found = try await experiences.experience(id)
+            // A card answers to its bare id too (its experience is `interaction:<id>`), and an approval to the `approval:<id>` its Home row shows.
+            var found = try await experiences.experience(id.hasPrefix("approval:") ? String(id.dropFirst("approval:".count)) : id)
             if found == nil { found = try await experiences.experience("interaction:" + id) }
             guard let experience = found else {
                 // A single person's name is a wait, not an invented dependency. Identifier-shaped unknowns still fail at the input boundary.

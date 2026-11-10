@@ -156,7 +156,7 @@ supplies sessions without request or resource clock limits. An unanswered
 request stays waiting with Stop as its cancellation lever; `provider.waiting`
 names the network path or provider response, the provider and the start time in
 its trace and the turn's existing progress notices. Mac chat reduces those notices
-into its working card; the other-door lifecycle intake consumes the same trace
+into its working card as the turn's state, never a step; the other-door lifecycle intake consumes the same trace
 descriptions for turns opened through another surface. Waiting names its start
 time, reconnecting names the event and next action, and Stop remains available.
 `ProviderHTTPBytes` receives headers, body chunks and task completion from one

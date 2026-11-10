@@ -14,9 +14,12 @@
 // agent's own {effect: "app", call: {tool: "app", input}}, its result coming
 // back as a result event, may set the notebook weigh reads with {effect:
 // "notebook", set: {...}}, and may end the turn in the agent's own words or
-// silently. The stem owns the loop, the stream, the gates, each act running
-// once, and the guarantee that a turn ends. This one thinks on every message,
-// and ends a thought on CPU when its class's no-op record stands.
+// silently. A result says whether its call landed, what it waits on and the
+// effect it had; a deed's result also carries say, its own closing words,
+// when every step came back as said. The stem owns the loop, the stream,
+// the gates, each act running once, and the guarantee that a turn ends. This
+// one thinks on every message, and ends a thought on CPU when its class's
+// no-op record stands.
 function step(state, event) {
   switch (event.type) {
     case "message":
@@ -32,6 +35,9 @@ function step(state, event) {
       // The familiarity nerve fires when this turn's hand work repeats earlier practice; her next thought carries it.
       var left = state.calls - 1, practice = event.practice || state.practice;
       if (left) return next({purpose: "tool_round", calls: left, practice: practice}, []);
+      // A deed whose every step came back as said carries its own closing words: they are said, and the turn ends without reading it back.
+      if (event.say) return next({purpose: state.purpose, calls: 0},
+        [{effect: "reply.stream", text: event.say}, {effect: "reply.end"}, {effect: "after"}]);
       var call = {effect: "model.call", purpose: "tool_round"};
       if (practice) call.note = kept(practice);
       return next({purpose: "tool_round", calls: 0}, [call]);

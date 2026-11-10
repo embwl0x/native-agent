@@ -14,7 +14,7 @@ public enum CognitiveMomentState: String, Codable, Sendable, Equatable {
     case meant
     /// Its attempt reached its end (fold and facts). The payloads are dropped.
     case lived
-    /// Refused, with its reason (another life, the agent's own work, nothing to live).
+    /// Refused, with its reason (another life, nothing it could settle, nothing to live).
     case refused
 }
 
@@ -45,7 +45,7 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
     public var runId: String?
     public var messageId: String?
     public var occurredAt: Date?
-    /// Reply boundary captured before deferred memory work.
+    /// When the turn's reply settled, captured before deferred memory work; nil when the turn failed or stopped before its reply settled.
     public var repliedAt: Date?
     public var took: String?
     public var standingAgentName: String?
@@ -55,8 +55,11 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
     /// Retain the same principal and carried steer as queue.add; missing provenance stays absent.
     public var originPrincipal: String?
     public var carriedSources: [String]?
-    /// Only the agent's thoughts about a care enter the journal from the agent's own work.
+    /// Only the agent's thoughts about a care enter the journal whole from the agent's own work.
     public var careWakes: [CognitiveCareWake]?
+    /// Judged for settlement alone: a turn without an incoming message from someone (her own work, a return, a continuation) that completed an act
+    /// while a moment was open. It has no mind or fact share.
+    public var settlesOnly: Bool?
 
     public var isCareWake: Bool {
         sessionId == Happening.stream && careWakes?.isEmpty == false
@@ -86,6 +89,17 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
         self.originPrincipal = originPrincipal
         self.carriedSources = carriedSources
         self.careWakes = careWakes
+    }
+
+    /// The moment's journal identity. A moment judged for settlement alone is its turn's (session plus turn id): its evidence is the turn's acts,
+    /// and it may have no incoming row. Any other is its incoming message's (session plus message id), so redelivery cannot duplicate it.
+    public var momentID: String? {
+        if settlesOnly == true {
+            guard let turnId, !turnId.isEmpty else { return nil }
+            return CognitiveLivedMoment.settlementID(sessionId: sessionId, turnId: turnId)
+        }
+        guard let messageId, !messageId.isEmpty else { return nil }
+        return CognitiveLivedMoment.turnID(sessionId: sessionId, messageId: messageId)
     }
 
     public var origin: AfterTurnOrigin? {
@@ -182,6 +196,11 @@ public struct CognitiveLivedMoment: Codable, Sendable {
     /// A turn's identity is its origin: the session and the incoming message. One chat message minted twice is one moment.
     public static func turnID(sessionId: String, messageId: String) -> String {
         ["turn", sessionId, messageId].map { "\($0.utf8.count):\($0)" }.joined()
+    }
+
+    /// A turn judged for settlement alone is identified by itself: the session and the turn.
+    public static func settlementID(sessionId: String, turnId: String) -> String {
+        ["settles", sessionId, turnId].map { "\($0.utf8.count):\($0)" }.joined()
     }
 }
 

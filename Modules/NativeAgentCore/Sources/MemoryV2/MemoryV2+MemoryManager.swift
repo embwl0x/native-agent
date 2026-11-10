@@ -9,8 +9,9 @@ import PersistenceCore
 import CognitiveSubstrate
 import TurnTrace
 import Desk
+import CryptoKit
 
-// Blueprint: | `MemoryV2+MemoryManager.swift` | `MemoryManagerLane`, `MemoryManagerPromise`, `MemoryManagerSettlement`: grounded decisions, reviewed targets, promises and saved person-quoted settlements |
+// Blueprint: | `MemoryV2+MemoryManager.swift` | Grounded decisions, promise candidates and evidence-backed intention outcomes |
 
 // MARK: - What the manager returns
 
@@ -111,9 +112,17 @@ public struct MemoryManagerRequest: Sendable, Equatable {
     public let took: String?
     /// The exchange's clock, retained when an owed turn is judged later.
     public let occurredAt: Date?
-    /// Only the recorded person's own incoming words can settle the shown moments.
+    /// The person's recorded words can complete or release work; completed acts can prove work done.
     public let personWords: String
     public let openMoments: [DeskItem]
+    public let completedActs: [MemoryManagerAct]
+    /// A failed evidence read is disclosed to interpretation; it cannot hold the person's words unjudged.
+    public let completedActsUnavailable: String?
+    /// The agent's reply on this turn reached a person; only then can it prove a deed that is itself saying something to them.
+    public let replyDelivered: Bool
+    /// A turn without an incoming message from someone, judged for settlement alone: only what it settled is kept, never memories, promises or
+    /// cares.
+    public let settlesOnly: Bool
 
     public init(
         userMessage: String,
@@ -127,7 +136,11 @@ public struct MemoryManagerRequest: Sendable, Equatable {
         took: String? = nil,
         occurredAt: Date? = nil,
         personWords: String = "",
-        openMoments: [DeskItem] = []
+        openMoments: [DeskItem] = [],
+        completedActs: [MemoryManagerAct] = [],
+        completedActsUnavailable: String? = nil,
+        replyDelivered: Bool = false,
+        settlesOnly: Bool = false
     ) {
         self.userMessage = userMessage
         self.assistantMessage = assistantMessage
@@ -141,6 +154,10 @@ public struct MemoryManagerRequest: Sendable, Equatable {
         self.occurredAt = occurredAt
         self.personWords = personWords
         self.openMoments = openMoments
+        self.completedActs = completedActs
+        self.completedActsUnavailable = completedActsUnavailable
+        self.replyDelivered = replyDelivered
+        self.settlesOnly = settlesOnly
     }
 }
 
@@ -154,10 +171,14 @@ public struct MemoryManagerPromise: Codable, Sendable, Equatable {
         self.words = words; self.when = when; self.source = source
     }
 
+    /// The one test for words quoted from the agent's reply: nonblank and exactly contained.
+    public static func quoted(_ source: String, in reply: String) -> Bool {
+        !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && reply.contains(source)
+    }
+
     /// A saved meaning already holds its semantic judgment; recovery checks its evidence against the recorded reply.
     public func validate(reply: String) throws {
-        guard !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, reply.contains(source) else {
+        guard !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, Self.quoted(source, in: reply) else {
             throw FoundationModelsError.decodeFailed("promise requires nonempty words and exact reply source")
         }
         switch when {
@@ -181,9 +202,7 @@ public struct MemoryManagerPromise: Codable, Sendable, Equatable {
             guard let words = row["words"] as? String,
                   !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   let when = row["when"] as? String,
-                  let source = row["source"] as? String,
-                  !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  reply.contains(source) else {
+                  let source = row["source"] as? String, Self.quoted(source, in: reply) else {
                 throw FoundationModelsError.decodeFailed("promise \(promises.count) requires nonempty words, when and exact reply source")
             }
             guard row["committed"] as? Bool == true else {
@@ -198,21 +217,63 @@ public struct MemoryManagerPromise: Codable, Sendable, Equatable {
     }
 }
 
-/// Filing decisions retained until their Desk writes land. The settled case also reads older retained judgments.
+/// Filing decisions retained until their Desk writes land.
 public enum MemoryManagerPromiseCapture: Codable, Sendable {
     case ignore
     case keep(MemoryManagerPromise, target: String?, candidates: [Int])
-    case settled(id: String, updatedAt: String, source: String)
+    case settled(MemoryManagerSettlement)
 }
 
-/// The shared interpretation's person-quoted settlement, with the shown row revision retained for closure.
+/// A successful closing dispatch receipt from this turn, with its owner's recorded outcome.
+public struct MemoryManagerAct: Sendable, Equatable {
+    public let id: String
+    public let record: JSONValue
+
+    public init(id: String, record: JSONValue) {
+        self.id = id; self.record = record
+    }
+
+    public func contains(_ source: String) -> Bool {
+        guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        var pending = [record.objectValue?["receipt"], record.objectValue?["result"]].compactMap { $0 }
+        while let value = pending.popLast() {
+            switch value {
+            case .string(let text): if text.contains(source) { return true }
+            case .object(let fields): pending.append(contentsOf: fields.values)
+            case .array(let values): pending.append(contentsOf: values)
+            default: break
+            }
+        }
+        return false
+    }
+}
+
+/// The shared judgment retains how work ended, what proves it and the exact row revision it reviewed.
 public struct MemoryManagerSettlement: Codable, Sendable {
+    public enum Outcome: String, Codable, Sendable { case done, letGo = "let_go" }
+    public enum Evidence: Codable, Sendable {
+        case personWords(String)
+        case act(id: String, source: String)
+        /// The agent's own delivered reply on this turn, when the deed was saying it.
+        case reply(String)
+
+        /// The basis name, as the judgment and the `memory.promise` trace spell it.
+        public var basis: String {
+            switch self {
+            case .personWords: "person_words"
+            case .act: "act"
+            case .reply: "reply"
+            }
+        }
+    }
     public let id: String
     public let updatedAt: String
-    public let source: String
+    public let outcome: Outcome
+    public let evidence: Evidence
+    public let reason: String
 
-    public init(id: String, updatedAt: String, source: String) {
-        self.id = id; self.updatedAt = updatedAt; self.source = source
+    public init(id: String, updatedAt: String, outcome: Outcome, evidence: Evidence, reason: String) {
+        self.id = id; self.updatedAt = updatedAt; self.outcome = outcome; self.evidence = evidence; self.reason = reason
     }
 }
 
@@ -227,12 +288,6 @@ public struct AfterTurnInterpretation: Codable, Sendable {
     public let appAuthored: Bool
     public let model: String?
     public let surface: String
-
-    /// The record's key for the model that judged: the judgment's own surface and model, as the call reported them. A label's scope is this key.
-    public var judgingKey: String { Self.judgingKey(surface: surface, model: model) }
-    public static func judgingKey(surface: String, model: String?) -> String {
-        AfterTurnMemorySurprise.fingerprint(["memory-judgment-v2", surface, model ?? ""])
-    }
 
     public init(memories: [MemoryManagerDecision],
                 affect: CognitiveSubstrate.AffectAppraisal, caring: CaringAppraisalVerdict,
@@ -261,8 +316,7 @@ public struct AfterTurnInterpretation: Codable, Sendable {
         caring = try values.decode(CaringAppraisalVerdict.self, forKey: .caring)
         cares = try values.decode([CognitiveCareJudgment].self, forKey: .cares)
         promises = try values.decode([MemoryManagerPromise].self, forKey: .promises)
-        if values.contains(.settled) { settled = try values.decode([MemoryManagerSettlement].self, forKey: .settled) }
-        else { settled = [] }
+        settled = try values.decode([MemoryManagerSettlement].self, forKey: .settled)
         appAuthored = try values.decode(Bool.self, forKey: .appAuthored)
         model = try values.decodeIfPresent(String.self, forKey: .model)
         surface = try values.decode(String.self, forKey: .surface)
@@ -318,31 +372,12 @@ public enum AfterTurnInterpretationFailure: String, Error, Sendable {
     case envelope, caring, affect, memories, cares
 }
 
-/// Each batched exchange retains the request and context it would have received alone.
-public struct MemoryBatchInput: Sendable {
-    public let call: LLMCall
-    public let request: MemoryManagerRequest
-    public let context: AfterTurnContext?
-    public let factsEnabled: Bool
-    public init(request: MemoryManagerRequest, context: AfterTurnContext?, factsEnabled: Bool, call: LLMCall) {
-        self.call = call
-        self.request = request
-        self.context = context
-        self.factsEnabled = factsEnabled
-    }
-}
-
 /// No incoming message returns nil; failures throw bounded recovery evidence. An empty memory array is a valid abstention.
 public protocol MemoryManaging: Sendable {
-    /// Read the judging model's key without changing the request; unkeyed predictions earn no standing.
-    func predictionModelKey() async -> String?
     /// The judging route as it stands now: surface, provider account and model; nil when the route cannot be read.
     func judgmentRouteKey() async -> String?
     func interpret(_ request: MemoryManagerRequest, context: AfterTurnContext?,
                    factsEnabled: Bool, call: LLMCall) async throws -> AfterTurnInterpretation?
-    /// Several owed exchanges in one call, one section each, in input order. A nil entry is a section the reply lacked or got wrong: that exchange stays owed.
-    /// Throws when the call itself fails.
-    func interpretBatch(_ inputs: [MemoryBatchInput]) async throws -> [AfterTurnInterpretation?]
     func capturePromises(_ promises: [MemoryManagerPromise], reply: String,
                          open: [DeskItem], call: LLMCall) async throws
         -> [MemoryManagerPromiseCapture]
@@ -357,9 +392,12 @@ public enum MemoryManagerLane {
     public static let sourcePrefix = "memory-manager"
     /// Nothing below this stages, whatever the action says.
     public static let confidenceFloor = 0.8
-    /// Four exchanges keep a batch near one turn's prompt scale while sharing its rules.
-    public static let batchLimit = 4
     public static let recallTopK = 8
+    /// One identity for an owed moment's dependency (its judging route, its embedder): the same values give the same key.
+    public static func fingerprint(_ values: [String]) -> String {
+        let text = values.map { "\($0.utf8.count):" + $0 }.joined()
+        return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
     public static let pendingCap = 24
     /// Bound memories to sentences rather than paragraphs.
     public static let statementCap = 200

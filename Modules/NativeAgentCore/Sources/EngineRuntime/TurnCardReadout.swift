@@ -15,6 +15,10 @@ public enum TurnCardReadout {
         if state.cancellationRequestedAt != nil {
             line = "Stopping…"
             moving = false
+        } else if let running = turn.runningStep?.runningCall {
+            // A running step is movement, whatever the turn's phase says.
+            line = ToolActivityPresentation.progress(running)
+            moving = true
         } else if let writing = turn.writing {
             line = writing.line
             moving = true
@@ -101,40 +105,45 @@ public enum TurnCardReadout {
 
         // Keep approval reachable while acknowledging Stop until actual settlement.
         let ownedApproval = approvalOwnsCard && !cancellationPending ? approval : nil
+        // A running step is what she is doing: it is movement, never a stall, and the card stays on it. Only Stop and a wait on the
+        // person (an approval, a block) speak over it.
+        let running = ownedApproval == nil && !cancellationPending && phase != .blocked ? presentation.runningStep : nil
         // A call being written is work with a name, not thinking.
         let writing = phase == .stalled ? nil : presentation.writing
-        let plain = !isTerminal && ownedApproval == nil && !cancellationPending
+        let plain = !isTerminal && ownedApproval == nil && !cancellationPending && running == nil
             && presentation.currentAction == nil && writing == nil
             && (phase == .acknowledged || phase == .working)
         return MacChatTurnCardModel(
             identity: state.identity,
             phase: phase,
-            title: ownedApproval.map(approvalTitle(for:)) ?? title(
+            title: ownedApproval.map(approvalTitle(for:)) ?? (running == nil ? title(
                 phase: phase,
                 personaName: personaName,
                 delegateName: presentation.delegateName,
                 cancellationPending: cancellationPending
-            ),
+            ) : "\(who(personaName)) is working"),
             detail: cancellationPending ? "Waiting for this response to stop."
-                : ownedApproval.map(approvalDetail(for:))
+                : ownedApproval.map(approvalDetail(for:)) ?? running?.detail
                     ?? writing?.line ?? detail(phase: phase, currentAction: presentation.currentAction),
             delegateName: presentation.delegateName,
-            tone: ownedApproval.map(tone(forApproval:)) ?? tone(for: phase),
-            symbolName: ownedApproval.map(symbolName(forApproval:)) ?? symbolName(for: phase),
+            tone: ownedApproval.map(tone(forApproval:)) ?? (running == nil ? tone(for: phase) : .working),
+            symbolName: ownedApproval.map(symbolName(forApproval:)) ?? symbolName(for: running == nil ? phase : .tool),
             isTerminal: isTerminal,
             // Waiting on the person is not movement regardless of the last lifecycle event.
-            showsLiveIndicator: ownedApproval == nil && !isTerminal && !cancellationPending && isMoving(phase),
+            showsLiveIndicator: ownedApproval == nil && !isTerminal && !cancellationPending && (running != nil || isMoving(phase)),
             cancellationPending: cancellationPending,
             approval: approval,
             clock: MacChatTurnCardModel.Clock(
                 startedAt: presentation.startedAt,
                 endedAt: presentation.endedAt,
                 lastMovementAt: presentation.lastMovementAt,
-                isTerminal: isTerminal
+                isTerminal: isTerminal,
+                stepStartedAt: running?.occurredAt
             ),
             thinkingSince: plain && presentation.streamedTextLength == 0 ? presentation.startedAt : nil,
             thoughtFor: plain && presentation.streamedTextLength > 0
-                ? presentation.firstReplyAt.map { $0.timeIntervalSince(presentation.startedAt) } : nil
+                ? presentation.firstReplyAt.map { $0.timeIntervalSince(presentation.startedAt) } : nil,
+            longStepTitle: running.map { _ in "\(who(personaName)) is still on it" }
         )
     }
 
@@ -208,8 +217,7 @@ public enum TurnCardReadout {
         delegateName: String?,
         cancellationPending: Bool
     ) -> String {
-        let persona = personaName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let who = persona.isEmpty ? "The agent" : persona
+        let who = Self.who(personaName)
         if cancellationPending, !phase.isTerminal {
             return "Stopping\u{2026}"
         }
@@ -243,6 +251,11 @@ public enum TurnCardReadout {
         case .outcomeUnknown:
             return "Not sure that finished."
         }
+    }
+
+    private static func who(_ personaName: String) -> String {
+        let persona = personaName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return persona.isEmpty ? "The agent" : persona
     }
 
     public static func detail(phase: TurnPresentationPhase, currentAction: String?) -> String? {

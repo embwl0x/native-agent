@@ -58,7 +58,7 @@ public final class ChatGPTTransport: LLMTransport {
         self.openAIPublicClientID = openAIPublicClientID
         self.telemetry = LLMCallTraceRecorder(dataRootOverride: telemetryDataRootOverride)
     }
-    /// Cache routing follows conversation, the sessionless workshop surface, then turn; an unbound call has no cache key and never changes store:false.
+    /// Cache routing follows conversation, the sessionless workshop surface, then the call's purpose, then turn; an unbound call has no cache key and never changes store:false.
     static func currentPromptCacheKey(call: LLMCall) -> String? {
         guard let raw = cacheScopeID(call: call) else { return nil }
         return "nativeagent-session-\(raw)"
@@ -67,7 +67,8 @@ public final class ChatGPTTransport: LLMTransport {
     private static func cacheScopeID(call: LLMCall) -> String? {
         let workshopScope = WorkshopSurfaceVocabulary.isWorkshopSurface(call.surface)
             ? "nativeagent-workshop" : nil
-        for candidate in [call.session, workshopScope, call.turn?.id] {
+        // Sessionless calls of one purpose send one prompt policy, so they share a scope and its unchanging text is cached across calls.
+        for candidate in [call.session, workshopScope, call.purpose.isEmpty ? nil : "purpose-" + call.purpose, call.turn?.id] {
             if let raw = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
                !raw.isEmpty {
                 return raw

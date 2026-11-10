@@ -100,7 +100,8 @@ unchanged-step snapshot. Launch and each carried pass finish saved debts
 without running the habit or speaking again, then mark them settled.
 Changed or already closed steps are left alone. Standing and rhythms remain open;
 their next occurrence is still owned by `IntentionClock`. An until condition
-in words still needs the agent's judgment. An unfinished/refused/needs-me result
+in words still needs judgment: they reads it when the moment comes, and the
+after-turn judgment closes the step once it is met. An unfinished/refused/needs-me result
 rides the step's moment as `already_looked` text. What comes out is the
 display-only planned call and the routine thought merely to decide to run it.
 

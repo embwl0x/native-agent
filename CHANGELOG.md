@@ -4,6 +4,14 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.17 — never clueless (2026-11-10)
+
+- The chat status box lists the last finished steps above the running one; past thirty seconds a step says the agent is still on it; a running step is never "no movement"; only calls are steps
+- The interface holds only unread link bytes, so its memory no longer grows while a turn streams; the Make and Screen panes no longer freeze it
+- After-turn work settles in seconds; an action can carry the agent's closing words and end the turn without another model call
+- Reads of chosen lines and paged long values work as described; the current-turn cache marker lasts five minutes; the ledger keeps the provider's cache-write split
+- Each moment of a turn is judged alone for memory, and others' turns are judged when idle; Fable 5.2 and GPT-6-Luna listed
+
 ## 0.6.16 — always on (2026-11-09)
 
 - It hears you: a message mid-answer stops the model's stream, keeps the words said and answers you; calls that have not started yield to your words; a running call is never cut

@@ -211,9 +211,10 @@ images, streaming and native tools. Both offer the Messages wire's Think
 Fast is not offered. Meta uses the shared Anthropic-format Messages adapter
 at `https://api.meta.ai/v1/messages` with Bearer auth and client-side history.
 Meta's returned thinking blocks, including opaque reasoning, replay across
-tool rounds through the shared in-memory tool-call ledger. They are not saved
-in conversation history; after eviction or app restart only ordinary text,
-tool calls and results remain. Kimi Code does not enable thinking replay.
+tool rounds through the shared in-memory tool-call ledger, for as long as the
+conversation before them is unchanged. They are not saved in conversation
+history; after a change to the model, system, tools or earlier messages, after
+eviction or app restart, only ordinary text, tool calls and results remain. Kimi Code does not enable thinking replay.
 Stop uses the same request cancellation and settlement as the other providers.
 Prompt caching is automatic; system cache markers use Meta's five-minute TTL.
 Cache-read counts appear only when Meta reports them; an absent count is unknown.
@@ -866,7 +867,16 @@ stays unavailable. Page search, catalog-entry forms, the memory graph,
 research lab and Your spaces are removed from this page; ask in Chat for
 searches, catalog changes and research, and use Personality for your spaces.
 Context receipts leave unmeasured sizes and totals unavailable; token shares
-are calculated only from a complete assembled size.
+are calculated only from a complete assembled size. The composer's Context
+popover shows the last provider request total against the selected model's
+window, a segmented bar and matching rows with aligned token counts and
+shares of the request. Opening-request parts are estimated by byte size with
+integer shares that add to the opening provider count; measured growth through
+tool rounds completes the final total. Images, incomplete sizes or a smaller
+final request leave the affected part counts unknown; a known provider total
+still draws the overall usage without inventing a split. Memory recall has
+its own injected-memory count, separate from token shares. The footer names
+the model that ran and when. **Show what I was given** opens the saved context.
 
 Today recognizes collaboration from recorded peer-bridge provenance, with
 contact names resolved by the connected-agent directory. Unreadable contact

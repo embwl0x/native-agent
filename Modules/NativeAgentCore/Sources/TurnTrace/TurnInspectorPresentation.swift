@@ -171,29 +171,6 @@ public enum TurnInspectorGrouping {
             add("elapsedMs", "elapsedMs")
             add("counts", "counts")
             add("labels", "labels")
-            if p["stage"]?.stringValue == "memory.promotion",
-               case .object(let counts)? = p["counts"],
-               let predicted = counts["surpriseWouldDefer"]?.integerValue.flatMap(Int.init(exactly:)),
-               let changed = counts["surpriseChangedOnPrediction"]?.integerValue.flatMap(Int.init(exactly:)),
-               let incomplete = counts["surpriseIncompletePredictions"]?.integerValue.flatMap(Int.init(exactly:)) {
-                var flags: [String: JSONValue] = [:]
-                if case .object(let found)? = p["flags"] { flags = found }
-                var labels: [String: JSONValue] = [:]
-                if case .object(let found)? = p["labels"] { labels = found }
-                let deferred = flags["surpriseDeferred"]?.boolValue == true
-                let lower = labels["surpriseLowerBound"]?.stringValue ?? "0"
-                let bar = labels["surpriseCostBar"]?.stringValue ?? "1"
-                out.append(.init(label: "memory deferral",
-                    value: (deferred ? "Deferred: this turn stays owed and is judged in a batch later. "
-                        : "Judged now. ")
-                        + """
-                            Predicted no-op on \(predicted) turns; changed something on \(changed); not yet labelled \(incomplete). Lower bound \(lower) \
-                            against cost bar \(bar).
-                            """))
-                if flags["surpriseLedgerReadable"]?.boolValue != true {
-                    out.append(.init(label: "deferral evidence", value: "Ledger unavailable or incomplete; no prediction can stand on it."))
-                }
-            }
         case "llm.call":
             add("model", "model")
             add("purpose", "purpose")

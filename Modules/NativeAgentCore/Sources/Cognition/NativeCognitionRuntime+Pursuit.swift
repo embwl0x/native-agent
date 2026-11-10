@@ -8,6 +8,7 @@ import BackgroundLoops
 import AgentWorkspace
 import CognitiveSubstrate
 import Context
+import MemoryV2
 import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
@@ -78,11 +79,12 @@ extension NativeCognitionRuntime {
                 await self?.carriedConditionsChanged()
             }
         }
-        // A turn window closing can free the agent: the Desk is read again and what is due for when free comes.
+        // A turn window closing can free the agent: the Desk is read again, what is due for when free comes, and owed moments are judged.
         turnIdleObservationTask = Task { [weak self, root = dataRoot] in
             for await _ in ChatTurnSteering.idleEdges(dataRoot: root) {
                 guard !Task.isCancelled else { return }
                 await self?.startPursuitRefresh()
+                await AdaptiveMemoryPromoter.shared.drainOwedMomentsAtWake()
             }
         }
         // A MY QUEUE time comes back as a fresh read of the Desk; the read posts what is due, once.

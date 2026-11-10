@@ -1,13 +1,23 @@
 import Foundation
 import Darwin
-// Blueprint: | `FaceLinkLog.swift` | Body and face append-only link record; correlation identities and redacted failures exclude payloads |
+// Blueprint: | `FaceLinkLog.swift` | Body and face link record of the recent past, turned over at 32 MiB; identities and redacted failures, no payloads |
 
 public actor FaceLinkLog {
     public enum Role: String, Sendable { case body, face }
+    /// The write that takes the record past this size turns it over.
+    private static let bound: off_t = 32 << 20
     private let handle: FileHandle
+    private let url: URL
+    private let previous: URL
     private let role: Role
+    private var closed = false
 
-    private init(handle: FileHandle, role: Role) { self.handle = handle; self.role = role }
+    private init(handle: FileHandle, url: URL, role: Role) {
+        self.handle = handle
+        self.url = url
+        previous = url.deletingLastPathComponent().appendingPathComponent("FaceLink.previous.log")
+        self.role = role
+    }
 
     @concurrent public static func open(dataRoot: URL, role: Role) async throws -> FaceLinkLog {
         let directory = dataRoot.appendingPathComponent("diagnostics", isDirectory: true)
@@ -18,18 +28,78 @@ public actor FaceLinkLog {
             throw WireFailure(code: "face_log_open_failed", message: "The \(role.rawValue) could not open its link record.",
                 cause: "POSIX \(errno): \(url.path)", effects: .none)
         }
-        return FaceLinkLog(handle: FileHandle(fileDescriptor: descriptor, closeOnDealloc: true), role: role)
+        return FaceLinkLog(handle: FileHandle(fileDescriptor: descriptor, closeOnDealloc: true), url: url, role: role)
     }
 
+    /// Writes hold the shared lock and a turn-over holds the exclusive one, so no write lands between its copy and its truncate.
     public func record(_ line: String) throws {
-        let stamp = Date().ISO8601Format(.init(includingFractionalSeconds: true))
+        // A closed record takes no more lines: a closed handle raises instead of throwing, which would end the process.
+        guard !closed else { return }
         let line = TurnSecretRedactor.redactText(line).replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\r", with: "\\r")
+        let descriptor = handle.fileDescriptor
+        try lock(LOCK_SH, "could not lock its link record to write")
+        defer { flock(descriptor, LOCK_UN) }
+        try write(line)
+        guard try size() > Self.bound else { return }
+        // Converting to exclusive releases the shared lock first, so two writers past the bound queue instead of deadlocking.
+        try lock(LOCK_EX, "wrote its line but could not lock its link record to turn it over")
+        guard try size() > Self.bound else { return }
+        try turnOver()
+    }
+
+    /// Copy then truncate, not rename: both processes append through O_APPEND descriptors on this inode and keep writing at its new end.
+    private func turnOver() throws {
+        let kept = keepPrevious()
+        guard ftruncate(handle.fileDescriptor, 0) == 0 else {
+            throw wireFailure("face_log_turnover_failed", "wrote its line but could not turn over its link record", errno)
+        }
+        switch kept {
+        case nil: try write("record.turned_over previous=" + previous.lastPathComponent)
+        case let cause?: try write("record.turned_over previous_not_kept cause=" + cause)
+        }
+    }
+
+    /// The bound is the law and the previous file is what the turn-over can keep, so a failure here is named, not thrown.
+    private func keepPrevious() -> String? {
+        if unlink(previous.path) != 0 {
+            let code = errno
+            if code != ENOENT { return "remove \(previous.lastPathComponent) POSIX \(code)" }
+        }
+        guard copyfile(url.path, previous.path, nil, copyfile_flags_t(COPYFILE_CLONE_FORCE)) == 0 else {
+            let code = errno
+            return "copy to \(previous.lastPathComponent) POSIX \(code)"
+        }
+        return nil
+    }
+
+    private func write(_ line: String) throws {
+        let stamp = Date().ISO8601Format(.init(includingFractionalSeconds: true))
         let prefix = "\(stamp) pid=\(ProcessInfo.processInfo.processIdentifier) role=\(role.rawValue) "
         try handle.write(contentsOf: Data((prefix + line + "\n").utf8))
     }
 
-    public func close() throws { try handle.close() }
+    private func lock(_ operation: Int32, _ what: String) throws {
+        guard flock(handle.fileDescriptor, operation) == 0 else { throw wireFailure("face_log_lock_failed", what, errno) }
+    }
+
+    private func size() throws -> off_t {
+        var status = stat()
+        guard fstat(handle.fileDescriptor, &status) == 0 else {
+            throw wireFailure("face_log_size_failed", "wrote its line but could not read its link record's size", errno)
+        }
+        return status.st_size
+    }
+
+    private func wireFailure(_ code: String, _ what: String, _ number: Int32) -> WireFailure {
+        WireFailure(code: code, message: "The \(role.rawValue) \(what).", cause: "POSIX \(number): \(url.path)", effects: .none)
+    }
+
+    public func close() throws {
+        guard !closed else { return }
+        closed = true
+        try handle.close()
+    }
 
     nonisolated public static func name<T>(_ value: T) -> String {
         Mirror(reflecting: value).children.first?.label ?? String(describing: value)

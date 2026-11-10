@@ -45,7 +45,80 @@ extension SwiftNativeChatOrchestrationClient {
         recalledMemoryIds: [String] = [],
         mechanicalRow: CognitiveMechanicalRowKind? = nil
     ) async {
-        guard let cognitiveRuntime else { return }
+        guard let cognitiveRuntime, let event = Self.cognitiveMessageEvent(
+            sessionId: sessionId, role: role, content: content, runId: runId, source: source,
+            occurredAt: NativeTimestampFormat.parseISO8601FractionalFirst(createdAt) ?? clock(),
+            messageId: messageId, origin: origin, recalledMemoryIds: recalledMemoryIds,
+            mechanicalRow: mechanicalRow, providerLifecycleObserverInstalled: providerLifecycleObserverInstalled
+        ) else { return }
+        await cognitiveRuntime.observe(event)
+    }
+
+    /// A saved user row's admission, read again from the row: its words, time, run and recorded provenance through the same builder.
+    /// Nil when the row is missing, not the person's row, or its provenance or writer stamp cannot be read; nothing is guessed.
+    public static func savedUserRowEvent(dataRoot: URL, sessionId: String, messageId: String) async -> CognitiveEvent? {
+        guard let safeSession = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return nil }
+        let path = dataRoot.appendingPathComponent("chat/messages/\(safeSession).jsonl")
+        guard let rows = try? await SwiftNativePersistenceCore.withFileLock(path, {
+            try await SwiftNativePersistenceCore.readJSONLReporting(path).rows
+        }) else { return nil }
+        let matches = rows.compactMap { value -> [String: JSONValue]? in
+            guard case .object(let row) = value, row["id"] == .string(messageId) else { return nil }
+            return row
+        }
+        guard matches.count == 1, let row = matches.first,
+              row["role"] == .string("user"), row["sessionId"] == .string(sessionId),
+              case .string(let content)? = row["content"], case .string(let source)? = row["source"],
+              case .string(let createdAt)? = row["createdAt"],
+              let occurredAt = NativeTimestampFormat.parseISO8601FractionalFirst(createdAt) else { return nil }
+        let runId: String?
+        switch row["runId"] {
+        case nil, .null?: runId = nil
+        case .string(let id)?: runId = id
+        default: return nil
+        }
+        var origin: ChatMessageOrigin?
+        var mechanicalRow: CognitiveMechanicalRowKind?
+        switch row["metadata"] {
+        case nil, .null?: break
+        case .object(let metadata)?:
+            // The row's recorded origin decides trust as it did at first observation; an unreadable origin is never the person's own words.
+            if let recorded = metadata["origin"] {
+                guard let read = try? JSONDecoder().decode(ChatMessageOriginMetadata.self, from: recorded.serializedData(pretty: false)),
+                      let surface = read.surface else { return nil }
+                var authored: ChatMessageAuthorship?
+                if let raw = read.authored {
+                    guard let parsed = ChatMessageAuthorship(rawValue: raw) else { return nil }
+                    authored = parsed
+                }
+                origin = ChatMessageOrigin(surface: surface, agent: read.agent, authored: authored)
+            }
+            if let stamp = metadata[CognitiveMechanicalRowKind.metadataKey] {
+                guard case .string(let raw) = stamp, let kind = CognitiveMechanicalRowKind(rawValue: raw) else { return nil }
+                mechanicalRow = kind
+            }
+        default: return nil
+        }
+        return cognitiveMessageEvent(
+            sessionId: sessionId, role: "user", content: content, runId: runId, source: source,
+            occurredAt: occurredAt, messageId: messageId, origin: origin,
+            mechanicalRow: mechanicalRow, providerLifecycleObserverInstalled: false)
+    }
+
+    /// The one event a saved chat row makes, at first observation and when its admission is read again.
+    nonisolated static func cognitiveMessageEvent(
+        sessionId: String,
+        role: String,
+        content: String,
+        runId: String?,
+        source: String,
+        occurredAt: Date,
+        messageId: String,
+        origin: ChatMessageOrigin?,
+        recalledMemoryIds: [String] = [],
+        mechanicalRow: CognitiveMechanicalRowKind?,
+        providerLifecycleObserverInstalled: Bool
+    ) -> CognitiveEvent? {
         let normalizedRole = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let kind: CognitiveEventKind
         let sourceClass: CognitiveSourceClass
@@ -68,7 +141,7 @@ extension SwiftNativeChatOrchestrationClient {
                 importance = 0.55
             }
         default:
-            return
+            return nil
         }
         let redactedSummary = ChatSecretRedactor.redactText(content)
         var metadata: [String: JSONValue] = [
@@ -143,17 +216,17 @@ extension SwiftNativeChatOrchestrationClient {
         } else {
             subject = CognitiveSubjectReference(type: "chat.session", id: sessionId)
         }
-        await cognitiveRuntime.observe(CognitiveEvent(
+        return CognitiveEvent(
             id: "chat:\(sessionId):\(messageId)",
             kind: kind,
             subject: subject,
             sourceClass: sourceClass,
-            occurredAt: NativeTimestampFormat.parseISO8601FractionalFirst(createdAt) ?? clock(),
+            occurredAt: occurredAt,
             summary: String(redactedSummary.prefix(500)),
             importance: importance,
             turnKind: turnKind,
             metadata: metadata
-        ))
+        )
     }
 
     /// One workload-class boundary for accepted events and their capsules.

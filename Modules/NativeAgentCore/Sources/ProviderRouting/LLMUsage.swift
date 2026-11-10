@@ -19,6 +19,9 @@ public struct LLMUsage: Sendable, Equatable {
     public var cacheWriteInputTokens: Int?
     public var cacheWrite30mInputTokens: Int?
     public var cacheWrite12hInputTokens: Int?
+    /// Anthropic's split of its cache creation count by lifetime; the two prices differ.
+    public var cacheWrite5mInputTokens: Int?
+    public var cacheWrite1hInputTokens: Int?
 
     public init(
         inputTokens: Int? = nil,
@@ -28,8 +31,12 @@ public struct LLMUsage: Sendable, Equatable {
         cacheWriteInputTokens: Int? = nil,
         cacheWrite30mInputTokens: Int? = nil,
         cacheWrite12hInputTokens: Int? = nil,
+        cacheWrite5mInputTokens: Int? = nil,
+        cacheWrite1hInputTokens: Int? = nil,
         additiveInputCounters: Bool = false
     ) {
+        self.cacheWrite5mInputTokens = cacheWrite5mInputTokens
+        self.cacheWrite1hInputTokens = cacheWrite1hInputTokens
         self.additiveInputCounters = additiveInputCounters
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
@@ -44,6 +51,7 @@ public struct LLMUsage: Sendable, Equatable {
         inputTokens == nil && outputTokens == nil
             && cacheReadInputTokens == nil && cacheCreationInputTokens == nil
             && cacheWriteInputTokens == nil && cacheWrite30mInputTokens == nil && cacheWrite12hInputTokens == nil
+            && cacheWrite5mInputTokens == nil && cacheWrite1hInputTokens == nil
     }
 
     /// Retained receipts use their explicit flag or the provider's known counter shape.
@@ -75,11 +83,14 @@ public struct LLMUsage: Sendable, Equatable {
 
     public static func fromAnthropic(_ obj: [String: Any]?) -> LLMUsage {
         guard let obj else { return LLMUsage() }
+        let created = obj["cache_creation"] as? [String: Any]
         return LLMUsage(
             inputTokens: intValue(obj["input_tokens"]),
             outputTokens: intValue(obj["output_tokens"]),
             cacheReadInputTokens: intValue(obj["cache_read_input_tokens"]),
             cacheCreationInputTokens: intValue(obj["cache_creation_input_tokens"]),
+            cacheWrite5mInputTokens: intValue(created?["ephemeral_5m_input_tokens"]),
+            cacheWrite1hInputTokens: intValue(created?["ephemeral_1h_input_tokens"]),
             additiveInputCounters: true
         )
     }
@@ -105,7 +116,9 @@ public struct LLMUsage: Sendable, Equatable {
             inputTokens: intValue(obj["prompt_tokens"]),
             outputTokens: intValue(obj["completion_tokens"]),
             cacheReadInputTokens: intValue(details?["cached_tokens"]),
-            cacheCreationInputTokens: nil
+            cacheCreationInputTokens: nil,
+            // OpenRouter reports what a request wrote to a provider's cache beside what it read.
+            cacheWriteInputTokens: intValue(details?["cache_write_tokens"])
         )
     }
 
@@ -120,5 +133,7 @@ public struct LLMUsage: Sendable, Equatable {
         if let v = other.cacheWriteInputTokens { cacheWriteInputTokens = v }
         if let v = other.cacheWrite30mInputTokens { cacheWrite30mInputTokens = v }
         if let v = other.cacheWrite12hInputTokens { cacheWrite12hInputTokens = v }
+        if let v = other.cacheWrite5mInputTokens { cacheWrite5mInputTokens = v }
+        if let v = other.cacheWrite1hInputTokens { cacheWrite1hInputTokens = v }
     }
 }

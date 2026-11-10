@@ -4,6 +4,22 @@ import Privacy
 // Blueprint: | `EngineFaceActs+SettingsPrivacy.swift` | Typed credential redaction for body failures and probe replies before either face transport |
 
 extension EngineFaceActs {
+    static func redacted(_ probe: ProviderTestReply, act: FaceAct) -> ProviderTestReply {
+        func scrub(_ text: String) -> String {
+            redacted(.init(code: "credential_text", message: text, cause: nil, effects: .none), act: act).message
+        }
+        var result = probe.result
+        result.provider_id = scrub(result.provider_id)
+        result.status = scrub(result.status)
+        result.response = result.response.map(scrub)
+        result.model_used = result.model_used.map(scrub)
+        result.detail = result.detail.map(scrub)
+        result.error = result.error.map(scrub)
+        result.cause = result.cause.map(scrub)
+        result.credential = result.credential.map(scrub)
+        return .init(result: result, credentialReady: probe.credentialReady, credentialMatches: probe.credentialMatches)
+    }
+
     static func redactedValue(_ value: PartFace.Value, act: FaceAct) -> PartFace.Value {
         switch value {
         case .string(let text):

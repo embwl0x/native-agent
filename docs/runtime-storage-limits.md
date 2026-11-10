@@ -36,6 +36,13 @@ downloads, generated images and user documents are outside this cache.
 The current delivery is protected; inline continuations own their pixel bytes.
 These are replaceable diagnostics, separate from authored images.
 
+The Shared `FaceLinkLog` keeps the body–face link record
+`diagnostics/FaceLink.log` to the recent past: the write that takes it past 32 MiB
+copies it to `diagnostics/FaceLink.previous.log`, replacing the earlier copy, and
+truncates the record, whose first line says it turned over. At most two records
+are kept. `diagnostics/TranscriptDocument.log` and `diagnostics/FacePage.log` are
+appended without a bound.
+
 The daily `DataRootDiskHygieneCheck` reports oversized state; it does not
 automatically delete it or enforce a global quota. Chat recovery backups have
 their own five-per-session policy; see [Data bounds](data-bounds.md).

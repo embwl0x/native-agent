@@ -26,6 +26,8 @@ struct MacChatTurnCard: View {
 
     var preview: TurnFace.Preview? = nil
     var onOpenScreen: (() -> Void)? = nil
+    /// This turn's last finished steps, oldest first, at most three.
+    var done: [TurnFace.Step] = []
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -42,7 +44,30 @@ struct MacChatTurnCard: View {
     var body: some View {
         GlassCard(tint: model.tone == .working ? nil : tint) {
             HStack(alignment: .center, spacing: NativeAgentSpacing.md) {
+            MacChatTurnStepAge(since: model.clock.stepStartedAt) { long in
             VStack(alignment: .leading, spacing: 3) {
+                // Her last finished steps sit above the one she is on, newest at the bottom; older ones are not shown.
+                if !done.isEmpty, !model.isTerminal, !model.cancellationPending, model.approval?.isActionable != true {
+                    ForEach(done) { step in
+                        HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
+                            Image(systemName: step.outcome == .ok ? "checkmark" : step.outcome == nil ? "minus" : "xmark")
+                                .frame(width: 12, alignment: .center)
+                                .accessibilityHidden(true)
+                            Text(step.text)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        .font(NativeAgentFont.tag)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                    }
+                    .allowsHitTesting(false)
+                    Rectangle()
+                        .fill(NativeAgentShell.hairline)
+                        .frame(height: 0.5)
+                        .padding(.vertical, 2)
+                        .accessibilityHidden(true)
+                }
+
                 HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
                     leading
                         .frame(width: 12, alignment: .center)
@@ -52,7 +77,7 @@ struct MacChatTurnCard: View {
                         if let since = model.thinkingSince {
                             MacChatTurnThinkingTitle(since: since)
                         } else {
-                            Text(thoughtTitle ?? model.title)
+                            Text(long ? model.longStepTitle ?? model.title : thoughtTitle ?? model.title)
                                 .font(NativeAgentFont.label)
                                 .foregroundStyle(model.isTerminal ? AnyShapeStyle(tint) : AnyShapeStyle(.primary))
                                 .lineLimit(1)
@@ -126,6 +151,18 @@ struct MacChatTurnCard: View {
                     }
                 }
 
+                if long {
+                    MacChatTurnLongStepLine()
+                        .padding(.leading, 12 + NativeAgentSpacing.sm)
+                        .padding(.vertical, 2)
+                    Text("This step takes a while. Nothing is stuck.")
+                        .font(NativeAgentFont.tag)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .lineLimit(1)
+                        .padding(.leading, 12 + NativeAgentSpacing.sm)
+                        .allowsHitTesting(false)
+                }
+
                 if let approval = model.approval, approval.isActionable,
                    let input = approval.inputSummary {
                     Text(input)
@@ -137,6 +174,7 @@ struct MacChatTurnCard: View {
                         .accessibilityLabel("Input: \(input)")
                         .padding(.leading, 12 + NativeAgentSpacing.sm)
                 }
+            }
             }
 
             if showsPreviewPane, onOpenScreen == nil, let preview, let image = preview.imageData {
@@ -240,7 +278,7 @@ struct MacChatTurnCardMetaText: View {
 
     var body: some View {
         if !clock.isTerminal, chatPageIsVisible {
-            TimelineView(.periodic(from: clock.startedAt, by: 1)) { context in
+            TimelineView(.periodic(from: clock.stepStartedAt ?? clock.startedAt, by: 1)) { context in
                 readout(at: context.date, clock: clock)
             }
         } else {
@@ -277,6 +315,51 @@ struct MacChatTurnCardMetaText: View {
             .lineLimit(1)
             .accessibilityLabel(spoken)
             .accessibilityAddTraits(.updatesFrequently)
+    }
+}
+
+/// Hands its content whether the running step has turned long, redrawing at that moment and not on a per-second tick.
+struct MacChatTurnStepAge<Content: View>: View {
+    let since: Date?
+    @ViewBuilder let content: (Bool) -> Content
+
+    var body: some View {
+        // One branch whether or not a step runs, so the box keeps its identity (its Stop button, its dot) across every step's start and end.
+        let long = since?.addingTimeInterval(TurnFace.longStepAfter)
+        // A periodic schedule from the step's start lands exactly on the long mark; the clock is also read at draw, so any redraw past the mark shows it.
+        TimelineView(.periodic(from: since ?? .distantPast, by: TurnFace.longStepAfter)) { context in
+            content(long.map { max(context.date, Date()) >= $0 } ?? false)
+        }
+    }
+}
+
+/// A thin accent line that keeps moving through a long step; under Reduce Motion it holds still.
+struct MacChatTurnLongStepLine: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.chatPageIsVisible) private var chatPageIsVisible
+
+    var body: some View {
+        Capsule()
+            .fill(Color.accentColor.opacity(reduceMotion ? 0.6 : 0.2))
+            .frame(height: 2)
+            .overlay(alignment: .leading) {
+                if !reduceMotion, chatPageIsVisible {
+                    // Draw from the clock to avoid repeatForever layout recursion.
+                    TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
+                        GeometryReader { geometry in
+                            let band = max(24, geometry.size.width * 0.3)
+                            let phase = NativeAgentMotion.loopPhase(at: context.date, period: 1.6)
+                            Capsule()
+                                .fill(Color.accentColor)
+                                .frame(width: band)
+                                .offset(x: -band + phase * (geometry.size.width + band))
+                        }
+                    }
+                    .clipShape(Capsule())
+                }
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
 
@@ -328,7 +411,9 @@ struct MacChatTurnCardHost: View {
         let face = appModel.turnFace(for: sessionId)
         if let model = face?.card {
             VStack(alignment: .leading, spacing: 3) {
-                MacChatTurnCard(model: model, onStop: onStop, preview: face?.preview, onOpenScreen: onOpenScreen)
+                MacChatTurnCard(model: model, onStop: onStop, preview: face?.preview, onOpenScreen: onOpenScreen,
+                                // A step whose words the box is already showing as its current line is not listed again above it.
+                                done: Array((face?.steps ?? []).filter { !$0.isRunning && $0.text != model.detail }.prefix(3).reversed()))
                 if let status = face?.approvalStatus {
                     Text(status).font(NativeAgentFont.tag).foregroundStyle(.secondary)
                 }

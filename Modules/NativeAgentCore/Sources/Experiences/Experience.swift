@@ -88,7 +88,7 @@ public actor ExperienceStore {
         }
     }
 
-    private let path: URL
+    let path: URL
     private var opened: DatabasePool?
     var detailsForgottenAt = Date.distantPast
     private var gap: String?
@@ -512,6 +512,9 @@ public actor ExperienceStore {
             }
             try db.execute(sql: Self.detailSchema)
         }
+        // Planner statistics improve reads but are not required for record correctness.
+        do { try pool.writeWithoutTransaction { try $0.execute(sql: "PRAGMA optimize=0x10002") } }
+        catch { Self.log("experience planner statistics unavailable: %@", error.localizedDescription) }
         opened = pool
         return pool
     }

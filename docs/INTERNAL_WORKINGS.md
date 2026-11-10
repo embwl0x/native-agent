@@ -591,7 +591,11 @@ do not import unselected models. No Muse Code credential source is consulted.
 History is client-side: text, native calls and results use the shared Messages
 encoding and SSE decoder. Meta enables the adapter's existing thinking ledger:
 completed thinking and redacted_thinking blocks bind to confirmed tool-call IDs
-and replay before the assistant's text and calls. The ledger holds at most 512
+and replay before the assistant's text and calls. Each entry carries a digest
+of the request that produced it (model, system text, tools and every message,
+cache markers excluded); it replays only where the request up to its assistant
+message has that digest. Anywhere else the entry is forgotten, so a block once
+left out never returns. The ledger holds at most 512
 tool-call IDs in memory; missing or evicted entries add no thinking blocks.
 Kimi Code does not enable replay. No Meta replay store or Responses control
 profile is added.
@@ -785,11 +789,10 @@ remain unchanged; see [memory disclosure](MEMORY_SYSTEM_MAP.md#recall-into-a-tur
 
 The current after-turn path uses one model interpretation for facts, cares
 and semantic appraisal; routing follows [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation).
-Before this pass the agent's own labelled record predicts whether the
-interpretation would be a complete no-op. User's own conversation keeps live
-judgment unless that claim stands; every other recorded turn is left owed
-and judged later with other owed turns in one batch call.
-Details, the cost law and its assumptions are in
+Every moment is judged alone. User's own turns are judged at once; every other
+recorded turn is left owed and judged when they are idle. The judgment's
+unchanging text comes first, so the provider caches it.
+Details are in
 [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation).
 Peer conversations identify their speaker so a peer's words are not
 mistaken for facts about the human.

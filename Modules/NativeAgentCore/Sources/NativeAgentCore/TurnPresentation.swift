@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentShared
 
-// Blueprint: | `TurnPresentation.swift` | `TurnPresentationReducer`: bounded lifecycle evidence without payloads |
+// Blueprint: | `TurnPresentation.swift` | `TurnPresentationReducer`: bounded lifecycle evidence without payloads; only their acts are steps, each one identity from start to end |
 
 /// Explicit lifecycle evidence supplied by a surface or turn orchestrator. Associated strings are redacted, normalized, and bounded before entering
 /// ``TurnPresentationState``.
@@ -20,7 +20,8 @@ public enum TurnPresentationLifecycleEvent: Sendable, Equatable {
     case outcomeUnknown(reason: String?)
 }
 
-/// One sanitized, bounded movement entry. It intentionally contains no tool arguments, provider payload, model output, hidden reasoning, or transport identity.
+/// One step of the turn, from its start to its end: one identity, its words now, and how it ended. It intentionally contains no tool arguments,
+/// provider payload, model output, hidden reasoning, or transport identity.
 public struct TurnPresentationActivity: Sendable, Equatable {
     /// How a tool step ended, read from its own result. Nil for a step that is not a settled tool result.
     public enum Outcome: Sendable, Equatable {
@@ -29,24 +30,32 @@ public struct TurnPresentationActivity: Sendable, Equatable {
         case failed
     }
 
+    /// The step's number in its turn, given when it starts and kept until it ends.
+    public let id: Int
     public let phase: TurnPresentationPhase
-    public let detail: String?
+    public internal(set) var detail: String?
     public let delegateName: String?
-    public let outcome: Outcome?
+    public internal(set) var outcome: Outcome?
     public let occurredAt: Date
+    /// The call this step is running, until its result ends it.
+    public internal(set) var runningCall: String?
 
     init(
+        id: Int,
         phase: TurnPresentationPhase,
         detail: String?,
         delegateName: String?,
         outcome: Outcome?,
-        occurredAt: Date
+        occurredAt: Date,
+        runningCall: String?
     ) {
+        self.id = id
         self.phase = phase
         self.detail = detail
         self.delegateName = delegateName
         self.outcome = outcome
         self.occurredAt = occurredAt
+        self.runningCall = runningCall
     }
 }
 
@@ -74,7 +83,10 @@ public struct TurnPresentationState: Sendable, Equatable {
     public internal(set) var endedAt: Date?
     public internal(set) var currentAction: String?
     public internal(set) var delegateName: String?
+    /// The turn's steps, oldest first, bounded to the newest few.
     public internal(set) var activities: [TurnPresentationActivity]
+    /// How many steps this turn has started; the next step takes the next number.
+    public internal(set) var stepCount = 0
 
     // Accumulated model text never enters presentation state. Its length is enough to coalesce duplicate streaming snapshots while observing real movement.
     public internal(set) var streamedTextLength: Int
@@ -85,6 +97,11 @@ public struct TurnPresentationState: Sendable, Equatable {
     public internal(set) var lastCallName: String? = nil
 
     public var isTerminal: Bool { phase.isTerminal }
+
+    /// The newest step still running in a turn still running: while one runs, that step is what she is doing.
+    public var runningStep: TurnPresentationActivity? {
+        isTerminal ? nil : activities.last { $0.runningCall != nil }
+    }
 
     public init(startedAt: Date) {
         phase = .acknowledged
@@ -213,7 +230,8 @@ public enum TurnPresentationReducer {
         return next
     }
 
-    /// Surface adapters may report activity whose vocabulary does not originate in a lifecycle event.
+    /// Surface adapters may report activity whose vocabulary does not originate in a lifecycle event. `callName` starts that call's step;
+    /// `endsCall` is a result, which ends the step of the oldest call by that name still running.
     public static func recordActivity(
         _ state: TurnPresentationState,
         phase: TurnPresentationPhase,
@@ -221,6 +239,7 @@ public enum TurnPresentationReducer {
         delegateName: String?,
         outcome: TurnPresentationActivity.Outcome? = nil,
         callName: String? = nil,
+        endsCall: String? = nil,
         at instant: Date,
         resetStreamLength: Bool = false,
         additionalRedactor: AdditionalRedactor? = nil
@@ -233,6 +252,7 @@ public enum TurnPresentationReducer {
             delegate: delegateName,
             outcome: outcome,
             callName: callName,
+            endsCall: endsCall,
             at: instant,
             resetStreamLength: resetStreamLength,
             additionalRedactor: additionalRedactor
@@ -263,14 +283,17 @@ public enum TurnPresentationReducer {
         delegate: String? = nil,
         outcome: TurnPresentationActivity.Outcome? = nil,
         callName: String? = nil,
+        endsCall: String? = nil,
         at instant: Date,
         streamedTextLength: Int? = nil,
         resetStreamLength: Bool = false,
         additionalRedactor: AdditionalRedactor? = nil
     ) -> TurnPresentationState {
-        let safeAction = sanitized(action, additionalRedactor: additionalRedactor)
+        // A call always has words: its own, else its name read as an act.
+        let safeAction = sanitized(action ?? callName.map { ToolActivityPresentation.progress($0) }, additionalRedactor: additionalRedactor)
         let safeDelegate = sanitized(delegate, additionalRedactor: additionalRedactor)
         let safeCall = sanitized(callName, additionalRedactor: additionalRedactor)
+        let safeEnd = sanitized(endsCall, additionalRedactor: additionalRedactor)
         let nextTextLength: Int
         if resetStreamLength {
             nextTextLength = 0
@@ -280,12 +303,12 @@ public enum TurnPresentationReducer {
             nextTextLength = state.streamedTextLength
         }
 
-        guard phase != state.phase
+        // Every call and every result is movement; any other step that changes nothing is none, and only ends the line of a call being written.
+        guard safeCall != nil || safeEnd != nil
+                || phase != state.phase
                 || safeAction != state.currentAction
                 || safeDelegate != state.delegateName
-                || (safeCall != nil && safeCall != state.lastCallName)
                 || nextTextLength != state.streamedTextLength else {
-            // A step that changes nothing is no new step; it only ends the line of a call being written.
             var next = state
             next.writing = nil
             return next
@@ -293,6 +316,29 @@ public enum TurnPresentationReducer {
 
         var next = state
         let movementAt = max(instant, state.lastMovementAt)
+        // Only her acts are steps. A step is one thing from its start to its end: a call starts its own step and its result ends that same
+        // step; a result whose start is not kept stands as one finished step. Waits, notices, retries and thinking are states of the turn:
+        // they move its words and phase, never its steps.
+        if let safeEnd, let index = next.activities.firstIndex(where: { $0.runningCall == safeEnd }) {
+            next.activities[index].detail = safeAction ?? next.activities[index].detail
+            next.activities[index].outcome = outcome
+            next.activities[index].runningCall = nil
+        } else if safeCall != nil || safeEnd != nil {
+            next.stepCount += 1
+            next.activities.append(TurnPresentationActivity(
+                id: next.stepCount,
+                phase: phase,
+                detail: safeAction,
+                delegateName: safeDelegate,
+                outcome: outcome,
+                occurredAt: movementAt,
+                runningCall: safeCall
+            ))
+            // The oldest finished step leaves first: a step still running keeps its row until it ends.
+            while next.activities.count > detailHistoryLimit {
+                next.activities.remove(at: next.activities.firstIndex { $0.runningCall == nil } ?? 0)
+            }
+        }
         next.phase = phase
         next.lastMovementAt = movementAt
         next.endedAt = phase.isTerminal ? movementAt : nil
@@ -302,16 +348,6 @@ public enum TurnPresentationReducer {
         next.streamedTextLength = nextTextLength
         next.writing = nil
         if nextTextLength > 0, next.firstReplyAt == nil { next.firstReplyAt = movementAt }
-        next.activities.append(TurnPresentationActivity(
-            phase: phase,
-            detail: safeAction,
-            delegateName: safeDelegate,
-            outcome: outcome,
-            occurredAt: movementAt
-        ))
-        if next.activities.count > detailHistoryLimit {
-            next.activities.removeFirst(next.activities.count - detailHistoryLimit)
-        }
         return next
     }
 }

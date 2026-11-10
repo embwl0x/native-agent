@@ -42,24 +42,27 @@ public enum WorkPaneFace {
                          alt: presentation.title ?? "Sense"))])
     }
 
-    public static func steps(_ turn: TurnFace?) -> PartFace {
-        let steps = turn?.steps ?? []
-        let line: String
-        if let turn, turn.isRunning { line = turn.liveLine ?? "Working" }
-        else if turn == nil { line = "Waiting for turn status…" }
-        else if steps.isEmpty { line = "When I'm working on something, my steps show up here." }
-        else { line = "Here's what I did last time." }
-        let rows = steps.enumerated().map { index, step in
+    /// The Steps page's one sentence: what she is doing now, or what the steps below are. Its own part, so its ticks redraw only it.
+    public static func stepsLine(_ turn: TurnFace?) -> String {
+        guard let turn else { return "Waiting for turn status…" }
+        if turn.isRunning { return turn.liveLine ?? "Working" }
+        return turn.steps.isEmpty ? "When I'm working on something, my steps show up here." : "Here's what I did last time."
+    }
+
+    /// Each step is its own row, by the step's identity, newest first; a running step's row is marked running until its result ends it.
+    public static func steps(_ steps: [TurnFace.Step]) -> PartFace {
+        let rows = steps.map { step in
             let symbol: String?
             switch step.outcome {
             case .ok?: symbol = "checkmark"
             case .failed?, .refused?: symbol = "xmark"
             case nil: symbol = nil
             }
-            return PartFace.Row(id: String(index), title: step.text, symbol: symbol,
-                                tone: step.outcome == .ok ? .quiet : step.outcome == nil ? .plain : .failed)
+            return PartFace.Row(id: step.id, title: step.text, symbol: symbol,
+                                tone: step.outcome == .ok ? .quiet : step.outcome == nil ? .plain : .failed,
+                                running: step.isRunning ? true : nil)
         }
-        return PartFace(line: line, sections: [.init(id: "steps", style: .list, rows: rows)])
+        return PartFace(sections: [.init(id: "steps", style: .list, rows: rows)])
     }
 
     public static func screen(_ preview: TurnFace.Preview) -> PartFace {

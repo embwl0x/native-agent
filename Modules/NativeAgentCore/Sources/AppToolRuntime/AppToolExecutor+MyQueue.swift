@@ -82,6 +82,12 @@ extension AppToolExecutor {
             fields["id"] = .string(id)
             fields["completed_at"] = at.map(JSONValue.string) ?? .null
             fields["outcome_summary"] = summary.map(JSONValue.string) ?? .null
+            // Asking for the ending a step already has is granted: nothing changes and its saved completion is the receipt.
+            if verb == (done ? "done" : "drop") {
+                fields["status"] = .string("no_change"); fields["queue"] = .string(change); fields["effects"] = .string("none")
+                fields["confirmation"] = .string("\(id) is already \(change)\(when)." + outcome)
+                return .object(fields)
+            }
             return Self.doorRefusal(done ? "already_done" : "already_dropped",
                 "\(id) is already \(change)\(when)." + outcome, remedy: "none",
                 "Read the saved completion evidence; this step needs no further closure.", extra: fields)

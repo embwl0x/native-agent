@@ -11,7 +11,7 @@ import ApplicationServices
 // Blueprint: | `MacAppWord.swift` | Event-paced effect settlement, off-lane app admission and payload-free mac.settled receipts |
 
 enum MacSettleEnd: String, Sendable { case held, patience, stopped, failed }
-enum MacAppReply: String, Sendable { case answered, gone, unreachable, busy, stopped }
+enum MacAppReply: String, Sendable { case answered, gone, unreachable, busy, stopped, running }
 
 struct MacSettledRow: Sendable {
     let what: String
@@ -167,8 +167,10 @@ private final class MacAppReplyState: Sendable {
     catch {
         if Task.isCancelled { return .stopped }
         onFailure("Renderer admission: " + error.localizedDescription)
-        macSettled(MacSettledRow(what: "renderer_admission", endedBy: "unreachable"))
-        return .unreachable
+        // A live process whose renderer failed to prepare is running, not unreachable: the next look can find it ready.
+        let reply: MacAppReply = (try? macProcessStart(pid)) == nil ? .unreachable : .running
+        macSettled(MacSettledRow(what: "renderer_admission", endedBy: reply.rawValue))
+        return reply
     }
     #endif
     return Task.isCancelled ? .stopped : context.expired ? .busy : .answered
@@ -188,6 +190,7 @@ extension SwiftNativeMacControl {
         case .gone: message = "The app exited before answering; nothing was pressed."
         case .stopped: message = "Stopped while waiting for the app; nothing was pressed."
         case .unreachable: message = "The app's accessibility channel could not answer; nothing was pressed. Inspect its accessibility availability."
+        case .running: message = "The app is running but its window content is not ready yet; nothing was pressed. Look again, then act."
         case .answered: return nil
         }
         var evidence: [String: JSONValue] = ["message": .string(message), "effects": .string("none"), "posted_events": .int(0)]

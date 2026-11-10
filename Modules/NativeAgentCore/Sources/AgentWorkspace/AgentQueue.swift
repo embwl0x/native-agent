@@ -156,7 +156,8 @@ public enum MyQueueReady {
         return entry.step.rhythm
     }
 
-    /// What the agent meant, as the agent reads it when it comes: `head` names it by the id it is finished with, `rest` says how to finish it.
+    /// What the agent meant, as the agent reads it when it comes: `head` names it, `rest` says when it comes back or what it is done when. A step
+    /// closes by itself when the after-turn judgment sees its deed; nothing here teaches closing it by hand.
     package static func line(_ item: DeskItem, at: Date) -> (head: String, rest: String) {
         let step = item.step
         let peers = (step?.peers ?? []).filter { !CapabilityLifecycle.ownerTrusts($0) }
@@ -165,27 +166,24 @@ public enum MyQueueReady {
         let released = MyQueue.entry(item).map { MyQueue.releaseNotes(for: $0).map { $0.text + " " }.joined() } ?? ""
         let words = step?.words ?? item.summary ?? item.title
         let name = "desk." + item.alias
-        let done = "app {action:\"queue.done\", args:{id:\"\(name)\"}}"
-        let wait = "desk.wait {handle:\"\(name)\", on: <the card, message or debt id it needs>}: it comes back when that settles, not before."
+        let doIt = "Do it now if it is safe, reversible and within what you are allowed. "
+        let wait = " If it can't move yet, desk.wait {handle:\"\(name)\", on:<what it needs>} holds it until that settles."
         let head: String
         var rest: String
         if let step, step.rhythm != nil {
             // A rhythm is never done by one occurrence: it comes back at its next time.
             head = "You meant to, now (" + MyQueue.shown(IntentionClock.occurrence(step, at: at) ?? at) + "): \(words) (\(name))."
-            rest = (IntentionClock.next(step, after: at).map { "It comes back " + MyQueue.shown($0) + "." } ?? "This is its last time.")
-                + " Keep it open unless it is finished for good; then \(done)."
+            rest = IntentionClock.next(step, after: at).map { "It comes back " + MyQueue.shown($0) + "." } ?? "This is its last time."
         } else if step != nil {
             head = "You meant to (\(name)): \(words)."
-            rest = "Do it now if it is safe, reversible and within what you are allowed, then say it is done. "
-                + "Once it is done, \(done); if it can't move yet, say what it waits on with \(wait)"
+            rest = doIt + "It closes by itself once the work is seen done." + wait
         } else {
+            // A carried row with no step is outside the after-turn settlement: say only that it stays hers.
             head = "Yours to carry, \(name): \(item.title) — \(words)."
-            rest = "Do it now if it is safe, reversible and within what you are allowed, then say it is done. "
-                + "Close it with desk.close {handle:\"\(name)\", reason} only once it is actually done. "
-                + "If it can't move yet, say what it waits on with \(wait)"
+            rest = doIt + "It stays yours until it is done." + wait
         }
         switch step.map({ MyQueue.Until($0.until) }) ?? .once {
-        case .words(let until): rest += " It is done when: \(until). Once it is, \(done)."
+        case .words(let until): rest += " It is done when: \(until)."
         case .time(let ends): rest += " It ends by itself " + MyQueue.shown(ends) + "."
         case .once, .standing: break
         }
@@ -273,8 +271,7 @@ extension AgentScreen {
             } else {
                 lines.append("You queued this step for after this card (\(entry.name) in MY QUEUE): \"\(entry.step.words)\""
                     + (entry.step.actionText.map { "\nHabit: " + $0 } ?? ""))
-                lines.append("Do it now with your usual tools, then mark it done: "
-                    + "app {action:\"queue.done\", args:{id:\"\(entry.name)\"}}.")
+                lines.append("Do it now with your usual tools; it closes by itself once the work is seen done.")
             }
         }
         return (lines.joined(separator: "\n"), sources, elevated)

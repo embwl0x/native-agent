@@ -148,7 +148,8 @@ public enum MacChatTurnLifecycleReducer {
                 detail: activity.actionSummary,
                 delegateName: activity.delegateDisplayName,
                 outcome: activity.outcome,
-                callName: activity.callName,
+                callName: activity.source == .toolUse ? activity.callName : nil,
+                endsCall: activity.source == .toolResult ? activity.callName : nil,
                 at: activity.occurredAt,
                 resetStreamLength: activity.phase == .retrying,
                 additionalRedactor: additionalRedactor

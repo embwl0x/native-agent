@@ -212,13 +212,27 @@ extension CognitiveSubstrate {
         recentTurnsBySession[session] = ring
     }
 
-    /// The admission entry, until the journal records it. Its record is also what interpretation and folding read; there is no rehydrated RAM copy.
+    /// The admission entry ingest holds, until the journal records it. RAM only caches it: the journal's record is what interpretation and folding read,
+    /// and a turn whose entry is gone is admitted again from its saved row (`admission(of:)`).
     public func deferredTurnRecord(origin: AfterTurnOrigin) -> CognitiveDeferredTurnRecord? {
         deferredTurns.first(where: {
             $0.event.sessionId == origin.sessionId
                 && $0.event.metadata["messageId"] == .string(origin.messageId)
                 && (origin.runId == nil || $0.event.metadata["runId"] == origin.runId.map(JSONValue.string))
         })
+    }
+
+    /// The entry ingest would have held for this saved user event, read again; only the completion slot and node its lost first ingest knew are absent.
+    /// The same gates as ingest's deferral; it changes nothing.
+    public func admission(of event: CognitiveEvent) -> CognitiveDeferredTurnRecord? {
+        guard configuration.enabled, Self.isUserAuthored(event.kind), event.turnKind.contributesToLivedState,
+              event.sessionId != nil,
+              (try? SessionConversation.checkedIsHelper(event.sessionId, dataRoot: conversationDataRoot, includingArchived: true)) == false
+        else { return nil }
+        // Words said before the last Clear were admitted to the mind it forgot: they carry the epoch before it, which every fold refuses.
+        return CognitiveDeferredTurnRecord(event: event, caring: caringEventCandidate(for: event),
+                                           mindEpoch: event.occurredAt > mindClearedAt ? mindEpoch : mindEpoch &- 1,
+                                           bodyEpoch: bodyEpoch)
     }
 
     public func releaseDeferredTurn(_ record: CognitiveDeferredTurnRecord) {

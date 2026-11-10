@@ -127,6 +127,7 @@ extension AgentConversationStore {
         }
         // Write all rows together, ordered with this owner’s other writes.
         ExperienceStore.record(root, "agent-conversations") { store in
+            await Self.noteHeldDeliveries(rows, dataRoot: root)
             let open = try await store.open()
             let contacts = Set(try AgentPeerStore(dataRoot: root).list().map { "peer:" + $0.id })
             for row in rows {

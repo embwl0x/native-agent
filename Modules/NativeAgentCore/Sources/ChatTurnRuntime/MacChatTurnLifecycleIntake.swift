@@ -1,4 +1,5 @@
 import Foundation
+import ChatToolParsing
 import Privacy
 import TurnTrace
 import NativeAgentCore
@@ -372,9 +373,17 @@ public final class OtherDoorTurns {
             guard case .object(let payload) = event.payload, case .string(let detail)? = payload["detail"] else { return nil }
             kind = .activity(MacChatTurnActivityBoundary.notice(kind: event.kind, text: detail, identity: identity, at: event.ts))
         case "tool.dispatch":
-            if case .object(let payload) = event.payload, payload["phase"] == .string("begin"),
-               case .string(let name)? = payload["shown"] ?? payload["name"] {
-                kind = .activity(MacChatTurnActivityBoundary.toolUse(name: name, args: [:], identity: identity, at: event.ts))
+            // A call's begin starts its step and its end ends that step.
+            if case .object(let payload) = event.payload, case .string(let name)? = payload["shown"] ?? payload["name"],
+               case .string(let phase)? = payload["phase"], phase == "begin" || phase == "end" {
+                if phase == "begin" {
+                    kind = .activity(MacChatTurnActivityBoundary.toolUse(name: name, args: [:], identity: identity, at: event.ts))
+                } else {
+                    let status = payload["status"]
+                    kind = .activity(MacChatTurnActivityBoundary.toolResult(name: name,
+                        result: status == .string("ok") ? .succeeded : status == .string("failed") ? .failed : .unknown,
+                        identity: identity, at: event.ts))
+                }
             } else {
                 kind = .working(action: nil)
             }

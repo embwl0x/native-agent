@@ -30,6 +30,8 @@ public actor AdaptiveMemoryPromoter {
     var door: LivedMomentDoor?
     /// Moments recorded by this process whose interpretation is queued or running on the live path; the owed-moment drain leaves them alone.
     var inFlightMoments: Set<String> = []
+    /// The moment each live turn recorded, by turn id: the live promotion of that turn is that moment.
+    var recordedMoments: [String: String] = [:]
     /// Accepted transcript settlements, including ones still reaching the door. Sleep joins these recordings independently of the interpretation tail.
     private var owedRecordings: [UUID: Task<String?, Never>] = [:]
     var recoveries: [String: RecoveryCheckpoint] = [:]
@@ -110,8 +112,8 @@ public actor AdaptiveMemoryPromoter {
         return observation
     }
 
-    /// Record accepted transcript settlements as owed under the turn's provenance, before earlier promotions finish, even during sleep. Only a care-bearing
-    /// wake with a reply is a moment among the agent's own work.
+    /// Record accepted transcript settlements as owed under the turn's provenance, before earlier promotions finish, even during sleep. Whether the
+    /// turn is a moment, and of what share, is `share`: the same law the judgment applies.
     @discardableResult
     public func recordOwedTurn(
         userMessage: String,
@@ -135,23 +137,32 @@ public actor AdaptiveMemoryPromoter {
             elevatedSources: steer.elevated, originPrincipal: turn.originPrincipal,
             carriedSources: steer.sources, careWakes: origin?.careWakes)
         let recordingID = UUID()
+        let turnID = turn.id
         let recording = Task<String?, Never> {
             defer { owedRecordings[recordingID] = nil }
+            // Whole: an incoming message from someone (not her own work) or a care wake.
             let ownWork = await conversationKind(sessionId)?.isOwnWork == true
-            guard !ownWork || momentTurn.isCareWake else { return nil }
+            let whole = momentTurn.isCareWake || (!ownWork && momentTurn.messageId?.isEmpty == false)
+            guard let share = await self.share(whole: whole,
+                                               settles: { await self.actedWhileOpen(momentTurn, dataRoot: door.dataRoot) }) else { return nil }
+            var recorded = momentTurn
+            if share == .settlement { recorded.settlesOnly = true }
+            let kept = recorded
             // Everything the door needs is in the captured turn; settlement does not inherit task locals or the caller's cancellation.
-            let id = await settle { await door.recordOwed(momentTurn) }
-            if let id, !stopped { inFlightMoments.insert(id) }
+            let id = await settle { await door.recordOwed(kept) }
+            if let id, !stopped {
+                inFlightMoments.insert(id)
+                recordedMoments[turnID] = id
+            }
             return id
         }
         owedRecordings[recordingID] = recording
         return await recording.value
     }
 
-    /// The recorded moment this live promotion is, when the door recorded it.
-    private func liveMomentID(sessionId: String, origin: AfterTurnOrigin?) -> String? {
-        guard door != nil, let origin else { return nil }
-        let id = CognitiveLivedMoment.turnID(sessionId: sessionId, messageId: origin.messageId)
+    /// The recorded moment this live promotion is: the one its turn recorded, when the door recorded it.
+    private func liveMomentID(turnId: String) -> String? {
+        guard door != nil, let id = recordedMoments[turnId] else { return nil }
         return inFlightMoments.contains(id) ? id : nil
     }
 
@@ -199,7 +210,7 @@ public actor AdaptiveMemoryPromoter {
     }
 
     func conversationKind(_ sessionID: String) async -> ChatThreadKind? {
-        guard let memory, let root = await memory.surpriseDataRoot() else { return nil }
+        guard let memory, let root = await memory.owningDataRoot() else { return nil }
         return SessionConversation.kind(sessionID, dataRoot: root, includingArchived: true)
     }
 
@@ -211,8 +222,11 @@ public actor AdaptiveMemoryPromoter {
         let skipped = AdaptiveMemoryObservation(proposals: [], extraction: .init(
             candidates: [], semanticStatus: .skipped
         ))
-        let momentID = liveMomentID(sessionId: sessionId, origin: origin)
-        defer { if let momentID { inFlightMoments.remove(momentID) } }
+        let momentID = turnId.flatMap { liveMomentID(turnId: $0) }
+        defer {
+            if let momentID { inFlightMoments.remove(momentID) }
+            if let turnId { recordedMoments[turnId] = nil }
+        }
         guard let momentID,
               !Task.isCancelled, let memory else { return skipped }
         let standingAgent = standingAgentName != nil
@@ -261,21 +275,24 @@ public actor AdaptiveMemoryPromoter {
         return try? JSONDecoder().decode(AfterTurnInterpretation.self, from: data)
     }
 
-    /// Expose interpretation outcomes with their prediction and standing through mind.why.
+    /// Expose interpretation outcomes through mind.why.
     static func whyInterpretation(turn: String, session: String, surface: String,
-                                  route: TurnEnvelope.DeliveryRoute?, outcome: String,
-                                  check: AfterTurnMemorySurprise?, heldTurn: Turn?) {
-        var fields: [String: JSONValue] = ["lane": .string("interpretation"), "outcome": .string(outcome)]
-        if let check {
-            fields["prediction"] = .string(check.verdict.rawValue)
-            fields["evidence"] = .string(check.reason)
-            fields["standing"] = .bool(check.standing == true)
-            fields["lower"] = .double(check.lowerBound ?? 0)
-            fields["bar"] = .double(check.costBar ?? 1)
-            fields["tries"] = .int(Int64(check.tries ?? 0))
-            fields["hits"] = .int(Int64(check.hits ?? 0))
-        }
+                                  route: TurnEnvelope.DeliveryRoute?, outcome: String, heldTurn: Turn?) {
+        let fields: [String: JSONValue] = ["lane": .string("interpretation"), "outcome": .string(outcome)]
         TurnTraceBus.fire(TurnTraceEvent(turnId: turn, kind: "mind.why", sessionId: session, surface: surface,
             destinationId: route?.destinationId, threadId: route?.threadId, payload: .object(fields), turn: heldTurn))
+    }
+}
+
+extension SwiftNativeMemoryV2 {
+    /// The data root this memory lives under: its canonical root, else the parent of its `memory` directory.
+    func owningDataRoot() async -> URL? {
+        if let canonicalDataRoot { return canonicalDataRoot }
+        if let storage {
+            let directory = storage.path.deletingLastPathComponent()
+            guard directory.lastPathComponent == "memory" else { return nil }
+            return directory.deletingLastPathComponent()
+        }
+        return nil
     }
 }

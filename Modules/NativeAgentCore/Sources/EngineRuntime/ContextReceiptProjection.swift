@@ -5,10 +5,12 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import ProviderRouting
+import NativeAgentShared
 // Blueprint: | `ContextReceiptProjection.swift` | `ComposerContextReceiptRow`, `ComposerContextReceipt`, `ComposerContextReceiptState`, `ContextReceipts` |
 
 /// Use accepted context sizes and provider counts; split token shares by bytes and use the selected-model window.
 public struct ComposerContextReceiptRow: Identifiable, Equatable, Sendable {
+    public let kind: ContextReceiptFace.Part.ID
     public let label: String
     /// Absent counts mean untraced evidence, never zero.
     public let detail: String?
@@ -17,6 +19,7 @@ public struct ComposerContextReceiptRow: Identifiable, Equatable, Sendable {
     /// Split provider tokens by bytes unless the component has a measured provider count.
     public var tokens: Int? = nil
     public var measured = false
+    public var count: Int? = nil
 
     public var id: String { label }
 }
@@ -187,7 +190,7 @@ public enum ContextReceipts {
         _ = try source.optionalString("toolCatalogMeasurementError")
         guard let raw = source.optionalValue("memoryRecall") else { throw JSONRow.Malformed.field("memoryRecall") }
         let recall = try JSONRow(raw)
-        _ = try recall.string("outcome")
+        let recallOutcome = try recall.string("outcome")
         guard let count = try recall.optionalInt("injectedHitCount"), count >= 0 else {
             throw JSONRow.Malformed.field("memoryRecall.injectedHitCount")
         }
@@ -227,6 +230,8 @@ public enum ContextReceipts {
         let historyBytes = int(payload, "historyMessageBytes")
         let userBytes = int(payload, "userMessageBytes")
         let imagePayloadBytes = int(payload, "imagePayloadBytes")
+        // Measured image payload bytes are the request's image size; zero bytes means no image tokens to account for.
+        let imageFree = imagePayloadBytes == 0
         let imageBytes = imagePayloadBytes.flatMap { $0 > 0 ? $0 : nil }
         let assembled = [systemBytes, briefBytes, toolBytes, historyBytes, userBytes, imagePayloadBytes]
             .reduce(Optional(0)) { total, bytes in total.flatMap { total in bytes.flatMap { sum(total, $0) } } }
@@ -234,7 +239,7 @@ public enum ContextReceipts {
         let firstTokens = calls.first.flatMap(inputTokens)
         let lastTokens = calls.last.flatMap(inputTokens)
         let tokensPerByte: Double? = {
-            guard let firstTokens, let assembled, assembled > 0, imagePayloadBytes == 0 else { return nil }
+            guard let firstTokens, let assembled, assembled > 0, imageFree else { return nil }
             return Double(firstTokens) / Double(assembled)
         }()
         func tokens(_ bytes: Int?) -> Int? {
@@ -250,50 +255,75 @@ public enum ContextReceipts {
 
         var rows = [
             ComposerContextReceiptRow(
+                kind: .system,
                 label: "System and persona",
                 detail: personaDetail(payload, tokens: tokens),
-                bytes: personaBytes,
-                tokens: tokens(personaBytes)
+                bytes: personaBytes
             ),
             ComposerContextReceiptRow(
+                kind: .fed,
                 label: "Fed this turn",
                 detail: fedBytes == nil ? "volatileBlockBytes unavailable" : "pinned facts, recalled memories, inner state and the clock",
-                bytes: fedBytes,
-                tokens: tokens(fedBytes)
+                bytes: fedBytes
             ),
             ComposerContextReceiptRow(
+                kind: .memory,
                 label: "Memory recall",
                 detail: recallDetail(payload),
-                bytes: nil
+                bytes: nil,
+                count: ["hits", "contextFlow", "zeroHits"].contains(recallOutcome) ? count : nil
             ),
             ComposerContextReceiptRow(
+                kind: .tools,
                 label: "Tools",
                 detail: toolDetail(payload, asText: toolsAsText, measured: toolBytes != nil),
-                bytes: toolBytes,
-                tokens: tokens(toolBytes)
+                bytes: toolBytes
             ),
             ComposerContextReceiptRow(
+                kind: .history,
                 label: "Conversation history",
                 detail: historyDetail(payload, pointedMidTurn: pointedMidTurn, growth: historyGrowth),
-                bytes: historyBytes,
-                tokens: tokens(historyBytes)
+                bytes: historyBytes
             ),
             ComposerContextReceiptRow(
+                kind: .message,
                 label: "Your message",
                 detail: nil,
-                bytes: userBytes,
-                tokens: tokens(userBytes)
+                bytes: userBytes
             ),
             ComposerContextReceiptRow(
+                kind: .images,
                 label: "Images",
                 detail: imageDetail(payload),
                 bytes: imageBytes
             ),
         ].filter { $0.bytes != nil || $0.detail != nil }
 
+        let partitionBytes = [personaBytes, fedBytes, toolBytes, historyBytes, userBytes]
+            .reduce(Optional(0)) { total, bytes in total.flatMap { total in bytes.flatMap { sum(total, $0) } } }
+        // The provider's measured total is split by each part's share of the parts' own bytes; cumulative integer shares keep the
+        // parts summing to that total without rounding drift. Parts stay estimates: the provider reports only the total.
+        if let firstTokens, let partitionBytes, partitionBytes > 0, imageFree {
+            var prefix = 0
+            var assigned = 0
+            rows = rows.map { row in
+                var row = row
+                guard let bytes = row.bytes, let next = sum(prefix, bytes), next <= partitionBytes else { return row }
+                prefix = next
+                let product = UInt(firstTokens).multipliedFullWidth(by: UInt(prefix))
+                let cumulative = UInt(partitionBytes).dividingFullWidth(product).quotient
+                if let boundary = Int(exactly: cumulative) {
+                    row.tokens = boundary - assigned
+                    assigned = boundary
+                }
+                return row
+            }
+        }
+
         if let firstTokens, let lastTokens, lastTokens > firstTokens, calls.count > 1 {
             let more = calls.count - 1
             rows.append(ComposerContextReceiptRow(
+                kind: .toolRounds,
                 label: "Tool rounds this turn",
                 detail: more == 1 ? "1 more request, provider count" : "\(more) more requests, provider count",
                 bytes: nil,

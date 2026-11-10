@@ -55,6 +55,7 @@ extension CognitiveSubstrate {
         do {
             // The forgetting boundary is read with the agent's mind: a turn admitted from here on is stamped with it.
             mindEpoch = try await store.loadEpoch("mind")
+            mindClearedAt = try await store.loadMindClearedAt()
             bundle = try await store.loadRestoreBundle(
                 artifactFamilies: restoreArtifactFamilyLoads()
             )

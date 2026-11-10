@@ -50,17 +50,19 @@ enum EngineFaceContextProjection {
             return
         }
         let reading = await ContextReceipts.read(sessionId: session, selectedModel: choice.choice?.model ?? "", dataRoot: engine.dataRoot)
-        let state: FaceReadState
+        let state: ContextReceiptFace.State
         switch reading {
         case .loading: state = .waiting(on: "the last turn's context")
         case .unavailable(let cause): state = .unavailable(failure("context_receipt_unavailable", cause))
-        case .noTurn, .outsideSearch, .receipt: state = .ready
+        case .noTurn: state = .noTurn
+        case .outsideSearch: state = .outsideSearch
+        case .receipt: state = .ready
         }
         let rows = ComposerContextReceiptPresentation.lines(reading).map { EngineFaceMindProjection.row($0.id, $0.label, nil) }
-        let turnId: String?
-        if case .receipt(let receipt) = reading { turnId = receipt.turnId }
-        else { turnId = nil }
-        await post(session, rows: rows, state: state, turnId: turnId, engine: engine)
+        let receipt: ComposerContextReceipt?
+        if case .receipt(let value) = reading { receipt = value }
+        else { receipt = nil }
+        await post(session, rows: rows, state: state, receipt: receipt, engine: engine)
     }
 
     @concurrent private static func unavailable(_ session: String, engine: NativeAgentEngine) async {
@@ -69,9 +71,15 @@ enum EngineFaceContextProjection {
     }
 
     @concurrent private static func post(_ session: String, rows: [PartFace.Row],
-        state: FaceReadState, turnId: String? = nil, engine: NativeAgentEngine) async {
+        state: ContextReceiptFace.State, receipt: ComposerContextReceipt? = nil, engine: NativeAgentEngine) async {
         guard !Task.isCancelled else { return }
-        await engine.face.post(ContextReceiptFace(session: session, turnId: turnId, rows: rows, state: state),
+        let parts = receipt?.rows.map {
+            ContextReceiptFace.Part(id: $0.kind, name: $0.label, tokens: $0.tokens, count: $0.count,
+                measurement: $0.measured ? .measured : .estimated, detail: $0.detail)
+        } ?? []
+        await engine.face.post(ContextReceiptFace(session: session, turnId: receipt?.turnId, rows: rows, parts: parts,
+            totalTokens: receipt?.lastRequestTokens, windowTokens: receipt?.windowTokens,
+            model: receipt?.model, ranAt: receipt?.ranAt, state: state),
             at: .contextReceipt(session: session))
     }
 

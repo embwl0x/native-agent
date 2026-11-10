@@ -18,7 +18,8 @@ extension EngineFaceActs {
         case .failed(let detail): throw Self.failure("providers_unavailable", detail)
         }
         let presentation = await engine.providers.refreshSession(session)
-        if let issue = presentation.error { throw Self.failure("chat_choice_unavailable", issue) }
+        // The context meter's failure is the meter's; only an unread choice refuses a change.
+        if presentation.choice == nil, let issue = presentation.error { throw Self.failure("chat_choice_unavailable", issue) }
         guard presentation.contract == nil else {
             throw Self.failure("helper_model_owned", "This helper's model is selected in Helpers.")
         }
@@ -81,8 +82,7 @@ extension EngineFaceActs {
         }
         let probe = try await engine.providers.testConfiguredProvider(provider, authMode: request.authMode,
             apiKey: Self.secret(request.secret) ?? "")
-        return .result(.object(["result": PartFace.Value(try JSONValue.fromEncodable(probe.result)),
-            "credentialReady": .bool(probe.credentialReady), "credentialMatches": .bool(probe.credentialMatches)]))
+        return .providerTest(.init(result: probe.result, credentialReady: probe.credentialReady, credentialMatches: probe.credentialMatches))
     }
 
     func disconnectProvider(_ id: String) async throws -> FaceActReply {

@@ -659,8 +659,9 @@ the [sent-context delivery, replay and cache contract](conversation-context-hist
 to resident and helper turns.
 OpenAI OAuth routes both its `session_id` header and `prompt_cache_key` by the
 conversation id. Sessionless calls on the `workshop` surface (the morning
-brief's) share one stable cache scope across runs; other sessionless calls use
-their turn id. These are routing
+brief's) share one stable cache scope across runs; other sessionless calls share a
+scope per purpose (every after-turn judgment reaches one cache node, so its
+unchanging text is cached across moments). These are routing
 hints and do not create a conversation or carry earlier task content.
 
 This arrangement permits provider-side prefix reuse. It does not guarantee a
@@ -875,13 +876,59 @@ reads the Mac's published turn face through its activity snapshot; the
 delivery and absence. This adds no turn owner, store or outcome clock.
 Nothing here stops a stream: the provider's
 [liveness boundary](TURN_RESILIENCE.md#4-provider-liveness) owns task completion
-and network loss, and Stop owns the person's choice. After 20 seconds without
-movement the card's meta line describes that duration. A clock never changes
+and network loss, and Stop owns the person's choice. A running step is movement: while one runs,
+every place that shows their state says what that step is and how long it has run,
+and nothing presents the turn as stalled or quiet. Between steps, after 20 seconds
+without movement the card's meta line describes that duration. A clock never changes
 its phase or decides a turn's outcome. Mac turn status is projected off main
 into the shared `TurnFace` at `FaceKey.turn(session:)`; the card, Work pane,
 presence and other Mac turn readers draw that slot. Elapsed time advances on
-the face from the start date, without engine ticks. The
+the face from the start date (a running step's own start), without engine ticks. The
 [face-feed contract](designs/separate-face.md#stage-one-turn-status) owns this boundary.
+
+A step is one thing with one identity from the moment it starts to the moment
+it ends, and its row is that step. The presentation reducer numbers each step in
+its turn as it starts. A call's use starts its step; its result ends that same
+step, updating it with the finished words and outcome rather than adding
+another. A result meets its use by the call's shown name in arrival order, the
+pairing `ShownToolNames` already gives results, so parallel calls keep their
+own steps; another door's turn pairs its `tool.dispatch` begin and end, and the
+Telegram card its tool use and result, the same way. A result whose start has left the kept steps stands as one finished step.
+Only their acts are steps. A wait is a state of the turn, never a step: a notice, a
+retry, a provider or network wait, thinking, stream progress, settled reply text
+and a working transition change the turn's words, phase and line, never its
+steps. A call with no words of its own takes its shown name read as an act
+(`Running a command`). The newest twelve steps are kept. `TurnFace.Step` carries
+the step's id (its turn and number), its words, its outcome, its start time and
+whether it is running: started, not ended, in a turn not yet terminal. The
+running step is a row like the others; the Work pane's Steps page keys each row
+by that id, marks a running row `running` (a small spinner, no clock of its own),
+and reads the steps apart from its line, so a clock or `Writing …` tick redraws
+the line and never a row.
+
+While a step runs (the newest step still running), it is what they are doing.
+`TurnCardReadout` keeps the card on it whatever the turn's phase, a stall
+included: title `<name> is working`, the step's words, the working tone and
+live dot, and a clock that reads the step's own start (`Clock.stepStartedAt`)
+and never says "no movement". Only Stop, a pending approval and a block on the
+person speak over it. The turn's line, the Work pane's pill, Simple's presence
+line and the cross-room movement line say the same step. The turn card has five
+states, the same in Simple and Advanced:
+
+- **Working**: the dot, `<name> is working`, the step's words, and its elapsed
+  time on the right.
+- **Long step**: once the step has run 30 seconds (`TurnFace.longStepAfter`),
+  the title is `<name> is still on it`, a thin indeterminate accent line runs
+  under the step (it holds still under Reduce Motion), and the card says "This step takes
+  a while. Nothing is stuck." The title turns by one redraw at that moment;
+  nothing is posted for it.
+- **Steps**: above the current line, this turn's last finished steps, newest at
+  the bottom, at most three, each a tick (a cross for a failed or refused one, a
+  dash for an unconfirmed one) and its finished words, set off from the current
+  step by a hairline. Older steps are not shown; rows are fixed single lines, so
+  the card's cost never grows with their work.
+- **Waiting on you**: a pending approval or a block keeps its own words.
+- **Done**: the card goes away; the transcript folds the reply's tools into one row.
 
 The session owns live delivery through `SessionTurnDelivery`, attached at the
 shared structured turn boundary before preparation or work. A mounted Mac or
@@ -989,15 +1036,23 @@ byte-count-only step result bypasses retention.
 
 A bounded view names `result_handle`, `full_result_retained:true` and
 `next_call`. `result.page` reads that session-and-turn-scoped handle: `page`
-is the zero-based page offset, `raw:true` reads exact UTF-8 bytes, and
+is the zero-based page offset, `raw:true` reads exact UTF-8 bytes, `pages`
+joins that many pages in one answer up to what one inline result holds (omitted,
+a section read joins two and a raw read one; a single long value takes a page
+of its own, and `page` in the answer is where it started), and
 `next_page` or `continue:true` advances without running the action again.
-Dispatch traces keep this pointer in `receipt.result_recovery` even when
-their result preview is bounded. Handles distinguish exact content and scope;
-later views and elapsed time never overwrite or evict a live turn's output.
-Turn settlement releases its handles; expired crash leftovers have no read
-authority. A missing scope, failed retention, unavailable spill or incomplete
-page reports its own failure, never an unretained prefix or a verdict about
-the original action's effects. A retention failure keeps the complete result
+The handle holds the answer, not its source: when the answer said its source
+has more (`has_more` with `next`), every page and the end of reading carry
+`source_continues`, whose `next_call` reads the source on; paging never does.
+In sections, a value's small fields come before its bulk, so a source's own
+state never trails its content. Dispatch traces keep the bounded view's
+pointer in `receipt.result_recovery` even when their result preview is
+bounded. Handles distinguish exact content and scope; later views and
+elapsed time never overwrite or evict a live turn's output. Turn settlement
+releases its handles; expired crash leftovers have no read authority. A
+missing scope, failed retention, unavailable spill or incomplete page reports
+its own failure, never an unretained prefix or a verdict about the original
+action's effects. A retention failure keeps the complete result
 in its caller's dispatch record; model delivery marks the projection error.
 
 The loop handles cancellation, bounded dispatch response waits and malformed-call feedback. The original tool owns its actual receipt and checkpoint settlement after a wait expires. Native routes execute only structured calls, text-marker routes only their offered markers, and text-only routes execute none. Malformed text is refused without salvage, and helpers share the offered-descriptor admission before the gate chain. No schema-loading round is needed between iterations. [Turn resilience](TURN_RESILIENCE.md#3-tool-dispatch-deadline) owns this contract.
@@ -1041,12 +1096,10 @@ Structured chat saves completed and incomplete answers and their attachments,
 then settles through `AfterReply`'s [owed-recording contract](SUBCONSCIOUS.md#lived-moments)
 and emits terminal evidence.
 
-Before that memory pass, the agent's own record predicts whether its
-interpretation would be a complete no-op. User's own turns keep live judgment
-unless that claim stands; every other recorded turn is left owed for a batch.
-Every judgment (live or batch) labels the record
-(`memory/after_turn_surprise.jsonl`; `memory.promotion` in Diagnostics,
-`mind.why` lane `interpretation`). See
+Every moment is judged alone. User's own turns are judged at once; every other
+recorded turn is left owed and judged when they are idle. The judgment's
+unchanging text comes first, so the provider caches it.
+Outcomes show in `mind.why` lane `interpretation`. See
 [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation).
 
 The Mac accumulator consumes core turn events directly; its execution joins or
@@ -1067,7 +1120,10 @@ saved-answer recovery, successor answers and explicit `/retry` keep that policy.
 Ordinary Telegram replies retain their normal notification behavior.
 
 The row's existing `completionState` distinguishes a saved completed answer
-from a saved incomplete reply. Incomplete replies retain their receipt and
+from a saved incomplete reply; where the row also carries the turn's
+`terminalState`, that settled state is what restart reads, the same one the
+live lifecycle projects, so a reply that ended on a pending card is waiting in
+both. Incomplete replies retain their receipt and
 text, but settle as an unconfirmed outcome, including on Regenerate and restart.
 
 Chrome form batches retain each structured action receipt beside the compact
@@ -1159,6 +1215,15 @@ itself by returning `{again: input}`. `practice.keep` records `practice`,
 `met: first|again` and `noted` (or `failed` with the read's cause; the turn goes
 on without the note). There is no private model call after the reply and no
 `keep` purpose ([Habits H3](HABITS.md#h3--keep-what-repeats-not-what-happened-once)).
+
+A deed may carry its own ending. When the round ran one call, that call's
+input has `actions` and text `then_say`, and its result's `then_say` stands,
+the `result` event carries `say`: the filled words
+([contract](TOOL_LOADING.md)). An action's own answer cannot put words there,
+because the call itself must have asked. The shipped `turn.js` then streams
+`say`, ends and asks for the after line, with no `tool_round` model call;
+any other result goes back to their mind as before. Their earlier prose in the
+turn is joined to the words as prose between two model rounds is.
 
 The turn also measures what it took: model rounds, tokens (each of its own
 calls' usage, `LLMCallTraceRecorder.spent`), minutes and the longest stretch of

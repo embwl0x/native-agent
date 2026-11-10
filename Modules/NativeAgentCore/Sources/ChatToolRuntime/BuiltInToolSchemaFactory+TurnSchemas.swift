@@ -26,7 +26,8 @@ extension BuiltInToolSchemaFactory {
                     Read a result retained this turn without repeating its action. Only full_result_retained:true results are eligible. Follow \
                     next_call; continue:true alone selects the sole retained result. Exact result_handle/page also works. Query selects only \
                     matching records in source order, with positions and retained-response coverage; it cannot search unread source content. \
-                    Read-only, redacted; expires at turn end.
+                    source_continues means the answer held only part of its source: its next_call reads on, pages never do. Read-only, redacted; \
+                    expires at turn end.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [
@@ -38,6 +39,10 @@ extension BuiltInToolSchemaFactory {
                         ("page", ToolSchema.nullable(ToolSchema.intSchema("""
                             Zero-based whole-number page index. Omit or null starts at 0; follow next_page while has_more is true. Keep query and \
                             raw unchanged while paging.
+                            """))),
+                        ("pages", ToolSchema.nullable(ToolSchema.intSchema("""
+                            How many pages to read in this one answer, from page onward; omit for the usual read (two section pages, or one raw page). The answer says pages_read and where to go \
+                            on; one answer holds only so many, so follow next_call for the rest.
                             """))),
                         ("query", ToolSchema.nullable(ToolSchema.strSchema("""
                             Select records containing every whitespace-separated term, case-insensitively. Keep query while paging; start at page 0 \

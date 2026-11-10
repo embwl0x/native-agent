@@ -20,11 +20,6 @@ extension DreamBackgroundWork {
         return { since, through in
             var reading = await SurpriseReading.read(dataRoot: dataRoot, since: since, through: through)
             if let failure = reading.sourceFailure { throw failure }
-            let afterTurn = try await SwiftNativeMemoryV2.afterTurnMissesForDream(
-                dataRoot: dataRoot, since: since, through: through)
-            if !afterTurn.isEmpty {
-                reading.groups.append(.init(section: .afterTurn, owner: SurpriseReading.Owner.none, kind: "after_turn", count: nil, lines: afterTurn))
-            }
             await cognitionRuntime.bootstrap()
             // Read the agent's live owner, never the persisted body behind its back.
             let body = await cognitionRuntime.organismKernel.exportPersistentState()
@@ -77,7 +72,7 @@ public struct SurpriseReading: Sendable {
         case none
     }
     /// The dream's sections, in the order its block shows them.
-    public enum Section: Int, CaseIterable, Sendable { case failures, afterTurn, expansion, organism, corrections, turnProgram }
+    public enum Section: Int, CaseIterable, Sendable { case failures, expansion, organism, corrections, turnProgram }
     public struct Group: Sendable {
         public let section: Section
         public let owner: Owner

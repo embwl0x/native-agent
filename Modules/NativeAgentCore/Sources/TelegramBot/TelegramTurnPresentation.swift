@@ -33,11 +33,15 @@ public enum TelegramTurnPresentationReducer {
 
         case .toolResult(let name, let output):
             let reply = ToolResult(output)
-            return TurnPresentationReducer.reduce(
+            // The result ends the step its use started.
+            return TurnPresentationReducer.recordActivity(
                 state,
-                lifecycle: .working(action: ToolActivityPresentation.finished(name,
+                phase: .working,
+                detail: ToolActivityPresentation.finished(name,
                     outcome: reply.outcome.rawValue,
-                    detail: [ChatToolOutcome.explanation(reply.payload), ChatToolOutcome.remedy(reply.payload)].compactMap { $0 }.joined(separator: " · "))),
+                    detail: [ChatToolOutcome.explanation(reply.payload), ChatToolOutcome.remedy(reply.payload)].compactMap { $0 }.joined(separator: " · ")),
+                delegateName: nil,
+                endsCall: ToolActivityPresentation.title(name),
                 at: instant
             )
 

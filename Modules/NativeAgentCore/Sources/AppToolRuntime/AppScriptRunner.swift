@@ -65,6 +65,27 @@ enum AppScriptRunner {
             execution: execution.programExecution(turn: turn, surface: surface, preview: preview))
     }
 
+    /// The receipt's own bookkeeping around what an action returned.
+    static let formEnvelope: Set<String> = ["action", "result", "status", "execution", "argument_form", "understood", "effect", "read_only", "irreversible"]
+
+    /// What came back from a call: object results unwrapped, model guidance, remedies, provenance and her own echoed arguments kept out.
+    /// A script receives this; a batch's expect and found read it.
+    static func answer(_ receipt: JSONValue) -> JSONValue {
+        guard case .object(var fields) = receipt else { return receipt }
+        if fields["action"] != nil, fields["argument_form"] != nil, fields.keys.allSatisfy(formEnvelope.contains),
+           let result = fields["result"], result.objectValue == nil {
+            return result
+        }
+        fields.removeValue(forKey: "argument_form")
+        fields.removeValue(forKey: "understood")
+        if fields["action"] != nil, case .object(let result)? = fields["result"] {
+            fields.removeValue(forKey: "result")
+            fields.merge(result) { _, own in own }
+        }
+        for key in ["guide", "remedy", "next_call", "sense_provenance"] { fields.removeValue(forKey: key) }
+        return .object(fields)
+    }
+
     /// Object arguments are named, with preview/version in a second object; other values follow declaration order.
     static func doorInput(id: String, given: [JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot(),
                           turn: Turn?) -> Result<[String: JSONValue], ScriptError> {
@@ -217,23 +238,7 @@ enum AppScriptRunner {
         func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? {
             ChatTranscriptEvidenceRendering.receiptField(key, in: receipt)
         }
-        /// Unwrap object results while keeping model guidance, remedies and provenance outside the program's data.
-        func answer(_ receipt: JSONValue) -> JSONValue {
-            guard case .object(var fields) = receipt else { return receipt }
-            let formEnvelope: Set<String> = ["action", "result", "status", "execution", "argument_form", "understood", "effect", "read_only", "irreversible"]
-            if fields["action"] != nil, fields["argument_form"] != nil, fields.keys.allSatisfy(formEnvelope.contains),
-               let result = fields["result"], result.objectValue == nil {
-                return result
-            }
-            fields.removeValue(forKey: "argument_form")
-            fields.removeValue(forKey: "understood")
-            if fields["action"] != nil, case .object(let result)? = fields["result"] {
-                fields.removeValue(forKey: "result")
-                fields.merge(result) { _, own in own }
-            }
-            for key in ["guide", "remedy", "next_call", "sense_provenance"] { fields.removeValue(forKey: key) }
-            return .object(fields)
-        }
+        func answer(_ receipt: JSONValue) -> JSONValue { AppScriptRunner.answer(receipt) }
         func perform(_ input: [String: JSONValue], execution program: OwnedProgramExecution) async -> JSONValue {
             guard let turn = program.turn else {
                 return AppToolExecutor.failure("door_unavailable", "An app action needs its originating turn.")

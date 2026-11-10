@@ -139,7 +139,7 @@ public struct DeskState: Sendable, Equatable {
     }
 
     public var topLevel: [DeskItem] { items.filter { $0.parent == nil } }
-    /// Keep all board rows before presentation caps; MY QUEUE belongs on the agent’s home.
+    /// Keep the person's board distinct from the agent's intentions.
     public var board: DeskState {
         var board = self
         board.items.removeAll { $0.project == MyQueue.project }
@@ -150,7 +150,8 @@ public struct DeskState: Sendable, Equatable {
         let top = board.topLevel
         return """
             \(top.filter { !$0.status.isTerminal }.count) of \(top.count) top-level items open; \
-            \(board.items.filter { !$0.status.isTerminal }.count) open including parts; MY QUEUE and archives excluded
+            \(board.items.filter { !$0.status.isTerminal }.count) board items open including parts; \
+            \(MyQueue.entries(self).filter { $0.item.project == MyQueue.project }.count) open MY QUEUE intentions; archives excluded
             """
     }
     public func children(of handle: String) -> [DeskItem] { items.filter { $0.parent == handle } }

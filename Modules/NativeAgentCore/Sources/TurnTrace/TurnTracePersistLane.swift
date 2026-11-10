@@ -75,6 +75,16 @@ public struct TurnTracePersistLane: Sendable {
         }
     }
 
+    /// The distinct verbs the agent's own calls did, as far back as the record holds their details: ended `ok` and `succeeded`, not a preview, top-level (no `parentId`) and her own
+    /// (no `automaticOrigin`, which marks a call the body made on its own). The record answers; no row is decoded here, and a record not yet
+    /// written has done nothing.
+    public func doneVerbs() throws -> [String] {
+        try store.recordedDetailValues(.init(sources: [Self.source], kinds: ["tool.dispatch"]), at: "$.payload.receipt.action",
+            holding: ["$.payload.phase": "\"end\"", "$.payload.status": "\"ok\"", "$.payload.receipt.resultClass": "\"succeeded\"",
+                      "$.payload.receipt.preview": "false"],
+            lacking: ["$.payload.parentId", "$.payload.automaticOrigin"])
+    }
+
     private struct Known: Sendable { let value: (id: String, at: Date)? }
     private static let receipts = OSAllocatedUnfairLock<[String: [String: Known]]>(initialState: [:])
 

@@ -58,8 +58,7 @@ public enum VectorMath {
     public enum Decision: Sendable {
         /// Something comes to the agent's attention: a care touched, a memory recalled into the turn, a moment it is reminded of. One deviation past chance.
         case attention
-        /// Something is done for the agent without asking. Two deviations past chance. AfterTurnSurpriseLedger uses this margin when a labelled precedent
-        /// nominates whether the after-turn fold has anything new.
+        /// Something is done for the agent without asking. Two deviations past chance.
         case action
 
         public var margin: Double {

@@ -1,10 +1,14 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `ToolResultSections.swift` | `ToolResultSections`, `pages`; lossless paging; verdict before bulk; raw oversized atoms |
+// Blueprint: | `ToolResultSections.swift` | `ToolResultSections`, `pages`; lossless paging; small fields before bulk; raw oversized atoms |
 
 /// Complete values and lines for reading; the retained byte stream remains available separately for exact reconstruction, including unusually large atoms.
 package enum ToolResultSections {
-    package static let pageBudget = 24_000
+    /// Three full pages join in one answer under `ProviderToolResultPage.defaultMaxUTF8Bytes`, with its envelope.
+    package static let pageBudget = 12_000
+    /// The largest single value a page shows whole. It is not tied to the page size: a long line takes a page of its own, and only a
+    /// value past this is left to raw reading.
+    package static let largestValue = 24_000
 
     package static func projection(content: String, value: JSONValue?, budget: Int) throws -> [(value: JSONValue, text: String, bytes: Int)] {
         var sections: [(value: JSONValue, text: String, bytes: Int)] = []
@@ -12,13 +16,13 @@ package enum ToolResultSections {
             let encoded = try value.serialize(pretty: false)
             // A large structured section has named children. Page those children instead of making the reader reconstruct raw JSON.
             if (value.objectValue != nil || value.arrayValue != nil),
-               encoded.utf8.count > budget - 1_024 {
+               encoded.utf8.count > max(budget, largestValue) - 1_024 {
                 try visit(value, path: path)
                 return
             }
             var row: [String: JSONValue] = ["path": .array(path), "value": value]
             if let line { row["line"] = .int(Int64(line)) }
-            if encoded.utf8.count > budget - 1_024 {
+            if encoded.utf8.count > max(budget, largestValue) - 1_024 {
                 row.removeValue(forKey: "value")
                 row["omitted_bytes"] = .int(Int64(encoded.utf8.count))
                 row["detail"] = .string("""
@@ -36,7 +40,7 @@ package enum ToolResultSections {
             }
             // Paths are source content too: a large key can outweigh its value. Keep the exact location in raw recovery rather than exceed the page.
             var rowBytes = try JSONValue.object(row).serialize(pretty: false).utf8.count
-            if rowBytes > budget - 2 {
+            if rowBytes > max(budget, largestValue) - 2 {
                 row = [
                     "raw_byte_start": .int(0),
                     "raw_byte_end": .int(Int64(content.utf8.count)),
@@ -77,13 +81,13 @@ package enum ToolResultSections {
                 }
             case .object(let fields):
                 if fields.isEmpty { try append(value, path: path) }
-                // Preserve search ranking, then show verdict fields before request echoes; shortest remaining fields keep bulk off the first page.
+                // Small fields lead, so a source's own state and continuation precede its bulk instead of trailing it as if they were content;
+                // then search ranking, verdict fields, and the shortest remaining fields keep other bulk off the first page.
                 let priority = ["results", "hits", "matches", "text", "content",
                                 "status", "reason", "error", "detail", "message", "result"]
                 let rank = Dictionary(uniqueKeysWithValues: try fields.map { key, value in
                     let bytes = try value.serialize(pretty: false).utf8.count
-                    return (key, priority.firstIndex(of: key).map { ($0, 0) }
-                        ?? (priority.count, bytes))
+                    return (key, bytes <= 1_024 ? (0, bytes) : priority.firstIndex(of: key).map { (1, $0) } ?? (2, bytes))
                 })
                 let keys = fields.keys.sorted { rank[$0]! == rank[$1]! ? $0 < $1 : rank[$0]! < rank[$1]! }
                 for key in keys { try visit(fields[key]!, path: path + [.string(key)]) }

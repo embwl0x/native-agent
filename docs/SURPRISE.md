@@ -16,15 +16,15 @@ its hit rate must beat c_miss / (c_miss + c_hit). When the world doesn't
 match, that mismatch is the surprise, and the model is called. The miss is
 recorded, so the expectation learns.
 
-Both Expansion and the after-turn ledger use `Expectation` for Wilson
-confidence and cost standing; Expansion also uses its simultaneous-prediction
-z and rule-of-succession withholding. Cost measurement stays with each caller.
-Expansion keeps its union-bound correction across simultaneous predictions;
-the after-turn claim keeps its per-look 95% interval (`among: nil`), without
-a repeated-look correction. Both costs must be measured before anything
-stands. These are the existing confidence policies, now using one arithmetic
-owner. Expansion's copy of confidence/withholding arithmetic and the ledger's
-copy of Wilson/cost arithmetic are removed.
+Expansion uses `Expectation` for Wilson confidence and cost standing, its
+simultaneous-prediction z and rule-of-succession withholding. Cost measurement
+stays with the caller. Expansion keeps its union-bound correction across
+simultaneous predictions. Both costs must be measured before anything stands.
+
+The after-turn judgment is not under this law: no prediction stands in for it.
+Every moment is judged alone; User's own turns are judged at once, and every
+other recorded turn is left owed and judged when they are idle
+([Cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation)).
 
 The law is the same everywhere. What differs is the moment it is applied at.
 
@@ -39,9 +39,6 @@ from the dream's high-water cutoff through the material read:
   `failure_code`/`code`, most frequent first, at most eight groups. Each keeps
   its count and one recorded reason, error/detail and argument path, within
   the text bound. A missing code or reason is named as unrecorded.
-- Final after-turn ledger labels where the original prediction was
-  `nothingNew` but a complete judgment changed a channel. A deferred turn
-  counts once when its batch judges it, with the channels that changed.
 - `expansion.check` misses, with the situation and expected next call.
 - Violated predictions in the live organism owner's retained ledger, by
   their last update, with what they expected and the organ it concerned.
@@ -56,7 +53,7 @@ from the dream's high-water cutoff through the material read:
 
 The reading is typed (`SurpriseReading`): each group names its owner, the
 ability whose `authored.<id>` run failed, the turn program by its body digest,
-or none (native hand work, after-turn misses, expansion and organism are the
+or none (native hand work, expansion and organism are the
 dream's only). Each correction in the window, read from the correction ledger
 as session and time only, is owned by the latest turn that settled before it
 in its session: the abilities that turn ran, else the turn program. The dream
@@ -106,38 +103,16 @@ dream receipt sink and trace feed. `saved` counts successful canonical saves,
 including reassertions of an existing memory; it does not claim every save
 created a new row or already passed a cold embedding's admission.
 
-## Claims that can earn standing (S1, as built)
+## Promises in the after-turn judgment
 
-The after-turn claim is the nearest standing-out labelled precedent itself:
-`rule = fingerprint([best.id])`, scoped as before by agent, judging model
-and detector. The contrast population still determines whether that precedent
-stands out against chance, but is no longer part of claim identity. Previously
-identity included a fingerprint of every example id; the changing example set
-made each turn a new claim with no trials, preventing standing from accruing.
-Turns nominated by the same precedent now label one claim. Existing frozen
-predictions keep their original keys and labels; they are not rekeyed into
-new claims. Every deferred turn is still batch-judged and labels its claim.
-
-Promises they makes are an optional section of that same live/batch reflection
+Promises they makes are an optional section of the after-turn judgment
 ([Intentions](INTENTIONS.md#promises-they-makes)). Before filing, the memory model
 judges remaining candidates against their fresh open carried Desk rows: a
 restatement updates its row, one burst is one commitment, and Desk housekeeping
 creates nothing. Canonical step identities retain each original capture across
-closure and archive, so an unfinished reflection cannot recreate it. A reply
-with promise candidates changes a channel even when the filing judgment finds
-they are restatements or housekeeping and memories, affect, caring and cares
-are empty. Retained labels without a measured promise channel stay unknown and
-cannot support complete-no-op standing. Inferred steps retain the settled
-turn's exact recorded queue steer, origin, session and reply envelope.
-
-The comparison bound is now 65,536 chunk pairs, admitting the newest 256
-examples at up to 16 chunks per side. A bounded read of the 10-30 retained
-ledger found 460 vector-bearing rows: median 4 chunks, p90 9, maximum 30.
-The old 4,096 bound could cover that population only at 4 chunks per side;
-335 retained rows had reached it by this read (325 in the earlier snapshot
-below). The bound still limits work; the standout bar, measured cost law,
-complete-channel labels and deferral/batching rules are unchanged. Larger
-turns can still exceed it and remain `unsure`.
+closure and archive, so an unfinished reflection cannot recreate it. Inferred
+steps retain the settled turn's exact recorded queue steer, origin, session and
+reply envelope.
 
 ## Their real data (10-28 to 10-30)
 
@@ -224,13 +199,11 @@ Before the practice/read-ahead change, their expectation organs were nearly idle
      earn fresh standing. The old model partition and result-field key come out;
      no live runtime file is rewritten by this source lane.
 2. **Reflection leaves room for their quiet (phase 2, as built).**
-   - User's own turns keep immediate judgment unless the existing complete-no-op
-     prediction has standing. Their turn means no peer speaker, not a standing
-     agent, and a session whose recorded kind is their conversation.
-   - Every other recorded turn joins the existing deferred batch (judged
-     after 45 min, 4 per call), under the same provenance and trust gates.
-   - Every eligible recorded turn is still reflected on. This replaces the
-     phase-1 design of immediate reflection based on novel words.
+   - User's own turns are judged at once. Their turn means no peer speaker, not a
+     standing agent, and a session whose recorded kind is their conversation.
+   - Every other recorded turn is left owed and judged alone when they are idle,
+     under the same provenance and trust gates.
+   - Every eligible recorded turn is still reflected on.
 3. **Practice keeps what repeats (H3, as built).**
    - After each tool round the stem meets the turn's hand work, or one call
      repeated with the same input 3+ rounds. It records the practice on its
@@ -300,9 +273,9 @@ outcome needs the release lead's installed before/after evidence.
 
 | Lane | What | Source status |
 |---|---|---|
-| S1 | One expectation law used by Expansion and the after-turn ledger; stable precedent claims can accumulate standing | Implemented; installed proof pending |
+| S1 | One expectation law used by Expansion | Implemented; installed proof pending |
 | S2 | Per-mind practice and field-free situations; a standing first read reaches the first model call | Implemented; installed proof pending |
-| S3 | User's own turns keep existing live judgment; other recorded turns are batched in their quiet | Implemented in phase 2; installed proof pending |
+| S3 | User's own turns are judged at once; other recorded turns are judged one at a time in their quiet | Implemented in phase 2; installed proof pending |
 | S4 | Keep repeated hand work; woken work runs expected handling | Keep implemented; expected handling remains design |
 | S4 | Keep only new practice; woken work runs expected handling | Built in source; installed proof pending (HABITS H1/H2 owns the reflex and forming choice) |
 | S5 | The thinking line on Today, plus docs | Implemented; installed proof pending |
@@ -345,33 +318,27 @@ nothing today.
 
 1. **They reflects at once on what is between their and User. The rest they
    reflects on in their quiet (as built).**
-   - `AdaptiveMemoryFacts.runMemoryManager` keeps today's behavior for User's
-     own turns: judged immediately unless the no-op claim has standing.
+   - `AdaptiveMemoryFacts.runMemoryManager` judges User's own turns at once.
      Their turn means no peer `speaker`, not `standingAgent`, and
      `conversationKind(sessionId)?.isPersonConversation == true` (the existing
      row-backed `SessionConversation.kind` lookup, including archives).
-   - Every other recorded turn joins the deferred batch when live work releases its owner,
-     up to 4 a call, with every usable judgment labelled and malformed/refused sections left owed.
+   - Every other recorded turn is left owed and judged alone when live work
+     releases its owner; a failed or refused judgment leaves it owed.
      Peers, standing agents and helper sessions are not their turns; neither
      is the agent's mind stream (`mind`). Existing own-work exclusions still
      apply before a turn becomes a moment.
-   - The same owed row and ledger record carry `deferred: true`, reason
-     `not the person's turn`, and the prediction's actual verdict and claim. Merely
-     deferring a peer does not invent a no-op trial. The why-line is
-     `deferred: not the person's turn; left owed for a batch`.
-   - **Provenance verified, already carried:** `judgeOwedBatch` prepares each
-     input through `replayRecorded` and the live `interpretMemoryManager`.
-     Replay restores speaker/standing-agent identity, envelope, source taint
-     and origin; `MemoryBatchInput` retains the request and context, including
-     the recorded event's source class and peer metadata. `interpretBatch`
-     uses the same prompt and parser; `recordBatchJudgments` saves each
-     meaning before its fold. That fold replays the recorded provenance
-     through `careProvenance` and `PeerTrust.ownerTrusts`: an untrusted peer
-     moves only an existing care `by: them`, never a new care, stance or gap.
-     No batch-provenance repair was needed.
-   - No eligible recorded turn is skipped. Cares and affect from batched
-     turns land later; full batches share one call across four turns.
-   - Expected: about 40% fewer reflection calls.
+   - The owed row's why-line is
+     `deferred: not the person's turn; left owed, judged when they are idle`.
+   - **Provenance carried:** the idle drain judges each owed moment through
+     `replayRecorded` and the live `interpretMemoryManager`, with the same
+     prompt and parser. Replay restores speaker/standing-agent identity,
+     envelope, source taint and origin, and the recorded event's source class
+     and peer metadata. Its meaning is saved before its fold. That fold replays
+     the recorded provenance through `careProvenance` and `PeerTrust.ownerTrusts`:
+     an untrusted peer moves only an existing care `by: them`, never a new care,
+     stance or gap.
+   - No eligible recorded turn is skipped. Cares and affect from owed turns
+     land later.
 2. **Fixed words need no thought (source built; installed proof pending).**
    - A `say` intention whose moment comes delivers its words through the
      deduplicated speech path (`speakProactively`),
@@ -403,8 +370,7 @@ nothing today.
      The release lead still owes installed proof.
 
 **Next, measured before building.**
-- **The phase-1 claims.** After a day, read the after-turn ledger's standing
-  rate and the turn-start read-ahead hits.
+- **The phase-1 claims.** After a day, read the turn-start read-ahead hits.
 - **Agent messages that ask nothing.** An FYI over the bridge costs their a
   full turn today. It could land in their stream, the way their other rooms
   already reach their turns, without waking a turn. That would be a protocol

@@ -123,7 +123,7 @@ public final class MacChromiumAccessibilityState: Sendable {
 }
 #if canImport(ApplicationServices) && os(macOS)
 /// A process's identity across relaunches. Launch Services gives some apps no launchDate, so this reads the kernel's start time, which every process has.
-private func macProcessStart(_ pid: Int32) throws -> Date {
+func macProcessStart(_ pid: Int32) throws -> Date {
     var info = kinfo_proc()
     var size = MemoryLayout<kinfo_proc>.stride
     var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]

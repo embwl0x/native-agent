@@ -33,6 +33,29 @@ public enum MyQueue {
         state.items.compactMap(entry).sorted { $0.item.updatedAt > $1.item.updatedAt }
     }
 
+    /// Read the intention beside its dependencies from the same Desk revision; waits are only what is provably outstanding, the condition is its own field.
+    public static func readout(_ entry: Entry, in state: DeskState, plan: DeskSequencing.ItemPlan?) -> JSONValue {
+        var waits: [String] = []
+        if let plan {
+            waits = plan.effectiveBlockers.map { handle in
+                state.items.first(where: { $0.handle == handle }).map { "desk." + $0.alias } ?? handle
+            }
+            if plan.isDeferred, let deferUntil = entry.item.deferUntil { waits.append("deferred until " + deferUntil) }
+            if plan.blockedByCycle { waits.append("dependency cycle; repair the named dependencies") }
+        } else {
+            waits.append("Desk dependency readiness unavailable")
+        }
+        if let reason = entry.item.blockedReason { waits.append("blocked: " + reason) }
+        if let person = entry.item.waitingOn { waits.append("message from " + person) }
+        if entry.step.status == "stopped" { waits.append("stopped; reconcile before acting") }
+        if when(entry) == nil { waits.append("condition unavailable; repair " + entry.step.when) }
+        return .object([
+            "name": .string(entry.name), "words": .string(entry.step.words),
+            "filed_at": .string(entry.step.filedAt ?? entry.item.openedAt),
+            "when": .string(entry.step.when), "waits_on": .array(waits.map(JSONValue.string)),
+        ])
+    }
+
     // MARK: - When
 
     /// A door is a surface the person messages from, spelled as that turn's surface. A closed set: an unknown word is refused where it is

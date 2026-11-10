@@ -32,6 +32,8 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         public var ttftMs: Int?
         /// Capture request size before send.
         public var requestBytes: Int?
+        /// Hashes of the cache scope and the request's first 2k and 8k bytes: whether two calls could share a cached prefix.
+        public var requestFront: String?
         public var requestCharacters: Int?
         public var requestPlan: Data?
         public init() {}
@@ -216,6 +218,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         if accountingOverflow { payload["tokenAccountingOverflow"] = .bool(true) }
         payload["tokenAccounting"] = .string(usageComplete && !accountingOverflow ? "complete" : "unavailable")
         if let bytes = Self.requestRecorded?.withLock({ $0.requestBytes }) { payload["requestBytes"] = .int(Int64(bytes)) }
+        if let front = Self.requestRecorded?.withLock({ $0.requestFront }) { payload["requestFront"] = .string(front) }
         if let characters = Self.requestRecorded?.withLock({ $0.requestCharacters }) { payload["requestCharacters"] = .int(Int64(characters)) }
         // Only streamMessages calls carry a delivery kind.
         if let streamKind = LLMMessagesStreamKind.current {
@@ -266,6 +269,8 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             if let v = usage.cacheWriteInputTokens { payload["cacheWriteInputTokens"] = .int(Int64(v)) }
             if let v = usage.cacheWrite30mInputTokens { payload["cacheWrite30mInputTokens"] = .int(Int64(v)) }
             if let v = usage.cacheWrite12hInputTokens { payload["cacheWrite12hInputTokens"] = .int(Int64(v)) }
+            if let v = usage.cacheWrite5mInputTokens { payload["cacheWrite5mInputTokens"] = .int(Int64(v)) }
+            if let v = usage.cacheWrite1hInputTokens { payload["cacheWrite1hInputTokens"] = .int(Int64(v)) }
         }
         let row = TurnTraceEvent(
             kind: "llm.call", title: model, status: status,
