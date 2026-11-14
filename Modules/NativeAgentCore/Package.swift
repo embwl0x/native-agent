@@ -170,7 +170,7 @@ let extraDeps: [String: [String]] = [
         "ChatTurnRuntime", "ToolRegistry", "StandingBots"],
     "AttentionRouting": ["Experiences", "MacControl", "Privacy", "PersistenceCore", "DeviceSync", "TelegramBot", "Desk", "TriggerScheduler",
         "NotificationInbox", "ApprovalInbox", "StandingBots", "Transcripts", "AgentWorkspace", "ChatTurnContracts", "ChatTurnRuntime"],
-    "ProviderRouting": ["Experiences", "PersistenceCore", "TurnTrace", "Privacy"],
+    "ProviderRouting": ["Experiences", "PersistenceCore", "TurnTrace", "Privacy", "ChatToolParsing"],
     "BackgroundLoops": ["Experiences", "PersistenceCore"],
     // Cross-domain runner bodies sit above their domain owners; the scheduler stays dependency-light and remains the only registration/single-flight owner.
     "BackgroundWork": ["ToolExecution", "Experiences", "SlackBot", "ActivityWatch", "AgentConversations", "AgentWorkspace", "ApprovalInbox", "AttentionRouting",

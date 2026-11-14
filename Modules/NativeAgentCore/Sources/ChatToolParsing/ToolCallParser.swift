@@ -315,6 +315,37 @@ package enum ToolCallParser {
         return (String(held[name]), input)
     }
 
+    /// Where the reply ends when its call stands outside a block. On the text wire a `<function_calls>` block is ended by its closing mark;
+    /// a call written with no block around it has no mark coming, so it is a block of one and the reply ends where the call does. Nil while
+    /// no complete call opens its own line outside a block. `appended` is how many characters just arrived: a call can only have completed
+    /// inside them, so text read before is not read again. The end is a UTF-16 offset, as marker text is measured.
+    package static func bareCallEnd(in text: String, appended: Int) -> Int? {
+        let tail = text.suffix(appended + 12)
+        guard tail.contains("</tool_use>") || tail.contains("</invoke>") else { return nil }
+        guard let first = framedCalls(text).first else { return nil }
+        let ns = text as NSString
+        guard !(unquotedProtocolText(text) as NSString).substring(to: first.0).contains("<function_calls") else { return nil }
+        // A call opens its own line. One written after other words on a line may be an example whose closing backtick has not arrived.
+        let line = ns.range(of: "\n", options: .backwards, range: NSRange(location: 0, length: first.0))
+        let lineStart = line.location == NSNotFound ? 0 : NSMaxRange(line)
+        guard ns.substring(with: NSRange(location: lineStart, length: first.0 - lineStart)).allSatisfy(\.isWhitespace) else { return nil }
+        let opened = ns.range(of: ">", range: NSRange(location: first.0, length: first.3 - first.0))
+        guard opened.location != NSNotFound else { return nil }
+        // A body that is one JSON object ends at the closing marker written right after the object. Until that marker is there the call
+        // is still being written, and a closing marker read so far is inside one of its strings.
+        let closers = ns.substring(from: first.0).hasPrefix("<tool_use") ? ["</tool_use>"] : ["</tool_use>", "</invoke>"]
+        switch JSONByteScanner.objectRead(ns.substring(from: NSMaxRange(opened)), closers: closers) {
+        case .open?, .closed(_, nil)?: return nil
+        case .closed(_, let closer?)?: return NSMaxRange(opened) + closer.upperBound
+        case nil: return first.3
+        }
+    }
+
+    /// Held text that opens at a marker: nothing before it is left to release.
+    package static func opensAtProtocolMarker(_ held: String) -> Bool {
+        protocolMarkerStarts.contains { held.range(of: $0, options: [.caseInsensitive, .anchored]) != nil }
+    }
+
     /// Hold potential call text until the complete round can distinguish calls from examples.
     package static func earliestPotentialProtocolMarker(in raw: String) -> Range<String.Index>? {
         var candidates = protocolMarkerStarts.compactMap { needle in
@@ -384,6 +415,11 @@ package enum ToolCallParser {
     }
 
     private static func parseAnthropic(_ raw: String) -> [(Int, ParsedToolCall, Bool)] {
+        framedCalls(raw).map { ($0.0, $0.1, $0.2) }
+    }
+
+    /// Each call the text holds, in order: where it opens, the call, whether it is written as invoke parameters, and where it ends.
+    private static func framedCalls(_ raw: String) -> [(Int, ParsedToolCall, Bool, Int)] {
         var positionedCalls: [(Int, ParsedToolCall, Bool)] = []
         let ns = raw as NSString
         let quoted = codeRanges(in: raw)
@@ -427,10 +463,10 @@ package enum ToolCallParser {
         }
         // A call written inside another call's body is that call's text, never a second call.
         var owned = 0
-        return positionedCalls.sorted { $0.0 < $1.0 }.filter { call in
-            guard call.0 >= owned else { return false }
+        return positionedCalls.sorted { $0.0 < $1.0 }.compactMap { call in
+            guard call.0 >= owned else { return nil }
             owned = ends[call.0] ?? owned
-            return true
+            return (call.0, call.1, call.2, owned)
         }
     }
 }

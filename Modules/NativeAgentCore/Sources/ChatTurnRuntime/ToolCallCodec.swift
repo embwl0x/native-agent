@@ -90,6 +90,8 @@ enum ToolCallCodec: Sendable, Equatable {
         }
         defer { pending += citationTail }
         pending = ChatRichContentParser.visibleText(pending)
+        // Text already held from a marker releases nothing. Searching all of it again on every chunk made a long call cost its length squared.
+        if ToolCallParser.opensAtProtocolMarker(pending) { return "" }
         let heldStarts = [ToolCallParser.earliestPotentialProtocolMarker(in: pending),
                           pending.range(of: "NativeAgent tool result #")].compactMap { $0 }
         if let marker = heldStarts.min(by: { $0.lowerBound < $1.lowerBound }) {
