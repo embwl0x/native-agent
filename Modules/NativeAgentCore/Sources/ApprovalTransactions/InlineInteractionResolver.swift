@@ -64,7 +64,12 @@ public enum InlineInteractionResolver {
             answers.append(.init(id: "act", label: "Enter on Mac", role: .primary, doors: mac,
                 call: .init("provider.sign_in", ["provider": .string(control.target)])))
         } else if picks.isEmpty, model.fields.isEmpty, control.isActionable, card.state.isOpen {
-            answers.append(.init(id: "answer", label: model.primaryLabel, role: .primary, doors: mac, call: .init("card.answer", id)))
+            // A walking permission card's answer is its next step: Continue, or the one restart its launch-applied grants wait on.
+            let restart = card.kind == .permission && card.state == .running && model.restartNote != nil
+            answers.append(.init(id: "answer", label: model.primaryLabel, role: .primary, doors: mac,
+                call: .init("card.answer", restart ? id.merging(["choice": .string("restart")]) { $1 } : id)))
+            // A pane closed without granting can always be opened again from the card.
+            if restart { answers.append(.init(id: "again", label: "Go through again", doors: mac, call: .init("card.answer", id))) }
         }
         if continuationFailed || (!providerEntry && model.canRetry && model.fields.isEmpty && [.failed, .stopped].contains(model.state)) {
             answers.append(.init(id: "try_again", label: "Try again", role: .primary, doors: mac, call: .init("card.try_again", id)))
@@ -76,7 +81,8 @@ public enum InlineInteractionResolver {
             summary = ([model.outcome, model.outcomeMeta].compactMap { $0 } + retryScope)
                 .filter { !$0.isEmpty }.joined(separator: "\n\n")
         } else {
-            summary = ([card.state.failureReason ?? card.why]
+            summary = ([card.state.failureReason ?? card.why, await grantsNow(card, control: control)].compactMap { $0 }
+                + [card.state == .running ? model.busyNote : nil].compactMap { $0 }
                 + model.scopeLines + [model.persistenceNote, "Not now: " + card.declineConsequence].compactMap { $0 })
                 .filter { !$0.isEmpty }.joined(separator: "\n\n")
         }
@@ -101,6 +107,19 @@ public enum InlineInteractionResolver {
             return try await owner.updateFace(matter)
         }
         return try await owner.tell(matter, doors: doors)
+    }
+    /// An open permission card's macOS grants as the app reads them now, never prompting: what took and what is left. The card's row, its
+    /// chat card and the agent's own read of it all say this line, so a card answered in part reads as such.
+    public static func grantsNow(_ card: InlineInteraction, control: InlineInteractionDescriptor) async -> String? {
+        guard card.kind == .permission, card.state.isOpen, control.control == .macPermissionGrant else { return nil }
+        var on: [String] = [], off: [String] = []
+        for target in card.allTargets where SystemPermissionPreflight.cardSettingsCapability(target) != nil {
+            let name = InlineInteractionRegistry.macCapabilityDisplayName(target)
+            if await platform.cardBlockReason([target], mode: card.mode) == nil { on.append(name) } else { off.append(name) }
+        }
+        guard !(on + off).isEmpty else { return nil }
+        return "On now: " + (on.isEmpty ? "none" : InlineInteractionRegistry.englishList(on))
+            + (off.isEmpty ? "." : ". Still off: " + InlineInteractionRegistry.englishList(off) + ".")
     }
     /// Starts a card's continuation in its own conversation, with the card's turn as its authority: the person's Mac conversation in the window, any
     /// other door's through that door. Only the first real question shows a user bubble; internal continuation markers stay hidden. Report actual

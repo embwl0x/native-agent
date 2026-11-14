@@ -266,7 +266,9 @@ and draw that row; current doors draw the block. Native value copies retain the 
 A section's `style` is
 `list`, `values`, `timeline`, `flow`, `note` or `waiting`; a `folded` section draws as one
 row, its title, that each reader opens to see its rows (open or closed is the view's own,
-never written to the face), and reads on the door as its title and footer, marked folded, with its rows that carry a control or an action kept and the rest counted. Consecutive
+never written to the face), and reads on the door as its title, marked folded, with its rows that carry a control or an action kept and the rest counted.
+In a page read those rows read as name, state and calls, without detail or the section's footer; `app {page, item:<section id>}` reads the
+section whole, and a row's id reads that row whole. Consecutive
 sections whose `beside` is the same nonempty string are drawn side by side as columns of equal width, as many
 to a line as stay readable, one under another where the width holds fewer than two; a list (the phone's
 page, a list mount) stacks them, and the door reads each as an ordinary section. `beside` is absent from the
@@ -390,6 +392,12 @@ refused with where the person does it. A list (`app {actions:[…]}`) whose ever
 ask, two or more of them, is one ask: nothing runs, the door replies `needs_person` for the list,
 and the gate puts the list on one card; Approve replays it as the person's decision of each of its
 calls, each admitted once (`PermissionLaw.decidedCalls`), and Decline leaves everything as it was.
+The person's word reads such a list step by step: a step is theirs when every quote reaching it (its
+own `because` and the list's) is about that step's own act, sharing a word with it, or, for a step that
+widens what the agent may do (a setting raise or owner row, a lever named for permission, access or
+grants), asking for the whole of that (`RequestWords.asksWhole`: "full permissions", "all your access",
+"everywhere" or "everything" beside such a word, "all of it"). The steps it names run as theirs; the
+others are left out of their act and each meets its own gate, card included.
 A setting's own check reads the decided change itself (`PermissionLaw.personDecided(setting:)`),
 whatever `because` rode beside it.
 

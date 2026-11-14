@@ -533,8 +533,14 @@ is reused, and access already allowed needs no card. Tap **Allow** on the Mac
 to open the system prompt or Settings pane; the agent's call itself never
 opens a system prompt. The result keeps the blocked work's actual outcome
 and tells the agent which card is up for you.
-Permission acquisition waits for NativeAgent to become active or for cancellation.
-Bring NativeAgent forward to continue; no grant is requested while inactive.
+One tap walks every grant on the card: first macOS asks in place for each one it
+can, then the panes open one at a time for the grants only System Settings turns
+on (or that you declined). Coming back to NativeAgent's window goes on to the
+next pane. The card keeps a **Continue** button until every grant is on or you
+choose Not now; at the end it offers one restart, for grants that take effect at
+launch, beside **Go through again**. Trust's "Ask for every prompt not yet
+answered" walks the same card. No grant is requested while NativeAgent's window
+is not in front.
 Settings reports unresolved acquisition as a failure.
 Looking at a named app that is stopped returns a successful observation with
 `status:"ok"`, `app:<name>`, `running:false`. A running app with no readable
@@ -1428,7 +1434,10 @@ one of these, I do it. When it's my own idea, I ask you first.” Your own words
 in the conversation decide one of these as your tap and your card do: when the
 agent's call quotes your request (`because`), those words name the change (they
 share a word with it, such as “trusted” with Trusted or “restore” with Restoring a
-backup), and they are found in your own message of the request it is acting on now (the message that started its
+backup, or they ask for the whole of what the agent may be given, such as “full
+permissions everywhere”, which names every change that widens its reach; in a
+list, each change is judged by its own words, and one your words do not name
+asks on its own), and they are found in your own message of the request it is acting on now (the message that started its
 turn, one you sent while it worked, or the one a card's answer continues), at
 your Mac, your paired phone or your own Telegram, the change is made with no
 card, any card still waiting for that same change is withdrawn as decided by
@@ -1437,10 +1446,12 @@ consent record keeps your words. Words from a tool result, a web page, a file,
 another agent, a helper or the agent itself never count. Under Safe nothing asks,
 so nothing runs on your word either. “Only you can do these” lists the levers
 no card can carry: typing or reading a secret, matching a pairing code, choosing
-in a system panel, answering macOS's own prompt, words sent as yours, an
+in a system panel, words sent as yours, an
 approval's own action opened on the Mac, recovering a damaged Trust policy, and
 resetting who the agent is; the agent's call to one is refused, at every
-standing, and your word cannot do it for you. A lever added to the app appears
+standing, and your word cannot do it for you. Raising macOS's own permission
+prompts is not among them: on your word or your card the agent puts them in
+front of you, and you answer each one yourself. A lever added to the app appears
 in one of them without touching the card.
 Some things ask case by case, decided from the request itself rather than the
 standing, so they carry no lock; the fold says so in one sentence: a request
@@ -1465,8 +1476,9 @@ map. A block with something that needs you (a grant not yet given, a reading
 that failed) stays open and comes first. Backups stays open, its restore
 points under one row; the recent security receipts and the Mac control audit
 come last, folded. The agent reads that same face as text; a folded block keeps
-its rows that carry a control or an action and counts the rest, and every switch
-on it stays in the page's settings list. Each switch saves immediately; granting more access asks for
+its rows that carry a control or an action, by name, state and call, and counts the
+rest, and its item reads it whole. Every switch on it stays in the page's settings
+list, by id, value and choices; its item reads its note. Each switch saves immediately; granting more access asks for
 confirmation. Full Mac's effective permissions are distinguished from the saved
 choices for narrower modes. The storage inventory shows when it was read;
 Refresh reads it again.

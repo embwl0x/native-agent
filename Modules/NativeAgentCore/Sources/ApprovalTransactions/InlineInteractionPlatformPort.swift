@@ -20,8 +20,9 @@ public protocol InlineInteractionPlatformPort {
     func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> String?
     func permissionChanges() -> AsyncStream<Void>
     func openInteractionCards() async throws -> [(id: String, sessionID: String)]
-    /// Ask macOS for each grant still off, in walk order, opening the first unresolved one's pane. Returns why each item is still unresolved.
-    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async throws -> [String]
+    /// The one walk: ask in place for every grant macOS can still ask, then open the pane of the first one still off that is not in `passed`.
+    /// Returns what it now waits on and any grant whose request failed.
+    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?, passed: Set<String>) async throws -> [String]
     func writeInteractionSnapshots() async
     func refreshInteractionInbox() async
     func interactionControls() -> (any InlineInteractionControlPort)?

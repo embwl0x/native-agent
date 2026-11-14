@@ -73,6 +73,9 @@ import TrustPersistence
     func pageItem(page: String, named: String) async -> (id: String, open: String?)? {
         await appModel.engine.pages.shownItem(page: page, named: named)
     }
+    func pageItemText(page: String, item: String, rows: Bool) async -> String? {
+        await appModel.engine.pages.shownText(page: page, item: item, rows: rows)
+    }
     func composerState(sessionId: String, turn: Turn) async -> [String: JSONValue] {
         if let face {
             do { return try await BodyQuietChatCommands(face: face).composerState(sessionID: sessionId, turn: turn) }

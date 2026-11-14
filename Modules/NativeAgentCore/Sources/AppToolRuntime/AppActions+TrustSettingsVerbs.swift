@@ -3,10 +3,10 @@ import Foundation
 
 extension AppActions {
     /// What the Trust and Settings rows call that no existing verb does. Each runs its Mac handler through `upkeep`
-    /// (`AppQuietToolHost.runTrustSettingsUpkeep`). A row that needs the person themself in the foreground on this Mac (answering a macOS
-    /// prompt, choosing in a file chooser, a damaged policy no gate can read) is a lever the agent's call never takes: `asks: false`, since no
-    /// card and no word of theirs can stand in for the person there. A row that only opens a window or writes the clipboard for them is a
-    /// lever a card can carry: the agent does it when they ask, and asks first when it is its own idea.
+    /// (`AppQuietToolHost.runTrustSettingsUpkeep`). A row that needs the person's own hands in the act itself (choosing in a file chooser, a
+    /// damaged policy no gate can read) is a lever the agent's call never takes: `asks: false`, since no card and no word of theirs can stand
+    /// in for the person there. A row that only puts something in front of the person (macOS's own prompts, which only the person answers, a
+    /// window, the clipboard) is a lever a card can carry: the agent does it when they ask, and asks first when it is its own idea.
     static var trustSettingsInboxVerbs: [AppAction] {
         get throws {
             let foreground = "it runs in the foreground on this Mac for the person at it"
@@ -18,17 +18,17 @@ extension AppActions {
                                   name: "Authorizing Safe after a damaged Trust policy"),
                           tool: "upkeep", input: verb("trust_authorize_safe")),
                 AppAction("trust.check_mail", "trust", "Check Mail access on this Mac", owner: .person(
-                              "it enters Mail, which can raise macOS's Automation prompt; " + foreground, asks: false, name: "Checking Mail access"),
+                              "it enters Mail, which can raise macOS's Automation prompt; " + foreground, name: "Checking Mail access"),
                           tool: "upkeep", input: verb("trust_check_mail")),
                 AppAction("trust.ask_grant", "trust", "Ask macOS for these grants", ["targets:list"], owner: .person(
-                              "only the person answers macOS's prompt; " + foreground,
-                              instead: "permissions.request raises the person's permission card", asks: false, name: "Answering macOS's permission prompts"),
+                              "it puts macOS's permission prompts in front of the person, and only the person answers them; " + foreground,
+                              instead: "permissions.request raises the person's permission card", name: "Raising macOS's permission prompts"),
                           tool: "upkeep", input: verb("trust_ask_grant")),
                 AppAction("trust.grant_settings", "trust", "Open System Settings at a grant's pane", ["target"], subject: ["target"], owner: .person(
                               "it opens System Settings; " + foreground, name: "Opening System Settings at a permission"),
                           tool: "upkeep", input: verb("trust_grant_settings")),
                 AppAction("trust.test_notification", "trust", "Send a Mac control test notification", owner: .person(
-                              "it tests Mac control's notification, which can raise macOS's prompt; " + foreground, asks: false,
+                              "it tests Mac control's notification, which can raise macOS's prompt; " + foreground,
                                   name: "Sending a Mac control test notification"),
                           tool: "upkeep", input: verb("trust_test_notification")),
                 AppAction("trust.workbench", "trust", "Open the Mac control workbench", owner: .person(

@@ -57,6 +57,27 @@ public enum SystemPermissionCapability: String, CaseIterable, Sendable {
         }
     }
 
+    /// What the grant lets the agent do, in plain words, as a permission card's row says it after the grant's name.
+    public var purpose: String {
+        switch self {
+        case .speechRecognition: return "turn what you say into words"
+        case .microphone: return "hear you when you talk to me"
+        case .accessibility: return "click, type and move windows on your Mac when you ask"
+        case .location: return "know where this Mac is when you ask"
+        case .fullDiskAccess: return "read your Messages history and other protected files when you ask"
+        case .screenRecording: return "see your screen when you ask"
+        case .inputMonitoring: return "tell when you're at the Mac, and your typing from mine"
+        case .automation: return "work in your apps when you ask"
+        case .calendars: return "read your calendar and add events"
+        case .reminders: return "read your reminders and add new ones"
+        case .contacts: return "look up the people you mention"
+        case .notifications: return "let you know when something needs you"
+        case .bluetooth: return "work with a Bluetooth device when you ask"
+        case .camera: return "use the camera when you ask"
+        case .photos: return "find photos in your library when you ask"
+        }
+    }
+
     /// macOS Privacy & Security anchor; Notifications has its own pane.
     public var settingsAnchor: String? {
         switch self {
@@ -159,13 +180,18 @@ public enum SystemPermissionPreflight {
         }
     }
 
+    /// The grants macOS never asks in place: their switch is only in System Settings, so a walk opens their pane. Any other grant the person already
+    /// declined joins them, read live.
+    public static let keptInSettings: Set<SystemPermissionCapability> = [.accessibility, .screenRecording, .inputMonitoring, .fullDiskAccess]
+
+    /// One line per grant the card sends to System Settings; macOS asks the others in place.
     public static func cardSettingsInstructions(_ ids: [String]) -> [String] {
         var seen: Set<SystemPermissionCapability> = []
         return ids.compactMap { id in
-            guard let pane = cardSettingsCapability(id), seen.insert(pane).inserted else { return nil }
+            guard let pane = cardSettingsCapability(id), keptInSettings.contains(pane), seen.insert(pane).inserted else { return nil }
             return pane == .fullDiskAccess
-                ? "Add NativeAgent from Finder to the pane that opens, then turn it on."
-                : "Allow \(pane.displayName) on this card; turn on NativeAgent in the pane that opens."
+                ? "\(pane.displayName): add NativeAgent from Finder to the pane that opens, then turn it on."
+                : "\(pane.displayName): turn on NativeAgent in the pane that opens."
         }
     }
 
@@ -400,13 +426,20 @@ extension SystemPermissionPreflight {
         return ids.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }.map(\.element)
     }
 
-    /// What a card's grants wait on now, read live and never prompting: the first grant still off in friction order, else the one restart its
-    /// launch-applied grants need, else nothing. A grant macOS has not confirmed is still waited on.
-    public static func waitingOn(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> InlineInteraction.WaitingOn? {
+    /// What a card's grants wait on now, read live and never prompting: the first grant still off in friction order that the walk has not
+    /// already shown the person (`passed`: its pane opened and the person came back without it reading on). Past those, the one restart when
+    /// a launch-applied grant is among what is left, else the first still off, so the card can open it again; nothing when all are on.
+    public static func waitingOn(_ ids: [String], mode: InlineInteraction.AccessMode?, passed: Set<String> = []) async -> InlineInteraction.WaitingOn? {
+        var left: [String] = []
         for id in frictionOrder(ids) where cardSettingsCapability(id) != nil {
-            if await cardBlockReason([id], mode: mode) != nil { return .target(id) }
+            guard await cardBlockReason([id], mode: mode) != nil else { continue }
+            if !passed.contains(id) { return .target(id) }
+            left.append(id)
         }
-        return awaitingLaunch(ids).isEmpty ? nil : .restart
+        if !awaitingLaunch(ids).isEmpty || left.contains(where: { cardSettingsCapability($0).map(appliesAtLaunch.contains) == true }) {
+            return .restart
+        }
+        return left.first.map { .target($0) }
     }
 
     /// The launch-applied grants on a card that this process did not launch with, in walk order: one restart is what makes them take effect.
@@ -414,15 +447,6 @@ extension SystemPermissionPreflight {
         var seen: Set<SystemPermissionCapability> = []
         return frictionOrder(ids).compactMap(cardSettingsCapability).filter {
             appliesAtLaunch.contains($0) && !grantedAtLaunch.contains($0) && seen.insert($0).inserted
-        }
-    }
-
-    /// The walk has reached what one restart covers: the restart itself, or a launch-applied grant whose probe this process may not see until then.
-    public static func waitsForRestart(_ waiting: InlineInteraction.WaitingOn?) -> Bool {
-        switch waiting {
-        case .some(.restart): return true
-        case .some(.target(let id)): return cardSettingsCapability(id).map { appliesAtLaunch.contains($0) } ?? false
-        case nil: return false
         }
     }
 

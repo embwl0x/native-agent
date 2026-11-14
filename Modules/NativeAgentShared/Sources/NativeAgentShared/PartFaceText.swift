@@ -91,13 +91,20 @@ extension PartFace {
                 continue
             }
             // Folding is how a section is drawn for the person. The agent's reading keeps every folded row it could act on (a control or
-            // an action) and counts the rest, so a fold never takes a call out of its reach.
+            // an action) and counts the rest, so a fold never takes a call out of its reach. On a page, a folded row reads as its name, its
+            // state and its calls, without its detail or the section's footer: the section's item reads it whole.
             // A row's inline group reads on the row's own line, so its children are not listed again; rows they hold are listed beneath it.
             let listed = section.rows.flatMap(\.lineRows)
             func callable(_ row: Row) -> Bool { row.control != nil || row.actions?.isEmpty == false }
             func reachable(_ row: Row) -> Bool { callable(row) || row.group.contains(where: callable) }
             let rows = section.folded != true ? listed : door ? listed.filter(reachable) : []
-            if section.folded == true, door, listed.count > rows.count {
+            let compact = section.folded == true && door && page != nil
+            if compact, let page {
+                let quiet = listed.count - rows.count
+                lines.append((quiet == 0 ? "" : quiet == 1 ? "1 row carries nothing to call and is not listed. "
+                    : "\(quiet) rows carry nothing to call and are not listed. ")
+                    + "Rows read without their detail; app {page:\"\(page)\", item:\"\(section.id)\"} reads this section whole.")
+            } else if section.folded == true, door, listed.count > rows.count {
                 let quiet = listed.count - rows.count
                 lines.append(quiet == 1 ? "1 folded row carries nothing to call and is not listed."
                     : "\(quiet) folded rows carry nothing to call and are not listed.")
@@ -108,7 +115,8 @@ extension PartFace {
                 let time = row.at.flatMap(FaceTime.short).map { $0 + " " } ?? ""
                 // A meter with no words of its own reads as its amount.
                 let value = row.value ?? row.meter.map { Self.amount($0.value) + " of " + Self.amount($0.max) }
-                var parts = [time + row.title, row.detail ?? "", value ?? ""].filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                var parts = [time + row.title, compact ? "" : row.detail ?? "", value ?? ""]
+                    .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
                 if let control = row.control {
                     if let on = control.on { parts.append(on ? "on" : "off") }
                     if let text = control.text { parts.append(text.isEmpty ? "(empty)" : "\u{201C}" + text + "\u{201D}") }
@@ -155,7 +163,7 @@ extension PartFace {
                 if door, let read = more.read { lines.append("Read more → " + read.text + " with cursor " + more.next) }
                 if let page { lines.append("page:" + page + "/" + section.id + ", offset:" + more.next) }
             }
-            if let footer = section.footer, !footer.isEmpty { lines.append(bounded(footer)) }
+            if !compact, let footer = section.footer, !footer.isEmpty { lines.append(bounded(footer)) }
         }
         if let detail { lines.append("Read an item from " + detail.of + " through its page link.") }
         return lines.joined(separator: "\n")

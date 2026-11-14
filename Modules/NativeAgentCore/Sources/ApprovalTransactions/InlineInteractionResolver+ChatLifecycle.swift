@@ -284,7 +284,16 @@ extension InlineInteractionResolver {
         if !categories.isEmpty {
             try await controls.grantMacControlCategories(categories, dataRoot: dataRoot, logTag: "interaction")
         }
-        // macOS is asked only for what the app side actually allowed: a Trust write refused outside Full Mac never leads to a macOS prompt.
+        // The card keeps running while macOS leaves anything unresolved, or while a grant waits on the restart only this card's tap performs.
+        let allowed = try await macOSAllowed(interaction, dataRoot: dataRoot)
+        shownPanes[interaction.id] = nil
+        let unresolved = try await platform.askMacOSForCard(allowed, mode: mode, passed: [])
+        return !unresolved.isEmpty || !SystemPermissionPreflight.awaitingLaunch(allowed).isEmpty
+    }
+
+    /// What of a card macOS may be asked for: only what the app side allowed, so a Trust write refused outside Full Mac never leads to a macOS
+    /// prompt.
+    static func macOSAllowed(_ interaction: InlineInteraction, dataRoot: URL) async throws -> [String] {
         let granted: [String: MacIntegrationPermission]
         if interaction.allTargets.contains(where: { MacIntegrationID.all.contains($0) }) {
             granted = try await MacIntegrationPermissionStore(dataRoot: dataRoot).currentChecked()
@@ -302,9 +311,7 @@ extension InlineInteractionResolver {
                 allowed.append(capability)
             }
         }
-        // The card keeps running while macOS leaves anything unresolved, or while a grant waits on the restart only this card's tap performs.
-        let unresolved = try await platform.askMacOSForCard(allowed, mode: mode)
-        return !unresolved.isEmpty || !SystemPermissionPreflight.awaitingLaunch(allowed).isEmpty
+        return allowed
     }
 
     public static func setCapabilityFlag(
@@ -318,7 +325,7 @@ extension InlineInteractionResolver {
         }
         try await controls.grantCapabilityFlag(policyKey: flag.policyKey, dataRoot: dataRoot, logTag: "interaction")
         if flag.id != "screen_capture" || controls.screenCaptureEnabled,
-           !(try await platform.askMacOSForCard([flag.id], mode: nil)).isEmpty {
+           !(try await platform.askMacOSForCard([flag.id], mode: nil, passed: [])).isEmpty {
             return true
         }
         // Trust is re-read by the resolver; the tap is not the authority.
@@ -404,10 +411,17 @@ extension InlineInteractionResolver {
         }
     }
 
-    /// A running permission card carries itself: on every wake it re-reads macOS, records the one item it now waits on, and when that moved off the item
-    /// it waited on, asks for the new one, which opens its pane. Only a tap starts a walk, so a pending card is never driven. The walk begins once the tap's
-    /// own ask has handed the card over (`handed`) or the card already recorded an item; its first read only records, because the tap opened that pane.
-    static func walk(id: String, sessionID: String, handed: Bool, dataRoot: URL) async {
+    /// The panes a running permission card's walk already showed and the person came back from without the grant reading on, per card. A
+    /// launch-applied grant may read off until the one restart, so coming back moves the walk on rather than stopping it. Process-local: after a
+    /// restart, what took reads on and what did not is shown again.
+    static var shownPanes: [String: Set<String>] = [:]
+
+    /// A running permission card carries itself. On every wake (the person back in the agent's window, System Settings quit) it re-reads
+    /// macOS. When the grant it waited on is on, or the person came back without it (that pane joins `shownPanes`), the one walk goes on
+    /// (`askMacOSForCard`) and the card records what it waits on after that ask. `asking` is the person's Continue: the walk starts over from
+    /// the first grant still off, so a pane closed without granting opens again. Only a tap starts a walk, so a pending card is never driven;
+    /// the first wake after the tap only records, because the tap's own walk just asked.
+    public static func walk(id: String, sessionID: String, handed: Bool, asking: Bool = false, dataRoot: URL) async {
         let current: InlineInteraction
         do {
             guard let found = try await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot) else { return }
@@ -416,9 +430,27 @@ extension InlineInteractionResolver {
             recordControlFailure(id, dataRoot: dataRoot, error: error)
             return
         }
-        guard current.kind == .permission, case .running = current.state, handed || current.waitingOn != nil,
+        guard current.kind == .permission, case .running = current.state else {
+            shownPanes[id] = nil
+            return
+        }
+        guard handed || asking || current.waitingOn != nil,
               await descriptor(for: current, dataRoot: dataRoot).control == .macPermissionGrant else { return }
-        let now = await SystemPermissionPreflight.waitingOn(current.allTargets, mode: current.mode)
+        if asking { shownPanes[id] = nil }
+        var now = await SystemPermissionPreflight.waitingOn(current.allTargets, mode: current.mode, passed: shownPanes[id] ?? [])
+        guard !Task.isCancelled else { return }
+        // Back from the pane it waited on, still off: that pane was shown; the walk goes on past it.
+        if !asking, case .target(let shown)? = current.waitingOn, now == current.waitingOn, shownPanes[id]?.contains(shown) != true {
+            shownPanes[id, default: []].insert(shown)
+            now = await SystemPermissionPreflight.waitingOn(current.allTargets, mode: current.mode, passed: shownPanes[id] ?? [])
+        }
+        if asking || (current.waitingOn != nil && now != current.waitingOn) {
+            do {
+                _ = try await platform.askMacOSForCard(try await macOSAllowed(current, dataRoot: dataRoot), mode: current.mode,
+                    passed: shownPanes[id] ?? [])
+            } catch { recordControlFailure(id, dataRoot: dataRoot, error: error) }
+            now = await SystemPermissionPreflight.waitingOn(current.allTargets, mode: current.mode, passed: shownPanes[id] ?? [])
+        }
         guard now != current.waitingOn, !Task.isCancelled else { return }
         var moved = current
         moved.waitingOn = now
@@ -431,11 +463,7 @@ extension InlineInteractionResolver {
             })
         } catch {
             recordControlFailure(id, dataRoot: dataRoot, error: error)
-            return
         }
-        guard current.waitingOn != nil, case .target(let next)? = now else { return }
-        do { _ = try await platform.askMacOSForCard([next], mode: current.mode) }
-        catch { recordControlFailure(id, dataRoot: dataRoot, error: error) }
     }
 
     static func recordControlFailure(_ id: String, dataRoot: URL, error: any Error) {

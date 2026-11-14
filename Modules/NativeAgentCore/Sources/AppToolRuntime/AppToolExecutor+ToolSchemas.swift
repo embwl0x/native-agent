@@ -175,8 +175,10 @@ extension AppToolExecutor {
                                          ("description", .string("""
                                              Many calls in one, in order: each {action, args}, {page[, item]} or {item}, so several pages or items are one \
                                              call, and a whole deed you already know is one call. Each reports itself with its own receipt. Nothing is built \
-                                             on a surprise: after a step that fails, waits on the person, or does not come back as you said, later changes do \
-                                             not run and later reads still do; the result names that step, what was there, and what did not run. A step may \
+                                             on a surprise, and nothing the person asked for waits on a step they did not: a step the gate refuses or files on \
+                                             a card is reported in its place and the steps after it still run, while after a step that fails, waits in place \
+                                             on the person, or does not come back as you said, later changes do not run and later reads still do; the result \
+                                             names that step, what was there, and what did not run. A step may \
                                              add expect, what must come back, as a shape laid over its result: text is met by containing it, a number or \
                                              true/false by equality, null by nothing being there (missing, null or empty), {exactly: v} by the whole value, {not: shape} by the shape \
                                              not being met; a bare string is looked for in what came back, never in your own arguments. An argument value \

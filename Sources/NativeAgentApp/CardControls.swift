@@ -134,9 +134,15 @@ extension AppInlineInteractionPlatformPort {
         AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let center = NSWorkspace.shared.notificationCenter
             // Tokens are immutable; NotificationCenter can remove them from any thread.
-            nonisolated(unsafe) let active = NotificationCenter.default.addObserver(
-                forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
-            ) { _ in continuation.yield(()) }
+            // The person coming back to the app is the agent's window coming to the front: that process is the face, and this one never
+            // becomes the active app, so its own activation would never arrive.
+            nonisolated(unsafe) let active = center.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+            ) { notification in
+                let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                guard PersonOnlyWindows.isOwnProcess(app?.processIdentifier) else { return }
+                continuation.yield(())
+            }
             nonisolated(unsafe) let changed = NotificationCenter.default.addObserver(
                 forName: SystemPermissionPreflight.permissionDidChange, object: nil, queue: .main
             ) { _ in continuation.yield(()) }
@@ -148,7 +154,7 @@ extension AppInlineInteractionPlatformPort {
                 continuation.yield(())
             }
             continuation.onTermination = { _ in
-                NotificationCenter.default.removeObserver(active)
+                center.removeObserver(active)
                 NotificationCenter.default.removeObserver(changed)
                 center.removeObserver(quit)
             }
@@ -156,8 +162,8 @@ extension AppInlineInteractionPlatformPort {
         }
     }
 
-    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async throws -> [String] {
-        try await SystemPermissionPreflight.askMacOSForCard(ids, mode: mode)
+    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?, passed: Set<String>) async throws -> [String] {
+        try await SystemPermissionPreflight.requestMacOSAccess(ids, mode: mode, passed: passed)
     }
 
     func writeInteractionSnapshots() async { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }

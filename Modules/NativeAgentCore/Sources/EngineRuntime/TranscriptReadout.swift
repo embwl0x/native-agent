@@ -50,6 +50,7 @@ extension InlineCards {
             var model = InlineCards.model(interaction, descriptor: descriptor,
                 repeatCount: collapsed.counts[interaction.id] ?? 1)
             model.sessionID = pair.sessionID
+            model.grantsNow = await InlineInteractionResolver.grantsNow(interaction, control: descriptor)
             built[pair.rowID, default: []].append(
                 .init(interaction: interaction, descriptor: descriptor, sessionID: pair.sessionID,
                        model: model, repeatCount: collapsed.counts[interaction.id] ?? 1)

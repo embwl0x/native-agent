@@ -258,6 +258,7 @@ enum QuietSelfAdminRender {
         }
         var lines: [String] = ["State: \(card.state.rawValue)"]
         if !card.why.isEmpty { lines.append("Why: \(card.why)") }
+        if let now = card.grantsNow { lines.append(now) }
         if card.state == .running, let note = card.busyNote { lines.append("Working: \(note)") }
         if let restart = card.restartNote { lines.append("Restart: \(restart) Only the person's tap on the card restarts.") }
         lines.append(contentsOf: card.scopeLines)

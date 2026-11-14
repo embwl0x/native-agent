@@ -1,5 +1,6 @@
 import Connectors
 import AttentionRouting
+import ChatToolRuntime
 import Foundation
 import AppKit
 import ApplicationServices
@@ -19,102 +20,96 @@ import UserNotifications
 // Blueprint: | `SystemPermissionPreflight.swift` | Shared consent; scoped failures, activation and Bluetooth event waits, checked cleanup |
 
 extension SystemPermissionPreflight {
-    /// Request native grants only with the person present. Each unresolved item reports why; the first one in walk order has its Settings pane open.
-    @MainActor
-    static func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async throws -> [String] {
-        try await requestMacOSAccess(ids, mode: mode)
-    }
-
-    /// Successful grants stay in-app; collect item failures while unrelated requests proceed.
+    /// The one walk through macOS grants, for the permission card's Allow and Continue, the person's return to the agent's window, and Trust's
+    /// "Ask for every prompt not yet answered" (which files or continues the same card). First, every grant macOS can still ask in place is
+    /// asked, in walk order (Notifications, Calendar, Reminders, Contacts, Microphone, Speech, Automation by an Apple Event to that app); a
+    /// request that fails is said in the result and the walk goes on. Then the first grant still off that is not in `passed` (a pane the
+    /// person already came back from) is registered where macOS has a request for it and its exact pane opens: Device Control, Screen
+    /// Recording, Input Monitoring, Full Disk Access, or one the person declined. The walk stops there and goes on when the person comes back
+    /// to the window (`InlineInteractionResolver.GrantWatch`). Returns what it waits on and what failed; empty when nothing is left to show.
     @MainActor
     static func requestMacOSAccess(
-        _ ids: [String], mode: InlineInteraction.AccessMode? = nil
+        _ ids: [String], mode: InlineInteraction.AccessMode? = nil, passed: Set<String> = []
     ) async throws -> [String] {
-        var problems: [String] = []
-        var requestFailed = false
-        var openedPanes: Set<SystemPermissionCapability> = []
-        defer { NotificationCenter.default.post(name: permissionDidChange, object: nil) }
-        for id in frictionOrder(ids) {
-            guard let gate = cardSettingsCapability(id),
-                  await cardBlockReason([id], mode: mode) != nil else { continue }
-            // Once this walk has sent the person to a Settings pane, they are there because it asked: the rest still register.
-            if openedPanes.isEmpty, let problem = await activationProblem() {
-                problems.append(problem)
-                break
-            }
-            do {
-            if let bundleID = AppleScriptExecution.automationTarget(id) {
-                let result = await AppleScriptExecution.automationPermission(bundleID: bundleID, ask: true)
-                if result.objectValue?["state"] == .string("unavailable") {
-                    throw ToolFailureError(try result.serialize(pretty: false), effects: .none)
-                }
-            } else if gate == .notifications {
-                if await NativeAgentNotifications.notificationSettings().authorizationStatus == .notDetermined {
-                    if let error = await NativeAgentNotifications.requestAuthorizationError() {
-                        throw ToolFailureError(error, effects: .none)
-                    }
-                }
-            } else {
-                switch gate {
-                case .calendars where mode == .write:
-                    _ = try await LocalPIMConnectorActions.requestCalendarWriteAccessIfNeeded(store: EKEventStore())
-                case .calendars: _ = try await LocalPIMConnectorActions.requestCalendarAccess()
-                case .reminders: _ = try await LocalPIMConnectorActions.requestReminderAccess()
-                case .contacts where status(gate) == .notDetermined:
-                    _ = try await CNContactStore().requestAccess(for: .contacts)
-                case .speechRecognition: _ = await requestSpeechRecognitionIfNotDetermined()
-                case .location: MacLocationReader.requestAuthorization()
-                case .microphone where status(gate) == .notDetermined:
-                    _ = await AVCaptureDevice.requestAccess(for: .audio)
-                case .camera where status(gate) == .notDetermined:
-                    _ = await AVCaptureDevice.requestAccess(for: .video)
-                case .photos where status(gate) == .notDetermined:
-                    _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-                case .bluetooth where status(gate) == .notDetermined:
-                    if let unresolved = await BluetoothPrompt.ask() {
-                        throw ToolFailureError(unresolved, effects: .none)
-                    }
-                // First requests register the app in Settings so the person has a switch to enable.
-                case .accessibility: registerForAccessibility()
-                case .screenRecording: _ = CGRequestScreenCaptureAccess()
-                case .inputMonitoring: _ = CGRequestListenEventAccess()
-                case .fullDiskAccess:
-                    NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
-                default: break
-                }
-            }
-            } catch {
-                let cause = "\(gate.displayName) (\(id)) permission request could not complete: \(error.localizedDescription)"
-                // Cancellation must not open another pane; other failures keep both cause and remedy.
-                let handoff = Task.isCancelled
-                    || !openedPanes.isEmpty || !openedPanes.insert(gate).inserted ? nil : await openSettings(gate, registered: true)
-                let remedy = " Open System Settings > Privacy & Security > \(gate.displayName), allow NativeAgent, then return here and refresh."
-                problems.append(cause + remedy + (handoff.map { " " + $0 } ?? ""))
-                requestFailed = true
-                if Task.isCancelled { break }
-                continue
-            }
-            guard !Task.isCancelled else {
-                problems.append("The macOS permission request was interrupted; its grant is unconfirmed.")
-                break
-            }
-            if let reason = await cardBlockReason([id], mode: mode) {
-                problems.append(reason)
-                // Open only the first unresolved pane because each later pane hides the previous one.
-                if openedPanes.isEmpty, openedPanes.insert(gate).inserted, let failure = await openSettings(gate, registered: true) {
-                    problems.append(failure)
-                }
-            }
+        let order = frictionOrder(ids)
+        var lines: [String] = []
+        var checked = false
+        // The person is checked once, before the first ask: after a macOS prompt closes, the app is not yet back in front.
+        func absent() async -> String? {
+            guard !checked else { return nil }
+            checked = true
+            return await activationProblem()
         }
-        if requestFailed {
-            throw ToolFailureError(problems.joined(separator: " "), effects: .none,
-                owner: "macOS permissions", tap: "System Settings",
-                code: "system_permission_request_unresolved", instruction: """
-                    For each unresolved permission, allow NativeAgent in the named pane, then return to the permission card or Settings and \
-                    refresh.
-                    """)
+        for id in order {
+            guard let gate = cardSettingsCapability(id), await asksInPlace(id, gate: gate) else { continue }
+            if let problem = await absent() { return [problem] }
+            do { try await askInPlace(id, gate: gate, mode: mode) }
+            catch { lines.append("\(InlineInteractionRegistry.macCapabilityDisplayName(id)) could not be asked: \(error.localizedDescription)") }
+            guard !Task.isCancelled else { return lines + ["The macOS permission request was interrupted; its grant is unconfirmed."] }
         }
-        return problems
+        for id in order where !passed.contains(id) {
+            guard let gate = cardSettingsCapability(id), let waiting = await cardBlockReason([id], mode: mode) else { continue }
+            if let problem = await absent() { return lines + [problem] }
+            register(gate)
+            // The pane opens and the walk waits for the person's return; it posts no change of its own, so only their return goes on.
+            return lines + [waiting] + ((await openSettings(gate, registered: true)).map { [$0] } ?? [])
+        }
+        NotificationCenter.default.post(name: permissionDidChange, object: nil)
+        return lines
+    }
+
+    /// Whether macOS would ask for this grant in place now: it has never been answered. A grant kept in System Settings never asks in place.
+    @MainActor
+    private static func asksInPlace(_ id: String, gate: SystemPermissionCapability) async -> Bool {
+        if let bundleID = AppleScriptExecution.automationTarget(id) {
+            // Not asked yet, or not readable while the app is stopped: the ask opens the app and macOS asks.
+            guard case .object(let probe) = await AppleScriptExecution.automationPermission(bundleID: bundleID) else { return true }
+            return probe["code"] == .int(-1744) || probe["code"] == .int(-600)
+        }
+        guard !keptInSettings.contains(gate) else { return false }
+        if gate == .notifications { return await NativeAgentNotifications.notificationSettings().authorizationStatus == .notDetermined }
+        return status(gate) == .notDetermined
+    }
+
+    /// Ask macOS for one grant in place.
+    @MainActor
+    private static func askInPlace(_ id: String, gate: SystemPermissionCapability, mode: InlineInteraction.AccessMode?) async throws {
+        if let bundleID = AppleScriptExecution.automationTarget(id) {
+            let result = await AppleScriptExecution.automationPermission(bundleID: bundleID, ask: true)
+            if result.objectValue?["state"] == .string("unavailable") {
+                throw ToolFailureError(try result.serialize(pretty: false), effects: .none)
+            }
+            return
+        }
+        switch gate {
+        case .notifications:
+            if let error = await NativeAgentNotifications.requestAuthorizationError() { throw ToolFailureError(error, effects: .none) }
+        case .calendars where mode == .write:
+            _ = try await LocalPIMConnectorActions.requestCalendarWriteAccessIfNeeded(store: EKEventStore())
+        case .calendars: _ = try await LocalPIMConnectorActions.requestCalendarAccess()
+        case .reminders: _ = try await LocalPIMConnectorActions.requestReminderAccess()
+        case .contacts: _ = try await CNContactStore().requestAccess(for: .contacts)
+        case .speechRecognition: _ = await requestSpeechRecognitionIfNotDetermined()
+        case .location: MacLocationReader.requestAuthorization()
+        case .microphone: _ = await AVCaptureDevice.requestAccess(for: .audio)
+        case .camera: _ = await AVCaptureDevice.requestAccess(for: .video)
+        case .photos: _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        case .bluetooth:
+            if let unresolved = await BluetoothPrompt.ask() { throw ToolFailureError(unresolved, effects: .none) }
+        default: break
+        }
+    }
+
+    /// Put NativeAgent's switch in the pane the walk opens: the pane lists only apps that asked.
+    @MainActor
+    private static func register(_ gate: SystemPermissionCapability) {
+        switch gate {
+        case .accessibility: registerForAccessibility()
+        case .screenRecording: _ = CGRequestScreenCaptureAccess()
+        case .inputMonitoring: _ = CGRequestListenEventAccess()
+        case .fullDiskAccess: NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+        default: break
+        }
     }
 
     /// The person is present when this app is in front. The agent's window is its face, a process of its own inside this bundle; this

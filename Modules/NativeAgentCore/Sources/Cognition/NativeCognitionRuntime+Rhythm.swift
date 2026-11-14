@@ -2,6 +2,7 @@ import AgentWorkspace
 import ChatToolRuntime
 import CognitiveSubstrate
 import Experiences
+import CoreGraphics
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -176,9 +177,21 @@ extension NativeCognitionRuntime {
             fields["reason"] = .string("Waiting for the person to be away.")
             if presence.here { fields["hereSince"] = .double(presence.since.timeIntervalSince1970) }
         } else {
-            fields["reason"] = .string("Whether the person is here is unknown (no Mac input reading yet), so no night is due.")
+            fields["reason"] = .string(Self.presenceUnknownCause)
         }
         return .object(fields)
+    }
+
+    /// Why presence is unknown, from Input Monitoring itself, with the step that ends it: no night is due until the person can be seen away.
+    static var presenceUnknownCause: String {
+        if MacPersonInput.listening {
+            return "I haven't felt your Mac input since NativeAgent started, so I can't tell yet when you're away; no night is due until I can."
+        }
+        if CGPreflightListenEventAccess() {
+            return "Input Monitoring is on but counts from the next launch: I can't tell when you're away until NativeAgent restarts once."
+        }
+        return "I can't tell when you're away until Input Monitoring is on: System Settings → Privacy & Security → Input Monitoring, "
+            + "or Allow it on Trust's macOS grants. No night is due until then."
     }
 
     func personTurnAt() throws -> Date? {

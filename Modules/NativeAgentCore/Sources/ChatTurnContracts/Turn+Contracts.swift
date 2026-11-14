@@ -192,4 +192,38 @@ public enum RequestWords {
             }
         }
     }
+
+    /// Whether the quote is about this act: it shares a word with the act's own words, or the act widens what the agent may do and the
+    /// quote asks for the whole of that (`asksWhole`), which names every such act at once.
+    public static func relates(_ quote: String, to act: [String], widens: Bool) -> Bool {
+        relates(quote, to: act) || (widens && asksWhole(quote))
+    }
+
+    /// The words that name what a widening gives the agent.
+    static let kind = ["permission", "access", "grant"]
+    /// Words that, before a word of the kind, ask for all of it.
+    static let whole: Set<String> = ["all", "every", "full", "fully", "entire", "whole"]
+    /// Words that may stand between those and the kind: articles and owners.
+    static let between: Set<String> = ["the", "my", "your", "her", "his", "their", "its", "of", "these", "those", "this", "that"]
+
+    /// Whether a word is one of the kind (`permissions`, `accessing`, `granted`).
+    public static func namesKind(_ text: String) -> Bool {
+        text.lowercased().split { !($0.isLetter || $0 == "'") }.contains { word in kind.contains { word.hasPrefix($0) } }
+    }
+
+    /// Whether the quote asks for everything the agent may be given: a whole word before a word of the kind, with only articles and owners
+    /// between ("full permissions", "all your access", "every grant"); "everywhere" or "everything" in a quote that names the kind; or
+    /// "all of it" / "all of them". A whole word before anything else ("full disk access") asks for that thing alone.
+    public static func asksWhole(_ quote: String) -> Bool {
+        let said = quote.lowercased().split { !($0.isLetter || $0.isNumber || $0 == "'") }.map(String.init)
+        let named = said.contains { word in kind.contains { word.hasPrefix($0) } }
+        for (index, word) in said.enumerated() {
+            if named, word == "everywhere" || word == "everything" { return true }
+            guard whole.contains(word) else { continue }
+            let rest = said.dropFirst(index + 1)
+            if word == "all", rest.prefix(2).elementsEqual(["of", "it"]) || rest.prefix(2).elementsEqual(["of", "them"]) { return true }
+            if let next = rest.first(where: { !between.contains($0) }), kind.contains(where: { next.hasPrefix($0) }) { return true }
+        }
+        return false
+    }
 }

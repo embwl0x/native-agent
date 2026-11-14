@@ -1002,7 +1002,7 @@ Directory: `Modules/NativeAgentCore/Sources/AppToolRuntime/`
 | `AppActions+TrustSettingsVerbs.swift` | The verbs Trust's and Settings' rows call beyond `setting.set` and the existing backup, history and grant verbs: the Mac's own buttons, each the person's lever where it needs the person at the Mac |
 | `AppChatToolDispatcher.swift` | `withAuthoredProgramHost`; Gated dispatch and settled-result observation |
 | `AppDoorActions.swift` | Shared admission, previews and typed receipts; accepted matters supply the call's knock count |
-| `AppDoorPrograms.swift` | Ordered gated calls; a failed, waiting or unexpected step bars later changes, not reads or cleanups; changes that are all the person's to decide are one card; their `then_say` stands only when the deed came back wholly as said |
+| `AppDoorPrograms.swift` | Ordered gated calls, each admitted on its own; a step that ran and failed, waits on an in-place card or came back unexpected bars later changes, not reads or cleanups; changes that are all the person's to decide are one card; their `then_say` stands only when the deed came back wholly as said |
 | `AppDoorReading.swift` | Home/page/item/find reads; call-fit census independent of admission |
 | `AppScriptRunner.swift` | Gated program host, live contracts and shared normalization |
 | `AppToolExecutor+AppDoor.swift` | `app`, `visible`, `undo`; App dispatch, version recovery and action-owned undo |

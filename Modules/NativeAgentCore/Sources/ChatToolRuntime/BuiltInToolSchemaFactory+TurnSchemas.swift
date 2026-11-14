@@ -34,8 +34,9 @@ extension BuiltInToolSchemaFactory {
                     properties: [
                         ("result_handle", ToolSchema.nullable(ToolSchema.strSchema("Opaque handle from the bounded_tool_result receipt."))),
                         ("continue", ToolSchema.nullable(ToolSchema.boolSchema("""
-                            Continue this turn's last successful read; page is ignored; omit query/raw. result_handle explicitly changes result. \
-                            Before any read, starts the sole retained result or asks you to choose.
+                            Continue this turn's last successful read; page is ignored. With query or raw, reads that way: the same read goes on, \
+                            a different one starts at its page 0. result_handle explicitly changes result. Before any read, starts the sole \
+                            retained result or asks you to choose.
                             """))),
                         ("page", ToolSchema.nullable(ToolSchema.intSchema("""
                             Zero-based whole-number page index. Omit or null starts at 0; follow next_page while has_more is true. Keep query and \

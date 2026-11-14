@@ -90,6 +90,9 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
     public var busyNote: String?
     /// The card's one restart for its launch-applied grants, said in full; nil when the card does not offer it.
     public var restartNote: String?
+    /// An open permission card's macOS grants as the app reads them now: what took and what is left. Filled where cards are read
+    /// (`InlineInteractionResolver.grantsNow`), never stored.
+    public var grantsNow: String?
     public var outcome: String?
     public var outcomeMeta: String?
     public var canStop: Bool
@@ -280,11 +283,13 @@ public enum InlineCards {
         case .connector, .apiKey:
             return "Connect \(descriptor.displayName)"
         case .permission:
-            let names = interaction.allTargets.map(
-                InlineInteractionRegistry.macCapabilityDisplayName
-            )
-            let phrase = InlineInteractionRegistry.englishList(names)
-            return phrase.isEmpty ? interaction.primaryActionLabel : "Allow \(phrase)"
+            // The button names the step, never the whole list: a long label does not fit the row and leaves the card with no button.
+            if case .running = interaction.state {
+                return restartNote(interaction) != nil ? "Restart NativeAgent" : "Continue"
+            }
+            let names = interaction.allTargets.map(InlineInteractionRegistry.macCapabilityDisplayName)
+            if names.isEmpty { return interaction.primaryActionLabel }
+            return names.count == 1 ? "Allow \(names[0])" : "Allow all"
         case .capability:
             return "Turn on \(descriptor.displayName.lowercased())"
         case .modelChoice, .choose, .unknown:
@@ -365,11 +370,18 @@ public enum InlineCards {
 
     /// Describe the real grant: integration axes can narrow access, but Trust categories are indivisible switches.
     private static func axes(_ capability: String, mode: InlineInteraction.AccessMode?) -> String {
-        if capability.hasPrefix("applescript:") { return "macOS Automation consent for this app" }
+        if capability.hasPrefix("applescript:"), let bundleID = AppleScriptExecution.automationTarget(capability) {
+            let app = AppleScriptExecution.automationTargetBundleIDs.first { $0.value == bundleID }?.key ?? bundleID
+            return "work in \(app) when you ask"
+        }
         if InlineInteractionRegistry.isMacControlCategory(capability) {
             guard let mode else { return "one switch in Trust, covering reading and changing" }
             return "needed for \(mode == .write ? "changing" : "reading")"
                 + "; the one Trust switch covers reading and changing"
+        }
+        // A macOS grant has no read or write axis: the row says what it lets the agent do.
+        if !MacIntegrationID.all.contains(capability), let gate = SystemPermissionPreflight.cardSettingsCapability(capability) {
+            return gate.purpose
         }
         let read = MacIntegrationID.supportsRead(capability) && (mode?.wantsRead ?? true)
         let write = MacIntegrationID.supportsWrite(capability) && (mode?.wantsWrite ?? true)
@@ -495,7 +507,8 @@ public enum InlineCards {
         guard !pending.isEmpty else { return nil }
         switch interaction.state {
         case .running where interaction.kind == .permission:
-            guard SystemPermissionPreflight.waitsForRestart(interaction.waitingOn) else { return nil }
+            // The restart is offered once, at the end of the walk; a grant still open mid-walk keeps Continue.
+            guard interaction.waitingOn == .restart else { return nil }
         case .running, .failed:
             break
         default:

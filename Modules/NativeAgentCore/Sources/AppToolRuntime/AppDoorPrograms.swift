@@ -22,7 +22,7 @@ import TrustCenter
 import Senses
 import PersonaEngine
 import Desk
-// Blueprint: | `AppDoorPrograms.swift` | Ordered gated calls; a failed, waiting or unexpected step bars later changes, not reads or cleanups; changes that are all the person's to decide are one card; their `then_say` stands only when the deed came back wholly as said |
+// Blueprint: | `AppDoorPrograms.swift` | Ordered gated calls, each admitted on its own; a step that ran and failed, waits on an in-place card or came back unexpected bars later changes, not reads or cleanups; changes that are all the person's to decide are one card; their `then_say` stands only when the deed came back wholly as said |
 extension AppToolExecutor {
     /// Every preview says who would receive a card, including refusals that stop before card filing and script previews of the calls reached.
     static func previewApproval(_ value: JSONValue, preview: Bool) -> JSONValue {
@@ -63,7 +63,9 @@ extension AppToolExecutor {
         guard !page.isEmpty, !page.contains("/"), !page.contains(".") else { return false }
         return item.isEmpty || (page.lowercased() != "home" && !item.contains("."))
     }
-    /// Each batch entry re-enters all gates in order. Failure, person-waiting or a step not coming back as said bars later changes while independent
+    /// Each batch entry re-enters all gates in order and is admitted on its own: a step the gate refused or put on the person's card ran nothing
+    /// and is reported in its place, and the steps after it are judged by their own admission. A step that ran and failed, an in-place card's
+    /// wait or a step not coming back as said bars later changes while independent
     /// reads and cleanups proceed. A step's found takes a whole value from what an earlier step returned; one not there stops the deed at that step.
     /// A shared page version advances after each write; Stop ends execution. The first person wait owns the batch envelope and card.
     /// Given then_say, the result always says whether the agent's closing words stand, filled from with, or why not.
@@ -225,7 +227,7 @@ extension AppToolExecutor {
                     let shown: String = named[index + 1].map { "\($0) (\(name))" } ?? name
                     readsAfter.append(shown + (reads ? "" : " as cleanup") + (landed ? "" : ", which did not land"))
                 }
-                if barrier == nil, !landed {
+                if barrier == nil, !landed, !Self.doorNotAdmitted(reply) {
                     barrier = (index + 1, name, reply)
                 } else if barrier == nil, ran, let expect, let value = came[index + 1] {
                     let misses = Self.doorMisses(expect, value, at: "result", said: Self.doorSaid(call["args"]))
@@ -282,8 +284,15 @@ extension AppToolExecutor {
             }
             result["remedy"] = landed == 0 && partial == 0 ? .object(["kind": .string("per_receipt"),
                 "instruction": .string("Each receipt says why it did not land and what to do next."), "next_call": .null]) : nil
-            if !stopped, !handedBack, case .object(let waiting)? = speaking?.payload {
+            // A step that ran and failed is the batch's word over any card beside it: the deed is its worst real step.
+            let realFailure = receipts.contains { $0.outcome.isFailure && !Self.doorNotAdmitted($0) }
+            if !stopped, !handedBack, !realFailure, case .object(let waiting)? = speaking?.payload {
                 result = waiting.merging(["receipts": .array(shown)]) { _, value in value }
+                // The steps admitted beside the wait ran on their own; the wait's words say so, so the card is not read as the whole deed.
+                if landed + partial > 0 {
+                    result["detail"] = .string(Self.doorText(result["detail"]) + " Beside it, \(landed) of \(receipts.count) steps landed fully and "
+                        + "\(partial) partially; each receipt, in order, says what happened.")
+                }
             }
             if let barrier {
                 let state = ChatToolOutcome.isWaitingApproval(barrier.reply.payload) || barrier.reply.isWaitingInteraction ? "is waiting on you" : "failed"
@@ -455,6 +464,23 @@ extension AppToolExecutor {
               !PermissionLaw.personDecided(tool: "app", input: ["action": .string(action.id), "args": .object(args)], turn: turn),
               let posture = await Self.freshQuietPosture(dataRoot: root), posture.changesAllowed else { return nil }
         return .ask((lever.name.isEmpty ? action.id : lever.name.prefix(1).lowercased() + lever.name.dropFirst()) + " (" + lever.why + ")")
+    }
+
+    /// A step admission answered without running it, with nothing changed: the gate refused it (`not_run_status`, or the refusal words the
+    /// gates answer in: `denied` for a Mac switch or app fence such as `operator_permission_off`, `blocked` or `pending_approval` for Trust's),
+    /// a refusal said it never ran (`execution: not_run`), or it was filed on the person's card. Its receipt stands in its place; it is no
+    /// failure of the deed, so it bars nothing after it. A list's answer is its worst real step: it ran nothing only when none of its own
+    /// steps ran, so a failure inside it wins over a card beside that failure.
+    static func doorNotAdmitted(_ reply: ToolResult) -> Bool {
+        guard case .object(let fields) = reply.payload else { return false }
+        if case .array(let steps)? = fields["receipts"] { return !steps.isEmpty && steps.allSatisfy { doorNotAdmitted(ToolResult($0)) } }
+        // A card that holds the step in place (an interaction the person answers before it goes on) is a wait, never a refusal.
+        guard reply.effects == nil || reply.effects == ToolFailureError.Effects.none, !reply.isWaitingInteraction else { return false }
+        // The door may hand an action's own answer back inside `result`; either level speaks for the step.
+        return [fields, fields["result"]?.objectValue ?? [:]].contains { said in
+            said["not_run_status"] != nil || said["execution"] == .string("not_run")
+                || ["denied", "blocked", "pending_approval"].contains(said["status"]?.stringValue ?? "")
+        }
     }
 
     /// Whether a step's arguments take a value from an earlier step, which is only there once that step has run.

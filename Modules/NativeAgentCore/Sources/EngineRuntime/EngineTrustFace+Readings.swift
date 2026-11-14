@@ -85,7 +85,8 @@ extension NativeAgentEngine {
     /// The reach on this Mac: each macOS grant read live and without prompting, as the permission card reads it and in the order a card asks;
     /// never a saved copy. Automation is per app, read by the Mac-access owner's last non-prompting probe, and asked on the same first card as
     /// the rest of the reach. Asking and opening System Settings are the person's levers, in the foreground on this Mac (`trust.ask_grant`,
-    /// `trust.grant_settings`); the agent asks with its own permission card.
+    /// `trust.grant_settings`): a card can carry them, so the agent's call runs on the person's word or their card, and macOS's own prompt
+    /// is still answered by the person alone.
     func trustSystemFace() async -> PartFace.Section {
         let systemStatuses = await macIntegration.systemStatuses
         // A grant is asked in the foreground on this Mac, so its actions run from the Mac door only; each names its own grant targets.

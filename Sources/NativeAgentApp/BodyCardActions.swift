@@ -54,6 +54,16 @@ final class BodyCardActions {
             try await restart()
             return .card(.init(identity: identity, effects: .known, presentationOperation: nil, failure: nil))
         }
+        // A walking permission card stays answerable: Continue starts the one walk over from the first grant still off. The grant watch
+        // already carries a running card (its census), and a wake of its own here would read as the person's return from the pane just opened.
+        if current.kind == .permission, case .running = current.state, descriptor.control == .macPermissionGrant {
+            await InlineInteractionResolver.walk(id: identity.card, sessionID: identity.session, handed: true, asking: true,
+                dataRoot: engine.dataRoot)
+            pending[identity.card] = identity
+            observe()
+            await engine.transcripts.refreshCards(in: identity.session)
+            return try await result(identity, controlIdentity: identity)
+        }
         var values: [String: String] = [:]
         let fields = InlineCards.model(current, descriptor: descriptor).fields
         for (key, value) in answer.fields {
@@ -83,15 +93,7 @@ final class BodyCardActions {
                 values: values, fullSetup: answer.choice == "full_setup", turn: turn, controls: controls, dataRoot: engine.dataRoot,
                 present: { [self] control in
                     try await present(control, descriptor: descriptor, identity: controlIdentity)
-                }, watch: { [self] in
-                    pending[identity.card] = controlIdentity
-                    observe()
-                    InlineInteractionResolver.GrantWatch.shared.watchUntilGranted(identity.card, sessionID: identity.session,
-                        dataRoot: engine.dataRoot) { [weak self] in
-                            guard let self else { return }
-                            await self.verifyPending()
-                        }
-                }, refresh: { [engine] in await engine.transcripts.refreshCards(in: identity.session) })
+                }, watch: { [self] in watch(controlIdentity) }, refresh: { [engine] in await engine.transcripts.refreshCards(in: identity.session) })
         } catch {
             let cause = FaceSecretRedaction.text(error.localizedDescription, secrets: Array(answer.secrets.values))
             pending[identity.card] = nil
@@ -106,6 +108,17 @@ final class BodyCardActions {
             throw WireFailure(code: "card_control_failed", message: "The request could not complete.", cause: cause, effects: .known)
         }
         return try await result(identity, controlIdentity: controlIdentity)
+    }
+
+    /// Watch a card until its owner verifies it: page changes, and for a permission card the grant watch that carries its walk.
+    private func watch(_ identity: CardIdentity) {
+        pending[identity.card] = identity
+        observe()
+        InlineInteractionResolver.GrantWatch.shared.watchUntilGranted(identity.card, sessionID: identity.session,
+            dataRoot: engine.dataRoot) { [weak self] in
+                guard let self else { return }
+                await self.verifyPending()
+            }
     }
 
     func verify(_ identity: CardIdentity) async throws -> FaceActReply {

@@ -394,13 +394,22 @@ package actor ProviderToolResultRecoveryStore {
     }
 
     /// Continue the exact last read in this turn, preserving its query/mode. Before the first read only an unambiguous retained result is selected.
-    package func continueReading(handle: String?, sessionId: String?, turnId: String?, pages: Int = 1) -> JSONValue {
+    /// A query or raw given with the continuation is the read wanted: the same read goes on from its position, a different one starts at its page 0.
+    /// An empty query is the whole-sections read: after a search it starts that read at page 0.
+    package func continueReading(handle: String?, sessionId: String?, turnId: String?, pages: Int = 1,
+                                 query: String? = nil, raw: Bool = false) -> JSONValue {
         cleanupExpired(now: Date())
         guard let scope = Scope(sessionId: sessionId, turnId: turnId) else {
             return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("missing_result_scope"),
                 "detail": .string("Continuing a result works inside the chat turn that read it; this call has no such turn.")])
         }
         if let cursor = readCursors[scope], handle == nil || handle == cursor.handle {
+            // A read is raw (nil), whole sections (a query without terms, "" here) or a search; a mode left unnamed keeps the cursor's.
+            func reading(_ query: String?) -> String? { query.map { ToolResultSections.queryTerms($0).isEmpty ? "" : $0 } }
+            let mode = raw ? nil : query ?? cursor.query
+            if reading(mode) != reading(cursor.query) {
+                return page(handle: cursor.handle, page: 0, sessionId: sessionId, turnId: turnId, query: mode, pages: pages)
+            }
             guard let next = cursor.nextPage else {
                 var end: [String: JSONValue] = ["status": .string("completed"), "result_handle": .string(cursor.handle),
                     "has_more": .bool(false), "reading_complete": .bool(true),
@@ -431,7 +440,7 @@ package actor ProviderToolResultRecoveryStore {
                     : "Several results are retained. Choose result_handle once; subsequent continue reads keep its position."),
             ])
         }
-        return page(handle: entry.handle, page: 0, sessionId: sessionId, turnId: turnId, query: "", pages: pages)
+        return page(handle: entry.handle, page: 0, sessionId: sessionId, turnId: turnId, query: raw ? nil : query ?? "", pages: pages)
     }
 
     private func unavailable(handle: String, reason: String, sessionId: String?) -> JSONValue {
@@ -691,22 +700,14 @@ extension SwiftToolDispatcher {
             ])
         }
         if input["continue"] == .bool(true) {
-            // Continue owns the position, even when a page is also supplied.
-            let blank: (JSONValue?) -> Bool = {
-                if case .string(let text)? = $0 { return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                return [nil, .null, .int(0), .bool(false)].contains($0)
-            }
-            guard ["query", "raw"].allSatisfy({ blank(input[$0]) }) else {
-                return .object(["status": .string("failed"), "reason": .string("conflicting_read_selection"),
-                    "recovery_hint": .string("""
-                        Use continue:true with optional result_handle and page, or omit continue to select an explicit page/query/raw mode. \
-                        Continue ignores page and retains the previous mode and position.
-                        """)])
-            }
+            // Continue owns the position, even when a page is also supplied. A query or raw named with it reads the continued result that
+            // way: on from where that same read stopped, or from its start when it is a different read.
+            // A query given, even an empty one (read everything), is named; only an absent or null query keeps the previous read's.
             let handle = input["result_handle"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
             return await ProviderToolResultRecoveryStore.shared.continueReading(
                 handle: handle?.isEmpty == false ? handle : nil,
-                sessionId: ChatToolSessionInjection.explicitSessionId(in: input), turnId: turn.id, pages: pages)
+                sessionId: ChatToolSessionInjection.explicitSessionId(in: input), turnId: turn.id, pages: pages,
+                query: input["query"]?.stringValue, raw: input["raw"] == .bool(true))
         }
         guard case .string(let handle)? = input["result_handle"], !handle.isEmpty else {
             return .object([

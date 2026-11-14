@@ -160,6 +160,8 @@ public struct BrowserToolPlatformPort: Sendable {
     func pageBody(page: String, item: String, offset: Int, turn: Turn) async throws -> String?
     /// The row or section the page shows under these words (its id, else its title), with where the row opens; nil when the page shows none.
     func pageItem(page: String, named: String) async -> (id: String, open: String?)?
+    /// The whole reading of a section (or, with `rows`, a row) the page draws, by its id, as an open section reads; nil when it draws none.
+    func pageItemText(page: String, item: String, rows: Bool) async -> String?
     /// Empty sessionId targets the visible conversation.
     func composerState(sessionId: String, turn: Turn) async -> [String: JSONValue]
     /// Attachments are already resolved and fenced; turnSessionId retains the asking conversation's __session_id.

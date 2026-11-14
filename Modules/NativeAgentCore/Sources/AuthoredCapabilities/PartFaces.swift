@@ -616,6 +616,24 @@ public actor PartFaces {
         return (section.id, nil)
     }
 
+    /// The whole door reading of the section (or, with `rows`, the row) the page shows with this id, read as an open section reads (detail
+    /// and footer included); a row reads with the rows beneath it, under its section's title. A section that holds a document is read by
+    /// its document's reader, never here. Nil when the page shows neither.
+    public func shownText(page id: String, item: String, rows: Bool) -> String? {
+        let sections = (currentSnapshot(id)?.drawnFace?.sections ?? []) + (currentSnapshot(id)?.levers ?? [])
+        var shown: PartFace.Section
+        if let section = sections.first(where: { $0.id == item && $0.block == nil }) {
+            shown = section
+        } else if rows, let section = sections.first(where: { $0.allRows.contains { $0.id == item } }),
+                  let row = section.allRows.first(where: { $0.id == item }) {
+            shown = section
+            shown.rows = [row]
+            shown.more = nil
+        } else { return nil }
+        shown.folded = nil
+        return PartFace(sections: [shown]).text(door: true, page: id)
+    }
+
     public func releaseItem(page id: String, item: String, request: UUID) {
         let namespace = id + "/" + item
         guard itemDemands[namespace]?.request.id == request else { return }

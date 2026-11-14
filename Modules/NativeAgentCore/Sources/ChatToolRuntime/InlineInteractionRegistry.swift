@@ -180,7 +180,9 @@ public enum InlineInteractionRegistry {
         if MacIntegrationID.all.contains(id) {
             return MacIntegrationID.displayName(for: id)
         }
-        if let bundleID = AppleScriptExecution.automationTarget(id) { return "Automation for \(bundleID)" }
+        if let bundleID = AppleScriptExecution.automationTarget(id) {
+            return "Automation for " + (AppleScriptExecution.automationTargetBundleIDs.first { $0.value == bundleID }?.key ?? bundleID)
+        }
         // Name the access being granted so a read permission never appears to authorize only changes.
         if let noun = macControlCategoryGrantNouns[id] {
             return noun.prefix(1).uppercased() + noun.dropFirst()

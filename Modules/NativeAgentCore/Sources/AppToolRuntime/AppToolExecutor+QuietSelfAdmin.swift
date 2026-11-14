@@ -217,19 +217,30 @@ extension AppToolExecutor {
         ]) { _, receipt in receipt })
     }
 
+    /// A page read of more than this many settings lists each compactly (`pageSettingRows`).
+    static let compactSettingsAfter = 8
+
     /// The page's setting rows, one producer for the page read's `settings` list and for an item read of one row (`only`, matched like
-    /// setting.get matches an id): types, choices and notes make setting.set's contract complete, and a row that cannot be read stays listed,
-    /// unavailable, so one row's failure never removes its siblings. A list of choices is said once per read: a later row offering the same
-    /// list (several groups on one account, and that account's default) carries `choices_same_as`, the id of the row that gave it.
+    /// setting.get matches an id): types, choices and notes make setting.set's contract complete (a long list's rows carry them through
+    /// their item reads), and a row that cannot be read stays listed, unavailable, so one row's failure never removes its siblings. A list
+    /// of choices is said once per read: a later row offering the same list (several groups on one account, and that account's default)
+    /// carries `choices_same_as`, the id of the row that gave it.
     @MainActor
     func pageSettingRows(page: QuietToolPage, host: any QuietToolHost, only item: String? = nil) async throws -> [JSONValue] {
         var rows: [JSONValue] = []
         var given: [(choices: JSONValue, id: String)] = []
         let wanted = item?.lowercased()
-        for setting in try QuietSettings.settings(forPage: page.id, host: host) where wanted == nil || setting.id.lowercased() == wanted {
+        let settings = try QuietSettings.settings(forPage: page.id, host: host)
+        // A long list reads as what a change needs: id, value, choices, owner_only and writable when false; the label, type and note read
+        // with the setting's item. A setting that is the agent's own keeps the note that says so.
+        let compact = wanted == nil && settings.count > Self.compactSettingsAfter
+        for setting in settings where wanted == nil || setting.id.lowercased() == wanted {
             do {
                 if case .object(let listed) = try await setting.catalogRow(host: { self.quietHost() }) {
-                    var row = listed.filter { ["id", "label", "type", "choices", "note", "writable", "owner_only"].contains($0.key) }
+                    let kept = compact ? ["id", "choices", "owner_only"] + (setting.mindOwned ? ["note"] : [])
+                        : ["id", "label", "type", "choices", "note", "writable", "owner_only"]
+                    var row = listed.filter { kept.contains($0.key) }
+                    if compact, listed["writable"] == .bool(false) { row["writable"] = .bool(false) }
                     let choices = row["choices"]
                     if let choices, let first = given.first(where: { $0.choices == choices }) {
                         row["choices"] = nil
@@ -252,7 +263,8 @@ extension AppToolExecutor {
         return rows
     }
 
-    /// Setting rows carry types, choices and notes so page reads supply the complete setting.set contract.
+    /// Setting rows carry types, choices and notes so page reads supply the complete setting.set contract; a long list carries them through
+    /// each setting's item read (`settings_read`).
     @MainActor
     func runAppPageRead(input: [String: JSONValue], turn: Turn) async -> JSONValue {
         let requested = Self.text(input["page"])
@@ -275,7 +287,7 @@ extension AppToolExecutor {
         do { settingRows = try await pageSettingRows(page: page, host: appModel) }
         catch { return ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none) }
 
-        return Self.pageReadResult(page: page.id, fields: [
+        var fields: [String: JSONValue] = [
             "status": .string("ok"),
             "title": .string(page.title),
             "about": .string(page.summary),
@@ -284,7 +296,13 @@ extension AppToolExecutor {
             "content": .array(content),
             "trust_mode": .string(posture?.name ?? "unreadable"),
             "changes_allowed": .bool(posture?.changesAllowed ?? false),
-        ])
+        ]
+        if settingRows.count > Self.compactSettingsAfter {
+            fields["settings_read"] = .string("""
+                Each setting is listed by what a change needs; app {page:"\(page.id)", item:"<setting id>"} reads its label, type and note.
+                """)
+        }
+        return Self.pageReadResult(page: page.id, fields: fields)
     }
 
     // MARK: - Setting set

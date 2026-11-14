@@ -1009,8 +1009,8 @@ extension AppActions {
         .fold("read_chat_message", "chat", read: true),
         .fold("chat_reply", "chat"),
         .fold("tool_result_page", "*", """
-            Page a long result retained this turn without rerunning its action; continue:true resumes the last read and ignores page; omit continue to select \
-            page/query/raw; source_continues names the call that reads a source past the part its answer held
+            Page a long result retained this turn without rerunning its action; continue:true resumes the last read and ignores page (with query or raw it \
+            reads that way); omit continue to select page/query/raw; source_continues names the call that reads a source past the part its answer held
             """, read: true),
 
         // Each Mac verb re-enters its own gate so accessibility, MacAttention and saved levels still apply; mac/guided owns the act guide.

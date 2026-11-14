@@ -1,11 +1,14 @@
 import AppKit
 import ActivityWatch
 import AppToolRuntime
+import ApprovalTransactions
 import ChatToolParsing
 import ChatTurnContracts
 import ChatTurnRuntime
+import ChatToolRuntime
 import EngineRuntime
 import MacIntegration
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import SwiftUI
@@ -62,16 +65,46 @@ extension AppQuietToolHost {
         } catch { return (false, error.localizedDescription, ["effects": .string("unknown")]) }
     }
 
-    /// Asks macOS in the foreground through the permission card's own request, then reads the grants again.
+    /// Trust's ask, and the agent's ask on the person's word, walk the grants on the permission card: an open card already holding them goes
+    /// on (Continue), else one card is filed in the open conversation and answered as the person's Allow. The card carries the walk, so
+    /// coming back to the window goes on and the card says what is on now.
     private func askGrants(_ targets: [String]) async throws -> (ok: Bool, detail: String, fields: [String: JSONValue]) {
         if let unknown = targets.first(where: { SystemPermissionPreflight.cardSettingsCapability($0) == nil }) {
             return (false, "Unknown macOS grant \(unknown); nothing was asked.", ["execution": .string("not_run"), "effects": .string("none")])
         }
-        let problems = try await SystemPermissionPreflight.requestMacOSAccess(targets)
+        let dataRoot = appModel.engine.dataRoot
+        var card: (id: String, sessionID: String)?
+        for open in try await InlineInteractionResolver.platform.openInteractionCards() {
+            guard let found = try await InlineInteractionResolver.interaction(id: open.id, sessionID: open.sessionID, dataRoot: dataRoot),
+                  found.kind == .permission, found.state.isOpen, Set(targets).isSubset(of: found.allTargets) else { continue }
+            card = open
+            break
+        }
+        if card == nil {
+            let session = appModel.activeChatSessionId
+            guard !session.isEmpty, let ask = InlineInteractionRegistry.permission(targets,
+                    why: "You asked for these macOS grants; macOS asks you for each one.") else {
+                return (false, "No conversation is open to hold the permission card; nothing was asked.", ["effects": .string("none")])
+            }
+            let turn = Turn(session: session).with(\.envelope, .native("trust:ask-grant")).with(\.verifiedSessionID, session)
+            guard let raised = await InlineInteractionResolver.raise(ask, sessionID: session, resumable: false,
+                origin: .native("trust:ask-grant"), turn: turn, dataRoot: dataRoot) else {
+                return (false, "The permission card could not be filed; nothing was asked.", ["effects": .string("none")])
+            }
+            card = (raised.id, session)
+        }
+        guard let card else { return (false, "No permission card holds these grants; nothing was asked.", ["effects": .string("none")]) }
+        await runCardControl(id: card.id, sessionID: card.sessionID, choice: nil)
         await appModel.engine.macIntegration.refresh()
-        return (problems.isEmpty, problems.isEmpty
-            ? "Trust shows each grant as macOS reads it now."
-            : problems.joined(separator: " "), [:])
+        guard let after = try await InlineInteractionResolver.interaction(id: card.id, sessionID: card.sessionID, dataRoot: dataRoot) else {
+            return (false, "The permission card is absent from readback; check it before asking again.", ["effects": .string("unknown")])
+        }
+        let descriptor = await InlineInteractionResolver.descriptor(for: after, dataRoot: dataRoot)
+        let words = [await InlineInteractionResolver.grantsNow(after, control: descriptor),
+                     InlineCards.model(after, descriptor: descriptor).busyNote, after.state.failureReason, after.state.outcome?.summary]
+            .compactMap { $0 }.joined(separator: " ")
+        return (after.state.failureReason == nil, words.isEmpty ? "The permission card is \(after.state.name)." : words,
+            ["interaction_id": .string(card.id), "state": .string(after.state.name)])
     }
 
     /// The person chooses the app and confirms the deletion of its recorded history.

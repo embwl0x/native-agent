@@ -213,8 +213,7 @@ replay authority. Chat approvals install the approved card's envelope (including
 verified command signature) on their held host turn; bounded domain cards with
 no requesting envelope execute as local approval acts. First-provider
 setup records the accepted chat request's envelope even before a provider can
-run; the launch-owned Input Monitoring card records its native owner and remains
-nonresumable. Follow-up execution maps `chat` explicitly to the Mac profile and
+run. Follow-up execution maps `chat` explicitly to the Mac profile and
 refuses unsupported surfaces.
 The request's complete `fileAccessCeiling` is retained on chat approval payloads
 and inline continuations, compared for chat-card deduplication, and covered by

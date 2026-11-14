@@ -189,7 +189,6 @@ public final class AppleScriptExecution: Sendable {
         try Task.checkCancellation()
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
-        configuration.createsNewApplicationInstance = true
         let app = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         try Task.checkCancellation()
         guard app.bundleURL?.standardizedFileURL.resolvingSymlinksInPath() == url.standardizedFileURL.resolvingSymlinksInPath(),
@@ -201,7 +200,12 @@ public final class AppleScriptExecution: Sendable {
 
     private static func permission(bundleID: String, url: URL, pid: pid_t?, ask: Bool = false) -> JSONValue {
         let target = pid.map { NSAppleEventDescriptor(processIdentifier: $0) } ?? NSAppleEventDescriptor(applicationURL: url)
-        let code = AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, ask)
+        // Some apps (Messages) refuse the wildcard event with paramErr (-50) instead of answering for consent; the consent asked for is the same
+        // for a concrete event every scriptable app accepts (Get Data), so ask again with it.
+        var code = AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, ask)
+        if code == OSStatus(paramErr) {
+            code = AEDeterminePermissionToAutomateTarget(target.aeDesc, AEEventClass(kAECoreSuite), AEEventID(kAEGetData), ask)
+        }
         let state = code == 0 ? "allowed" : code == -1744 ? "needs_consent" : code == -1743 ? "denied" : "unavailable"
         var fields: [String: JSONValue] = ["bundle_id": .string(bundleID), "app_path": .string(url.path), "code": .int(Int64(code)),
                         "state": .string(state), "detail": .string(code == -1743

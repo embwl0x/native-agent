@@ -27,7 +27,7 @@ requests offer it alone. The schema is defined in
 | `app {"action":"find","args":{"what":"<words>"}}` | The same discovery reader; `query` is an alternative to `what`. |
 | `app {"action":"<id>","args":{…}}` | Run one registered action. |
 | `app {"script":"<JavaScript>"}` | Compose permitted app calls in JavaScriptCore. |
-| `app {"actions":[{…},…]}` | Many calls in one, in order, each re-entering the gate chain as its own app call. Nothing is built on a surprise: after a step that fails, waits on the person, or does not come back as they said, later changes do not run; later reads still run. The result names the blocking step and reason, skipped changes and what ran after it, with `stopped_at:{step, as, because}` (`because` is `failed`, `waiting` or `surprise`), `failed_step` when the step failed or waits, `not_run:[{step, as, action, because}]` (`because` is `stopped` for a change after the stop, `found_not_there` for a step whose `found` could not be resolved) and `steps_total`; each receipt carries its `step` and its `as` name (steps count from 1). `then_say` and `with` beside `actions` carry their closing words (below). An action's single-valued argument given a list (`args.handle:[…]`) follows the same law per value: a failed write stops later write values; reads fan out fully. |
+| `app {"actions":[{…},…]}` | Many calls in one, in order, each re-entering the gate chain as its own app call. Nothing is built on a surprise, and nothing the person asked for waits on a step they did not: a step the gate refuses or files on a card is reported in its place and the steps after it still run, while after a step that fails, waits in place on the person, or does not come back as they said, later changes do not run; later reads still run. The result names the blocking step and reason, skipped changes and what ran after it, with `stopped_at:{step, as, because}` (`because` is `failed`, `waiting` or `surprise`), `failed_step` when the step failed or waits, `not_run:[{step, as, action, because}]` (`because` is `stopped` for a change after the stop, `found_not_there` for a step whose `found` could not be resolved) and `steps_total`; each receipt carries its `step` and its `as` name (steps count from 1). `then_say` and `with` beside `actions` carry their closing words (below). An action's single-valued argument given a list (`args.handle:[…]`) follows the same law per value: a failed write stops later write values; reads fan out fully. |
 
 A step in `actions` may carry three keys of its own beside its call. They are
 read by the batch and never reach the action.
@@ -655,9 +655,11 @@ still quotes at least three words of the person's or trusted agent's request,
 unless restoring their previous change. A lowering of a Trust row is theirs at any
 posture. A raise, a change to an owner-only row (Full Mac included) and a lever
 a card can carry are the person's: they run on the person's word when `because`
-quotes the person's own message of the ask being acted on and names the change,
-and otherwise ask the person on one card for the exact call (several asked in
-one list are one card). A card still waiting for a call the word decided is
+quotes the person's own message of the ask being acted on and names the change
+(an ask for the whole, such as full permissions everywhere, names every change
+that widens what they may do), and otherwise ask the person on a card for the
+exact call; in a list, each step the word did not name gets its own card and
+the rest go on. A card still waiting for a call the word decided is
 withdrawn as decided, with the quote. Only what needs the person's own hands (a
 secret, a sign-in, a code from another device) stays theirs alone. Safe allows
 none of these.
@@ -904,8 +906,9 @@ conversations. The original result and effect evidence remain intact, with
 (from `AgentScreen.names`). Filing failures and requests without an originating
 conversation report that no card was filed. Previews, cancelled calls and
 hand-back-only runs file nothing. This removes the model's extra permission
-request step; it does not retry the blocked work or grant access. Only the
-person's Allow tap on the Mac invokes the foreground macOS acquisition flow.
+request step; it does not retry the blocked work or grant access. The person's
+Allow tap on the Mac, or the agent's ask on the person's own word, invokes the
+foreground macOS acquisition flow; macOS still asks the person.
 Answering the card continues its originating conversation without replaying
 the blocked call.
 

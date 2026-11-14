@@ -97,8 +97,6 @@ extension NativeAgentEngine {
     @MainActor private static var launchStopped = false
     @MainActor private static var residentsStarted = false
     @MainActor private static var runtimeObservationsInstalled = false
-    @MainActor private static var firstAnchorTask: Task<Void, Never>?
-    @MainActor private static var firstAnchorObserver: NSObjectProtocol?
     @MainActor private static var frontSenseDrain: Task<Void, Never>?
 
     @MainActor
@@ -118,9 +116,6 @@ extension NativeAgentEngine {
         launchStopped = true // Close admission synchronously, before any drain suspends.
         frontSenseDrain = EngineFrontSense.shared.stop()
         for task in launchTasks.values { task.cancel() }
-        firstAnchorTask?.cancel()
-        if let firstAnchorObserver { NotificationCenter.default.removeObserver(firstAnchorObserver) }
-        firstAnchorObserver = nil
         DoctorFacade.disarmFirstTurnRefresh()
     }
 
@@ -146,40 +141,8 @@ extension NativeAgentEngine {
         }
         // Beats are recorded from the first one; the mind's nerve feels them only while a mind runs (`MindLifetime`).
         BackgroundLoopLifetimes.shared.receiveOrganPulses()
-        // Observe person input once per launch; retain one access-and-relaunch card until granted.
-        if !MacPersonInput.listening,
-           let card = InlineInteractionRegistry.permission(["privacy:inputMonitoring"],
-               why: "I need Input Monitoring to tell your own typing and pointing from mine, so I know when you're here before I bring an app forward.") {
-            let published = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
-            firstAnchorObserver = NotificationCenter.default.addObserver(
-                forName: ConversationAnchor.didPublish, object: nil, queue: nil
-            ) { _ in published.continuation.yield(()) }
-            firstAnchorTask = Task {
-                defer {
-                    if let firstAnchorObserver { NotificationCenter.default.removeObserver(firstAnchorObserver) }
-                    firstAnchorObserver = nil
-                    firstAnchorTask = nil
-                    published.continuation.finish()
-                }
-                var session = await Task.detached(priority: .utility) {
-                    ConversationAnchor.currentSessionId(dataRoot: dataRoot)
-                }.value
-                if session == nil {
-                    for await _ in published.stream {
-                        guard !Task.isCancelled else { return }
-                        session = await Task.detached(priority: .utility) {
-                            ConversationAnchor.currentSessionId(dataRoot: dataRoot)
-                        }.value
-                        if session != nil { break }
-                    }
-                }
-                guard let session, !Task.isCancelled, !launchStopped else { return }
-                let turn = Turn(session: session).with(\.envelope, .native("launch:input-monitoring"))
-                    .with(\.verifiedSessionID, session)
-                await InlineInteractionResolver.raise(card, sessionID: session, resumable: false,
-                    origin: .native("launch:input-monitoring"), turn: turn, dataRoot: dataRoot)
-            }
-        }
+        // Input Monitoring is asked once, on the first-run permission card's walk with every other grant; Trust and the Desk's night row say
+        // when it is still off. No second card is raised here.
     }
 
     public static func validateProvidersAtLaunch() {
@@ -733,7 +696,6 @@ extension NativeAgentEngine {
     public static func beginQuitProducerSettlement(appLaunch: Task<Void, Never>?, appObservers: [Task<Void, Never>] = []) -> Task<Void, Never> {
         stopLaunchWork()
         let launch = Array(launchTasks.values)
-        let anchor = firstAnchorTask
         let frontSense = frontSenseDrain
         let otherDoors = OtherDoorTurns.shared.stop()
         let make = NativeAgentEngine.live.make.shutdown()
@@ -747,7 +709,6 @@ extension NativeAgentEngine {
             async let loops: Void = BackgroundLoopLifetimes.shared.shutdown()
             for task in launch { await task.value }
             await appLaunch?.value
-            await anchor?.value
             await frontSense?.value
             for observer in appObservers { await observer.value }
             await otherDoors.value

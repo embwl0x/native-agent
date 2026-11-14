@@ -248,6 +248,11 @@ extension AppToolExecutor {
                                                           execution: execution, following: true), at: place)
             }
         }
+        // A section the page draws reads whole by its id before any reader of the page claims the words, on every page: it is the read a
+        // folded section's page reading names. A later page of a section's collection (offset) is its owner's read.
+        if !item.isEmpty, offset == 0, let host = quietHost(), let words = await host.pageItemText(page: page.id, item: item, rows: false) {
+            return .object(["status": .string("ok"), "page": .string(page.id), "item": .string(item), "content": .string(words)])
+        }
         do {
             if page.id == "pairing", item == "phone-senses" {
                 return try PhoneSensesGuide.read(dataRoot: root)
@@ -349,10 +354,14 @@ extension AppToolExecutor {
                 let rows = try await pageSettingRows(page: page, host: host, only: item)
                 guard !rows.isEmpty else {
                     // A row with no reader of its own that opens a place reads that place, as the person's tap on it opens it (a link to
-                    // its own page names a place of the app, `AppDoorNames`). A link is followed once.
+                    // its own page names a place of the app, `AppDoorNames`). A link is followed once. Any other row the page draws reads
+                    // whole, under its section's title.
                     let notFound = ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("not_found")]))
                     guard !following, let shown = await host.pageItem(page: page.id, named: item), let open = shown.open,
-                          case .page(let to, item: let toItem)? = FaceLink(open) else { return notFound }
+                          case .page(let to, item: let toItem)? = FaceLink(open) else {
+                        guard let words = await host.pageItemText(page: page.id, item: item, rows: true) else { return notFound }
+                        return .object(["status": .string("ok"), "page": .string(page.id), "item": .string(item), "content": .string(words)])
+                    }
                     let place = AppDoorNames.place(page: to + (toItem.map { "/" + $0 } ?? ""), item: "")
                     guard place.page != page.id || place.item != shown.id, let next = await doorPage(place.page) else { return notFound }
                     return Self.doorOpened(try await doorRead(page: next, item: place.item, offset: offset, surface: surface, turn: turn,
