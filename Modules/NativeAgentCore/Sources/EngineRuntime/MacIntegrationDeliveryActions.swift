@@ -91,9 +91,9 @@ public struct MacIntegrationDeliveryActions: ChatMacIntegrationToolBridge, PureT
 
     public func mobileNotify(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let router = router()
-        return try await AppToolExecutor.mobileNotify(input: input, surface: surface, toolName: "mobile_notify", turn: held().turn) { title, body, userInfo,
+        return try await AppToolExecutor.mobileNotify(input: input, surface: surface, toolName: "mobile_notify", turn: held().turn) { note, userInfo,
             turn in
-            try await AppToolExecutor.defaultMobileNotificationSender(title: title, body: body, userInfo: userInfo, router: router, turn: turn)
+            try await AppToolExecutor.defaultMobileNotificationSender(note, userInfo: userInfo, router: router, turn: turn)
         }
     }
 

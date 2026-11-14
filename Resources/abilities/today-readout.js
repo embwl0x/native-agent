@@ -91,9 +91,10 @@ function run(input) {
     }
     const intentions = input.intentions.state === "available" ? input.intentions.rows : [];
     intentions.slice().sort((a,b)=>a.at-b.at || a.key.localeCompare(b.key)).slice(0,5).forEach(i=>{
-        const words=bounded(plain(i.words));
-        // The gutter shows the clock time; the line names the day only when it is not today.
-        ahead.push(row(i.key,words,i.time.startsWith("at ") ? "" : i.time,[i.key]));
+        const words=plain(i.words), title=i.title || "Something I mean to do";
+        // The gutter shows the clock time; the line names the day only when it is not today, then every word the pill left out.
+        const day=i.time.startsWith("at ") ? "" : i.time;
+        ahead.push(row(i.key,title,[day,title === words ? "" : words].filter(Boolean).join("\n"),[i.key]));
     });
     if (input.conversations.length) {
         const count=input.conversations.length, places=[...new Set(input.conversations.map(c=>c.surface))].sort().join(" and ");
@@ -104,14 +105,26 @@ function run(input) {
         const count=new Set(input.builders.map(b=>b.session)).size;
         did.push(row("worked","I worked with "+names,spelled(count)+" "+(count===1 ? "conversation" : "conversations")+".",input.builders.map(b=>b.key)));
     }
+    // The agent's own decisions of one kind (the kind their owner names, as the Inbox folds them) stand as one row holding each.
+    // A count says what it counts: a kind's decisions are their owner's counts, summed; unreadable, there is no count.
+    const decisionCount=members=>members.every(m=>Number.isInteger(m.decisions)) ? members.reduce((sum,m)=>sum+m.decisions,0) : null;
+    const decisionWords=count=>count === null ? "" : count+" "+(count === 1 ? "decision" : "decisions");
     const earlierGroups=new Map();
     input.notes.filter(n=>!n.today).forEach(n=>{
-        const lower=n.title.toLowerCase(), key=n.job ? "job:"+n.job : n.key;
-        if (!earlierGroups.has(key)) earlierGroups.set(key,{title:n.title || "A note I left you",sources:[],failure:lower.includes("fail") || lower.includes("lost") || lower.includes("didn't finish")});
+        const lower=n.title.toLowerCase(), key=n.job ? "job:"+n.job : n.kind ? "decided:"+n.kind : n.key;
+        if (!earlierGroups.has(key)) earlierGroups.set(key,{title:n.title || "A note I left you",sources:[],members:[],kind:n.job ? null : n.kind,
+            failure:lower.includes("fail") || lower.includes("lost") || lower.includes("didn't finish")});
         earlierGroups.get(key).sources.push(n.key);
+        earlierGroups.get(key).members.push({key:n.key,title:n.title || "A note I left you",decisions:n.decisions,
+            value:n.kind ? decisionWords(decisionCount([n])) : ""});
     });
-    earlier.push(...earlierGroups.values());
-    const notes=input.notes.filter(n=>n.today && (n.title || n.summary) && !(dreamTitle && ["dream_cycle","rem_cycle"].includes(n.source.toLowerCase())))
+    earlierGroups.forEach(g=>{
+        const many=g.members.length>1;
+        g.value=g.kind ? decisionWords(decisionCount(g.members)) : many ? g.members.length+" notes" : "";
+        if (g.kind && many) g.title+=", and "+(g.members.length-1)+" more";
+        earlier.push(g);
+    });
+    const units=input.notes.filter(n=>n.today && (n.title || n.summary) && !(dreamTitle && ["dream_cycle","rem_cycle"].includes(n.source.toLowerCase())))
         .map(n=>{
             let title=n.title, summary=n.summary, id=n.key;
             if (title.toLowerCase().startsWith("claude delegation failed")) {
@@ -122,8 +135,21 @@ function run(input) {
                 if (n.job) id="claude:"+n.job+":"+n.key.slice(6);
             }
             return {value:row(id,title || "I left you a note",summary,[n.key]), at:n.at, job:n.job,
-                collaboration:id.startsWith("claude:")};
-        }).filter(n=>n.value.title || n.value.line).sort((a,b)=>a.at-b.at).slice(-4);
+                collaboration:id.startsWith("claude:"), kind:n.kind, decisions:n.decisions};
+        }).filter(n=>n.value.title || n.value.line);
+    const kinds=new Map();
+    units.forEach(n=>{ if (n.kind) kinds.set(n.kind,[...(kinds.get(n.kind) || []),n]); });
+    const folded=units.filter(n=>!n.kind || kinds.get(n.kind).length<2);
+    kinds.forEach((group,kind)=>{
+        if (group.length<2) return;
+        const newest=group.slice().sort((a,b)=>b.at-a.at || (a.value.id<b.value.id ? -1 : 1)), count=decisionCount(group);
+        const fold=row("did.decided."+kind,newest[0].value.title+", and "+(group.length-1)+" more",decisionWords(count),
+            newest.flatMap(n=>n.value.sources));
+        fold.rows=newest.map(n=>n.value);
+        folded.push({value:fold,at:newest[0].at,job:null,collaboration:false});
+    });
+    // The latest four rows, a fold counting as one.
+    const notes=folded.sort((a,b)=>a.at-b.at).slice(-4);
     const byJob=new Map();
     notes.forEach(n=>{
         if (n.collaboration && n.job) {
@@ -218,21 +244,29 @@ function face(input) {
         if (!times.length) return undefined;
         return new Date((newest ? Math.max(...times) : Math.min(...times))*1000).toISOString();
     }
+    // A row that leads somewhere takes the key of the source it leads to; a row holding others leads nowhere itself.
+    function drawn(row) {
+        const linked=row.rows ? undefined : row.sources.find(key=>open(key)), id=linked || row.id;
+        return {id,title:row.title,detail:row.line,at:at(row.sources),open:linked ? open(linked) : undefined,
+            rows:row.rows ? row.rows.map(drawn) : undefined};
+    }
     for (const area of ["did","ahead"]) {
         const rows=[];
         for (const row of decision[area]) {
-            // A row that leads somewhere takes the key of the source it leads to.
-            const linked=row.sources.find(key=>open(key)), id=linked || row.id;
-            rows.push({id,title:row.title,detail:row.line,at:at(row.sources),open:linked ? open(linked) : undefined});
-            row.details.forEach((title,i)=>rows.push({id:"detail:"+id+":"+i,title,tone:"quiet"}));
+            const shown=drawn(row);
+            rows.push(shown);
+            row.details.forEach((title,i)=>rows.push({id:"detail:"+shown.id+":"+i,title,tone:"quiet"}));
         }
         if (rows.length) sections.push({id:area,title:area === "did" ? "What I did" : "Ahead",
             style:area === "did" ? "timeline" : "flow",rows});
     }
     const earlier=decision.earlier.map(group=>{
-        const newest=group.sources.slice().sort((a,b)=>((facts.get(b)||{}).at||0)-((facts.get(a)||{}).at||0))[0];
-        return {id:newest,title:group.title,value:String(group.sources.length),at:at(group.sources,true),
-            tone:group.failure ? "failed" : "quiet",open:open(newest)};
+        const order=group.sources.slice().sort((a,b)=>((facts.get(b)||{}).at||0)-((facts.get(a)||{}).at||0));
+        const tone=group.failure ? "failed" : "quiet", fold=group.kind && group.members.length>1;
+        const rows=fold ? order.map(key=>group.members.find(m=>m.key === key)).map(m=>({id:m.key,title:m.title,value:m.value || undefined,
+            at:at([m.key]),tone,open:open(m.key)})) : undefined;
+        return {id:fold ? "earlier.decided."+group.kind : order[0],title:group.title,value:group.value || undefined,at:at(group.sources,true),
+            tone,open:fold ? undefined : open(order[0]),rows};
     });
     for (const row of decision.omitted) earlier.push({id:"omitted:"+row.id,title:"Today row "+row.id+" omitted",
         detail:row.sources.length ? "Missing facts: "+row.sources.join(", ")+"." : "No source.",tone:"quiet"});
@@ -245,13 +279,22 @@ function face(input) {
         }
     }
     [...new Set(gaps)].forEach((title,i)=>earlier.push({id:"source-gap:"+i,title,tone:"quiet"}));
-    for (let i=0;i<earlier.length;i+=256) sections.push({id:"earlier:"+i,title:"Earlier",style:"values",rows:earlier.slice(i,i+256)});
+    // A section holds at most 256 rows, nested ones counted, so a folded group weighs what it holds.
+    const weight = entry => 1 + (entry.rows || []).reduce((sum, child) => sum + weight(child), 0);
+    let part = [], used = 0, offset = 0;
+    const close = () => { if (part.length) { sections.push({id:"earlier:"+offset,title:"Earlier",style:"values",rows:part}); offset += part.length; part = []; used = 0; } };
+    for (const entry of earlier) {
+        if (part.length && used + weight(entry) > 256) close();
+        part.push(entry); used += weight(entry);
+    }
+    close();
     sections.push({id:"queues",style:"flow",rows:[
         {id:"approvals",title:"Approvals and past decisions",open:"page:today/approvals"},
         {id:"inbox",title:"Every note I've left you",open:"page:today/inbox"},
         {id:"rem",title:"REM Replay Lineage",open:"page:today/cognitionProposals"}
     ]});
-    return {title:"Today",line:dayLine(input,decision.did.length),sections};
+    // How full the day was counts what happened, each decision a fold holds included.
+    return {title:"Today",line:dayLine(input,decision.did.reduce((n,row)=>n+(row.rows ? row.rows.length : 1),0)),sections};
 }
 // The page's one sentence: how full the day has been, and what waits on you. A Desk that would not read cannot vouch for "nothing".
 function dayLine(input,did) {

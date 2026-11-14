@@ -71,7 +71,7 @@ extension NativeCognitionRuntime {
                     OrganJudge.beatOff("microcycle", because: "inner life or background thinking is off")
                     return .skipped(reason: "inner life or background thinking is off")
                 }
-                return .skipped(reason: "nothing new to settle since the last pass")
+                return .notNeeded("nothing new to settle since the last pass")
             }
             publishRuntimeChange(reason: "microcycle:completed")
             OrganJudge.beat("microcycle", .worked, note: "settled the cognitive field")

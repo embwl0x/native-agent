@@ -327,7 +327,8 @@ struct MacChatTurnStepAge<Content: View>: View {
         // One branch whether or not a step runs, so the box keeps its identity (its Stop button, its dot) across every step's start and end.
         let long = since?.addingTimeInterval(TurnFace.longStepAfter)
         // A periodic schedule from the step's start lands exactly on the long mark; the clock is also read at draw, so any redraw past the mark shows it.
-        TimelineView(.periodic(from: since ?? .distantPast, by: TurnFace.longStepAfter)) { context in
+        // With no step running there is nothing to mark, so the schedule is a year apart and the card is not redrawn.
+        TimelineView(.periodic(from: since ?? .distantPast, by: since == nil ? 31_536_000 : TurnFace.longStepAfter)) { context in
             content(long.map { max(context.date, Date()) >= $0 } ?? false)
         }
     }

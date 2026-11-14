@@ -3,7 +3,7 @@
 The iPhone/iPad app is a surface of the Mac-owned agent. Keep the Mac awake
 with NativeAgent open to process new work. The runtime is in
 `EngineRuntime` and `ChatTurnRuntime`; mobile sync does not create another
-brain. Agent's tool interface remains the single `app` tool:
+brain. The agent's interface remains its one door, `app`:
 `app {}` opens their home, while `page`, `item`, `find`, `action` and
 `script` reach its contents and actions.
 
@@ -327,9 +327,16 @@ the previous pairing's pending sends. Unreadable or not-yet-restored pairing
 authority does not itself change switches, readings, places or pending sends; it pauses
 new sense admission and delivery until authority can be checked. The person's explicit
 switch-off still saves and retires that sense's queued readings. Previously accepted
-evidence remains historical, never proof of current state. Pending delivery
-runs before new wake readings and still runs if new-reading admission refuses
-at the outbox limit; receipts free capacity and continue the drain.
+evidence remains historical, never proof of current state. A sense reading is a
+dated fact, not a request: the phone holds one pending reading per slot (a
+source's observation, or its setup), and a newer reading of a slot replaces the
+unsent or unacknowledged one and retires its delivery, so the queue never holds
+a backlog and one slot's delivery never waits on another's. Every pending slot
+is sent each publication. The Mac accepts and acknowledges an authentic sense
+reading of any age (one more than 15 minutes in the future is still refused as
+`clock_ahead`); its own timestamp orders it in history and marks it historical.
+Every other phone envelope, places included, keeps the 24-hour request window,
+so a request is never acted on late.
 
 Places share names and arrival/departure times, plus an initial **at**
 observation when the phone is first seen inside a place. A first outside fix
@@ -420,7 +427,8 @@ PhotoKit notifications can also invalidate a reading while the process is
 running; they do not keep it running. iOS controls wake delivery. Motion queries
 wait for Core Motion's callback or switch-off; a pending reading is visible rather
 than becoming unknown after a deadline. Signed pending changes remain on disk
-until a correlated Mac receipt, explicit cancellation or checked pairing retirement.
+until a correlated Mac receipt, a newer reading of the same slot, explicit
+cancellation or checked pairing retirement.
 Unreadable pairing material preserves the original pending identities. Neither
 silence nor elapsed time authorizes a resend or declares delivery.
 

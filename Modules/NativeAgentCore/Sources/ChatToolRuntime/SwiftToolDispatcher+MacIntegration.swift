@@ -243,7 +243,7 @@ extension SwiftToolDispatcher {
         let input = tool == "mail_save_attachment"
             ? AgentWorkspace.bindMail(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation), input, dataRoot: dataRoot) : input
         guard let access = Self.macIntegrationAccess(forTool: tool) else {
-            throw ToolFailureError("Mac integration tool has no permission declaration: \(tool)", effects: .none)
+            throw ToolFailureError("Mac integration action has no permission declaration: \(tool)", effects: .none)
         }
         let (integration, mode) = (access.integration, access.mode)
         let admitted = await fullMacYoloAdmitted(turn: turn, surface: surface)
@@ -258,11 +258,11 @@ extension SwiftToolDispatcher {
                 "reason": .string("bridge_not_wired"),
                 "integration": .string(integration),
                 "message": .string("""
-                    Mac integration is unavailable in this caller. Call app from the installed app's chat tool chain; supplying a session id \
-                    cannot attach it.
+                    Mac integration is unavailable in this caller. Call app from inside a chat turn of the installed app; supplying a session \
+                    id cannot attach it.
                     """),
                 "remedy": .object(["kind": .string("correct_arguments"),
-                    "instruction": .string("Call app from the installed app's chat tool chain."), "next_call": .null]),
+                    "instruction": .string("Call app from inside a chat turn of the installed app."), "next_call": .null]),
             ]))
         }
         let bridge = integrationBridge.serving(turn: turn.with(\.fullMacAdmitted, admitted), context: invocation.macContext(dataRoot: dataRoot))
@@ -307,7 +307,7 @@ extension SwiftToolDispatcher {
         case "scheduler_list_jobs": result = try await bridge.schedulerListJobs(input: input)
         case "scheduler_create_job": result = try await bridge.schedulerCreateJob(input: input)
         case "scheduler_cancel_job": result = try await bridge.schedulerCancelJob(input: input)
-        default: throw ToolFailureError("Mac integration tool has no backend: \(tool)", effects: .none)
+        default: throw ToolFailureError("Mac integration action has no backend: \(tool)", effects: .none)
         }
         if integration == MacIntegrationID.messages, case .object(var fields) = result,
            fields["reason"] == .string("database_unavailable") || fields["history_reason"] == .string("database_unavailable") {

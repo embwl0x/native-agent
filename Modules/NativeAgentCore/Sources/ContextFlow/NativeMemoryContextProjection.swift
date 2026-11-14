@@ -139,16 +139,17 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
             }
             let pending = dropped.filter { $0.1.flatMap { byID[$0] }.map(Self.pendingAdmission) == true }
             return ContextTurnExclusion(atomIDs: Set(dropped.map(\.0.draft.id)), unverified: pending.map {
-                ContextDegradedSourceNotice(sourceID: $0.0.draft.sourceID, reason: "saved; its check is pending")
+                ContextDegradedSourceNotice(sourceID: $0.0.draft.sourceID, reason: "just saved; its check is still pending")
             } + invalidDates.map {
-                ContextDegradedSourceNotice(sourceID: $0.0.draft.sourceID, reason: "memory source dates unavailable; repair the canonical record")
+                ContextDegradedSourceNotice(sourceID: $0.0.draft.sourceID, reason: "its saved dates are unreadable; the memory needs repair")
             } + staleProvenance.map {
-                ContextDegradedSourceNotice(sourceID: $0.0.draft.sourceID, reason: "memory attribution changed; waiting for its current projection")
+                ContextDegradedSourceNotice(sourceID: $0.0.draft.sourceID, reason: "who it came from changed; it is being read again")
             })
         } catch {
-            return ContextTurnExclusion(atomIDs: Set(atoms.map(\.0.draft.id)), unverified: [ContextDegradedSourceNotice(
-                sourceID: ContextStableID.source(owner: Self.owner, locator: "memory-v2"),
-                reason: "memories withheld this turn: the memory store could not confirm them (\(error.localizedDescription))")])
+            // Name each withheld memory's own source, so the reason speaks only for what this owner held back.
+            return ContextTurnExclusion(atomIDs: Set(atoms.map(\.0.draft.id)), unverified: Set(atoms.map(\.0.draft.sourceID)).sorted().map {
+                ContextDegradedSourceNotice(sourceID: $0, reason: "the memory store could not confirm them (\(error.localizedDescription))")
+            })
         }
     }
 

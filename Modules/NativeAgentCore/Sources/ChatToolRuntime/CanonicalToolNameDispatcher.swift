@@ -100,6 +100,8 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
     /// Only Inbox reads and decision routes are exempt; every other call closes message authority without inspecting content.
     private static func readsInboxOrAnswersApproval(tool: String, input: [String: JSONValue], turn: Turn) throws -> Bool {
         let name = canonical(tool)
+        // A reader that runs before admission judges the call as the door will read it, and passes nothing on.
+        let input = ToolNameAliases.doorCall(name, input)
         let arguments: [String: JSONValue]
         if name == "inbox" {
             arguments = input
@@ -180,7 +182,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
                     Workspace needs a runtime-bound originating door. No action was performed. Call app {} through a verified turn or native \
                     owner's door; creating a transcript or supplying __session_id cannot bind this caller.
                     """,
-                    argumentPath: "context", accepted: "a verified turn or native owner's tool chain", effects: .none,
+                    argumentPath: "context", accepted: "a verified turn or native owner's door", effects: .none,
                     nextCall: ToolFailureError.call("app"))
             }
             // Admission to the facade is checked first. Each selected read or send then re-enters the SAME complete chain under its real name and complete

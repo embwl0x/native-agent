@@ -183,7 +183,7 @@ public struct TurnTraceRecentReader: Sendable {
             "measurement": .string("""
                 Recorded llm.call details, including standalone calls and recorded failures. Unbound calls use turn_id unknown; calls without a purpose use \
                 purpose other. Windows may exceed retained evidence. Missing durations are not estimated. rounds_per_turn is each finished turn's model \
-                rounds (its first call and one per tool round, from its turn.terminal detail), \
+                rounds (its first call and one per round of calls, from its turn.terminal detail), \
                 nearest-rank p50/p90; heaviest_asks are the week's five turns with the most rounds, ! marking a call that failed.
                 """),
             "unreadable_details": .int(Int64(evidence.turns.unreadable)),

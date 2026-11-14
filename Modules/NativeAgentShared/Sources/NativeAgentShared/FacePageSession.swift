@@ -25,6 +25,10 @@ enum FaceFocus: Hashable {
     public let children = FacePageSessions()
     public var scrollAnchor: FaceItemID?
     var unfolded: Set<String> = []
+    /// Sections whose long list the person opened in full.
+    var opened: Set<String> = []
+    /// A list longer than this shows its first rows and says how many more it holds.
+    static let foldAfter = 8
     var expanded: Set<FaceItemID> = []
     public var selection: FaceItemID?
     var filter = ""
@@ -58,12 +62,27 @@ enum FaceFocus: Hashable {
 
     func visibleRows(_ section: PartFace.Section) -> [(row: PartFace.Row, depth: Int)] {
         func flatten(_ rows: [PartFace.Row], depth: Int) -> [(row: PartFace.Row, depth: Int)] {
+            // A row's inline group is drawn on the row's own line, never as rows of its own beneath it; what lies beneath is `beneath`.
             rows.flatMap { row in
-                [(row, depth)] + (expanded.contains(.init(section: section.id, row: row.id)) ? flatten(row.rows ?? [], depth: depth + 1) : [])
+                [(row, depth)] + (expanded.contains(.init(section: section.id, row: row.id)) ? flatten(row.beneath, depth: depth + 1) : [])
             }
         }
         guard section.folded != true || unfolded.contains(section.id) else { return [] }
-        return flatten(section.rows, depth: 0)
+        return flatten(Array(section.rows.prefix(section.rows.count - hiddenRows(section))), depth: 0)
+    }
+
+    /// How many of a long list's rows wait behind its "more" line. None while the person filters, once they opened it, or when the row
+    /// they selected or were sent to is among them. A list is shortened once: a section that folds as a whole opens whole, so only a
+    /// section that is always open keeps a "more" line.
+    func hiddenRows(_ section: PartFace.Section) -> Int {
+        guard filter.isEmpty, !opened.contains(section.id), section.folded != true, section.style != .flow, section.style != .waiting,
+              section.rows.count > Self.foldAfter + 2 else { return 0 }
+        for target in [selection, scrollAnchor] {
+            guard let target, target.section == section.id,
+                  let index = section.rows.firstIndex(where: { $0.descendants.contains { $0.id == target.row } }) else { continue }
+            if index >= Self.foldAfter { return 0 }
+        }
+        return section.rows.count - Self.foldAfter
     }
 
     public func attach(_ viewer: UUID) { viewers.insert(viewer) }

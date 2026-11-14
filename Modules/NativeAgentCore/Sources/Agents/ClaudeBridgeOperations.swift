@@ -91,7 +91,7 @@ extension ClaudeBridgeRuntime {
         if let supplied = json["input"] {
             guard let object = supplied as? [String: Any] else {
                 writeJSON(conn, status: 400, obj: ["error": "invalid_input",
-                    "detail": "Tool input must be an object; no work was queued."])
+                    "detail": "The call's input must be an object; no work was queued."])
                 return
             }
             inputRaw = object

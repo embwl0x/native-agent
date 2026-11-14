@@ -43,7 +43,8 @@ extension SlackSocketModeLoop {
                 channelId: channel, userId: route.requesterUserId ?? "", eventType: "answer", text: "",
                 ts: "", threadTs: route.threadId, channelType: nil,
                 isDirectMessage: channel.hasPrefix("D"), files: [], opensReplyThread: false)
-            indexed = try await deliveryJournal.reserveReply(inbound, reply: Self.preparedReply(text: response.output, attachments: response.attachments ?? []),
+            indexed = try await deliveryJournal.reserveReply(inbound,
+                reply: Self.preparedReply(text: Self.replyText(response), attachments: response.attachments ?? []),
                 runId: response.runId, sessionId: session)
         }
         guard let indexed else {
@@ -91,13 +92,14 @@ extension SlackSocketModeLoop {
         if record.assistantRunId != response.runId {
             guard record.phase.isTerminal else { return "owed" }
             try await deliveryJournal.prepareSuccessor(eventId: record.inbound.eventId,
-                response: Self.preparedReply(text: response.output, attachments: response.attachments ?? []), runId: response.runId, sessionId: session)
+                response: Self.preparedReply(text: Self.replyText(response), attachments: response.attachments ?? []),
+                runId: response.runId, sessionId: session)
         }
         if record.assistantRunId == response.runId,
            record.phase == .generating || record.phase == .claimed || record.phase == .interrupted {
             _ = try await deliveryJournal.prepare(
                 eventId: record.inbound.eventId,
-                reply: Self.preparedReply(text: response.output, attachments: response.attachments ?? [])
+                reply: Self.preparedReply(text: Self.replyText(response), attachments: response.attachments ?? [])
             )
         }
         guard await handleClaimedInbound(inbound) else { return "owed" }
@@ -123,6 +125,17 @@ extension SlackSocketModeLoop {
         }
         return .make(text: text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !uploads.isEmpty
             ? "Generated image" : text, uploads: uploads)
+    }
+
+    /// A stopped or failed turn's saved words go out once, closed by the words this door already uses for a stop or a failure.
+    private static func replyText(_ response: ChatResponse) -> String {
+        let ending: String
+        switch response.terminalState {
+        case .stopped?: ending = "Stopped."
+        case .failed?: ending = response.statusDetail ?? "Couldn't finish the reply."
+        default: return response.output
+        }
+        return [response.output, ending].filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 
     private func settleCheckpoint(_ record: SlackInboundDeliveryRecord, verdict: String) async throws {
@@ -211,7 +224,7 @@ extension SlackSocketModeLoop {
                 if let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: session, runId: run) {
                     record = try await deliveryJournal.prepare(
                         eventId: inbound.eventId,
-                        reply: Self.preparedReply(text: response.output, attachments: response.attachments ?? [])
+                        reply: Self.preparedReply(text: Self.replyText(response), attachments: response.attachments ?? [])
                     )
                 } else {
                     // A live turn owns its eventual answer; only an orphaned generation is interrupted.
@@ -266,13 +279,24 @@ extension SlackSocketModeLoop {
                     }
                 } catch {
                     guard !Task.isCancelled else { return false }
-                    failedBeforeAnswer = true
                     await recordError(context: "chat_handler", error: error, inbound: inbound)
                     // Persist error notices too: their external delivery must not multiply on retry.
                     let detail = error is SlackSessionStorageError
                         ? "Slack conversation storage needs repair before this message can be answered. Existing conversation bindings were preserved."
                         : ProviderRecoveryPolicy.personMessage(error) ?? "Couldn't finish the reply."
-                    reply = SlackSocketModeReply(text: (hydration.notice.map { $0 + "\n\n" } ?? "") + detail)
+                    // A failed turn's saved words lead its notice and replace its preview, so they reach the person once.
+                    var words = "", ending = detail
+                    do {
+                        if let saved = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: sessionId,
+                            runId: runId), saved.terminalState == .failed || saved.terminalState == .stopped {
+                            words = saved.output
+                            // A turn stopped from another door ends here as a stop, not as a failure.
+                            if saved.terminalState == .stopped { ending = "Stopped." }
+                        }
+                    } catch { await recordError(context: "saved_partial_read", error: error, inbound: inbound) }
+                    failedBeforeAnswer = words.isEmpty
+                    reply = SlackSocketModeReply(text: (hydration.notice.map { $0 + "\n\n" } ?? "")
+                        + [words, ending].filter { !$0.isEmpty }.joined(separator: "\n\n"))
                 }
                 if let readBy = reply.readBy {
                     // The agent's turn in progress read it; that turn's reply answers it, so this event posts nothing.

@@ -12,6 +12,19 @@ import ChatToolParsing
 
 /// One rolling info row per requester/tool shows the agent's decision without a push. The detail names the session; the write stays off the tool gate's path.
 public enum BodyDecidedRow {
+    /// The part that tells these rows: their face's `from` and the first part of their identity.
+    static let source = "body_decided"
+
+    /// A decision row's kind: its identity (`body_decided.<requester>.<tool>.<uuid>`) without its last two parts, so two requesters never
+    /// share a kind. A tool whose own name holds a dot splits its requester's rows by that name's beginning. Nil for any other matter.
+    public static func kind(of matter: Experience) -> String? {
+        // Rows written under this part's earlier name are the same rows: they group with today's, kind for kind.
+        guard let from = matter.face?.from, from == source || from == "harness_decided", matter.id.hasPrefix(from + ".") else { return nil }
+        let parts = matter.id.dropFirst(from.count + 1).split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count > 2 else { return nil }
+        return parts.dropLast(2).joined(separator: ".")
+    }
+
     public static func post(turn: Turn, requester: String, tool: String, sessionID: String?, dataRoot: URL, ran: Bool = false) {
         Task { [turn] in _ = await record(turn: turn, requester: requester, tool: tool, sessionID: sessionID, dataRoot: dataRoot, ran: ran) }
     }
@@ -43,7 +56,7 @@ public enum BodyDecidedRow {
             displayName = requester
             contactFailure = error
         }
-        let key = "body_decided.\(requester).\(tool)"
+        let key = "\(source).\(requester).\(tool)"
         // The agent's own decision, in its own voice, like every row it leaves the person.
         let title = "I \(ran ? "ran" : "allowed"): \(displayName) → \(tool)"
         var words = sessionID.map { "Session: " + $0 } ?? ""
@@ -83,7 +96,7 @@ private actor BodyDecisionRollups {
     private func file(key: String, title: String, words: String, dataRoot: URL) async throws -> Receipt {
         let forPerson = ForPerson.at(dataRoot)
         let open = try await forPerson.matters().first {
-            $0.face?.from == "body_decided" && $0.id.hasPrefix(key + ".")
+            $0.face?.from == BodyDecidedRow.source && $0.id.hasPrefix(key + ".")
                 && (ForPerson.reading($0) == .unread || ForPerson.reading($0) == .read)
         }
         let previous: Int
@@ -96,7 +109,7 @@ private actor BodyDecisionRollups {
         let count = previous + 1
         var id = open?.id ?? key + "." + UUID().uuidString.lowercased()
         func matter(_ id: String, _ count: Int) -> Matter {
-            Matter(id: id, form: .done, from: "body_decided", title: title,
+            Matter(id: id, form: .done, from: BodyDecidedRow.source, title: title,
                 summary: "\(count) decision\(count == 1 ? "" : "s")", words: words, badge: String(count))
         }
         if try await forPerson.tell(matter(id, count), doors: []) == .settled {

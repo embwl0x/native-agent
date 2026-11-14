@@ -45,14 +45,14 @@ extension AppToolExecutor {
         securityCenter: SwiftNativeSecurityCenter = SwiftNativeSecurityCenter(),
         enforceAutonomySecurity: Bool = true,
         browserActionRunner: (@Sendable (String, Bool, [String: JSONValue], Turn, AppActionExecution) async throws -> JSONValue)? = nil,
-        mobileNotificationSender: @escaping @Sendable (String, String, [String: String], Turn) async throws -> AttentionOutcome = {
-            title, body, userInfo, turn in
-            try await AppToolExecutor.defaultMobileNotificationSender(
-                title: title, body: body, userInfo: userInfo, router: AttentionRouter.shared, turn: turn)
+        mobileNotificationSender: @escaping @Sendable (NativeAgentNotificationDefaults.Note, [String: String], Turn) async throws -> AttentionOutcome = {
+            note, userInfo, turn in
+            try await AppToolExecutor.defaultMobileNotificationSender(note, userInfo: userInfo, router: AttentionRouter.shared, turn: turn)
         },
-        macNotificationSender: @escaping @Sendable (String, String, Turn, ContinuousClock.Instant?) async throws -> NativeAgentNotificationPostResult = {
-            title, body, turn, deadline in
-            await NativeAgentNotifications.postMessage(title: title, body: body, router: .shared, turn: turn, deadline: deadline)
+        macNotificationSender: @escaping @Sendable (NativeAgentNotificationDefaults.Note, Turn, ContinuousClock.Instant?) async throws
+            -> NativeAgentNotificationPostResult = { note, turn, deadline in
+            await NativeAgentNotifications.postMessage(title: note.title, subtitle: note.subtitle, body: note.message, router: .shared, turn: turn,
+                deadline: deadline)
         },
         macIntegrationPermissionStore: MacIntegrationPermissionStore = .shared,
         doctorStatusProvider: (@Sendable (_ repair: Bool?, _ checkID: String?, _ turn: Turn) async throws -> JSONValue)? = nil,

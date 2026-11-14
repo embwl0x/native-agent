@@ -4,6 +4,7 @@ import Dispatcher
 import ChatTurnRuntime
 import ChatTurnContracts
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Studio
@@ -62,10 +63,35 @@ extension AppToolExecutor {
             return await readMake(ref: ref)
         }
         let path = input["path"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !path.isEmpty else { return Self.failure("invalid_input", "Pass path: the file to add to Make.") }
         let file: URL
         let candidate = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
-        if execution.generatedImagePaths.contains(candidate.path),
+        // Words the caller already holds go in as they are: content with a file name, no file written somewhere first.
+        var written: URL?
+        defer { if let written { try? FileManager.default.removeItem(at: written.deletingLastPathComponent()) } }
+        if path.isEmpty {
+            guard case .string(let content)? = input["content"], !content.isEmpty else {
+                return Self.failure("invalid_input", "Pass path (a file to add), or content with name (its words and a file name such as board.html).")
+            }
+            let name = URL(fileURLWithPath: input["name"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").lastPathComponent
+            guard !name.isEmpty, name != "/", !name.hasPrefix("."), !URL(fileURLWithPath: name).pathExtension.isEmpty else {
+                return Self.failure("invalid_input", "With content, pass name: a file name with its type, such as board.html or notes.md.")
+            }
+            guard content.utf8.count <= MakePreviewFace.wordsLimit else {
+                return Self.failure("invalid_input", "content is over 2 MB; write it to a file and pass path instead.")
+            }
+            do {
+                let folder = FileManager.default.temporaryDirectory.appendingPathComponent("make-" + UUID().uuidString, isDirectory: true)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                let staged = folder.appendingPathComponent(name)
+                try Data(content.utf8).write(to: staged, options: .atomic)
+                written = staged
+            } catch {
+                return Self.failure("make_add_failed", "The words could not be staged for Make: " + error.localizedDescription + " Nothing was added.")
+            }
+        }
+        if let written {
+            file = written
+        } else if execution.generatedImagePaths.contains(candidate.path),
            (try? candidate.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true,
            !connectorPathIsSensitiveData(candidate, dataRoot: root, turn: turn) {
             // Only the native receipt's actual outputs have this provenance; every arbitrary file still goes through the workspace fence.
@@ -77,8 +103,9 @@ extension AppToolExecutor {
             }
         }
         do {
+            // A table the person changed in the window is laid as their edit of the version on screen (`Turn.personEditOf`).
             let added = try studio.add(file, ref: ref.isEmpty ? nil : ref,
-                prompt: input["prompt"]?.scalarText, model: input["model"]?.scalarText)
+                prompt: input["prompt"]?.scalarText, model: input["model"]?.scalarText, personEditOf: turn.personEditOf)
             return .object(["status": .string("ok"), "ref": .string(added.ref), "version": .int(Int64(added.version.n)),
                             "path": .string(studio.url(added.ref, added.version).path)])
         } catch let refusal as MakeStudio.Refusal {

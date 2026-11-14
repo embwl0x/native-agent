@@ -18,7 +18,7 @@ struct ContentView: View {
     private var showsSimpleView: Bool { displayedViewMode == ShellViewMode.simple }
     private var showsAgentView: Bool { displayedViewMode == ShellViewMode.agent }
     private var displayedPage: String? {
-        showsAgentView ? "home" : showsSimpleView ? "chat" : ownPageID ?? ShellPageContent.doorPage(activeContentItem)
+        showsAgentView ? "home" : ownPageID ?? ShellPageContent.doorPage(activeContentItem)
     }
     @State private var didCheckFirstRunOnboarding = false
     @State private var showFirstRunOnboarding = false
@@ -31,15 +31,12 @@ struct ContentView: View {
     @State private var chatShortcut: ChatSlashPage?
     @State private var agentRoom = "home"
     @State private var tourID = UUID()
+    /// The page last shown in each surface during this run of the window, which choosing the surface shows again.
+    @State private var surfacePages: [ShellSurface: ShellRailRow] = [:]
 
     /// The page of the agent's own the window shows: the selection holds it as `page:<id>`, the same name the rail's layout block has.
     private var ownPageID: String? {
         selectionRaw.hasPrefix(SurfaceLayout.pagePrefix) ? String(selectionRaw.dropFirst(SurfaceLayout.pagePrefix.count)) : nil
-    }
-
-    /// One identity per page shown, so two pages of the agent's own never share a page's state.
-    private var paneIdentity: String {
-        ownPageID.map { SurfaceLayout.pagePrefix + $0 } ?? selection.wrappedValue.rawValue
     }
 
     private var selection: Binding<SidebarItem> {
@@ -58,6 +55,14 @@ struct ContentView: View {
         selection.wrappedValue
     }
 
+    /// The page the window shows, as the layout's rail block names it.
+    private var shownRow: ShellRailRow {
+        ownPageID.map(ShellRailRow.page) ?? .item(activeContentItem)
+    }
+
+    /// The place of the page shown, so every writer of the selection also lands on its place and tab, in Simple and Advanced alike.
+    private var shownSurface: ShellSurface { ShellSurface(activeContentItem) }
+
     /// Keep Chat mounted; visibility affects drawing and hit testing only.
     private var isShowingChat: Bool {
         selection.wrappedValue == .chat
@@ -66,6 +71,10 @@ struct ContentView: View {
     var body: some View {
         let windowAction = appModel.windowActions.first
         FacePreferences(keys: ["nativeagent.showTour", ShellViewMode.key, WorkPaneState.sidebarsHiddenKey]) { preferenceContent }
+            // Choosing Simple starts on the conversation: it is the view a person meets first, whatever page Advanced was on.
+            .onChange(of: viewModeRaw) { old, new in
+                if new == ShellViewMode.simple, !old.isEmpty, old != new { selectSidebarItem(.chat) }
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(appModel.windowActionIssues) { issue in
@@ -103,27 +112,17 @@ struct ContentView: View {
                     }
                 }.padding(24)
             } else if showsSimpleView {
-                SimpleShellView()
+                SimpleShellView(shown: shownRow, choose: { chooseSurface($0, pages: $1) }, select: { selectRow($0) })
+                    .task(id: selectionRaw) { await refreshShownPage() }
             } else if showsAgentView {
                 AgentScreenView(room: $agentRoom)
             } else {
             ShellFrame {
                 if !sidebarsHidden {
-                ShellSidebarRail(
-                    selection: selection,
-                    selectedPage: ownPageID,
-                    selectPage: { selectionRaw = SurfaceLayout.pagePrefix + $0 }
-                )
+                ShellSidebarRail(surface: shownSurface) { chooseSurface($0, pages: $1) }
                 .navigationTitle("NativeAgent")
                 }
             } detail: {
-                VStack(spacing: 0) {
-                if activeContentItem != .chat,
-                   let notice = appModel.panelStaleNotice(for: activeContentItem) {
-                    StalePanelNotice(text: notice)
-                        .padding(.horizontal, 12)
-                        .padding(.top, 8)
-                }
                 ZStack {
                 ChatView()
                     .environment(\.chatPageIsVisible, isShowingChat)
@@ -137,33 +136,11 @@ struct ContentView: View {
                     .accessibilityHidden(!isShowingChat)
                     .accessibilityElement(children: isShowingChat ? .contain : .ignore)
 
-                ZStack {
-                if !isShowingChat {
-                // Chat stays mounted above; every other page draws through the one page map.
-                ShellPageContent(item: selection.wrappedValue, ownPage: ownPageID)
-                // Give each page distinct identity so navigation cannot reuse another page's state.
-                .id(paneIdentity)
-                .transition(NativeAgentMotion.fadeIn)
-                }
-                }
-                // Replace pages atomically to avoid superimposed translucent text; local controls own their animations.
-                .animation(nil, value: paneIdentity)
+                // Chat stays mounted above; every other page draws in its place's page area.
+                ShellPlacePage(shown: shownRow) { selectRow($0) }
                 }
                 // Refresh by selection so mounted Chat also receives its arrival refresh.
-                .task(id: selectionRaw) {
-                    appModel.faceRefreshIssue = nil
-                    let item = activeContentItem
-                    if item == .activity {
-                        // Today's source owner posts its face; opening it only draws that face.
-                    } else if item == .settings || item == .ownPage
-                                || (item == .memories
-                                    && UserDefaults.standard.string(forKey: ShellRailTab.storageKey(.memories)) != "knowledge") {
-                        // These pages own their arrival refresh, so the shell does not repeat it.
-                    } else {
-                        await appModel.refreshForSidebarItem(item)
-                    }
-                }
-                }
+                .task(id: selectionRaw) { await refreshShownPage() }
             }
             }
             }
@@ -176,6 +153,7 @@ struct ContentView: View {
                 // Links that await the body before navigating slightly undercount the person's wait.
                 FacePageDiagnostics.selected(page: displayedPage)
             }
+            .onChange(of: shownRow, initial: true) { surfacePages[shownSurface] = shownRow }
 
             if showTour, let layout = appModel.shellLayout?.value {
                 OnboardingTourOverlay(
@@ -229,7 +207,6 @@ struct ContentView: View {
             guard navigationMountID == nil else { return }
             navigationMountID = ApplicationLifetime.shared.mountMainScene(visiblePageInput: {
                 switch displayedViewMode {
-                case ShellViewMode.simple: return ["page": .string("chat")]
                 case ShellViewMode.agent: return ["page": .string("agent_view"), "item": .string(agentRoom)]
                 default:
                     if let page = ownPageID { return ["page": .string(page)] }
@@ -335,6 +312,21 @@ struct ContentView: View {
         }
     }
 
+    /// The shown page's arrival refresh, the same in Simple and Advanced.
+    private func refreshShownPage() async {
+        appModel.faceRefreshIssue = nil
+        let item = activeContentItem
+        if item == .activity {
+            // Today's source owner posts its face; opening it only draws that face.
+        } else if item == .settings || item == .ownPage
+                    || (item == .memories
+                        && UserDefaults.standard.string(forKey: ShellRailTab.storageKey(.memories)) != "knowledge") {
+            // These pages own their arrival refresh, so the shell does not repeat it.
+        } else {
+            await appModel.refreshForSidebarItem(item)
+        }
+    }
+
     private func windowIssue(_ text: String, dismiss: @escaping () -> Void) -> some View {
         HStack(alignment: .top) {
             Text(text).font(.callout).foregroundStyle(.red).textSelection(.enabled)
@@ -375,8 +367,8 @@ struct ContentView: View {
             return
         }
         chatShortcut = nil
-        // Every non-chat destination needs the full shell, whether or not an overlay was open.
-        if destination != .sidebar(.chat) {
+        // Simple and Advanced show every page in place; any other view has none, so a non-chat destination opens Advanced.
+        if destination != .sidebar(.chat), viewModeRaw != ShellViewMode.simple {
             viewModeRaw = ShellViewMode.advanced
         }
         switch destination {
@@ -384,7 +376,6 @@ struct ContentView: View {
         case .ownPage(let page):
             selectionRaw = SurfaceLayout.pagePrefix + page
         case .savedThing(let saved):
-            viewModeRaw = ShellViewMode.advanced
             switch saved {
             case .botReply(let botID, let entryID):
                 Task { await openHelperReply(botID: botID, entryID: entryID) }
@@ -424,8 +415,22 @@ struct ContentView: View {
         } catch { appModel.statusText = error.localizedDescription }
     }
 
+    /// Choosing a surface shows the page last shown in it, or the page it opens on.
+    private func chooseSurface(_ surface: ShellSurface, pages: [ShellRailRow]) {
+        if let page = surface.opening(pages, last: surfacePages[surface]) { selectRow(page) }
+    }
+
+    /// A tab or surface selects its page the way every other writer does: an app page by its item, a page of the agent's own by its id.
+    private func selectRow(_ row: ShellRailRow) {
+        switch row {
+        case .item(let item): selectSidebarItem(item)
+        case .page(let page): selectionRaw = SurfaceLayout.pagePrefix + page
+        case .divider: break
+        }
+    }
+
     private func selectSidebarItem(_ target: SidebarItem) {
-        // A page of the agent's own is selected by its id (`.ownPage(id)`, the rail's page row), never by the bare case.
+        // A page of the agent's own is selected by its id (`.ownPage(id)`, its tab on the agent's surface), never by the bare case.
         guard target != .ownPage else { return }
         // Write the tab before selecting its parent so the page mounts on that tab.
         if let home = SidebarItem.shellHome(for: target) {

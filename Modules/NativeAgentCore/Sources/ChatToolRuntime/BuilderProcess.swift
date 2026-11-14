@@ -283,7 +283,7 @@ extension SwiftToolDispatcher {
                 "reason": .string("cwd_invalid_or_outside_workspace"),
                 "execution": .string("not_run"),
                 "effect": .string("none"),
-                "detail": .string("cwd is not an existing folder this tool may work in; use one inside workspace_root. Nothing ran."),
+                "detail": .string("cwd is not an existing folder this action may work in; use one inside workspace_root. Nothing ran."),
                 "cwd_requested": .string(cwd),
                 "workspace_root": .string(builderWorkspaceRoot(dataRoot: dataRoot).path),
                 "source_checkout_available": .bool(builderSourceRepoRoot(dataRoot: dataRoot) != nil),

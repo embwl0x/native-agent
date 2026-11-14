@@ -130,6 +130,7 @@ extension ProvidersFacade {
         guard !Task.isCancelled else { return nil }
         present(result)
         if result.ok {
+            fetchModelListInBackground(after: providerID)
             _ = await adoptProviderForBlankSurfaces(
                 providerID, dataRoot: dataRoot, failure: failure
             )

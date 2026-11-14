@@ -69,8 +69,8 @@ extension AppToolExecutor {
     func doorHome(_ call: [String: JSONValue], input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue {
         guard let perform = execution.perform else {
             return Self.doorRefusal("door_unavailable",
-                "Home reads only through a chat's tool chain. Nothing was read.",
-                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
+                "Home reads only from inside a chat turn. Nothing was read.",
+                remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
         }
         let call = ChatToolSessionInjection.apply(toolName: "workspace", input: call,
                                                   sessionId: input["__session_id"]?.scalarText)
@@ -295,8 +295,8 @@ extension AppToolExecutor {
             // A helper item is bot.list's own row, found by its one resolver under every form the app shows a helper by.
             if page.id == "bots", !item.isEmpty {
                 guard let perform = execution.perform else {
-                    return Self.doorRefusal("door_unavailable", "A helper reads only through a chat's tool chain. Nothing was read.",
-                        remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
+                    return Self.doorRefusal("door_unavailable", "A helper reads only from inside a chat turn. Nothing was read.",
+                        remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
                 }
                 let result = Self.foldedResult(try await perform("bot_list", ["id": .string(item)], turn, execution), guide: nil, tool: "bot_list")
                 guard case .object(let list) = result, list["status"] == .string("ok"),

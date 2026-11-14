@@ -563,12 +563,9 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return try MacAXAttributeRead.collectingAttributeGaps(context: context) { gaps, context in
             let actions = try MacAXAttributeRead.observationActions(element, context: context)
             let names = MacAXAttributeRead.copyLabel(element, role: role, context: context, prepare: prepareForRead)
-            // The shared value reader suppresses unknown text subroles; every other value failure still makes coverage incomplete.
+            // A failed caption or value read stays on the element as a gap. On a text element its secrecy is unproven, so its pixels and those
+            // of everything its words could name are covered, and one with no finite frame still withholds the picture.
             let rawValue = MacAXAttributeRead.copyRaw(element, kAXValueAttribute, context: context)
-            // Failed caption or geometry reads leave secrecy unproven and must withhold pixels even when looks can report a gap.
-            if let gap = gaps.entries.first(where: { $0.attribute != kAXSubroleAttribute }) {
-                throw MacAccessibilityReader.NativeReadFailure(detail: "Required secret-masking read failed: \(gap.detail)")
-            }
             return MacAXAttributes(
                 role: role,
                 subrole: names.subrole,

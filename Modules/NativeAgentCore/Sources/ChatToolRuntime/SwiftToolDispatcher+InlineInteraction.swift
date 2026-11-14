@@ -43,7 +43,7 @@ extension SwiftToolDispatcher {
             case "missing_target":
                 path = "$.target"
                 accepted = """
-                    A canonical ID supported by the selected kind in request_interaction. Inspect its tool contract; do not invent an ID or \
+                    A canonical ID supported by the selected kind in request_interaction. Inspect its argument form; do not invent an ID or \
                     widen permission.
                     """
             case "invalid_mode":
@@ -51,7 +51,7 @@ extension SwiftToolDispatcher {
                 accepted = "read, write or read_write"
             default:
                 path = "$"
-                accepted = "A supported kind, target and additional targets with an available control in this app. Inspect request_interaction's tool contract."
+                accepted = "A supported kind, target and additional targets with an available control in this app. Inspect request_interaction's argument form."
             }
             return .object([
                 "status": .string("failed"),

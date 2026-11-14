@@ -13,7 +13,7 @@ public enum MoonshotModelCatalog {
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
         readCache: { try readDecodedCache(dataRoot: $0) },
-        providerConfigFile: "moonshot.json",
+        credential: .apiKey(providerConfigFile: "moonshot.json"),
         fetchLive: { ModelCatalogFetch(models: try await fetchLiveModels(key: $0, session: $1), isComplete: true) }
     )
 
@@ -31,7 +31,28 @@ public enum MoonshotModelCatalog {
         session: URLSession = ProviderHTTP.session,
         refresh: Bool = false
     ) async -> ModelCatalogRead {
-        await cache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
+        var read = await cache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
+        // Moonshot lists models only for a key: with none saved, a refresh cannot help and the note says what would.
+        if read.freshness == .unavailable, read.failure == nil {
+            let keyless: Bool
+            do { keyless = try cache.savedCredential(dataRoot: dataRoot) == nil } catch { keyless = false }
+            if keyless {
+                read.failure = "no key is saved"
+                read.remedy = "Add a key to see its models."
+            }
+        }
+        return read
+    }
+
+    /// Asks Moonshot again when a key is saved. Nil when the list was saved or no key is saved; otherwise why not.
+    public static func refreshSaved(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        session: URLSession = ProviderHTTP.session
+    ) async -> String? {
+        do { guard try cache.savedCredential(dataRoot: dataRoot) != nil else { return nil } }
+        catch { return error.localizedDescription }
+        let read = await cache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: true)
+        return read.freshness == .unavailable ? (read.failure ?? "the list could not be fetched") : nil
     }
 
     /// Routing reads the same credential-bound cache without network access; shipped rows retain their own catalog authority.

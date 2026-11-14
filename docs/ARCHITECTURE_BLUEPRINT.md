@@ -93,7 +93,7 @@ context and state. Their file maps below identify the owning declarations.
 
 ## Tool Dispatcher Map
 
-[TOOL_LOADING](TOOL_LOADING.md) owns discovery and dispatch;
+[ONE_DOOR](ONE_DOOR.md) owns discovery and dispatch;
 `AppToolExecutor.runAppDoor` owns the door and `AppActions` its actions.
 At executor assembly `AppActionRegistry` supplies `ToolRegistry.AppActionBinding`: executor, fixed input,
 renames, descriptor, saved Trust keys, lifecycle and argument-dependent read conditions.
@@ -225,7 +225,7 @@ projections; call identity, source line and meaningful arguments still match.
 
 [The manifest](skill_manifest_spec.md#the-one-form) owns executable admission and exact-version review.
 `AppActionRegistry` and `ToolNameAliases` own native dispatch mappings.
-[TOOL_LOADING](TOOL_LOADING.md#extending-their-reach) owns search, retained web reads and Maps results.
+[ONE_DOOR](ONE_DOOR.md#extending-their-reach) owns search, retained web reads and Maps results.
 `Research+WebSearch`, `Research+SearchFetch` and `ResearchHTMLExtraction` own their implementation.
 
 ## Policy Chokepoints
@@ -233,7 +233,7 @@ projections; call identity, source line and meaningful arguments still match.
 `TrustCenter` and `SecurityCenter` retain effect-time authority. Full Mac uses
 the operator's selected autonomy; macOS privacy-permission resets still require
 explicit approval. `PeerTurnEffectPolicy` applies the
-[peer-turn authority contract](TOOL_LOADING.md#authority-and-receipts);
+[peer-turn authority contract](ONE_DOOR.md#authority-and-receipts);
 `ApprovalTransactions` owns the corresponding approval execution paths.
 
 ## State Ownership
@@ -522,7 +522,7 @@ The body retains its existing window while the copied renderer is assembled.
 | `AppModel+SettingsFeed.swift` | Finished settings readers and scene-held preference write admission |
 | `AppModel+SkillsIntegrations.swift` | Connector, Telegram, Doctor and Inbox acts; the body owns their effects |
 | `AppModel+TrustActions.swift` | Trust, approval, backup and Mac control requests through the body dispatcher |
-| `AppModel.swift` | Renderer selections, shared edit drafts and the pipe client's finished face values |
+| `AppModel.swift` | Renderer selections, shared edit drafts, each page's ask bar record and the pipe client's finished face values |
 | `AppShellMenuPresentation.swift` | Rail-derived shortcuts, status words and ordered rail rows |
 | `AppTrustFaceActions.swift` | Native Trust workbench and confirmed app-exclusion picker |
 | `AppearanceController.swift` | `AppearanceController`: one explicit light/dark answer applied consistently to SwiftUI and AppKit |
@@ -593,6 +593,7 @@ The body retains its existing window while the copied renderer is assembled.
 | `MacChatTurnCard.swift` | `MacChatTurnCard`: main/detached display of the shared turn face |
 | `MacControlWorkbenchView.swift` | Shared Mac control forms, policy availability and retained owner outcomes |
 | `MacWorkOverviewDetail.swift` | Shared work facts and document body; approvals and Inbox draw the Inbox page |
+| `MakeSheetView.swift` | A Make table version drawn as a native table; a changed cell is laid as the next version by the person's tap |
 | `MemoriesFaceNavigation.swift` | Memory and helper document demands; existing correction/Forget controls and local graph/upkeep destinations |
 | `MemoryView.swift` | Memory upkeep acts, full text, feed read status and scoped face observations |
 | `MessageAttachments.swift` | Granted transcript resources: image previews, file chips and off-main bookmark resolution |
@@ -635,10 +636,12 @@ The body retains its existing window while the copied renderer is assembled.
 | `SettingsDock.swift` | Permission guidance from body slots, with the grant-holding body bundle as its drag source |
 | `SettingsFaceCalls.swift` | Mounted settings presentations, bundle-root references, native pickers and disconnect cancellation |
 | `SettingsNavigation.swift` | SettingsLink routes to canonical pages; ShellPageFrame supplies shared page layout |
+| `ShellAskBar.swift` | `ShellAskBar`: the line under every page but Chat that sends the person's words about it, then follows that turn |
 | `ShellFaceCalls.swift` | Scene, Desk, Work pane and clipboard reverse presentations |
 | `ShellPageContent.swift` | Page drawing map and local rail/profile vocabulary |
 | `ShellRailPages.swift` | `SurfaceLayoutContent`: checked layout; `ShellRailTab`: canonical tab routing |
-| `ShellSidebarRail.swift` | Canonical rail rows, unavailable page owners, selection and focus rings |
+| `ShellSidebarRail.swift` | The rail; place rows shared with Simple, the Desk row's waiting mark, selection bar and focus ring |
+| `ShellSurface.swift` | `ShellSurface`: the window's five places; `ShellSurfaceTabs`: a place's tabs; `ShellPlacePage`: tabs over the page, the ask bar under it |
 | `ShellTabs.swift` | Shell page/tab components: content-local action rows, shared scroll gutter and tabbed page layout |
 | `ShellWindowChrome.swift` | `ShellWindowChrome`, `ShellFrame`: native chrome, split layout and keyboard order |
 | `Shotgun.swift` | `ShotgunController`: person-only driving chat; scoped Stop/Resume, placement and fade settlement |
@@ -648,8 +651,8 @@ The body retains its existing window while the copied renderer is assembled.
 | `SimpleContactThread.swift` | Finished contact-thread lines, links, pending rows and body-owned action receipts |
 | `SimpleHelperThread.swift` | Helper run rows, full documents and helper-contact messages use body DTOs and acts |
 | `SimpleSetupPanel.swift` | Setup hosts hold conversation-bound return verification, cancellation and dismissible feedback |
-| `SimpleShellView.swift` | Simple's local selection draws contact and helper slots without owning either catalog |
-| `SimpleSidebar.swift` | Selected contacts, helpers, layout and shared face preferences |
+| `SimpleShellView.swift` | Simple's local selection draws contact and helper slots beside chat; every other page shows in place |
+| `SimpleSidebar.swift` | The agent's card, the places, and the folded Agents and Helpers lists in the layout's order |
 | `SimpleThreadComposer.swift` | Thread-bound drafts clear only on acceptance; shared send and accessibility |
 | `SimpleThreadPresentation.swift` | Thread typography, line formatting and local geometry |
 | `SimpleViewMode.swift` | `ViewModeSwitch`: Simple/Advanced/Agent selection and shared top chrome placement |
@@ -724,11 +727,11 @@ Directory: `Modules/NativeAgentCore/Sources/Senses/`
 | `HelperSenseRunner.swift` | Progress supervision, selected-lifetime retirement, source wakes and cancellation-safe receipts |
 | `OwnedProgram.swift` | Source and candidate identities, run/face entries and shared monotonic progress-window policy |
 | `OwnedProgramCalls.swift` | Static prelude call and argument inspection; unknown expressions retain runtime validation |
-| `OwnedProgramJournal.swift` | Request-owned replay, read freshness and receipts; Stop retains each call's actual effects |
+| `OwnedProgramJournal.swift` | Request-owned replay and read freshness; receipts show calls as metadata and name the private journal |
 | `OwnedProgramPrelude.swift` | Frozen app/host namespaces, preview/version propagation, ordered batches and strict replay |
 | `OwnedProgramProcess.swift` | Shared helper process framing, IO and deadlines |
 | `OwnedProgramRunner.swift` | `holding`, `endResidents`, `host.state.get/set`, `ReadContent`: resident leases, replay and receipts |
-| `OwnedProgramStore.swift` | Sealed candidates, exact rehearsal reuse and publication; `tape: true` replays seal `tape` coverage |
+| `OwnedProgramStore.swift` | Sealed candidates, exact rehearsal reuse and publication; `tape: true` replays seal `tape` coverage; a kept shipped part follows it |
 | `SenseDoor.swift` | Registry-first reads, exact captured views and provenance; raw reads stay explicit and acts retain ordinary gates |
 | `SenseNewsBoard.swift` | Bounded deduplicated news; checked persistence precedes publication, and each new item is a world happening |
 | `SenseScreenThings.swift` | Exact window selections, related-action bindings and in-turn mac.act verbs |
@@ -1010,13 +1013,13 @@ Directory: `Modules/NativeAgentCore/Sources/AppToolRuntime/`
 | `AppToolExecutor+Make.swift` | `AppToolExecutor`; Studio versions, intake and workspace-fenced reply images |
 | `AppToolExecutor+MyQueue.swift` | `runMyQueue`, `runHouseFile`; Exact-id intentions, schedules, habits and closure receipts |
 | `AppToolExecutor+PagePresentation.swift` | screenshot results, quiet page reads, and a door-only page's read (summary, actions, Trust's access rows) |
-| `AppToolExecutor+PartRun.swift` | Part admission, previews, stopped-run checkpoints, Desk reservations and result settlement |
+| `AppToolExecutor+PartRun.swift` | Part admission, previews, stopped-run checkpoints from the private journal, Desk reservations and settlement |
 | `AppToolExecutor+Photos.swift` | `AppToolExecutor`, `runPhotosRead`; Read-only PhotoKit metadata and permission remedies |
 | `AppToolExecutor+QuietMind.swift` | Owner previews precede bootstrap and effect callbacks |
 | `AppToolExecutor+QuietSelfAdmin.swift` | `AppToolExecutor`, `performMacSelfAppRoute`, `behind`, `quietPosture`, `freshQuietPosture`; posture |
 | `AppToolExecutor+SenseMake.swift` | `AppToolExecutor`; Author captured material under owner-off authority |
 | `AppToolExecutor+Senses.swift` | Sense corner reads, served verb discovery and gated in-turn acts |
-| `AppToolExecutor+ToolSchemas.swift` | `AppToolExecutor`, `appToolSchemas`; Lazy door schema avoids registry initialization cycles |
+| `AppToolExecutor+ToolSchemas.swift` | `AppToolExecutor`, `appToolSchemas`, `modelSchemas`; the agent's hand, drawn again only when it can change |
 | `AppToolExecutor+UpkeepTarget.swift` | backup restore target validation |
 | `AppToolExecutor.swift` | Platform routing and canonical effect owners; phone sends and chat.post knocks tell one matter |
 | `AppToolNotificationInput.swift` | `NativeAgentNotificationDefaults`: `parseInput` |
@@ -1144,7 +1147,7 @@ Directory: `Modules/NativeAgentCore/Sources/BackgroundLoops/`
 | `LoopFailureReceipts.swift` | Loop failure occurrence details, read-time incident folding, classification and result accounting |
 | `LoopHistory.swift` | SwiftNativeLoopScheduler durable run/completion history, first-seen stamps, organ pulses and ordered checkpoints |
 | `LoopStatusEvidence.swift` | WatchdogStatus wire encoding, scheduler LoopState, LoopStatus and event-listener health evidence |
-| `ManagedLoopRunner.swift` | LoopExecutionGate and ManagedLoopRunner: serialize each registration until body exit and accounting settle |
+| `ManagedLoopRunner.swift` | LoopExecutionGate, ManagedLoopRunner: one run per registration until exit and accounting; agent passes await setup |
 | `ModuleLogging.swift` | `nativeLog`: module-local `ModuleLog` category for BackgroundLoops diagnostics |
 | `PhysiologySelfWriteRegistry.swift` | `PhysiologySelfWriteRegistry`: generation-based echo suppression without hiding external writes |
 <!-- END GENERATED BLUEPRINT -->
@@ -1235,7 +1238,7 @@ pairing, provenance, experience resolution and dream marks. The
 | `ChatSecretRedactor.swift` | `ChatSecretRedactor` typealias |
 | `ChatSessionDirective.swift` | `ChatSessionDirective.recordURL`. |
 | `ChatSessionIndexReconciler.swift` | `ChatSessionIndexReconciler` actor; `reconcile` selects repairs and commits through ChatSessionIndexFile |
-| `ChatTranscriptEvidenceRendering.swift` | ChatTranscriptEvidenceRendering owner. |
+| `ChatTranscriptEvidenceRendering.swift` | Persisted receipt evidence for history; a script's calls read as metadata, never raw results |
 | `ChatTranscriptToolMessageKind.swift` | `ChatTranscriptToolMessageKind` enum; `pendingApprovalID`, `pendingApprovalReason` |
 | `ContextBudgetPolicy.swift` | ContextBudgetPolicy owner. |
 | `ContextWindowPolicy.swift` | Context-window readout from the powering model's verified default. |
@@ -1248,7 +1251,7 @@ pairing, provenance, experience resolution and dream marks. The
 | `SessionContextMeasurement.swift` | SessionContextMeasurement owner. |
 | `SessionContextRequest.swift` | SessionContextRequest owner. |
 | `SessionHistoryMessageProjection.swift` | `admission`, `project`. |
-| `SessionHistoryPromptRenderer.swift` | `renderDetailed`, `recallQuery`. |
+| `SessionHistoryPromptRenderer.swift` | `renderDetailed`, `recallQuery`; `Renderable.replay(words:)`, the one form every replayed row takes. |
 | `SessionHistoryReader.swift` | `SessionHistoryReader`, `messages`, `messagesWithStats`. |
 | `SessionHistoryTail.swift` | Stateless whole-turn checkpoints from the admitted replay and its row sizes. |
 | `SessionMessageProvenance.swift` | `SessionMessageProvenance` |
@@ -1344,7 +1347,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatToolRuntime/`
 | `SwiftToolDispatcher+DelegationTools.swift` | `SwiftToolDispatcher` `impl_delegation_status` `delegationStatusLimit` `delegationStatusOffset` |
 | `SwiftToolDispatcher+DeskNotifications.swift` | `SwiftToolDispatcher`; stable scopes, mute windows, nag settlement |
 | `SwiftToolDispatcher+DeskPlans.swift` | `SwiftToolDispatcher`; locked plans; partial-write receipts |
-| `SwiftToolDispatcher+DeskReadout.swift` | `SwiftToolDispatcher`; canonical live/archive paging |
+| `SwiftToolDispatcher+DeskReadout.swift` | `SwiftToolDispatcher`; canonical live/archive paging; a table contact's Desk and piece read |
 | `SwiftToolDispatcher+DeskTools.swift` | `SwiftToolDispatcher`; raw mutation admission; checked waits and close |
 | `SwiftToolDispatcher+DesktopPixels.swift` | `SwiftToolDispatcher`, `desktopPixelsRequested`, `desktopPixels`; masked capture; settled saves |
 | `SwiftToolDispatcher+Dispatch.swift` | Normalized dispatch; pure validation; part-write receipts |
@@ -1380,7 +1383,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatToolRuntime/`
 | `ToolApproval.swift` | PreApprovalToolValidating contract and SwiftToolDispatcher refusal/proposal wording before approval admission |
 | `ToolArguments.swift` | Checked admission; lossless normalization; explicit tool operation and app-door dependencies |
 | `ToolCausalBoundary.swift` | `ToolCausalBoundary` enum; `hasCanonicalMotorOwner`, `motorReference` |
-| `ToolResultSections.swift` | `ToolResultSections`, `pages`; lossless paging; small fields before bulk; raw oversized atoms |
+| `ToolResultSections.swift` | `ToolResultSections`, `pages`; lossless paging; small fields before bulk; long strings in ordered pieces |
 | `Turn+ChatTools.swift` | `Turn` holds approved model override, image-generation admission and Make evidence |
 | `VisualContinuity.swift` | `VisionLiveSceneSnapshot`, `SwiftToolDispatcherFourVerbLiveScene`; bounded motion and occlusion |
 | `WindowObservation.swift` | `SwiftToolDispatcherFourVerbPerceptionSource`; masked capture; visual recognition; live preview |
@@ -1437,7 +1440,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `ChatOrchestration+ToolDispatch.swift` | Offered-call admission; deadlines end only the wait |
 | `ChatOrchestration+ToolLoop.swift` | `TurnContext`; `withToolSchemas`; `finishReplyTurn`; `.completed` |
 | `ChatOrchestration+TurnEngine.swift` | SwiftNativeTurnEngine actor dependencies and retained task lifetimes |
-| `ChatOrchestration+TurnReach.swift` | `SwiftNativeTurnEngine`; Frozen packet rendering and exact delivery credit |
+| `ChatOrchestration+TurnReach.swift` | `SwiftNativeTurnEngine`; Frozen packet rendering, withheld-context notice and exact delivery credit |
 | `ChatOrchestrationClient+AttachmentEvidence.swift` | `CodexCompletionTranscriptEvidence`; Exact completion and saved-attachment recovery |
 | `ChatOrchestrationClient+Attachments.swift` | Trust-gated images and bounded document excerpts; audio stays attached |
 | `ChatOrchestrationClient+Client.swift` | `SwiftNativeChatOrchestrationClient` actor; `chat`, `chatExecution`; `StructuredChatExecution` carries the response and typed success/failure; `withCurrentChatModel` admits the current Chat pick at a wake's `model.call`, so a run that never thinks needs no model; `withModelContext` binds the same client/provider/model/effort/tier for turns and wakes |
@@ -1730,7 +1733,7 @@ Directory: `Modules/NativeAgentCore/Sources/Context/`
 | `ContextHealthEvents.swift` | Root-owned context health invalidations; readers subscribe before reading and release on cancellation |
 | `ContextMarkdownCompiler.swift` | `ContextMarkdownCompiler`, `triggerTokens`: bounded Markdown atoms and source-specific triggers |
 | `ContextMarkdownGrammar.swift` | `ContextMarkdownCompiler` grammar: UTF-8 block ranges, Markdown boundaries and generated USER fact bullets |
-| `ContextMemoryLead.swift` | `ContextMemoryLead`: rendered age, roots and source |
+| `ContextMemoryLead.swift` | `ContextMemoryLead`: rendered age at the turn's pinned instant, roots and source |
 | `ContextPacket.swift` | Context packet, expandable pointers, safe representation leads and retained memory roots |
 | `ContextPreparation+Feedback.swift` | ordered feedback replay and delivery-backed local rest |
 | `ContextPreparation+SourceReconciliation.swift` | source compilation, checked faults and gated generation publication |
@@ -1747,7 +1750,7 @@ Directory: `Modules/NativeAgentCore/Sources/Context/`
 | `ContextSelectionConfiguration.swift` | Context selector limits, ranking weights and named admission errors |
 | `ContextSelectionReceipt.swift` | Selection degraded sources, budget, index and explicit current receipt evidence |
 | `ContextSourceMonitoring.swift` | `ContextSourceRegistry`: allowlists, owner inventories and source-count health edges |
-| `ContextTurnRuntime.swift` | `ContextPreparedTurn`: turn leases, query handoff and delivery |
+| `ContextTurnRuntime.swift` | `ContextPreparedTurn`: turn leases, pinned turn instant, query handoff and delivery |
 | `ModuleLogging.swift` | `nativeLog`: module-local `ModuleLog` category for Context diagnostics |
 | `NeedSignal.swift` | Context need, admitted origin/authorization, cache identity vocabulary |
 | `RequiredDocumentMirror.swift` | `RequiredDocumentMirror`, `StablePromptKernel`: required document and stable-prompt ownership |
@@ -1793,7 +1796,7 @@ Directory: `Modules/NativeAgentCore/Sources/Desk/`
 <!-- BEGIN GENERATED BLUEPRINT: Modules/NativeAgentCore/Sources/Desk/ -->
 | File | Owns |
 |---|---|
-| `DeskArchiveQueries.swift` | Archival and locked hierarchy queries; partial archive commits preserve receipts |
+| `DeskArchiveQueries.swift` | Archival and locked hierarchy queries; partial archive commits preserve receipts; a retried archive replaces its receipt |
 | `DeskBoardLayout.swift` | `DeskBoardLayout`: active work and the pursuit lane; `DeskPage` reads a stored timestamp |
 | `DeskCadence.swift` | Checked step provenance and cadence; malformed saved values cannot become defaults |
 | `DeskClock.swift` | `DeskClock` enum; `nowISO`, `commitStamp` |
@@ -1815,7 +1818,7 @@ Directory: `Modules/NativeAgentCore/Sources/Desk/`
 | `DeskRef.swift` | Stable Desk references and their persisted tagged-union identity |
 | `DeskRefActions.swift` | `DeskRefAction`, `DeskRefAffordance`: reference open destinations and copy text |
 | `DeskSequencing.swift` | `DeskSequencing.compute`: blockedness derives from edges without unblocking writes |
-| `DeskState.swift` | Append-only archive records and materialized Desk state formats |
+| `DeskState.swift` | Append-only archive records and materialized Desk state formats; `matching`: the one reading of an item's name |
 | `DeskStore+Reduction.swift` | `SwiftNativeDeskStore`: `compact`, `aliasSeq`, `orderByAlias` |
 | `DeskStore.swift` | `SwiftNativeDeskStore`, `currentRevision`, `continuation`, `setContinuation`, `updateTitle` |
 | `DeskStoreRecords.swift` | `DeskError` enum |
@@ -1823,7 +1826,7 @@ Directory: `Modules/NativeAgentCore/Sources/Desk/`
 | `DeskWorkTransitions.swift` | Locked work creation, bounded reservations and idempotent receipts |
 | `MyQueue.swift` | `MyQueue`, `entries`, `add`, `isReady`, `releaseSignal`, `releaseNews`, `freeAfter`, `shown`, `Entry.owedToPerson` |
 | `OwnerAttentionPolicy.swift` | One owner-attention policy from approvals, Desk waits and inbox choices |
-| `PartRunStore.swift` | Sealed bounded checkpoints; rename claims bytes until explicit settlement |
+| `PartRunStore.swift` | Sealed bounded checkpoints and unsettled run journals; rename claims bytes until explicit settlement |
 | `PromotionDossier.swift` | Desk notes and typed evidence dossiers for self-authored pursuits |
 | `Pursuit.swift` | Durable work attempts and pursuit accounting values |
 | `TaskLedger.swift` | `SwiftNativeTaskLedger`: locked history; `PersistenceCore.defaultDataRoot()` or explicit `--data-root` |
@@ -2220,7 +2223,7 @@ mission-identity reader remains.
 | `ConnectorFace+Agents.swift` | Connectors' agent rows: contact doors, their threads and the person's send; Connect, Test and Disconnect ask in a new Mac chat; a read never discovers; each row is a door call, and the agent verbs no other verb runs run here |
 | `ConnectorFace+Phone.swift` | Connectors' iPhone rows: iCloud pairing facts, paired devices, notification route, phone senses; Pair, Remove and Rotate are the person's; each row is a door call, and the pairing verbs no other verb runs run here |
 | `ConnectorFace+Telegram.swift` | Connectors' Telegram rows: transport health, the person's levers (on, token card, who may reach, mention, model), receipts, blocked and errors; each row is a door call, and the Telegram verbs no other verb runs run here |
-| `ConnectorFace.swift` | The Connectors page: accounts, kept secrets and folders from `ConnectorReadiness`, composed with Telegram, iPhone and agent sections; each row is a door call, and the `connections` verbs the stem pages call run here |
+| `ConnectorFace.swift` | The Connectors page: one connector list (accounts from `ConnectorReadiness`, the iPhone, each agent) whose rows hold their own settings, then kept secrets and folders; each row is a door call, and the `connections` verbs the stem pages call run here |
 | `ConnectorRecord.swift` | `ConnectorRecord`, `ConnectorActionRecord` and descriptor readiness projection |
 | `ConnectorStatusProjection+Actions.swift` | connector action registry, records and checked capability statuses |
 | `ConnectorStatusProjection+LocalIntegrations.swift` | `mac-watch-catalog`; Read-only catalog and native recovery words |
@@ -2319,12 +2322,12 @@ mission-identity reader remains.
 | `EngineTools.swift` | `PartDoor`, `withPartDoor`; gated native calls and owner-supplied page outcomes |
 | `EngineTrust.swift` | Checked policy, audit and capability publication through canonical mutation owners |
 | `EngineTrustFace+Readings.swift` | Trust's security, live macOS grants (the reach and per-app Automation), watches and activity readings with source failures; each action its door call |
-| `EngineTrustFace.swift` | Trust's checked policy, Mac grants, peers, receipts, privacy and backup controls |
+| `EngineTrustFace.swift` | Trust's What I may do card, checked policy, Mac grants, peers, receipts, privacy and backup controls |
 | `EngineTurnContinuation.swift` | `TurnContinuationRuntime`: turns a relaunch interrupted resume, settled Desk waits return, reply settlement |
 | `EngineTurns.swift` | Operational turn/Stop facade, off-main face publication and independent read-only panes |
 | `GraphUpkeepOwner.swift` | One owner holds reviewed orphan identities and consumes their Apply token exactly once |
 | `ImprovementGauntletReadModels.swift` | `ImprovementGauntletRun`, `GauntletCheck`; Stored promotion evidence |
-| `InboxFace.swift` | Inbox's one face reads ForPerson's matters, put-away ones as folded history; each answer is its one door call, the person's tap and the agent's call alike |
+| `InboxFace.swift` | Inbox's one face reads ForPerson's matters, put-away ones as folded history, the agent's own decisions of one kind under one row; each answer is its one door call, the person's tap and the agent's call alike |
 | `LivingStatusRefreshCoalescer.swift` | `LivingStatusRefreshCoalescer` struct; `requestRefresh`, `completePass` |
 | `MacChatScreenPreview.swift` | `TurnsFacade.receiveScreenPreview`: off-main encoded masked preview, scoped to its exact active turn |
 | `MacChatTurnExecution.swift` | `NativeAgentEngine`, `TurnsFacade.runtime`, `ChatTurnToolPlacement`; Ordered stream settlement |
@@ -2367,7 +2370,7 @@ mission-identity reader remains.
 | `TranscriptRowFace+Mac.swift` | Mac and phone transcript row faces; unreadable tool input names its cause. |
 | `TranscriptSessionMutations.swift` | Canonical session creation, archive and generation-checked clearing |
 | `TranscriptsFacade.swift` | Root-scoped transcripts, press, session faces, mounted invalidations and live tail boxes |
-| `TrustFaceGuardrails.swift` | Policy-derived guardrail rows used by Trust’s shared face |
+| `TrustFaceGuardrails.swift` | Policy-derived guardrail rows and the lock rows read from `PermissionLaw` and levers for Trust’s shared face |
 | `TurnCardReadout.swift` | `TurnCardReadout`; Off-main lifecycle and canonical approval projection |
 | `TurnFaceProjection.swift` | `TurnFaceProjection`: off-main finished turn faces, ordered from canonical owners and deduplicated before posting |
 | `WorkOverviewRead+Today.swift` | Source-specific Today readings and the off-main owner posting its finished `today-readout` face |
@@ -2430,6 +2433,12 @@ worker; a fast answer waits for launch completion once or reports unreachable.
 The ten-second patience is capped by the operation deadline. Stop retires the
 wait; a late worker reply has no authority to emit input. Passive looks skip
 admission, and post-effect passes do not admit.
+
+Admission refusals describe the caller's operation: looks and menu reads report
+that the app did not answer the read; handle acts and menu presses report that
+nothing was pressed. A successful navigation keeps its own receipt when the
+landing read fails; `landing_read` carries that read's failure without replacing
+navigation's status, verification or success.
 
 `macSettle` judges evidence immediately and after coalesced event batches, one
 pass at a time. Navigation and menu surface commands retain their transition
@@ -2729,7 +2738,7 @@ Directory: `Modules/NativeAgentCore/Sources/NativeAgentCore/`
 | `NativeActionRecord.swift` | `NativeActionRecord` struct |
 | `NativeAgentBuildIdentity.swift` | checked process-cached current app stamps; incomplete identity unavailable; `writeLaunchStamp` refuses it |
 | `NativeLoopbackListenerParameters.swift` | Fixed-port listeners and retained bounded diagnostics |
-| `NativeTimestampFormat.swift` | Core alias to Shared's locked wire timestamp owner |
+| `NativeTimestampFormat.swift` | Core alias to Shared's wire timestamp owner |
 | `NetworkSense.swift` | One path monitor; network-return waits and body wakes follow path events |
 | `OrganBody.swift` | `OrganBody`: the one body projection (each organ's line and deviation), the felt-memory rule and the body read hook |
 | `OrganPulse.swift` | `OrganPulse` beats and recording hook; `OrganRecord` derives profile and deviation from the record's newest beats |
@@ -2748,7 +2757,6 @@ Directory: `Modules/NativeAgentCore/Sources/NativeAgentCore/`
 | `TurnPresentation.swift` | `TurnPresentationReducer`: bounded lifecycle evidence without payloads; only their acts are steps, each one identity from start to end |
 | `TurnTokenBudget.swift` | `TurnTokenBudget` class; `take`, `beginRequest` |
 | `UserMDAutogenMarkers.swift` | `UserMDAutogenMarkers`, `promptByteCap`: markers and picture bound |
-| `UserMessageIntentSignals.swift` | `UserMessageIntentSignals`: lexical signals grant no effect authority |
 | `VectorMath.swift` | `requireUsable`, `cosine`, `standout`, `chanceBar`: vector gates and attention thresholds |
 | `WorkshopWireVocabulary.swift` | The `workshop` surface spelling and trimmed event-kind matching |
 <!-- END GENERATED BLUEPRINT -->
@@ -2801,6 +2809,7 @@ Directory: `Modules/NativeAgentCore/Sources/PersistenceCore/`
 <!-- BEGIN GENERATED BLUEPRINT: Modules/NativeAgentCore/Sources/PersistenceCore/ -->
 | File | Owns |
 |---|---|
+| `CallLedger.swift` | `CallLedger`: the metadata a receipt's nested call keeps, its result's measured identity and its artifacts |
 | `CapabilityLifecycle+FileAdmission.swift` | CapabilityLifecycle file-write admission, peer-content protection and owner-off reconciliation |
 | `CheckedFixedSizeSecretFile.swift` | `CheckedFixedSizeSecretFile`; Missing-only creation; invalid bytes preserved. |
 | `CodexHandoff.swift` | `CodexHandoff.path`; One explicit handoff identity. |
@@ -2905,14 +2914,15 @@ Directory: `Modules/NativeAgentCore/Sources/ProviderRouting/`
 | `AsyncSerialQueue.swift` | FIFO completion and caller cancellation for shared single-use OAuth token refreshes |
 | `ChatCompletionsMessageEncoding.swift` | `chatCompletionsMessages` |
 | `ChatCompletionsStreamDecoder.swift` | `ChatCompletionsStreamDecoder`: checked stream terminals and fragments |
-| `ChatGPTAccountModelRefresh.swift` | `ChatGPTAccountModelRefresh`: account discovery outside dispatch |
+| `ChatGPTAccountModelRefresh.swift` | `ChatGPTAccountModelRefresh`: account discovery outside dispatch; says when it cannot ask |
 | `ChatGPTCredentials.swift` | ChatGPTTransport credential discovery, exact account binding and serialized single-use token refresh |
 | `ChatGPTResponsesBody.swift` | ChatGPTTransport Responses wire body, structured input roles and native tool encoding |
 | `ChatGPTTransport.swift` | ChatGPT OAuth request/stream/error execution with conversation or stable workshop-surface cache routing |
 | `CodexAccountModelCatalog.swift` | `CodexAccountModelCatalog`, `load`, `matchingModels`, `codex.model_catalog:<file path>` |
 | `CodexExecutable.swift` | `CodexExecutable`: shared executable selection |
 | `CodexOAuthAccessContext.swift` | Checked Codex OAuth access identity and stable re-sign-in-required exhaustion marker |
-| `FirstPartyModelCatalog.swift` | `FirstPartyModelCatalog`: route-owned model contracts |
+| `FirstPartyModelCatalog.swift` | `FirstPartyModelCatalog`: shipped floor rows, route contracts, effective lookups and one output allowance |
+| `FirstPartyModelDiscovery.swift` | `FirstPartyModelDiscovery`: live model lists, offered flag, one identity per model, effective contracts |
 | `LLMCallTelemetry.swift` | `LLMCallTraceRecorder`, `spent`: one receipt per request; partial output settles |
 | `LLMClient+AnthropicAdapter.swift` | `AnthropicTransport`: shared Messages transport |
 | `LLMClient+AnthropicNativeTools.swift` | `AnthropicTransport`, `ProviderWire`: ordered native calls and signed replay |
@@ -2929,7 +2939,7 @@ Directory: `Modules/NativeAgentCore/Sources/ProviderRouting/`
 | `LLMProviderStatusFeed.swift` | checked, credential-bound observation |
 | `LLMRequestShape.swift` | `ToolContractWeight`: bounded request receipts and secondary-call isolation |
 | `LLMUsage.swift` | Provider usage parsing, counter semantics, streaming accumulation and saturating logical input totals |
-| `ModelCatalogCache.swift` | Credential-bound catalog reads and explicitly refreshed, ordered publication |
+| `ModelCatalogCache.swift` | Credential-bound catalog reads, route-supplied credentials and explicitly refreshed, ordered publication |
 | `ModuleLogging.swift` | `nativeLog`: module-local `ModuleLog` category for ProviderRouting diagnostics |
 | `MoonshotModelCatalog.swift` | `MoonshotModelCatalog`: authenticated model discovery |
 | `NativeOAuthCallbackPolicy.swift` | exact callback state |
@@ -2950,7 +2960,7 @@ Directory: `Modules/NativeAgentCore/Sources/ProviderRouting/`
 | `OpenRouterModelCatalog.swift` | `OpenRouterModelCatalog`: live-backed membership and controls |
 | `ProviderAPIKeyStore.swift` | Provider reference/string validation; byte insertion, readback and deletion delegate to DeviceSecretKeychain |
 | `ProviderConfiguration.swift` | Byte-checked provider configuration decode under the writer's lock with fresh credential/readiness facts |
-| `ProviderConnectionProbe.swift` | Native probe capabilities and request-bound OAuth credential evidence; API-key connection probes |
+| `ProviderConnectionProbe.swift` | Native probe capabilities and request-bound credential evidence; API-key connection probes |
 | `ProviderErrorBodyDrain.swift` | Error diagnostics settled by body EOF, read error, byte cap or cancellation |
 | `ProviderFailure.swift` | `Diagnostic`, `ToolFailureError`, `repair`: typed failure and repair ownership |
 | `ProviderOAuthAdmission.swift` | Observed OAuth credential admission and expiry interpretation |
@@ -3172,7 +3182,7 @@ Directory: `Modules/NativeAgentCore/Sources/TelegramBot/`
 | `TelegramTurnPresentation.swift` | `TelegramTurnPresentationPhase`: canonical lifecycle semantics |
 | `TelegramTurnProgressCardDriver.swift` | `TelegramTurnProgressCardDriver`: persist terminal identity before release |
 | `TelegramUpdateInbox.swift` | `TelegramUpdateInbox`, `snapshots`, `ensurePending`, `failedReplyClaims`, `repair`: life-bound recovery |
-| `TelegramVoiceTranscription.swift` | Speech final/error and cancellation own recognition; process exit owns conversion |
+| `TelegramVoiceTranscription.swift` | Speech final/error and cancellation own recognition; the Mac's own audio reader owns conversion |
 <!-- END GENERATED BLUEPRINT -->
 
 ### ToolRegistry
@@ -3276,7 +3286,7 @@ The workflow capability reader does not write back. The demo-only installer is r
 | `SwiftNativeManifestSigner.swift` | `SwiftNativeManifestSigner`, `canonicalBytes`, `existingSigningKey`; Exact signing authority. |
 | `TrustAccessModeCapabilityCatalog+Read.swift` | Effective grants preserve saved restricted settings. |
 | `TrustAccessModeCapabilityCatalog.swift` | `TrustAccessModeCapabilityCatalog`, `normalizedMode`, `macControlPolicy`; Canonical presets. |
-| `TrustCenter+Autonomy.swift` | `PermissionLaw`: one posture, class, reach and effective level for authorization and scheduling |
+| `TrustCenter+Autonomy.swift` | `PermissionLaw`: one posture, class, reach and level for authorization and scheduling; `verdict` by act kind |
 | `TrustCenter+ChromeControl.swift` | `SwiftNativeTrustCenter.authorizeChromeControlEffect`; Fresh authority per effect. |
 | `TrustCenter+Defaults.swift` | Canonical scalar defaults shared with typed and phone reads. |
 | `TrustCenter+PolicyLoading.swift` | One checked generation; only proven fresh policy bootstraps. |
@@ -3323,7 +3333,7 @@ Directory: `Modules/NativeAgentCore/Sources/TurnTrace/`
 | `TurnTraceContext.swift` | Trace-only correlation; reply-row identity is held on `Turn.replyRow` |
 | `TurnTraceEvent.swift` | Canonical events; bounded envelopes retain receipt evidence |
 | `TurnTraceGrouping.swift` | Stable grouping and exact metrics with coverage gaps |
-| `TurnTracePersistLane.swift` | The one trace writer and reader over the record's detail grain (`ExperienceStore.note`/`details`); terminal and dispatch notices after the write |
+| `TurnTracePersistLane.swift` | The one trace writer and reader of the record's details; terminal and dispatch notices; the agent's done verbs (`Deed`) |
 | `TurnTraceRecentReader.swift` | Checked record windows, model-call evidence and measured coverage |
 | `TurnTraceReplayReader.swift` | Record queries and positive terminal evidence |
 | `TurnTraceThinkingReader.swift` | `TurnTraceThinkingReader`: Recorded model/turn counts in local day buckets |
@@ -3393,7 +3403,7 @@ Tool execution, sandbox primitive broker and promotion boundary.
 | `PartFileReads.swift` | `PartFileReads`: a part's readPaths admission, `files.query` over a private snapshot, `files.mime`'s budget |
 | `PartHost.swift` | `Parts.rehearse`, `ToolHost`: gated host; previews suppress effects; a read verb's run only reads |
 | `PartMIMERead.swift` | `PartMIMERead`: pure saved-message reader behind `files.mime` and the native attachment save |
-| `Parts+BundledSeed.swift` | Parts bundled seed admission from the shipped current part contract |
+| `Parts+BundledSeed.swift` | Parts bundled seed admission from the shipped current part contract; whether a kept version is that part |
 | `Parts+CallValidation.swift` | static call-fit against current declarations |
 | `Parts+Creation.swift` | checked save/rehearsal; ratcheted provenance |
 | `Parts+Execution.swift` | pinned calls and pure faces; exact run admission |
@@ -3491,7 +3501,7 @@ Directory: `Modules/NativeAgentShared/Sources/NativeAgentShared/`
 | `FacePageSession.swift` | Door-held edits, document demands and subject-owned operations above disposable rows |
 | `FaceProtectedForm.swift` | Transient secret fields use named native receivers outside page edits and retained operations |
 | `FaceReadPage.swift` | Revision-bound document chunks for the signed phone read door |
-| `FaceRowView.swift` | Quiet native rows, drawn-call submission and row-local pending, failure and undo |
+| `FaceRowView.swift` | Quiet native rows, inline control groups, drawn-call submission and row-local pending, failure and undo |
 | `FaceSectionView.swift` | Shared face sections in native lists or door-supplied cards |
 | `FaceStyle.swift` | Door-supplied card surface, row density, insets and type |
 | `FaceView.swift` | Shared page renderer, adaptive sections and keyboard row navigation |
@@ -3524,7 +3534,7 @@ Directory: `Modules/NativeAgentShared/Sources/NativeAgentShared/`
 | `ModuleLogging.swift` | `ModuleLog`: shared public diagnostic formatting and credential scrubbing; `nativeLog` retains the Shared category |
 | `NativeCollectionPages.swift` | Shared graph collection and item projections from canonical device or body readings |
 | `NativePersonInput.swift` | Shared person-event provenance for body input and renderer hand-back controls |
-| `NativeTimestampFormat.swift` | Locked wire timestamp formats and Foundation parsers; explicit precision, UTC suffixes and calendar-day zones |
+| `NativeTimestampFormat.swift` | Per-thread wire timestamp formats and Foundation parsers; explicit precision, UTC suffixes and calendar-day zones |
 | `OrganismLivingStatus.swift` | `OrganismLivingStatusFile`: read-only body status; unavailable stays explicit |
 | `PanelFreshnessFace.swift` | Shared panel refresh receipts and selected panel reading state |
 | `PartFace.swift` | Shared page values, documents, typed forms and installed-phone notes; feed keys and catalog |
@@ -3551,6 +3561,7 @@ Directory: `Modules/NativeAgentShared/Sources/NativeAgentShared/`
 | `SecretActionEnvelope.swift` | `SecretActionEnvelope`: shared seal/open wire contract for authenticated secret actions |
 | `SessionContextStatus.swift` | `SessionContextStatus` struct |
 | `SettingsFace.swift` | Finished settings groups, preference scalars and permission-dock words at the settings feed key |
+| `SheetTable.swift` | A table kept as a CSV or TSV file, read and written by the standard quoting rules |
 | `SimpleViewMode.swift` | Canonical view preference key and offered window modes |
 | `SpeechUtterance.swift` | `SpeechUtterance`: original recognition evidence and compact uncertainty |
 | `StoreReloadDebouncer.swift` | `StoreReloadDebouncer`, `Timer`: one reload in flight until actual exit |
@@ -3571,6 +3582,7 @@ Directory: `Modules/NativeAgentShared/Sources/NativeAgentShared/`
 | `TurnFace.swift` | `TurnFace`, `TurnSessionsFace`, `TurnElsewhereLine`: turn values and quiet cross-conversation movement drawing |
 | `TurnSecretRedactor.swift` | `TurnSecretRedactor`: shared credential recognition; callers own size bounds |
 | `UserDisplayFormatters.swift` | Shared timestamp/path display and `CompactDurationFormatter`; parsing is cached |
+| `UserMessageIntentSignals.swift` | `UserMessageIntentSignals`: lexical signals grant no effect authority; the window and the body read one control-phrase match |
 | `VoiceNoteBubble.swift` | Mac/phone voice-note face; original audio, playback and expandable transcript |
 | `VolumeIO.swift` | Serial off-pool filesystem work; issued writes own physical completion |
 | `WorkPaneFace.swift` | Shared Work pages: Steps, Screen, version-bound Make controls and owner-resolved preview leaves |
@@ -3598,7 +3610,7 @@ native effects, consent and settlement.
 | `music.js` | ability `music`: Play, pause, stop or skip Music; bound play with seconds through the native player call, resolve an exact library track, and read playback through music-library. |
 | `native-chrome-history.js` | ability `native-chrome-history`: Read Chrome's Default profile history from a private snapshot: recent pages, title/URL search, or the most visited domains since a time. |
 | `native-cognition.js` | ability `native-cognition`: Draw my cognition reading, controls and evidence from the resident mind's packet. |
-| `native-desk.js` | ability `native-desk`: Draw the Desk from its packet: the selection, the board grouped by what each item waits on, other work, lines, timers and source gaps. |
+| `native-desk.js` | ability `native-desk`: Draw the Desk from its packet: what is on the table, the selection, the board by what each waits on, other work, lines, timers and gaps. |
 | `native-diagnostics.js` | ability `native-diagnostics`: My Diagnostics page from Doctor's measured verdicts, and my words for Desk and Activity checks, Doctor asks, storage and speech cards. |
 | `native-document.js` | ability `native-document`: My passive document page from its owner's title and frozen reading, with selection, Find and Copy at every door. |
 | `native-dreams.js` | ability `native-dreams`: My dream diary from the diary owner's bounded reading, with selection and the person's cycle levers. |

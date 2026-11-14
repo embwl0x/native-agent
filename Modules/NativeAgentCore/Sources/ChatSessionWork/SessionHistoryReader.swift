@@ -78,6 +78,12 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
     public let truncated: Bool
     public let decodeCacheHits: Int
     public let decodeCacheMisses: Int
+    /// Prompt replay's steps after the bytes, in nanoseconds: UTF-8 decode and line split, the row memo (its snapshot
+    /// and every per-line lookup or decode), selection without the memo's share, and the memo write-back.
+    public let splitNanoseconds: UInt64
+    public let rowMemoNanoseconds: UInt64
+    public let selectNanoseconds: UInt64
+    public let memoWriteNanoseconds: UInt64
 
     public init(
         mode: String,
@@ -92,7 +98,11 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
         returnedCount: Int = 0,
         truncated: Bool = false,
         decodeCacheHits: Int = 0,
-        decodeCacheMisses: Int = 0
+        decodeCacheMisses: Int = 0,
+        splitNanoseconds: UInt64 = 0,
+        rowMemoNanoseconds: UInt64 = 0,
+        selectNanoseconds: UInt64 = 0,
+        memoWriteNanoseconds: UInt64 = 0
     ) {
         self.mode = mode
         self.sourceBytes = sourceBytes
@@ -107,6 +117,10 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
         self.truncated = truncated
         self.decodeCacheHits = decodeCacheHits
         self.decodeCacheMisses = decodeCacheMisses
+        self.splitNanoseconds = splitNanoseconds
+        self.rowMemoNanoseconds = rowMemoNanoseconds
+        self.selectNanoseconds = selectNanoseconds
+        self.memoWriteNanoseconds = memoWriteNanoseconds
     }
 }
 
@@ -363,13 +377,16 @@ public actor SessionHistoryReader {
     }
 
     /// Select history from one transcript read, from the supplied bytes; absence is empty history, invalid IDs fail.
-    public func transcriptBytes(forSessionId id: String) throws -> Data? {
+    /// The file read's own duration returns beside its bytes, so a caller can tell it from waiting for this actor.
+    public func transcriptBytes(forSessionId id: String) throws -> (bytes: Data?, fileNanoseconds: UInt64) {
         guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
             throw SessionTranscriptError(
                 errorDescription: "Conversation history has an invalid session id. Select a valid conversation before continuing.")
         }
         let path = dataRoot.appendingPathComponent("chat/messages/\(safeId).jsonl")
-        do { return try Data(contentsOf: path) } catch CocoaError.fileReadNoSuchFile { return nil }
+        let start = DispatchTime.now().uptimeNanoseconds
+        do { return try (Data(contentsOf: path), DispatchTime.now().uptimeNanoseconds &- start) }
+        catch CocoaError.fileReadNoSuchFile { return (nil, DispatchTime.now().uptimeNanoseconds &- start) }
     }
 
     /// Replay reads preserve every retained transcript row.
@@ -387,11 +404,15 @@ public actor SessionHistoryReader {
         let excludedRunId = excludingRunId?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let shouldExcludeRun = excludedRunId?.isEmpty == false
+        let memoReadStart = DispatchTime.now().uptimeNanoseconds
         let previousRows = Self.promptRowMemo.withLock { $0.rows }
+        var rowMemoNs = DispatchTime.now().uptimeNanoseconds &- memoReadStart
         var rows: [Data: DecodedRow] = [:]
         var cacheHits = 0
         var cacheMisses = 0
         func decode(_ line: String) -> DecodedRow {
+            let start = DispatchTime.now().uptimeNanoseconds
+            defer { rowMemoNs &+= DispatchTime.now().uptimeNanoseconds &- start }
             let key = Data(line.utf8)
             if let row = rows[key] { return row }
             let row: DecodedRow
@@ -401,6 +422,7 @@ public actor SessionHistoryReader {
             return row
         }
         // Split JSONL on byte LF without walking every grapheme; preserve String's CR/CRLF segmentation when CR is present.
+        let splitStart = DispatchTime.now().uptimeNanoseconds
         guard let decodedTranscript = String(data: transcript, encoding: .utf8) else {
             return (SessionHistoryReadResult(
                 messages: [],
@@ -412,15 +434,21 @@ public actor SessionHistoryReader {
             ), nil)
         }
         let lines = decodedTranscript.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        let selectStart = DispatchTime.now().uptimeNanoseconds
+        let memoBeforeSelect = rowMemoNs
         let prompt = Self.selectionResult(
             SessionHistoryLineReadResult(lines: lines, sourceBytes: Int64(transcript.count),
                 bytesRead: Int64(transcript.count), truncated: false),
             mode: "replay_full", excludingRunId: shouldExcludeRun ? excludedRunId : nil, decode: decode)
+        // Selection calls the memo per line; its time stays with the memo so the two steps never overlap.
+        let promptRowMemoNs = rowMemoNs
+        let selectNs = (DispatchTime.now().uptimeNanoseconds &- selectStart) &- (promptRowMemoNs &- memoBeforeSelect)
         let relevance = relevanceWhen(prompt) ? relevanceMessagesWithStats(
             size: transcript.count, excludingRunId: excludingRunId, decode: decode
         ) { transcript.subdata(in: (transcript.startIndex + $0)..<(transcript.startIndex + $0 + $1)) } : nil
         // Late memo updates affect only cache misses; they cannot publish stale transcript state.
         // A read adds every line it used as the most recent; past the cap the least recently read lines go first.
+        let memoWriteStart = DispatchTime.now().uptimeNanoseconds
         Self.promptRowMemo.withLock { memo in
             memo.reads += 1
             for (key, row) in rows {
@@ -433,6 +461,7 @@ public actor SessionHistoryReader {
                 memo.bytes -= key.count
             }
         }
+        let memoWriteNs = DispatchTime.now().uptimeNanoseconds &- memoWriteStart
         let stats = prompt.stats
         let measured = SessionHistoryReadResult(messages: prompt.messages, stats: SessionHistoryReadStats(
             mode: stats.mode, sourceBytes: stats.sourceBytes, bytesRead: stats.bytesRead,
@@ -440,7 +469,9 @@ public actor SessionHistoryReader {
             malformedRowCount: stats.malformedRowCount, invalidShapeRowCount: stats.invalidShapeRowCount,
             damageEvidence: stats.damageEvidence,
             excludedByRunId: stats.excludedByRunId, returnedCount: stats.returnedCount,
-            truncated: stats.truncated, decodeCacheHits: cacheHits, decodeCacheMisses: cacheMisses),
+            truncated: stats.truncated, decodeCacheHits: cacheHits, decodeCacheMisses: cacheMisses,
+            splitNanoseconds: selectStart &- splitStart, rowMemoNanoseconds: promptRowMemoNs,
+            selectNanoseconds: selectNs, memoWriteNanoseconds: memoWriteNs),
             contextStatistics: prompt.contextStatistics)
         return (measured, relevance)
     }

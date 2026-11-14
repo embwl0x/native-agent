@@ -225,7 +225,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         var scoped = execution
         scoped.openScreenWatch = { request, hands, callTurn in
             guard let dispatcher = self.scopedInner(execution) as? SwiftToolDispatcher else {
-                throw SenseFailure(code: "unavailable", message: "The originating tool dispatcher is unavailable.")
+                throw SenseFailure(code: "unavailable", message: "The chat turn this call came from is unavailable.")
             }
             return try await dispatcher.openScreenWatch(turn: callTurn, invocation: execution.invocation, request, hands: hands, surface: surface)
         }
@@ -241,7 +241,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         let host = AppToolExecutor.authoredProgramHost(dataRoot: securityCenter.dataRoot, turn: turn, execution: hostExecution,
             reach: { operation, arguments, callTurn in
                 guard let dispatcher = self.scopedInner(hostExecution) as? SwiftToolDispatcher else {
-                    throw SenseFailure(code: "unavailable", message: "The originating tool dispatcher is unavailable.")
+                    throw SenseFailure(code: "unavailable", message: "The chat turn this call came from is unavailable.")
                 }
                 return try await dispatcher.performReach(turn: callTurn, operation, arguments: arguments, surface: surface)
             }) { id, arguments, program, perform in
@@ -423,8 +423,8 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             "checker": .string("trust"),
             "reasons": .array(envelope.reasons.map { .string($0.persistedValue) }),
             "capabilities": .array(envelope.capabilities.map { .string($0) }),
-            "message": .string(envelope.requiresApproval ? "Security Center requires approval before running this tool."
-                : "Security Center blocked this tool before execution."),
+            "message": .string(envelope.requiresApproval ? "Security Center requires approval before running this action."
+                : "Security Center blocked this action before it ran."),
         ]
         refusal["remedy"] = envelope.remedy
         return ChatToolOutcome.refusedBeforeRunning(.object(refusal))

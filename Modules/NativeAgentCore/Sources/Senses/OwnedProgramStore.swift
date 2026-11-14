@@ -3,7 +3,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OwnedProgramStore.swift` | Sealed candidates, exact rehearsal reuse and publication; `tape: true` replays seal `tape` coverage |
+// Blueprint: | `OwnedProgramStore.swift` | Sealed candidates, exact rehearsal reuse and publication; `tape: true` replays seal `tape` coverage; a kept shipped part follows it |
 
 /// Keep metadata and source in one ability file to preserve version identity.
 public struct OwnedProgramStore: Sendable {
@@ -220,6 +220,47 @@ public struct OwnedProgramStore: Sendable {
         }
     }
 
+    /// A kept version that is the shipped part follows it: sealed as the bundle's, so launch treats it as the seed it is.
+    public func follow(_ candidate: Candidate, key: Data, turn: Turn?) throws {
+        try CapabilityLifecycle.requireWrite(turn: turn)
+        try AbilityStore.withLock {
+            if try existingProof(candidate, key: key)?.objectValue?["domain"] == .string("owned-program-seed") { return }
+            _ = try seal(candidate, evidence: ["domain": .string("owned-program-seed")], key: key, turn: turn)
+        }
+    }
+
+    /// One part is another while it runs and declares the same: code, entry, actions, reach, residency and header, with what the agent
+    /// declared it learned. How it was kept (name, description, origin, prior selection, fixtures, dependency shapes, the stem's own trial
+    /// record inside `learned`) is not the part. Nor is its input schema:
+    /// the agent's own save path restates a schema with typed properties, so a copy saved unchanged never carries the shipped schema word
+    /// for word, and the packet a part is handed is the app's to describe.
+    public static func samePart(_ a: Candidate, _ b: Candidate) throws -> Bool {
+        func header(_ candidate: Candidate) throws -> [String: JSONValue] {
+            var fields = (candidate.manifest.objectValue ?? [:]).filter { AbilityStore.partKeys.contains($0.key) }
+            if case .object(var learned)? = fields["learned"] {
+                learned.removeValue(forKey: "trial")
+                fields["learned"] = learned.isEmpty ? nil : .object(learned)
+            }
+            return try AbilityStore.partHeader(fields)
+        }
+        let sameHeader = try header(a) == header(b)
+        return sameHeader && a.id == b.id && sameCode(a.program.source, b.program.source) && a.program.entry == b.program.entry
+            && Set(a.program.dependencies) == Set(b.program.dependencies)
+            && Set(a.program.permissions) == Set(b.program.permissions) && a.program.isResident == b.program.isResident
+    }
+
+    /// Code is the same code whatever blank space ends it: the agent's own save drops a file's last newline.
+    public static func sameCode(_ a: String, _ b: String) -> Bool {
+        a.trimmingCharacters(in: .whitespacesAndNewlines) == b.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Whether a retained file holds the shipped part; other code, or no sealed candidate, is not it.
+    public func samePart(_ file: AbilityStore.File, as shipped: Candidate) throws -> Bool {
+        guard Self.sameCode(file.body, shipped.program.source),
+              let digest = file.metadata["candidate"]?.objectValue?["program"]?.objectValue?["version"]?.stringValue else { return false }
+        return try Self.samePart(load(id: file.id, digest: digest), shipped)
+    }
+
     private func seal(_ candidate: Candidate, evidence: [String: JSONValue], key: Data, turn: Turn?) throws -> JSONValue {
         let proof = try sealedProof(candidate, evidence: evidence, key: key)
         try AbilityStore.withLock {
@@ -301,11 +342,13 @@ public struct OwnedProgramStore: Sendable {
                 let receipt = await runner.run(candidate.owned, input: input, preview: false, replay: replay,
                     host: interceptor, execution: rehearsal)
                 final = receipt.objectValue ?? [:]
+                // A stopped rehearsal's journal stays private; the next pass replays it, and the sealed proof keeps only the receipt.
+                let held = OwnedProgramRunner.journal(final.removeValue(forKey: "journal_ref"))
                 receipts.append(.object(final.merging(["input": input]) { _, input in input }))
                 if final["status"] == .string("ok") { break }
                 guard !recording, pass < answers.count, final["status"] == .string("stopped"),
                       ["decide", "irreversible", "users_step", "would_card"].contains(final["reason"]?.stringValue ?? ""),
-                      let journal = final["journal"]?.arrayValue else {
+                      let journal = held else {
                     let failure = (final["stopped"] ?? final["error"])?.objectValue ?? [:]
                     throw SenseFailure(code: "validation_failed", message: """
                         Fixture \(index + 1) stopped: \(failure["reason"]?.stringValue ?? "runtime") — \
@@ -511,7 +554,7 @@ public extension OwnedProgramToolHost {
     }
     func think(messages: [LLMMessage], tools: [String], surface: String?, host: any OwnedProgramHostProfile, execution: OwnedProgramExecution,
         purpose: String) async -> OwnedProgramThought {
-        .init(output: .failure(SenseFailure(code: "unavailable", message: "This host has no canonical tool-turn owner.")), effects: "none")
+        .init(output: .failure(SenseFailure(code: "unavailable", message: "This host has no canonical owner for a thought that calls app.")), effects: "none")
     }
 }
 

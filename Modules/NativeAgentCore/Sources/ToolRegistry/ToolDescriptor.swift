@@ -82,9 +82,19 @@ public struct AppActionBinding: Sendable {
     public struct Lever: Sendable, Equatable {
         public let why: String
         public let asks: Bool
-        public init(why: String, asks: Bool) { self.why = why; self.asks = asks }
+        /// Arguments under which the call is the agent's own: it only narrows what the agent has.
+        public let freely: [String: JSONValue]
+        /// The act in the person's words, as its declaration names it (Trust's card and refusals read it).
+        public let name: String
+        public init(why: String, asks: Bool, freely: [String: JSONValue] = [:], name: String = "") {
+            self.why = why; self.asks = asks; self.freely = freely; self.name = name
+        }
+        /// Whether this call, with these arguments, is the person's. Arguments that are missing or differ leave it theirs.
+        public func holds(_ args: [String: JSONValue]) -> Bool {
+            freely.isEmpty || !freely.allSatisfy { args[$0.key] == $0.value }
+        }
     }
-    public let lever: Lever?
+    public var lever: Lever?
     public var isPersonOwned: Bool { lever != nil }
     public let irreversible: Bool
     public var read: Bool
@@ -99,19 +109,22 @@ public struct AppActionBinding: Sendable {
     public let capabilities: Set<String>
     /// Subject arguments distinguish debts so success settles only its own target.
     public let subject: [String]
+    /// The argument names the action declares, as the door spells them; the door's one reading of a call takes a declared name for the action.
+    public let declaredArguments: Set<String>
 
     public init(lever: Lever?, irreversible: Bool, read: Bool, secretArgs: [String],
                 boundArguments: @escaping @Sendable ([String: JSONValue]) throws -> [String: JSONValue], readWhen: [String: JSONValue] = [:],
                 lifecycle: CapabilityLifecycle.Action? = nil, subject: [String] = [],
                 tool: String = "", fixedInput: [String: JSONValue] = [:], rename: [String: String] = [:],
                 folded: Bool = false, descriptor: ToolDescriptor? = nil, toolClass: ToolClass = .write,
-                reach: ToolReach = .agent, capabilities: Set<String>? = nil) {
+                reach: ToolReach = .agent, capabilities: Set<String>? = nil, declaredArguments: Set<String> = []) {
         self.tool = tool; self.fixedInput = fixedInput; self.rename = rename; self.folded = folded; self.descriptor = descriptor
         self.lever = lever; self.irreversible = irreversible; self.read = read
         self.secretArgs = secretArgs; self.readWhen = readWhen
         self.boundArguments = boundArguments
         self.lifecycle = lifecycle
         self.subject = subject
+        self.declaredArguments = declaredArguments
         self.toolClass = toolClass
         self.reach = reach
         // A door action writes the app's own data unless it says otherwise.
@@ -222,6 +235,7 @@ public struct AppActionBinding: Sendable {
         guard var policy = try binding(key, turn: turn, catalog: catalog) else { return nil }
         let args: [String: JSONValue] = if tool == "app", case .object(let args)? = input["args"] { args } else { input }
         policy.read = policy.readOnly(args: args)
+        if let lever = policy.lever, !lever.holds(args) { policy.lever = nil }
         return policy
     }
 

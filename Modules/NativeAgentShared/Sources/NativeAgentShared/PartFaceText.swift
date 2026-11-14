@@ -36,14 +36,21 @@ extension PartFace {
     public static func isLink(_ link: String) -> Bool { FaceLink(link) != nil }
 
     /// Bounded page prose. The agent's door retains complete row references and action calls.
-    public func text(lineLimit: Int = 240, door: Bool = false, page: String? = nil) -> String {
+    public func text(lineLimit: Int? = nil, door: Bool = false, page: String? = nil) -> String {
+        // The agent reads a row whole: a reason cut mid-sentence is a reason it cannot act on. A longer line still ends on a word.
+        let limit = max(1, lineLimit ?? (door ? 1_200 : 240))
         func bounded(_ line: String) -> String {
             let flat = line.split(whereSeparator: \.isNewline).joined(separator: " ")
-            return flat.count <= lineLimit ? flat : String(flat.prefix(max(1, lineLimit) - 1)) + "…"
+            guard flat.count > limit else { return flat }
+            let head = flat.prefix(limit - 1)
+            let word = head.lastIndex(of: " ").map { head[..<$0] } ?? head
+            return String(word.count > limit / 2 ? word : head) + "…"
         }
         var lines: [String] = []
         if let title, !title.isEmpty { lines.append(title) }
         if let line, !line.isEmpty { lines.append(bounded(line)) }
+        // The link leads, so a long title never cuts the address.
+        if let opened { lines.append(bounded("Open now: " + opened.link + " · " + Self.oneLine(opened.title, limit: 80))) }
         for section in sections {
             if !lines.isEmpty { lines.append("") }
             if let title = section.title, !title.isEmpty { lines.append(title + (section.folded == true ? " (folded)" : "") + ":") }
@@ -83,10 +90,25 @@ extension PartFace {
                 if let footer = section.footer { lines.append(bounded(footer)) }
                 continue
             }
-            for row in section.folded == true ? [] : section.allRows {
+            // Folding is how a section is drawn for the person. The agent's reading keeps every folded row it could act on (a control or
+            // an action) and counts the rest, so a fold never takes a call out of its reach.
+            // A row's inline group reads on the row's own line, so its children are not listed again; rows they hold are listed beneath it.
+            let listed = section.rows.flatMap(\.lineRows)
+            func callable(_ row: Row) -> Bool { row.control != nil || row.actions?.isEmpty == false }
+            func reachable(_ row: Row) -> Bool { callable(row) || row.group.contains(where: callable) }
+            let rows = section.folded != true ? listed : door ? listed.filter(reachable) : []
+            if section.folded == true, door, listed.count > rows.count {
+                let quiet = listed.count - rows.count
+                lines.append(quiet == 1 ? "1 folded row carries nothing to call and is not listed."
+                    : "\(quiet) folded rows carry nothing to call and are not listed.")
+            }
+            /// A row's words, and its reference on the door (its id, its set call, where it opens, its actions), which is never cut.
+            func reading(_ row: Row) -> (parts: [String], reference: String) {
                 // A time reads as FaceView shows it: the clock time today, the day otherwise.
                 let time = row.at.flatMap(FaceTime.short).map { $0 + " " } ?? ""
-                var parts = [time + row.title, row.detail ?? "", row.value ?? ""].filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                // A meter with no words of its own reads as its amount.
+                let value = row.value ?? row.meter.map { Self.amount($0.value) + " of " + Self.amount($0.max) }
+                var parts = [time + row.title, row.detail ?? "", value ?? ""].filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
                 if let control = row.control {
                     if let on = control.on { parts.append(on ? "on" : "off") }
                     if let text = control.text { parts.append(text.isEmpty ? "(empty)" : "\u{201C}" + text + "\u{201D}") }
@@ -106,14 +128,23 @@ extension PartFace {
                 }.joined(separator: " | ") + "]" }
                 // On the door the actions ride the reference, which is never cut; Telegram keeps them in the line.
                 if !door, let actions, row.actions?.isEmpty == false { parts.append(actions) }
-                guard !parts.isEmpty else { continue }
                 var reference = ""
                 if door, row.actions?.isEmpty == false || row.control != nil || row.open != nil {
                     let set = row.control.map { control in ", set" + (control.call.map { " → " + $0.text + " with value" } ?? "") } ?? ""
                     reference = " (row " + row.id + set + (row.open.map { ", opens " + $0 } ?? "") + ")"
                     if let actions, row.actions?.isEmpty == false { reference += " " + actions }
                 }
-                lines.append(bounded("- " + parts.joined(separator: " · ")) + reference)
+                return (parts, reference)
+            }
+            for row in rows {
+                let (parts, reference) = reading(row)
+                guard !parts.isEmpty else { continue }
+                // Each child of an inline group follows on the same line: its word and state, then its own reference.
+                let group = row.group.map { child -> String in
+                    let (words, reference) = reading(child)
+                    return " · " + bounded(words.joined(separator: " ")) + reference
+                }.joined()
+                lines.append(bounded("- " + parts.joined(separator: " · ")) + reference + group)
                 if row.expands == true {
                     if door, let read = row.read { lines.append("Read " + row.id + " → " + read.text) }
                     if let page { lines.append("page:" + page + "/" + row.id) }
@@ -129,14 +160,30 @@ extension PartFace {
         if let detail { lines.append("Read an item from " + detail.of + " through its page link.") }
         return lines.joined(separator: "\n")
     }
+
+    /// Words for one line in a person's message or a page read: every whitespace run (newlines included) one space, cut on a word to `limit`
+    /// characters.
+    public static func oneLine(_ text: String, limit: Int) -> String {
+        let flat = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard flat.count > limit, limit > 1 else { return flat }
+        let head = flat.prefix(limit - 1)
+        let word = head.lastIndex(of: " ").map { head[..<$0] } ?? head
+        return String(word) + "…"
+    }
+
+    /// A meter's number as words: a whole number without a decimal point.
+    private static func amount(_ number: Double) -> String {
+        number.rounded() == number && abs(number) < 1e15 ? String(Int64(number)) : String(number)
+    }
 }
 
 extension PartFaceSnapshot {
     /// Native levers remain readable beside the face or its owner's failure.
-    public func text(title: String, lineLimit: Int = 240, door: Bool = false, page: String? = nil) -> String {
+    public func text(title: String, lineLimit: Int? = nil, door: Bool = false, page: String? = nil) -> String {
         var blocks: [String] = []
         let drawn = drawnFace
-        if let drawn, let header = PartFace(title: drawn.title, line: drawn.line, sections: []).text(lineLimit: lineLimit, door: door).nonEmpty {
+        if let drawn, let header = PartFace(title: drawn.title, line: drawn.line, sections: [], opened: drawn.opened)
+            .text(lineLimit: lineLimit, door: door).nonEmpty {
             blocks.append(header)
         }
         if let levers, let words = PartFace(sections: levers).text(lineLimit: lineLimit, door: door).nonEmpty { blocks.append(words) }

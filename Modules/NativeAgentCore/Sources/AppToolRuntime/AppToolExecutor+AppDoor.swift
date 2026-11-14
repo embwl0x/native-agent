@@ -42,12 +42,6 @@ extension AppToolExecutor {
         return await presentation.page(named: key)
     }
     public static let doorDoctor = "Doctor (app {page:\"diagnostics\", item:\"doctor\"})"
-    /// Keys beginning with __ belong to the gate chain.
-    static let doorKeys: Set<String> = ["page", "item", "action", "args", "actions", "preview", "expected_version", "find", "script"]
-    /// A batch step's own keys: what must come back, its name for found, and whether it puts back what the deed moved.
-    static let doorStepKeys: Set<String> = ["expect", "as", "cleanup"]
-    /// The deed's own keys beside actions, and on no other form: the agent's closing words and the slots they take from what came back.
-    static let doorDeedKeys: Set<String> = ["then_say", "with"]
     static func doorText(_ value: JSONValue?) -> String {
         value?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
@@ -75,13 +69,14 @@ extension AppToolExecutor {
         }
         guard (1...AppScriptRunner.actionLimit).contains(list.count) else { return try shape() }
         let shared = input.filter {
-            !$0.key.hasPrefix("__") && !["actions", "preview", "expected_version"].contains($0.key) && !doorDeedKeys.contains($0.key)
+            !$0.key.hasPrefix("__") && !["actions", "preview", "expected_version"].contains($0.key) && !ToolNameAliases.appDeedKeys.contains($0.key)
                 && $0.value != .null
         }
         var calls: [JSONValue] = []
         for entry in list {
-            guard case .object(var call) = entry,
-                  call.keys.allSatisfy({ doorKeys.contains($0) || doorStepKeys.contains($0) || $0.hasPrefix("__") }),
+            guard case .object(let given) = entry else { return try shape() }
+            var call = ToolNameAliases.doorCall("app", given)
+            guard call.keys.allSatisfy({ ToolNameAliases.appDoorKeys.contains($0) || ToolNameAliases.appStepKeys.contains($0) || $0.hasPrefix("__") }),
                   shared.allSatisfy({ call[$0.key] == nil || call[$0.key] == .null || call[$0.key] == $0.value }) else {
                 return try shape()
             }
@@ -505,9 +500,18 @@ extension AppToolExecutor {
             return result
         }
         if case .string? = input["item"], Self.doorText(input["item"]).isEmpty { input.removeValue(forKey: "item") }
+        let action = Self.doorText(input["action"])
+        // With an action, the action is what runs. An item it did not take as its own names nothing beside it, so it is refused, never opened in
+        // the action's place; a page or find beside an action stays the context it always was.
+        if let named = resolvedAction?.action, !Self.doorText(input["item"]).isEmpty {
+            return Self.doorRefusal("beside_action",
+                "\(named.id) is what runs, and a field beside it is not one of its arguments. Nothing was read or done.",
+                remedy: "correct_arguments", "Put the action's own arguments inside args, as its args_schema names them.",
+                next: ["find": .string(named.id)])
+        }
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let scope = input["__session_id"]?.scalarText ?? turn.verifiedSessionID ?? ""
-        if Self.doorText(input["page"]).isEmpty, !Self.doorText(input["item"]).isEmpty,
+        if action.isEmpty, Self.doorText(input["page"]).isEmpty, !Self.doorText(input["item"]).isEmpty,
            input[Self.doorScriptKey] != .bool(true), !scope.isEmpty,
            let page = await AgentWorkspaceNavigation.shared.lastDoorPage(dataRoot: root, scope: scope),
            ["tools", "skills"].contains(page) {
@@ -524,9 +528,8 @@ extension AppToolExecutor {
             let result = try await runAppDoor(input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
             return AgentWorkspace.resolvedRead(result, as: step.label)
         }
-        let action = Self.doorText(input["action"])
-        // A bare item names its unique owner; ambiguity is explicit, including a home room.
-        if Self.doorText(input["page"]).isEmpty, case .string? = input["item"], !Self.doorText(input["item"]).isEmpty {
+        // A bare item names its unique owner; ambiguity is explicit, including a home room. With an action, the action runs instead.
+        if action.isEmpty, Self.doorText(input["page"]).isEmpty, case .string? = input["item"], !Self.doorText(input["item"]).isEmpty {
             let named = Self.doorText(input["item"])
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             let scope = input["__session_id"]?.scalarText ?? turn.verifiedSessionID ?? ""
@@ -542,8 +545,7 @@ extension AppToolExecutor {
                     guard case .object(let fields) = refusal, fields["reason"] == .string("unknown_id") else { return refusal }
                 } else { owners["inbox"] = named }
             }
-            if let desk = try await SwiftToolDispatcher.deskMatches(named,
-                in: SwiftNativeDeskStore(dataRoot: root).liveState()).first {
+            if let desk = try await SwiftNativeDeskStore(dataRoot: root).liveState().matching(named).first {
                 owners["desk"] = desk.handle
             }
             let conversations = try HumanConversationIndex.rows(dataRoot: root)
@@ -579,9 +581,10 @@ extension AppToolExecutor {
             }
         }
         // Other keys app does not take still fail loudly; a deed key sent as null was omitted.
-        for key in Self.doorDeedKeys where input[key] == .null { input.removeValue(forKey: key) }
+        for key in ToolNameAliases.appDeedKeys where input[key] == .null { input.removeValue(forKey: key) }
         let deed = input["actions"] != nil && input["actions"] != .null
-        let stray = input.keys.filter { !Self.doorKeys.contains($0) && !(deed && Self.doorDeedKeys.contains($0)) && !$0.hasPrefix("__") }.sorted()
+        let valid = deed ? ToolNameAliases.appDoorKeys.union(ToolNameAliases.appDeedKeys) : ToolNameAliases.appDoorKeys
+        let stray = input.keys.filter { !valid.contains($0) && !$0.hasPrefix("__") }.sorted()
         if !stray.isEmpty {
             if stray.count == 1, action.isEmpty, let key = stray.first, let value = input[key],
                let correction = try await Self.doorActionCorrection(key, input: input.merging(["args": value]) { _, value in value }, turn: turn) {
@@ -589,17 +592,17 @@ extension AppToolExecutor {
             }
             return Self.doorRefusal("unknown_key",
                 "app takes no \(stray.joined(separator: ", ")). Its keys are page, item, action, args, actions, preview, "
-                + "expected_version, find and script, and then_say and with beside actions; an action's own arguments go inside args. "
-                + "Nothing was read or done.",
+                + "expected_version, find and script, and then_say and with beside actions. An action's own arguments go inside args, "
+                + "or beside action when the call has no args. Nothing was read or done.",
                 remedy: "correct_arguments", "Call app again with only those keys; {} lists the pages.",
-                next: [:], extra: ["unrecognised": .array(stray.map(JSONValue.string)),
-                                   "valid": .array((deed ? Self.doorKeys.union(Self.doorDeedKeys) : Self.doorKeys).sorted().map(JSONValue.string))])
+                next: [:], extra: ["unrecognised": .array(stray.map(JSONValue.string)), "valid": .array(valid.sorted().map(JSONValue.string))])
         }
         // Strict providers represent omitted optional fields with null.
         if let entries = input["actions"], entries != .null {
             let beside = input.filter { $0.key != "actions" && $0.value != .null }
             guard case .array(let list) = entries,
-                  beside.keys.allSatisfy({ $0.hasPrefix("__") || ["preview", "expected_version"].contains($0) || Self.doorDeedKeys.contains($0) }) else {
+                  beside.keys.allSatisfy({ $0.hasPrefix("__") || ["preview", "expected_version"].contains($0)
+                      || ToolNameAliases.appDeedKeys.contains($0) }) else {
                 let advice = try Self.doorBatchAdvice(entries, input: input)
                 return Self.doorRefusal("invalid_actions",
                     "actions is a list of app calls ({action, args}, {page[, item]} or {item}, each may add expect, as and cleanup) "
@@ -794,10 +797,6 @@ extension AppToolExecutor {
                 extra: ["argument_path": .string("args")])
         }
         let catalog = item == "actions"
-        if resolved.id == "desk", !item.isEmpty, !catalog, !item.hasPrefix("guide:") {
-            return Self.doorItemRead(try await runAppDoor(input: ["action": .string("desk.read"), "args": .object(["handle": .string(item)])],
-                surface: surface, inProcess: inProcess, turn: turn, execution: execution), page: resolved, item: item)
-        }
         let offset: Int64 = if case .int(let value)? = input["args"]?.objectValue?["offset"] { value } else { 0 }
         let result = Self.doorItemRead(try await doorRead(page: resolved, item: catalog ? "" : item, offset: Int(offset), surface: surface,
             turn: turn, execution: execution),

@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import TrustCenter
 
-// Blueprint: | `TrustFaceGuardrails.swift` | Policy-derived guardrail rows used by Trust’s shared face |
+// Blueprint: | `TrustFaceGuardrails.swift` | Policy-derived guardrail rows and the lock rows read from `PermissionLaw` and levers for Trust’s shared face |
 
 /// Tone is presentation only and must never become authority.
 enum TrustGuardrailTone: String, Hashable, Sendable {
@@ -28,10 +28,8 @@ enum TrustGuardrailSummary {
         guard let policy else { return [] }
         return [
             filesRow(policy: policy, accessMode: accessMode),
-            autonomyRow(policy: policy, accessMode: accessMode),
             backupsRow(policy: policy),
             macControlRow(policy: policy),
-            externalSendRow(policy: policy),
         ]
     }
 
@@ -69,7 +67,7 @@ enum TrustGuardrailSummary {
         )
     }
 
-    /// Keep reach separate from approval, which belongs to the autonomy row.
+    /// Keep reach separate from approval, which belongs to the lock rows (`TrustLockCard`).
     private static func fileReachSentence(_ policy: TrustPolicy, accessMode: String) -> String {
         let state = TrustAccessModeCapabilityCatalog.fileChangeState(policy, accessMode: accessMode)
         if state == .unavailable {
@@ -87,51 +85,6 @@ enum TrustGuardrailSummary {
         case "ask": return head + "; files outside them need your approval."
         default: return head + ". Files outside them are off limits."
         }
-    }
-
-    private static func outsideWriteClause(_ policy: TrustPolicy) -> String {
-        switch policy.filePolicy?.outsideWorkspaceDefault ?? "deny" {
-        case "allow": return "writes outside them run without asking."
-        case "ask": return "writes outside them wait for your approval."
-        default: return "writes outside them are not available."
-        }
-    }
-
-    private static func autonomyRow(policy: TrustPolicy, accessMode: String) -> TrustGuardrailRow {
-        // Full Mac changes effective autonomy; read the canonical verdict instead of the saved baseline.
-        let state = TrustAccessModeCapabilityCatalog.fileChangeState(policy, accessMode: accessMode)
-        let value: String
-        let detail: String
-        let tone: TrustGuardrailTone
-        switch state {
-        case .fullMac:
-            value = "Changes without asking"
-            detail = PermissionLaw.fullMacContract
-            tone = .danger
-        case .unavailable:
-            value = "Not available"
-            detail = "Nothing changes on its own: file changes and deletions are not available."
-            tone = .ok
-        case .workspace:
-            value = "Acts alone in your workspaces"
-            detail = "Edits inside your workspaces run on their own; " + outsideWriteClause(policy)
-            tone = .danger
-        case .appData:
-            value = "Automatic memory and notes"
-            detail = "NativeAgent's own memory and notes update without asking; file changes ask you first."
-            tone = .caution
-        case .supervised:
-            value = "Asks you first"
-            detail = "I ask you before I change or delete a file."
-            tone = .ok
-        }
-        return TrustGuardrailRow(
-            id: "autonomy",
-            title: "Before I change something",
-            value: value,
-            detail: detail,
-            tone: tone
-        )
     }
 
     private static func backupsRow(policy: TrustPolicy) -> TrustGuardrailRow {
@@ -185,30 +138,76 @@ enum TrustGuardrailSummary {
             return name.prefix(1).lowercased() + name.dropFirst()
         }.joined(separator: ", ")
     }
+}
 
-    private static func externalSendRow(policy: TrustPolicy) -> TrustGuardrailRow {
-        if TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy) {
-            return TrustGuardrailRow(
-                id: "external_send", title: "Sending things to other people",
-                value: "Sends without asking",
-                detail: """
-                    Under Full Mac I can send through your connected accounts without an additional app approval. Agents you enabled in \
-                    Trust inherit your authority. Other agents do not, and their requests can require approval.
-                    """,
-                // Sending reaches other people, so its scope must be at least as visible as file reach.
-                tone: .danger
-            )
+/// What asks the person first, as the Trust card draws it: a locked row for each kind of act the permission law makes ask at the saved
+/// posture, then one folded row holding the kinds that run on their own, the kinds this standing leaves out and what only the person can
+/// do. Which row is locked comes only from `PermissionLaw.verdict`, the table the gate reads for every call; lever names come from their
+/// declarations (`AppAction.Owner.person`). Deciders that answer from a call's own input are not drawn as locks: the fold names their kinds.
+enum TrustLockCard {
+    /// `levers`: every lever as its declaration names it, in declaration order, and whether a card can carry the agent's ask for it.
+    static func rows(posture: PermissionPosture, levers: Result<[(name: String, asks: Bool)], Error>) -> [PartFace.Row] {
+        var locked: [PartFace.Row] = [], runs: [PartFace.Row] = [], out: [PartFace.Row] = []
+        for act in PermissionLaw.Act.allCases {
+            let level = PermissionLaw.verdict(act, posture: posture)
+            let (title, written) = words(act)
+            var detail = written, tone: PartFace.Tone? = nil
+            if act == .lever {
+                switch levers {
+                case .success(let levers): detail = list(levers.filter { $0.asks }.map { $0.name })
+                case .failure(let error):
+                    detail = "What is yours to decide could not be read: " + error.localizedDescription
+                    tone = .failed
+                }
+            }
+            func row(_ value: String, symbol: String? = nil) -> PartFace.Row {
+                .init(id: "lock." + act.rawValue, title: title, detail: detail, value: value, symbol: symbol, tone: tone)
+            }
+            switch level {
+            case "confirm": locked.append(row("I ask you first", symbol: "lock"))
+            case "auto": runs.append(row("I don't ask first"))
+            // Left out is neither locked nor on: it sits in the fold, "Not available" as the page has always said it.
+            default: out.append(row("Not available"))
+            }
         }
-        // A send is a write on the person's side: Work asks, Safe sends nothing.
-        let safe = TrustAccessModeCapabilityCatalog.posture(policy) == .readOnly
-        return TrustGuardrailRow(
-            id: "external_send",
-            title: "Sending things to other people",
-            value: safe ? "Doesn't send" : "Asks before sending",
-            detail: safe
-                ? "Safe sends nothing to other people."
-                : "Email, messages, and posts wait for your approval before they leave this Mac.",
-            tone: .ok
-        )
+        // What no card can carry is the person's alone at every standing: no lock, no "On".
+        let onlyYours = ((try? levers.get()) ?? []).filter { !$0.asks }.map { $0.name }
+        let only: [PartFace.Row] = onlyYours.isEmpty ? [] : [.init(id: "lock.only_you", title: "Only you can do these", detail: list(onlyYours))]
+        // The card says who decides, never whether a thing can be done at all (an app's own Write switch, what the standing reaches):
+        // "on" would claim that, so the fold and its rows speak only of asking.
+        let fold = locked.isEmpty ? "Nothing asks you first" : "Nothing else asks you first"
+        return locked + [PartFace.Row(id: "lock.rest", title: fold, detail: caseByCase, rows: runs + out + only)]
+    }
+
+    /// The deciders that answer from a call's own input (where it came from, which limit it widens, which ability it keeps), by kind. True
+    /// at every setting; their owners are named in the Trust doc.
+    static let caseByCase = "A few things can still ask case by case: a request from another device, chat or agent; a change that widens "
+        + "my own limits; and keeping an ability, my turn program included."
+
+    /// Names in one sentence, as they are declared.
+    private static func list(_ names: [String]) -> String {
+        guard let first = names.first else { return "" }
+        return ([first] + names.dropFirst().map { $0.prefix(1).lowercased() + $0.dropFirst() }).joined(separator: ", ") + "."
+    }
+
+    /// The person's words for each kind of act, first person as the page speaks. The lever kind's detail is its declarations' names.
+    static func words(_ act: PermissionLaw.Act) -> (title: String, detail: String) {
+        switch act {
+        case .send:
+            ("Sending things to other people", "Mail, messages, replies in your conversations, and messages to other agents. "
+                + "Whether I can send through an app at all is that app's own Write switch.")
+        case .delete:
+            ("Deleting for good", "Deleting files, contacts, events or reminders, commands that cannot be undone, and resetting macOS privacy grants. "
+                + "Moving something to the Trash is a change, not this.")
+        case .change:
+            ("Changing things on your side", "Your files and apps, controlling your Mac, terminal commands and other machines. "
+                + "What I can reach at all is under Standing.")
+        case .lever:
+            ("Changing what is yours to decide", "")
+        case .own:
+            ("Working in my own space", "My memory and notes, and the workspace folders you gave me.")
+        case .read:
+            ("Reading and looking things up", "Files, the web and your apps, wherever I can reach and you have let me read.")
+        }
     }
 }

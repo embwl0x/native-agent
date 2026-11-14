@@ -11,6 +11,8 @@ actor BodyFaceConnection {
     private let log: FaceLinkLog
     private let disconnected: @Sendable (UUID?, String) async -> Void
     private let connected: @Sendable (UUID) async throws -> Void
+    /// Runs synchronously as the first act of close, before any drain: what must stop reading this connection forgets it here.
+    private let ending: @Sendable (UUID?) -> Void
     private var sink: FaceFeedSink?
     private var attached = false
     private var attachmentFailure: (any Error)?
@@ -28,10 +30,11 @@ actor BodyFaceConnection {
 
     init(link: FaceLink.Connection, source: FaceFeedSource, handler: any FaceActHandler, log: FaceLinkLog,
          connected: @escaping @Sendable (UUID) async throws -> Void,
+         ending: @escaping @Sendable (UUID?) -> Void,
          disconnected: @escaping @Sendable (UUID?, String) async -> Void) {
         self.link = link; self.source = source; self.handler = handler
         self.log = log
-        self.connected = connected; self.disconnected = disconnected
+        self.connected = connected; self.ending = ending; self.disconnected = disconnected
     }
 
     func run() async {
@@ -228,6 +231,7 @@ actor BodyFaceConnection {
         guard failure == nil else { return }
         failure = cause
         let connection = sink?.epoch
+        ending(connection)
         await record("disconnect epoch=\(String(describing: connection)) cause=\(FaceLinkLog.failure(cause))")
         feedTask?.cancel()
         feedTask = nil

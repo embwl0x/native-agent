@@ -68,7 +68,7 @@ enum ChatShellCopy {
     static let errorStuckLink = "Still stuck? Settings"
 
     static func workingRowTitle(agentName: String) -> String { agentName + " with agents" }
-    static let conversationsTitle = "Conversations"
+    static let conversationsTitle = "Chats"
     static let briefsRowTitle = "Morning briefs"
 }
 

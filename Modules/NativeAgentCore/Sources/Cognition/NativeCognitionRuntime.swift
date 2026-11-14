@@ -59,6 +59,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     var approvalLifecycleObservationTask: Task<Void, Never>?
     /// Routing authority failure closes only provider reflection; a later checked refresh can clear it independently of state restore.
     var providerRoutingFailure: String?
+    /// The slot whose reflection failed, and why. The slot stays spent, so a later request in it repeats the failure and never reads as done.
+    var failedReflection: (window: String, error: String)?
     /// Mirror the last injection for display without affecting cadence.
     var lastInjectedCapsule: (capsule: CognitiveCapsule, userMessage: String)?
     var organismDebugBodyOverride: OrganismDebugBodyOverride?

@@ -64,6 +64,8 @@ enum MobileNotificationRouting {
         for key in ["itemId", "approvalId", "sessionId", "originSessionId", "screen", "source", "eventId", "correlationId", "taskId"] {
             if let value = nonEmpty(metadata["userInfo.\(key)"]) { copy.userInfo[key] = value }
         }
+        // CloudKit's alert names only title and body; the envelope carries the subtitle the call gave.
+        if let subtitle = nonEmpty(metadata["subtitle"]) { copy.subtitle = subtitle }
         return try categorized(copy)
     }
 

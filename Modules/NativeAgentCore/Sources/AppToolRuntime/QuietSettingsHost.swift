@@ -91,13 +91,20 @@ public struct QuietProviderModel: Sendable {
     public let efforts: [String]
     public let supportsFast: Bool
     public let reasoningCapabilitiesKnown: Bool
+    /// False for a build row standing where the provider's list is missing: its controls read here, but it is not a choice.
+    public let offered: Bool
+    /// What a choice of it is refused with: the account's own sentence.
+    public let refusal: String?
 
-    public init(id: String, defaultEffort: String, efforts: [String], supportsFast: Bool, reasoningCapabilitiesKnown: Bool = true) {
+    public init(id: String, defaultEffort: String, efforts: [String], supportsFast: Bool, reasoningCapabilitiesKnown: Bool = true,
+                offered: Bool = true, refusal: String? = nil) {
         self.id = id
         self.defaultEffort = defaultEffort
         self.efforts = efforts
         self.supportsFast = supportsFast
         self.reasoningCapabilitiesKnown = reasoningCapabilitiesKnown
+        self.offered = offered
+        self.refusal = refusal
     }
 }
 

@@ -603,7 +603,7 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
         let rollback: @Sendable () async -> Void
         switch await reserveOncePerPeriod(key: Self.dayKey(now), at: marker) {
         case .alreadyReserved:
-            return .skipped(reason: "disk hygiene already ran today")
+            return .notNeeded("disk hygiene already ran today")
         case .failed(let error):
             return .failed(error: "disk hygiene reservation: \(error)")
         case .reserved(_, let rb):

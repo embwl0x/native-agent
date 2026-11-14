@@ -182,8 +182,8 @@ extension SwiftToolDispatcher {
         }
         guard invocation.imageSink != nil else {
             return failed("image_delivery_unavailable", "This text-only call cannot display desktop pixels.",
-                instruction: "Request pixels from a model tool turn.",
-                remedy: Repair.terminal(instruction: "This call has no image delivery channel. Request pixels from a model tool turn if an image is needed."))
+                instruction: "Request pixels from a model turn's call.",
+                remedy: Repair.terminal(instruction: "This call has no image delivery channel. Request pixels from a model turn's call if an image is needed."))
         }
         guard !Task.isCancelled else { return cancelled() }
         guard source.isScreenRecordingTrusted() else {

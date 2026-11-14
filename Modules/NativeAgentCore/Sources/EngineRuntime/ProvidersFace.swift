@@ -42,8 +42,9 @@ extension ProvidersFacade {
             ]), epoch)
         }
         let selections = faceSelections(settings)
+        // A picker lists the rows each account offers; a not-offered row shows only as a group's own current model.
         let options = settings.providers.filter(\.auth_status.eligible).flatMap { account in
-            Self.modelsForProvider(account.provider_id, providers: [account]).map { model in
+            account.offeredModels.map { model in
                 PartFace.Control.Option(id: InlineInteractionRegistry.modelOptionID(providerID: account.provider_id, modelID: model.id),
                                         label: "\(account.display_name) · \(model.name)")
             }
@@ -56,14 +57,23 @@ extension ProvidersFacade {
                         + ". Tell me in chat to reconstruct the saved routing explicitly.", tone: .attention)
             ]))
         }
-        var accounts = settings.providers.sorted {
+        // Connected accounts lead, one row each; the ones still waiting for a key or sign-in open from one row.
+        var accounts: [PartFace.Row] = []
+        var unconnected: [PartFace.Row] = []
+        for provider in settings.providers.sorted(by: {
             ($0.auth_status.eligible ? 0 : 1, $0.display_name) < ($1.auth_status.eligible ? 0 : 1, $1.display_name)
-        }.map { faceAccount($0, started: state.probes[$0.provider_id]) }
-        if accounts.isEmpty {
+        }) {
+            let row = faceAccount(provider, started: state.probes[provider.provider_id])
+            if provider.auth_status.eligible || Self.holdsCredential(provider.auth_status) { accounts.append(row) } else { unconnected.append(row) }
+        }
+        if settings.providers.isEmpty {
             accounts.append(.init(id: "accounts-empty", title: "No accounts listed",
                                   detail: "Refresh Models to read the account catalog.", tone: .attention))
         }
         if let offer = settings.codexCLISessionOffer { accounts.append(faceCLIOffer(offer)) }
+        if !unconnected.isEmpty {
+            accounts.append(.init(id: "accounts-add", title: "Add a provider", value: "\(unconnected.count) available", rows: unconnected))
+        }
         sections.append(.init(id: "accounts", title: "Accounts", style: .list, rows: accounts))
         sections.append(.init(id: "catalog", title: "Catalog", style: .values, rows: [faceCatalog(settings, started: state.started)]))
         return (PartFace(title: "Providers", line: faceLine(settings, selections: selections), sections: sections), epoch)
@@ -79,9 +89,11 @@ extension ProvidersFacade {
 
     nonisolated private func faceLine(_ settings: ProviderSettingsSnapshot, selections: [String: ProviderTurnChoice]) -> String {
         guard let chat = selections["chat"], !chat.model.isEmpty else { return "Chat has no readable model and account choice." }
+        // A model reads by its catalog name; its id stands only where the account's catalog has no row for it.
         func words(_ pick: ProviderTurnChoice) -> String {
             let account = settings.providers.first { $0.provider_id == pick.provider }?.display_name ?? pick.provider
-            return "\(pick.model) on \(account)"
+            let name = Self.modelsForProvider(pick.provider, providers: settings.providers).first { $0.id == pick.model }?.name
+            return "\(name.flatMap { $0.isEmpty ? nil : $0 } ?? pick.model) on \(account)"
         }
         let overrides = [ProviderSurfaceGroups.work, ProviderSurfaceGroups.mind].compactMap { group -> String? in
             let lead = Self.leadSurface(group, selections: selections)
@@ -105,19 +117,28 @@ extension ProvidersFacade {
         let prefix = "providers.\(group.id)_"
         var options = offered
         let selected = pick.map { InlineInteractionRegistry.modelOptionID(providerID: $0.provider, modelID: $0.model) }
+        let pickAccount = pick.flatMap { pick in settings.providers.first { $0.provider_id == pick.provider } }
+        let pickRow = pick.flatMap { pick in pickAccount?.models.first { $0.id == pick.model } }
         if let pick, let selected, !options.contains(where: { $0.id == selected }) {
-            let account = settings.providers.first { $0.provider_id == pick.provider }?.display_name ?? pick.provider
-            options.insert(.init(id: selected, label: "\(account) · \(pick.model) (saved; unavailable)"), at: 0)
+            let account = pickAccount?.display_name ?? pick.provider
+            // The current model shows as itself: with its row's note when its provider has not listed it, else as unavailable.
+            let label = pickRow?.offer_note.map { "\(account) · \(pickRow?.name ?? pick.model) (\($0))" } ?? "\(account) · \(pick.model) (saved; unavailable)"
+            options.insert(.init(id: selected, label: label), at: 0)
         }
         let unresolvedSelection = selected.map { selected in !offered.contains { $0.id == selected } } ?? true
+        // A picker with nothing offered says each connected account's own sentence.
+        let waiting = settings.providers.filter { $0.auth_status.eligible && $0.offeredModels.isEmpty }.compactMap(\.models_note)
+        let emptyWords = waiting.isEmpty ? "No eligible account offers models. Connect an account or refresh Models."
+            : "No models to choose yet: " + waiting.joined(separator: " ")
         // Each control of the group calls provider.choose with its setting; its new value arrives as the call's value.
         func choose(_ setting: String) -> PartFace.Call {
             .init("provider.choose", ["group": .string(group.id), "setting": .string(setting)])
         }
+        // A picker names its choice; only without one does the row say the saved model itself.
         var rows: [PartFace.Row] = [
-            .init(id: prefix + "model", title: "Model", detail: offered.isEmpty ? "No eligible account offers models. Connect an account or refresh Models."
+            .init(id: prefix + "model", title: "Model", detail: offered.isEmpty ? emptyWords
                     : "Choosing a model uses its declared thinking default and turns Fast off.",
-                  value: pick?.model, tone: offered.isEmpty || unresolvedSelection ? .attention : nil,
+                  value: offered.isEmpty ? pick?.model : nil, tone: offered.isEmpty || unresolvedSelection ? .attention : nil,
                   control: offered.isEmpty ? nil : .choice(options, selected: selected, call: choose("model")))
         ]
         if let pick {
@@ -129,7 +150,7 @@ extension ProvidersFacade {
                     var choices = efforts.map { PartFace.Control.Option(id: $0.id, label: $0.label) }
                     let unresolved = !model.supportedReasoningEfforts.contains(pick.reasoningEffort)
                     if unresolved { choices.insert(.init(id: pick.reasoningEffort, label: "Saved: \(pick.reasoningEffort) (unavailable)"), at: 0) }
-                    rows.append(.init(id: prefix + "thinking", title: "Thinking", value: pick.reasoningEffort,
+                    rows.append(.init(id: prefix + "thinking", title: "Thinking",
                         tone: unresolved ? .attention : nil, control: .choice(choices, selected: pick.reasoningEffort, call: choose("thinking"))))
                 }
             } else {
@@ -176,7 +197,7 @@ extension ProvidersFacade {
         default: (status.state.isEmpty ? "Status unavailable" : status.state.replacingOccurrences(of: "_", with: " "), .attention)
         }
         // Only a saved credential can be checked or removed; an account with none offers its sign-in alone.
-        let saved = ["ready", "saved", "failed", "rejected", "unavailable"].contains(status.state)
+        let saved = Self.holdsCredential(status)
         let account: [String: PartFace.Value] = ["provider": .string(provider.provider_id)]
         let entry: String? = switch (provider.auth_modes.contains("api_key"), provider.auth_modes.contains("oauth")) {
         case (true, false): "Enter a key in the protected entry on the Mac."
@@ -198,14 +219,20 @@ extension ProvidersFacade {
                      tone: started == nil ? tone : .live, actions: actions.isEmpty ? nil : actions)
     }
 
+    /// The states readiness gives an account that holds a saved credential, whether or not its last check passed.
+    nonisolated private static func holdsCredential(_ status: ProviderAuthStatus) -> Bool {
+        ["ready", "saved", "failed", "rejected", "unavailable"].contains(status.state)
+    }
+
     nonisolated private func faceCLIOffer(_ offer: CodexCLISessionOffer) -> PartFace.Row {
         switch offer {
         case .available(let email, let alreadyDeclined):
             var actions: [PartFace.Action] = [.init(id: "codex.use_session", label: "Use it", call: Self.codexAnswer("use"))]
             if !alreadyDeclined { actions.append(.init(id: "codex.ignore_session", label: "Ignore", call: Self.codexAnswer("ignore"))) }
+            // Unanswered, the offer is a question waiting on the person; once ignored it stays a quiet row that can still be used.
             return .init(id: "codex-cli-session", title: "Codex CLI sign-in",
                          detail: email.map { "Found an existing sign-in on this Mac (\($0))." } ?? "Found an existing sign-in on this Mac.",
-                         value: alreadyDeclined ? "Ignored" : "Available", actions: actions)
+                         value: alreadyDeclined ? "Ignored" : "Available", tone: alreadyDeclined ? nil : .attention, actions: actions)
         case .unavailable(let reason):
             return .init(id: "codex-cli-session", title: "Codex CLI sign-in adoption unavailable", detail: reason, tone: .attention,
                          actions: [.init(id: "codex.repair_consent", label: "Back up and reset consent", role: .destructive,
@@ -221,14 +248,14 @@ extension ProvidersFacade {
         let word: String
         switch freshness {
         case .live: word = "Fresh"
-        case .cached: word = "Cached"
+        case .cached: word = "Fetched"
         case .liveIncomplete: word = "Refreshed; may be partial"
         case .staleAfterFailedRefresh: word = "Refresh failed; last known list"
         case .unavailable, .none: word = "Unavailable"
         }
         let attention = settings.catalogError != nil || freshness == nil || freshness == .unavailable || freshness == .staleAfterFailedRefresh
         return .init(id: "models", title: "Models", detail: settings.catalogError ?? settings.catalog?.catalogNote,
-            value: started == nil ? word : "Refreshing…", at: started.map { $0.formatted(.iso8601) },
+            value: started == nil ? word : "Refreshing…", at: started.map { $0.formatted(.iso8601) } ?? settings.catalog?.updatedAt,
             tone: started != nil ? .live : attention ? .attention : .quiet,
             actions: [catalogAction(started: started)])
     }
@@ -316,6 +343,12 @@ extension NativeAgentEngine {
                   let account = settings.providers.first(where: { $0.provider_id == option.providerID && $0.auth_status.eligible }),
                   let model = ProvidersFacade.modelsForProvider(account.provider_id, providers: [account]).first(where: { $0.id == option.modelID }) else {
                 throw PartCallError(code: "provider_model_unavailable", message: "That account and model are no longer offered. Refresh Models.")
+            }
+            // A model choice: offered, or the model this group holds now (`ModelSlot.mayHold`).
+            let held = group.surfaces.lazy.compactMap { settings.activeProviders[$0] == account.provider_id ? settings.preferences[$0]?.model : nil }.first
+            guard ModelSlot.mayHold(model.id, row: account.models.first { $0.id == model.id }, savedInSlot: held) else {
+                throw PartCallError(code: "provider_model_unavailable",
+                                    message: ModelSlot.refusal(note: account.models_note, accountName: account.display_name))
             }
             guard model.reasoningCapabilitiesKnown,
                   model.supportedReasoningEfforts.isEmpty || model.supportedReasoningEfforts.contains(model.defaultReasoningEffort) else {

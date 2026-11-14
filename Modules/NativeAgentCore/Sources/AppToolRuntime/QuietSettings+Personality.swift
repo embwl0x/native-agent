@@ -32,14 +32,12 @@ extension QuietSettings {
         rows.append(defaultsBool(
             id: "personality.self_improvement", page: "settings",
             label: "Overnight revision", key: "selfImprovementEnabled", defaultOn: true,
-            note: "Overnight, the agent may revise a part that keeps failing, as a trial the record keeps or sets aside."
+            note: "Overnight, I may revise a part of me that keeps failing, as a trial my record keeps or sets aside."
         ).ownedByMind())
         rows.append(QuietSetting(
             id: "personality.dreams", page: "settings", label: "Dreams at night",
             kind: .boolean,
-            note: "One switch over two policy gates (personalityPolicy.dream_cycle_enabled and "
-                + "trainingPolicy.dream_scheduler), which move together. The read-back is the "
-                + "composite, so it says whether dreams can actually run.",
+            note: "On, I dream at night; it shows whether my dreams can actually run, not only what was asked.",
             read: .dreams,
             write: { appModel, value, context in
                 let enabled = try boolValue(value, "Dreams at night")

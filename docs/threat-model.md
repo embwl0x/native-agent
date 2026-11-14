@@ -7,7 +7,7 @@
 `NativeAgent.app` hosts the runtime in-process. The shared turn engine lives
 in core `EngineRuntime` / `ChatTurnRuntime`: one brain, many doors.
 
-The agent has one always-on tool, `app`. Its home, pages, items, search, actions
+The agent has one always-on door, `app`. Its home, pages, items, search, actions
 and JavaScriptCore scripts reach the registered capabilities.
 `AppToolRuntime/AppActions+Declarations.swift` defines those actions; their
 underlying Trust checks still apply.
@@ -22,6 +22,7 @@ underlying Trust checks still apply.
 | Paired iOS transport | Signed requests checked by `MacSyncEngine` before dispatch; pairing material owned by `PairingSecret` |
 | APNS | HTTP 2xx means provider acceptance, not proof of user display; `MobileNotificationDeliveryReceipt.swift` reports display as unverified |
 | Peer-steered turns | A turn an untrusted agent started with its message: `PeerTurnEffectPolicy` files one card on its first effect and the owner's answer covers the turn; a read steers nothing; agents enabled in Trust → Connected agents carry the owner's authority; ordinary Trust and domain checks remain |
+| Contacts at the table | A contact reads the Desk and the pieces laid on it through MCP `agent_desk` with its own key, only while the person's per-contact lever (`readsDesk`) is on; it writes nothing, reaches only pieces laid on open board items (each document's words bounded at 2 MB), the lever is rechecked before any words go back, and the contact's last read is kept on its own record, shown on Connectors and in the agent's line for it |
 | Model input from web, tools or peers | Content is input, not operator authority |
 
 Loopback is a network boundary, not privilege separation from another process

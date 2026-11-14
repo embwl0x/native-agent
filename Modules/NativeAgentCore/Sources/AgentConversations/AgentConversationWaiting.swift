@@ -105,9 +105,25 @@ extension AgentConversationSession {
             await AgentConversationRunning.shared.change(after: seen, until: deadline)
         }
         if Task.isCancelled { outcome = "cancelled" }
-        // Out of time (or stopped): the saved snapshot, never another read that could hold the turn past `seconds`.
+        // A reply handed to this wait just before it gave up is in the row: stop watching under the store's lock and take the row as it is
+        // then, so that reply is returned here and never falls between this wait and a turn of its own. A row that cannot be updated keeps
+        // the last snapshot.
+        let gaveUp = ["still_waiting", "cancelled"].contains(outcome)
+        if gaveUp, let row = latest, let id = watching {
+            let released = try? store.update(id: row.id, operationID: row.operationID, touch: false) { _ in
+                AgentConversationRunning.shared.unwatch(id)
+            }
+            if let current = released {
+                watching = nil
+                latest = current
+                if outcome == "still_waiting", try !(replyInFlight(current, transport, dataRoot: dataRoot)
+                    || !stoppedOrReleased(current) && heldReplyPending(current)) { outcome = "settled" }
+            }
+        }
+        // Out of time (or stopped): the row as the release left it, never another read that could hold the turn past `seconds` or find the
+        // conversation already moved on to its next message.
         let snapshot: JSONValue?
-        if ["still_waiting", "cancelled"].contains(outcome), let latest {
+        if gaveUp, let latest {
             snapshot = AgentConversationView.view(latest, details: input["details"] == .bool(true), dataRoot: dataRoot, includeHistory: false)
         } else {
             snapshot = try await read("agent_read", readInput, turn, conversation.withoutHistory.withoutConsuming, mac)

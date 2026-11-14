@@ -32,7 +32,7 @@ public enum AutonomousPursuitProposer {
                 abandonCondition: "If a few work sessions pass with no new insight, I close it with a note on what I learned by letting it go.",
                 privateName: nil)
             guard pursuit.validationError() == nil else { continue }
-            return PursuitProposal(project: "workshop", title: title,
+            return PursuitProposal(project: DeskItem.workshopProject, title: title,
                 summary: "Self-pursuit proposed from a life-depth care.", pursuit: pursuit, citedCareId: id,
                 rationale: bounded("Proposed self-pursuit from life-depth care \(id): \(stance.text)", max: 240))
         }

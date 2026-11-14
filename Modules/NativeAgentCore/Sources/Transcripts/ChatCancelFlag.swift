@@ -4,9 +4,9 @@ import PersistenceCore
 
 // Blueprint: | `ChatCancelFlag.swift` | `ChatCancelFlag`: Run-tagged Stop survives later acceptance |
 
-/// Run-tagged Stop markers preserve cancellation across later acceptance; only a matching run observes a tagged marker. Empty markers and untagged URLs match
-/// any run. URL fragments carry run identity without changing the file path. Stop markers use off-disk backup and PrivacyMap/chat; local backup, export and
-/// phone sync exclude them.
+/// Run-tagged Stop markers preserve cancellation across later acceptance. Readable tagged markers match only their runs; empty markers and untagged URLs
+/// match any run. An unreadable marker stops work and retains its cause until settlement. URL fragments carry run identity without changing the file path.
+/// Stop markers use off-disk backup and PrivacyMap/chat; local backup, export and phone sync exclude them.
 public enum ChatCancelFlag {
     public static func path(dataRoot: URL, sessionId: String) -> URL {
         dataRoot
@@ -23,6 +23,7 @@ public enum ChatCancelFlag {
         public let turnId: String
         public let acceptedAt: Date
         public let stop: URL
+        fileprivate var readFailure: String? = nil
     }
 
     /// Register before any await so Stop can name the live run; repeated admission is idempotent and must pair with finish.
@@ -88,12 +89,34 @@ public enum ChatCancelFlag {
 
     public static func isRaised(_ flag: URL?) -> Bool {
         guard let flag else { return false }
-        guard let runId = flag.fragment else {
-            return FileManager.default.fileExists(atPath: flag.path)
+        if readFailure(flag) != nil { return true }
+        let content: String
+        do {
+            content = try String(contentsOf: URL(fileURLWithPath: flag.path), encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return false
+        } catch {
+            let reason = "Stopped because the Stop marker could not be read: \(error.localizedDescription). Repair \(flag.path) before continuing."
+            let firstReadFailure = registry.withLock { runs in
+                let key = URL(fileURLWithPath: flag.path).standardizedFileURL.path
+                guard let index = runs.inFlight[key]?.firstIndex(where: { $0.stop == flag }) else { return true }
+                guard runs.inFlight[key]?[index].readFailure == nil else { return false }
+                runs.inFlight[key]?[index].readFailure = reason
+                return true
+            }
+            if firstReadFailure { nativeLog("%@", reason, level: .error) }
+            return true
         }
-        guard let data = FileManager.default.contents(atPath: flag.path) else { return false }
-        let content = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let runId = flag.fragment else { return true }
         return content.isEmpty || content.split(separator: "\n").contains { $0 == runId }
+    }
+
+    /// The accepted run owns the observed cause; repairing the file cannot undo its Stop or erase that cause before settlement.
+    public static func readFailure(_ flag: URL?) -> String? {
+        guard let flag else { return nil }
+        let key = URL(fileURLWithPath: flag.path).standardizedFileURL.path
+        return registry.withLock { runs in runs.inFlight[key]?.first(where: { $0.stop == flag })?.readFailure }
     }
 
     private struct Runs {

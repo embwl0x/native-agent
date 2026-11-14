@@ -57,7 +57,7 @@ extension AppActions {
     private static let agentJobSchema = arguments("agent_job", [
         "agent": ToolSchema.strSchema("""
             Who takes the job: a contact's name or peer:<id> from agent.contacts, or self for a line of your own: a turn of yours in its own work \
-            conversation, with your tools, Trust and present.
+            conversation, with your hand, Trust and present.
             """),
         "instructions": ToolSchema.strSchema("""
             For agent self only: who this line is (a researcher, a critic, a specialist), in your words; they stand in place of your persona. Omit and \
@@ -131,7 +131,8 @@ extension AppActions {
         AppAction("inbox.withdraw", "inbox", "Withdraw my own pending approval", ["id", "reason?"], subject: ["id"], irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: verb("withdraw")),
         AppAction("inbox.open_on_mac", "inbox", "Open on Mac", ["id"], subject: ["id"], owner: .person("it opens the card for the owner at the Mac",
-                  instead: "inbox.not_now declines it; inbox.archive retires a stale one", asks: false), tool: "inbox", input: press("act")),
+                  instead: "inbox.not_now declines it; inbox.archive retires a stale one", asks: false,
+                      name: "Opening an approval on the Mac"), tool: "inbox", input: press("act")),
         AppAction("inbox.approve", "inbox", "Approve", ["id"], subject: ["id"], irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: press("approve"), scope: """
                   Approve this exact waiting card when the person tells you in their own Mac chat, paired-phone or allowlisted Telegram message. \
@@ -189,7 +190,7 @@ extension AppActions {
             Hold a private choice or plan in this conversation (up to 1200 characters); shown privately to you each turn until replaced or cleared
             """, ["text:secret"], warn: "Empty text clears it. Its words stay out of scratch reads, receipts and the person's surfaces.",
                   tool: "chat_working_memory", versionExempt: true),
-        AppAction("page.show", "*", "Go to page", ["page", "item?"], subject: ["page"], screen: true, tool: "interaction_act",
+        AppAction("page.show", "*", "Go to page; returns what it now shows", ["page", "item?"], subject: ["page"], screen: true, tool: "interaction_act",
                   input: composer("set_page"), rename: ["page": "value", "item": "choice"]),
         AppAction("browser.show", "chat", "Show your own built-in browser (NativeAgent's browser, not Chrome)", screen: true, tool: "interaction_act",
                   input: composer("show_browser")),
@@ -198,8 +199,11 @@ extension AppActions {
         AppAction("pane.hide", "chat", "Close the Work pane", screen: true, tool: "interaction_act",
                   input: composer("hide_pane")),
         // Version-exempt: adding a version never overwrites an existing one.
-        AppAction("make.add", "make", "Add a file to Make as a new version of ref (a new ref when left out); returns the ref",
-                  ["path", "ref?", "prompt?", "model?"], tool: "make_studio", input: verb("add"), versionExempt: true),
+        AppAction("make.add", "make", """
+            Add a file (path), or words I already hold (content with a file name such as board.html), to Make as a new version of ref (a new \
+            ref when left out); returns the ref
+            """,
+                  ["path?", "content?", "name?", "ref?", "prompt?", "model?"], tool: "make_studio", input: verb("add"), versionExempt: true),
         AppAction("make.read", "make", "A Make ref's versions: n, path, prompt, created (newest ref when left out). Read page:make for the paged shelf.",
                   ["ref?"],tool: "make_studio", input: verb("read"), read: true),
         AppAction("studio.intake.read", "personality", """
@@ -226,7 +230,7 @@ extension AppActions {
                       "resident?:bool", "learned?:any", "choices?:any"],
                   capabilities: ["app_data_write", "safe_read", "tool_call"], warn: """
                       apps declares bundle ids for sense.apps.read({bundle_id,dictionary:true}) or read-only Apple Events using event_class, event_id and \
-                      parameters. Standard core getd/cnte/doex events are reads; other events require a tool's write declaration.
+                      parameters. Standard core getd/cnte/doex events are reads; other events are writes and need a write declaration.
                       """, tool: "sense_make",
                   readWhen: ["show": .string("material"), "trial_id": .null, "digest": .null], lifecycle: .change,
                   schema: arguments("sense_make", AbilityStore.partArgumentSchemas.merging(["code": ToolSchema.strSchema(), "trial_id": ToolSchema.strSchema(),
@@ -284,7 +288,8 @@ extension AppActions {
                       Screenshot of one of your own NativeAgent pages (your current page, chat, settings…), drawn offscreen; returns the PNG's path. Not the \
                       Mac screen. tab is a tab key as page.show takes it\u{20}
                       """
-                  + "(knowledge, dreams…), the page's default tab when left out", ["page", "tab?", "height?:int"],
+                  + "(knowledge, dreams…), the page's default tab when left out. item opens one Desk item in the picture as page.show does "
+                  + "(desk.4 or its handle; board lets the open item go); the window stays on its page", ["page", "tab?", "height?:int", "item?"],
                   warn: "saves a PNG and prunes old page captures", tool: "app_page_screenshot", versionExempt: true),
         // Phone, Telegram and below-Full-Mac authority cards remain user-owned; answering runs an irreversible control.
         AppAction("permissions.request", "chat", "Ask for a macOS permission in your own words", ["capability", "why", "mode?", "also_needed?:list"],
@@ -317,16 +322,18 @@ extension AppActions {
         AppAction("provider.sign_in", "providers", "Sign in", ["provider"], subject: ["provider"],
                   tool: "connections", input: verb("provider_sign_in")),
         AppAction("provider.disconnect", "providers", "Disconnect", ["provider"], subject: ["provider"],
-                  owner: .person("only the person can sign back in, and disconnects on Providers"), irreversible: true,
+                  owner: .person("only the person can sign back in, and disconnects on Providers", name: "Disconnecting an AI account"), irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "provider", input: verb("disconnect")),
 
         // Connector and pairing controls may lower access, never raise it. A switch's change names the position it moves to (value).
         AppAction("connector.off", "connectors", "Turn off", ["id", "reason?", "value?:bool"], subject: ["id"], tool: "connections",
                   input: verb("connector_off")),
         AppAction("connector.on", "connectors", "Turn on", ["id", "value?:bool"], subject: ["id"],
-                  owner: .person("it raises Trust; the person turns it on in Connectors"), tool: "connections", input: verb("connector_on")),
+                  owner: .person("it raises Trust; the person turns it on in Connectors",
+                      name: "Turning a connector on"), tool: "connections", input: verb("connector_on")),
         AppAction("connector.disconnect", "connectors", "Disconnect", ["id"], subject: ["id"],
-                  owner: .person("only the person can sign back in, and disconnects in Connectors", instead: "connector.off stops one"),
+                  owner: .person("only the person can sign back in, and disconnects in Connectors", instead: "connector.off stops one",
+                      name: "Disconnecting a connected account"),
                   irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections", input: verb("connector_disconnect")),
         AppAction("telegram.repair", "telegram", "Rebuild admission index", ["inbox"], tool: "connections",
                   input: verb("telegram_repair")),
@@ -339,10 +346,10 @@ extension AppActions {
                   input: verb("telegram_clear_logs")),
         AppAction("telegram.disconnect", "telegram", "Remove the token",
                   owner: .person("only the person can sign back in; Connectors → Telegram",
-                             instead: "setting.set with setting telegram.enabled, value false stops it"),
+                             instead: "setting.set with setting telegram.enabled, value false stops it", name: "Removing the Telegram bot token"),
                   irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections", input: verb("telegram_disconnect")),
         AppAction("pairing.remove", "pairing", "Remove the phone", ["id"], subject: ["id"],
-                  owner: .person("only the person can pair it again; Connectors → iPhone"), irreversible: true,
+                  owner: .person("only the person can pair it again; Connectors → iPhone", name: "Removing a paired iPhone"), irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections", input: verb("pairing_remove")),
 
         AppAction("doctor.run", "diagnostics", "Run Doctor checks",tool: "doctor_status", input: ["repair": .bool(false)], read: true),
@@ -354,7 +361,7 @@ extension AppActions {
             "export_bundle")),
         AppAction("backup.now", "trust", "Back up now", tool: "upkeep", input: verb("backup_now")),
         AppAction("backup.restore", "trust", "Restore", ["id"], subject: ["id"],
-                  owner: .person("it replaces what is here now; Trust → Advanced → Backups → Restore"), irreversible: true,
+                  owner: .person("it replaces what is here now; Trust → Advanced → Backups → Restore", name: "Restoring a backup"), irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"],
                       warn: "a restore that needs it restarts NativeAgent when this turn ends, 20 seconds at most",
                   tool: "upkeep", input: verb("backup_restore")),
@@ -567,19 +574,26 @@ extension AppActions {
                       + """
                           below Full Mac or on a turn started by an untrusted agent, it remains unkept; ability.enable files the owner's card. wake defaults \
                           []; face {page?,action?,projection?} places the action and may name an unclaimed app action id. projection:true declares \
-                          face(input) → {title?,line?,detail?:{of:sectionId},sections:[{id,title?,style?:list|values|timeline|flow|note|waiting,\
-                          footer?,folded?,filter?:label,revision?:string,more?:{next:cursor,total?,revision?},rows?:[{id,\
-                          title,detail?,value?,at?:ISO,symbol?:SF Symbol,tone?:plain|quiet|attention|failed|done|live,\
+                          face(input) → {title?,line?,opened?:{link,title},detail?:{of:sectionId},sections:[{id,title?,\
+                          style?:list|values|timeline|flow|note|waiting,footer?,folded?,filter?:label,revision?:string,\
+                          more?:{next:cursor,total?,revision?},rows?:[{id,title,detail?,value?,at?:ISO,symbol?:SF Symbol,\
+                          tone?:plain|quiet|attention|failed|done|live,\
                           open?:chat:|page:|approval:|card:|dream:|url:,actions?:[{id,label,role?,unavailable?:reason}],control?:{on}|{options,selected}|\
-                          {text,placeholder?}|{number:{value,min?,max?,step?}}|{date:ISO},rows?:[rows],expands?:true}],\
-                          block?:{kind:"document",key,text?,format?:plain|markdown|code,language?,copy?}|{kind:"leaf",key,leaf,ref,alt}|\
+                          {text,placeholder?}|{number:{value,min?,max?,step?}}|{date:ISO},rows?:[rows],expands?:true,\
+                          meter?:{value,max,start?}}],\
+                          block?:{kind:"document",key,text?,format?:plain|markdown|code,language?,copy?}|{kind:"leaf",key,leaf,ref,alt,revision?}|\
                           {kind:"form",key,fields:[{id,label,kind:line|lines|choice|switch|number|date|secret,value?,placeholder?,required?,\
                           options?:[{id,label}],min?,max?,step?}],submit:[{id,label,role?,unavailable?}],revision?,protected?,receiver?,doors?}}]} \
-                          from a frozen packet, with no host effects. A section has rows or block, never both. Inline document text is at most \
-                          16 KiB; longer text is read on demand. A document key declares read:{action,args?}; the action must declare itself \
-                          read-only. Its frozen result enters face(input) as input.read; return the requested document block with its text. \
+                          from a frozen packet, with no host effects. A section has rows or block, never both. A count is a row's value; progress \
+                          is its meter, a bar of value out of max (max above 0, value and start from 0 to max; the words stay in value); a chart \
+                          or picture is a piece: an SVG, HTML and CSS with no script (previews run none) or a picture, make.add it, then lay \
+                          {kind:"leaf",key:"piece:<id>",leaf:"web"|"image",ref,revision:<its version as a string>,alt:<what it shows>}. \
+                          Inline document text is at most 16 KiB; longer text is read on demand. A document key declares read:{action,args?}; \
+                          the action must declare itself read-only. Its frozen result enters face(input) as input.read; return the requested \
+                          document block with its text. \
                           Collections use their section id's read, with args.cursor, revision and anchor from the held demand. Inline nested rows \
                           share the section's 256-row bound and nest at most four deep; expands names that row's read for deeper evidence. \
+                          opened says what the page has open now: a page link, as page:<page>/<item>, and a one-line title, for the ask bar and page reads. \
                           A selected row links page:<page>/<item>; detail.of names the list section. Each held item read returns its face, \
                           outside the top-level phone snapshot. A filter searches retained rows; an owner query travels with its held result. \
                           A row that opens, acts or holds a control has an id its packet's keys declare, with only that key's open and actions; \
@@ -1049,8 +1063,8 @@ extension AppActions {
         ([surface, about] + blocks.map { $0.name + " " + $0.shows }).joined(separator: " ")
     }.joined(separator: " ") + " " + SurfaceLayout.profilesAbout
 
-    /// What every agent's hand is born knowing. Her hand in `app`'s own description is these and every native action her own mind has done
-    /// (`AppToolExecutor.handForms`).
+    /// What every agent's hand is born knowing. The agent's hand in `app`'s own description is these and everything the agent's own mind has done, a native
+    /// action and an ability the agent wrote alike, from the next turn on (`AppToolExecutor.Hand`).
     public static let bornKnowing = ["undo", "time.now", "context.expand", "mind.inner_state", "agent.introspect", "ability.list",
                              "ability.read", "trace.recent", "desk.read", "memory.recall", "memory.commit",
                              "bot.reply", "agent.contacts", "agent.message", "agent.read", "agent.connect",

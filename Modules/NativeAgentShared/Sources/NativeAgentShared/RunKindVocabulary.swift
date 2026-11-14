@@ -19,6 +19,8 @@ public enum RunKindVocabulary {
         switch kind.lowercased() {
         case "codex": return "Codex"
         case "claude": return "Claude Code"
+        case "mission": return "Mission"
+        case "rem_weekly_consolidation": return "Weekly dream"
         default: return "Other run"
         }
     }

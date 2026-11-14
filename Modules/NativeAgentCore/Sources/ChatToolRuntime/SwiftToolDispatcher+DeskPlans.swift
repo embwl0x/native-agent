@@ -119,11 +119,8 @@ extension SwiftToolDispatcher {
             parentAlias = parentItem.alias
             project = parentItem.project
         } else {
-            let proj = try deskString(input, "project").trimmingCharacters(in: .whitespacesAndNewlines)
+            let proj = try deskProject(input, absent: DeskItem.tasksProject)
             let title = try deskString(input, "title").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !proj.isEmpty, !title.isEmpty else {
-                throw deskInvalid("title", reason: "desk_breakdown: project and title must be non-empty")
-            }
             let kindRaw = optionalString(input, "kind")?.trimmingCharacters(in: .whitespacesAndNewlines)
             let kind = (kindRaw?.isEmpty == false) ? DeskKind(rawValue: kindRaw!) : .plan
             guard let kind else {
@@ -242,7 +239,7 @@ extension SwiftToolDispatcher {
                 "plan": .array(lines.map { .string($0) }),
                 "ready_now": .array(readyNow.map { .string($0) }),
                 "confirmation": .string(
-                    "campaign \(parentAlias) already live · added \(addedHandles.count) missing step(s), \(reusedSteps.count) already open"),
+                    "plan \(parentAlias) already live · added \(addedHandles.count) missing step(s), \(reusedSteps.count) already open"),
             ])
         }
         return .object([
@@ -254,7 +251,7 @@ extension SwiftToolDispatcher {
             "plan": .array(lines.map { .string($0) }),
             "ready_now": .array(readyNow.map { .string($0) }),
             "confirmation": .string("""
-                campaign \(parentAlias) · \(createdHandles.count) sub-items · ready now: \
+                plan \(parentAlias) · \(createdHandles.count) steps · ready now: \
                 \(readyNow.isEmpty ? "none" : readyNow.joined(separator: ", "))
                 """),
         ])

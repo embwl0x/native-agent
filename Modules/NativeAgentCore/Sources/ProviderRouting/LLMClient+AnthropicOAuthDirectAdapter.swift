@@ -44,11 +44,15 @@ public final class AnthropicOAuthTransport: LLMTransport {
     }
 
     public func requestOutputTokens(model: String, call: LLMCall) throws -> Int {
-        if let limit = call.turn?.tokenBudget?.available { return limit }
+        // What is left of a run's budget never exceeds the model's effective ceiling, nor this transport's own cap.
+        if let allowance = FirstPartyExecutionControls.budgetedOutputTokens(
+            model: model, providerID: providerId, call: call, transportCap: maxTokensOverride, dataRoot: catalogRoot) {
+            return allowance
+        }
         return try FirstPartyExecutionControls.anthropicMaxOutputTokens(
             model: model,
             requestedEffort: call.admission?.reasoningEffort,
-            explicitOverride: maxTokensOverride, providerID: providerId
+            explicitOverride: maxTokensOverride, providerID: providerId, dataRoot: catalogRoot
         )
     }
 
@@ -61,7 +65,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
         "fine-grained-tool-streaming-2025-05-14",
     ]
     // Explicit protocol identity for this adapter; never inferred from another application's installed version or a directory read.
-    private static let claudeCLIVersion = "2.1.280"
+    private static let claudeCLIVersion = "2.1.323"
 
     /// Shared OAuth headers; turn context needs no provider-specific beta.
     static func apiHeaders(accessToken: String) -> [String: String] {
@@ -237,7 +241,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
             system: system,
             coercedModel: model,
             maxTokens: try requestOutputTokens(model: model, call: call),
-            stream: true, call: call
+            stream: true, call: call, dataRoot: catalogRoot
         )
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         Self.dumpBodyIfEnabled(body, call: "streamMessages")
@@ -291,6 +295,11 @@ public final class AnthropicOAuthTransport: LLMTransport {
     }
 
     // MARK: - Auth file resolution + token load
+
+    /// The data root this sign-in's file lives in, where its model list lives too.
+    var catalogRoot: URL {
+        resolveAuthPath().deletingLastPathComponent().deletingLastPathComponent()
+    }
 
     func resolveAuthPath() -> URL {
         if let override = authPathOverride { return override }

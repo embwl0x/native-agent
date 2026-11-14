@@ -36,6 +36,8 @@ public enum DoctorReadout {
             let owedIDs = Set(owed.map(\.checkID))
             return rows.filter { !owedIDs.contains($0.id) || $0.ask != nil } + owed
         } catch {
+            // A stopped run read nothing: the rows stand as measured, with no verdict on the store.
+            if error is CancellationError { return rows }
             return rows + [CheckResult(source: "experiences/experiences.sqlite",
                 id: "doctor.repair_store", title: "Repairs owed", status: "fail",
                 detail: "Repair obligations could not be read: \(error.localizedDescription)",

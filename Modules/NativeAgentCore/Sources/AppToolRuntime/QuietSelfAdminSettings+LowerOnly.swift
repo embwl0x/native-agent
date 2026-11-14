@@ -14,14 +14,15 @@ import TrustCenter
 // Blueprint: | `QuietSelfAdminSettings+LowerOnly.swift` | Lower-only rows enforce subsets under the authority lock; Slack rows share an asynchronous checked policy per read and refresh it for mutations |
 
 extension QuietProviderAccount {
-    public init(providerID: String, authState: String, eligible: Bool, models: [ProviderModelInfo]) {
+    public init(providerID: String, authState: String, eligible: Bool, models: [ProviderModelInfo], refusal: String? = nil) {
         self.init(id: providerID, authState: authState, eligible: eligible, models: models.map {
             QuietProviderModel(
                 id: $0.id,
                 defaultEffort: $0.default_reasoning_effort ?? "",
                 efforts: $0.supported_reasoning_efforts ?? [],
                 supportsFast: $0.supports_fast == true,
-                reasoningCapabilitiesKnown: $0.supported_reasoning_efforts != nil)
+                reasoningCapabilitiesKnown: $0.supported_reasoning_efforts != nil,
+                offered: $0.isOffered, refusal: refusal)
         })
     }
 }
@@ -213,6 +214,28 @@ extension QuietLowerOnlySettingsHost {
                     }
                 ))
             }
+        }
+        // The table lever lives on the contact's record; its store is read off the main actor.
+        let table = AgentPeerStore(dataRoot: root)
+        for peer in connectedPeers where peer.canReadTable {
+            let id = peer.id, name = peer.name
+            rows.append(QuietSettings.lowerOnly(
+                id: "agent.reads_desk_\(id)", page: "connectors",
+                label: "\(name) reads my Desk",
+                whereUserDoesIt: "Connectors → \(name) → Reads my Desk",
+                note: "At the table, it reads my Desk and the pieces laid on it through its own connection; it changes nothing and asks me instead.",
+                read: { _ in
+                    guard let current = try await Task.detached(operation: { try table.list().first { $0.id == id } }).value else {
+                        throw QuietSettingError.unavailable("\(name) is no longer in the checked contact list. Read app {page:\"connectors\"} again.")
+                    }
+                    return current.readsDesk == true
+                },
+                write: { _, on, _ in
+                    guard try await Task.detached(operation: { try table.setReadsDesk(peerID: id, on: on) }).value != nil else {
+                        throw QuietSettingError.unavailable("\(name) is no longer a contact. Read app {page:\"connectors\"} for the current list.")
+                    }
+                }
+            ))
         }
 
         let store = MacIntegrationPermissionStore(dataRoot: root)

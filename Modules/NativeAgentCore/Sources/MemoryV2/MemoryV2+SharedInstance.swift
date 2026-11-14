@@ -117,6 +117,14 @@ extension SwiftNativeMemoryV2 {
         return try await underlying.userPromptCore(surface: surface)
     }
 
+    /// The same read, with how long it took once this actor took it up, so a caller can tell waiting for the actor (it also computes
+    /// embeddings) from the read itself.
+    public func userPromptCoreTimed(surface: String) async throws -> (facts: [String], workNanoseconds: UInt64) {
+        let entered = DispatchTime.now().uptimeNanoseconds
+        let facts = try await userPromptCore(surface: surface)
+        return (facts, DispatchTime.now().uptimeNanoseconds &- entered)
+    }
+
     /// The process-wide actor shares canonical SQLite and managed embeddings; failed real inference throws unless mock is explicitly configured. Attach
     /// Spotlight hooks to the same storage for all mutations.
     public static let shared = SwiftNativeMemoryV2(canonicalDataRoot: PersistenceCore.defaultDataRoot())

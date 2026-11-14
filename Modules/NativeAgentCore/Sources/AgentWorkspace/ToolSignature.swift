@@ -8,14 +8,14 @@ import PersistenceCore
 public enum ToolSignature {
     private static func properties(_ data: Data) throws -> (props: [String: [String: Any]], required: Set<String>) {
         guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ToolFailureError("The tool's parameter schema is not an object. Repair its schema before reading its arguments or running it.",
+            throw ToolFailureError("The action's parameter schema is not an object. Repair its schema before reading its arguments or running it.",
                 effects: .none, code: "tool_schema_unavailable")
         }
         // JSON Schema permits an object without named property declarations, including a required list whose values are otherwise unconstrained.
         let props: [String: Any]
         if let value = raw["properties"] {
             guard let declared = value as? [String: Any] else {
-                throw ToolFailureError("The tool's parameter schema properties are not an object. Repair its schema before using it.", effects: .none,
+                throw ToolFailureError("The action's parameter schema properties are not an object. Repair its schema before using it.", effects: .none,
                     code: "tool_schema_unavailable")
             }
             props = declared
@@ -23,7 +23,7 @@ public enum ToolSignature {
         let required: Set<String>
         if let value = raw["required"] {
             guard let names = value as? [String] else {
-                throw ToolFailureError("The tool's required-argument schema is not a list of names. Repair its schema before using it.", effects: .none,
+                throw ToolFailureError("The action's required-argument schema is not a list of names. Repair its schema before using it.", effects: .none,
                     code: "tool_schema_unavailable")
             }
             required = Set(names)
@@ -31,7 +31,7 @@ public enum ToolSignature {
         var visible: [String: [String: Any]] = [:]
         for (key, value) in props {
             guard let property = value as? [String: Any] else {
-                throw ToolFailureError("The tool's parameter schema property \(key) is not an object. Repair its schema before using it.", effects: .none,
+                throw ToolFailureError("The action's parameter schema property \(key) is not an object. Repair its schema before using it.", effects: .none,
                     code: "tool_schema_unavailable")
             }
             let about = (property["description"] as? String ?? "").lowercased()

@@ -329,9 +329,9 @@ public enum OrganismBodySchemaSampler {
         }
         if let memoryIntegrityReading = read.memoryIntegrityReading {
             body.memoryIntegrityReading = memoryIntegrityReading
-            if let healthy = memoryIntegrityReading.compatibilityHealthy {
-                body.memoryHealthy = healthy
-            }
+            // Unknown here is a store that read fine with its upkeep unproven: it reads healthy, so a failed read taken before the store
+            // attached does not outlive the next good one.
+            body.memoryHealthy = memoryIntegrityReading.compatibilityHealthy ?? true
         }
         if let dreamIntegrityReading = read.dreamIntegrityReading {
             body.dreamIntegrityReading = dreamIntegrityReading

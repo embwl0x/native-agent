@@ -67,7 +67,7 @@ public struct CapabilityLifecycleCommands: Sendable {
         case "save":
             let existing = try? parts.row(id)
             if existing == nil, !SwiftToolDispatcher.isAuthorableToolName(Parts.id(id)) {
-                return CapabilityCommandOutcome(false, "\(id) is a built-in tool's name. Pick another id; nothing was saved.", ["id": .string(id)])
+                return CapabilityCommandOutcome(false, "\(id) is a built-in action's name. Pick another id; nothing was saved.", ["id": .string(id)])
             }
             // Retain pre-save state so the Inbox distinguishes a new keep from a re-enable. The turn program has no row, and its save keeps only an
             // installed program: it was active.

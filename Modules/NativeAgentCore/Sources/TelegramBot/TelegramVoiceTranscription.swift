@@ -6,7 +6,8 @@ import PersistenceCore
 import ProviderRouting
 import NativeAgentShared
 import Darwin
-// Blueprint: | `TelegramVoiceTranscription.swift` | Speech final/error and cancellation own recognition; process exit owns conversion |
+import AudioToolbox
+// Blueprint: | `TelegramVoiceTranscription.swift` | Speech final/error and cancellation own recognition; the Mac's own audio reader owns conversion |
 
 // MARK: - Telegram voice transcription
 
@@ -142,7 +143,7 @@ enum TelegramVoiceAudioPreparer {
             throw TelegramVoiceTranscriptionError.conversionFailed("Audio has no declared filename format or supported MIME type")
         }
         let input = tempRoot.appendingPathComponent("\(id).\(inputExt)")
-        let output = tempRoot.appendingPathComponent("\(id).m4a")
+        let output = tempRoot.appendingPathComponent("\(id).wav")
         do {
             try bytes.write(to: input, options: .atomic)
 
@@ -150,16 +151,9 @@ enum TelegramVoiceAudioPreparer {
                 return TelegramPreparedVoiceAudio(url: input, cleanupURLs: [input])
             }
 
-            guard ["ogg", "oga", "opus", "webm"].contains(inputExt) else {
-                throw TelegramVoiceTranscriptionError.conversionFailed("Unsupported declared audio format: \(inputExt)")
-            }
+            // The Mac reads the note itself: Core Audio opens Ogg Opus (what Telegram records) with nothing installed. Speech gets plain PCM.
             try Task.checkCancellation()
-            guard let ffmpeg = ffmpegURL() else {
-                throw TelegramVoiceTranscriptionError.conversionFailed(
-                    "Telegram \(inputExt) audio requires ffmpeg; install it before transcribing this format"
-                )
-            }
-            try await transcodeWithFFmpeg(ffmpeg: ffmpeg, input: input, output: output)
+            try decodeWithSystemAudio(input: input, output: output, format: inputExt)
             return TelegramPreparedVoiceAudio(url: output, cleanupURLs: [input, output])
         } catch {
             // Preparation failure bypasses caller cleanup; remove downloaded bytes here to prevent a private-data leak.
@@ -198,44 +192,47 @@ enum TelegramVoiceAudioPreparer {
         }
     }
 
-    private static func ffmpegURL() -> URL? {
-        [
-            "/opt/homebrew/bin/ffmpeg",
-            "/usr/local/bin/ffmpeg",
-            "/usr/bin/ffmpeg",
-        ]
-        .map { URL(fileURLWithPath: $0) }
-        .first { FileManager.default.isExecutableFile(atPath: $0.path) }
-    }
-
-    private static func transcodeWithFFmpeg(ffmpeg: URL, input: URL, output: URL) async throws {
-        let result: ProcessRunResult
-        do {
-            result = try await ProcessExecution().run(
-                executable: ffmpeg.path,
-                arguments: [
-                    "-hide_banner", "-loglevel", "error", "-y",
-                    "-i", input.path, "-vn", "-acodec", "aac", "-b:a", "96k", output.path,
-                ],
-                currentDirectory: nil, environment: nil, standardInput: nil,
-                timeoutSeconds: nil, outputByteLimit: 64 * 1024,
-                launchFailure: { TelegramVoiceTranscriptionError.conversionFailed("ffmpeg failed to start: \($0.localizedDescription)") }
+    /// One reader for every container Core Audio knows; what it cannot open is refused by name. Writes 16 kHz mono 16-bit PCM.
+    private static func decodeWithSystemAudio(input: URL, output: URL, format: String) throws {
+        func unreadable(_ step: String, _ status: OSStatus) -> TelegramVoiceTranscriptionError {
+            .conversionFailed("This Mac cannot read \(format) audio (\(step), status \(status)).")
+        }
+        var source: ExtAudioFileRef?
+        var status = ExtAudioFileOpenURL(input as CFURL, &source)
+        guard status == noErr, let source else { throw unreadable("opening it", status) }
+        defer { ExtAudioFileDispose(source) }
+        var pcm = AudioStreamBasicDescription(
+            mSampleRate: 16_000, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2, mChannelsPerFrame: 1, mBitsPerChannel: 16, mReserved: 0
+        )
+        status = ExtAudioFileSetProperty(
+            source, kExtAudioFileProperty_ClientDataFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &pcm
+        )
+        guard status == noErr else { throw unreadable("decoding it", status) }
+        var destination: ExtAudioFileRef?
+        status = ExtAudioFileCreateWithURL(output as CFURL, kAudioFileWAVEType, &pcm, nil, AudioFileFlags.eraseFile.rawValue, &destination)
+        guard status == noErr, let destination else { throw unreadable("writing the decoded audio", status) }
+        defer { ExtAudioFileDispose(destination) }
+        let capacity: UInt32 = 8_192
+        let samples = UnsafeMutableRawPointer.allocate(byteCount: Int(capacity) * 2, alignment: 2)
+        defer { samples.deallocate() }
+        var written = 0
+        while true {
+            try Task.checkCancellation()
+            var buffers = AudioBufferList(
+                mNumberBuffers: 1, mBuffers: AudioBuffer(mNumberChannels: 1, mDataByteSize: capacity * 2, mData: samples)
             )
-        } catch {
-            if error is CancellationError || error is ProcessRunCancellation { throw CancellationError() }
-            throw error as? TelegramVoiceTranscriptionError
-                ?? TelegramVoiceTranscriptionError.conversionFailed(error.localizedDescription)
+            var frames = capacity
+            status = ExtAudioFileRead(source, &frames, &buffers)
+            guard status == noErr else { throw unreadable("decoding it", status) }
+            if frames == 0 { break }
+            buffers.mBuffers.mDataByteSize = frames * 2
+            status = ExtAudioFileWrite(destination, frames, &buffers)
+            guard status == noErr else { throw unreadable("writing the decoded audio", status) }
+            written += Int(frames)
         }
-        try Task.checkCancellation()
-        guard result.exitCode == 0 else {
-            let message = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw TelegramVoiceTranscriptionError.conversionFailed(
-                "ffmpeg exited \(result.exitCode): \(message)"
-            )
-        }
-        guard FileManager.default.fileExists(atPath: output.path) else {
-            throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg did not write output audio")
-        }
+        guard written > 0 else { throw TelegramVoiceTranscriptionError.conversionFailed("This \(format) audio holds no sound.") }
     }
 }
 

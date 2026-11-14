@@ -62,7 +62,7 @@ enum TurnObservation {
                     needed.
                     """
             case .fabricatedResult:
-                happened = "Your reply invented a tool result and was cut before it. Use only returned results; call the action if evidence is still needed."
+                happened = "Your reply invented a result and was cut before it. Use only returned results; call the action if evidence is still needed."
             case .postCallProse:
                 happened = "Your reply continued after a call without its result and was cut there. Read the result before continuing."
             case .refusal:
@@ -76,7 +76,7 @@ enum TurnObservation {
         case .restarted(let steps, let unknown, let started):
             happened = "The app restarted after step \(steps); the recorded results are below"
                 + (unknown.map { "; step \($0)'s effect is unknown" } ?? "") + "."
-                + " Oversize tool-result pages from before the restart are unavailable."
+                + " Oversize result pages from before the restart are unavailable."
                 + (started.isEmpty ? "" : " Started without a receipt: " + started.joined(separator: "; ") + ".")
                 + " Calls without receipts may have taken effect; inspect their affected state before repeating them."
         case .healed(let from, let to, let why):

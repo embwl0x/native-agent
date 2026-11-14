@@ -38,42 +38,48 @@ extension NativeAgentEngine {
         } catch { return trustFaceFailure("watches", "Background watches", error) }
     }
 
-    func trustSecurityFace() async -> [PartFace.Section] {
-        var sections: [PartFace.Section] = []
+    /// Security's settings and readings, and its record: the recent security receipts and the Mac control audit.
+    func trustSecurityFace() async -> (security: PartFace.Section, record: [PartFace.Section]) {
+        let security: PartFace.Section
+        var record: [PartFace.Section] = []
         do {
             let status = try await SwiftNativeSecurityCenter(dataRoot: dataRoot).status(limit: 10)
             var rows: [PartFace.Row] = [
                 .init(id: "security.mode", title: "Mode", value: status.mode),
                 .init(id: "trust.developer_mode", title: "Developer mode",
                     detail: "Destructive actions on this Mac; the riskiest setting.", value: status.developerMode ? "On" : "Off"),
-                trustFaceToggle("trust.pause_everything", "Pause everything", status.killSwitchEnabled,
-                    "On, every action stops until you lift it.", safe: true)
+                // While everything is paused the block stays open: a pause no one can see reads as a broken agent.
+                { pause in PartFace.Row(id: pause.id, title: pause.title, detail: pause.detail,
+                                        tone: status.killSwitchEnabled ? .attention : nil, control: pause.control) }(
+                    trustFaceToggle("trust.pause_everything", "Pause everything", status.killSwitchEnabled,
+                                    "On, every action stops until you lift it.", safe: true))
             ]
             rows += status.flags.filter { $0.id != "security_center" }.map {
                 .init(id: "security.flag." + $0.id, title: $0.title, detail: $0.detail, value: $0.status)
             }
-            sections.append(.init(id: "security", title: "Security", rows: rows))
-            sections.append(.init(id: "security_receipts", title: "Recent security receipts", style: .timeline,
-                footer: status.recentReceipts.isEmpty ? status.flags.first { $0.id == "audit_receipts" }?.detail : status.auditReceiptsPath,
+            security = .init(id: "security", title: "Security", rows: rows)
+            record.append(.init(id: "security_receipts", title: "Recent security receipts", style: .timeline,
+                footer: status.recentReceipts.isEmpty ? status.flags.first { $0.id == "audit_receipts" }?.detail
+                    : "Every receipt is kept in " + status.auditReceiptsPath,
                 rows: status.recentReceipts.map {
                     .init(id: "security.receipt." + $0.id, title: $0.tool, detail: $0.reason + " · " + $0.surface + " · " + $0.risk,
                         value: $0.decision, at: $0.at)
                 }))
-        } catch { sections.append(trustFaceFailure("security", "Security", error)) }
+        } catch { security = trustFaceFailure("security", "Security", error) }
         switch await trust.auditLog(limit: 100) {
         case .entries(let entries, let malformed):
-            sections.append(.init(id: "mac_audit", title: "Mac control audit", style: .timeline,
+            record.append(.init(id: "mac_audit", title: "Mac control audit", style: .timeline,
                 footer: malformed > 0 ? "Could not decode \(malformed) audit entries."
                     : entries.isEmpty ? "No Mac control refusal receipts retained in the experience record. The Mac Control inventory counts operation files."
                         : nil,
                 rows: entries.map { .init(id: "audit." + $0.id, title: $0.action, detail: $0.detail,
                     value: $0.allowed.map { $0 ? "Allowed" : "Blocked" } ?? "Outcome not recorded", at: $0.ts) }))
         case .unreadable(let detail):
-            sections.append(.init(id: "mac_audit", title: "Mac control audit", rows: [
+            record.append(.init(id: "mac_audit", title: "Mac control audit", rows: [
                 .init(id: "audit.unavailable", title: "Could not read the audit log", detail: detail, tone: .failed)
             ]))
         }
-        return sections
+        return (security, record)
     }
 
     /// The reach on this Mac: each macOS grant read live and without prompting, as the permission card reads it and in the order a card asks;
@@ -129,12 +135,12 @@ extension NativeAgentEngine {
                 actions: [ask(MacIntegrationFrameworkPermission.allCases.map { "privacy:" + $0.capability.rawValue }
                     + AppleScriptExecution.automationTargetApps.compactMap { AppleScriptExecution.automationTargetBundleIDs[$0].map { "applescript:" + $0 } },
                     "Ask for each one")]))
-        return .init(id: "system", title: "macOS grants", footer: "Separate from the app Read and Write switches above. Only you grant access, "
+        return .init(id: "system", title: "macOS grants", footer: "Separate from the Read and Write switches under Apps and features. Only you grant access, "
             + "in the foreground on this Mac; ordinary text chat needs none. My greeting raises one permission card for every grant still off; "
-            + "Full Mac stays your own switch, under Access and policy.", rows: rows)
+            + "Full Mac stays your own switch, under What I may do.", rows: rows)
     }
 
-    func trustActivityFace() async -> [PartFace.Section] {
+    func trustActivityFace() async -> PartFace.Section {
         let (controller, state) = await MainActor.run {
             let controller = activityWatch
             return (controller, (policy: trust.policy, issues: controller.presentationIssues,
@@ -156,7 +162,8 @@ extension NativeAgentEngine {
                     call: settingSetCall("trust.activity_titles"))))
             let full = state.policy.map(TrustAccessModeCapabilityCatalog.fullMacGrantIsActive) == true
             rows.append(full ? .init(id: "trust.activity_model_access", title: "Let me answer from activity history",
-                detail: "When I answer from it, the answer goes to the chat's AI provider. The database stays on this Mac.", value: "On with Full Mac")
+                detail: "Full Mac allows it. When I answer from it, the answer goes to the chat's AI provider. The database stays on this Mac.",
+                value: "On")
                 : .init(id: "trust.activity_model_access", title: "Let me answer from activity history",
                     detail: "Answers reach the chat's AI provider; the database stays on this Mac. Recording must be on.",
                     value: !policy.captureEnabled ? "Recording is off" : nil,
@@ -188,10 +195,10 @@ extension NativeAgentEngine {
         rows.append(.init(id: "activity.wipe", title: "Delete all recorded activity",
             detail: "Permanently deletes the record, including recovery logs. Settings stay; if recording is on it keeps going.",
             actions: [.init(id: "wipe", label: "Delete everything", role: .destructive, call: PartFace.Call("history.clear"))]))
-        return [.init(id: "activity", title: "Activity capture", footer:
+        return .init(id: "activity", title: "Activity capture", footer:
             "Never records typed text, field contents or screenshots, or while locked or asleep. "
                 + "The history never leaves this Mac: no iCloud, backup or export. "
-                + "My own windows and the lock screen are always excluded.", rows: rows)]
+                + "My own windows and the lock screen are always excluded.", rows: rows)
     }
 }
 

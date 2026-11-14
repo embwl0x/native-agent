@@ -7,6 +7,13 @@ import QuickLookUI
 import UniformTypeIdentifiers
 // Blueprint: | `WorkPaneMakeView.swift` | Shared Make page, retained version-bound actions, granted native leaves and checked exports |
 
+extension MakePreviewFace {
+    /// An SVG is a picture to whoever looks at it, so it is drawn as one at its own proportions, not in a page's web frame.
+    var isPicture: Bool {
+        kind == "image" || resources.first.map { ($0.name as NSString).pathExtension.lowercased() == "svg" } == true
+    }
+}
+
 struct WorkPaneMakeView: View {
     let ref: String?
     @Environment(AppModel.self) private var appModel
@@ -46,6 +53,9 @@ struct WorkPaneMakeView: View {
                 self.selectedVersion = nil
             }
         }
+        // Leaving a ref lets go of what its last table save said.
+        .onChange(of: reference) { left, _ in if let left { MakeSheetWords.shared.said[left] = nil } }
+        .onDisappear { if let reference { MakeSheetWords.shared.said[reference] = nil } }
         .modifier(FaceObservation(demand: .key(.makeShelf)))
     }
 }
@@ -76,7 +86,7 @@ private struct MakeVersionPage: View {
                 FaceView(face: WorkPaneFace.make(version, versions: versions, title: title, preview: preview),
                          door: door, session: session, leaf: { block in
                     if let preview, block.key == "make-preview", block.ref == preview.reference, block.revision == preview.revision {
-                        return AnyView(GrantedMakePreview(preview: preview).id(preview.revision).frame(minHeight: 240))
+                        return AnyView(GrantedMakePreview(preview: preview).id(preview.revision).frame(minHeight: preview.isPicture ? nil : 240))
                     }
                     return AnyView(Text("This preview does not match its owner's current resource grant.").foregroundStyle(.red))
                 })
@@ -155,6 +165,29 @@ private struct MakeVersionPage: View {
     }
 }
 
+/// One Make version drawn on a page (a piece on the Desk), through the same granted preview the Make pane draws.
+struct PageMakePreview: View {
+    let reference: String
+    let version: String
+    @Environment(AppModel.self) private var appModel
+    private var key: FaceKey { .makePreview(reference: reference, version: version) }
+    private var preview: MakePreviewFace? { appModel.face.slot(key).value(as: MakePreviewFace.self) }
+
+    var body: some View {
+        Group {
+            if let preview, preview.state == .ready, preview.reference == reference, preview.version == version {
+                // A piece on a page is there to be looked at: tall enough to read a board without scrolling inside it. A table is as
+                // tall as its rows, a picture as its own proportions.
+                let table = preview.resources.first.map { SheetTable.delimiter(type: ($0.name as NSString).pathExtension) != nil } == true
+                GrantedMakePreview(preview: preview).id(preview.revision).frame(minHeight: table || preview.isPicture ? nil : 440)
+            } else { FaceReadStatus(state: preview?.state) }
+        }
+        .modifier(FaceObservation(demand: .key(key)))
+        // The piece stays drawn here across its versions; leaving it lets go of what its last table save said.
+        .onDisappear { MakeSheetWords.shared.said[reference] = nil }
+    }
+}
+
 private struct GrantedMakePreview: View {
     let preview: MakePreviewFace
     @Environment(\.quietCaptureSession) private var capture
@@ -164,11 +197,15 @@ private struct GrantedMakePreview: View {
     var body: some View {
         Group {
             if let capture {
-                if let image = capture.makeImage { Image(nsImage: image).resizable().scaledToFit().padding(12) }
-                else if preview.kind == "web", let file = capture.resources.first?.url,
-                        let folder = capture.resources.dropFirst().first?.url {
+                let held = capture.held(preview)
+                if let image = held?.image { Image(nsImage: image).resizable().scaledToFit().padding(12) }
+                else if let table = held?.table, let file = held?.resources.first?.url,
+                        let delimiter = SheetTable.delimiter(type: file.pathExtension) {
+                    MakeSheetView(file: file, delimiter: delimiter, reference: preview.reference, version: preview.version, read: table)
+                } else if preview.kind == "web", let file = held?.resources.first?.url,
+                        let folder = held?.resources.dropFirst().first?.url {
                     MakeMockupView(file: file, folder: folder, revision: 0)
-                } else { FaceReadStatus(state: capture.makeReadState) }
+                } else { FaceReadStatus(state: preview.state) }
             } else if let issue { Text(issue).foregroundStyle(.red).textSelection(.enabled) }
             else if let image, let decoded = NSImage(data: image) {
                 Image(nsImage: decoded).resizable().scaledToFit().padding(12)
@@ -177,6 +214,8 @@ private struct GrantedMakePreview: View {
                     MakeMockupView(file: file, folder: folder, revision: 0)
                 } else if preview.kind == "web" {
                     Text("The body did not grant the mockup's resource folder.").foregroundStyle(.red)
+                } else if let delimiter = SheetTable.delimiter(type: file.pathExtension) {
+                    MakeSheetView(file: file, delimiter: delimiter, reference: preview.reference, version: preview.version)
                 } else { MakeQuickLookView(file: file, revision: 0) }
             } else if preview.resources.isEmpty {
                 Text("The ready Make preview supplied no resource grant.").foregroundStyle(.red)
@@ -192,7 +231,7 @@ private struct GrantedMakePreview: View {
                 var opened: [FaceResourceAccess.Opened] = []
                 do {
                     for grant in preview.resources { opened.append(try await FaceResourceAccess.resolve(grant)) }
-                    if preview.kind == "image", let file = opened.first {
+                    if preview.isPicture, let file = opened.first {
                         image = try await FaceResourceAccess.bytes(file.url)
                         guard image.flatMap(NSImage.init(data:)) != nil else {
                             throw PartCallError(code: "image_decode_failed", message: "The granted image could not be decoded.")

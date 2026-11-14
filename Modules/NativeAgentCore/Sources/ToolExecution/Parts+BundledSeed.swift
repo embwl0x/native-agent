@@ -9,11 +9,11 @@ import ToolRegistry
 import NativeAgentShared
 import PersonaEngine
 import Privacy
-// Blueprint: | `Parts+BundledSeed.swift` | Parts bundled seed admission from the shipped current part contract |
+// Blueprint: | `Parts+BundledSeed.swift` | Parts bundled seed admission from the shipped current part contract; whether a kept version is that part |
 
 extension Parts {
-    /// A current seed needs no admission work. Changed bundle bytes land kept and on.
-    package func bundledSeed(_ seed: AbilityStore.File, invocation: Invocation) async throws -> AbilityStore.File? {
+    /// The shipped part as launch installs it: its candidate, made from the bundled file alone.
+    package func seedCandidate(_ seed: AbilityStore.File, invocation: Invocation) throws -> OwnedProgramStore.Candidate {
         let record = seed.record.filter { !["kind", "version"].contains($0.key) }
         guard case .string(let description)? = record["description"], !description.isEmpty else {
             throw PartError.invalid("Seed \(seed.id) needs a description in its record. Fix the bundled seed and relaunch.")
@@ -25,10 +25,25 @@ extension Parts {
             "id": .string(seed.id), "name": record["name"] ?? .string(seed.id), "origin": .object(["by": .string("hers")]),
             "language": .string("javascript"), "inputSchema": schema, "actions": .array(actions.map(JSONValue.string)),
         ]) { _, value in value }.merging(seed.part) { _, value in value }
-        let candidate = try OwnedProgramStore.Candidate(
-            program: OwnedProgram(kind: .part, id: seed.id, version: "seed", source: seed.body, entry: .run,
+        return try OwnedProgramStore.Candidate(
+            program: OwnedProgram(kind: .part, id: seed.id, version: "seed", source: seed.body,
+                entry: AbilityStore.answersCalls(seed.body, header: seed.part) ? .run : .face,
                 schema: schema, dependencies: actions, permissions: permissions, resident: seed.part["resident"] == .bool(true)),
             manifest: .object(manifest), fixtures: .array([]), dependencyShapes: try dependencyShapes(actions, invocation: invocation), prior: .null)
+    }
+
+    /// Whether a version is the part the app ships under its id: then it follows the shipped part, as a seed does.
+    func followsShipped(_ candidate: OwnedProgramStore.Candidate, invocation: Invocation) throws -> Bool {
+        guard let url = try AbilityStore.seedCatalog().first(where: { $0.deletingPathExtension().lastPathComponent == candidate.id }) else { return false }
+        let seed = try AbilityStore.decode(url)
+        guard seed.kind == .part, seed.id == candidate.id, OwnedProgramStore.sameCode(seed.body, candidate.program.source) else { return false }
+        return try OwnedProgramStore.samePart(candidate, seedCandidate(seed, invocation: invocation))
+    }
+
+    /// A current seed needs no admission work. Changed bundle bytes land kept and on.
+    package func bundledSeed(_ seed: AbilityStore.File, candidate: OwnedProgramStore.Candidate, invocation: Invocation) async throws
+        -> AbilityStore.File? {
+        let manifest = Self.fields(candidate.manifest)
         let version: Int64 = if case .int(let value)? = seed.metadata["version"] { value } else { 1 }
         guard try !store.isCurrentSeed(candidate, version: version) else { return nil }
         try await checkDependencies(candidate, invocation: invocation)

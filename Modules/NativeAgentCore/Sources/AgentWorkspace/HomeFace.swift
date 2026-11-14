@@ -29,7 +29,7 @@ package enum HomeFace {
         guard snapshot.status == .ready, let face = snapshot.face else {
             throw snapshot.error ?? PartCallError(code: "home_unavailable", message: "Home returned no readable face.")
         }
-        return PartFace(title: face.title, line: face.line, sections: (snapshot.levers ?? []) + face.sections)
+        return PartFace(title: face.title, line: face.line, sections: (snapshot.levers ?? []) + face.sections, opened: face.opened)
     }
 
     private static func observe(center: NotificationCenter, names: [Notification.Name], changed: @escaping @Sendable () -> Void)

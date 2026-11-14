@@ -51,6 +51,7 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
                     catch CocoaError.fileReadNoSuchFile { return State() }
                     return try JSONDecoder().decode(State.self, from: data)
                 }.value
+                state.pending = Self.newestPerSlot(state.pending)
                 enabled = state.enabled; available = true
             } catch { errorMessage = "Phone senses could not be read: \(error.localizedDescription)" }
         }
@@ -65,7 +66,7 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
             do { try await body() }
             catch {
                 errorMessage = "Phone senses are waiting: \(error.localizedDescription)"
-                // Drain accepted work despite new admission failure so receipts can release outbox capacity.
+                // A failed step must not hold the readings already queued.
                 await publishNow()
             }
         }
@@ -174,8 +175,6 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
 
     private func sample() async throws {
         try await reconcilePairing()
-        // Drain before sampling: a full outbox must not block its own send.
-        await publishNow()
         UIDevice.current.isBatteryMonitoringEnabled = state.enabled.contains(.charging) || state.enabled.contains(.battery)
         if !state.enabled.isEmpty, location.authorizationStatus == .authorizedAlways,
            CLLocationManager.significantLocationChangeMonitoringAvailable() {
@@ -300,30 +299,48 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
     private func record(_ source: PhoneSenseEvent.Source, value: String, night: Bool? = nil, at: Date = Date(),
                         setup: PhoneSenseEvent.Setup? = nil, confidence: String? = nil, activityStartedAt: Date? = nil, summary: String? = nil) async throws {
         guard let pairing, state.pairing == pairing else { return }
-        let slot = source.rawValue + (value == "setup" ? "/setup" : "")
+        let slot = Self.slot(source, value: value)
         let previous = state.latest[slot]
         guard previous.map({ $0.timestamp <= at }) ?? true else { return }
         // Unchanged is not unknown: a reading re-reports before the Mac's fifteen minutes would call it historical.
         let held = value != "setup" && previous.map { at.timeIntervalSince($0.timestamp) > 10 * 60 } == true
         guard held || previous?.value != value || previous?.localNight != night || previous?.setup != setup
             || previous?.confidence != confidence || previous?.activityStartedAt != activityStartedAt || previous?.summary != summary else { return }
-        guard state.pending.count < 128 else {
-            throw DeviceSyncError.underlying(message: "Phone sense changes are waiting to sync. Open NativeAgent with the Mac connected.")
-        }
         let event = PhoneSenseEvent(source: source, value: value, timestamp: at, localNight: night,
             setup: setup, confidence: confidence, activityStartedAt: activityStartedAt, summary: summary)
         guard event.isValid else { throw DeviceSyncError.underlying(message: "Invalid \(source.title) evidence was not queued.") }
         try await save { state in
             state.latest[slot] = event
-            state.pending.append(Pending(event: event, pairing: pairing))
+            state.pending = Self.newestPerSlot(state.pending + [Pending(event: event, pairing: pairing)])
         }
+    }
+
+    /// A slot holds one fact: a source's reading, or its setup.
+    private static func slot(_ source: PhoneSenseEvent.Source, value: String) -> String {
+        source.rawValue + (value == "setup" ? "/setup" : "")
+    }
+
+    /// The Mac needs each slot's newest fact, never a backlog: a later reading takes its slot's place in the queue. The first movement
+    /// stays queued beside it, because the Mac dates an absence from it (`PhoneSenseHistory.record`).
+    private static func newestPerSlot(_ pending: [Pending]) -> [Pending] {
+        let firstMovement = pending.first { $0.event.isMovement }
+        var queue: [Pending] = firstMovement.map { [$0] } ?? []
+        for reading in pending where reading.event.id != firstMovement?.event.id {
+            let key = Self.slot(reading.event.source, value: reading.event.value)
+            if let index = queue.firstIndex(where: {
+                $0.event.id != firstMovement?.event.id && Self.slot($0.event.source, value: $0.event.value) == key
+            }) {
+                queue[index] = reading
+            } else { queue.append(reading) }
+        }
+        return queue
     }
 
     func publish() { enqueue { try await self.reconcilePairing(); await self.publishNow() } }
 
     private func publishNow() async {
         guard iCloudBridge.shared.usesCloudKitDeviceTransport else { return }
-        for pending in state.pending.prefix(8) {
+        for pending in state.pending {
             guard pending.pairing == pairing else { return }
             guard state.pending.contains(where: { $0.event.id == pending.event.id }) else { continue }
             guard !iCloudBridge.shared.isAwaitingMacAcceptance(pending.event.id) else { continue }

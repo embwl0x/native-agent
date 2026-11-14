@@ -49,6 +49,29 @@ public enum DeskRefKind: Sendable, Equatable {
     }
 }
 
+/// A piece is a made thing laid on an item: a url reference addressed `make:<Make ref>`, so every build reads it as a url reference.
+public enum DeskPiece {
+    public static let scheme = "make:"
+
+    /// The Make ref an address lays, or nil when the address is not a piece's.
+    public static func makeRef(address: String) -> String? {
+        guard address.hasPrefix(scheme) else { return nil }
+        let ref = String(address.dropFirst(scheme.count))
+        return ref.isEmpty ? nil : ref
+    }
+
+    /// The Make ref a reference lays, or nil when it is not a piece.
+    public static func makeRef(_ ref: DeskRef) -> String? {
+        guard case .url(let url, _) = ref.kind else { return nil }
+        return makeRef(address: url)
+    }
+
+    /// What is on the table: each piece laid on a board item that is not finished, with its item, as the Desk page draws **On the table**.
+    public static func onTable(_ state: DeskState) -> [(item: DeskItem, ref: DeskRef)] {
+        state.board.items.filter { !$0.status.isTerminal }.flatMap { item in item.refs.filter { makeRef($0) != nil }.map { (item: item, ref: $0) } }
+    }
+}
+
 public struct DeskRef: Sendable, Equatable {
     public var refId: String
     public var kind: DeskRefKind

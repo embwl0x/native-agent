@@ -200,7 +200,7 @@ public actor AgentContactTasks {
             guard let id = claimed.cachedReceipt?["taskID"] as? String else {
                 throw AgentContactFailure(code: -32603, message: "Earlier work has no retained task details. Do not send it again automatically.")
             }
-            return try get(id, owner: principal.id)
+            return try queued(id, owner: principal.id)
         case .conflict: throw AgentContactFailure(code: -32602, message: "That message ID was already used for different content")
         case .inFlight: throw AgentContactFailure(code: -32004, message: "That message is already being accepted")
         case .stopped: throw AgentContactFailure(code: -32004, message: "That message is stopped (restored). Start a new task in the conversation.")
@@ -214,6 +214,11 @@ public actor AgentContactTasks {
                     message: "This task has ended. Start a new task in the conversation.") }
                 throw AgentContactFailure(code: -32004, message: "This task is still working or waiting for the person's permission card")
             } else {
+                // A task id names one task. A replay claim is per contact, so another contact repeating the ids holds a fresh claim: it is
+                // refused here, never given the record a worker is still writing to.
+                guard records[send.taskID] == nil else {
+                    throw AgentContactFailure(code: -32602, message: "This request already has retained task evidence. Read its result; do not resend.")
+                }
                 if records.count >= capacity {
                     guard let oldest = order.first(where: { records[$0]?.task.state.terminal == true }) else {
                         throw AgentContactFailure(code: -32004, message: "Too much work is active. Try again later.")
@@ -244,13 +249,34 @@ public actor AgentContactTasks {
             records[task.id]?.task = task
         }
         let acceptedTask = task
+        // The caller is answered once its message is saved and bound to this task, or the task has ended; the worker owns both, so Stop and a repeat
+        // meet the same task they always did.
+        let (saved, mark) = AsyncStream<Void>.makeStream()
         let turn = AgentContactTurn(taskID: acceptedTask.id, context: acceptedTask.context, requestID: send.request,
                                     principal: principal, parts: send.parts,
-                                    bindRun: { session, run in try await self.bindRun(acceptedTask.id, session: session, run: run) },
+                                    bindRun: { session, run in
+                                        try await self.bindRun(acceptedTask.id, session: session, run: run)
+                                        mark.finish()
+                                    },
                                     job: acceptedTask.job)
         let runner = self.runner
-        startWorker(acceptedTask.id) {
+        let worker = startWorker(acceptedTask.id) {
             try await runner(turn) { progress in await self.progress(acceptedTask.id, progress) }
+        }
+        Task { await worker.value; mark.finish() }
+        for await _ in saved {}
+        return try queued(acceptedTask.id, owner: principal.id)
+    }
+    /// The caller's own task, first time or repeated. One that ended failed before it was ever saved was not queued: the caller gets the failure,
+    /// never an acknowledgement.
+    private func queued(_ id: String, owner: String) throws -> AgentContactTask {
+        let task = try get(id, owner: owner)
+        // A repeat that arrives while the first send is still being saved is not yet queued either.
+        if !task.state.terminal, task.canonicalRunID == nil, records[id]?.worker != nil {
+            throw AgentContactFailure(code: -32004, message: "That message is already being accepted")
+        }
+        if task.state == .failed, task.canonicalRunID == nil {
+            throw AgentContactFailure(code: -32603, message: task.detail ?? "The message could not be saved. Do not resend automatically.")
         }
         return task
     }

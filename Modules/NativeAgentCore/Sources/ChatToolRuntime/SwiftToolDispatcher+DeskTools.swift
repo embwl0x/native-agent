@@ -4,7 +4,9 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import AgentConversations
+import AgentWorkspace
 import Experiences
+import Studio
 import ToolExecution
 // Blueprint: | `SwiftToolDispatcher+DeskTools.swift` | `SwiftToolDispatcher`; raw mutation admission; checked waits and close |
 
@@ -36,8 +38,22 @@ extension SwiftToolDispatcher {
         return value
     }
 
+    /// An item filed with no project goes where its caller says the app files its own (`absent`). A project that is given must name one.
+    func deskProject(_ input: [String: JSONValue], absent: String) throws -> String {
+        guard let given = input["project"], given != .null else { return absent }
+        guard case .string(let value) = given, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw deskInvalid("project", reason: "project must be a nonempty string; leave it out to file under \(absent).")
+        }
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     func deskStore() -> SwiftNativeDeskStore {
         SwiftNativeDeskStore(dataRoot: dataRoot)
+    }
+
+    /// A peer's step is named by its contact, read as Home reads it; a contact book that cannot be read leaves the id the step recorded.
+    func deskPeerName() -> (String) -> String? {
+        do { return AgentScreen.peerName(identity: try AgentContactIdentity(dataRoot: dataRoot)) } catch { return { $0 } }
     }
 
     /// A committed effect remains committed when its confirmation cannot be read.
@@ -53,7 +69,10 @@ extension SwiftToolDispatcher {
         let item = state.items.first { $0.handle == handle }
         let label: String
         if let item {
-            label = "\(item.alias) \(item.kind.rawValue) (status: \(item.statusDescription)) \(item.title)"
+            // A person wait reads as the wait; otherwise the state in the words the Desk shows (an unstarted item is queued).
+            let state = item.statusDescription.hasPrefix("waiting on ") ? item.statusDescription : item.spokenStatus
+            // A prefix that is the state itself (a wait) is not said a second time.
+            label = "\(item.alias) \(item.kind.rawValue) " + (state == prefix ? "" : "(\(state)) ") + item.displayTitle(peerName: deskPeerName())
         } else {
             label = handle
         }
@@ -126,41 +145,19 @@ extension SwiftToolDispatcher {
         return try resolveDeskRef(raw, in: state)
     }
 
-    static func deskAlias(_ raw: String) -> String {
-        var r = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if r.lowercased().hasPrefix("desk.") { r = String(r.dropFirst(5)) }
-        if r.hasPrefix("#") { r = String(r.dropFirst()) }
-        if let first = r.split(separator: " ").first, first.count < r.count,
-           first.allSatisfy({ $0.isNumber || $0 == "." }) { r = String(first) }
-        return r
-    }
-
-    package static func deskMatches(_ raw: String, in state: DeskState, field: String = "handle") throws -> [DeskItem] {
-        let reference = deskAlias(raw)
-        let exact = state.items.filter { $0.alias == reference || $0.handle == reference }
-        let matches = exact.isEmpty ? state.items.filter {
-            $0.title.caseInsensitiveCompare(raw.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
-        } : exact
-        guard matches.count <= 1 else {
-            throw ToolFailureError("Several items share that title; use query in desk.read to find their handles.", argumentPath: "$." + field,
-                effects: .none, code: "invalid_input")
-        }
-        return matches
-    }
-
     func resolveDeskRef(_ raw: String, in state: DeskState, field: String = "handle") throws -> String {
-        let r = Self.deskAlias(raw)
+        let r = DeskState.reference(raw)
         guard !r.isEmpty else {
             throw deskInvalid(field, reason: "\(field) must not be empty.")
         }
-        let matches = try Self.deskMatches(raw, in: state, field: field)
+        let matches = try state.matching(raw, field: field)
         if matches.count == 1 { return matches[0].handle }
         throw deskInvalid(field, reason: "No live item has handle '\(r)'; desk.read lists the current handles.")
     }
 
     /// Display-only `laneOf` requires a live reference at the tool boundary.
     private func resolveDeskLaneRef(_ raw: String, in state: DeskState, updating handle: String? = nil) throws -> String {
-        let reference = Self.deskAlias(raw)
+        let reference = DeskState.reference(raw)
         guard !reference.isEmpty else {
             throw deskInvalid("lane_of", reason: "desk: empty lane_of reference")
         }
@@ -180,12 +177,8 @@ extension SwiftToolDispatcher {
     // MARK: - desk_add_item
 
     func impl_desk_add_item(input: [String: JSONValue]) async throws -> JSONValue {
-        let kind = try deskRequireKind(input, "kind")
-        let project = try deskString(input, "project").trimmingCharacters(in: .whitespacesAndNewlines)
+        let kind = try deskKind(input, "kind")
         let title = try deskString(input, "title").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !project.isEmpty, !title.isEmpty else {
-            throw deskInvalid("title", reason: "desk_add_item: project and title must be non-empty")
-        }
         let parentRaw = optionalString(input, "parent")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let summary = optionalString(input, "summary")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let assignee = optionalString(input, "assignee")?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -203,6 +196,9 @@ extension SwiftToolDispatcher {
         let state = try await deskStore().liveState()
         let parent: String? = (parentRaw?.isEmpty == false) ? try resolveDeskRef(parentRaw!, in: state, field: "parent") : nil
         let laneOf: String? = (laneRaw?.isEmpty == false) ? try resolveDeskLaneRef(laneRaw!, in: state) : nil
+        // A part filed with no project goes under its parent's, as a breakdown's parts do; with no parent, where the Desk files a person's task.
+        let project = try deskProject(input, absent: parent.flatMap { handle in state.items.first { $0.handle == handle } }?.project
+            ?? DeskItem.tasksProject)
 
         let allowDuplicate: Bool
         switch input["allow_duplicate"] {
@@ -250,11 +246,8 @@ extension SwiftToolDispatcher {
 
     /// The sole chat path to an origin=agent pursuit; the store gates dossier sources and caps. Store refusals return their reason with status "refused".
     func impl_desk_open_pursuit(input: [String: JSONValue]) async throws -> JSONValue {
-        let project = try deskString(input, "project").trimmingCharacters(in: .whitespacesAndNewlines)
+        let project = try deskProject(input, absent: DeskItem.workshopProject)
         let title = try deskString(input, "title").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !project.isEmpty, !title.isEmpty else {
-            throw deskInvalid("title", reason: "desk_open_pursuit: project and title must be non-empty")
-        }
         // The store owns refusal of empty pursuit fields.
         let why = (optionalString(input, "why") ?? "")
         let doneLooksLike = (optionalString(input, "done_looks_like") ?? "")
@@ -437,9 +430,9 @@ extension SwiftToolDispatcher {
             return id.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         let correction = """
-            desk.wait takes on: a person's or agent's name (for example User, owner or Claude Desktop) or an agent's peer: id, a conversation id \
-            (its next message), a Desk handle/number, an experience id (card, message, delivery or repair), or a list of those dependency ids. \
-            note is optional.
+            desk.wait takes on: a person's or agent's name (for example User, owner or Claude Desktop), what you are waiting for said in a \
+            sentence, an agent's peer: id or a conversation id (each a status only), a Desk handle/number, an experience id (card, message, \
+            delivery or repair), or a list of those dependency ids. note is optional.
             """
         guard !ids.isEmpty, ids.count == values.count else { throw ToolFailureError(correction, argumentPath: "$.on", effects: .none, code: "invalid_input") }
         let store = deskStore()
@@ -449,22 +442,22 @@ extension SwiftToolDispatcher {
         var blockers: [String] = [], settled: [String] = []
         let note = try deskMetadataString(input, "note")
         for id in ids {
-            if let item = try Self.deskMatches(id, in: state, field: "on").first { blockers.append(item.handle); continue }
+            if let item = try state.matching(id, field: "on").first { blockers.append(item.handle); continue }
             // A card answers to its bare id too (its experience is `interaction:<id>`), and an approval to the `approval:<id>` its Home row shows.
             var found = try await experiences.experience(id.hasPrefix("approval:") ? String(id.dropFirst("approval:".count)) : id)
             if found == nil { found = try await experiences.experience("interaction:" + id) }
             guard let experience = found else {
-                // A single person's name is a wait, not an invented dependency. Identifier-shaped unknowns still fail at the input boundary.
-                let personName = id.contains(where: { $0.isLetter }) && id.allSatisfy {
-                    $0.isLetter || $0.isWhitespace || "-'.".contains($0)
-                } && !id.lowercased().hasPrefix("desk.")
+                // What she waits for said in words, a name or a sentence about what has to happen, is a wait and not an invented
+                // dependency. One unbroken token that is not a plain name is identifier-shaped and still fails at the input boundary.
+                let words = id.contains(where: \.isLetter) && !id.lowercased().hasPrefix("desk.")
+                    && (id.contains(where: \.isWhitespace) || id.allSatisfy { $0.isLetter || "-'.".contains($0) })
                 // A contact is named by the id agent.read hands out (peer:…) as well as by name.
                 let contact = id.hasPrefix("peer:")
                     ? try AgentPeerStore(dataRoot: dataRoot).list().contains { "peer:" + $0.id == id } : false
                 // A conversation the agent can reach is waited on like its person, through the same identity resolver as agent.read.
-                let conversation = !personName && !contact && ids.count == 1
+                let conversation = !words && !contact && ids.count == 1
                     ? try AgentConversationStore(dataRoot: dataRoot).containsConversation(id) : false
-                if ids.count == 1, personName || conversation || contact, case .string? = input["on"] {
+                if ids.count == 1, words || conversation || contact, case .string? = input["on"] {
                     var statusInput = input
                     statusInput.removeValue(forKey: "wait")
                     statusInput["handle"] = .string(handle)
@@ -478,8 +471,12 @@ extension SwiftToolDispatcher {
         }
         _ = try await store.setBlockedOn(handle, blockers: blockers, waiting: true, note: note)
         if blockers.isEmpty { return await deskConfirm(store, handle: handle, prefix: "already settled: nothing to wait for; go on now") }
-        return await deskConfirm(store, handle: handle, prefix: "waiting on " + blockers.map { $0.hasPrefix("exp:") ? String($0.dropFirst(4))
-            : $0 }.joined(separator: ", ")
+        // A Desk item is named as she reads it (desk.N), never by its stored handle.
+        let named = blockers.map { blocker in
+            blocker.hasPrefix("exp:") ? String(blocker.dropFirst(4))
+                : state.items.first { $0.handle == blocker }.map { "desk." + $0.alias } ?? blocker
+        }
+        return await deskConfirm(store, handle: handle, prefix: "waiting on " + named.joined(separator: ", ")
             + (settled.isEmpty ? "" : "; already settled: " + settled.joined(separator: ", ")))
     }
 
@@ -515,9 +512,27 @@ extension SwiftToolDispatcher {
     func impl_desk_add_ref(input: [String: JSONValue]) async throws -> JSONValue {
         let handle = try deskString(input, "handle")
         let ref = try deskBuildRef(input)
+        try deskRequireMadeThing(ref)
         let store = deskStore()
         _ = try await store.addRef(handle, ref: ref)
-        return await deskConfirm(store, handle: handle, prefix: "ref added (\(ref.kind.token))")
+        return await deskConfirm(store, handle: handle, prefix: DeskPiece.makeRef(ref) == nil ? "ref added (\(ref.kind.token))" : "piece laid")
+    }
+
+    /// A url addressed `make:` lays a piece, so it names a Make ref that holds a version; any other url passes untouched.
+    private func deskRequireMadeThing(_ ref: DeskRef) throws {
+        guard case .url(let url, _) = ref.kind, url.lowercased().hasPrefix(DeskPiece.scheme) else { return }
+        guard let made = DeskPiece.makeRef(address: url), MakeStudio.isRef(made) else {
+            throw deskInvalid("url", reason: "desk_add_ref: a piece's url is make: and the Make ref of something I made, like make:3f2a1b9c "
+                + "(make.read lists versions; page:make lists what I made). Nothing was laid.")
+        }
+        let meta: MakeStudio.Meta?
+        do { meta = try MakeStudio(dataRoot: dataRoot).readMeta(made) } catch {
+            throw ToolFailureError("desk_add_ref: Make could not read \(made): \(error.localizedDescription). Nothing was laid.",
+                argumentPath: "$.url", effects: .none, code: "make_unreadable")
+        }
+        guard let meta, !meta.versions.isEmpty else {
+            throw deskInvalid("url", reason: "desk_add_ref: nothing in Make is called \(made); page:make lists what I made. Nothing was laid.")
+        }
     }
 
     // MARK: - desk_set_cadence
@@ -714,8 +729,13 @@ extension SwiftToolDispatcher {
 
     // MARK: - Helpers
 
-    private func deskRequireKind(_ input: [String: JSONValue], _ key: String) throws -> DeskKind {
-        let raw = try deskString(input, key).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    /// An item filed with no kind takes the kind the Desk files a person's task as; a kind that is given must be one of the Desk's.
+    private func deskKind(_ input: [String: JSONValue], _ key: String) throws -> DeskKind {
+        guard let given = input[key], given != .null else { return DeskItem.tasksKind }
+        guard case .string(let text) = given else {
+            throw deskInvalid(key, reason: "\(key) must be a string; leave it out for \(DeskItem.tasksKind.rawValue).")
+        }
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard let kind = DeskKind(rawValue: raw) else {
             throw deskInvalid(key,
                 reason: "desk_add_item: unknown kind '\(raw)' (expected one of \(DeskKind.allCases.map(\.rawValue).joined(separator: "/")))"

@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `PartRunStore.swift` | Sealed bounded checkpoints; rename claims bytes until explicit settlement |
+// Blueprint: | `PartRunStore.swift` | Sealed bounded checkpoints and unsettled run journals; rename claims bytes until explicit settlement |
 
 /// Seal bounded resumable checkpoints, retaining at most 50 waiting runs.
 /// The key prevents accidental edits, not a writer that controls the data root.
@@ -152,6 +152,50 @@ public enum PartRunStore {
         } catch let error as ToolFailureError { throw error }
         catch { throw failure("run_validation_failed",
             "Checkpoint validation at \(url.path) failed: \(error.localizedDescription). Its bytes were preserved.", at: url) }
+    }
+
+    private static func journalFile(_ reference: String, root: URL) throws -> URL {
+        let folder = root.appendingPathComponent("skills/runs/journals", isDirectory: true)
+        guard reference.range(of: "^journal-[0-9a-f-]{36}$", options: .regularExpression) != nil else {
+            throw failure("journal_reference_invalid", "\(reference) is not a run journal reference.", at: folder)
+        }
+        return folder.appendingPathComponent(reference + ".json")
+    }
+
+    /// A run whose settlement failed keeps its private replay journal here, sealed like a checkpoint and named by the reference its receipt
+    /// carries. Only its settling owner reads it, once, with `takeJournal`; no receipt, trace or transcript holds the journal itself.
+    public static func keepJournal(_ journal: [JSONValue], reference: String, root: URL) async throws {
+        let url = try journalFile(reference, root: root)
+        do {
+            var held: [String: JSONValue] = ["journal_ref": .string(reference), "journal": .array(journal)]
+            held["seal"] = .string(try await seal(held, root: root))
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(try JSONValue.object(held).serializedData(pretty: false), to: url)
+        } catch let error as ToolFailureError { throw error }
+        catch { throw failure("journal_save_failed",
+            "Run journal save at \(url.path) failed: \(error.localizedDescription). Inspect the path to reconcile whether the write committed.", at: url,
+            effects: .unknown) }
+    }
+
+    /// Take a kept run journal once: its seal is verified and its file removed. A reference with no kept journal answers nil.
+    public static func takeJournal(_ reference: String, root: URL) async throws -> [JSONValue]? {
+        let url = try journalFile(reference, root: root)
+        guard try present(url) else { return nil }
+        let journal: [JSONValue]
+        do {
+            guard case .object(let held) = try JSONValue.parse(Data(contentsOf: url)), held["journal_ref"] == .string(reference),
+                  case .string(let kept)? = held["seal"], case .array(let entries)? = held["journal"] else {
+                throw failure("journal_invalid", "Run journal at \(url.path) has invalid identity or seal fields. Its bytes were preserved.", at: url)
+            }
+            let mac = try await seal(held, root: root)
+            guard kept.utf8.count == mac.utf8.count, zip(kept.utf8, mac.utf8).reduce(UInt8(0), { $0 | ($1.0 ^ $1.1) }) == 0 else {
+                throw failure("journal_seal_invalid", "Run journal seal at \(url.path) does not verify. Its bytes were preserved.", at: url)
+            }
+            journal = entries
+        } catch let error as ToolFailureError { throw error }
+        catch { throw failure("journal_read_failed", "Run journal at \(url.path) could not be read: \(error.localizedDescription).", at: url) }
+        do { try FileManager.default.removeItem(at: url) }
+        catch { throw failure("journal_cleanup_failed", "Could not remove the taken run journal at \(url.path): \(error.localizedDescription).", at: url) }
+        return journal
     }
 
     /// Bind HMAC to the run domain so manifest signatures cannot authenticate checkpoints or vice versa.

@@ -43,11 +43,14 @@ public struct Experience: Codable, Sendable, Equatable {
         /// The row every door draws it as (on a page, in a conversation, in an alert), and the part that speaks it.
         public var row: PartFace.Row?
         public var from: String?
-        public init(words: String, artifacts: [Ref], row: PartFace.Row? = nil, from: String? = nil) {
+        /// An alert's line between its title and body, as the call that told it gave it; the alert doors draw it, other doors do not.
+        public var subtitle: String?
+        public init(words: String, artifacts: [Ref], row: PartFace.Row? = nil, from: String? = nil, subtitle: String? = nil) {
             self.words = words
             self.artifacts = artifacts
             self.row = row
             self.from = from
+            self.subtitle = subtitle
         }
     }
 

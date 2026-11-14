@@ -122,7 +122,7 @@ Every non-Stop failure of the selected turn program or its helper invokes the on
 | **code** | The file body, outside the JSON comment; JavaScript or retained Markdown guidance. |
 | **reach** | `{capabilities: string[], readPaths: string[], hosts: string[], apps: string[]}`, all arrays default empty. Ordinary abilities consume `capabilities`, including `app_read:<id>`/`app_write:<id>` for app targets; with `computer_files`, `readPaths` bounds an ability's `host.files.query` and `host.files.mime` (a `*` is one path component; a directory covers what is beneath it); `hosts` and `apps` constrain senses only. Retained historical headers and sense reach load into this shape; ability saves take `reach`. Declarations do not grant authority. |
 | **wake** | String array, default `[]` (called only). [Wake signals](#wake-signals) defines names, payloads and delivery. |
-| **face** | `{page?: string, action?: string, projection?: bool}`, default `{}`. An authored tool's action lists on this door page, or diagnostics when absent; `action` claims an unclaimed door id, never beside `answers`. Unknown pages refuse at save. `projection:true` declares `face(input)`; its typed sections/rows are computed from frozen native sources outside view rendering and published through `LatestRead` (contract below). |
+| **face** | `{page?: string, action?: string, projection?: bool}`, default `{}`. An authored tool's action lists on this door page, or diagnostics when absent; `action` claims an unclaimed door id, never beside `answers`. Unknown pages refuse at save. `projection:true` declares `face(input)`; its typed sections/rows are computed from frozen native sources outside view rendering and published through `LatestRead` (contract below). A projection part that defines no `run(input)` is a page, never a call (below). |
 | **answers** | Door verbs the part answers, by action id: `{description, class, args, irreversible?, screen?, summary?}` each, absent when none. `class` is `read`, `write`, `send` or `destructive`; `args` is the verb's JSON Schema (no argument named `verb`). The door registers each verb on `face.page` with that contract and judges it by its class, its Mac integration switch taken from the part's `app_read:`/`app_write:` reach; a verb a native declaration still holds stays native, and a verb two active parts answer is the first by id. `run(input)` receives `{verb, ...args}`; the part's input schema is derived from the verbs and takes no `params`. A `read` verb runs read-confined: read-only app events, read actions and read primitives only. A class other than the four refuses at admission. A verb a shipped seed answers keeps that seed's class and irreversibility as its floor: a revision may raise them, never lower them; and every revision's keep passes the one keep gate (the person's card below Full Mac, the agent's own keep under Full Mac). |
 | **state** | Abilities use `host.state.get()` → saved JSON (initially `null`) and `host.state.set(value)` → `null`. One durable notebook owner, shared with senses' keyed `state.get/set`, stores it by ability id at `senses/<id>/state.json` under key `part`; it survives helper restarts and app relaunch, and `ability.drop` deletes it with the ability. Values are limited to 16 KiB and the notebook to 64 KiB. Validation and preview use a scratch notebook. Resume replays journaled state results without repeating their operations, then reads and writes durable state normally. State calls do not renew stalled execution. `abilities/state.json` remains lifecycle/run accounting only; there is no authored header `state` key. |
 | **learned** | Optional arbitrary JSON, preserved verbatim; a declared value teaches nothing, and a declared `trial` is refused at save. The stem projects `learned.use`, `learned.versions`, `learned.trial` and `learned.trials` (below). A part's prediction (`applies`, `after`, `record`) is the stem's, never declared: see [Expansion](#expansion-a-part-is-a-prediction). |
@@ -201,8 +201,15 @@ through nested calls without changing version pinning, typed answers or settleme
 Stop cancels work;
 child settlement, terminal accounting and broker release run through `settle`.
 
+The entry a part answers with is a fact of the part, read in one place (`AbilityStore.answersCalls`): it answers calls with
+`run(input)`, unless it declares `face:{projection:true}` and its code defines no `run`. Such a part is a page: its version's
+program entry is `face`, its registry row says `callable:false`, it is not published as an action (not `authored.<id>`, not in
+`find`, not in the hand), a call that reaches it anyway is refused as `page_not_call`, and its page route draws it as before. A
+bundled seed and an ability the agent saves are read alike.
+
 With `face:{projection:true}`, `function face(input)` (optionally async) returns a page:
-`{title?,line?,detail?:{of:<section id>},sections:[{id,title?,style?,footer?,folded?,rows?:[...],block?,more?,filter?,revision?}]}`.
+`{title?,line?,opened?:{link,title},detail?:{of:<section id>},sections:[{id,title?,style?,footer?,folded?,beside?,rows?:[...],block?,more?,filter?,revision?}]}`.
+`opened` says what the page has open now, exactly a `page:` link in the page-read form (`page:desk/<item>`) and a nonempty one-line title in the person's words: the ask bar leads a message with it and the agent's page read names it first; it is absent from the encoding when unset, so installed phones skip it.
 A section has rows or a block, never both in authored output.
 A document block is `{kind:"document",key,text?,format?:plain|markdown|code,language?,copy?}`.
 A form block is `{kind:"form",key,fields:[{id,label,kind,value?,placeholder?,required?,options?,min?,max?,step?}],
@@ -234,9 +241,14 @@ keeps the original operation identity and never resubmits it. A failed read keep
 that hold; successful owner evidence or approval execution/decline settles the
 same operation through the shared session. Consent alone proves no execution.
 Cancel awaits the owner's actual settlement.
-A native leaf is `{kind:"leaf",key,leaf,ref,alt}`: the owner resolves its resource;
+A native leaf is `{kind:"leaf",key,leaf,ref,alt,revision?}`: the owner resolves its resource;
 `alt` is its text representation. A missing grant or unsupported leaf shows its words,
 and never opens another resource. Graph is a leaf; its surrounding list and detail remain faces.
+A graphic on any page is one of three: a count is a row's `value`; progress is a row's `meter`; a chart or
+picture is a piece: make it (an SVG, or HTML and CSS with no script, since previews run no script; a picture
+file), `make.add` it, then lay it as `{kind:"leaf",key:"piece:<any id>",leaf:"web"|"image",ref:<make.add's ref>,
+revision:<make.add's version as a string>,alt:<what it shows, in words>}`. The Mac draws that version on a page's
+own face, Home's included; a page with a `detail` list and its items, the iPhone and the door show `alt`.
 Kind is an open string; `Style`, `Tone`, `Role` and `Status` keep their existing values.
 Inline text is at most 16 KiB. Without inline text, the document's key declares
 `read:{action,args?}`. The reader checks the current call and its read-only declaration,
@@ -254,8 +266,14 @@ and draw that row; current doors draw the block. Native value copies retain the 
 A section's `style` is
 `list`, `values`, `timeline`, `flow`, `note` or `waiting`; a `folded` section draws as one
 row, its title, that each reader opens to see its rows (open or closed is the view's own,
-never written to the face), and reads on the door as its title and footer, marked folded. A row is
-`{id,title,detail?,value?,at?,symbol?,tone?,open?,actions?,control?,rows?,expands?}`: `at` is ISO 8601,
+never written to the face), and reads on the door as its title and footer, marked folded, with its rows that carry a control or an action kept and the rest counted. Consecutive
+sections whose `beside` is the same nonempty string are drawn side by side as columns of equal width, as many
+to a line as stay readable, one under another where the width holds fewer than two; a list (the phone's
+page, a list mount) stacks them, and the door reads each as an ordinary section. `beside` is absent from the
+encoding when unset, so installed phones and every page without it decode and draw as before. A row is
+`{id,title,detail?,value?,at?,symbol?,tone?,open?,actions?,control?,rows?,inline?,expands?,meter?}`: `at` is ISO 8601,
+`meter` `{value,max,start?}` draws a bar of `value` out of `max` from `start` (max above 0, value and start from 0 to max;
+the amount's words stay in `value`, as "3 of 5"; a page read of a meter row with no `value` says "<value> of <max>"),
 `symbol` an SF Symbols name, `tone` one of `plain`, `quiet`, `attention`, `failed`, `done`,
 `live`; `open` leads to `chat:<session>`, `page:<page>[/<item>]`, `approval:<id>`,
 `card:<id>`, `dream:<date>` or `url:<http(s) url>`; `actions` are up to four
@@ -281,6 +299,14 @@ action; what it does comes from the key alone. A face that breaks this does not 
 page shows the stem's words for why.
 
 Inline children use `rows` and nest to depth four within the section's shared 256-row bound.
+An `inline:true` row holds its `rows` as a small group of named controls on its own line: the title leads, and each child's short word
+(its `title`, as "Read") then its control sit side by side at the trailing edge, in columns the section's inline rows share, so a row
+missing one child leaves that column empty. Each child stays an ordinary row with its own id, control, confirmation and call. The group
+sits beside the title when both fit the row, beneath it when they do not, and its children stack when they do not fit side by side; it
+is drawn so in every section style. A reader that does not know `inline` draws the children beneath. A group holds controls, not
+groups: a child of a group is always one of its controls (`inline` on it has no effect), and rows a child holds of its own lie beneath
+the parent's line. The agent's door reads such a row on one line, `- Mail · Read on (row …, set → …) · Write off (row …, set → …)`,
+every child's reference kept, with any rows its children hold listed beneath it.
 An `expands:true` row declares its key's `read`; the window holds that demand while expanded.
 Nested actions, controls and expanding reads bind to the same packet keys as top-level rows.
 The authored face never supplies a call, read or resource authority of its own.
@@ -343,13 +369,16 @@ decision of that exact call (`PersonAct`), admitted once per run; a row the agen
 of its own is the agent's call, so the tap only asks. A lever's verb (`owner: .person(why, asks:)`)
 is never the agent's at any posture: its call raises the person's card, or is refused where no
 card can carry it; a change that widens the agent's own reach is a lever the same way, and
-lowering it stays the agent's. An owner of the stem's that needs the person's yes for an exact
+lowering it stays the agent's. A lever can name the arguments under which its call only lowers
+(`freely:`): with exactly those arguments the call is the agent's own, and with any other, or with
+them missing, it stays the person's. `sense.switch` is the first: `value: false` turns a sense off
+as the agent's own act; turning one on is the person's consent. An owner of the stem's that needs the person's yes for an exact
 call replies `needs_person`, and the gate puts that call on the person's card; Approve replays it
 as the person's act.
 
 Approval answers (`inbox.approve`, `inbox.deny`, and declining a pending approval
 when putting it away) also accept one exact card on the person's own authenticated
-message, through the shared [decision authority](TOOL_LOADING.md#authority-and-receipts).
+message, through the shared [decision authority](ONE_DOOR.md#authority-and-receipts).
 They are not tap-only levers. The decision names that message and door; helpers,
 wakes and peer-steered turns remain refused. If a message joins the running turn,
 its exact authorization cannot be attributed and message decisions refuse;
@@ -701,7 +730,8 @@ writes outside the call ledger. Missing evidence never proves a no-op; failures,
 unknown effects, actual calls and changed notebooks retain their accounting.
 Run accounting retains the terminal refusal's `reason`, `reasons`, `gate_reason`,
 `detail`, `message`, `checker` and `remedy` in `lastRun`, beside status, effects,
-version, calls and terminal error/stop evidence. `at` is the start of that run or
+version, calls (metadata only, under the [receipts law](ONE_DOOR.md#authority-and-receipts); a run
+accounted before it is reduced when read) and terminal error/stop evidence. `at` is the start of that run or
 refused attempt, not its accounting-write time; an older settlement cannot replace
 a newer `lastRun`. A successful explicit no-op leaves the retained run untouched.
 A failed notebook operation makes `notebook_changed` null even if its code
@@ -869,6 +899,11 @@ An ability save whose normalized authored source, declarations, fixtures and pro
 `status:ok, effects:none`. It stages, signs and publishes nothing, leaves any open trial and kept baseline intact, and does not enable a draft or
 disabled part. Use the lifecycle action to keep or restore that existing version.
 
+An ordinary create or revision accepts `why` within its declared text bounds without opening a trial. Its receipt carries `why_note`, also
+appended to `detail`, explaining that the reason was not kept because only trials and setting a trial aside have a saved reason record.
+This includes an unchanged save (`effects:none`); the reason creates no stored field or version. Trial and setting-aside reasons stay with
+the trial accounting owner described above.
+
 `ability.save` discovery and argument refusals expose `Parts.saveArgumentsSchema`,
 owned beside the save validators. Only `id` is unconditionally required; new
 abilities also need description and code, and revisions inherit omitted fields.
@@ -891,12 +926,15 @@ call returns: fulfillment supplies the result, rejection is the thrown error.
 A Promise still pending after that drain fails with “Its Promise never settled:
 only app and host calls, which answer at once, can be awaited here.”
 `app` is a frozen callable door with its existing properties:
-use `app.<page>.<action>(args)` or `app({action:"page.action",args})`; declared
+use `app.<page>.<action>(args)` or `app({action:"page.action",args})`. Each action id binds by
+its full segments, bare and deeper ids included (`app.undo()`, `app.studio.intake.read(args)`);
+a namespace that is itself an action is that action's function, holding its members. Declared
 indirect actions use `host.call(actionID,args)` or `app.call(actionID,args)`. Literal bracket members
 (`app["page.action"](args)`, `app["page"]["action"](args)`) have the same direct
 dependency derivation as dotted app members. Literal actions in callable requests
-derive dependencies the same way. `app({actions:[{action,args},…]})` runs in order
-and returns an array of answers, stopping at the first throw. `app({find:"words"})`
+derive dependencies the same way. `app({actions:[…]})` runs in order and returns an
+array of answers, stopping at the first throw; each entry is read as a lone request is
+(an action, `{page, item}` or `{find}`), and action entries keep the batch's options. `app({find:"words"})`
 is `app.find("words")`; `app({action:"find",args:{what:"words"}})` (or `query`)
 reaches that same discovery reader as a registered read action. Item/page
 requests go through `app.read(page,item)`.
@@ -973,7 +1011,7 @@ words end at whitespace, commas, colons or parentheses. The word `optional`
 anywhere also marks an optional input, including an untyped string description.
 A description without a leading type names a string parameter. Plain types pass
 through this same reader; object declarations keep their explicit type. The
-[parameter contract](TOOL_LOADING.md#one-tool-every-action) gives examples.
+[parameter contract](ONE_DOOR.md#one-door-every-action) gives examples.
 Param names match `^[A-Za-z_][A-Za-z0-9_]{0,63}$`;
 each declaration takes `type`, an optional nonempty text `description`, and
 parameter schema constraints such as `items` or `enum`. Those constraints survive
@@ -1234,13 +1272,26 @@ version-swap action and repairs go forward. Prior host effects remain real.
 
 Legacy numeric versions must be positive integers before migration prepares
 any slot; invalid versions preserve the old layout and report the cause.
-Launch admits current bundled seeds. Only an untouched seed follows a changed
-bundle: the seed owner compares its complete authored/sealed identity (body,
-header version, reach/wake/face/residency, manifest and dependency contracts),
-excluding installation timestamps, admission and status bookkeeping. A changed
-seed retains the displaced version as previous and preserves its installed off
-switch, including who switched it off and why. An authored version is left
-alone; first installation skips an id occupied in another retained slot.
+Launch admits current bundled seeds. A part follows the shipped one while it
+is that part: a seed, or a version they keeps that is the shipped part as launch
+installs it (`OwnedProgramStore.samePart`: the same code, entry,
+actions, reach, residency and header; input schema, name, description, origin, prior
+selection, fixtures, dependency shapes and the stem's trial record inside `learned` are how it was kept, not
+the part). Keeping such a version seals it as a seed (`Parts.admit`), and
+launch replaces a kept current that is the shipped part in place with the
+admitted seed. A followed part follows a changed bundle: the seed owner compares
+its complete authored/sealed identity (body, header version,
+reach/wake/face/residency, manifest and dependency contracts), excluding
+installation timestamps, admission and status bookkeeping. A different part
+retains the displaced version as previous; the same part with changed
+bookkeeping is replaced in place, so previous stays the last different version.
+Either way the installed off switch stays, including who switched it off and
+why. When a followed part changes they are told once per shipped version: a
+`body` happening (`shipped:<id>:<version>`) naming the part and its versions
+from and to. A version they edited is never replaced: launch leaves it and tells
+their once per shipped version, under that same key, that the shipped part is at
+a version theirs does not have, to merge from or leave. First installation skips
+an id occupied in another retained slot.
 The unsigned candidate uses that same identity comparison before admission:
 an already-current seed is left alone without signing or proof work. Body,
 header and live dependency-contract changes still require admission. For an

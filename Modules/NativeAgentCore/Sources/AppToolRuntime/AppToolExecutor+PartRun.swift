@@ -17,7 +17,7 @@ import ToolRegistry
 import TrustCenter
 import Transcripts
 import TurnTrace
-// Blueprint: | `AppToolExecutor+PartRun.swift` | Part admission, previews, stopped-run checkpoints, Desk reservations and result settlement |
+// Blueprint: | `AppToolExecutor+PartRun.swift` | Part admission, previews, stopped-run checkpoints from the private journal, Desk reservations and settlement |
 
 /// Part calls retain turn gates. Previews preview every write; strict hand-backs retain resumable runs and surface owed upgrades.
 extension AppToolExecutor {
@@ -71,7 +71,8 @@ extension AppToolExecutor {
             var out = Self.partFields(try await Parts(root: root).run(id: action.tool, input: .object(args),
                 requiredFingerprint: execution.valueCall.flatMap { $0.id == action.tool ? $0.version : nil }, preview: true,
                 invocation: execution.partInvocation(turn: turn, surface: surface, preview: true)))
-            out.removeValue(forKey: "journal")
+            // A previewed run is never resumed: its private journal is let go.
+            _ = OwnedProgramRunner.journal(out.removeValue(forKey: "journal_ref"))
             if case .array(let calls)? = out["calls"] {
                 out["would"] = .array(calls.compactMap { row -> JSONValue? in
                     guard case .object(let fields) = row, fields["would_card"] == .bool(true) else { return nil }
@@ -99,13 +100,23 @@ extension AppToolExecutor {
         out["id"] = .string(id)
         // A self-carried run must report the actual input of its last execution.
         let input = if case .object(let last)? = out["ran_on"] { last } else { given }
-        let calls: [JSONValue]? = if case .array(let calls)? = out.removeValue(forKey: "journal") { calls } else { nil }
+        // A stopped strict run's replay journal is private: the receipt names it, and only this settlement takes it.
+        let reference = out.removeValue(forKey: "journal_ref")
         let row: [String: JSONValue]?
         do { row = try Parts(root: root).row(id) }
         catch {
-            if let calls { out["unsettled_journal"] = .array(calls) }
+            // Unsettled, the journal moves to the private run store on disk under the same reference; the result names it, never its raw answers.
+            if let named = reference?.stringValue, let journal = OwnedProgramRunner.journal(reference) {
+                do {
+                    try await PartRunStore.keepJournal(journal, reference: named, root: root)
+                    out["unsettled_journal"] = .string(named)
+                } catch let kept {
+                    out = partSettlementFailure(out, error: kept, operation: "ability.unsettled_journal", id: named, root: root)
+                }
+            }
             return .object(partSettlementFailure(out, error: error, operation: "ability.metadata", id: id, root: root))
         }
+        let calls = OwnedProgramRunner.journal(reference)
         let name = row.flatMap { Parts.fields(.object($0))["name"] }?.scalarText ?? id
         let voices = row.map(Parts.voices) ?? []
         out["name"] = .string(name)

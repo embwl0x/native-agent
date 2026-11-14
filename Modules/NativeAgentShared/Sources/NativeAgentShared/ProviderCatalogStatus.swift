@@ -63,6 +63,9 @@ public struct NAProviderCatalogModel: Codable, Equatable, Sendable {
     public var supportedReasoningEfforts: [String]?
     public var supportsFast: Bool?
     public var controlsNote: String?
+    /// False for a row the provider has not listed; absent is offered.
+    public var offered: Bool?
+    public var offerNote: String?
 
     public init(
         id: String,
@@ -75,7 +78,9 @@ public struct NAProviderCatalogModel: Codable, Equatable, Sendable {
         defaultReasoningEffort: String?,
         supportedReasoningEfforts: [String]?,
         supportsFast: Bool?,
-        controlsNote: String? = nil
+        controlsNote: String? = nil,
+        offered: Bool? = nil,
+        offerNote: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -88,6 +93,8 @@ public struct NAProviderCatalogModel: Codable, Equatable, Sendable {
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.supportsFast = supportsFast
         self.controlsNote = controlsNote
+        self.offered = offered
+        self.offerNote = offerNote
     }
 }
 

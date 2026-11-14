@@ -433,6 +433,7 @@ enum NativeAgentBridgeNotificationScheduler {
 
         let content = UNMutableNotificationContent()
         content.title = title
+        if let subtitle = nonEmpty(metadata["subtitle"]) { content.subtitle = subtitle }
         content.body = body
         content.sound = .default
         content.userInfo = userInfo

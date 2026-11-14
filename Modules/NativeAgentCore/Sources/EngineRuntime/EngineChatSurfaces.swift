@@ -29,7 +29,7 @@ extension NativeAgentEngine {
         guard let face = snapshot?.drawnFace else {
             throw snapshot?.error ?? PartCallError(code: "inbox_unread", message: "The Inbox has not been read yet.")
         }
-        return face.sections.flatMap(\.rows).first { $0.id == matter }
+        return face.sections.flatMap(\.allRows).first { $0.id == matter }
     }
 
     public static let telegramUnconfiguredReason =

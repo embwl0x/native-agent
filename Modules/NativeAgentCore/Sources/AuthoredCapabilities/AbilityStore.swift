@@ -169,17 +169,20 @@ public struct AbilityStore: Sendable {
         }
     }
 
-    package func installSeed(_ file: File, turn: Turn?, checkingSeed: (File) throws -> Void) throws {
-        try Self.withLock {
+    /// A current version follows the shipped part while it is a seed or is that same part (`samePart`, read by the executable owner under this
+    /// selection lock); any other is the agent's own and stays. A different part is retained as previous and returned; the same part is replaced
+    /// in place, so its previous version stays the way back.
+    @discardableResult
+    package func installSeed(_ file: File, turn: Turn?, samePart: (File) throws -> Bool) throws -> File? {
+        try Self.withLock { () throws -> File? in
             guard let current = try readFile(id: file.id, slot: .current) else {
-                guard try !contains(id: file.id) else { return }
+                guard try !contains(id: file.id) else { return nil }
                 try write(file, turn: turn)
-                return
+                return nil
             }
-            guard Self.isSeed(current) else { return }
-            // The executable owner checks its candidate and seal under this same selection lock: changed authored bytes never become replaceable seeds.
-            try checkingSeed(current)
-            guard Self.seedIdentity(current) != Self.seedIdentity(file) else { return }
+            // The owner also checks a seed's candidate and seal here: changed authored bytes never become replaceable seeds.
+            let same = try samePart(current)
+            guard Self.isSeed(current) || same, Self.seedIdentity(current) != Self.seedIdentity(file) else { return nil }
             try CapabilityLifecycle.requireWrite(turn: turn)
             // Off is the ability's, not the bundle version's: it stays off, by whoever switched it.
             var file = file
@@ -188,8 +191,9 @@ public struct AbilityStore: Sendable {
                 for key in ["status", "disabledBy", "disabledReason"] { record[key] = before[key] }
                 file.metadata["record"] = .object(record)
             }
-            try writeFile(current, slot: .previous)
+            if !same { try writeFile(current, slot: .previous) }
             try write(file, turn: turn)
+            return same ? nil : current
         }
     }
     /// Exclude admission and installation bookkeeping from authored identity; manifests, programs and dependencies remain sealed inputs.
@@ -202,7 +206,7 @@ public struct AbilityStore: Sendable {
             "record": .object(Self.storedRecord(file.record, kind: file.kind).filter { !installed.contains($0.key) })
         ])
     }
-    /// Only sealed bundle-owned proofs identify replaceable seeds; authored edits must survive installation.
+    /// Only seed seals identify replaceable seeds: the bundle's, or a kept version that is the shipped part. Authored edits survive installation.
     public static func isSeed(_ file: File) -> Bool {
         file.metadata["proof"]?.objectValue?["domain"] == .string("owned-program-seed")
     }

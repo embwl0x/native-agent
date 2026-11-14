@@ -148,7 +148,8 @@ package enum AgentWorkspace {
             if AgentScreen.families.contains(where: { $0.tools.contains { $0 == call || (($0.hasSuffix("_") || $0.hasSuffix(".")) && call.hasPrefix($0)) } }),
                let schema = try await AgentWorkspaceEnvironment.optionalSchema(call, catalog: catalog) {
                 guard AgentWorkspaceEnvironment.readTools.contains(call), try ToolSignature.argumentNames(schema.parametersJSON).required.isEmpty else {
-                    throw AgentWorkspaceFailure(message: "\(call) is a tool, not a workspace name: call \(call) directly with its arguments. Nothing was run.")
+                    throw AgentWorkspaceFailure(message: "\(call) is an action, not a workspace name: call \(call) directly with its arguments. "
+                        + "Nothing was run.")
                 }
                 return .action(.open(.record(tool: call, input: [:], title: call)))
             }

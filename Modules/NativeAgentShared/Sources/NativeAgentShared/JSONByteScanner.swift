@@ -81,6 +81,32 @@ public enum JSONByteScanner {
         return found
     }
 
+    /// Text that opens with one JSON object, read lexically: strings and their escapes are content, never structure. Offsets are UTF-16, as
+    /// marker text is measured.
+    public enum ObjectRead: Equatable {
+        /// Still being written: nothing but whitespace yet, or a string or container left open where the text ends.
+        case open
+        /// The object ends at `objectEnd`; `closer` is the first of the given closers written right after it, past whitespace, if one is.
+        case closed(objectEnd: Int, closer: Range<Int>?)
+    }
+
+    /// How `text` reads as one JSON object followed by one of `closers`; nil when no object opens it. Callers own validation.
+    public static func objectRead(_ text: some StringProtocol, closers: [String]) -> ObjectRead? {
+        let bytes = Array(text.utf8)
+        var index = 0
+        skipWhitespace(bytes, &index)
+        guard index < bytes.count else { return .open }
+        guard bytes[index] == UInt8(ascii: "{") else { return nil }
+        guard (try? skipValue(bytes, &index)) != nil else { return .open }
+        let objectEnd = index
+        skipWhitespace(bytes, &index)
+        let rest = bytes[index...]
+        // Structure is ASCII, so every offset here falls between whole characters.
+        func units(_ offset: Int) -> Int { String(decoding: bytes[..<offset], as: UTF8.self).utf16.count }
+        let closer = closers.first { rest.starts(with: $0.utf8) }.map { units(index)..<units(index + $0.utf8.count) }
+        return .closed(objectEnd: units(objectEnd), closer: closer)
+    }
+
     public static func skipWhitespace(_ bytes: [UInt8], _ index: inout Int) {
         while index < bytes.count, bytes[index] == 0x20 || bytes[index] == 0x09
             || bytes[index] == 0x0a || bytes[index] == 0x0d { index += 1 }

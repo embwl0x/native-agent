@@ -198,6 +198,8 @@ public struct QuietComposerOutcome: Sendable {
     public var status: String
     public var refusal: (reason: String, detail: String, effects: ToolFailureError.Effects)?
     public var remedy: JSONValue? = nil
+    /// The page id the window resolved and now shows, from its own navigation receipt; nil for anything that is not a page show.
+    public var shownPage: String? = nil
     public init(changed: Bool, element: String, detail: String, refusal: (reason: String, detail: String, effects: ToolFailureError.Effects)?,
         status: String = "ok") {
         self.changed = changed; self.element = element; self.detail = detail; self.refusal = refusal; self.status = status

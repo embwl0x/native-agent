@@ -173,7 +173,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
 
     public func listAvailableToolSchemas(named names: Set<String>, turn: Turn?, surface: String) async throws -> [LLMToolSchema] {
         if names == ["app"] {
-            return appTools == nil ? [] : executorDescriptors.values.filter { names.contains($0.name) }.map(\.schema)
+            return appTools?.modelSchemas.filter { names.contains($0.name) } ?? []
         }
         return try await catalogSnapshot(turn: turn, includeSchemas: true, schemaNames: names, surface: surface).schemas
     }
@@ -213,12 +213,12 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         return (names, schemas, access)
     }
 
-    /// Assembly and authored admission reserve every executor-owned name.
+    /// Assembly and authored admission reserve every executor-owned name. The schemas offered are the executor's as the model reads them now.
     private func withContributedSchemas(_ native: [LLMToolSchema], named names: Set<String>?) -> [LLMToolSchema] {
-        guard appTools != nil else { return native }
+        guard let appTools else { return native }
         precondition(Set(native.map(\.name)).isDisjoint(with: contributedToolNames), "Tool ownership collision in catalog.")
-        return native + executorDescriptors.values.filter { contributedToolNames.contains($0.name) && names?.contains($0.name) != false }
-            .sorted { $0.name < $1.name }.map(\.schema)
+        return native + appTools.modelSchemas.filter { contributedToolNames.contains($0.name) && names?.contains($0.name) != false }
+            .sorted { $0.name < $1.name }
     }
 
     var contributedToolNames: Set<String> {
@@ -239,7 +239,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         switch Self.authoredRegistry(dataRoot: dataRoot) {
         case .success(let read): rows = read
         case .failure(let error):
-            throw ToolFailureError("The agent's tool registry did not read (\(error.localizedDescription)), so '\(tool)' could not be looked up. Nothing ran.",
+            throw ToolFailureError("The agent's ability registry did not read (\(error.localizedDescription)), so '\(tool)' could not be looked up. "
+                                   + "Nothing ran.",
                                    effects: .none, owner: "abilities")
         }
         for row in rows where row.id == tool { return row.fields }
@@ -345,11 +346,13 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             let id = row.id
             guard names?.contains(id) != false, isAuthorableToolName(id) else { continue }
             guard row.fields["language"] == .string("javascript") else { continue }
+            // A page (face only, no run) is drawn by its page route and is never offered as a call (`AbilityStore.answersCalls`).
+            guard row.fields["callable"] == .bool(true) else { continue }
             guard let digest = row.codeFingerprint, !digest.isEmpty,
                   case .object(let admission)? = row.fields["admission"], admission["candidate"] == .string(digest) else { continue }
             guard case .object(let schemaObject)? = row.fields["inputSchema"], schemaObject["type"] == .string("object") else {
                 throw ToolFailureError("The admitted ability \(id) has no valid object inputSchema.", effects: .none,
-                    owner: "abilities/\(id).js", instruction: "Repair and validate this ability's parameter declaration before offering it as a tool.")
+                    owner: "abilities/\(id).js", instruction: "Repair and validate this ability's parameter declaration before offering it as an action.")
             }
             let schemaData = try JSONValue.object(schemaObject).serializedData(pretty: false)
             let page: String? = if case .object(let face)? = row.fields["face"], case .string(let page)? = face["page"] { page } else { nil }

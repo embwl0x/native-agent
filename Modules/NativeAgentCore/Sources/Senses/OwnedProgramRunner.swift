@@ -763,9 +763,10 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
     public static func versionScope(_ version: String) -> String {
         version.split(separator: "@", maxSplits: 1).first.map(String.init) ?? version
     }
+    /// A changed read is named by its version, else by its value's measured identity (size and digest), never by its text.
     static func brief(_ out: String) -> JSONValue {
         let value = readValue(out)
         if case .object(let fields) = value, let version = fields["version"] { return version }
-        return .string(String(((try? value.serialize(pretty: false)) ?? out).prefix(300)))
+        return (try? CallLedger.measured(value)).map(JSONValue.object) ?? .object(["result_bytes": .null])
     }
 }

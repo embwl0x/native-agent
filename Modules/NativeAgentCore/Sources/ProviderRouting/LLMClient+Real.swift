@@ -125,7 +125,8 @@ public protocol LLMTransport: Sendable {
     static var toolWire: ProviderToolWire { get }
     static var carriesImages: Bool { get }
     var providerId: String { get }
-    /// Exact wire output cap; zero explicitly declares no output-cap field.
+    /// Exact wire output cap; zero explicitly declares no output-cap field. A transport that writes a cap takes it, while a run's budget is bound,
+    /// from `FirstPartyExecutionControls.budgetedOutputTokens`: min(remaining budget, effective ceiling).
     func requestOutputTokens(model: String, call: LLMCall) throws -> Int
     /// Adapters declare whether native schemas or the text tool protocol can reach the provider; Codex CLI does not carry NativeAgent tools.
     func complete(
@@ -336,6 +337,22 @@ public final class SwiftNativeLLMClient: LLMClient {
         }
     }
 
+    /// The provider's answer checks the credential this call sent. Its proof, or a rejection the call path classified, lands on the account as a
+    /// connection check's would, off the turn's path: the turn neither waits for that write nor fails with it.
+    private func recordAnswer(_ sent: SentCredential?, of started: LLMCallLifecycleEvent, failure: Error?, call: LLMCall) {
+        guard !call.preview, let credential = sent?.fingerprint else { return }
+        let answer: LLMProviderStatusFeed.Answer
+        if let failure {
+            guard ProviderFailure.classify(failure) == .authExpired else { return }
+            answer = .rejected(ProviderFailure.diagnosticDescription(failure))
+        } else { answer = .answered }
+        let dataRoot = router.dataRoot
+        Task.detached(priority: .utility) {
+            await LLMProviderStatusFeed.recordAnswer(answer, providerID: started.providerId, model: started.model,
+                                                    credential: credential, dataRoot: dataRoot)
+        }
+    }
+
     /// Written under the request's identity: no row when the adapter's came first.
     private func recordFailedCall(_ started: LLMCallLifecycleEvent, error: Error,
                                   startedAt: TimeInterval, recorded: OSAllocatedUnfairLock<LLMCallTraceRecorder.Receipt>, call: LLMCall) async -> Error {
@@ -374,12 +391,14 @@ public final class SwiftNativeLLMClient: LLMClient {
 
     /// Only the explicit provider pick chooses routing; model spelling validates compatibility.
     private func resolveAdapter(_ admission: TurnRouteAdmission, call: LLMCall) throws -> AdapterResolution {
-        let model = admission.modelId
         let requestedProvider = admission.providerId
         guard let activeProvider = requestedProvider?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               ProviderToolCapability.transport(providerID: activeProvider) != nil else {
             throw LLMError.notConfigured(provider: requestedProvider.flatMap { $0.isEmpty ? nil : $0 } ?? "router")
         }
+        // What the person chose is what is sent: the pick itself when the provider listed that spelling, else its listed spelling of the same model.
+        let model = FirstPartyModelCatalog.listedSpelling(admission.modelId, providerID: activeProvider, dataRoot: moonshotCatalogDataRoot)
+            ?? admission.modelId
         let catalog = SwiftNativeProviderRouting(dataRoot: moonshotCatalogDataRoot).catalogRows(activeProvider, preview: call.preview)
         let listsModel = catalog.fault == nil && catalog.rows.contains {
             $0["id"]?.stringValue?.caseInsensitiveCompare(model) == .orderedSame
@@ -501,6 +520,8 @@ public final class SwiftNativeLLMClient: LLMClient {
             let task = Task {
                 var lifecycle: LLMCallLifecycleEvent?
                 var streamKind: LLMMessagesStreamKind?
+                // A caller that brings its own sent-credential evidence (the connection check) records that verdict itself.
+                let sent = call.sentCredential == nil ? SentCredential() : nil
                 let attemptStartedAt = ProcessInfo.processInfo.systemUptime
                 let requestBytes = LLMMessage.inputBytes(messages, system: system, tools: tools ?? [])
                 let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
@@ -526,6 +547,7 @@ public final class SwiftNativeLLMClient: LLMClient {
                     var routedCall = call
                     routedCall.admission = try admission.modelAdmission
                     if routedCall.traceDataRoot == nil { routedCall.traceDataRoot = self.diagnosticDataRoot }
+                    if let sent { routedCall.sentCredential = sent }
                     let held = routedCall
                     if let budget = held.turn?.tokenBudget, !budget.beginRequest() {
                         throw LLMError.outputLengthLimit(partial: budget.partialReply)
@@ -567,6 +589,7 @@ public final class SwiftNativeLLMClient: LLMClient {
                     if held.replyWork?.isStopped == true { throw CancellationError() }
                     await self.providerLifecycleFinish(started, phase: .succeeded, receipt: recorded,
                         streamKind: streamKind, call: held)
+                    self.recordAnswer(sent, of: started, failure: nil, call: held)
                     continuation.finish()
                 } catch is CancellationError {
                     if let lifecycle { await self.providerLifecycleFinish(lifecycle, phase: .cancelled, call: call) }
@@ -575,6 +598,7 @@ public final class SwiftNativeLLMClient: LLMClient {
                     if let lifecycle {
                         await self.providerLifecycleFinish(lifecycle, phase: .failed, receipt: recorded,
                             streamKind: streamKind, error: error, call: call)
+                        self.recordAnswer(sent, of: lifecycle, failure: error, call: call)
                         let owned = await self.recordFailedCall(lifecycle, error: error,
                             startedAt: attemptStartedAt, recorded: recorded, call: call)
                         continuation.finish(throwing: owned)

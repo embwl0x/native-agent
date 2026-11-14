@@ -173,7 +173,7 @@ extension TelegramPollLoop {
         var saved: TelegramAssistantDeliveryState?
         if let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: sessionId, runId: runId) {
             saved = TelegramAssistantDeliveryState(reply: TelegramRichMessageRenderer.sanitize(
-                TelegramRichMessageRenderer.stripBoldMarkers(response.output)), imagePaths: Self.replyImagePaths(response))
+                TelegramRichMessageRenderer.stripBoldMarkers(Self.replyText(response))), imagePaths: Self.replyImagePaths(response))
         }
         var delivery = claim.assistantDelivery ?? saved
         if delivery?.previewPending == true, let saved {

@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import Observation
 import SwiftUI
-// Blueprint: | `AppModel.swift` | Renderer selections, shared edit drafts and the pipe client's finished face values |
+// Blueprint: | `AppModel.swift` | Renderer selections, shared edit drafts, each page's ask bar record and the pipe client's finished face values |
 
 @MainActor @Observable
 final class AppModel {
@@ -31,6 +31,8 @@ final class AppModel {
     var dreamError: String?
     var chatRestoreIssue: String?
     private let editDrafts = FaceEditDrafts()
+    /// Each page's ask bar, beside its draft: the words in flight, the last accepted send, or why the last one was refused.
+    var askBar: [String: AskBarRecord] = [:]
     let pageSessions = FacePageSessions()
     typealias PanelRefreshStatus = NativeAgentShared.PanelRefreshStatus
 

@@ -24,8 +24,9 @@ extension BuiltInToolSchemaFactory {
             requestedSchema(name: "tool_result_page", toolClass: .read, capabilities: ["catalog_read", "tool_call"],
                 description: """
                     Read a result retained this turn without repeating its action. Only full_result_retained:true results are eligible. Follow \
-                    next_call; continue:true alone selects the sole retained result. Exact result_handle/page also works. Query selects only \
-                    matching records in source order, with positions and retained-response coverage; it cannot search unread source content. \
+                    next_call; continue:true alone selects the sole retained result. Exact result_handle/page also works. Query returns the \
+                    lines that match in source order, each with its path, line or offset, the adjacent lines and section_page, the page a \
+                    read without query shows its whole section on; it cannot search unread source content. \
                     source_continues means the answer held only part of its source: its next_call reads on, pages never do. Read-only, redacted; \
                     expires at turn end.
                     """,
@@ -41,18 +42,19 @@ extension BuiltInToolSchemaFactory {
                             raw unchanged while paging.
                             """))),
                         ("pages", ToolSchema.nullable(ToolSchema.intSchema("""
-                            How many pages to read in this one answer, from page onward; omit for the usual read (two section pages, or one raw page). The answer says pages_read and where to go \
-                            on; one answer holds only so many, so follow next_call for the rest.
+                            How many pages to read in this one answer, from page onward; omit to read as many as one answer holds (an explicit \
+                            raw read takes one). The answer says pages_read and where to go on; follow next_call for the rest.
                             """))),
                         ("query", ToolSchema.nullable(ToolSchema.strSchema("""
-                            Select records containing every whitespace-separated term, case-insensitively. Keep query while paging; start at page 0 \
-                            when changing it. Empty reads all records.
+                            Return the lines holding a term, from sections containing every whitespace-separated term, case-insensitively; a \
+                            long line gives a window around the match. Keep query while paging; start at page 0 when changing it. Empty reads \
+                            all sections whole.
                             """))),
                         ("raw", ToolSchema.nullable(ToolSchema.boolSchema("""
                             Exact original bytes instead of sections, only for reconstruction or oversized values. Separate 8000-byte pages may \
                             split sentences/JSON; concatenate from page 0 through raw_page_count pages.
                             """))),
-                        ("session_id", ToolSchema.nullable(ToolSchema.strSchema("Current conversation id; the tool loop auto-fills this."))),
+                        ("session_id", ToolSchema.nullable(ToolSchema.strSchema("Current conversation id; the app fills this in."))),
                     ],
                     required: []
                 )
@@ -172,7 +174,7 @@ extension BuiltInToolSchemaFactory {
                 description: """
                     Generate raster images with the Work account when it can draw, else your ChatGPT sign-in: Codex uses \
                     image_gen.imagegen; OpenAI uses its separately billed image API. Only Codex supports edits/local references here. Provider \
-                    and image model are route-owned, never selected by tool input; with neither able to draw, it asks for a Work choice that can. \
+                    and image model are route-owned, never selected by the call's arguments; with neither able to draw, it asks for a Work choice that can. \
                     Requires admitted Full Mac or Trust’s image-generation permission. Saves under data/generated_images/; returns paths, \
                     thumbnails and a receipt.\u{20}
                     """ + CodexImageGenerationHelp.usage,
@@ -222,13 +224,13 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(name: "scratchpad_read", toolClass: .read,
                 description: """
-                    Read the current conversation scratchpad written by /scratch controls or app action chat.scratch. The chat tool loop injects \
+                    Read the current conversation scratchpad written by /scratch controls or app action chat.scratch. The app fills in \
                     session_id when available.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("key", ToolSchema.strSchema("Optional scratch key. If omitted, returns bounded scratch keys and values.")),
-                        ("session_id", ToolSchema.strSchema("Optional conversation id; injected by the Swift tool loop for normal chat/Telegram turns.")),
+                        ("session_id", ToolSchema.strSchema("Optional conversation id; injected by the app for normal chat/Telegram turns.")),
                     ],
                     required: []
                 )
@@ -271,9 +273,9 @@ extension BuiltInToolSchemaFactory {
                             Last N finished turns, capped at 50; limit and the total response budget still apply. Includes completed, failed and \
                             cancelled turns.
                             """)),
-                        ("kind", ToolSchema.strSchema("Optional event kind substring, e.g. tool.dispatch or turn.terminal; tool/action names belong in name.")),
+                        ("kind", ToolSchema.strSchema("Optional event kind substring, e.g. tool.dispatch or turn.terminal; action names belong in name.")),
                         ("name", ToolSchema.strSchema("""
-                            Optional exact tool or app action filter, e.g. mac.clipboard_read or mac.clipboard_read. For returned values use \
+                            Optional exact action filter, e.g. mac.clipboard_read. For returned values use \
                             turn_id or completed_turns with fields:[name,args,result,receipt].
                             """)),
                         ("status", ToolSchema.strSchema("Optional exact status filter.")),

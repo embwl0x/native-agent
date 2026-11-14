@@ -24,10 +24,11 @@ import TrustCenter
 
 /// Browser acts reread the same tab and clear the same Trust gate as direct calls.
 extension AppToolExecutor {
+    /// Verbs that change or wait on a page: each answers with the tab's fresh page, so the agent never spends a round only to look.
     private static let chromePageActions: Set<String> = [
         "browser.chrome_navigate", "browser.chrome_click", "browser.chrome_fill", "browser.chrome_type",
         "browser.chrome_select", "browser.chrome_keypress", "browser.chrome_set_checked",
-        "browser.chrome_double_click", "browser.chrome_drag", "browser.chrome_scroll",
+        "browser.chrome_double_click", "browser.chrome_drag", "browser.chrome_scroll", "browser.chrome_wait",
     ]
 
     public func runBrowserTool(actionId: String, input: [String: JSONValue], surface: String, turn: Turn,
@@ -36,8 +37,7 @@ extension AppToolExecutor {
         // Inventory, setup, history and dry runs do not publish. Close publishes its receipt, without capture.
         let previews = turn.screenPreview != nil && !Self.inputBool(input["dry_run"], default: false)
             && (Self.chromePageActions.contains(actionId)
-                || ["browser.chrome_snapshot", "browser.chrome_look", "browser.chrome_wait", "browser.chrome_media",
-                    "browser.chrome_close_tab"].contains(actionId))
+                || ["browser.chrome_snapshot", "browser.chrome_look", "browser.chrome_media", "browser.chrome_close_tab"].contains(actionId))
         let preview = previews ? ChromeScreenPreviewCall() : nil
         do {
             let result = try await runBrowserToolCall(actionId: actionId, input: input, surface: surface, turn: turn,
@@ -121,8 +121,10 @@ extension AppToolExecutor {
         if direct, actionId == "browser.chrome_snapshot", let page = projection.text {
             return try await browserSenseRead(snapshot: result, raw: .string(page), input: input, projection: projection, turn: turn, execution: execution)
         }
-        if direct, Self.chromePageActions.contains(actionId), case .object(let receipt)? = obj["receipt"],
-           case .int(let tab)? = receipt["tabId"] {
+        // A refused wait watched nothing, so it answers as it was refused.
+        if direct, Self.chromePageActions.contains(actionId),
+           actionId != "browser.chrome_wait" || obj["outcome"] != .string("refused"),
+           case .object(let receipt)? = obj["receipt"], case .int(let tab)? = receipt["tabId"] {
             let fresh = await freshChromePage(after: actionId, tab: tab,
                 sequence: receipt["userSequence"], input: input, surface: surface,
                 navigationDocument: actionId == "browser.chrome_navigate" ? obj["documentId"] : nil,
@@ -609,7 +611,7 @@ extension AppToolExecutor {
         }
         if fields["status"] == .string("ok"), fields["image_pixels"] == .bool(true) {
             let reason: String = if case .object(let reading)? = capture["reading"], case .string(let reason)? = reading["reason"] { reason + " " } else { "" }
-            fields["note"] = .string(reason + "Actual image follows this tool result: your tab as Chrome renders it now; not a text description.")
+            fields["note"] = .string(reason + "Actual image follows this result: your tab as Chrome renders it now; not a text description.")
         } else if fields["status"] == .string("ok") {
             fields["note"] = .string("""
                 Verified capture metadata only; this call has no image slot. To see the pixels, use chrome.look or chrome.snapshot from a turn.

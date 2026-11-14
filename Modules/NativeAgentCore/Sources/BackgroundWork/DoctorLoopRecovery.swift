@@ -54,6 +54,8 @@ public enum DoctorLoopRecovery {
                 }) { pending.insert(id) }
             }
         } catch {
+            // A stopped run read nothing: that says nothing about the store's health, so it owes the person no repair.
+            if error is CancellationError { return [] }
             return [CheckResult(source: "experiences/experiences.sqlite",
                 id: "doctor.repair_store", title: "Repairs owed", status: "fail",
                 detail: "Background work repair obligations could not be read: \(error.localizedDescription)",

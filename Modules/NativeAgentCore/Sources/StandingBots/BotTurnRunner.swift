@@ -48,10 +48,8 @@ package enum BotTurnRunner {
         decode: @Sendable (String, [LLMStreamToolCall]) throws -> [Call],
         feedback: @Sendable (String, [Call], [JSONValue], [LLMContentBlock]) throws -> [LLMMessage],
         dispatch: @Sendable (Call, LocalToolImage.Round, Turn) async throws -> (JSONValue, [LLMContentBlock]),
-        waiting: @Sendable (JSONValue) -> BotTurnReply?,
-        attachments: @Sendable () -> [MultimodalAttachment],
-        save: @escaping @Sendable (BotTurnReply, [MultimodalAttachment], Turn) async throws -> Void
-    ) async throws -> BotTurnReply {
+        waiting: @Sendable (JSONValue) -> BotTurnReply?
+    ) async -> BotTurnReply {
         var messages = initialMessages
         var output = ""
         var text = ""
@@ -133,18 +131,6 @@ package enum BotTurnRunner {
         outcome.reply = output
         if judgesCondition, !output.isEmpty { await progress(output) }
         outcome.model = model
-        let attachments = attachments()
-        outcome.artifacts = attachments.map {
-            var artifact = BotArtifact(name: $0.name ?? "Artifact", path: $0.path ?? "")
-            artifact.type = $0.type; artifact.mime = $0.mime; artifact.byteSize = $0.byteSize
-            return artifact
-        }
-        let saved = outcome
-        let persisted = await settle { () -> Result<Void, Error> in
-            do { try await save(saved, attachments, turn); return .success(()) }
-            catch { return .failure(error) }
-        }
-        try persisted.get()
         return outcome
     }
 }

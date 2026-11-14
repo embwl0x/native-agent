@@ -82,7 +82,7 @@ sit beside the agent as a parallel silo.
   still replay their embedded examples before admission; those examples
   do not prove other inputs or branches.
 - The agent's persona is self-owned. Direct persona writes are governed by
-  [Trust](TOOL_LOADING.md#authority-and-receipts): under Full Mac they writes
+  [Trust](ONE_DOOR.md#authority-and-receipts): under Full Mac they writes
   their own persona; REM→GROWTH proposals remain the approval-gated path.
   Aliveness includes self-directed becoming.
 
@@ -262,7 +262,7 @@ is the center and the program its visitor. NativeAgent inverts that.
   keeps the law, draws faces and reaches the world. It never thinks and has
   no opinions; when a rule can't settle something it asks their, with evidence.
   Fading unused parts is future design. Current launch behavior only disables
-  untouched bundled seeds the app no longer ships, leaving them restorable;
+  bundled seeds they follows that the app no longer ships, leaving them restorable;
   [the design's lifecycle description](AGENT_IS_THE_APP.md#one-law-how-a-part-lives)
   records that boundary.
 - **Not from zero, never a downgrade.** The download is a fully formed agent:

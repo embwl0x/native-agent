@@ -45,7 +45,7 @@ public enum OpenRouterModelCatalog {
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
         readCache: { try readDecodedCache(dataRoot: $0) },
-        providerConfigFile: "openrouter.json",
+        credential: .apiKey(providerConfigFile: "openrouter.json"),
         fetchLive: { try await fetchLiveModels(key: $0, session: $1) }
     )
 

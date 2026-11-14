@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 // Blueprint: | `ShellPageContent.swift` | Page drawing map and local rail/profile vocabulary |
 
-/// Every place that draws a page draws it here: the window, the offscreen picture, the chat's page sheet and Simple's setup panel. A tab
+/// Every place that draws a page draws it here: the window in Simple and Advanced, the offscreen picture and the chat's page sheet. A tab
 /// item (Knowledge graph, Dreams, Cognition, Inspector) draws the page that holds it; the caller's stored tab picks the tab.
 struct ShellPageContent: View {
     let item: SidebarItem
@@ -17,7 +17,7 @@ struct ShellPageContent: View {
         switch SidebarItem.shellHome(for: item)?.parent ?? item {
         case .chat: ChatView()
         case .activity: TodayView()
-        // The rail's Notifications row shows the Inbox: what needs the person now and the history folded below it.
+        // The Desk's Notifications tab shows the Inbox: what needs the person now and the history folded below it.
         case .inboxPolicy: FacePageView(page: "inbox")
         case .bots: FacePageView(page: "bots", isReading: reading(.bots))
         case .memories: FacePageView(page: "memories").modifier(MemoriesFaceNavigation())

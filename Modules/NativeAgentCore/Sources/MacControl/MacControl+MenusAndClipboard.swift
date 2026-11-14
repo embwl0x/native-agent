@@ -71,7 +71,7 @@ extension SwiftNativeMacControl {
         case .refused(let refusal): return refusal
         case .app(let hit): app = hit
         }
-        if let refusal = await macAdmissionRefusal(pid: app.processIdentifier, action: "menu", context: context) { return refusal }
+        if let refusal = await macAdmissionRefusal(pid: app.processIdentifier, action: "menu", reading: true, context: context) { return refusal }
         // Keep every bounded find match so duplicate menu names stay ambiguous. Only explicit paths select levels; bare names containing slashes stay literal.
         let selected = body["find"]?.stringValue.map(MacMenuBar.selection)
         let wantedLevels = selected.map {
@@ -96,7 +96,7 @@ extension SwiftNativeMacControl {
             return accessibilityActSource(context: context).menuShortcut(element, context: context)
         }
         func hasChord(_ item: MacMenuBar.Item) -> Bool {
-            guard let wantedChord, !item.hasSubmenu,
+            guard let wantedChord, item.hasSubmenu == false,
                   let shortcut = shortcut(item),
                   let chord = try? MacKeySyntax.parseChords(shortcut.chord).first else { return false }
             return chord.keyCode == wantedChord.keyCode && chord.modifiers == wantedChord.modifiers
@@ -247,24 +247,23 @@ extension SwiftNativeMacControl {
         if let continuation, continuation.app?.processIdentifier != app.processIdentifier {
             return refuse("continuation_target_mismatch", continuation.modelContext(context: context))
         }
-        if let refusal = await macAdmissionRefusal(pid: app.processIdentifier, action: "menu_press", context: context) { return refusal }
-        // Limit descent to the requested top-level menu to preserve the bounded walk.
+        if let refusal = await macAdmissionRefusal(pid: app.processIdentifier, action: "menu_press", reading: false, context: context) { return refusal }
+        // Descend only through the requested path, retaining siblings for a missing level.
         let reading = MacMenuBar.read(
             source: accessibilitySource(context: context), pid: app.processIdentifier,
-            top: MacMenuBar.components(MacMenuBar.selection(requested).path).first,
             matchingPath: MacMenuBar.components(MacMenuBar.selection(requested).path),
             depth: MacMenuBar.findPathDepth
         , context: context)
         if let unavailable = reading.unavailable {
             return refuse(
                 unavailable,
-                "\(app.name)'s menu bar could not be read: \(unavailable). No command was pressed."
+                "\(app.name)'s menu items could not be read: \(unavailable). No command was pressed."
             )
         }
         guard !reading.truncated else {
             return refuse("menu_coverage_incomplete", """
-                The requested menu branch could not be read completely; command absence or uniqueness is unknown. No command was pressed. Read that branch \
-                before continuing.
+                The requested menu branch's items could not be read completely; command absence or uniqueness is unknown. No command was pressed. \
+                Read that branch before continuing.
                 """,
                           ["attribute_gaps": .array(reading.attributeGaps.map(JSONValue.string))])
         }
@@ -297,7 +296,7 @@ extension SwiftNativeMacControl {
                 default: return "menu_path_not_found"
                 }
             }()
-            var words = MacMenuBar.words(for: resolution, requested: requested)
+            var words = MacMenuBar.words(for: resolution, requested: requested, among: reading.items)
                 ?? "I couldn't find \"\(requested)\" in \(app.name)'s menu bar."
             if case .ambiguous = resolution {
                 let wanted = MacMenuBar.components(MacMenuBar.selection(requested).path).map(MacMenuBar.normalized)
@@ -334,9 +333,9 @@ extension SwiftNativeMacControl {
         case .menuPathDrifted: return driftRefusal()
         case .pathNotFound:
             return refuse(
-                "menu_path_not_found",
-                "\"\(item.display)\" was in the menu a moment ago and is not there now; "
-                    + "read the menu again."
+                "menu_path_unavailable",
+                "The selected menu path could not be revalidated at its observed AX address; its current items are unknown. "
+                    + "No command was pressed. Read the menu again."
             )
         default:
             return refuse(
@@ -380,7 +379,7 @@ extension SwiftNativeMacControl {
                 }
                 return refuse(
                     "menu_item_disabled",
-                    MacMenuBar.words(for: .disabled(item), requested: requested) ?? "\"\(item.display)\" is greyed out.",
+                    MacMenuBar.words(for: .disabled(item), requested: requested, among: reading.items) ?? "\"\(item.display)\" is greyed out.",
                     ["requested_path": .string(requested)]
                 )
             }
@@ -391,7 +390,7 @@ extension SwiftNativeMacControl {
         if requireFront, !target.enabled {
             return refuse(
                 "menu_item_disabled",
-                MacMenuBar.words(for: .disabled(item), requested: requested) ?? "The menu item is greyed out.",
+                MacMenuBar.words(for: .disabled(item), requested: requested, among: reading.items) ?? "The menu item is greyed out.",
                 ["requested_path": .string(requested)]
             )
         }
@@ -480,7 +479,7 @@ extension SwiftNativeMacControl {
                     item.display,
                     valueChars: MacMenuBar.pathChars(MacMenuBar.findPathDepth)
                 ),
-                "opens_submenu": .bool(item.hasSubmenu),
+                "opens_submenu": item.hasSubmenu.map(JSONValue.bool) ?? .null,
                 "effect": .object(["notifications": .array(wait.notifications.map(JSONValue.string))]),
             ].merging(verdict.receipt) { _, new in new }),
             error: nil,

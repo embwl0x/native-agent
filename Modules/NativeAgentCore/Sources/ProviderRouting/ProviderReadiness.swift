@@ -18,8 +18,9 @@ extension SwiftNativeProviderRouting {
 
     private nonisolated static func snapshotFiles(dataRoot: URL) -> [URL] {
         let directory = dataRoot.appendingPathComponent("providers", isDirectory: true)
-        return ["registry.json", "active.json", "surfaces.json", "pending-surface-configuration.json",
-                "openrouter-models-cache.json", "moonshot-models-cache.json"].map { directory.appendingPathComponent($0) }
+        return (["registry.json", "active.json", "surfaces.json", "pending-surface-configuration.json",
+                 "openrouter-models-cache.json", "moonshot-models-cache.json"] + FirstPartyModelDiscovery.cacheFileNames)
+            .map { directory.appendingPathComponent($0) }
             + [ChatGPTTransport.cliAdoptionConsentPath(dataRoot: dataRoot)]
     }
 
@@ -43,7 +44,7 @@ extension SwiftNativeProviderRouting {
         moonshotModels: [[String: JSONValue]]? = nil,
         codexCacheURL: URL? = nil,
         authEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-        additionalProviderIDs: Set<String> = [], preview: Bool = false
+        additionalProviderIDs: Set<String> = [], savedModels: Set<String> = [], preview: Bool = false
     ) throws -> (providers: [Provider], cache: ProviderConfigCache) {
         var byId: [String: Provider] = [:]
         for provider in try Self.loadProviderRegistryChecked(at: providersDir.appendingPathComponent("registry.json")) ?? [] {
@@ -58,8 +59,16 @@ extension SwiftNativeProviderRouting {
             var row = byId[id] ?? Provider(id: id)
             row.displayName = Self.connectableProviderIds.contains(id) ? Self.displayName(for: id) : (row.displayName ?? Self.displayName(for: id))
             row.kind = id.contains("oauth") || id == "codex" ? "oauth" : "api_key"
-            // Preserve custom registry catalogs; shipped routes always use current catalogs.
-            if Self.connectableProviderIds.contains(id) || row.modelCatalog == nil {
+            // Preserve custom registry catalogs; shipped routes always use current catalogs. A live route's list carries a note beside it (why the
+            // provider's list is missing, when it was fetched, how many models were left out), shows each model once (a dated spelling only when
+            // saved), and each row says whether it is offered: the build's rows standing in for a missing list are not.
+            var liveNote: String?
+            if FirstPartyModelDiscovery.isLiveRoute(id) {
+                let list = FirstPartyModelDiscovery.currentList(route: id, dataRoot: dataRoot)
+                let savedDefault = (cache.reads[id]?.object?["default_model"] as? String).map { [$0] } ?? []
+                row.modelCatalog = .array(list.rows(keeping: savedModels.union(savedDefault), route: id).map { .object($0) })
+                liveNote = list.note
+            } else if Self.connectableProviderIds.contains(id) || row.modelCatalog == nil {
                 row.modelCatalog = .array(modelsForProvider(
                     id, openRouterModels: openRouterModels, moonshotModels: moonshotModels,
                     codexCacheURL: codexCacheURL, authEnvironment: authEnvironment, preview: preview
@@ -67,6 +76,7 @@ extension SwiftNativeProviderRouting {
             }
             var extras: [String: JSONValue] = [:]
             if case .object(let saved)? = row.extras { extras = saved }
+            if FirstPartyModelDiscovery.isLiveRoute(id) { extras["models_note"] = liveNote.map(JSONValue.string) }
             if Self.connectableProviderIds.contains(id) || extras["auth_modes"] == nil {
                 extras["auth_modes"] = .array(authModes(for: id).map { .string($0) })
             }
@@ -133,6 +143,8 @@ extension SwiftNativeProviderRouting {
         if let error = cache?.reads[id]?.unreadable {
             return (false, "unavailable", error)
         }
+        /// A check's time is fixed into the account's words when readiness is read, so it carries its day and stays true however long it is shown.
+        func checkedWords(_ date: Date) -> String { date.formatted(.dateTime.month(.abbreviated).day().hour().minute()) }
         /// Readiness grades the exact credential's own check. Rejection blocks it; absent, failed or unreadable proof stays eligible and unproven until
         /// dispatch.
         func receiptReadiness(_ credential: String, holding: String, rejected: String,
@@ -142,7 +154,7 @@ extension SwiftNativeProviderRouting {
             if let unreadable = receipts.unreadable {
                 return (true, "failed", "\(holding); its checks are unreadable (\(unreadable)).")
             }
-            switch receipts.verdict(providerID: id, key: credential) {
+            switch receipts.verdict(providerID: id, credential: LLMProviderStatusFeed.fingerprint(credential)) {
             case .rejected: return (false, "rejected", rejected)
             case .failed(let why): return (true, "failed", "\(holding); its last check failed: \(why)")
             case .proven(let checkedAt): return standing(checkedAt)
@@ -164,7 +176,7 @@ extension SwiftNativeProviderRouting {
             guard let key else { return (false, "needs_key", "No \(name) API key configured") }
             return receiptReadiness(key, holding: "\(name) API key saved",
                                     rejected: "\(name) rejected this API key at its last check; paste a new key.") {
-                $0.map { (true, "ready", "\(name) API key checked \($0.formatted(.iso8601))") }
+                $0.map { (true, "ready", "\(name) API key checked \(checkedWords($0))") }
                     ?? (true, "saved", "\(name) API key saved, not yet proven by a check")
             }
         }
@@ -174,14 +186,8 @@ extension SwiftNativeProviderRouting {
             guard judged.0, let token = judged.2 else { return (judged.0, "needs_oauth", judged.1) }
             // A usable sign-in without a check is present and unproven; needs_oauth is reserved for absent sign-in.
             return receiptReadiness(token, holding: "Signed in",
-                                    rejected: "This sign-in was rejected at its last check; sign in again in Providers.") { checkedAt in
-                // The check time reads as every face row's time does: the clock today, the day otherwise.
-                if let checkedAt {
-                    let when = Calendar.current.isDateInToday(checkedAt) ? checkedAt.formatted(date: .omitted, time: .shortened)
-                        : checkedAt.formatted(.dateTime.month(.abbreviated).day())
-                    return (true, "ready", judged.1 + "; checked " + when)
-                }
-                return (true, "saved", judged.1)
+                                    rejected: "This sign-in was rejected at its last check; sign in again in Providers.") {
+                $0.map { (true, "ready", "\(judged.1); checked \(checkedWords($0))") } ?? (true, "saved", judged.1)
             }
         }
         switch id {
@@ -213,7 +219,7 @@ extension SwiftNativeProviderRouting {
             if let credential = credentials.first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
                 return receiptReadiness(credential.trimmingCharacters(in: .whitespacesAndNewlines), holding: "Provider credential saved",
                                         rejected: "Provider rejected this credential at its last check; save a new credential.") {
-                    $0.map { (true, "ready", "Provider credential checked \($0.formatted(.iso8601))") }
+                    $0.map { (true, "ready", "Provider credential checked \(checkedWords($0))") }
                         ?? (true, "saved", "Provider credential saved, not yet proven by a check")
                 }
             }
@@ -295,7 +301,8 @@ extension SwiftNativeProviderRouting {
         if let shape = ProviderModelChoice.rejection(
             provider: provider, model: model, reasoningEffort: reasoningEffort,
             accountModels: accountModels, moonshotModels: moonshotModels,
-            openRouterModels: routeID == "openrouter" ? OpenRouterModelCatalog.readCache(dataRoot: dataRoot) : nil
+            openRouterModels: routeID == "openrouter" ? OpenRouterModelCatalog.readCache(dataRoot: dataRoot) : nil,
+            dataRoot: dataRoot
         ) {
             return shape
         }
@@ -339,6 +346,11 @@ extension SwiftNativeProviderRouting {
         case "openrouter": return openRouterModels ?? []
         case "moonshot": return moonshot
         default:
+            // A live route's list is its provider's answer for this credential, else the build's rows, not offered.
+            if FirstPartyModelDiscovery.isLiveRoute(id) {
+                let list = FirstPartyModelDiscovery.currentList(route: id, dataRoot: dataRoot)
+                return list.models.map { list.rowJSON($0, route: id) }
+            }
             let shipped = FirstPartyModelCatalog.models(forProviderID: id)
             if id == id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !shipped.isEmpty {
                 return shipped.map { $0.providerJSON() }

@@ -128,8 +128,11 @@ extension AgentScreen {
         @Sendable func files(_ dir: URL, file: String? = nil) -> [URL] {
             // Passive watch reach only. Keep the parent even if enumeration fails, so restoration invalidates the checked owner reading.
             let names = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).sorted()
-            return [dir] + names.map { name in
-                file.map { dir.appendingPathComponent(name).appendingPathComponent($0) } ?? dir.appendingPathComponent(name)
+            return [dir] + names.compactMap { name in
+                let child = dir.appendingPathComponent(name)
+                guard let file else { return child }
+                // Only a folder holds a file of its own; a path under a plain file can never be watched.
+                return (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true ? child.appendingPathComponent(file) : nil
             }
         }
         let memo = AgentMemo.shared
@@ -207,7 +210,8 @@ extension AgentScreen {
                     """
             }
         }
-        world.health = part("health", [AgentLocalHealth.url(dataRoot), at("agents/peers.json")], {
+        world.health = part("health", [AgentLocalHealth.url(dataRoot), at("agents/peers.json")],
+                notifications: workspace.ports.conversations.healthNotifications, {
             try workspace.ports.conversations.liveHealth(dataRoot: dataRoot)
         }) ?? [:]
 
@@ -268,8 +272,8 @@ extension AgentScreen {
             return (pending.filter { SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }.count,
                     pending.count == 100)
         }) { world.reviews = reviews }
-        // Asks are a reading of the record, so they refresh with it like the owed rows.
-        if let asks: [InboxItemRecord] = part("asks", [], notifications: [HomeFace.experiencesChanged], {
+        // Asks read the inbox: its change rereads what it took; the record's change retries an inbox that could not load.
+        if let asks: [InboxItemRecord] = part("asks", [], notifications: [HomeFace.experiencesChanged, ForPerson.didChange], {
             try await ForPerson.at(dataRoot).inbox().filter { $0.id != $0.related_approval_id && $0.requiresOwnerInput }
         }) { world.asksToOpen = asks; world.asks = asks.count; world.newestAsk = asks.first?.title }
         world.running = part("running helpers", [at("bots/run-queue.json")], notifications: [BotRunQueue.didChange]) {
@@ -331,21 +335,32 @@ extension AgentScreen {
         return world
     }
 
-    static func freshness(_ world: AgentWorld, now: Date = Date()) -> String {
-        "Retained picture" + (world.oldest.map { "; oldest read " + age(now.timeIntervalSince($0)) + " ago" } ?? "; not read yet")
-            + (world.pending.isEmpty ? "" : "; pending: " + world.pending.joined(separator: ", "))
+    /// What the app can vouch for, and no more: each part is read again when a source it watches signals a change, and a part that is
+    /// not being read has had no such signal since. How long ago it was read is not staleness; said as an age, it made the agent read
+    /// everything again to be sure. A source that changes without a signal (a clock passing, a file the part does not watch) is not
+    /// covered by this line.
+    static func freshness(_ world: AgentWorld) -> String {
+        (world.oldest == nil ? "Nothing read yet"
+            : "Each part is read again when a source it watches signals a change; none has since these were read"
+                + (world.pending.isEmpty ? "" : ", except " + world.pending.joined(separator: ", ") + " (being read now)"))
             + (world.failures.isEmpty ? "" : "\n" + world.failures.keys.sorted().compactMap { world.failures[$0] }.joined(separator: "\n"))
     }
 
     // MARK: - Since you looked
 
     /// Compare each stable name's fingerprint to distinguish changes from first appearance or removal.
+    /// `waits` and `what` are read from the world on every look, so the saved record keeps only what a comparison needs.
     struct Mark: Codable, Equatable {
         var fp: String
         var line: String
         var new: String = ""
         var gone: String = ""
         var at: Double
+        /// Its change needs me: it is told on its own line and never folded into a count.
+        var waits = false
+        /// What happened, in the line's own word; a change that does not wait is counted by it under its room.
+        var what = ""
+        private enum CodingKeys: String, CodingKey { case fp, line, new, gone, at }
     }
 
     struct Seen: Codable {
@@ -375,51 +390,65 @@ extension AgentScreen {
                 // Already-shown replies are silent.
                 let shown = record.map { $0.shownInline == $0.operationID + ":" + $0.phase } ?? false
                 let line = shown || change.isEmpty ? "" : slug + " " + change
+                // My sending is no change; what a contact says back, or what became of my send, needs me.
                 marks[slug] = Mark(fp: [fp(record?.updatedAt), fp(answered), record?.phase ?? "-"].joined(separator: "|"),
-                    line: line, at: ([record?.updatedAt, answered].compactMap { $0 }.max() ?? .distantPast).timeIntervalSince1970)
+                    line: line, at: ([record?.updatedAt, answered].compactMap { $0 }.max() ?? .distantPast).timeIntervalSince1970,
+                    waits: true, what: change)
                 for id in Set([contact.id] + contact.agents) {
                     if let health = world.health[id], health.current, current("health") {
                         marks["health:" + id] = Mark(fp: health.status + ":" + health.detail,
-                            line: health.problem.map { slug + ": " + $0 } ?? "", at: health.checkedAt.timeIntervalSince1970)
+                            line: health.problem.map { slug + ": " + $0 } ?? "", at: health.checkedAt.timeIntervalSince1970,
+                            waits: true, what: health.status)
                     }
                 }
                 // A chat the agent already answered is not news: the agent was there.
-                for chat in world.chats where chat.heard != nil && !chat.answered && (chat.who == contact.id || chat.who == contact.name.lowercased()) {
-                    marks["chat:" + chat.id] = Mark(fp: fp(chat.heard), line: slug + " wrote", at: chat.heard!.timeIntervalSince1970)
+                for chat in world.chats where !chat.answered && (chat.who == contact.id || chat.who == contact.name.lowercased()) {
+                    guard let heard = chat.heard else { continue }
+                    marks["chat:" + chat.id] = Mark(fp: fp(heard), line: slug + " wrote", at: heard.timeIntervalSince1970, waits: true, what: "wrote")
                 }
             }
             for bot in world.bots where current("bots", "running helpers", "people") {
                 let slug = book.slug(id: "bot:" + bot.id.uuidString, name: bot.name)
                 let entry = world.latest[bot.id], running = world.running.contains(bot.id)
-                var line = slug + " ran"
-                if running { line = slug + " running" }
-                else if let entry, world.handed.contains(entry.id.uuidString) { line = "" }
+                // A helper that answered my ask, failed, or waits on the person needs me; a run or a stop is counted.
+                var what = "ran", detail = "", waits = false
+                if running { what = "running" }
+                else if let entry, world.handed.contains(entry.id.uuidString) { what = "" }
                 else if let entry {
                     switch entry.runtimeStatus {
-                    case .completed: line = slug + (entry.asked == true ? " answered" : " ran") + ": " + clip(entry.headline, 36)
-                    case .failed, .interrupted: line = slug + " failed"
-                    case .stopped: line = slug + " stopped"
-                    case .waitingForApproval, .waitingOnPerson: line = slug + " waiting on " + person
+                    case .completed:
+                        (what, waits, detail) = (entry.asked == true ? "answered" : "ran", entry.asked == true, ": " + clip(entry.headline, 36))
+                    case .failed, .interrupted: (what, waits) = ("failed", true)
+                    case .stopped: what = "stopped"
+                    case .waitingForApproval, .waitingOnPerson: (what, waits) = ("waiting on " + person, true)
                     }
                 }
+                let line = what.isEmpty ? "" : slug + " " + what + detail
                 marks[slug] = Mark(fp: [entry?.id.uuidString ?? "-", entry?.runtimeStatus.rawValue ?? "-",
                                       entry?.statusDetail ?? "-", entry?.approvalID ?? "-", running ? "running" : "idle"].joined(separator: "|"), line: line,
-                                   at: (running ? now : entry?.runAt ?? .distantPast).timeIntervalSince1970)
+                                   at: (running ? now : entry?.runAt ?? .distantPast).timeIntervalSince1970, waits: waits, what: what)
             }
         }
         if let desk = world.desk, current("desk") {
             for item in desk.items where item.parent == nil || OwnerAttentionPolicy.waitsOnOwner(item) {
                 let name = "desk." + item.alias
-                let label = OwnerAttentionPolicy.waitsOnOwner(item) ? "waiting on " + person
-                    : item.status == .now ? "in progress" : item.status.displayLabel
+                let waits = OwnerAttentionPolicy.waitsOnOwner(item)
+                let label = waits ? "waiting on " + person : item.spokenStatus
+                let at = (date(item.updatedAt) ?? now).timeIntervalSince1970
+                // What I do by my own hand I already know, so it is seen as it is made: my queue steps are filed by me and closed by my own
+                // work. A step the person closed from the Desk is theirs, and a wait on the person is always told.
+                if !waits, item.origin == .agent, item.project == MyQueue.project, item.summary != DeskQuickAction.deskCloseOutcome {
+                    marks[name] = Mark(fp: label, line: "", at: at)
+                    continue
+                }
                 marks[name] = Mark(fp: label, line: name + " → " + label, new: name + " new: " + clip(item.title, 36),
-                                   gone: name + " closed", at: (date(item.updatedAt) ?? now).timeIntervalSince1970)
+                                   gone: name + " closed", at: at, waits: waits, what: label)
             }
         }
         for approval in world.approvals where current("approvals") {
             marks["approval:" + approval.id] = Mark(fp: "pending", line: "",
                 new: "approval: " + clip(approval.title, 40),
-                at: (date(approval.lastRequestedAt ?? approval.createdAt) ?? now).timeIntervalSince1970)
+                at: (date(approval.lastRequestedAt ?? approval.createdAt) ?? now).timeIntervalSince1970, waits: true)
         }
         let placeClock = DateFormatter()
         placeClock.locale = Locale(identifier: "en_US_POSIX")
@@ -429,37 +458,90 @@ extension AgentScreen {
             let when = " (" + placeClock.string(from: event.timestamp) + ", " + age(now.timeIntervalSince(event.timestamp)) + " ago)"
             // Keep the observation time inside the glance's 44-character line budget.
             let place = clip(String(reflecting: event.name), max(1, 44 - prefix.count - when.count))
-            let line = prefix + place + when
-            marks["phone-place:" + event.id] = Mark(fp: event.id, line: line, new: line,
-                at: event.timestamp.timeIntervalSince1970)
+            marks["phone-place:" + event.id] = Mark(fp: event.id, line: prefix + place + when, at: event.timestamp.timeIntervalSince1970,
+                what: event.transition.rawValue)
         }
         return marks
     }
 
-    /// What changed since the saved look, newest first. The chat the agent is in (`excluding`) is never news.
+    /// The room a mark's change is counted under and read in, from its name. A plain name is a contact's or a helper's; the name book
+    /// knows which.
+    static func room(_ name: String, book: NameBook) -> String {
+        if name.hasPrefix("desk.") { return "desk" }
+        if name.hasPrefix("approval:") { return "approvals" }
+        if name.hasPrefix("phone-place:") { return "phone" }
+        if name.hasPrefix("home:tab:") { return "browser tabs" }
+        if name.hasPrefix("home:") { return String(name.dropFirst(5)) }
+        if name.hasPrefix("chat:") || name.hasPrefix("health:") { return "people" }
+        return book.slugs[name]?.id.hasPrefix("bot:") == true ? "helpers" : "people"
+    }
+
+    /// What changed since the saved look: what waits on me first, newest first within each. The chat the agent is in (`excluding`) is never news.
     struct Change {
         var names: Set<String>
         var at: Double
         var line: String
+        var waits: Bool
+        var what: String
     }
 
     static func changes(since seen: Seen?, now marks: [String: Mark], excluding scope: String?) -> [Change] {
         guard let seen, seen.problem == nil else { return [] }
         var found: [String: Change] = [:]
-        func add(_ name: String, _ line: String, _ at: Double) {
+        func add(_ name: String, _ line: String, _ at: Double, waits: Bool, what: String) {
             guard !line.isEmpty else { return }
-            found[line, default: Change(names: [], at: at, line: line)].names.insert(name)
+            found[line, default: Change(names: [], at: at, line: line, waits: waits, what: what)].names.insert(name)
         }
         let live = scope.map { "chat:" + $0 }
         for (name, mark) in marks where name != live {
             guard let old = seen.marks[name] else {
-                add(name, mark.new.isEmpty ? mark.line : mark.new, mark.at)
+                add(name, mark.new.isEmpty ? mark.line : mark.new, mark.at, waits: mark.waits, what: mark.new.isEmpty ? mark.what : "new")
                 continue
             }
-            if old.fp != mark.fp { add(name, mark.line, mark.at) }
+            if old.fp != mark.fp { add(name, mark.line, mark.at, waits: mark.waits, what: mark.what) }
         }
-        for (name, old) in seen.marks where marks[name] == nil { add(name, old.gone, seen.at) }
-        return found.values.sorted { ($0.at, $0.line) > ($1.at, $1.line) }
+        for (name, old) in seen.marks where marks[name] == nil { add(name, old.gone, seen.at, waits: false, what: "closed") }
+        return found.values.sorted { ($0.waits ? 1 : 0, $0.at, $0.line) > ($1.waits ? 1 : 0, $1.at, $1.line) }
+    }
+
+    /// One telling of what changed, for Home and the glance alike. Each change that waits on me is its own line, up to `limit`; more than
+    /// that are one line saying how many and, when they fit, the rooms (each an item) to read them in, and stay news until a look shows them.
+    /// Everything else is one line per room, counted by what happened, or by its total when those counts do not fit, or the change's own line
+    /// when the room has one. `names` are the names of every change these lines tell.
+    static func tell(_ changed: [Change], limit: Int, width: Int, book: NameBook) -> (lines: [String], names: Set<String>) {
+        func roomOf(_ change: Change) -> String? { change.names.min().map { room($0, book: book) } }
+        let waiting = changed.filter(\.waits), shown = waiting.prefix(limit)
+        var lines = shown.map { clip($0.line, width) }
+        var told = Set(shown.flatMap(\.names))
+        let more = waiting.dropFirst(limit)
+        if !more.isEmpty {
+            var places: [String] = []
+            for name in more.compactMap(roomOf) where !places.contains(name) { places.append(name) }
+            let count = "+\(more.count) more need me", read = count + ": read " + places.joined(separator: ", ")
+            lines.append(read.count <= width ? read : count)
+        }
+        var rooms: [(name: String, changes: [Change])] = []
+        for change in changed where !change.waits {
+            guard let name = roomOf(change) else { continue }
+            if let index = rooms.firstIndex(where: { $0.name == name }) { rooms[index].changes.append(change) }
+            else { rooms.append((name, [change])) }
+            told.formUnion(change.names)
+        }
+        for room in rooms {
+            if room.changes.count == 1, let only = room.changes.first { lines.append(clip(only.line, width)); continue }
+            var counts: [(what: String, count: Int)] = []
+            for change in room.changes {
+                if let index = counts.firstIndex(where: { $0.what == change.what }) { counts[index].count += 1 }
+                else { counts.append((change.what, 1)) }
+            }
+            // A count is never cut: a room whose counts do not fit is told by its total, and she reads the rest in the room.
+            let counted = room.name + ": " + counts.map { "\($0.count) \($0.what)" }.joined(separator: ", ")
+            var line = counted.count <= width ? counted : room.name + ": \(room.changes.count) changes"
+            // A count says how many; where there is room, the newest one says what kind of thing arrived. Only this example is ever cut.
+            if let newest = room.changes.first, width - line.count > 24 { line += " · newest: " + clip(newest.line, width - line.count - 11) }
+            lines.append(line)
+        }
+        return (lines, told)
     }
 
     /// Missing source evidence cannot close Desk work or announce a helper's run as ended.
@@ -496,6 +578,18 @@ extension AgentScreen {
         return await AgentMemo.shared.value(dataRoot.standardizedFileURL.path + "\u{0}seen", stamp: [stamp(url)]) { readSeen(url) }
     }
 
+    /// What the agent changes on its Desk by its own hand it already knows: the item is recorded as seen in the state it now has, and the
+    /// time of the last look stays where it was, so Home does not tell the change back as news. A wait on the person is still told, and
+    /// a step under another item was never told by itself.
+    package static func sawOwnDeskChange(_ handle: String, dataRoot: URL) async {
+        guard let seen = readSeen(seenURL(dataRoot)), seen.problem == nil,
+              let item = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items.first(where: { $0.handle == handle }),
+              item.parent == nil, !OwnerAttentionPolicy.waitsOnOwner(item) else { return }
+        let name = "desk." + item.alias
+        markSeen(dataRoot, marks: [name: Mark(fp: item.spokenStatus, line: "", at: seen.at)], only: [name],
+                 now: Date(timeIntervalSince1970: seen.at))
+    }
+
     /// A look merges only identities represented in its output, retaining hidden and capped records at their previous observation. One writer at a time: read,
     /// merge and write happen under one lock.
     static func markSeen(_ dataRoot: URL, marks: [String: Mark], only names: Set<String>? = nil, now: Date = Date()) {
@@ -507,7 +601,8 @@ extension AgentScreen {
             if let names {
                 var saved = previous ?? Seen(at: now.timeIntervalSince1970, marks: [:])
                 for name in names { saved.marks[name] = marks[name] }
-                saved.at = now.timeIntervalSince1970
+                // The time of the last look never moves back: a write that carries an older reading leaves a newer look standing.
+                saved.at = max(saved.at, now.timeIntervalSince1970)
                 seen = saved
             } else { seen = Seen(at: now.timeIntervalSince1970, marks: marks) }
             do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(seen), to: url) }
@@ -598,7 +693,7 @@ extension AgentScreen {
     static func renderGlance(workspace: WorkspaceOperation, dataRoot: URL, scope: String?, now: Date) async -> String? {
         do {
             let world = await readWorld(workspace: workspace, dataRoot, now: now)
-            if !world.failures.isEmpty { return "Home glance unavailable. " + freshness(world, now: now) }
+            if !world.failures.isEmpty { return "Home glance unavailable. " + freshness(world) }
             let person = names(dataRoot).person
             let seen = await lastSeen(dataRoot)
             if let problem = seen?.problem { return "Home glance — " + problem }
@@ -632,13 +727,14 @@ extension AgentScreen {
             let unread = world.unread.map { words[$0] ?? $0 }
             guard !changed.isEmpty || !waits.isEmpty || !mine.isEmpty || !unread.isEmpty else { return nil }
             var parts = ["""
-                Home glance — snapshot as of \(now.formatted(.iso8601)). \(freshness(world, now: now)). Desk, inbox, approvals, exchanges, helper \
+                Home glance — snapshot as of \(now.formatted(.iso8601)). \(freshness(world)). Desk, inbox, approvals, exchanges, helper \
                 status, phone-place records and reviews; no live calendar, reminders, mail, front app, full Doctor check or complete activity log.
                 """]
             if let seen, !changed.isEmpty {
-                let shown = changed.prefix(3).map { clip($0.line, 44) }
+                let book = try withNames(workspace: workspace, dataRoot) { $0 }
+                let shown = tell(changed, limit: 3, width: 44, book: book).lines
                 parts.append("Since you looked (\(age(now.timeIntervalSince1970 - seen.at))): " + shown.joined(separator: " · ")
-                    + (changed.count > 3 ? " +\(changed.count - 3) more." : shown.last?.hasSuffix("…") == true ? "" : "."))
+                    + (shown.last?.hasSuffix("…") == true ? "" : "."))
             }
             if !waits.isEmpty { parts.append(person + " waits on: " + waits.joined(separator: ", ") + ".") }
             if !mine.isEmpty { parts.append("Mine: " + mine.joined(separator: ", ") + ".") }

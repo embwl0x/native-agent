@@ -25,7 +25,7 @@ extension CapabilityLifecycle {
             try requireWrite(turn: turn)
         }
         if abilities.contains(where: reaches) {
-            throw PersistenceCoreError.ioFailure("Ability stores require lifecycle actions; use the sense, tool or skill action for this change.")
+            throw PersistenceCoreError.ioFailure("Ability stores require lifecycle actions; use the sense, ability or skill action for this change.")
         }
     }
 

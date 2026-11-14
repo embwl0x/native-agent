@@ -240,15 +240,18 @@ enum EngineFaceWorkProjection {
         return file
     }
 
-    private static func makeKind(_ file: URL) -> String {
+    static func makeKind(_ file: URL) -> String {
         let type = file.pathExtension.lowercased()
         return MakeStudio.webTypes.contains(type) ? "web" : MakeStudio.imageTypes.contains(type) ? "image" : "file"
     }
 
+    /// A Make version's title, as the shelf and the Desk name it.
+    static func versionTitle(_ ref: String, _ version: MakeStudio.Version) -> String { ref + "-" + version.file }
+
     private static func shelfFace(_ metadata: [MakeStudio.Meta], newest: String?, loaded: Bool, issue: String?) -> MakeShelfFace {
         let versions = metadata.flatMap { meta in
             meta.versions.map { version in
-                FaceMakeVersion(reference: meta.ref, version: String(version.n), title: meta.ref + "-" + version.file,
+                FaceMakeVersion(reference: meta.ref, version: String(version.n), title: versionTitle(meta.ref, version),
                     date: NativeTimestampFormat.parseISO8601(version.created),
                     prompt: version.prompt.map(NativeAppSecretRedactor.redactText), kind: makeKind(URL(fileURLWithPath: version.file)))
             }

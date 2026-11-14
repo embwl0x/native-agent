@@ -255,7 +255,7 @@ extension SwiftToolDispatcher {
         object["images"] = .array(updated)
         object["imagesShownToModel"] = .int(Int64(shown))
         object["visionNote"] = .string(shown > 0
-            ? "\(shown) of \(rows.count) generated image(s) follow this tool result as thumbnails —"
+            ? "\(shown) of \(rows.count) generated image(s) follow this result as thumbnails —"
                 + " look at them before you describe or ship them. The thumbnails are for checking;"
                 + " the full-size files are at images[].path."
             : "No generated image could be shown inline this turn — each row's visionNote says why."

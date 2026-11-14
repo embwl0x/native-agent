@@ -280,25 +280,32 @@ function face(input) {
         background.push({id: "background.runtime", title: "Background scheduling", detail: watchdog.detail, value: watchdog.status,
             tone: tone(watchdog.badge, watchdog.badgeBucket)});
     }
+    // What is healthy folds under one row at the end of Checks, so what needs attention reads first.
+    const healthy = [];
     if (background.length === 0) {
         if (input.loops.length === 0) {
             background = [{id: "background.unmeasured", title: "Background work has not been measured", tone: "attention"}];
         } else if (input.loops.some(l => l.ok)) {
-            background = [{id: "background.healthy", title: issue === undefined
+            healthy.push({id: "background.healthy", title: issue === undefined
                 ? "All background work is healthy" : "Last measured background work was healthy",
-                detail: "Off and unneeded work is excluded from this health verdict.", tone: "done"}];
+                detail: "Off and unneeded work is excluded from this health verdict.", tone: "done"});
         } else {
             background = [{id: "background.inactive", title: "Background work is off or not needed", tone: "quiet"}];
         }
     }
-    sections.push({id: "background", title: "Background work", style: "list", footer: issue, rows: background});
+    if (background.length > 0) sections.push({id: "background", title: "Background work", style: "list", footer: issue, rows: background});
 
     const grouped = groups.map(g => [g, checks.filter(c => group(c.checkID) === g[0])]).filter(p => p[1].length > 0).map(p => {
         const s = summarize(p[1]);
         return {id: "checks." + p[0][0], title: p[0][1], value: counts(s), tone: s.tone};
     });
-    sections.push({id: "checks", title: "Checks", style: "values", footer: issue,
-        rows: grouped.length === 0 ? [{id: "checks.empty", title: "No measured checks yet", tone: "attention"}] : grouped});
+    healthy.unshift(...grouped.filter(row => row.tone === "done"));
+    const checkRows = grouped.length === 0 ? [{id: "checks.empty", title: "No measured checks yet", tone: "attention"}]
+        : grouped.filter(row => row.tone !== "done");
+    if (healthy.length > 0) {
+        checkRows.push({id: "checks.healthy", title: "Nothing else needs attention", value: String(healthy.length), tone: "done", rows: healthy});
+    }
+    sections.push({id: "checks", title: "Checks", style: "values", footer: issue, rows: checkRows});
 
     const mac = [];
     if (input.mac !== null) {
@@ -344,9 +351,12 @@ function face(input) {
     const runs = input.runs;
     let runRows = runs.recent.map(r => {
         const badge = runBadge(r.status), kind = runKind(r.kind);
-        const model = r.model !== null && r.model !== "" ? r.model : "Model unavailable";
+        // A run with no model simply used none; its row says how long it took and, when it did not finish, why.
         const took = r.durationSeconds !== null ? duration(r.durationSeconds) : "Duration unavailable";
-        return {id: r.id, title: kind.name, detail: dated(model + " · " + took, r.createdAt, r.timeReadable), value: badge.label,
+        const words = [r.model !== null && r.model !== "" ? r.model : null, took,
+            r.cause !== undefined && r.cause !== null && r.cause !== "" ? r.cause : null].filter(w => w !== null).join(" · ");
+        return {id: r.id, title: typeof r.name === "string" && r.name !== "" ? r.name : kind.name,
+            detail: dated(words, r.createdAt, r.timeReadable), value: badge.label,
             at: r.createdAt, symbol: kind.symbol, tone: badge.tone, open: keys[r.id] !== undefined ? keys[r.id].open : undefined};
     });
     if (runRows.length === 0) {

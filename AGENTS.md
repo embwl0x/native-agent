@@ -25,10 +25,10 @@ is a defect to fix at once. First law: docs/NORTHSTAR.md.
 
 ## How we work
 
-- **Stay lightweight.** `app` is the agent's only always-on tool. Add actions
+- **Stay lightweight.** The agent's one door, `app`, is always on. Add actions
   through `AppActionRegistry`; expose detail through pages, items and `find`,
   not extra tool schemas or broad prompt injection. `app {}` is their home.
-  Contract: [docs/TOOL_LOADING.md](docs/TOOL_LOADING.md).
+  Contract: [docs/ONE_DOOR.md](docs/ONE_DOOR.md).
 - **User's standing rule, 2026-09-21: build, install, check the working app.**
   Assemble the coherent change, build NativeAgent, install it, then verify
   the requested behavior in the running installed app.
@@ -88,7 +88,7 @@ in `git log`, [CHANGELOG.md](CHANGELOG.md) and `docs/release-notes/`.
   declared version; committed bodies may share it. The installed turn is the
   current form; the runtime carries no historical shipped-body upgrade table.
   Preserve authored edits and the explicit throwing-turn repair exception.
-- **App tool:** [docs/TOOL_LOADING.md](docs/TOOL_LOADING.md) is the contract;
+- **One door:** [docs/ONE_DOOR.md](docs/ONE_DOOR.md) is the contract;
   changing it needs User's word.
 - **Private notes:** `docs/HANDOFF_CURRENT.md` (the lead maintainer's current
   state; lanes never edit it, their commits and reports are the record; the old

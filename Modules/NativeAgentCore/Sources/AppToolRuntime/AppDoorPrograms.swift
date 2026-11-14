@@ -38,8 +38,8 @@ extension AppToolExecutor {
     func doorScript(_ source: String, input: [String: JSONValue], surface: String, turn: Turn, execution: AppActionExecution) async -> JSONValue {
         guard let perform = execution.perform else {
             return Self.doorRefusal("door_unavailable",
-                "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing ran.",
-                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
+                "This call did not come from inside a chat turn, so it has no gate to pass. Nothing ran.",
+                remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
         }
         let session = input["__session_id"]
         let preview = input["preview"] == .bool(true)
@@ -71,8 +71,8 @@ extension AppToolExecutor {
     func doorMany(_ entries: [JSONValue], base: [String: JSONValue], turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
         guard let perform = execution.perform else {
             return Self.doorRefusal("door_unavailable",
-                "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing ran.",
-                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
+                "This call did not come from inside a chat turn, so it has no gate to pass. Nothing ran.",
+                remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
         }
         guard (1...AppScriptRunner.actionLimit).contains(entries.count) else {
             let advice = try Self.doorBatchAdvice(.array(entries), input: base.merging(["actions": .array(entries)]) { _, entries in entries })
@@ -137,11 +137,11 @@ extension AppToolExecutor {
                 handedBack = true
                 break
             }
-            var call = base.filter { $0.key != "expected_version" && !Self.doorDeedKeys.contains($0.key) }
+            var call = base.filter { $0.key != "expected_version" && !ToolNameAliases.appDeedKeys.contains($0.key) }
             do {
                 guard case .object(let fields) = entry else {
                     // Suggest only the refused entry: earlier entries may already have changed something, so the deed's closing words are not carried.
-                    let advice = try Self.doorBatchAdvice(entry, input: base.filter { !Self.doorDeedKeys.contains($0.key) }
+                    let advice = try Self.doorBatchAdvice(entry, input: base.filter { !ToolNameAliases.appDeedKeys.contains($0.key) }
                         .merging(["actions": entry]) { _, entry in entry })
                     let reply = ToolResult(Self.doorRefusal("invalid_actions", "Each entry is one app call, an object. Nothing ran.",
                         remedy: "correct_arguments", "Write this entry using try_instead's declared shape; earlier entries keep their receipts.",
@@ -157,6 +157,8 @@ extension AppToolExecutor {
                 let expect = call.removeValue(forKey: "expect")
                 let cleanup = call.removeValue(forKey: "cleanup") == .bool(true)
                 call.removeValue(forKey: "as")
+                // The step is read once, as its own app call would be, before its found values or its read-only check look at args.
+                call = ToolNameAliases.doorCall("app", call)
                 // A previewed list previews every entry; an entry's own preview:false never runs one.
                 if base["preview"] == .bool(true) { call["preview"] = .bool(true) }
                 let action = (try await AppActions.resolvedAction(Self.doorText(call["action"]),

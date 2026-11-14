@@ -1,4 +1,5 @@
 import Foundation
+import DeviceSync
 import NativeAgentCore
 import PersistenceCore
 import MacControl
@@ -19,7 +20,7 @@ public struct ConnectorActionStatusEvidence: Sendable {
 
 public protocol ConnectorActionPlatform: Sendable {
     func spotlight(input: [String: JSONValue], turn: Turn) async throws -> MacControlResult
-    func postMessage(title: String, body: String, turn: Turn) async -> [String: JSONValue]
+    func postMessage(_ note: NativeAgentNotificationDefaults.Note, turn: Turn) async -> [String: JSONValue]
     func macAssistantStatusClient() -> any MacAssistantStatusClient
     func statusEvidence(actionID: String) async throws -> ConnectorActionStatusEvidence?
     func runGit(_ arguments: [String], repoRoot: URL, timeout: TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String)

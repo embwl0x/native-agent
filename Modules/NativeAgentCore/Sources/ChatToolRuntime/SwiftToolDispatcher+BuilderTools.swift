@@ -141,7 +141,7 @@ extension SwiftToolDispatcher {
             "effect": .string("none"),
             "tool": .string(tool),
             "detail": .string(
-                "Trust Center Full Mac file_ops_allowed must be active to dispatch shell-class tools. Toggle Full Mac in the Trust Center."
+                "Trust Center Full Mac file_ops_allowed must be active to run shell-class actions. Toggle Full Mac in the Trust Center."
             ),
         ])
     }

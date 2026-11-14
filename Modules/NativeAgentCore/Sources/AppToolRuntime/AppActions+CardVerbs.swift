@@ -15,7 +15,7 @@ extension AppToolExecutor {
     /// Whether the person decided the `app` call that reached `tool`'s handler with `input`: the person's act names an action this tool runs,
     /// and the door made exactly `input` from that act's arguments (the door's own `__` keys aside). This recognizes taps only;
     /// approval decisions also admit an authenticated person-message through `ApprovalExecution.decisionProvenance`.
-    static func personDecided(tool: String, input: [String: JSONValue], turn: Turn) -> Bool {
+    public static func personDecided(tool: String, input: [String: JSONValue], turn: Turn) -> Bool {
         guard let act = turn.personAct, act.tool == "app", let id = act.input["action"]?.stringValue,
               let binding = AppActionBinding.declaredBinding(id), binding.tool == tool,
               case .object(let args) = act.input["args"] ?? .object([:]),

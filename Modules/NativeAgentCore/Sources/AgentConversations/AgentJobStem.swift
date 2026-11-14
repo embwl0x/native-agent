@@ -84,7 +84,10 @@ public enum AgentJobs {
             }
         }
         let now = Date()
-        let job = AgentJob(id: id, lifeID: life, contact: peer.id, name: peer.name, brief: brief, place: place, worktree: worktree,
+        // The commissioning turn's peer steering stays on the job, so its return is still a peer's work and never a turn of her own.
+        let job = AgentJob(id: id, lifeID: life, contact: peer.id, name: peer.name, brief: brief,
+            peers: limits.peers.isEmpty ? nil : limits.peers, elevated: limits.elevated.isEmpty ? nil : limits.elevated,
+            fileAccess: limits.fileAccess, place: place, worktree: worktree,
             envelope: envelope, done: done, desk: desk?.isEmpty == false ? desk : nil, state: .working, deliverables: [],
             commission: .init(session: session, surface: surface), startedAt: now, updatedAt: now)
         let store = AgentJobStore(dataRoot: dataRoot)
@@ -118,7 +121,7 @@ public enum AgentJobs {
             return failed(words, effects: "unknown", job: job.id)
         }
         await AgentJobFlights.shared.fly(job.id, runner: runner) {
-            await consume(job.id, events, dataRoot: dataRoot, register: register)
+            await consume(job.id, events, dataRoot: dataRoot, runner: runner, register: register)
         }
         var receipt = view(job, jobs: Result { try store.jobs() }, dataRoot: dataRoot)
         receipt["status"] = .string("accepted")
@@ -466,13 +469,28 @@ public enum AgentJobs {
 
     // MARK: The flight
 
-    static func consume(_ id: String, _ events: AsyncThrowingStream<JobEvent, Error>, dataRoot: URL, register: @escaping AgentJobRegistrar) async {
+    static func consume(_ id: String, _ events: AsyncThrowingStream<JobEvent, Error>, dataRoot: URL, runner: (any JobRunner)? = nil,
+                        register: @escaping AgentJobRegistrar) async {
         let store = AgentJobStore(dataRoot: dataRoot)
         var outcome: JobOutcome?
         do {
             for try await event in events {
                 switch event {
-                case .started(let session): keep(id, store: store, dataRoot: dataRoot) { $0.session = session }
+                case .started(let session):
+                    keep(id, store: store, dataRoot: dataRoot) { $0.session = session }
+                    // A stop that landed while the door was still starting found no run to end. Its session is known only now, so it is
+                    // ended here: her stop owns the record, and the organ must not go on working behind it.
+                    do {
+                        if try store.job(id).stoppedByHer == true {
+                            if let runner {
+                                do { try await runner.cancel(session: session) }
+                                catch { owe(id, "stop a job that was stopped while it started", error, store: store, dataRoot: dataRoot) }
+                                return
+                            }
+                            // Her own line has no session to cancel: ending this flight ends its producer at the stream's next read.
+                            await AgentJobFlights.shared.take(id)?.task.cancel()
+                        }
+                    } catch { owe(id, "read a job as it started", error, store: store, dataRoot: dataRoot) }
                 case .working(let note):
                     keep(id, store: store, dataRoot: dataRoot) { $0.state = .working; $0.request = nil; $0.note = String(note.prefix(500)) }
                 case .needsYou(let request): keep(id, store: store, dataRoot: dataRoot) { $0.state = .needsYou; $0.request = request }

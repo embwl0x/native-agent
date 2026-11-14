@@ -4,11 +4,12 @@ import DeviceSync
 // Blueprint: | `AppToolNotificationInput.swift` | `NativeAgentNotificationDefaults`: `parseInput` |
 
 extension NativeAgentNotificationDefaults {
-    /// All notification entry points share message keys and blank/missing refusals through this parser.
+    /// All notification entry points share message keys and blank/missing refusals through this parser; what it reads (title, subtitle, message) is
+    /// the one value every delivery carries.
     public static func parseInput(
         _ input: [String: JSONValue],
         toolName: String
-    ) throws -> (title: String, message: String) {
+    ) throws -> Note {
         let resolvedTitle = Self.title(input["title"]?.scalarText)
         // Refusals distinguish a blank message body from a missing one.
         guard let message = input["message"]?.scalarText else {
@@ -17,7 +18,7 @@ extension NativeAgentNotificationDefaults {
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NotificationInputError.emptyMessage(toolName)
         }
-        return (resolvedTitle, message)
+        return Note(title: resolvedTitle, subtitle: input["subtitle"]?.scalarText, message: message)
     }
 }
 

@@ -6,7 +6,7 @@
 
 **An agent is a who. A who has doors. Every word to a who is owed until that who receives it.**
 
-- **Who.** One saved contact: a stable id, the name the person or they gave it, and the history between them. Nothing else establishes identity. A product name, a vendor, a host, a bridge route or a lane name never makes two contacts one, and never makes a contact anyone else. On a stranger's Mac, Claude Code is "Claude Code". On User's Mac, "Claude" is a who that they named, reached through Claude Code's and Claude Desktop's doors.
+- **Who.** One saved contact: a stable id, the name the person or they gave it, and the history between them. Nothing else establishes identity. A product name, a vendor, a host, a bridge route or a lane name never makes two contacts one, and never makes a contact anyone else. On a stranger's Mac, Claude Code is "Claude Code". On User's Mac, "the builder agent" is a who that they named, reached through Claude Code's and Claude Desktop's doors.
 - **Door.** One authenticated way to reach a who: a recipe route (MCP entry, ACP launch, desktop chat, A2A endpoint, bot routine), its own credential, and the recipe's two declarations: how the door **wakes** its agent (none, open the app, run a command, start an ACP session) and what counts as **acceptance** (the agent read it through its door, answered, or acknowledged it). Joining several doors into one who is an explicit association written on the contact by the person or by them; there is no implicit one. Authority lives on a door: a call is elevated only when it authenticates with that door's own key and the person granted that door. Associating a new door with a trusted who grants it nothing. A door may instead be one of their own abilities (`ability` on the contact): a message runs it with the text, the contact, the exchange and the recent talk, and it answers as that contact with `agent.reply`, which settles the exchange as any route's answer does; the who, its thread, trust and replay claims stay the contact's.
 - **Owed until received.** A message is an experience that owes `accept` to its who. It settles when a door's acceptance evidence arrives; a send, a queue write or a launch never settles it. While it is owed, their home shows it as waiting on that who, with the lever: their next call (wake it through a door that can) or the person's exact tap (open that app) when no door can. A who with no door that can deliver says so with the owner (the recipe, the vendor) and what would change it.
 - **Found as it is.** A host is found the way the person's own Mac finds it: its app by bundle or markers, its command line through the person's own login PATH and the recipe's paths, resolved once into one installation binding that discovery, connect and launch share. Installation events settle together before comparing the candidate programs, bundle locations, app metadata and executables; unrelated directory changes keep the binding and do not scan running programs. Explicit discovery still refreshes immediately. An update keeps the who, its doors' keys, the person's grants and authored recipe changes; only owned configuration is rewritten.
@@ -44,7 +44,7 @@ gated contact-send owner and shows its actual delivery state. Saved contacts use
 their peer identity; discovery candidates are rows without a saved contact.
 
 
-Agent talks to agents through their one always-on `app` tool. `app {}` is home,
+The agent talks to agents through their one always-on door, `app`. `app {}` is home,
 where they left off; `app {"page":"agents"}` lists agent actions.
 `AppActions+Declarations.swift` declares them. Retired standalone tool calls are
 refused with a translated `app` call; they do not execute.
@@ -558,7 +558,9 @@ life normalization still commits when it differs from saved state.
 Builder, MCP and A2A ingress share `AgentContactTasks` admission, record-owned
 execution, output settlement and retained receipts. Builder formatting remains
 at its door. Enqueue acknowledgment (30 seconds) and reply (600 seconds) bounds
-end only the HTTP wait: a late enqueue still admits its original run. The bridge
+end only the HTTP wait: a late enqueue still admits its original run. `enqueued` is answered once the task's worker has
+saved the input in its conversation and bound its run to the task (or a waiting conversation took it inline); a message
+that failed before it was saved returns its failure instead. The bridge
 reads the app's actual selected chat; recent activity cannot select a chat.
 Discovery publication must commit before readiness, admission and recovery begin;
 its file failure is exposed in listener health. HTTP JSON, SSE and gRPC record
@@ -622,10 +624,12 @@ Peer turns retain agent authorship and use the shared turn engine in Core
 (`EngineRuntime` / `ChatTurnRuntime`). Connection identity and conversation
 identity do not grant owner authority.
 
-Full Mac admits Agent's autonomous actions. macOS privacy permission resets
+Full Mac admits the agent's autonomous actions. macOS privacy permission resets
 still ask the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
 Agents enabled in Trust → Connected agents carry the owner's authority on
-authenticated turns; ordinary Trust and domain checks still apply.
+authenticated turns; ordinary Trust and domain checks still apply. A contact at
+the table reads the Desk without a turn and gains no authority by it
+([the table](#the-table)); their line for it in each turn's contacts says so.
 Routine peer replies are not sends in the owner's name. `PeerTurnEffectPolicy`,
 TrustCenter and the action's own gates enforce these boundaries.
 
@@ -786,9 +790,48 @@ row identified, including in continuity; it cannot disappear from an `ok` feed.
 
 External MCP clients use `/agent/mcp`, or the bundled `nativeagent-link`
 executable with argument `mcp` for stdio. This protocol exposes
-`agent_message` and `agent_reply`: these are external MCP names, not additional
-tools in Agent's turn. The message call can wait for an answer; an `enqueued`
-result requires recovery through `agent_reply` with the returned IDs.
+`agent_message`, `agent_reply` and `agent_desk`: these are external MCP names, not
+additional tools in the agent's turn. The message call can wait for an answer; an
+`enqueued` result requires recovery through `agent_reply` with the returned IDs.
+
+#### The table
+
+A contact the person has brought to the table reads the Desk itself; it changes
+nothing, and to change anything it asks their with `agent_message`. Bringing a
+contact to the table is the person's lever, per contact, off until set:
+`readsDesk` on the contact's record in `agents/peers.json`, written only by
+`AgentPeerStore.setReadsDesk` through the lower-only setting
+`agent.reads_desk_<contact id>`. Their call may take a contact away from the table;
+their call to bring one asks the person on a card, and the person's tap on
+Connectors → the contact → **Reads my Desk** makes it. Only an MCP host or ACP
+contact, which calls the MCP tools with its own key (`canReadTable`), has the
+lever.
+
+`agent_desk` takes `desk_read`'s own arguments and returns its result unchanged,
+the reading they have (`SwiftToolDispatcher.tableRead`). With `piece` set to a
+`make_ref` from an item's `on_the_table`, it reads that piece: a document or page
+(Markdown, plain text, CSV, HTML, SVG) as its words, 16,000 characters per read
+with `text_offset`, anything else as its title, kind, version and size, never its
+bytes. A document or page over `MakePreviewFace.wordsLimit` (2 MB, the bound `make.add`
+takes as content) reads as its facts, judged by its file size before any byte is
+loaded. Only a piece on the table is readable: one laid on a board item that is
+not finished (`DeskPiece.onTable`, what the Desk page draws as **On the table**);
+any other Make ref is refused as `not_on_the_table`. A contact not at the table
+gets `not_at_table`, which says to ask their and that they asks the person.
+
+The record of a read is the contact's last read, `lastRead` on its record beside
+the lever: when, and what (the Desk, or a piece's `make_ref` and title).
+`AgentPeerStore.recordTableRead` writes it under the store lock after the read
+and before its words go back, only while the lever is still on; a lever turned
+off meanwhile returns `not_at_table`, and a record that cannot be written returns
+no words. A refused read goes back only after the same lever check. Taking the
+contact away removes `lastRead` with `readsDesk`. Connectors → the contact →
+**Reads my Desk** says "Last read my Desk today at 3:04 PM" (or the piece's
+title), and their line for the contact says the same. The tool carries held
+messages like the other two. Connect's host allowance
+covers `agent_message` and `agent_reply` only, so the host's own approval applies
+to `agent_desk`. A2A peers, NativeAgent peer apps and Grok Bot's link commands
+call in by message only; they ask their, and they answers.
 
 MCP `agent_message` requires `text` and a caller-generated canonical UUID
 `request_id`, the at-most-once claim key. For example, its arguments are:

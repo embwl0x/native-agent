@@ -64,7 +64,7 @@ public enum VerifiedImageRead {
         guard reply.said("ok"), case .object(var fields) = reply.payload else { return reply.payload }
         fields["source_width"] = .int(Int64(thumbnail.sourceWidth))
         fields["source_height"] = .int(Int64(thumbnail.sourceHeight))
-        fields["note"] = .string("Actual image follows this tool result. First frame, oriented and bounded to 2048 pixels; not OCR or a text description.")
+        fields["note"] = .string("Actual image follows this result. First frame, oriented and bounded to 2048 pixels; not OCR or a text description.")
         return .object(fields)
     }
 }

@@ -205,7 +205,7 @@ enum ArtifactContext {
     private static func evidence(_ message: ChatMessage, sessionID: String, dataRoot: URL) -> JSONValue {
         let row = object(message.extras)
         let display = SwiftToolDispatcher.chatHistoryDisplayEvidence(
-            message.role == "tool" ? "Retained tool receipt; open source for details." : safeText(message.content),
+            message.role == "tool" ? "Retained call receipt; open source for details." : safeText(message.content),
             role: message.role, row: row)
         var value: [String: JSONValue] = [
             "session_id": .string(sessionID), "role": .string(message.role),

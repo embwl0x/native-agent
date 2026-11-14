@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ContextMemoryLead.swift` | `ContextMemoryLead`: rendered age, roots and source |
+// Blueprint: | `ContextMemoryLead.swift` | `ContextMemoryLead`: rendered age at the turn's pinned instant, roots and source |
 
 /// Freeze time and calendar per turn so midnight and rerendering cannot change age tags. Without a turn clock, `.unstamped` claims no age.
 public struct ContextRenderClock: Sendable, Equatable {
@@ -19,12 +19,12 @@ public struct ContextRenderClock: Sendable, Equatable {
     )
 
     /// Capture the user's time zone once per turn, never per atom. Fixed Gregorian/POSIX formatting keeps month names and root dates independent of
-    /// host locale.
+    /// host locale. Ages read the turn's own instant, never the selection bucket's end, which can already be tomorrow in a day's last minute.
     public static func turn(
-        _ need: NeedSignal,
+        _ prepared: ContextPreparedTurn,
         timeZone: TimeZone = .current
     ) -> ContextRenderClock {
-        ContextRenderClock(now: need.evaluationTime, calendar: MemoryRoot.calendar(in: timeZone))
+        ContextRenderClock(now: prepared.turnTime, calendar: MemoryRoot.calendar(in: timeZone))
     }
 }
 

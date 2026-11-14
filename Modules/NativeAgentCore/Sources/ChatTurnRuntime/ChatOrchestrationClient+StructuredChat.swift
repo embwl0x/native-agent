@@ -215,7 +215,7 @@ extension SwiftNativeChatOrchestrationClient {
 
         // Context-build failures are saved and rethrown; one bound turn ID keeps assembly and execution traces correlated.
         let historyStart = DispatchTime.now().uptimeNanoseconds
-        let threadedCtx = try await TurnTraceContext.$bus.withValue(turnTraceBus) {
+        let built = try await TurnTraceContext.$bus.withValue(turnTraceBus) {
             try await TurnTraceContext.$turnId.withValue(boundTurnId) {
                 try await engine.buildTurnContextWithHistory(
                     surface: surface,
@@ -227,10 +227,16 @@ extension SwiftNativeChatOrchestrationClient {
                     excludeHistoryRunId: runId,
                     imageBlocks: imageBlocks,
                     queryUserMessage: attachmentInput.queryUserMessage,
+                    startedNs: historyStart,
                  turn: turn, work: work)
             }
             }
-        preparationTrace.record(.historyContext, since: historyStart)
+        let historyEnd = DispatchTime.now().uptimeNanoseconds
+        let threadedCtx = built.context
+        // The builder's summary covers historyStart up to its close; the rest is the hop back onto this actor.
+        preparationTrace.record(.historyContext, since: historyStart, until: historyEnd)
+        preparationTrace.record(.historyBuild, since: historyStart, until: built.closedNs, of: .historyContext)
+        preparationTrace.record(.historyContextReturn, since: built.closedNs, until: historyEnd, of: .historyContext)
         let cognitionJoinStart = DispatchTime.now().uptimeNanoseconds
         let cognitiveProjection = try await cognitiveProjectionTask
         preparationTrace.record(.cognitionJoin, since: cognitionJoinStart)
@@ -239,7 +245,7 @@ extension SwiftNativeChatOrchestrationClient {
             to: threadedCtx,
             projection: cognitiveProjection?.projection
         )
-        // `app` is the agent's one tool (docs/TOOL_LOADING.md): the turn offers it alone.
+        // `app` is the agent's one door (docs/ONE_DOOR.md): the turn offers it alone.
         let providerCtx = Self.applyLazyToolFilter(to: threadedCtxWithCognition, activeTools: [])
         preparationTrace.record(.cognitiveAppend, since: appendStart)
         _ = TurnTraceContext.$bus.withValue(turnTraceBus) {
@@ -381,7 +387,8 @@ extension SwiftNativeChatOrchestrationClient {
             }
         })
         } catch {
-            if case .streamCancelled = error as? TurnEngineError { outcome = .failure(CancellationError()) }
+            if ChatCancelFlag.readFailure(cancelFlagPath) != nil { outcome = .failure(CancellationError()) }
+            else if case .streamCancelled = error as? TurnEngineError { outcome = .failure(CancellationError()) }
             else { outcome = .failure(error) }
         }
         // The effect has ended. Capture the settlement's identity explicitly: settle does not inherit task locals, and Stop cannot cancel this work.
@@ -399,6 +406,7 @@ extension SwiftNativeChatOrchestrationClient {
                         message: message, sessionId: resolvedSession, runId: runId, turnId: boundTurnId, replyRowID: replyRowID,
                         heardID: heardID, model: model, reasoningEffort: reasoningEffort, persona: persona,
                         surface: surface, suppressUserAppend: suppressUserAppend, chosenPaths: replyChoices.paths,
+                        cancelFlagPath: cancelFlagPath,
                         outputMilestoneGate: outputMilestoneGate, noticeSink: noticeSink,
                         turn: settlementTurn, work: work)
                     ChatCancelFlag.finish(cancelFlagPath)

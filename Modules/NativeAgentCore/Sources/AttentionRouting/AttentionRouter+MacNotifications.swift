@@ -22,7 +22,7 @@ public enum NativeAgentNotificationRoute {
 
 extension NativeAgentNotifications {
     private static func postAccepted(
-        title: String, body: String, userInfo: [String: String], soundName: String?, identifier: String
+        title: String, subtitle: String?, body: String, userInfo: [String: String], soundName: String?, identifier: String
     ) async -> NativeAgentNotificationPostResult {
         let notificationTitle = NativeAgentNotificationDefaults.title(title)
         var settings = await notificationSettings()
@@ -56,7 +56,7 @@ extension NativeAgentNotifications {
                 error: CancellationError().localizedDescription)
         }
         let addError = await addNotification(
-            identifier: identifier, title: notificationTitle, body: body,
+            identifier: identifier, title: notificationTitle, subtitle: subtitle, body: body,
             category: NativeAgentNotificationActions.category(for: userInfo),
             userInfo: userInfo, soundName: soundName
         )
@@ -115,7 +115,7 @@ public enum NativeAgentNotifications {
     }
 
     /// Bind reply routing when posting so a later visible conversation cannot receive another turn's answer.
-    public static func postMessage(title: String, body: String, soundName: String? = nil, router: AttentionRouter,
+    public static func postMessage(title: String, subtitle: String? = nil, body: String, soundName: String? = nil, router: AttentionRouter,
                                    turn: Turn?, deadline _: ContinuousClock.Instant?) async -> NativeAgentNotificationPostResult {
         let id = "mac_notify:" + UUID().uuidString.lowercased()
         guard !Task.isCancelled else {
@@ -124,7 +124,7 @@ public enum NativeAgentNotifications {
         let finished = ContinuationOnce<NativeAgentNotificationPostResult>()
         let task = Task {
             do {
-                let matter = Matter(id: id, form: .words, from: "mac_notify", title: title, summary: body,
+                let matter = Matter(id: id, form: .words, from: "mac_notify", title: title, subtitle: subtitle, summary: body,
                     open: turn?.verifiedSessionID.map { "chat:" + $0 },
                     evidence: soundName.map { [.init(source: soundEvidence, id: $0)] } ?? [])
                 let outcome = try await router.tell(matter, reach: .pinned(.mac, from: nil), turn: turn)
@@ -180,7 +180,7 @@ public enum NativeAgentNotifications {
     }
 
     /// The OS callback owns the post's verdict and durable receipt; cancelling observation cannot retract an accepted banner.
-    static func banner(title: String, body: String, userInfo: [String: String], soundName: String? = nil, identifier: String,
+    static func banner(title: String, subtitle: String? = nil, body: String, userInfo: [String: String], soundName: String? = nil, identifier: String,
                        dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> NativeAgentNotificationPostResult {
         guard !Task.isCancelled else {
             return .from(.notDelivered(reason: "The banner was cancelled before admission"), id: identifier)
@@ -211,7 +211,7 @@ public enum NativeAgentNotifications {
                         return
                     }
                 }
-                var result = await postAccepted(title: title, body: body, userInfo: info, soundName: sound, identifier: identifier)
+                var result = await postAccepted(title: title, subtitle: subtitle, body: body, userInfo: info, soundName: sound, identifier: identifier)
                 if result.posted, userInfo["eventId"] == identifier {
                     let recorded: Result<Void, Error> = await settle {
                         do {
@@ -249,11 +249,12 @@ public enum NativeAgentNotifications {
     }
 
     public static func addNotification(
-        identifier: String, title: String, body: String, category: String,
+        identifier: String, title: String, subtitle: String? = nil, body: String, category: String,
         userInfo: [String: String], soundName: String?
     ) async -> String? {
         let content = UNMutableNotificationContent()
         content.title = title
+        if let subtitle { content.subtitle = subtitle }
         content.body = body
         content.categoryIdentifier = category
         content.sound = soundName.flatMap {

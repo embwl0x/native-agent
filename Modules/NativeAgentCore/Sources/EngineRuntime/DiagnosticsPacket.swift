@@ -7,6 +7,25 @@ import PersistenceCore
 // Blueprint: | `DiagnosticsPacket.swift` | Diagnostics' packet for `native-diagnostics`: measured verdicts and row keys, each action calling its Doctor verb |
 
 extension NativeAgentEngine {
+    /// Why a run did not finish, as one plain sentence: its error's own words without the error type's wrapper, or the reason its report names.
+    static func runCause(_ run: RunRecord) -> String? {
+        var words = run.error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if words.isEmpty, let data = run.output?.data(using: .utf8),
+           let report = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let reason = report["reason"] as? String {
+            words = reason.replacingOccurrences(of: "_", with: " ")
+        }
+        // `someFailure("the words")` reads as the words.
+        if let open = words.range(of: "(\""), words[..<open.lowerBound].allSatisfy({ $0.isLetter || $0.isNumber }) {
+            words = String(words[open.upperBound...]).replacingOccurrences(of: "\\'", with: "'")
+            if words.hasSuffix("\")") { words.removeLast(2) }
+        }
+        // A bare code (`subprocess_exit_1`) reads as words.
+        if !words.contains(" ") { words = words.replacingOccurrences(of: "_", with: " ") }
+        guard let line = words.split(whereSeparator: \.isNewline).first, !line.isEmpty else { return nil }
+        let sentence = line.range(of: ": ").map { line[..<$0.lowerBound] } ?? line[...]
+        return String((sentence.count >= 24 ? sentence : line[...]).prefix(160))
+    }
+
     /// What `native-diagnostics` draws Diagnostics from. Each status arrives with the stem's bucket for it, each check with whether it is adverse
     /// and safely repairable; the part words, groups and orders them. Lists the page shows in part are bounded tails: the last 8 loaded activity
     /// events in record order and the first 15 runs of the ledger. The read moment is the epoch.
@@ -67,7 +86,10 @@ extension NativeAgentEngine {
         var recentRuns: [JSONValue] = []
         for run in runs.rows.prefix(15) {
             keys[run.id] = .object(["open": .string("page:diagnostics/" + run.id)])
+            // A run says what it was and, when it did not finish, why: the first line of its own error or skip note.
+            let cause = ["succeeded", "completed"].contains(run.status.lowercased()) ? nil : Self.runCause(run)
             recentRuns.append(.object(["id": .string(run.id), "kind": .string(run.kind), "status": .string(run.status),
+                "name": .string(RunKindVocabulary.displayName(run.kind, on: .mac)), "cause": faceText(cause),
                 "model": faceText(run.model), "durationSeconds": run.durationSeconds.map(JSONValue.double) ?? .null,
                 "createdAt": .string(run.createdAt), "timeReadable": .bool(UserDisplayFormatters.parseISOTimestamp(run.createdAt) != nil)]))
         }

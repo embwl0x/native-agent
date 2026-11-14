@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import ChatTurnContracts
 import AgentWorkspace
+import Desk
 import MemoryV2
 import ProviderRouting
 import ToolRegistry
@@ -71,7 +72,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(name: "desk_add_item", toolClass: .write, capabilities: ["ledger_write", "tool_call"],
                 description: """
-                    Add a Desk item: kind=watch|plan|project|gh|standing, project bucket and short title; optional parent nesting. For delegation, \
+                    Add a Desk item: a short title; optional kind=watch|plan|project|gh|standing, project bucket and parent nesting. For delegation, \
                     set assignee and lane_of (coordinating Desk item) as fields, not prose. A live same-title/project/parent item returns \
                     disposition=existing; allow_duplicate=true is only for intentional equivalents. Returns status=ok, created, disposition, stable \
                     handle and view alias (\"2\", \"2.1\").
@@ -79,8 +80,11 @@ extension BuiltInToolSchemaFactory {
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("kind", ToolSchema.enumStringSchema(["watch", "plan", "project", "gh", "standing"],
-                            "Item kind: watch | plan | project | gh | standing.")),
-                        ("project", ToolSchema.strSchema("Project bucket this item belongs to.")),
+                            "Optional item kind: watch | plan | project | gh | standing; left out, \(DeskItem.tasksKind.rawValue), as a person's task.")),
+                        ("project", ToolSchema.strSchema("""
+                            Optional project bucket this item belongs to. Left out, the item goes under its parent's project, or with no parent under \
+                            \(DeskItem.tasksProject), where the Desk files a task the person starts.
+                            """)),
                         ("title", ToolSchema.strSchema("Short item title.")),
                         ("until", ToolSchema.strSchema("Optional yyyy-MM-dd or ISO timestamp to defer the item in this same add call.")),
                         ("defer", ToolSchema.strSchema("Alias for until; if both are supplied, they must agree.")),
@@ -97,7 +101,7 @@ extension BuiltInToolSchemaFactory {
                             Explicitly create a second equivalent live item instead of reusing the existing owner. Default false.
                             """)),
                     ],
-                    required: ["kind", "project", "title"]
+                    required: ["title"]
                 )
             ),
             requestedSchema(name: "desk_set_status", toolClass: .write, capabilities: ["ledger_write", "tool_call"],
@@ -155,9 +159,12 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(name: "desk_wait", toolClass: .write, capabilities: ["ledger_write", "tool_call"],
                 description: """
-                    Put a Desk item in 'waiting on <person>' with one call: handle, on (for example User or owner), and optional note. A person wait \
-                    appears in the Desk status; owner waits contribute to the page's waiting-on-owner count. on also accepts an observed Desk \
-                    handle/number or experience id (card, message, delivery, repair); a list waits on those dependencies until they settle. Unknown \
+                    Put a Desk item in 'waiting on …' with one call: handle, on (a name such as User or owner, or what you are waiting for said \
+                    in a sentence), and optional note. The wait appears in the Desk status; owner waits contribute to the page's \
+                    waiting-on-owner count. A wait on a name, a sentence or a conversation is a status only: nothing ends it but a status change. on also accepts an observed Desk handle/number or experience id (card, \
+                    message, delivery, repair); a list waits on those dependencies; such a wait is released by itself when what it names settles. \
+                    To be told when a contact answers, wait on the wait_on id your send to them returned (thread.wait_on); a send held for a \
+                    contact that collects its messages returns none, because its answer comes as a message of its own. Unknown \
                     identifier-shaped inputs are refused.
                     """,
                 parametersJSON: ToolSchema.params(
@@ -165,7 +172,7 @@ extension BuiltInToolSchemaFactory {
                         ("handle", ToolSchema.strSchema("The item's handle or visible Desk number.")),
                         ("on", ToolSchema.obj([
                             ("anyOf", .array([
-                                ToolSchema.strSchema("A person's or agent's name, a conversation id (its next message), or one observed Desk/experience id."),
+                                ToolSchema.strSchema("A name, a sentence saying what you wait for, or a conversation id (a status only), or one observed Desk/experience id (released when it settles)."),
                                 ToolSchema.obj([("type", .string("array")), ("items", ToolSchema.strSchema("An observed Desk/experience id.")), ("minItems",
                                     .int(1))]),
                             ])),
@@ -202,7 +209,8 @@ extension BuiltInToolSchemaFactory {
                 description: """
                     Attach a reference to a Desk item. ref_kind selects the shape and which fields apply: file (path[,line,label]) | commit \
                     (sha[,repo,label,status]) | gh_issue (repo,number[,title,status]) | gh_pr (repo,number[,title,status,checks]) | url \
-                    (url[,title]) | agent (name[,handoff_id,session_id]) | approval (id[,status]) | trace (id[,trace_kind]) | note (text).
+                    (url[,title]) | agent (name[,handoff_id,session_id]) | approval (id[,status]) | trace (id[,trace_kind]) | note (text). \
+                    A url of make:<ref> lays that made thing on the item as a piece, its title the label the Desk shows.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [
@@ -319,11 +327,13 @@ extension BuiltInToolSchemaFactory {
                     two); dotted numbers (\"3.1\")/desk_ handles name existing items. Bare top-level numbers are ambiguous here; link them \
                     afterward with desk.blocked_on. parent grafts children onto an existing item, ignoring project/title/kind. Returns the numbered \
                     plan and ready children. Same-kind/project/title live campaigns return status=\"existing\", adding only missing steps. \
-                    Mid-batch refusal returns status=\"partial\" and created items.
+                    Mid-batch refusal returns status=\"partial\" and created items. One call lays out a whole plan, and the Desk page draws \
+                    an item with steps as a board: a column per state (Now, Next, Waiting, Done), each step a card whose Start and Done are \
+                    desk.set_status and desk.close.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("project", ToolSchema.strSchema("Project bucket for a new plan's parent item. Required unless parent is given.")),
+                        ("project", ToolSchema.strSchema("Optional project bucket for a new plan's parent item; left out, \(DeskItem.tasksProject).")),
                         ("title", ToolSchema.strSchema("Title for the new plan's parent item. Required unless parent is given.")),
                         ("kind", ToolSchema.enumStringSchema(["watch", "plan", "project", "gh", "standing"],
                             "Optional parent kind (default plan): watch|plan|project|gh|standing.")),
@@ -378,14 +388,14 @@ extension BuiltInToolSchemaFactory {
             requestedSchema(name: "desk_open_pursuit", toolClass: .write, capabilities: ["ledger_write", "tool_call"],
                 description: """
                     The only route to a self-authored Desk pursuit (origin=agent): an answerable question for ~6–12 work sessions. Required: \
-                    project, title, first-person why, done_looks_like, abandon_condition and typed evidence (shapes below). Needs ≥1 non-friction \
+                    title, first-person why, done_looks_like, abandon_condition and typed evidence (shapes below). Needs ≥1 non-friction \
                     source; felt_salience needs ≥2 dates; chat_observation needs distinctDays≥2. Optional private_name, summary, max_sessions \
                     (default 12, cap 24), max_days (default 10, cap 21). Returns handle/alias; on cap or dossier failure, use the cause and \
                     supplied remedy.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("project", ToolSchema.strSchema("Project bucket this pursuit belongs to.")),
+                        ("project", ToolSchema.strSchema("Optional project bucket this pursuit belongs to; left out, \(DeskItem.workshopProject).")),
                         ("title", ToolSchema.strSchema("Short pursuit title.")),
                         ("why", ToolSchema.strSchema("First-person: why this is worth your sessions.")),
                         ("done_looks_like", ToolSchema.strSchema("A question that can end — answerable in ~6–12 work sessions.")),
@@ -424,7 +434,7 @@ extension BuiltInToolSchemaFactory {
                         ("max_days", ToolSchema.intSchema("Optional day bound (default 10, cap 21).")),
                         ("summary", ToolSchema.strSchema("Optional one-line summary.")),
                     ],
-                    required: ["project", "title", "why", "done_looks_like", "abandon_condition", "evidence"]
+                    required: ["title", "why", "done_looks_like", "abandon_condition", "evidence"]
                 )
             ),
             requestedSchema(name: "desk_work_log", toolClass: .write, capabilities: ["ledger_write", "tool_call"],

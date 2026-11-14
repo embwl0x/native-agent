@@ -231,10 +231,7 @@ private struct ChatTranscriptRoom: View {
     private var document: some View {
         TranscriptDocumentView(sessionID: sessionID, bottomInset: clearance.clearance, handle: handle)
             .ignoresSafeArea(.container, edges: .bottom)
-            .environment(\.transcriptOpenSettings) { [inlineCards, appModel] in
-                do { try inlineCards.openPage(.settings) }
-                catch { appModel.setFailureStatus(error, action: "open Settings") }
-            }
+            .environment(\.transcriptOpenSettings) { [inlineCards] in inlineCards.openPage(.settings) }
     }
 
     private var emptyRoom: some View {
@@ -245,10 +242,7 @@ private struct ChatTranscriptRoom: View {
                     case .loading: ProgressView("Checking providers…")
                     case .unavailable(let reason): NativeEmptyState(title: "Providers unavailable", detail: reason)
                     case .needsConnection:
-                        ChatProviderConnectEmptyState {
-                            do { try inlineCards.openPage(.providers) }
-                            catch { appModel.setFailureStatus(error, action: "open Providers") }
-                        }
+                        ChatProviderConnectEmptyState { inlineCards.openPage(.providers) }
                     case .ready:
                         ShellEmptyRoom(personaName: appModel.agentDisplayName) { suggestion in
                             ChatEmptyStateSuggestionAction.apply(suggestion, model: appModel, activeSessionID: sessionID)

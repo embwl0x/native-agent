@@ -249,6 +249,7 @@ extension NativeAgentEngine {
     private static func installBundledParts(dataRoot: URL, resources: URL) async {
         let abilities = AbilityStore(dataRoot: dataRoot)
         var failures: [String] = []
+        var moved: [(id: String, from: String, to: String)] = []
         var currentSeeds = 0, preparedAdmissions = 0
         do {
             let bundled = AbilityStore(dataRoot: resources)
@@ -266,6 +267,8 @@ extension NativeAgentEngine {
             let execution = AppActionExecution(invocation: invocation, deadlines: invocation.deadlines,
                 turnWork: .init(toolInvocation: invocation))
             let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot, turn: nil, execution: execution) { _, _, _, _ in nil }
+            let parts = Parts(root: dataRoot), programs = OwnedProgramStore(root: abilities.root)
+            let admission = Parts.Invocation(host: host, execution: .init(turn: nil, surface: "launch", deadlines: execution.deadlines))
             for (url, decoded) in seeds {
                 do {
                     let seed = try decoded.get()
@@ -273,35 +276,48 @@ extension NativeAgentEngine {
                         throw CocoaError(.fileReadCorruptFile)
                     }
                     // Preserve authored versions; compare the full unsigned seed contract and recheck at installation.
-                    if let current = try abilities.read(id: seed.id, slot: .current) {
-                        guard AbilityStore.isSeed(current) else { continue }
-                    } else if try abilities.contains(id: seed.id) { continue }
-                    let kept: AbilityStore.File
+                    let current = try abilities.read(id: seed.id, slot: .current)
+                    if current == nil, try abilities.contains(id: seed.id) { continue }
+                    let kept: AbilityStore.File, shipped: OwnedProgramStore.Candidate?
                     if seed.kind == .part {
-                        guard let admitted = try await Parts(root: dataRoot).bundledSeed(seed,
-                            invocation: .init(host: host, execution: .init(turn: nil, surface: "launch", deadlines: execution.deadlines))) else {
+                        let candidate = try parts.seedCandidate(seed, invocation: admission)
+                        // A version of the agent's own follows the shipped part while it is that part; any other stays its own.
+                        if let current, !AbilityStore.isSeed(current), try !programs.samePart(current, as: candidate) {
+                            tellShippedBeside(current, shipped: candidate, source: url, dataRoot: dataRoot)
+                            continue
+                        }
+                        guard let admitted = try await parts.bundledSeed(seed, candidate: candidate, invocation: admission) else {
                             currentSeeds += 1
                             continue
                         }
                         preparedAdmissions += 1
-                        kept = admitted
-                    } else { kept = seed }
-                    try abilities.installSeed(kept, turn: nil) { current in
-                        guard let digest = current.metadata["candidate"]?.objectValue?["program"]?.objectValue?["version"]?.stringValue else {
-                            throw ToolFailureError("""
-                                Installed seed \(current.id) has no sealed candidate identity. Preserve its bytes and repair its authored source before \
-                                upgrading.
-                                """, effects: .none,
-                                code: "seed_identity_missing",
-                                    instruction: "Read this ability and repair its missing sealed candidate through its authoring owner.",
-                                    recovery: .inspect)
-                        }
-                        guard let key = try SwiftNativeManifestSigner(dataRoot: dataRoot).existingSigningKey() else {
-                            throw ManifestSigningError.keyUnavailable("Installed seed authority is missing")
-                        }
-                        let programs = OwnedProgramStore(root: abilities.root)
-                        _ = try programs.proof(try programs.load(id: current.id, digest: digest), key: key)
+                        kept = admitted; shipped = candidate
+                    } else {
+                        if let current, !AbilityStore.isSeed(current) { continue }
+                        kept = seed; shipped = nil
                     }
+                    var followed: String?
+                    let displaced = try abilities.installSeed(kept, turn: nil) { current in
+                        if AbilityStore.isSeed(current) {
+                            guard let digest = current.metadata["candidate"]?.objectValue?["program"]?.objectValue?["version"]?.stringValue else {
+                                throw ToolFailureError("""
+                                    Installed seed \(current.id) has no sealed candidate identity. Preserve its bytes and repair its authored source before \
+                                    upgrading.
+                                    """, effects: .none,
+                                    code: "seed_identity_missing",
+                                        instruction: "Read this ability and repair its missing sealed candidate through its authoring owner.",
+                                        recovery: .inspect)
+                            }
+                            guard let key = try SwiftNativeManifestSigner(dataRoot: dataRoot).existingSigningKey() else {
+                                throw ManifestSigningError.keyUnavailable("Installed seed authority is missing")
+                            }
+                            _ = try programs.proof(try programs.load(id: current.id, digest: digest), key: key)
+                            followed = digest
+                        }
+                        guard let shipped else { return false }
+                        return try programs.samePart(current, as: shipped)
+                    }
+                    if displaced != nil, let followed, let shipped { moved.append((seed.id, followed, shipped.digest)) }
                 } catch {
                     failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
                 }
@@ -309,6 +325,7 @@ extension NativeAgentEngine {
         } catch {
             failures.append(error.localizedDescription)
         }
+        tellFollowedChanged(moved, dataRoot: dataRoot)
         AbilityFilesCheck.recordSeedInstallation(failures: failures, current: currentSeeds,
             prepared: preparedAdmissions, root: dataRoot)
         // Doctor's reading publishes on its own; launch never waits for it.
@@ -317,6 +334,26 @@ extension NativeAgentEngine {
                 await DoctorReadout.recordReadings([await AbilityFilesCheck(root: dataRoot).run()], dataRoot: dataRoot)
             }
         }
+    }
+
+    /// Parts the agent follows changed under it: one note for the launch, each part with its version from and to. Told once per set of versions.
+    private static func tellFollowedChanged(_ moved: [(id: String, from: String, to: String)], dataRoot: URL) {
+        guard !moved.isEmpty else { return }
+        let lines = moved.map { "\($0.id) \($0.from.prefix(12)) → \($0.to.prefix(12))" }.joined(separator: "; ")
+        Attention.post(Happening(.body, subject: "parts", door: "stem", who: "self",
+            words: "Parts I follow changed with the app: \(lines). Each earlier version stays as <id>.prev.",
+            once: "shipped:" + moved.map { $0.id + ":" + $0.to }.joined(separator: ",")), dataRoot: dataRoot)
+    }
+
+    /// The agent's own version of a shipped part stays as it is; it is told once of each shipped version, to merge from or leave.
+    private static func tellShippedBeside(_ own: AbilityStore.File, shipped: OwnedProgramStore.Candidate, source: URL, dataRoot: URL) {
+        let id = own.id
+        Attention.post(Happening(.body, subject: "part:" + id, door: "stem", who: "self",
+            words: """
+                The shipped \(id) is at version \(shipped.digest.prefix(12)); yours is your own and stays as it is. ability.read {id:"\(id)"} shows \
+                yours; merge from the shipped one or leave it.
+                """,
+            once: "shipped:" + id + ":" + shipped.digest, shows: "Shipped source: " + source.path), dataRoot: dataRoot)
     }
 
     // Disable only untouched unbundled seeds; edited or re-enabled parts belong to the agent.
@@ -614,6 +651,8 @@ extension NativeAgentEngine {
     public static func startBackgroundLoops(loops: [LoopRegistration]) async {
         let manager = BackgroundLoopLifetimes.shared
         let dataRoot = PersistenceCore.defaultDataRoot()
+        // Before setup finishes there is no agent: the scheduler does not start a pass that needs one.
+        manager.admitAgentPasses { NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) }
         await manager.setFailureOutcome { loopId, error in
             await MaintenanceBackgroundWork.fileLoopFailureNotice(
                 dataRoot: dataRoot, loopId: loopId, error: error)
@@ -632,7 +671,6 @@ extension NativeAgentEngine {
         // Refresh restart heartbeat without blocking startup.
         await retainLaunchWork { await manager.runTickOnce(loopId: "heartbeat") }
         guard !Task.isCancelled else { return }
-        guard NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) else { return }
         let config = DoctorReadout.readAutoDoctorConfig(dataRoot: dataRoot)
         if (config.enabled ?? true) && (config.runOnStartup ?? true) {
             await retainLaunchWork { await manager.runTickOnce(loopId: "doctor_auto_run") }

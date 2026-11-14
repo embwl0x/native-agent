@@ -25,7 +25,7 @@ actor PartThoughtTools: ToolDispatchClient {
 
     func listAvailableTools(turn: Turn?, surface: String) async throws -> [String] {
         guard Set(names).isSubset(of: ["app"]) else {
-            throw SenseFailure(code: "bad_input", message: "model.call tools names the app tool; actions remain the part's declared reach.")
+            throw SenseFailure(code: "bad_input", message: "model.call's tools names only app; actions remain the part's declared reach.")
         }
         return names
     }
@@ -36,7 +36,7 @@ actor PartThoughtTools: ToolDispatchClient {
     func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
         try Task.checkCancellation()
         guard names.contains(tool), tool == "app" else {
-            throw SenseFailure(code: "undeclared_dependency", message: "The thought requested a tool it was not offered.")
+            throw SenseFailure(code: "undeclared_dependency", message: "The thought asked to call something it was not offered.")
         }
         var input = input
         if !host.scriptKey.isEmpty { input[host.scriptKey] = .bool(true) }

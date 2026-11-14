@@ -28,7 +28,8 @@ extension ChatView {
 
     private var modelChoices: [ModelChoice] {
         sync.providers.filter { $0.auth_status.eligible }.flatMap { provider in
-            var models = provider.models.map(\.id).filter { !$0.isEmpty }
+            // A picker lists offered rows; the selected model shows as itself.
+            var models = provider.offeredModels.map(\.id).filter { !$0.isEmpty }
             if provider.provider_id == selectedProviderId, !selectedModel.isEmpty, !models.contains(selectedModel) { models.append(selectedModel) }
             return Set(models).sorted().map { model in
                 ModelChoice(provider: provider.provider_id, model: model,

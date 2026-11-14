@@ -180,7 +180,7 @@ extension SwiftNativeMacControl {
                 ]
             )
         }
-        if let refusal = await macAdmissionRefusal(pid: framePid, action: "act", context: context) { return refusal }
+        if let refusal = await macAdmissionRefusal(pid: framePid, action: "act", reading: false, context: context) { return refusal }
         // Match the observed window by persistent identity; missing or ambiguous matches refuse instead of choosing current focus.
         let actWindows: [MacAXWindowRef]
         do { actWindows = try accessibilityActSource(context: context).windows(pid: framePid, context: context) }

@@ -66,10 +66,7 @@ struct ShotgunView: View {
                     .accessibilityLabel("What I am looking at: \(preview.caption)")
             }
             TranscriptDocumentView(sessionID: sessionId, presentation: "shotgun")
-            .environment(\.transcriptOpenSettings) { [inlineCards] in
-                do { try inlineCards.openPage(.settings) }
-                catch { appModel.setFailureStatus(error, action: "open Settings") }
-            }
+            .environment(\.transcriptOpenSettings) { [inlineCards] in inlineCards.openPage(.settings) }
             .frame(maxHeight: .infinity)
             composer(sessionId: sessionId, running: running)
         }

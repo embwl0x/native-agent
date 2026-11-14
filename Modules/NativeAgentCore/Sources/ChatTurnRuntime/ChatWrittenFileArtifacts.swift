@@ -75,10 +75,10 @@ public enum ChatWrittenFileArtifacts {
                 }
                 return
             }
-            for case .object(let row) in calls where row["status"] == .string("ok") && row["read_only"] == .bool(false) {
+            // A nested call carries its destination or shell directory in artifacts, never its raw result; a stored older row is reduced first.
+            for case .object(let row) in calls.map(CallLedger.published) where row["status"] == .string("ok") && row["read_only"] == .bool(false) {
                 let reply = ToolResult(.object(row))
-                if case .object(let at)? = row["at"], place(at) { continue }
-                if case .object(let result)? = row["result"], place(result) { continue }
+                if case .object(let at)? = row["artifacts"]?.objectValue?["at"], place(at) { continue }
                 if reply.effects != ToolFailureError.Effects.none, !unlisted.contains(run) { unlisted.append(run) }
             }
         }

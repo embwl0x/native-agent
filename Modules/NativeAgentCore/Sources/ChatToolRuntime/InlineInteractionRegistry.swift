@@ -417,7 +417,8 @@ public enum InlineInteractionRegistry {
             guard let route = FirstPartyModelCatalog.imageRoute(forProviderID: providerID)
             else { continue }
             let catalog = try SwiftNativeProviderRouting(dataRoot: dataRoot).checkedCatalogModels(for: providerID)
-            for model in catalog {
+            // The card offers only what each account offers; an account whose provider has not listed its models adds nothing.
+            for model in catalog where model.isOffered {
                 // Qualify and deduplicate by account/model pair; a bare model ID cannot identify the correct connected account.
                 guard seen.insert("\(providerID.lowercased())::\(model.id.lowercased())").inserted
                 else { continue }

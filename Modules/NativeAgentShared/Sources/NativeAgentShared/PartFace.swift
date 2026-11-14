@@ -211,17 +211,42 @@ public struct PartFace: Codable, Sendable, Equatable {
         public var actions: [Action]?
         public var control: Control?
         public var rows: [Row]?
+        /// The child `rows` are this row's own small group of named controls, drawn side by side at its trailing edge on its own line, each
+        /// under its short word ("Read", "Write"). Each child stays its own row: its id, control, confirmation and call. Absent, the children
+        /// sit beneath as before; a reader that does not know the key draws them beneath.
+        ///
+        /// A group holds controls, not groups. A child of a group is always drawn and read as one control of that group, so `inline` on
+        /// it has no effect; rows a child holds of its own are not dropped but lie beneath the parent's line (`beneath`), drawn there in
+        /// the window and listed there in the agent's reading, ids and calls kept, as any nested rows are.
+        public var inline: Bool?
         public var expands: Bool?
         public var read: Call?
         /// In progress now: drawn with a small spinner until it ends.
         public var running: Bool?
+        /// A length drawn as a bar beside the value: `value` out of `max`, beginning `start` along it (a call's place in its turn).
+        /// The words stay in `value`; a reader that draws no bar loses nothing.
+        public struct Meter: Codable, Sendable, Equatable {
+            public let value: Double
+            public let max: Double
+            public let start: Double?
+            public init(value: Double, max: Double, start: Double? = nil) { self.value = value; self.max = max; self.start = start }
+        }
+        public var meter: Meter?
         public init(id: String, title: String, detail: String? = nil, value: String? = nil, at: String? = nil, symbol: String? = nil,
                     tone: Tone? = nil, open: String? = nil, actions: [Action]? = nil, control: Control? = nil,
-                    rows: [Row]? = nil, expands: Bool? = nil, read: Call? = nil, running: Bool? = nil) {
+                    rows: [Row]? = nil, inline: Bool? = nil, expands: Bool? = nil, read: Call? = nil, running: Bool? = nil, meter: Meter? = nil) {
             (self.id, self.title, self.detail, self.value, self.at) = (id, title, detail, value, at)
             (self.symbol, self.tone, self.open, self.actions, self.control) = (symbol, tone, open, actions, control)
-            self.rows = rows; self.expands = expands; self.read = read; self.running = running
+            self.rows = rows; self.inline = inline; self.expands = expands; self.read = read; self.running = running; self.meter = meter
         }
+        /// The children drawn on this row's own line, when it holds them so.
+        public var group: [Row] { inline == true ? rows ?? [] : [] }
+        /// The rows beneath this row's line: its children, or, when they are its group, the rows its group's children hold.
+        public var beneath: [Row] { inline == true ? (rows ?? []).flatMap { $0.rows ?? [] } : rows ?? [] }
+        /// Whether anything lies beneath the line (an empty `rows` that is not a group still says the row holds more).
+        public var holdsBeneath: Bool { inline == true ? !beneath.isEmpty : rows != nil }
+        /// This row and every row drawn or read as a line of its own beneath it, in order; a group's children ride their parent's line.
+        public var lineRows: [Row] { [self] + beneath.flatMap(\.lineRows) }
         public var descendants: [Row] { [self] + (rows ?? []).flatMap(\.descendants) }
     }
 
@@ -344,14 +369,17 @@ public struct PartFace: Codable, Sendable, Equatable {
         /// Drawn as one header row (its title) with a disclosure; its rows show when the reader opens it. Open or closed is each view's own
         /// and is never written back to the face.
         public var folded: Bool?
+        /// Consecutive sections naming the same `beside` are drawn side by side as columns of equal width, stacking where the width holds
+        /// fewer than two readable columns. A reader that draws no columns (an installed phone, a list) stacks them; nothing is lost.
+        public var beside: String?
         public init(id: String, title: String? = nil, style: Style? = nil, footer: String? = nil, rows: [Row], folded: Bool? = nil,
-                    block: Block? = nil, more: More? = nil, filter: String? = nil, revision: String? = nil) {
+                    block: Block? = nil, more: More? = nil, filter: String? = nil, revision: String? = nil, beside: String? = nil) {
             self.id = id; self.title = title; self.style = style; self.footer = footer; self.rows = rows; self.folded = folded
             self.block = block
-            self.more = more; self.filter = filter; self.revision = revision
+            self.more = more; self.filter = filter; self.revision = revision; self.beside = beside
         }
 
-        private enum CodingKeys: String, CodingKey { case id, title, style, footer, rows, folded, block, more, filter, revision }
+        private enum CodingKeys: String, CodingKey { case id, title, style, footer, rows, folded, block, more, filter, revision, beside }
         public init(from decoder: any Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
             id = try fields.decode(String.self, forKey: .id)
@@ -359,6 +387,7 @@ public struct PartFace: Codable, Sendable, Equatable {
             style = try fields.decodeIfPresent(Style.self, forKey: .style)
             let wireFooter = try fields.decodeIfPresent(String.self, forKey: .footer)
             folded = try fields.decodeIfPresent(Bool.self, forKey: .folded)
+            beside = try fields.decodeIfPresent(String.self, forKey: .beside)
             block = try fields.decodeIfPresent(Block.self, forKey: .block)
             more = try fields.decodeIfPresent(More.self, forKey: .more)
             if more != nil, wireFooter == Self.continuationNote { footer = nil }
@@ -380,6 +409,7 @@ public struct PartFace: Codable, Sendable, Equatable {
             let wireFooter = more == nil ? footer : footer.map { $0 + "\n" + Self.continuationNote } ?? Self.continuationNote
             try fields.encodeIfPresent(wireFooter, forKey: .footer)
             try fields.encodeIfPresent(folded, forKey: .folded)
+            try fields.encodeIfPresent(beside, forKey: .beside)
             try fields.encodeIfPresent(block, forKey: .block)
             try fields.encodeIfPresent(more, forKey: .more)
             try fields.encodeIfPresent(filter, forKey: .filter)
@@ -394,6 +424,9 @@ public struct PartFace: Codable, Sendable, Equatable {
             func draw(_ row: Row) -> Row? {
                 var drawn = row
                 drawn.rows = row.rows.map { $0.compactMap(draw) }
+                // A row that only groups others is not drawn on a door where none of them is.
+                if row.rows?.isEmpty == false, drawn.rows?.isEmpty == true, row.actions == nil, row.open == nil, row.control == nil,
+                   row.expands != true { return nil }
                 if let actions = row.actions, actions.contains(where: { !$0.runs(from: door) }) {
                     let kept = actions.filter { $0.runs(from: door) }
                     if kept.isEmpty, row.open == nil, row.control == nil, drawn.rows?.isEmpty != false, row.expands != true { return nil }
@@ -415,14 +448,24 @@ public struct PartFace: Codable, Sendable, Equatable {
         }
     }
 
+    /// What the face is opened on right now: its link in the form a page read uses (`page:desk/<handle>`) and its title in the person's
+    /// words. The ask bar and the agent's page read name it; a reader that does not know the key (an installed phone) skips it.
+    public struct Opened: Codable, Sendable, Equatable {
+        public let link: String
+        public let title: String
+        public init(link: String, title: String) { self.link = link; self.title = title }
+    }
+
     /// The page's name and its one sentence.
     public let title: String?
     public let line: String?
     public var sections: [Section]
     public var detail: Detail?
+    /// Synthesized coding reads it only when present and writes it only when set, so a face without it encodes as before.
+    public var opened: Opened?
     public var allRows: [Row] { sections.flatMap(\.allRows) }
-    public init(title: String? = nil, line: String? = nil, sections: [Section], detail: Detail? = nil) {
-        self.title = title; self.line = line; self.sections = sections; self.detail = detail
+    public init(title: String? = nil, line: String? = nil, sections: [Section], detail: Detail? = nil, opened: Opened? = nil) {
+        self.title = title; self.line = line; self.sections = sections; self.detail = detail; self.opened = opened
     }
 }
 

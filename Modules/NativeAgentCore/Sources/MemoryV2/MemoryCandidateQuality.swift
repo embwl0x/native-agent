@@ -11,7 +11,7 @@ public enum MemoryCandidateQuality {
             return "transient session/context state is not durable memory"
         }
         if isToolTranscriptNoise(normalized) {
-            return "tool transcript/status output is not durable memory"
+            return "call transcript/status output is not durable memory"
         }
         return nil
     }

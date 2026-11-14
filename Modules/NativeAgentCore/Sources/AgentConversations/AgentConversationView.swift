@@ -131,6 +131,12 @@ public enum AgentConversationView {
         var thread: [String: JSONValue] = ["conversation": .string(row.label), "exchanges": .int(Int64(row.exchanges?.count ?? 0)),
             "state": .string(row.phase), "history": .string("agent_read shows the conversation, both directions.")]
         if let id = AgentConversationSession.threadID(row) { thread["thread_id"] = .string(id) }
+        // An unanswered send is a condition the Desk can wait on: its record settles when the answer lands, fails or expires. Not a held
+        // send: a contact that pulls its messages answers with a message of its own, which nothing ties to the send, so a wait on it
+        // would end only when the send expired.
+        if fields["reply"] == nil, row.awaitsReply, !AgentConversationSession.heldReplyPending(row) {
+            thread["wait_on"] = .string(row.operationID)
+        }
         fields["thread"] = .object(thread)
         return .object(fields)
     }

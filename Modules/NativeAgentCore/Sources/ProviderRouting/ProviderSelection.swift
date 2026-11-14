@@ -22,7 +22,8 @@ extension SwiftNativeProviderRouting {
             openRouterModels: openRouter.models.map { $0.providerJSON() },
             moonshotModels: moonshot.models.map { $0.providerJSON() },
             codexCacheURL: codexCacheURL, authEnvironment: authEnvironment,
-            additionalProviderIDs: Set(state.active.values), preview: preview
+            additionalProviderIDs: Set(state.active.values),
+            savedModels: Set(state.surfaces.values.compactMap { $0.objectValue?["model"]?.stringValue }), preview: preview
         )
         let cache = inventory.cache
         return ProviderCatalogSnapshot(
@@ -45,17 +46,38 @@ extension SwiftNativeProviderRouting {
             )
         )
     }
-    public func selectionValidator(reasoningEffort: String? = nil) async throws -> @Sendable (String, String) throws -> Void {
+    /// What a slot holds: the persisted choice for it, with inheritance resolved from saved values (its own saved model; else, when it follows
+    /// Chat's account, Chat's saved model; else its account's saved default). Never the effective routing snapshot, which blanks a choice exactly
+    /// when it needs repair. The one producer of "the model already in the slot" for `ModelSlot.mayHold`. The slot's account is resolved as routing
+    /// resolves it (`routingSnapshot`): its own assignment, else Chat's, else `soleConnectedRoute` (`soleConnectedProviderID`, routing's rule for
+    /// an unassigned slot), which the caller passes so the two cannot disagree.
+    nonisolated func savedModelInSlot(_ surface: String, route: String, surfaces: [String: JSONValue], active: [String: String],
+                                      soleConnectedRoute: String?) -> String? {
+        let models = Self.parseSurfacesFile(.object(surfaces)).0
+        let ownRoute = active[surface]
+        guard (ownRoute ?? active["chat"] ?? soleConnectedRoute) == route else { return nil }
+        if let model = Self.stringFrom(models, key: surface) { return model }
+        if ownRoute == nil, let model = Self.stringFrom(models, key: "chat") { return model }
+        let saved = (readProviderConfig(route).object?["default_model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return saved?.isEmpty == false ? saved : nil
+    }
+    /// Every save passes through this: the model must be one the slot may hold (`ModelSlot.mayHold`: offered, or already in the slot), then its
+    /// row's Think levels are checked. The third argument is the model the slot holds now, saved or inherited.
+    public func selectionValidator(reasoningEffort: String? = nil) async throws -> @Sendable (String, String, String?) throws -> Void {
         let providers = try await checkedProviderSnapshot().providers
-        return { route, model in
+        let dataRoot = self.dataRoot
+        return { route, model, savedInSlot in
             guard let provider = providers.first(where: { $0.id == route }),
                   provider.configured == true,
                   case .array(let models)? = provider.modelCatalog,
-                  let selected = models.first(where: {
-                      guard case .object(let row) = $0 else { return false }
-                      return row["id"] == .string(model)
-                  }), case .object(let row) = selected else {
+                  let row = FirstPartyModelCatalog.pickerRow(model, providerID: route, rows: models, dataRoot: dataRoot) else {
                 throw ProviderRoutingError.configurationFailed("\(route) cannot serve \(model). Refresh Providers and choose an available model.")
+            }
+            guard ModelSlot.mayHold(model, rowOffered: row["offered"] != .bool(false), savedInSlot: savedInSlot) else {
+                var note: String?
+                if case .object(let extras)? = provider.extras { note = extras["models_note"]?.stringValue }
+                throw ProviderRoutingError.configurationFailed(
+                    ModelSlot.refusal(note: note, accountName: SwiftNativeProviderRouting.displayName(for: route)))
             }
             guard case .array(let efforts)? = row["supported_reasoning_efforts"] else {
                 throw ProviderRoutingError.configurationFailed("\(route)'s thinking capabilities for \(model) are unavailable. Reload Providers.")
@@ -78,12 +100,14 @@ extension SwiftNativeProviderRouting {
         let rows = try nativeListProviders(
             openRouterModels: openRouterModels, moonshotModels: moonshotModels
         ).providers.filter { $0.configured == true }.map { provider in
-            let shipped = !CodexAccountModelCatalog.isAccountBackedProvider(provider.id)
+            let live = FirstPartyModelDiscovery.isLiveRoute(provider.id)
+            let shipped = !live && !CodexAccountModelCatalog.isAccountBackedProvider(provider.id)
                 && (provider.id != "moonshot" || moonshotModels == nil)
                 && !FirstPartyModelCatalog.models(forProviderID: provider.id).isEmpty
             let models: [[String: JSONValue]]
             if case .array(let saved)? = provider.modelCatalog {
-                models = saved.compactMap { if case .object(let row) = $0 { return row }; return nil }
+                // Helper choices are what may be chosen: the rows the provider offers.
+                models = saved.compactMap { if case .object(let row) = $0, row["offered"] != .bool(false) { return row }; return nil }
             } else { models = [] }
             let keys: Set<String> = ["id", "name", "supported_reasoning_efforts", "default_reasoning_effort", "supports_fast", "supports_tools",
                 "controls_note"]
@@ -94,9 +118,15 @@ extension SwiftNativeProviderRouting {
                 "models": .array(models.prefix(40).map { .object($0.filter { keys.contains($0.key) }) }),
                 "models_truncated": .bool(models.count > 40)
             ]
+            // Where the rows come from is a fact of the list, never the presence of a note; the note travels beside them as text.
+            if live {
+                let isProviderList = FirstPartyModelDiscovery.currentList(route: provider.id, dataRoot: dataRoot).isLive
+                choice["catalog_source"] = .string(isProviderList ? "provider_list" : "shipped_floor")
+            } else if models.isEmpty {
+                choice["catalog_source"] = .string("unavailable")
+            }
             if case .object(let extras)? = provider.extras, let note = extras["models_note"] {
                 choice["models_note"] = note
-                choice["catalog_source"] = .string("unavailable")
             }
             return JSONValue.object(choice)
         }
@@ -265,7 +295,7 @@ extension SwiftNativeProviderRouting {
         seedMissingControls: Bool = false,
         reconcilePinnedModelWithProvider: Bool = false,
         clearOverride: Bool = false,
-        selectionValidator: (@Sendable (String, String) throws -> Void)? = nil
+        selectionValidator: (@Sendable (String, String, String?) throws -> Void)? = nil
     ) async throws {
         // Surface commands must mutate their owning group like the picker.
         _ = try await saveSurfaceConfigurations(
@@ -286,7 +316,7 @@ extension SwiftNativeProviderRouting {
         reconcilePinnedModelWithProvider: Bool = false,
         clearOverride: Bool = false,
         adoptingConnectedProvider: Bool = false,
-        selectionValidator: (@Sendable (String, String) throws -> Void)? = nil,
+        selectionValidator: (@Sendable (String, String, String?) throws -> Void)? = nil,
         expectedRevision: Double? = nil,
         expectedChatChoice: ProviderTurnChoice? = nil
     ) async throws -> ProviderGroupWriteResult {
@@ -305,7 +335,7 @@ extension SwiftNativeProviderRouting {
                 throw ProviderRoutingError.configurationFailed(readiness.detail)
             }
         }
-        let validateSelection: (@Sendable (String, String) throws -> Void)?
+        let validateSelection: (@Sendable (String, String, String?) throws -> Void)?
         if clearOverride || (model == nil && reasoningEffort == nil) { validateSelection = nil }
         else if let selectionValidator { validateSelection = selectionValidator }
         else { validateSelection = try await self.selectionValidator(reasoningEffort: reasoningEffort) }
@@ -361,6 +391,13 @@ extension SwiftNativeProviderRouting {
             let current = !clearOverride ? try await self.selectionRoutingSnapshot(
                 surfaces: proposedSurfaces, active: proposedActive, preview: false
             ) : nil
+            // The model each slot holds now, from the saved values (`ModelSlot.mayHold` lets a slot keep it, so repairing its Think works), on the
+            // account routing gives the slot.
+            var soleConnected: String?
+            if validateSelection != nil { soleConnected = await self.soleConnectedProviderID() }
+            func savedInSlot(_ surface: String, _ route: String) -> String? {
+                self.savedModelInSlot(surface, route: route, surfaces: originalSurfaces, active: active, soleConnectedRoute: soleConnected)
+            }
             var surfaceRoot = originalSurfaces
             var activeRoot = originalActive
             for surface in surfaces {
@@ -384,11 +421,11 @@ extension SwiftNativeProviderRouting {
                     if let family = self.inferProviderForModel(model), !Self.providerCanServeModel(route, inferredProvider: family) {
                         throw ProviderRoutingError.configurationFailed("\(route) does not serve \(model). Pick a model that account offers.")
                     }
-                    try validateSelection?(route, model)
+                    try validateSelection?(route, model, savedInSlot(surface, route))
                 } else if reasoningEffort != nil, !clearOverride,
                           let route = providerId ?? current?.activeProviders[surface],
                           let selected = current?.preferences[surface]?.model {
-                    try validateSelection?(route, selected)
+                    try validateSelection?(route, selected, savedInSlot(surface, route))
                 }
                 // An account-only change preserves the exact saved choice; an incompatible pin needs an explicit combined selection.
                 var surfacesUntouched = false

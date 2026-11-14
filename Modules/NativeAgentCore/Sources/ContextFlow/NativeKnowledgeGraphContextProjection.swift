@@ -92,9 +92,11 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
             }.map(\.0.draft.id))
         } catch {
             exclusion.atomIDs.formUnion(supported.map(\.0.draft.id))
-            exclusion.unverified.append(ContextDegradedSourceNotice(
-                sourceID: ContextStableID.source(owner: Self.owner, locator: "knowledge-graph"),
-                reason: "graph relations withheld this turn: their memories could not be confirmed (\(error.localizedDescription))"))
+            // Name each withheld relation's own source, so the reason speaks only for what this owner held back.
+            exclusion.unverified += Set(supported.map(\.0.draft.sourceID)).sorted().map {
+                ContextDegradedSourceNotice(sourceID: $0,
+                    reason: "graph relations withheld this turn: their memories could not be confirmed (\(error.localizedDescription))")
+            }
         }
         return exclusion
     }

@@ -1,6 +1,6 @@
 # The Subconscious & Personality System
 
-This is the source map for Agent's carried inner state: what they cares about,
+This is the source map for the agent's carried inner state: what they cares about,
 attention, affect, reflection and their bounded expression in a turn. It describes
 implemented mechanisms, not proof of subjective experience or reply quality.
 Source descriptions establish no installed, timing, restart, provider-swap,
@@ -1036,6 +1036,12 @@ Its helpers own distinct projections:
   makes the app's standing words and the agent's own words coming back
   familiar, so they remind the agent of nothing (10-29: a chat.post receipt's
   standing note brought up two memories that had nothing to do with it).
+  The result lines recollection weighed become familiar only when the model
+  has read the request that carried their round (that round's first output),
+  so a turn stopped before its model call leaves those lines new. A memory
+  over 280 characters is clipped only when its line can end with the call that
+  opens it whole, `app {"action":"memory.recall","args":{"memory_id":"<id>"}}`;
+  one without a record address is shown whole.
   The store distinguishes a missing first-use file from unreadable or damaged
   bytes. Familiarity validates complete eight-byte keys and persists before
   publishing new familiarity. An unavailable optional recall records repair
@@ -1120,6 +1126,9 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
   A malformed row or missing field node refuses that node's claim and owes repair while sibling crossings proceed; a failure of the
   shared record channel, or a row whose node cannot be read, holds the unfinished batch.
   Already admitted batches finish even if sleep begins while their record is being written; subsequent world batches wait.
+- **Before setup (known gap).** The mind starts at launch, before onboarding has completed, so attention, the night and
+  microcycles can run before the agent exists (a fresh installation's first night ran REM against a persona not yet written).
+  The design to close it is to start the mind only once setup finishes ([Automated Systems §2](AUTOMATED_SYSTEMS.md)).
 - **Sleep.** From the admitted night until it settles the agent is asleep: owed happenings still open thoughts and the world
   waits unweighed. Waking (the night settled, something owed arrived, a message arrived, the person arrived) records
   `attention.wake` and weighs what waited, once, in mode `waking`.
@@ -1359,7 +1368,7 @@ Reflection also obeys the
 A thought's own words stay in the mind stream; to tell the person, the thought acts (`app chat.post`).
 Speech shares locked claims and destination reconciliation in `ProactiveAssistantSpeech.swift`,
 without an hourly quota; notification routing keeps the person's quiet hours
-(`AttentionRouting/AttentionRouter+Policy.swift`). The [post contract](TOOL_LOADING.md)
+(`AttentionRouting/AttentionRouter+Policy.swift`). The [post contract](ONE_DOOR.md)
 owns deduplication, routes and exact-call approval. A MY QUEUE
 step's fixed words (`say`) land in the current conversation between turns through `speakProactively`, followed by the neutral
 shoulder tap "Left you something in chat. No reply needed." (`NativeCognitionRuntime+Pursuit.swift`), which carries none of the
@@ -1405,7 +1414,7 @@ Desk reads the hour's latest thought from the same experience record that attent
 
 ## Reading and acting on their state
 
-Agent reaches this through their one `app` tool:
+The agent reaches this through their one door, `app`:
 
 ```json
 {"action":"mind.inner_state","args":{"detail":"compact"}}

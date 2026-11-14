@@ -1,8 +1,9 @@
 import NativeAgentShared
 import Transcripts
 import Foundation
+import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `DeskState.swift` | Append-only archive records and materialized Desk state formats |
+// Blueprint: | `DeskState.swift` | Append-only archive records and materialized Desk state formats; `matching`: the one reading of an item's name |
 
 // MARK: - ArchiveRecord (append-only archived item record)
 
@@ -217,5 +218,32 @@ public struct DeskState: Sendable, Equatable {
             }
         }
         return state
+    }
+}
+
+extension DeskState {
+    /// The one reading of a Desk item's name, for every Desk call and the window alike: its stable handle, its visible number (`4`, `2.1`), `desk.4`,
+    /// `#4`, the number with its title after it, or its exact title.
+    public static func reference(_ raw: String) -> String {
+        var r = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if r.lowercased().hasPrefix("desk.") { r = String(r.dropFirst(5)) }
+        if r.hasPrefix("#") { r = String(r.dropFirst()) }
+        if let first = r.split(separator: " ").first, first.count < r.count,
+           first.allSatisfy({ $0.isNumber || $0 == "." }) { r = String(first) }
+        return r
+    }
+
+    /// The live items a name reads as: none or one. A title two items share is refused, naming `field` as the argument to correct.
+    public func matching(_ raw: String, field: String = "handle") throws -> [DeskItem] {
+        let reference = Self.reference(raw)
+        let exact = items.filter { $0.alias == reference || $0.handle == reference }
+        let matches = exact.isEmpty ? items.filter {
+            $0.title.caseInsensitiveCompare(raw.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
+        } : exact
+        guard matches.count <= 1 else {
+            throw ToolFailureError("Several items share that title; use query in desk.read to find their handles.", argumentPath: "$." + field,
+                effects: .none, code: "invalid_input")
+        }
+        return matches
     }
 }

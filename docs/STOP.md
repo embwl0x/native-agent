@@ -34,6 +34,22 @@ Only confirmed file absence starts a new marker. Unreadable existing bytes are
 preserved and the Stop request reports the read failure; a named Stop never
 erases earlier run identities or an existing empty stop-all marker.
 
+Stop-marker checks read once with strict UTF-8 decoding. Only a no-such-file
+read error means absent; an empty marker or a line equal to the run id raises
+Stop, and a readable marker for other runs leaves this run alone. An untagged
+URL matches any readable existing marker. Any other read or decoding failure
+stops the run without retry, preserving the bytes. The accepted run retains
+that observed cause until it finishes, so repairing the marker cannot resume
+stopped work or erase the explanation. The marker owner logs the cause once;
+the existing turn settlement reports it in its stopped detail and notice, and
+the structured turn's terminal trace carries `stopMarkerError`. Mac's cancelled
+lifecycle retains that response detail. Helpers join
+their Stop watcher before selecting the saved and returned outcome, reporting
+the same cause through their reply detail and notice. Work returning after an
+observed unreadable marker keeps its output and settles stopped. Telegram's
+pre-chat media settlement keeps it in its cancelled card and error record
+rather than requeueing that message on shutdown.
+
 Work in flight has two parts:
 
 - **Its effect** is what it does in the world: send a message, write a file,
@@ -251,7 +267,7 @@ replaced before quit remain retained until exit and join the same shutdown;
 cancelling or freeing an active slot is never proof of settlement.
 Helper scheduler shutdown permanently closes that scheduler's admission,
 cancels its retained runs and joins their shelf, claim and deadline settlement.
-Telegram voice Stop/deadline cancels the selected ffmpeg conversion and
+Telegram voice Stop/deadline cancels the audio decoding and
 recognition, then joins the owning body and its temporary-file cleanup before
 releasing the turn.
 Context Flow stop also cancels and joins admitted query-embedding bodies before

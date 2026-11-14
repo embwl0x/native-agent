@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `ManagedLoopRunner.swift` | LoopExecutionGate and ManagedLoopRunner: serialize each registration until body exit and accounting settle |
+// Blueprint: | `ManagedLoopRunner.swift` | LoopExecutionGate, ManagedLoopRunner: one run per registration until exit and accounting; agent passes await setup |
 
 /// Coalesce requests against active execution and join its physical exit instead of invoking the worker twice.
 
@@ -77,6 +77,8 @@ internal struct ManagedLoopRunner: LoopRunner {
     let gate: LoopExecutionGate
     let clock: @Sendable () -> Date
     let onFinished: @Sendable () async -> Void
+    /// Whether the agent exists yet (setup finished); read at each start of a pass that needs the agent.
+    let agentExists: @Sendable () -> Bool
 
     var loopId: String { underlying.loopId }
     var wake: OrganWake { underlying.wake }
@@ -109,8 +111,15 @@ internal struct ManagedLoopRunner: LoopRunner {
             )
         }
         let loop = underlying
+        let agentExists = agentExists
         let child = Task {
-            let outcome = await loop.tickOutcome()
+            // The one gate for the agent's passes: before setup finishes there is no agent, so its pass is not started and records no failure.
+            let outcome: LoopTickOutcome
+            if loop.needsAgent && !agentExists() {
+                outcome = .notNeeded(LoopTickOutcome.waitingForSetup)
+            } else {
+                outcome = await loop.tickOutcome()
+            }
             // Only an uncancelled body that ran may stamp its own writes.
             if !Task.isCancelled && !outcome.isHealthNeutralSkip {
                 PhysiologySelfWriteRegistry.shared.stampAfterTick(loopId: loopId)

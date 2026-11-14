@@ -9,7 +9,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Transcripts
-// Blueprint: | `ConnectorFace.swift` | The Connectors page: accounts, kept secrets and folders from `ConnectorReadiness`, composed with Telegram, iPhone and agent sections; each row is a door call, and the `connections` verbs the stem pages call run here |
+// Blueprint: | `ConnectorFace.swift` | The Connectors page: one connector list (accounts from `ConnectorReadiness`, the iPhone, each agent) whose rows hold their own settings, then kept secrets and folders; each row is a door call, and the `connections` verbs the stem pages call run here |
 
 @MainActor
 extension ConnectorReadiness {
@@ -36,9 +36,11 @@ extension ConnectorReadiness {
             line = "Connected accounts are unread; refresh Connectors to read them."
         case .success(let records):
             let on = records.filter(\.enabled).count
-            let waiting = records.filter { $0.needsConnectionAttention }.count
+            // The line names who is asking: a count sends the reader down the page to find out.
+            let waiting = records.filter { $0.needsConnectionAttention }.map(\.name)
             line = "\(on) of \(records.count) \(records.count == 1 ? "door is" : "doors are") on. "
-                + (waiting == 0 ? "No account is asking for setup." : "\(waiting) \(waiting == 1 ? "account needs" : "accounts need") your attention.")
+                + (waiting.isEmpty ? "No account is asking for setup."
+                    : ListFormatter.localizedString(byJoining: waiting) + (waiting.count == 1 ? " needs" : " need") + " your attention.")
             accountRows = records.isEmpty ? [.init(id: "accounts-empty", title: "No accounts are listed.", tone: .quiet)]
                 : records.sorted {
                     if $0.connectionState != $1.connectionState { return $0.connectionState.rawValue < $1.connectionState.rawValue }
@@ -46,6 +48,8 @@ extension ConnectorReadiness {
                     return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
                 }.map(accountFaceRow)
         }
+        // What is not kept or shared yet is one line each, together in one small section.
+        var emptyRows: [PartFace.Row] = []
         let secretRows: [PartFace.Row]
         switch state.secrets {
         case nil:
@@ -53,7 +57,7 @@ extension ConnectorReadiness {
         case .failure(let error)?:
             secretRows = [notice("secrets-unavailable", "Kept secrets could not be read: \(error.localizedDescription)")]
         case .success(let entries)?:
-            secretRows = entries.isEmpty ? [.init(id: "secrets-empty", title: "No secrets kept yet.", tone: .quiet)] : entries.map { entry in
+            secretRows = entries.map { entry in
                 let destinations = (entry.hosts + entry.programs.map(\.path)).joined(separator: ", ")
                 return .init(id: "secret:" + entry.name, title: entry.name,
                     detail: "May go to " + destinations + (entry.account.map { " · Account " + $0 } ?? ""),
@@ -61,12 +65,14 @@ extension ConnectorReadiness {
                     actions: [.init(id: "forget", label: "Forget", role: .destructive,
                                     call: .init("connector.forget_secret", ["name": .string(entry.name)]))])
             }
+            if entries.isEmpty { emptyRows.append(.init(id: "secrets-empty", title: "No secrets kept yet.", tone: .quiet)) }
         }
+        let share = PartFace.Action(id: "share-folder", label: "Share a folder", doors: ["mac"], call: .init("connector.share_folder"))
         var folderRows: [PartFace.Row]
         if let error = state.workspacesReadError {
             folderRows = [notice("folders-unavailable", "Shared folders could not be read: " + error)]
         } else if let folders = state.workspaceSnapshot {
-            folderRows = folders.isEmpty ? [.init(id: "folders-empty", title: "No folder is shared yet.", tone: .quiet)] : folders.map { folder in
+            folderRows = folders.map { folder in
                 let access: String
                 let permissions = Set(folder.permissions)
                 if permissions == Set(["read"]) { access = "read" }
@@ -75,18 +81,29 @@ extension ConnectorReadiness {
                 return .init(id: folder.id, title: folder.name, detail: folder.path, value: access, symbol: "folder",
                     tone: folder.permissions.isEmpty ? .attention : nil)
             }
+            if folders.isEmpty {
+                emptyRows.append(.init(id: "folders-empty", title: "No folder is shared yet.", symbol: "folder", tone: .quiet))
+                emptyRows.append(.init(id: "share-folder", title: "Share a folder", detail: "Choose a folder and its access on your Mac.",
+                    symbol: "folder.badge.plus", actions: [share]))
+            }
         } else {
             folderRows = [notice("folders-unread", "Shared folders have not been read yet. Refresh Connectors to read them.")]
         }
-        folderRows.append(.init(id: "share-folder", title: "Share a folder", detail: "Choose a folder and its access on your Mac.",
-            symbol: "folder.badge.plus", actions: [.init(id: "share-folder", label: "Share a folder", doors: ["mac"],
-                                                         call: .init("connector.share_folder"))]))
-        return (.init(title: "Connectors", line: line, sections: [
-            .init(id: "accounts", title: "Accounts", style: .list, rows: accountRows),
+        if !folderRows.isEmpty {
+            folderRows.append(.init(id: "share-folder", title: "Share a folder", detail: "Choose a folder and its access on your Mac.",
+                symbol: "folder.badge.plus", actions: [share]))
+        }
+        let sections: [PartFace.Section] = [
+            .init(id: Self.connectionsSection, title: "Where I reach", style: .list, rows: accountRows),
             .init(id: "secrets", title: "Kept secrets", style: .list, rows: secretRows),
-            .init(id: "folders", title: "Folders I may open", style: .list, rows: folderRows)
-        ]), epoch)
+            .init(id: "folders", title: "Folders I may open", style: .list, rows: folderRows),
+            .init(id: "nothing-yet", title: "Secrets and folders", style: .list, rows: emptyRows),
+        ]
+        return (.init(title: "Connectors", line: line, sections: sections.filter { !$0.rows.isEmpty }), epoch)
     }
+
+    /// The first section: every account, then the iPhone and each agent, one row each, its own settings behind it.
+    nonisolated static let connectionsSection = "accounts"
 
     nonisolated private func notice(_ id: String, _ words: String) -> PartFace.Row {
         .init(id: id, title: words, tone: .attention)
@@ -103,11 +120,8 @@ extension ConnectorReadiness {
         if let access = connector.connectionAccessLabel { detail += "\n" + access }
         let id: [String: PartFace.Value] = ["id": .string(connector.id)]
         var actions: [PartFace.Action] = []
-        var open: String?
         if connector.id == "browser" {
             actions.append(.init(id: "browser.show", label: "Show browser", role: .primary, doors: ["mac"], call: .init("browser.show")))
-        } else if connector.id == "telegram" {
-            open = "page:connectors/telegram.on"
         } else if ConnectorWizardSetupRoute.resolve(provider: connector.id) != .unavailable {
             let connect = connector.connectionState == .needsAuth || connector.connectionState == .comingSoon
             actions.append(.init(id: "connect", label: connect ? "Connect" : "Reconnect", role: .primary, call: .init("connector.connect", id)))
@@ -122,7 +136,7 @@ extension ConnectorReadiness {
         return .init(id: connector.id, title: connector.name, detail: detail,
             value: connector.canToggle ? (connector.enabled ? "On" : "Off")
                 : connector.connectionStatusText + " · " + (connector.enabled ? "On" : "Off"), symbol: "link", tone: tone,
-            open: open, actions: actions.isEmpty ? nil : actions, control: connector.canToggle ? toggle : nil)
+            actions: actions.isEmpty ? nil : actions, control: connector.canToggle ? toggle : nil)
     }
 
     /// `connector.share_folder`: the person chooses a folder and its access in the Mac's panel; the owner saves and confirms it.
@@ -198,8 +212,9 @@ extension ConnectorReadiness {
 }
 
 extension NativeAgentEngine {
-    /// The Connectors page: the connector owner's accounts, secrets and folders, then Telegram, the iPhone and agent contacts, each read from
-    /// its own owner. One section's failed read is that section's failed row; the others still draw.
+    /// The Connectors page: one list of everywhere I reach (the connector owner's accounts, the iPhone, each agent contact), each row holding
+    /// its own settings; then agent conversations, secrets and folders, and Telegram's diagnostics and records folded last. Each part is
+    /// read from its own owner, and one part's failed read is that part's failed row; the others still draw.
     @MainActor func connectorsFaceRead() -> PartFaces.Read {
         let accounts = connectors.faceReader(pages: pages)
         watchPhoneFace()
@@ -208,18 +223,35 @@ extension NativeAgentEngine {
 
     @concurrent private func connectorsFace(accounts: PartFaces.Read) async throws -> (face: PartFace, epoch: UInt64) {
         async let accountRead = accounts()
-        async let telegramRead = telegramFaceSections()
-        async let phoneRead = phoneFaceSections()
-        async let agentRead = agentFaceSections()
+        async let telegramRead = telegramFace()
+        async let phoneRead = phoneFaceRow()
+        async let agentRead = agentFace()
         let (base, telegram, phone, agents) = try await (accountRead, telegramRead, phoneRead, agentRead)
-        return (.init(title: base.face.title, line: base.face.line, sections: base.face.sections + telegram + phone + agents), base.epoch)
+        let list = base.face.sections.filter { $0.id == ConnectorReadiness.connectionsSection }.map { section -> PartFace.Section in
+            var connections = section
+            // Telegram's settings sit behind its account row, or behind a Telegram row of their own when no Telegram account is listed.
+            connections.rows = section.rows.map { row in
+                guard row.id == "telegram" else { return row }
+                var account = row
+                account.rows = telegram.settings
+                return account
+            }
+            if !connections.rows.contains(where: { $0.id == "telegram" }) {
+                connections.rows.append(.init(id: "telegram.settings", title: "Telegram", symbol: "paperplane", rows: telegram.settings))
+            }
+            connections.rows += [phone] + agents.rows
+            return connections
+        }
+        let others = base.face.sections.filter { $0.id != ConnectorReadiness.connectionsSection }
+        return (.init(title: base.face.title, line: base.face.line, sections: list + agents.sections + others + telegram.records), base.epoch)
     }
 
     /// Every file and change the Connectors page reads beyond the connector owner, which refreshes the page itself.
     var connectorsFacePaths: [URL] { telegramFacePaths + phoneFacePaths + agentFacePaths }
     static let connectorsFaceNotifications = [ConnectorFaceChange.phone, PhoneSenseHistory.changed] + agentFaceNotifications
 
-    /// A listed row reads from the owner's current face; the phone guide and agent threads read their documents on demand.
+    /// A listed row, top-level or held behind another, reads from the owner's current face; the phone guide and agent threads read their
+    /// documents on demand.
     @MainActor func connectorsFaceBody() -> PartFaces.Body {
         { [weak self] item in
             guard let self else { throw PartCallError(code: "connectors_closed", message: "The connectors owner has closed.") }
@@ -232,7 +264,7 @@ extension NativeAgentEngine {
                 throw snapshot.error ?? PartCallError(code: "connectors_unavailable", message: "Connectors is unavailable. Read Connectors again.")
             }
             let sections = face.sections.compactMap { section -> PartFace.Section? in
-                let rows = section.rows.filter { $0.id == item }
+                let rows = section.allRows.filter { $0.id == item }
                 return rows.isEmpty ? nil : .init(id: section.id, title: section.title, style: section.style, rows: rows)
             }
             guard !sections.isEmpty else {
@@ -284,7 +316,8 @@ extension NativeAgentEngine {
             case "browser_preview": words = try await CapabilitiesFace.previewBrowser(self)
             case "browser_cancel": words = try await CapabilitiesFace.cancelBrowser(self, id: text("id"))
             case "tools_refresh": words = try await CapabilitiesFace.refreshTools(self)
-            case "sense_switch": words = try await CapabilitiesFace.switchSense(id: text("sense_id"), version: version, on: input["value"]?.boolValue)
+            case "sense_switch": words = try await CapabilitiesFace.switchSense(id: text("sense_id"), version: version, on: input["value"]?.boolValue,
+                byPerson: AppToolExecutor.personDecided(tool: "connections", input: input, turn: turn))
             case "sense_share": words = try await CapabilitiesFace.shareSense(self, id: text("sense_id"), version: version)
             case "ability_keep": words = try await CapabilitiesFace.keepAbility(self, id: text("id"), version: input["version"]?.stringValue)
             case "ability_off": words = try await CapabilitiesFace.switchOffAbility(self, id: text("id"))

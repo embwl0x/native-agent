@@ -63,13 +63,12 @@ extension ActivityWatcher {
     static func safelyPolled(
         _ polled: ActivityPolicy, current: ActivityPolicy, currentlyEnabled: Bool
     ) -> ActivityPolicy? {
-        // Disabling is always allowed, whatever else the file says.
-        guard polled.captureEnabled else { return polled }
-        // Only the direct Trust Center path may enable capture; external writes can only tighten it.
-        guard currentlyEnabled, current.captureEnabled else { return nil }
+        // Only the direct Trust Center path may enable capture; an external write that enables it while it is off is not consent.
+        if polled.captureEnabled { guard currentlyEnabled, current.captureEnabled else { return nil } }
 
+        // Disabling is always allowed, and it tightens like any other external change: an edit that turns capture off cannot also widen
+        // what the next enable would allow.
         var safe = polled
-        safe.captureEnabled = true
         // Keep all existing exclusions when applying an external policy.
         safe.excludedBundleIDs = polled.excludedBundleIDs.union(current.excludedBundleIDs)
         safe.captureTitles = polled.captureTitles && current.captureTitles

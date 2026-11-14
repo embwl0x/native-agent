@@ -377,19 +377,4 @@ public enum DeskNagPanelModel {
             : "Nagging is ON for \(on) live item\(on == 1 ? "" : "s")."
     }
 
-    /// Resolve against the supplied clock so near-midnight choices use one consistent instant.
-    public struct SnoozeOption: Identifiable, Equatable, Sendable {
-        public let label: String
-        public let until: String?
-        public var id: String { label }
-    }
-
-    public static func snoozeOptions(from now: Date, calendar: Calendar = .current) -> [SnoozeOption] {
-        [
-            SnoozeOption(label: "Through tomorrow", until: DeskDeferPreset.tomorrow.day(from: now, calendar: calendar)),
-            SnoozeOption(label: "Through " + DeskDeferPreset.nextWeek.day(from: now, calendar: calendar), until: DeskDeferPreset.nextWeek.day(from: now,
-                calendar: calendar)),
-            SnoozeOption(label: "Indefinitely", until: nil),
-        ]
-    }
 }

@@ -260,7 +260,7 @@ public enum ProviderWire {
         call.lifetime.sending?()
         TurnTraceBus.fireFromContext(kind: "provider.httpRequestStarted", surface: call.surface,
             payload: .object(["request": .string(requestID), "requestBodyBytes": .int(Int64(request.httpBody?.count ?? 0))]), turn: call.turn)
-        call.probeCredential?.sending(request)
+        call.sentCredential?.sending(request)
         let label = call.admission.map { SwiftNativeProviderRouting.displayName(for: $0.provider) } ?? request.url?.host ?? "provider"
         await waiting(on: "provider response", detail: "Waiting on \(label)", call: call)
         let response = try await transfer.open()

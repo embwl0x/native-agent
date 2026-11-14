@@ -355,7 +355,7 @@ public enum ResearchClientError: LocalizedError, Sendable, Equatable {
         return .transport(String(describing: error))
     }
 
-    /// Keep the actual read failure useful in ordinary Workspace recovery. NSError's synthesized enum number otherwise hides even an HTTP refusal.
+    /// Keep the source's actual failure visible instead of NSError's synthesized enum number.
     public var errorDescription: String? {
         switch self {
         case .notConfigured:
@@ -363,7 +363,9 @@ public enum ResearchClientError: LocalizedError, Sendable, Equatable {
         case .malformedResponse(let detail):
             return "The source could not be read: \(detail.prefix(400)). Check the address or open it in Browser."
         case .httpStatus(let status):
-            return "HTTP \(status) refused this public read."
+            return [404, 410].contains(status)
+                ? "The page is not there (HTTP \(status))."
+                : "The server answered with HTTP \(status)."
         case .noSuchHost(let host):
             return "No such host: \(host). DNS could not resolve the hostname; no page was read."
         case .connectionRefused(let host):

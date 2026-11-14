@@ -65,8 +65,13 @@ private struct ProviderConfigEditor: View {
         if displayedMode == "api_key" {
             fields.append(.init(id: "key", label: "Key", kind: "secret", placeholder: "Leave empty to keep the saved key"))
         }
-        fields.append(.init(id: "model", label: "Default model", kind: "choice", value: baseline.default_model.map(PartFace.Value.string),
-            options: baseline.models.filter { $0.supported_reasoning_efforts != nil }.map { .init(id: $0.id, label: $0.name) }))
+        // The rows this slot may hold (`ModelSlot.mayHold`): offered ones, and the saved default itself with its note, so Save and Test keep it.
+        let saved = baseline.default_model
+        let holdable = baseline.models.filter { row in
+            (row.supported_reasoning_efforts != nil || row.id == saved) && ModelSlot.mayHold(row.id, row: row, savedInSlot: saved)
+        }
+        fields.append(.init(id: "model", label: "Default model", kind: "choice", value: saved.map(PartFace.Value.string),
+            options: holdable.map { row in .init(id: row.id, label: row.offer_note.map { note in "\(row.name) (\(note))" } ?? row.name) }))
         return fields
     }
     private var entryIssue: String? {

@@ -147,9 +147,10 @@ extension Parts {
         }
     }
 
-    /// Only enabled selected JavaScript runs; Markdown guidance is read, never executed.
+    /// Only enabled selected JavaScript runs; Markdown guidance is read, never executed, and a page (`AbilityStore.answersCalls`) is drawn, never called.
     static func runs(_ row: [String: JSONValue]) -> Bool {
         row["status"] == .string("active") && row["language"] == .string("javascript") && string(row, "codeFingerprint") != nil
+            && row["callable"] == .bool(true)
     }
 
     public enum Arrival: Sendable { case message, stop }
@@ -232,7 +233,7 @@ extension Parts {
             } else if let arrived = invocation.arrived {
                 switch arrived() {
                 case .message?: "A message arrived for you while it worked, so it handed back; " + goOn
-                case .stop?: "Stop was pressed while it worked, so it handed back; " + goOn
+                case .stop?: "The turn stopped while it worked, so it handed back; " + goOn
                 case nil: nil
                 }
             } else { "It goes on by itself only in a conversation turn, so it handed back; " + goOn }
@@ -334,7 +335,16 @@ extension Parts {
             let owned = candidate.owned
             program = OwnedProgram(kind: owned.kind, id: id, version: owned.version, source: owned.source, entry: .face,
                 dependencies: owned.dependencies, permissions: owned.permissions, seconds: owned.seconds)
-        } else { program = candidate.owned }
+        } else {
+            // A page answers no call: catalog publication leaves it out by the same reading, so a call that reaches it anyway is refused here.
+            guard AbilityStore.answersCalls(candidate.program.source, header: Self.fields(candidate.manifest)) else {
+                throw SenseFailure(code: "page_not_call", message: """
+                    \(id) is a page, drawn by face(input); it defines no run(input), so it is never called. Read it with ability.read, or add run(input) \
+                    with ability.save to make it callable.
+                    """)
+            }
+            program = candidate.owned
+        }
         let dataRoot = root
         let broker = program.isResident && !preview
             ? try await OwnedProgramRunner.holding(program, dataRoot: dataRoot,

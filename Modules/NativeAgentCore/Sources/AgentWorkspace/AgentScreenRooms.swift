@@ -395,7 +395,7 @@ extension AgentScreen {
             return "blocked: " + clip(String(last.dropFirst(9)).trimmingCharacters(in: .whitespaces), 40)
         }
         if !item.status.isTerminal, item.waitingOn?.isEmpty == false { return item.statusDescription }
-        return item.status == .now ? "in progress" : item.status.displayLabel
+        return item.spokenStatus
     }
 
     private static func deskItemRoom(workspace: WorkspaceOperation, _ value: JSONValue, projection: WorkspacePage, dataRoot: URL, scope: String,

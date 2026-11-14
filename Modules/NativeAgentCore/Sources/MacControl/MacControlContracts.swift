@@ -59,7 +59,8 @@ public struct MacControlResult: Sendable, Equatable {
         self.nativePage = nativePage
     }
 
-    public func toJSON(readContent: OwnedProgramRunner.ReadContent?) -> JSONValue {
+    /// `text` is the four-verb answer a receipt may carry beside its fields: what happened in words, then the screen after it.
+    public func toJSON(readContent: OwnedProgramRunner.ReadContent?, text: String? = nil) -> JSONValue {
         let outputFields = output.objectValue ?? [:]
         var fields: [String: JSONValue] = [
             "status": outputFields["status"] ?? .string(!ok ? "failed" : outputFields["partial"] == .bool(true) ? "partial" : "completed"),
@@ -74,6 +75,7 @@ public struct MacControlResult: Sendable, Equatable {
             "verification": verification.map { .string($0.rawValue) } ?? .null,
         ]
         fields["error"] = error.map(JSONValue.string)
+        fields["text"] = text.map(JSONValue.string)
         // Owners supply receipt facts through the same projection for every action.
         for key in ["delivery", "effects", "recorded", "delivered", "posted", "deferredUntil", "message", "notificationId"] {
             fields[key] = outputFields[key]

@@ -6,6 +6,7 @@ import NativeAgentCore
 import PersistenceCore
 import MacControl
 import AttentionRouting
+import DeviceSync
 import AppKit
 import NativeAgentShared
 import SwiftUI
@@ -88,8 +89,8 @@ extension AppConnectorActionPlatform {
     init(engine: NativeAgentEngine) {
         self.init(dataRoot: engine.dataRoot, statusPlatform: AppConnectorStatusPlatform(),
                   macAssistant: engine.macIntegration,
-                  notification: { title, body, turn in
-                      await NativeAgentNotifications.postMessage(title: title, body: body, router: .shared,
+                  notification: { note, turn in
+                      await NativeAgentNotifications.postMessage(title: note.title, subtitle: note.subtitle, body: note.message, router: .shared,
                           turn: turn, deadline: nil).deliveryFields()
                   })
     }

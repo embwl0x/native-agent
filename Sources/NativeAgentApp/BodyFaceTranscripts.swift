@@ -63,8 +63,9 @@ final class BodyFaceTranscripts {
             let reader = Reader(request: request)
             readers[id] = reader
             do {
-                if Self.contact(request) != nil { engine.contactThreads.start() }
-                else { try await readOpeningTranscript(request.session, minimumRows: request.openingParagraphCount) }
+                // Every transcript reads the contact readout: a contact's room for its lines, any other for the exchanges had in other rooms.
+                engine.contactThreads.start()
+                if Self.contact(request) == nil { try await readOpeningTranscript(request.session, minimumRows: request.openingParagraphCount) }
                 try Task.checkCancellation()
                 guard readers[id]?.lifetime == reader.lifetime else { throw FaceWireError.disconnected }
                 await update(id)

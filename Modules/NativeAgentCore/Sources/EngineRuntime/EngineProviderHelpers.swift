@@ -65,9 +65,17 @@ extension ProvidersFacade {
             catch { catalogError = cause(error, refreshCatalog ? "refresh the model list" : "load the model list") }
             try Task.checkCancellation()
             let snapshot = try await facade.routing.checkedProviderSnapshot()
+            let asking = askingModelRoutes
             let providers = try await Task.detached(priority: .userInitiated) {
                 try ProvidersFacade.connections(from: snapshot)
-            }.value
+            }.value.map { account in
+                // An account whose provider is being asked says so, in place of why it has nothing offered yet.
+                var account = account
+                if asking.contains(account.provider_id), account.offeredModels.isEmpty {
+                    account.models_note = FirstPartyModelDiscovery.askingSentence(route: account.provider_id)
+                }
+                return account
+            }
             return .loaded(await settingsSnapshot(
                 routing: snapshot.routing,
                 providers: providers,
@@ -188,6 +196,11 @@ extension ProvidersFacade {
               !provider.models.isEmpty else {
             return false
         }
+        // A live route answers through the one carriage check: absent only when no spelling of the pick is in its provider's complete list; its
+        // shipped floor proves no model absent.
+        if FirstPartyModelDiscovery.isLiveRoute(providerId) {
+            return !FirstPartyModelCatalog.routeCarries(model, providerID: providerId, dataRoot: dataRoot)
+        }
         return !provider.models.contains(where: { $0.id == model })
     }
 
@@ -287,8 +300,9 @@ extension ProvidersFacade {
 }
 
 extension ChatComposerModelGroup {
+    /// Menus list offered rows, plus the selected model's own row (shown with its note) so its controls read from it like any other.
     public static func groups(
-        connections: [ProviderInfo], catalog: ModelCatalogResponse?, providerID: String
+        connections: [ProviderInfo], catalog: ModelCatalogResponse?, providerID: String, selectedModel: String? = nil
     ) -> [Self] {
         // Provider-scoped contracts and catalog descriptions form one finished menu.
         var catalogById: [String: ModelCatalogItem] = [:]
@@ -308,13 +322,16 @@ extension ChatComposerModelGroup {
                 return lhs.display_name < rhs.display_name
             }
             .compactMap { provider in
-                let models = provider.models.map { item in
+                let shown = provider.models.filter { row in
+                    ModelSlot.mayHold(row.id, row: row, savedInSlot: provider.provider_id == providerID ? selectedModel : nil)
+                }
+                let models = shown.map { item in
                     let catalogModel = catalogById[item.id]
                     // Provider-scoped capability contracts are authoritative because transports can share model ids with different contracts.
                     return ModelCatalogItem(
                         id: item.id,
                         displayName: item.name,
-                        description: catalogModel?.description,
+                        description: item.offer_note ?? catalogModel?.description,
                         defaultReasoningEffort: item.default_reasoning_effort,
                         supportedReasoningEfforts: item.supported_reasoning_efforts,
                         supportsFast: item.supports_fast,
@@ -363,12 +380,23 @@ extension ProvidersFacade {
         if verb == "refresh_models" {
             let refreshed = await refresh()
             if let detail = refreshed.failure {
-                return AppToolExecutor.failure("refresh_failed", "The model lists did not refresh: \(detail)." + retry, extra: ["effects": .string("unknown")])
+                // Each account's own result stays readable: its row's models_note is the text beside its list (why it is the floor, or when it was fetched).
+                guard !refreshed.accounts.isEmpty else {
+                    return AppToolExecutor.failure("refresh_failed", "The model lists did not refresh: \(detail)." + retry,
+                        extra: ["effects": .string("unknown")])
+                }
+                await reload()
+                return AppToolExecutor.failure("refresh_failed", "Not every model list refreshed. \(detail)." + retry,
+                    extra: ["effects": .string("known"), "accounts": .array(refreshed.accounts.map { quietProviderRow($0) })])
             }
             await reload()
+            // The answer names each connected account and how many models its provider now lists.
+            let asked = refreshed.accounts.filter { $0.auth_status.eligible }.map { "\($0.display_name) \($0.offeredModels.count)" }
+            let listed = asked.isEmpty ? "No account is connected, so no provider was asked."
+                : "Refreshed. Connected accounts now list: " + asked.joined(separator: ", ") + "."
             return .object([
                 "status": .string("ok"),
-                "detail": .string("Fetched every account's model list again, as the page's Refresh does."),
+                "detail": .string(listed),
                 "accounts": .array(refreshed.accounts.map { quietProviderRow($0) }),
             ])
         }
@@ -414,14 +442,15 @@ extension ProvidersFacade {
                     "not_connected",
                     "\(name) is not connected, so it has no fallback model to set. Connecting it is the owner's: ask them to sign in on Providers.")
             }
-            let offered = account.models.map(\.id)
-            guard !offered.isEmpty else {
-                return AppToolExecutor.failure(
-                    "no_model_list",
-                    "\(name)'s model list isn't loaded, so there is nothing to choose from. Run provider.refresh, then try again.")
-            }
+            // A model choice: offered, or the default already saved here (`ModelSlot.mayHold`).
+            let offered = account.offeredModels.map(\.id)
             let model = input["model"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard offered.contains(model) else {
+            let row = account.models.first { $0.id == model }
+            guard ModelSlot.mayHold(model, row: row, savedInSlot: account.default_model) else {
+                if offered.isEmpty || row != nil {
+                    return AppToolExecutor.failure("no_model_list",
+                        ModelSlot.refusal(note: account.models_note, accountName: name) + " Run provider.refresh, then try again.")
+                }
                 return AppToolExecutor.failure(
                     "bad_model",
                     (model.isEmpty ? "Pass model" : "\(model) is not a model \(name) offers")
@@ -477,7 +506,8 @@ extension ProvidersFacade {
             "state": .string(account.auth_status.state),
             "detail": .string(account.auth_status.detail),
             "fallback_model": .string(account.default_model ?? ""),
-            "models": .array(account.models.map { .string($0.id) }),
+            // What the account offers to choose from; the build's rows standing in for a missing list are not offered.
+            "models": .array(account.offeredModels.map { .string($0.id) }),
         ]
         if let note = account.models_note { row["models_note"] = .string(note) }
         return .object(row)

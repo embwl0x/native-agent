@@ -84,7 +84,7 @@ extension BuiltInToolSchemaFactory {
             requestedSchema(name: "artifact_find", toolClass: .read,
                 description: """
                     Find a document, image, mockup or handoff by what it was for or the conversation around it. Searches recorded chat attachments, \
-                    structured tool artifact references and current Desk links; returns exact references with source conversation and version \
+                    structured artifact references in call results and current Desk links; returns exact references with source conversation and version \
                     evidence when recorded. Does not crawl disk, open files, infer approval from filenames, or prove current file availability. Use \
                     the returned evidence to distinguish approved work from a later draft.
                     """,

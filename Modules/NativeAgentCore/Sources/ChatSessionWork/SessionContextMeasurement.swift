@@ -197,9 +197,7 @@ public struct SessionContextMeasurement: Sendable {
     /// The readout sizes the conversation under the same input budget as a live request.
     private static func rendered(_ rows: [JSONValue], windowTokens: Int,
                                  outputTokens: Int) throws -> (characters: Int, rows: [String: Int]) {
-        let latestUser = rows.lastIndex { $0.objectValue?["role"] == .string("user") }
-        var unbounded = Set<String>()
-        let renderables = try rows.enumerated().compactMap { index, row -> SessionHistoryPromptRenderer.Renderable? in
+        let renderables = try rows.compactMap { row -> SessionHistoryPromptRenderer.Renderable? in
             guard case .object(let fields) = row,
                   case .string(let id)? = fields["id"], !id.isEmpty,
                   ContactThread.Line(fields).provenanceFailure == nil,
@@ -208,18 +206,12 @@ public struct SessionContextMeasurement: Sendable {
             if fields["metadata"]?.objectValue?["awaitingConsumption"] == .bool(true) { return nil }
             let createdAt = try JSONRow(row).string("createdAt")
             let message = ChatMessage(role: role, content: content, timestamp: createdAt, extras: row)
-            guard var rendered = SessionHistoryPromptRenderer.renderable(message) else { return nil }
-            // Current user words are not capped prior history; SentTurnContext keeps the exact sent words after sending.
-            if role == "user", rendered.sentContext == nil,
-               index == latestUser {
-                unbounded.insert(rendered.historyIdentity)
-                rendered.structuredContent = ChatSecretRedactor.redactText(content)
-            }
-            return rendered
+            // Every row, the current one included, is sized in the form replay sends it: saved exact words when kept, else the stored
+            // message with its speech and attachment evidence. Measurement and replay read the same `replayed` bytes.
+            return SessionHistoryPromptRenderer.renderable(message)
         }
         guard let admission = try SessionHistoryMessages.admission(renderables: renderables, historyLimit: 1,
-            budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens),
-            unboundedUserIdentities: unbounded) else { return (0, [:]) }
+            budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens)) else { return (0, [:]) }
         var projected = SessionHistoryMessages.project(admission)
         let inputBudget = Double(ContextBudgetPolicy.inputTokens(windowTokens: windowTokens, outputTokens: outputTokens))
             * ContextBudgetPolicy.transcriptCharactersPerToken

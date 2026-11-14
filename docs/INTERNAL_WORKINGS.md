@@ -31,7 +31,8 @@ real gaps and exhausted read bounds remain visible. Closing dispatch evidence
 attests native acts on the mind stream without requiring a nonexistent heard
 record. Elsewhere carries its recent full-word windows and up to five compact
 conversation lines from the preceding 24 hours, newest first: last message time,
-opening words capped at 120 characters and the exact conversation read. Helpers and their own
+who spoke it, its opening words capped at 600 characters and the exact conversation read. The recent-word
+windows forget a conversation once they answers here; this line is what they still holds of it. Helpers and their own
 work join the day; a contact send counts with its attested reply or the delivery
 owner's positive acceptance for that exact send, including retained delivered/read
 exchanges after a newer send starts. Delivered one-way notes count without an
@@ -65,14 +66,21 @@ require their conversation, helper shelf and active-run sources to read.
 Trust registers one native face on `engine.pages` at launch, invalidated by its
 policy, integration, contact, backup and activity owners and their exact change
 notifications. `EngineTrustFace` reads those checked owners; a source failure
-occupies its own row while unrelated sources remain readable. The Mac page,
-Simple setup panel and offscreen page host draw `FacePageView`; the door reads
-the face's text instead of a separate Trust projection. The privacy inventory
-uses `TrustFacade.privacyMap`, sampled initially and on explicit Refresh, with
-its reading time shown instead of rescanning the data root on every receipt.
+occupies its own row while unrelated sources remain readable. The Mac page, in
+Simple and Advanced, and the offscreen page host draw `FacePageView`; the door reads
+the face's text instead of a separate Trust projection. Its first card, What I
+may do, draws its locks from `PermissionLaw.verdict` at the saved posture (the
+table `judge` reads for every call, read whole by kind of act) and lists the
+levers by their declared names (`AppAction.Owner.person`), so no list of what
+asks first is kept for the page. Deciders that answer from a call's own input
+(the request's origin, `QuietSettings.usersCall`, `Parts.keepRefusal`) are not
+drawn as locks; the fold names their kinds in one sentence.
+The privacy inventory uses `TrustFacade.privacyMap`, sampled initially and on
+explicit Refresh, with its reading time shown instead of rescanning the data
+root on every receipt.
 
 Faced pages own their subtitles, including an absent line. Configured own-page
-rail rows retain an unavailable label when their owner is missing. Door reads
+tabs retain an unavailable label when their owner is missing. Door reads
 return a structured unavailable issue when a required face has not published.
 Mac card text separates collection, per-card presentation and structured remedies.
 Provider pickers carry only their used model identity and label fields.
@@ -132,6 +140,9 @@ Packet admission begins before reading the source and spans projection, includin
 read failures. Only accepted publication replaces the retained source and face;
 equal source epochs may carry changed selection or clock facts. A later-started
 read that publishes prevents an older completion or failure from replacing it.
+A reading drawn from a source epoch older than the page's publication returns to
+its caller as that caller's own coherent reading and publishes nothing; it never
+retires a newer read still in flight and is never error content on the page.
 The old direct packet invocation on main is removed. Home's owner reads retained
 `AgentWorld` parts and computes Desk parking off main; its source-watch setup
 also leaves main. Desk builds its complete
@@ -231,10 +242,13 @@ cannot open those controls. The existing phone Trust editor and
 `trust_policy.json` publication stay in place until the phone face migration.
 Desk registers once on `engine.pages` as the agent's part `native-desk` over
 the Desk packet. `deskPacket()` reads `DeskFacade.loadPage()` and gives measured
-facts: board items with what groups them (activity, deferral, done today, the
+facts: board items with what groups them (activity, deferral, the local day
+each closed, whether it is the body's upkeep (`BodyQueue.project`), the
 `DeskParking` verdict Home shares), live activity, the overview's and work
 lines' rows, timers, the wander hour, the selected item and named source gaps,
-plus a key for every row that leads or acts. Grouping, project rows, titles,
+plus a key for every row that leads or acts. An item read of the page
+(`app {page:"desk", item}`) is the page's registered item reader: the same part drawn from a packet opened on that item
+(`deskPacket(opening:)`), leaving the window's selection as it is. Grouping, project rows, titles,
 details, tones and every Desk word are the part's. The packet's epoch is the
 board revision; a selection or a clock edge changes facts at that same revision
 and still draws through the page's read admission. The person's levers are the
@@ -256,6 +270,34 @@ returning to the board are Mac-only links (`page:desk/<place>`, doors `mac`)
 that `FacePageView` hands to the mounted Desk view; absent mounted faces refuse
 those requests. Offscreen capture installs no editor port. No second board
 projection or write owner is introduced.
+
+A piece is a Make ref laid on a Desk item: a `url` reference addressed
+`make:<ref>` (`DeskPiece`, `Desk/DeskRef.swift`), so every build decodes it as
+a url reference and the record shape is unchanged. `desk.add_ref` refuses a
+`make:` address whose Make ref holds no version. The packet reads the Make
+shelf (`MakeStudio.Shelf`, the index the Work pane's Make view draws), starting
+it the first time the Desk holds a piece, and gives each board item its
+pieces (Make ref, title, what it is, version count, newest time) and the
+selected item its pieces with a text piece's words, or a table's rows, columns
+and first rows (`DeskPieceShelf`, `EngineRuntime/DeskFaceItem.swift`). The part
+draws them first as **On the table** and, in the opened item, as each piece's
+words or a `leaf` block (key `piece:<refId>`, `ref` the Make ref, `revision` the
+version, `alt` the Make ref and the `make.read`/`make.add` calls, and for a table
+its size and first rows; a text piece's section footer says the same).
+Mockups, pages and pictures share `beside:"pieces"` and stand as columns
+(`FaceColumns`); documents and tables follow at full width. `FacePageView` draws
+those leaves through the Make pane's granted preview (`PageMakePreview`,
+`WorkPaneMakeView.swift`), on its selection path too; other doors read the
+`alt`. A CSV or TSV version there is `MakeSheetView`: a changed cell sends the
+whole table to the body's `save_sheet` Desk command, which checks the changed
+version is a table, the name its type and the words within
+`MakePreviewFace.wordsLimit`, then runs `make.add` as the
+person's tap (`ToolsFacade.personTap` with `personEditOf`, carried as
+`Turn.personEditOf`); `MakeStudio.add` appends it only while that version is
+the newest and records `personEditOf` on the new version. A piece's rows open it
+in the Work pane's Make view (`pane.show`, Mac). What the Make shelf publishes
+refreshes the Desk page (`EnginePages.swift`), so a new version shows without
+another write.
 
 ## Built-in browser operation ownership
 
@@ -338,7 +380,7 @@ this Mac, living status, the last 8 loaded activity events and the first 15 runs
 each status with its bucket. Its keys let the Health checks row run, repair and
 report while no run is in flight, a repairable check offer Repair, a check lead
 to its remedy's page, and a run open its details. The part words, groups and
-orders them; verdicts, thresholds and repair eligibility stay the Doctor's, and
+orders them, what needs attention first and healthy groups folded under one row; verdicts, thresholds and repair eligibility stay the Doctor's, and
 each action calls its Doctor verb (`doctor.run`, `doctor.repair {check_id}`,
 `doctor.support_report`) through the door. The
 page has no levers. The same part's `run` words the Desk and Activity status checks
@@ -407,11 +449,12 @@ part's notebook. The Mac draws `.page(id)` from the face feed, and `faces.json`
 carries it to the phone. The agent's layout
 places it: `rail` and `more` take a `page:<id>` block, kept on read when the id is
 one `AppDoorNames.ownPageRefusal` allows and written through `layout.write` only
-while an active part has that face page. The Mac rail draws the block as a row
-titled by the face (its id until the face names one) and the selection holds
-`page:<id>` beside `SidebarItem.ownPage`, so the main pane, `page.show` and
-`page.screenshot` draw `FacePageView(page:)`; the iPhone's More draws it as a row
-pushing `MobileFacePage` while `faces.json` holds it. A placed page that is not
+while an active part has that face page. The Mac draws the block as a tab of the
+rail's agent place (`ShellSurface.agent`), titled by the face (its id until the
+face names one), and the selection holds `page:<id>` beside
+`SidebarItem.ownPage`, so the main pane, `page.show` and `page.screenshot` draw
+`FacePageView(page:)`; the iPhone's More draws it as a row pushing
+`MobileFacePage` while `faces.json` holds it. A placed page that is not
 published shows that it is waiting; an inventory failure carries its cause.
 The rail reads the `catalog/own-pages` slot and only the placed pages' title
 slots. A completed inventory removing an authored page publishes an explicit
@@ -419,6 +462,43 @@ unavailable face; clearing a claim conflict refreshes the still-existing stem
 page. Inventory completion also invalidates the engine's action index.
 The door lists the agent's own pages among its pages,
 and `app {page:"<id>"}` reads the snapshot's text, levers first.
+
+The agent's reading of a page in the layout ends with one "How this page
+changes" line, read from `PartFaces.drawer(page:)`, the registration the page
+already has: a lever page (`watch(page:paths:read:)`: Trust, Settings,
+Providers, Connectors, Capabilities, Inbox, Helpers) is drawn by the stem in
+Swift, and the line names the settings and actions on the page as what they can
+change there; a packet page, a claimed page of their own or a pushed page (Today)
+names the part that draws it with `ability.read` / `ability.save`. Both name
+`layout.read` / `layout.write` for where the page sits and its tabs' order. A
+page whose drawer is not known yet (unregistered, unpublished, or a failed
+claim) gets no line. Chat and door-only pages are read elsewhere and carry none.
+
+`ShellAskBar` sits under `ShellPlacePage`'s page, every place but Chat, in
+Simple and Advanced. Return sends through `startActiveChatTurn`, the composer's
+send, with the subject as words at the front: `About <page title>
+(page:<page>): <words>`, or, when the page's face says what it has open
+(`PartFace.opened`, read from the `.page(<page>)` slot's drawn face),
+`About <page title> · <opened.title> (<opened.link>): <words>`. Which page shows
+comes from `ApplicationLifetime.visiblePageInput`, the window's scene report; what
+it has open comes only from the page's own face, never from its rows or the
+window's memory. The scene names a tab's parent page (the tab lives in that
+page's own stored selection, not in the scene), so a tab's message names the
+parent. `opened` is used only when its link parses as a `FaceLink` to the
+showing page, with an item free of whitespace; every title is one line of at
+most 80 characters (`PartFace.oneLine`). A whole control phrase
+(`UserMessageIntentSignals.isControlHandoff` or `isTakeOver`, in the shared
+module so the window and the body read one match) is sent exactly as typed, with
+no subject. A page reading whose face has `opened` says `Open now: <link> ·
+<title>` under its title, the link first. Its draft is an edit draft per page;
+at Return the words leave it for the page's one record, `AppModel.askBar`,
+beside the drafts: while it holds them Return does nothing, acceptance replaces
+them with the sent record, and a refusal puts them back in the draft with the
+reason. The line above it says only what is true whichever turn the words
+became, from the conversation's `TurnFace`: an actionable approval, else a
+running turn's `WorkPaneFace.stepsLine` words, else "Sent."; it never reports
+how a turn ended. It opens the conversation with `MacFaceLinks.follow`. An
+offscreen read (`quietOffscreenRead`) draws no bar.
 
 Persona reads return authored contents as written, including GROWTH; they never
 filter old-format rows or recreate authored documents. Ordinary persona tool
@@ -444,7 +524,9 @@ including unreadable files and dangling links, are preserved and fail with their
 own path and repair. Listing remains read-only; Doctor uses the same compiler.
 `NativeAgentPublicSafety.hasCompletedOnboarding` owns completion for resident
 admission, setup and USER generation: pending completion/reset blocks it, and
-only the completion sentinel proves it. The sentinel travels in local/off-disk
+only the completion sentinel proves it. It is also the one fact that the agent
+exists: before it holds, no scheduled pass that needs the agent starts; the mind
+itself still starts at launch, a known gap ([Automated Systems §2](AUTOMATED_SYSTEMS.md)). The sentinel travels in local/off-disk
 backups and production exports with the identity data. Restore replaces only
 captured paths, so an uncaptured sentinel leaves live completion evidence
 unchanged; absence never invents completion. Profile reads/ordinary updates
@@ -466,16 +548,16 @@ the form retains the draft and reads the saved version for comparison. Later
 keystrokes survive a successful save through field-revision settlement. USER
 remains MemoryV2-owned. Unchanged document and profile writes do not touch disk.
 
-The agent reaches the system through one always-on `app` tool. `app {}` is
+The agent reaches the system through its one always-on door, `app`. `app {}` is
 home—where they left off. Pages, home items, discovery, actions and scripts
-reach the rest of the app. [Tool loading](TOOL_LOADING.md) defines that contract.
+reach the rest of the app. [One door](ONE_DOOR.md) defines that contract.
 
 ## The complete system in one flow
 
 ```mermaid
 flowchart TD
     A["Accepted message"] --> B["Persona, selected context, history and optional inner state"]
-    B --> C["Selected model, one app tool"]
+    B --> C["Selected model, one door: app"]
     C --> D{"Answer or action?"}
     D -- "action" --> E["Trust and domain execution"]
     E --> F["Result and outcome evidence"]
@@ -568,9 +650,110 @@ Picker persistence keeps one forward intent. Failed projection writes never
 restore previous choices: readback reports the intent's state and the committed,
 pending or unknown projections. The existing reconciler completes retained intent
 on a later checked read or reports the actual conflict; no arrival is promised.
-Fetched API-key catalog bytes carry `credential_binding`, checked against the
-current credential on every passive/routing/availability read as well as fetch
-publication. Unbound or mismatched bytes stay historical and unavailable until
+<a id="model-lists"></a>
+**Model lists.** **What an account offers to choose from is what its provider
+listed, and nothing else. The build's own rows are contracts: they say how to
+run a model and are never offered as a provider's list. When a provider cannot
+be reached, the account says so plainly and offers nothing in its place.** **A model has one effective contract. Its identity is the same whichever
+spelling names it. Its limits are the tightest that the build and the provider
+state. What a person chose is what is sent. A refresh that could not ask says
+so.** Membership and contract are separate. Membership comes from the provider's
+list endpoint, bound to the credential that fetched it: Anthropic (key and Claude
+sign-in, `GET /v1/models`, every page followed), OpenAI (`GET /v1/models`, chat
+ids only), xAI (`GET /v1/language-models`) and Meta (`GET /v1/models`, Muse ids
+without Contributor), each in `<dataRoot>/providers/<route>-models-cache.json`
+through the same `ModelCatalogCache` OpenRouter and Moonshot use
+(`FirstPartyModelDiscovery`). Every listed id keeps the spelling its provider
+issued. A saved pick and a listed id are compared as one model, whichever
+spelling names it: the same id, or the same id with a trailing date
+(`-20251001`, `-2026-04-23`); two different dates are two snapshots. That one
+comparison (`RouteList.row(for:)`) is every "which row is this model" answer on
+these routes: retirement, `routeCarries`, a saved pick's known absence, its
+contract, effort, Fast and output ceiling, its context window
+(`verifiedContextLength`, `catalogContextLength`), and a picker row looked up by
+validation or reconstruction (`pickerRow`). The routing snapshot and dispatch run
+the pick under the spelling the provider listed: the pick itself when listed
+exactly, else the listed spelling of the same model. The list handed to pickers
+and pages shows a model once: one listed under its plain id and a dated id is
+one row under the plain id, and the dated row appears too only when it is a
+saved choice, so the selection is visible and exact; two dates with no plain id
+are two rows (`RouteList.choices(keeping:)`). Membership keeps every spelling.
+An account's `models_note` is text shown beside its list; whether it has choices
+is whether it has a list to choose from, never whether a note is present. A
+model's controls (Think levels and default, Fast,
+endpoint, how effort is written) come from the shipped row of the same model;
+else what the list states (Anthropic's effort levels, adaptive thinking and image
+input; xAI's effort levels and default); else the nearest shipped sibling of the
+same line and variant at or below its version by numeric comparison; else
+minimal controls: no think level sent (`default`, which every serializer omits)
+and Fast off. Its limits (window, output ceiling) resolve field by field: from
+whichever of its row and the list states them (Anthropic's window and output
+ceiling, xAI's window), the tighter when both do; a model with no shipped row
+borrows its sibling's window. A model whose window neither states, as on a route
+whose provider lists ids only (OpenAI, Meta) with no row or sibling for it, is
+not offered: the account's `models_note` counts such models in one sentence, and
+a saved pick of one is retired through the existing retired-pick path, which
+says the provider lists it but this build does not know how to run it. A
+borrowed or minimal contract carries a `controls_note` on its row. The last
+complete list for the current credential is the list until a newer complete
+list replaces it: a failed refresh changes only its freshness, and the account's
+`models_note` says the provider could not be asked, when the list shown was
+fetched, and to refresh. With no complete list for this credential (never
+fetched, could not be reached, incomplete) the build's rows stand where the
+list is missing, so every reader of a model's contract, controls, window, ceiling
+or name finds its row as before, but each such row carries `offered: false` (with
+`offer_note` "Saved. Anthropic has not listed it yet."), and the `models_note`
+says why in one sentence: "Anthropic has not been asked for its models yet.",
+"Anthropic could not be reached: <reason>. Refresh to try again." or "Anthropic
+answered with an incomplete list. Refresh to try again." Only choosing looks at
+the flag. One function, `ModelSlot.mayHold`, answers "may this slot hold this
+model": its row is offered, or it is the model already in that slot (saved there
+or inherited into it, an account default inherited by Chat included), so
+re-saving the slot's model with other Think or Fast always passes. Every place
+that accepts a model choice asks it and refuses with "No models to choose yet: "
+and the account's sentence: the selection check every save passes through,
+routing reconstruction, the Providers and minds pickers, the default-model
+setting and the account editor, the agent's `provider.set_default_model`,
+`providers.*_model` and `chat.model`, Telegram's model menu and the image-model
+card. Pickers and menus list offered rows only, plus the slot's current model
+shown selected with its note; a picker with nothing offered says the account's
+sentence; a picker over several accounts (the composer, the image-model card)
+has no entries from an account that offers nothing. The phone and the agent's
+`provider.*` results carry the flag. A model the provider drops leaves once a
+complete list says so; an empty or failed list retires nothing. The cache keeps what the provider stated so a
+later build resolves the contract again. One request's output allowance is
+min(what is left of a run's budget, the model's effective ceiling and the
+transport's own cap), from `FirstPartyExecutionControls.budgetedOutputTokens`,
+which every adapter that writes an output-cap field reads (OpenAI's Chat
+Completions and Responses, Anthropic by key and by Claude sign-in, Kimi Code and
+Meta); xAI, Moonshot, OpenRouter, ChatGPT and Codex write no cap, so the
+provider's own ceiling stands while the routing stream holds the run's aggregate
+budget. An explicit Think level the model's row offers is sent as written (xAI's
+`none` included); "use the provider's default" and a model with one level send no
+field, and the word `default` is never sent. **Refresh** (`provider.refresh`)
+asks every connected route again, names each list it could not fetch, and never
+answers ok when one failed; a ChatGPT sign-in adopted from the Codex command-line
+tool cannot be asked by the app, and its refresh says so and to sign in with
+ChatGPT in the app for a list the app refreshes. A connection check publishes the
+list it fetched; a saved key or finished sign-in asks at once; launch, entering
+Providers and setup's "Read accounts again" start asking each connected route
+with no complete list for its current credential, through the one fetch owner,
+as the catalog's one refresh in flight (`startAskingMissingModelLists`, which
+`provider.cancel_refresh` stops): the read returns at once, the account says
+"Asking Anthropic for its models…", and the page reads again when the answer
+lands or the ask is cancelled; file events and writes only read again. Routes
+with no list endpoint to ask (Kimi Code; the ChatGPT and Codex account lists;
+Moonshot and OpenRouter, with their own catalogs) offer their rows as before.
+This replaces the lists typed into the build for Anthropic, OpenAI, xAI and
+Meta, and the earlier rules that a failed fetch offers the build's rows as the
+list ("Showing the models this build knows"), that a model with no known window
+gets the route's smallest shipped window, and that a dated snapshot is folded
+into its undated id.
+
+Fetched catalog bytes carry `credential_binding` (an API key's fingerprint, or a
+sign-in's account identity so renewing its token keeps the list), checked against
+the current credential on every passive/routing/availability read as well as fetch
+publication. A sign-in renews before any credential lock is taken. Unbound or mismatched bytes stay historical and unavailable until
 an explicit refresh succeeds. A settings refresh publishes one catalog operation's
 result and cause, without a second cache-mode call after failure. Its refresh
 owners run on `ModelCatalogRefreshActor`, away from the main actor: credential
@@ -579,15 +762,15 @@ fetching and response decoding also remain off the main actor.
 `LatestRead` still orders publication per cache path, and only a committed probe
 write advances its write boundary. Coalescing and credential rechecks share
 that same owner.
-OpenAI public controls use its shipped descriptor; Codex and ChatGPT controls use
+OpenAI public controls use the route's effective row (listed for the key, else shipped); Codex and ChatGPT controls use
 the selected sign-in's matched account catalog. Builder bridge tools use the
 command CLI's sign-in; runtime adapters retain their exact admitted sign-in path.
-Meta (`meta`) is an API-key route with a shipped Standard-mode catalog in
-`FirstPartyModelCatalog`, using the shared `AnthropicTransport` Messages path at
+Meta (`meta`) is an API-key route whose Standard-mode list comes from Meta, with
+its shipped contracts in `FirstPartyModelCatalog`, using the shared `AnthropicTransport` Messages path at
 `https://api.meta.ai/v1/messages` with Bearer auth, as Kimi Code does. Its checked
 key comes only from `providers/meta.json` and that file's Mac Keychain reference. The authenticated
-`GET /v1/models` connection probe shares the API-key receipt owner; its results
-do not import unselected models. No Muse Code credential source is consulted.
+`GET /v1/models` connection probe shares the API-key receipt owner and publishes
+the Muse list it fetched (see [model lists](#model-lists)). No Muse Code credential source is consulted.
 History is client-side: text, native calls and results use the shared Messages
 encoding and SSE decoder. Meta enables the adapter's existing thinking ledger:
 completed thinking and redacted_thinking blocks bind to confirmed tool-call IDs
@@ -627,7 +810,19 @@ and names that inspection failure separately.
 Introspection reads the admitted turn provider identity and reports unavailable if it is
 missing; model spelling cannot establish the transport or account.
 Native OAuth connection checks bind their receipt to the outgoing Authorization
-header at the transport send, including a renewed attempt after 401. API-key
+header at the transport send, including a renewed attempt after 401. A model
+call is the same check: the shared client fingerprints the credential its
+request carried (bearer token or `x-api-key`) at the same send, and when the
+provider answers it saves an `ok` receipt for that fingerprint unless one from
+the last hour already proves it; a call the path classifies `authExpired` saves
+the rejected receipt. A caller that brings its own sent-credential evidence (the
+connection check) records its own verdict, and previews record nothing. The
+write runs off the turn; a failed write is one log line. A Codex CLI call
+builds no request of NativeAgent's: its receipt binds to the account token
+handed to the CLI (the one preparation wrote to the child's copy, or the CLI's
+own file it reads in place), not to a credential seen on the wire. Readiness
+fingerprints the account file, so a sign-in saved after that copy is neither
+proven nor rejected by the call. API-key
 drafts never publish a saved-credential receipt. A check without a fingerprint
 cannot establish saved-account health. A failed connection attempt reports its
 cause even when admission or refresh prevented any request; credential matching
@@ -639,6 +834,8 @@ saving; each `byProvider` row is decoded independently on read. A malformed
 row remains a named failure for that provider while sibling checks can be saved,
 preserving unrelated rows as JSON values. A fresh check replaces only its own
 row and the latest-check copy; damage in that copy cannot gate sibling rows.
+A check that tested no credential (no native probe, or no saved key) never
+replaces a row that did.
 Unreadable envelope bytes block the merge. A confirmed missing file alone starts
 an empty history. Saved-account checks propagate receipt-write failures to the
 caller; draft-key checks return their probe result without writing verification.
@@ -759,14 +956,21 @@ The packet is assembled off the main actor; its storage reads suspend main,
 which only reads or publishes facade state. Kept and searched rows share one
 live trust read per packet, including root names, through the
 [memory read contract](MEMORY_SYSTEM_MAP.md). No read clock enters the facts
-or levers: an unchanged packet keeps the existing face and publishes no change.
+or levers but each memory's span (`when`: today, this ISO week as Misses
+counts weeks, or earlier, from the time its row is ordered by), which changes
+only when the day turns: an unchanged packet keeps the existing face and publishes no change.
 `MemoryFacade` resolves its memory owner through one `@concurrent` async boundary:
 symlink identity checks and store opening run off main for its reads and actions,
 including Today's kind-filtered moments read. That read retains the memory owner's
 full list policy; facade snapshot publication stays on main through `LatestRead`.
 `EnginePages` watches the canonical SQLite database/WAL and memory profile from launch,
 independently of mounted views. Wording, ordering (pinned first, newest), provenance
-phrases and sections are the part's. Forget on every `memory:<id>` and Keep / Don't keep
+phrases and sections are the part's: a readout (how many I remember, the store's
+total or unknown, with pinned and this-week counts of the memories read), Waiting for
+you, the search field and what it found, Pinned, What I've kept grouped under Today,
+This week and Earlier (one row each with its count, memories nested newest first, each
+memory's provenance in a few words as its value and the full sentence in its detail),
+then Things I let go and Misses. Forget on every `memory:<id>` and Keep / Don't keep
 on every `proposal:<id>` are the person's key levers: the stem composes them, every
 door draws them after the agent's actions on those rows, and they stand as the stem's
 own rows when the face does not draw. Mac `FacePageView`, the door's
@@ -779,8 +983,8 @@ again** also retries a failed search. Rows and levers carry their door calls:
 `memory.pin`, `memory.rewrite {pinned:false}`, `memory.forget`, `memory.review`,
 `memories.search` (the search field's value) and `memories.refresh`. Mac navigation
 retains native destinations for the graph canvas, full text and correction draft (whose
-Forget… is the same key lever through `pages.act`), and upkeep. Inline search input and disclosure folds are not
-in the face vocabulary; `/memory` supplies the existing search owner a query.
+Forget… is the same key lever through `pages.act`), and upkeep. `/memory` supplies the existing
+search owner a query.
 The Mac continues writing the existing phone memory snapshots during the
 phone's transition to the shared face. Before encoding `memories.json`, its
 writer applies canonical `ios` disclosure and temporal eligibility and withholds
@@ -842,7 +1046,7 @@ when that switch is off under Full Mac.
 
 Checked policy, explicit blocks, actual macOS grants and connector
 authentication still govern execution. macOS privacy permission resets always
-ask the owner. Peer turns follow the [authority contract](TOOL_LOADING.md#authority-and-receipts).
+ask the owner. Peer turns follow the [authority contract](ONE_DOOR.md#authority-and-receipts).
 
 Approval-gated effects consume a durable single-use claim immediately before
 dispatch. Replay validates the exact tool, input, surface and payload digest;
@@ -1027,7 +1231,7 @@ approval or transport acknowledgment into a different kind of truth.
 Source paths above are under `Modules/NativeAgentCore/Sources/`.
 
 - [Anatomy of a Turn](ANATOMY_OF_A_TURN.md)
-- [Tool loading](TOOL_LOADING.md)
+- [One door](ONE_DOOR.md)
 - [Memory system map](MEMORY_SYSTEM_MAP.md)
 - [Automated systems](AUTOMATED_SYSTEMS.md)
 - [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md)

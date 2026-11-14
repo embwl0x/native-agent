@@ -4,11 +4,11 @@ import NativeAgentShared
 
 // Blueprint: | `AppShellMenuPresentation.swift` | Rail-derived shortcuts, status words and ordered rail rows |
 
-/// Derive Navigate order and labels from SidebarItem.rail so numbered shortcuts always match the visible rail.
+/// Derive Navigate order and labels from SidebarItem.rail so numbered shortcuts follow the shown pages in the layout's order.
 enum NavigateMenuPresentation {
     struct Entry: Equatable, Identifiable {
         let item: SidebarItem
-        /// Only the first nine rail items receive shortcuts to avoid duplicate or misleading digits.
+        /// Only the first nine shown pages receive shortcuts to avoid duplicate or misleading digits.
         let shortcut: Character?
 
         var id: String { item.rawValue }
@@ -38,7 +38,8 @@ enum MenuBarStatusPresentation {
     }
 }
 
-/// One row of the Advanced rail, in the layout's order: an app page, the divider, or a page of the agent's own by its id.
+/// One entry of the layout's `rail` block, in its order: an app page, the divider (the rail draws none; its surfaces group the pages),
+/// or a page of the agent's own by its id.
 enum ShellRailRow: Hashable {
     case item(SidebarItem)
     case divider
@@ -46,17 +47,18 @@ enum ShellRailRow: Hashable {
 }
 
 extension SidebarItem {
-    /// Read layout order from the rail so the rail, Navigate shortcuts and palette pages follow the visible rows.
-    static func railRows(_ layout: SurfaceLayoutAvailability) -> [ShellRailRow] {
-        layout.contentNames("rail", profile: ShellViewMode.advanced).map { name -> ShellRailRow in
+    /// Read the layout's rail block as the view `profile` names shows it, so the places and their tabs, Navigate shortcuts and palette
+    /// pages follow the shown pages.
+    static func railRows(_ layout: SurfaceLayoutAvailability, profile: String) -> [ShellRailRow] {
+        layout.contentNames("rail", profile: profile).map { name -> ShellRailRow in
             if let page = SurfaceLayout.ownPage("rail", name) { return .page(page) }
             return QuietPages.all.first { $0.id == name }.map { ShellRailRow.item($0.item) } ?? .divider
         }
     }
 
-    /// The rail's app pages and its divider (nil); a page of the agent's own is the rail's alone.
+    /// Advanced's app pages and the rail's divider (nil); a page of the agent's own is the rail's alone.
     static func rail(_ layout: SurfaceLayoutAvailability) -> [SidebarItem?] {
-        railRows(layout).flatMap { row -> [SidebarItem?] in
+        railRows(layout, profile: ShellViewMode.advanced).flatMap { row -> [SidebarItem?] in
             switch row {
             case .item(let item): [item]
             case .divider: [nil]

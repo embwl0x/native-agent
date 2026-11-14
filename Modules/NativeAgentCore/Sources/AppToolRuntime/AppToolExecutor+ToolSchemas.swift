@@ -1,55 +1,108 @@
 import AgentWorkspace
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
+import os
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `AppToolExecutor+ToolSchemas.swift` | `AppToolExecutor`, `appToolSchemas`; Lazy door schema avoids registry initialization cycles |
+// Blueprint: | `AppToolExecutor+ToolSchemas.swift` | `AppToolExecutor`, `appToolSchemas`, `modelSchemas`; the agent's hand, drawn again only when it can change |
 
 extension AppToolExecutor {
-    /// The fold registry reads non-door schemas here; door schema initialization must not re-enter that registry.
+    /// The fold registry reads non-door schemas here; drawing the door must not re-enter that registry.
     public static func appToolSchemas(includeDoor: Bool = true) -> [LLMToolSchema] {
-        includeDoor ? doorSchemas + nonDoorSchemas : nonDoorSchemas
+        includeDoor ? Hand.door() + nonDoorSchemas : nonDoorSchemas
+    }
+
+    /// What a turn's collection offers the model: these tools with the door as the agent's hand is now. The registered descriptors keep the first
+    /// drawing, as a registered descriptor must; the model reads this.
+    public var modelSchemas: [LLMToolSchema] {
+        Self.appToolSchemas().filter { Self.buckets[$0.name] != nil }.sorted { $0.name < $1.name }
     }
 
     private static let nonDoorSchemas = makeAppToolSchemas(includeDoor: false)
-    /// Built once per process: the description is part of the provider's cached prefix, and registered descriptors must never change.
-    private static let doorSchemas = makeAppToolSchemas(includeDoor: true)
 
-    /// Her hand, alphabetical, each verb in its one-line form from the current admitted schema: what a hand is born knowing and every native
-    /// action her own mind has done in what her record still holds. Read when the door is first built (the engine builds it as it is made,
-    /// off the main thread, and launch waits for the engine). A verb this release does not admit, or whose schema does not render, is not in her hand; an unread record or an unrendered
-    /// verb is traced as `app.hand`.
-    static func handForms() -> [String] {
-        var ids = Set(AppActions.bornKnowing)
-        var gaps: [String: JSONValue] = [:]
-        do {
-            let done = try TurnTracePersistLane().doneVerbs()
-            ids.formUnion(done.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
-        } catch { gaps["record"] = .string(error.localizedDescription) }
-        var forms: [String] = []
-        do {
-            let native = try Dictionary(AppActions.seedActions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-            for id in ids.sorted() {
-                guard let action = native[id] else { continue }
-                do {
-                    guard let schema = try AppActions.discovery(action).objectValue?["args_schema"] else {
-                        gaps[id] = .string("no admitted args_schema")
-                        continue
-                    }
-                    forms.append(try ToolSignature.call(id, schema.serializedData(pretty: false)))
-                } catch { gaps[id] = .string(error.localizedDescription) }
-            }
-        } catch { gaps["catalog"] = .string(error.localizedDescription) }
-        if !gaps.isEmpty {
-            let at = Date()
-            TurnTraceBus.fire(TurnTraceEvent(kind: "app.hand", title: "Her hand", status: "partial", payload: .object(gaps),
-                createdAt: NativeTimestampFormat.plainZulu(at), ts: at, turn: nil))
+    /// The agent's hand is what the agent has done: the door as it was last drawn, with what it was drawn from. A turn's collection reads it once and holds
+    /// it for the turn; it is drawn again only when a verb entered the agent's done set or an ability's definition changed, and a drawing whose forms
+    /// come out byte-identical keeps the door it had, so the provider's cached prefix is not broken for nothing.
+    enum Hand {
+        /// The abilities as they stood when a drawing read them; each change to an ability's definition stands a new one.
+        final class Abilities: Sendable {}
+        struct Drawn: Sendable {
+            let from: Set<String>
+            let abilities: Abilities
+            let forms: [String]
+            let door: [LLMToolSchema]
         }
-        return forms
+        struct State: Sendable {
+            var drawn: Drawn?
+            var abilities = Abilities()
+        }
+        static let state = OSAllocatedUnfairLock(initialState: State())
+        /// Heard from the first drawing on, for the life of the process.
+        static let hearing: Bool = {
+            _ = NotificationCenter.default.addObserver(forName: AbilityStore.didChange, object: nil, queue: nil) { _ in
+                Hand.state.withLock { $0.abilities = Hand.Abilities() }
+            }
+            return true
+        }()
+
+        static func door() -> [LLMToolSchema] {
+            _ = hearing
+            var gaps: [String: JSONValue] = [:]
+            let done: Set<String>
+            do { done = try TurnTracePersistLane().doneVerbs() } catch {
+                done = []
+                gaps["record"] = .string(error.localizedDescription)
+            }
+            let (drawn, abilities) = state.withLock { ($0.drawn, $0.abilities) }
+            if let drawn, drawn.abilities === abilities, drawn.from == done { return drawn.door }
+            let forms = AppToolExecutor.handForms(done, gaps: &gaps)
+            if !gaps.isEmpty {
+                let at = Date()
+                TurnTraceBus.fire(TurnTraceEvent(kind: "app.hand", title: "The agent's hand", status: "partial", payload: .object(gaps),
+                    createdAt: NativeTimestampFormat.plainZulu(at), ts: at, turn: nil))
+            }
+            // An unread inventory leaves the last drawing standing; the next collection draws again.
+            if forms == nil, let drawn { return drawn.door }
+            let door = drawn.flatMap { $0.forms == forms ? $0.door : nil }
+                ?? AppToolExecutor.makeAppToolSchemas(includeDoor: true, hand: forms ?? [])
+            // A first drawing over an unread inventory is never current, so the next collection draws again.
+            let drew = Drawn(from: done, abilities: forms == nil ? Abilities() : abilities, forms: forms ?? [], door: door)
+            state.withLock { $0.drawn = drew }
+            return door
+        }
     }
 
-    private static func makeAppToolSchemas(includeDoor: Bool) -> [LLMToolSchema] {
+    /// The agent's hand, alphabetical, native actions and the agent's own abilities together: what a hand is born knowing and every verb the
+    /// agent's own mind has done in what the agent's record still holds, each once, in its one-line form under the id the agent calls it by,
+    /// from its current admitted schema. Nil when
+    /// the inventory did not read. A verb that does not resolve is not in the agent's hand; one whose schema does not render is left out and named in
+    /// `gaps`, traced as `app.hand`.
+    static func handForms(_ done: Set<String>, gaps: inout [String: JSONValue]) -> [String]? {
+        let inventory: [AppAction]
+        do { inventory = try AppActions.checkedInventory(dataRoot: PersistenceCore.defaultDataRoot(), turn: nil).actions } catch {
+            gaps["catalog"] = .string(error.localizedDescription)
+            return nil
+        }
+        var seen = Set<String>()
+        var forms: [(id: String, form: String)] = []
+        for id in Set(AppActions.bornKnowing).union(done).sorted() {
+            // `x` and `authored.x` are one ability: it enters once, as the action the agent calls.
+            guard let action = AppActions.action(id, in: inventory), seen.insert(action.id).inserted else { continue }
+            do {
+                guard let schema = try AppActions.discovery(action).objectValue?["args_schema"] else {
+                    gaps[action.id] = .string("no admitted args_schema")
+                    continue
+                }
+                let form = try ToolSignature.call(action.id, schema.serializedData(pretty: false))
+                forms.append((id: action.id, form: form))
+            } catch { gaps[action.id] = .string(error.localizedDescription) }
+        }
+        return forms.sorted { $0.id < $1.id }.map { $0.form }
+    }
+
+    private static func makeAppToolSchemas(includeDoor: Bool, hand: [String] = []) -> [LLMToolSchema] {
 
         func stringArraySchema(_ desc: String) -> JSONValue {
             ToolSchema.obj([
@@ -70,12 +123,12 @@ extension AppToolExecutor {
         let snapshotDefault = "Optional; defaults to this tab's last-read page."
 
         let door: [LLMToolSchema] = !includeDoor ? [] : [
-            // Pages and actions travel in results to bound prompt mass; only her hand (handForms, read once per process) enters the door description.
+            // Pages and actions travel in results to bound prompt mass; only the agent's hand (`Hand`, what the agent has done) enters the door description.
             LLMToolSchema(
                 name: "app",
                 toolClass: .read, capabilities: ["app_data_write", "safe_read", "tool_call"],
                 description: """
-                    NativeAgent itself, worked in process: your home, its pages, settings and buttons, and every tool you have. Nothing comes forward on the \
+                    NativeAgent itself, worked in process: your home, its pages, settings and buttons, and everything you can do. Nothing comes forward on the \
                     owner's screen unless an action says screen. {} is your home first, where you left off (open agent windows, work in progress, what waits \
                     and what arrived, each with a name like desk.4, mail or an agent's name), then a line per page and the action ids that work on every \
                     page. item alone opens a name or ref from home or one of its rooms; its text or fields go in args. page (+item) reads one: what it shows, \
@@ -97,12 +150,15 @@ extension AppToolExecutor {
                     + """
                         One action uses app {action:\"files.read\",args:{path:\"README.md\"}}. Put its arguments inside args; page selects a reader, not an \
                         action id. find always discovers actions, including with page:\"home\"; use work.context {query} or chat.search {query} for saved \
-                        work and history. These are yours to call straight, in the form shown, * marking a required argument; find is for \
-                        anything not here:\u{20}
-                        """ + handForms().joined(separator: "; ") + ".",
+                        work and history. These are yours to call straight, in the form this build takes them, * marking a required argument; \
+                        find is for anything not here:\u{20}
+                        """ + hand.joined(separator: "; ") + ".",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("page", ToolSchema.strSchema("A page id from {}, such as inbox, chat or providers.")),
+                        ("page", ToolSchema.strSchema("""
+                            A page id from {}, such as inbox, chat or providers. A person's message that begins \"About <page> (page:…):\" was \
+                            sent from that page, about it.
+                            """)),
                         ("item", ToolSchema.strSchema("""
                             With page: one thing on it, a note id on inbox or a conversation id on chat; actions reads full action signatures when the page \
                             returns a compact catalog. Alone: a name or ref from home or its rooms (desk.4, mail.find, an agent's name), with args {text, \
@@ -527,7 +583,8 @@ extension AppToolExecutor {
                 name: "browser.chrome_wait",
                 toolClass: .read,
                 description: """
-                    Wait up to 10 s for the tab to settle or a row to become visible/hidden/enabled/disabled. Rarely needed: acts already wait for navigation.
+                    Wait up to 10 s for the tab to settle or a row to become visible/hidden/enabled/disabled. Returns the page as it reads when the wait \
+                    ends. Rarely needed: acts already wait for navigation.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [

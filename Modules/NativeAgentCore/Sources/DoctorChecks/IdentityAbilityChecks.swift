@@ -18,6 +18,12 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
     public func run(repair: Bool) async -> CheckResult {
         let engine = engineProvider()
         let rootPath = await engine.personaRoot.path
+        let dataRoot = await engine.dataRootURL
+        // Before setup finishes there is no agent and so no persona: its absence is not a fault, and setup writes it.
+        guard NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) else {
+            return CheckResult(source: rootPath, id: id, title: title, status: "not needed",
+                detail: "Waiting for setup to finish; it writes the agent's persona.")
+        }
         do {
             let docs = try await PersonaCompiler(engine: engine).compile(
                 surface: "chat", personaOverride: PersonaSelection.current()
@@ -33,34 +39,31 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                     repair: nil
                 )
             }
-            // After onboarding, require the saved profile to compile; Doctor never invents missing identity.
-            let dataRoot = await engine.dataRootURL
-            if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) {
-                let profileURL = dataRoot
-                    .appendingPathComponent("memory", isDirectory: true)
-                    .appendingPathComponent("profile.json")
-                do {
-                    guard try profileURL.checkResourceIsReachable() else {
-                        throw CocoaError(.fileReadNoSuchFile)
-                    }
-                    _ = try PersonaCompiler.compileProfile(dataRoot: dataRoot)
-                } catch {
-                    return CheckResult(source: profileURL.path,
-                        id: id,
-                        title: title,
-                        status: "fail",
-                        detail: """
-                            Onboarding completed on this Mac but the saved personality profile at \(profileURL.path) is unavailable: \
-                            \(error.localizedDescription)
-                            """,
-                        harm: "The agent's configured identity cannot be loaded reliably.",
-                        human_action: """
-                            Open Trust → Advanced → Backups, select a verified backup containing memory/profile.json, then choose Restore → Restore \
-                            backup to recover the configured names.
-                            """,
-                        ask: .permission
-                    )
+            // Setup finished: require the saved profile to compile; Doctor never invents missing identity.
+            let profileURL = dataRoot
+                .appendingPathComponent("memory", isDirectory: true)
+                .appendingPathComponent("profile.json")
+            do {
+                guard try profileURL.checkResourceIsReachable() else {
+                    throw CocoaError(.fileReadNoSuchFile)
                 }
+                _ = try PersonaCompiler.compileProfile(dataRoot: dataRoot)
+            } catch {
+                return CheckResult(source: profileURL.path,
+                    id: id,
+                    title: title,
+                    status: "fail",
+                    detail: """
+                        Onboarding completed on this Mac but the saved personality profile at \(profileURL.path) is unavailable: \
+                        \(error.localizedDescription)
+                        """,
+                    harm: "The agent's configured identity cannot be loaded reliably.",
+                    human_action: """
+                        Open Trust → Advanced → Backups, select a verified backup containing memory/profile.json, then choose Restore → Restore \
+                        backup to recover the configured names.
+                        """,
+                    ask: .permission
+                )
             }
             return CheckResult(source: rootPath,
                 id: id,

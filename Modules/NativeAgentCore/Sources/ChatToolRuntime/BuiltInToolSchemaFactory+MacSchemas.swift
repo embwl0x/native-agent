@@ -384,7 +384,7 @@ extension BuiltInToolSchemaFactory {
                         termination when the originating turn settles. If that turn stalls for \(Int(AppRelaunch.stalledTurnSeconds))s, the app \
                         exits with an explicit unfinished outcome. This does not build, stage, sign, or install new Swift code; after Swift source \
                         edits use app.install instead. The relauncher observes process exit and reopens the app bundle; it aborts if quitting takes \
-                        more than \(AppRelaunch.relaunchExitDeadlineSeconds)s. Refuses if a tool-initiated restart fired within the last 10 minutes \
+                        more than \(AppRelaunch.relaunchExitDeadlineSeconds)s. Refuses if a restart called through app fired within the last 10 minutes \
                         (cooldown). Requires admitted Full Mac file access; restarting needs no routine approval card.
                         """,
                     parametersJSON: ToolSchema.params(
@@ -786,7 +786,8 @@ extension BuiltInToolSchemaFactory {
                     name: "act",
                     toolClass: .write, reach: .person, capabilities: ["ax_injection", "mac_control", "tool_call"],
                     description: """
-                        Act by name/visible ordinal against a fresh screen, or run up to 12 steps in order. Steps accept names, menu paths, key \
+                        Act by name/visible ordinal against a fresh screen, or run up to 12 steps in order. A name needs no look first: the act \
+                        reads the screen itself before it acts. Steps accept names, menu paths, key \
                         chords, {verb,target,text,mode}, or {verb,handle,frame_id}; handle steps re-resolve the recorded identity live, stopping \
                         when it disappears or changes; each reads/verifies afresh, stops on first failure and returns a receipt line. A trailing ? \
                         skips an absent optional target. Example: app:'TextEdit', front:true, steps:['Format > Make Plain \
@@ -938,10 +939,10 @@ extension BuiltInToolSchemaFactory {
                     description: """
                         Press one menu item by name, as the menu bar shows it: \"File › Export › PDF…\". Levels can be separated by ›, >, or /. \
                         This runs the app's own menu handler — the same thing that happens when a person picks it — so it can save, close, quit, or \
-                        delete depending on what you name. Resolve the path with `menu` first: an unknown path refuses and lists what is actually \
-                        there, an ambiguous one refuses and names the candidates, and a disabled item refuses; use the cause and supplied remedy. \
-                        Whether the intended thing happened is for the next look to say. Needs active Full Mac Accessibility app control; there is \
-                        no per-call approval.
+                        delete depending on what you name. A known path needs no `menu` read first, since the press reads the menu bar itself: \
+                        an unknown path refuses and lists what is actually there, an ambiguous one refuses and names the candidates, and a disabled \
+                        item refuses; use the cause and supplied remedy. Returns the screen after the press, so you see whether the intended thing \
+                        happened. Needs active Full Mac Accessibility app control; there is no per-call approval.
                         """,
                     parametersJSON: ToolSchema.params(
                         properties: [

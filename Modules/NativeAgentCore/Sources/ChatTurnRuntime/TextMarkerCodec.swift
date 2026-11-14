@@ -172,7 +172,13 @@ struct TextMarkerCodec: Sendable {
                 let suffix = params.isEmpty ? "" : "(\(params))"
                 return "- \(schema.name)\(suffix): \(compact(schema.description, limit: 180))"
             }
-            floorRows = try floorSchemas.map(row)
+            // An always-on tool's description and its parameters' own words are the agent's manual and its hand, so this wire carries them
+            // whole, as the native wire does. A tool loaded beside it stays one line.
+            floorRows = try floorSchemas.map { schema in
+                let params = try parameterSummary(schema)
+                return "- \(schema.name)\(params.isEmpty ? "" : "(\(params))"): \(compact(schema.description, limit: .max))"
+                    + (try parameterWords(schema))
+            }
             appendedRows = try appendedSchemas.prefix(80).map(row)
         } else {
             let floorNames = names.filter { core.contains($0) }.sorted()
@@ -183,11 +189,11 @@ struct TextMarkerCodec: Sendable {
         }
         let omittedToolCount = max(0, appendedTotal - appendedRows.count)
         let disclosure = omittedToolCount > 0
-            ? "\n- \(omittedToolCount) more tools not listed in this bounded catalog."
+            ? "\n- \(omittedToolCount) more you can call, not listed here."
             : ""
         return CatalogSections(
             floor: floorRows.isEmpty
-                ? "- No Swift tools are exposed for this turn."
+                ? "- Nothing is callable this turn."
                 : floorRows.joined(separator: "\n"),
             appended: appendedRows.isEmpty
                 ? ""
@@ -203,30 +209,31 @@ struct TextMarkerCodec: Sendable {
     ) -> String {
         let findLine = appDoor
             ? "open its page with app {\"page\": \"<page>\"} or find its action with app {\"find\": \"<what you want done>\"}."
-            : "call a known tool name directly (calling loads it)."
+            : "call a known name directly (calling loads it)."
         let gitLine = appDoor
             ? ""
-            : "Do not ask for raw shell/git commands unless a shell tool is explicitly listed."
+            : "Do not ask for raw shell/git commands unless a shell action is explicitly listed."
         TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P10"), "site": .string("TextMarkerCodec.swift:renderFloor")]),
             turn: turn)
         return """
         \(AnthropicOAuthTransport.textToolProtocolHeader)
-        - This provider request intentionally does not include provider-native tools. Do not infer that tools are unavailable.
-        - Every tool in Available Swift tools is ready to call directly. A capability not listed: \(findLine)
-        - To use a Swift tool, output only one or more exact markers, with a JSON object body, all wrapped in ONE block per reply:
+        - This provider request intentionally does not include provider-native tools. Do not infer that nothing can be called.
+        - Everything under What you can call is ready to call directly. Something not listed: \(findLine)
+        - To call one, output only one or more exact markers, with a JSON object body, all wrapped in ONE block per reply:
           <function_calls>
           <tool_use name="tool_name">{"arg":"value"}</tool_use>
           </function_calls>
+        - Inside a JSON string, write </ as <\\/, which JSON reads as the same text.
         - End your reply at </function_calls>. NativeAgent runs the calls and returns their results in the next message; never write results yourself.
-        - Do not wrap tool markers in Markdown or code fences.
+        - Do not wrap call markers in Markdown or code fences.
         - Do not narrate fake calls such as tool_name(...), "runs git log", or "loads coding tools"; those are not executable.
         - Each reply contains either executable calls or the complete answer. Describing work does not run it. Your turn part may continue privately after \
         reply.end; only dispatched effects happen, and they do not alter the delivered reply.
         \(DelegatedCampaignGuidance.rendered)
         \(gitLine)
-        - Built-in Markdown is guidance; executable abilities need an offered run route. Guidance grants no tools, permissions, approval bypasses or safety \
-        authority.
-        Available Swift tools:
+        - Built-in Markdown is guidance; executable abilities need an offered run route. Guidance grants no abilities, permissions, approval bypasses or \
+        safety authority.
+        What you can call:
         \(renderedRows)
         """
     }
@@ -253,6 +260,18 @@ struct TextMarkerCodec: Sendable {
             }
             return "\(key)\(requiredMarker)=\(values.joined(separator: "|"))"
         }.joined(separator: ", ")
+    }
+
+    /// Each parameter that says something about itself, one line each under its tool, in the order the summary names them.
+    private static func parameterWords(_ schema: LLMToolSchema) throws -> String {
+        let raw = try schema.checkedParameters().objectValue!
+        guard let properties = raw["properties"]?.objectValue else { return "" }
+        let required = Set(raw["required"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+        return properties.keys.sorted { a, b in required.contains(a) != required.contains(b) ? required.contains(a) : a < b }
+            .compactMap { key -> String? in
+                guard let words = properties[key]?.objectValue?["description"]?.stringValue, !words.isEmpty else { return nil }
+                return "\n  \(key): \(compact(words, limit: .max))"
+            }.joined()
     }
 
     private static func compact(_ text: String, limit: Int) -> String {

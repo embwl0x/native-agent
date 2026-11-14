@@ -122,18 +122,27 @@ final class ApplicationLifetime {
         var tab: String?
         var item: SidebarItem?
         var diagnosticsRun: String?
+        // The receipt names the page the window resolved, so the caller reads what is shown without resolving the name again.
+        var shown = target
         if target.session != nil { destination = .sidebar(.chat) }
         else if target.page == "approvals" { destination = .activity(.approvals) }
         else if target.page == "today_inbox" { destination = .activity(.inbox) }
         else if target.page == "memory_proposals" { destination = .activity(.memoryProposals) }
-        else if let page = QuietPages.page(named: target.page) {
+        // A page by its name, or a place by the word the rail draws for it, which opens on the page that place opens first.
+        else if let page = QuietPages.page(named: target.page)
+            ?? ShellSurface.named(target.page, appModel: appModel).flatMap({ QuietPages.shown($0.firstPage) }) {
             destination = page.item == .ownPage ? .ownPage(page.id) : .sidebar(page.item)
+            shown = .init(page: page.id, item: target.item, session: nil, message: nil)
             item = SidebarItem.shellHome(for: page.item)?.parent ?? page.item
             tab = SidebarItem.shellHome(for: page.item)?.tab
             if let handle = target.item, !handle.isEmpty, let item {
                 if item == .desk {
-                    _ = try await appModel.client.act(.deskCommand(.init(command: "validate", handle: handle, arguments: [:]))).checkedValue()
-                    appModel.pendingDeskHandle = handle
+                    // Showing an item opens it, as its row does: the Desk's owner selects it, and the page draws it open.
+                    // Selecting is an act, answered as one: only its failure or refusal stops the show.
+                    switch try await appModel.client.act(.deskCommand(.init(command: "select", handle: handle, arguments: [:]))) {
+                    case .failed(let failure), .refused(let failure): throw failure
+                    default: break
+                    }
                 }
                 else if item == .memories, let memory = MemoriesFaceTarget(row: handle) {
                     appModel.pendingMemoryFaceTarget = .init(page: "memories", item: memory.row, session: nil, message: nil)
@@ -164,14 +173,14 @@ final class ApplicationLifetime {
             if delivered, let tab, let item { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(item)) }
             if delivered, let diagnosticsRun { appModel.diagnosticsRunID = diagnosticsRun }
             FaceReports.shared.sceneChanged()
-            return .navigation(.init(disposition: delivered ? .mounted : .unavailable, destination: target,
+            return .navigation(.init(disposition: delivered ? .mounted : .unavailable, destination: shown,
                                      reason: delivered ? nil : "The main scene is not mounted."))
         }
         let receipt = self.request(destination)
         if let tab, let item { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(item)) }
         if let diagnosticsRun { appModel.diagnosticsRunID = diagnosticsRun }
         return .navigation(.init(disposition: receipt == .deliveredToMountedScene ? .mounted : .queued,
-                                 destination: target, reason: nil))
+                                 destination: shown, reason: nil))
     }
     func showWindow(destination: FaceDestination?) async throws -> FaceReply {
         if let openMainWindow { openMainWindow() } else { windowOwed = true }

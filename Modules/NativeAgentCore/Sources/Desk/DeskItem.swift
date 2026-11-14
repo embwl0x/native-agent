@@ -38,12 +38,23 @@ public struct DeskProgress: Sendable, Equatable {
 }
 
 public struct DeskItem: Sendable, Equatable {
+    /// The project and kind an item takes when it is filed with none: what the Desk files a task the person starts as.
+    public static let tasksProject = "Tasks"
+    public static let tasksKind = DeskKind.project
+    /// The project a pursuit goes under when it is opened with none: where the agent's own pursuits are filed.
+    public static let workshopProject = "workshop"
     /// Interpret persisted person waits consistently across readers without rewriting stored work.
     public var statusDescription: String {
         if !status.isTerminal, let party = waitingOn?.trimmingCharacters(in: .whitespacesAndNewlines), !party.isEmpty {
             return "waiting on " + party
         }
         return status.rawValue
+    }
+    /// The item's state in a few words. "watch" is the status every item starts with: only a watch is watching, anything else is queued.
+    public var spokenStatus: String {
+        if status == .now { return "in progress" }
+        if status == .watch, kind != .watch { return "queued" }
+        return status.displayLabel
     }
     public var continuation: DeskContinuation?
     public var findingKey: String?
@@ -64,6 +75,12 @@ public struct DeskItem: Sendable, Equatable {
         refs.reversed().lazy.compactMap { ref -> DeskStep? in
             if case .step(let step) = ref.kind { return step }; return nil
         }.first
+    }
+    /// A step filed in a peer's turn keeps the peer's id in its stored title; a reader names the peer by the contact it is now.
+    public func displayTitle(peerName: (String) -> String?) -> String {
+        guard let step, title == step.title, !step.peers.isEmpty || !step.elevated.isEmpty else { return title }
+        let names = (step.peers + step.elevated).map { peerName($0) ?? "an agent no longer in contacts" }
+        return "A step from \(names.joined(separator: ", "))'s turn"
     }
     public var cadence: Cadence
     public var notify: NotifyPolicy

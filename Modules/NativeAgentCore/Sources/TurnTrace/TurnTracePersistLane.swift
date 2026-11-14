@@ -4,7 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import Experiences
 import os
-// Blueprint: | `TurnTracePersistLane.swift` | The one trace writer and reader over the record's detail grain (`ExperienceStore.note`/`details`); terminal and dispatch notices after the write |
+// Blueprint: | `TurnTracePersistLane.swift` | The one trace writer and reader of the record's details; terminal and dispatch notices; the agent's done verbs (`Deed`) |
 
 /// One trace writer: a turn's events are details about its heard experience (subject = turn id); a standalone receipt is a detail about none.
 /// `append` logs failures; checked and terminal writes propagate them.
@@ -36,14 +36,14 @@ public struct TurnTracePersistLane: Sendable {
     public func appendChecked(_ event: TurnTraceEvent, transitionId: String? = nil) async throws {
         let written = try await store.note([try event.detail(once: transitionId.map { "transition:" + $0 })],
                                            durable: TurnTraceEvent.isTerminalKind(event.kind))
-        if let seq = written.first ?? nil { feed(event); postCompletionIfNeeded(event, seq: seq) }
+        if let seq = written.first ?? nil { feed(event); noteDeed(event); postCompletionIfNeeded(event, seq: seq) }
     }
 
     /// Write events in one transaction, in order: one disk sync for the whole flush.
     public func appendBatch(_ events: [TurnTraceEvent]) async throws {
         guard !events.isEmpty else { return }
         let written = try await store.note(events.map { try $0.detail() }, durable: events.contains { TurnTraceEvent.isTerminalKind($0.kind) })
-        for (event, seq) in zip(events, written) { if let seq { feed(event); postCompletionIfNeeded(event, seq: seq) } }
+        for (event, seq) in zip(events, written) { if let seq { feed(event); noteDeed(event); postCompletionIfNeeded(event, seq: seq) } }
     }
 
     /// The newest successful standalone receipt of a kind: its id and time. A reading in memory, fed as receipts are written and read from the
@@ -75,15 +75,67 @@ public struct TurnTracePersistLane: Sendable {
         }
     }
 
-    /// The distinct verbs the agent's own calls did, as far back as the record holds their details: ended `ok` and `succeeded`, not a preview, top-level (no `parentId`) and her own
-    /// (no `automaticOrigin`, which marks a call the body made on its own). The record answers; no row is decoded here, and a record not yet
-    /// written has done nothing.
-    public func doneVerbs() throws -> [String] {
-        try store.recordedDetailValues(.init(sources: [Self.source], kinds: ["tool.dispatch"]), at: "$.payload.receipt.action",
-            holding: ["$.payload.phase": "\"end\"", "$.payload.status": "\"ok\"", "$.payload.receipt.resultClass": "\"succeeded\"",
-                      "$.payload.receipt.preview": "false"],
-            lacking: ["$.payload.parentId", "$.payload.automaticOrigin"])
+    /// A deed, said once for the record and for memory: a written `tool.dispatch` row is something the agent's own mind did when it ended `ok` and
+    /// `succeeded`, not as a preview, top-level (no `parentId`), not the body's own (no `automaticOrigin`), and inside a turn holding an admitted
+    /// model (`receipt.model`, the route admitted at the turn's boundary that made the call). What the app runs by itself holds none: a runner
+    /// (`DeskNotifyRunner`'s ability), a part's wake or a carried habit (`withCurrentChatModel` clears it), a person's tap, a page's own read.
+    private enum Deed {
+        static let action = "$.payload.receipt.action"
+        /// Scalars only: their serialized text is the JSON SQLite compares with.
+        static let holding: [String: JSONValue] = ["$.payload.phase": .string("end"), "$.payload.status": .string("ok"),
+                                                   "$.payload.receipt.resultClass": .string("succeeded"), "$.payload.receipt.preview": .bool(false)]
+        static let lacking = ["$.payload.parentId", "$.payload.automaticOrigin"]
+        static let bearing = ["$.payload.receipt.model"]
+
+        /// The same conditions read off one row in memory as SQLite reads them off the record: `holding` is JSON equality, `lacking` absence,
+        /// `bearing` text.
+        static func doneVerb(in row: JSONValue) -> String? {
+            func at(_ path: String) -> JSONValue? {
+                path.split(separator: ".").dropFirst().reduce(Optional(row)) { value, key in value?.objectValue?[String(key)] }
+            }
+            guard case .string(let done)? = at(action), holding.allSatisfy({ at($0.key) == $0.value }), lacking.allSatisfy({ at($0) == nil }),
+                  bearing.allSatisfy({ if case .string? = at($0) { true } else { false } }) else { return nil }
+            return done
+        }
     }
+
+    /// The distinct verbs the agent's own mind has done (`Deed`), as far back as the record holds their details. The record is asked once per root, at the
+    /// first ask, and answers without decoding a row; every deed written since is noted as it is written, so a later ask is answered from memory
+    /// and never queries again. A record that could not be read is reported to that first ask only; deeds written since still count. A record
+    /// not yet written has done nothing.
+    public func doneVerbs() throws -> Set<String> {
+        let key = resolvedDataRoot().standardizedFileURL.path
+        if let known = Self.done.withLock({ state in state[key].flatMap { $0.read ? $0.verbs : nil } }) { return known }
+        let recorded: [String], failure: (any Error)?
+        do {
+            recorded = try store.recordedDetailValues(.init(sources: [Self.source], kinds: ["tool.dispatch"]), at: Deed.action,
+                holding: try Deed.holding.mapValues { try $0.serialize(pretty: false) }, lacking: Deed.lacking, bearing: Deed.bearing)
+            failure = nil
+        } catch {
+            recorded = []
+            failure = error
+        }
+        // A deed written while this read ran is already in memory; both stand.
+        let verbs = Self.done.withLock { state in
+            var known = state[key] ?? Done()
+            known.verbs.formUnion(recorded)
+            known.read = true
+            state[key] = known
+            return known.verbs
+        }
+        if let failure { throw failure }
+        return verbs
+    }
+
+    /// A deed written is in the agent's done set from that write on; a root not yet read keeps it for its first read.
+    private func noteDeed(_ event: TurnTraceEvent) {
+        guard event.kind == "tool.dispatch", let verb = Deed.doneVerb(in: event.row) else { return }
+        let key = resolvedDataRoot().standardizedFileURL.path
+        Self.done.withLock { state in _ = state[key, default: Done()].verbs.insert(verb) }
+    }
+
+    private struct Done: Sendable { var read = false; var verbs: Set<String> = [] }
+    private static let done = OSAllocatedUnfairLock<[String: Done]>(initialState: [:])
 
     private struct Known: Sendable { let value: (id: String, at: Date)? }
     private static let receipts = OSAllocatedUnfairLock<[String: [String: Known]]>(initialState: [:])
@@ -185,11 +237,14 @@ extension TurnTraceEvent {
     /// The detail this event is: about its turn (the turn's id is its heard experience's id), or about none for a standalone receipt. The row is the
     /// full envelope plus any receipt fields, so every detail reads back as the event it was.
     func detail(once: String? = nil) throws -> ExperienceStore.Detail {
-        let envelope = Self.ordinaryEnvelope(payload: payload, turnId: turnId, ts: ts, kind: kind, sessionId: sessionId, surface: surface,
-                                             destinationId: destinationId, threadId: threadId)
-        return ExperienceStore.Detail(source: TurnTracePersistLane.source, at: ts, subject: turnId == "unknown" ? "" : turnId, kind: kind,
-                                      row: try JSONValue.object(envelope.merging(diagnostic) { _, receipt in receipt }).serializedData(pretty: false),
-                                      once: once)
+        ExperienceStore.Detail(source: TurnTracePersistLane.source, at: ts, subject: turnId == "unknown" ? "" : turnId, kind: kind,
+                               row: try row.serializedData(pretty: false), once: once)
+    }
+
+    /// The row this event is written as; a reading of a written event reads this.
+    var row: JSONValue {
+        .object(Self.ordinaryEnvelope(payload: payload, turnId: turnId, ts: ts, kind: kind, sessionId: sessionId, surface: surface,
+                                      destinationId: destinationId, threadId: threadId).merging(diagnostic) { _, receipt in receipt })
     }
 
     init?(detail: ExperienceStore.Detail) {

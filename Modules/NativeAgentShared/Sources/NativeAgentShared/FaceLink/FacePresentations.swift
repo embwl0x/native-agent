@@ -78,12 +78,15 @@ public struct FaceContact: Codable, Sendable, Equatable {
     public var portrait: Data?
     public var appBundleID: String?
     public var state: FaceReadState
-    public init(id: String, label: String, portrait: Data?, appBundleID: String?, state: FaceReadState) {
+    /// The connection's setup waits on the person: its program needs their approval before it can start a turn.
+    public var needsYou: Bool
+    public init(id: String, label: String, portrait: Data?, appBundleID: String?, state: FaceReadState, needsYou: Bool) {
         self.id = id
         self.label = label
         self.portrait = portrait
         self.appBundleID = appBundleID
         self.state = state
+        self.needsYou = needsYou
     }
 }
 
@@ -384,11 +387,14 @@ public struct HelpersFace: FaceValue {
     public var rows: [PartFace.Row]
     public var runningIDs: [String]
     public var waitingIDs: [String]
+    /// Helpers that wait on the person: for their answer, their approval or their choice of model.
+    public var needsYouIDs: [String]
     public var state: FaceReadState
-    public init(rows: [PartFace.Row], runningIDs: [String], waitingIDs: [String], state: FaceReadState) {
+    public init(rows: [PartFace.Row], runningIDs: [String], waitingIDs: [String], needsYouIDs: [String], state: FaceReadState) {
         self.rows = rows
         self.runningIDs = runningIDs
         self.waitingIDs = waitingIDs
+        self.needsYouIDs = needsYouIDs
         self.state = state
     }
 }
@@ -415,6 +421,12 @@ public struct MakeShelfFace: FaceValue {
         self.newest = newest
         self.state = state
     }
+}
+
+extension MakePreviewFace {
+    /// The most words, in UTF-8 bytes, Make takes in hand from one file: make.add's content, a contact's read of a piece, and a table the
+    /// window reads or saves. The body and the window bound by this one number.
+    public static let wordsLimit = 2_000_000
 }
 
 public struct MakePreviewFace: FaceValue {

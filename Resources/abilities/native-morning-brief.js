@@ -5,7 +5,7 @@
 */
 function run(input) {
     if (input.operation === "defaults") return {
-        inbox:[{name:"morning_brief",kind:"time",enabled:false,config:{hour:8,minute:0,notify:true},description:"Daily morning brief at configured hour."}],
+        inbox:[{name:"morning_brief",kind:"time",enabled:false,config:{hour:8,minute:0,notify:true},description:"My own built-in daily brief at the set hour. A helper that sends a brief is separate and listed on Helpers."}],
         notify:{morning_brief:true}
     };
     const current = Date.parse(input.now), yesterday = Date.parse(input.yesterday), label = input.dayLabel;

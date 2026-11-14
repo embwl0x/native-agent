@@ -155,12 +155,9 @@ public struct ConnectorActions: Sendable {
     }
 
     public func runMacNotify(input: [String: JSONValue], toolName: String, turn: Turn) async throws -> JSONValue {
-        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: toolName)
-        var obj = await platform.postMessage(title: title, body: message, turn: turn)
-        obj.merge([
-            "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
-        ]) { _, new in new }
+        let note = try NativeAgentNotificationDefaults.parseInput(input, toolName: toolName)
+        var obj = await platform.postMessage(note, turn: turn)
+        obj.merge(AppToolExecutor.notificationEcho(note)) { _, new in new }
         return .object(obj)
     }
 

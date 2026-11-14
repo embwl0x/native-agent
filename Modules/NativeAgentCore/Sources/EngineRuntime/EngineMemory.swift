@@ -182,7 +182,11 @@ public final class MemoryFacade {
                 $0.status == "active" && !MemoryLifecycle.recallExcluded.contains($0.lifecycle)
             }
         } else {
-            stored = try await storage.listMemories(persona: nil, status: "active", limit: limit, keepingGraduated: true)
+            let newest = try await storage.listMemories(persona: nil, status: "active", limit: limit, keepingGraduated: true)
+            // A bounded list keeps every pin, older than its newest rows or not.
+            let pinned = try await limit == nil ? [] : storage.listMemories(persona: nil, status: "active", keepingGraduated: true, pinnedOnly: true)
+            let shown = Set(newest.map(\.id))
+            stored = newest + pinned.filter { !shown.contains($0.id) }
         }
         return stored.map(MemoryV2.MemoryRecord.init(stored:))
     }

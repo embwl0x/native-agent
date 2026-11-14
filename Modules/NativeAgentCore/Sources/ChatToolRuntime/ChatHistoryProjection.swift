@@ -151,7 +151,7 @@ extension SwiftToolDispatcher {
         }
         receipt["evidence_type"] = .string("persisted_tool_receipt")
         receipt["receipt_projection_truncated"] = .bool(clipped)
-        return (try? JSONValue.object(receipt).serialize(pretty: false)) ?? "[unreadable persisted tool receipt]"
+        return (try? JSONValue.object(receipt).serialize(pretty: false)) ?? "[unreadable persisted call receipt]"
     }
 
     /// Provenance affects display only, never search relevance or authority for bridge requests and interrupted replies.

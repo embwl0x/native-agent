@@ -27,9 +27,14 @@ public enum AppActions {
     }
 
     public static func action(_ id: String, dataRoot: URL = PersistenceCore.defaultDataRoot(), turn: Turn?) throws -> AppAction? {
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return try action(id, in: checkedInventory(dataRoot: dataRoot, turn: turn).actions)
+    }
+
+    /// The one resolution, against an inventory already read: the agent's hand resolves many ids against one reading.
+    static func action(_ id: String, in own: [AppAction]) -> AppAction? {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !key.isEmpty else { return nil }
-        let own = try checkedInventory(dataRoot: dataRoot, turn: turn).actions
         if let action = own.first(where: { $0.id == key }) { return action }
         // An ability dispatches under its own id: the tool its authored action binds. A part that answers verbs stands for its strictest verb, so a
         // judgment made by its id alone is never looser than one of its verbs; each call is judged by the verb it carries.

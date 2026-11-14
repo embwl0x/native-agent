@@ -25,7 +25,8 @@ public final class AnthropicTransport: LLMTransport {
     /// Meta's opaque reasoning uses the same Messages blocks and tool-call ledger as Anthropic.
     var replaysThinking: Bool { firstPartyAnthropicToolContract || providerId == "meta" }
 
-    private var credentialRoot: URL {
+    /// Credentials and the route's model list share this root.
+    var credentialRoot: URL {
         dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
@@ -80,11 +81,15 @@ public final class AnthropicTransport: LLMTransport {
     }
 
     public func requestOutputTokens(model: String, call: LLMCall) throws -> Int {
-        if let limit = call.turn?.tokenBudget?.available { return limit }
+        // What is left of a run's budget never exceeds the model's effective ceiling, nor this transport's own cap (Kimi Code's).
+        if let allowance = FirstPartyExecutionControls.budgetedOutputTokens(
+            model: model, providerID: providerId, call: call, transportCap: maxTokensOverride, dataRoot: credentialRoot) {
+            return allowance
+        }
         return try FirstPartyExecutionControls.anthropicMaxOutputTokens(
             model: model,
             requestedEffort: call.admission?.reasoningEffort,
-            explicitOverride: maxTokensOverride, providerID: providerId
+            explicitOverride: maxTokensOverride, providerID: providerId, dataRoot: credentialRoot
         )
     }
 
@@ -169,10 +174,12 @@ public final class AnthropicTransport: LLMTransport {
         guard providerId == "kimi-code" || providerId == "meta",
               let requested = call.admission?.reasoningEffort else { return }
         let effort = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard let row = FirstPartyModelCatalog.descriptor(for: model, providerID: providerId),
+        guard let row = FirstPartyModelCatalog.descriptor(for: model, providerID: providerId, dataRoot: credentialRoot),
               row.supportedReasoningEfforts.contains(effort) else {
             throw LLMError.providerError(message: "Think level '\(requested)' is unsupported for \(model) on \(providerId). Choose a supported level in Providers.")
         }
+        // "default" is the provider's own default: no thinking or effort field.
+        guard effort != "default" else { return }
         if providerId == "meta" {
             body["thinking"] = ["type": "adaptive"]
             body["output_config"] = ["effort": effort]

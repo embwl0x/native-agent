@@ -503,6 +503,7 @@ public enum MacActClosedLoop {
         var readoutOnly = false
         var mismatch = "The declared effect differs from the target's accessibility state."
         var unobserved = "The input went out, but the declared effect could not be read back."
+        var unobservedReason = "effect_unreadable"
         switch effect {
         case .text(let expected):
             readback = "The complete AXValue matches the declared edit."
@@ -599,6 +600,14 @@ public enum MacActClosedLoop {
                 readoutOnly = evidence.readoutOnly
                 // An unrelated change leaves the result uncertain, even with a complete census. It earns no route-learning evidence.
                 matches = evidence.consequence ? true : nil
+                // What changed elsewhere was read, so the verdict says that instead of "unreadable".
+                if !evidence.consequence, diff.readoutsChanged.contains(where: { !Self.positionRoles.contains($0.role) }) {
+                    unobservedReason = "changed_elsewhere"
+                    unobserved = """
+                        The press went out and readouts in the window changed after it (readouts_changed), outside the pressed control, so the \
+                        change is not proven to be the press's.
+                        """
+                }
             } else if processGone || dismissed == true || diff?.modalDisappeared == true
                 || diff?.modalAppeared == true {
                 matches = true
@@ -640,7 +649,7 @@ public enum MacActClosedLoop {
         }
         return ActClassification(
             status: matches.map { $0 ? "acted" : "acted_mismatch" } ?? "acted_unobserved",
-            reason: matches.map { $0 ? nil : "effect_mismatch" } ?? "effect_unreadable",
+            reason: matches.map { $0 ? nil : "effect_mismatch" } ?? unobservedReason,
             note: matches.map { $0 ? readback : mismatch } ?? unobserved,
             readoutOnly: readoutOnly
         )

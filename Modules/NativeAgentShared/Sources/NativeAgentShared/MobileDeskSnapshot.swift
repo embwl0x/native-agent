@@ -183,8 +183,9 @@ public enum DeskActivityState: String, Sendable {
         if execution != .unknown { return execution }
         if deferred { return .deferred }
         if status == "blocked" { return .blocked }
-        if status == "watch" || kind == "watch" { return .watching }
-        if ["todo", "next"].contains(status) { return .queued }
+        // "watch" is the status an item starts with. Only a watch is watching; any other item not yet started is queued.
+        if kind == "watch" { return .watching }
+        if ["todo", "next", "watch"].contains(status) { return .queued }
         if status == "now", let updated = movementDate(updatedAt),
            now.timeIntervalSince(updated) >= movementWindow { return .stale }
         return .unknown
@@ -327,7 +328,10 @@ public enum MobileDeskProjectionBounds {
 
     public static func clipped(_ text: String, to limit: Int) -> String {
         guard text.count > limit else { return text }
-        return String(text.prefix(max(0, limit - 1))) + truncationMark
+        var kept = text.prefix(max(0, limit - 1))
+        // A cut ends on a whole word when one ends near the bound, so it never leaves half a word.
+        if let space = kept.lastIndex(where: \.isWhitespace), kept.distance(from: space, to: kept.endIndex) <= 24 { kept = kept[..<space] }
+        return String(kept) + truncationMark
     }
 
     public static func isClipped(_ text: String) -> Bool {

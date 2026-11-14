@@ -71,7 +71,7 @@ Source: [NativeAgentEngine.swift](../Modules/NativeAgentCore/Sources/EngineRunti
 - **Local bridges and agent contacts:** authenticated conversations and coding
   handoffs. The bundled `nativeagent-link` helper and HTTP agent clients read
   the agent bridge's descriptor under `~/.config/nativeagent-link/` and send
-  each contact's own credential; the older Claude/Codex lane keeps
+  each contact's own credential; the older builder-bridge lane keeps
   `~/.config/claude-bridge/bridge.json`.
 
 `agent.message` can initiate an A2A conversation with `files: [{path}]`
@@ -170,14 +170,16 @@ Retired names are refused with translated `app` calls. There is no tool
 loading/unloading workflow or separate workspace tool; workspace items are
 part of app home.
 
-Action preview follows the [preview contract](TOOL_LOADING.md#one-tool-every-action).
+Action preview follows the [preview contract](ONE_DOOR.md#one-door-every-action).
 `expected_version` guards a read's page version. Home items can act and support neither option.
 
 ### Scripts
 
 `app {script}` runs JavaScriptCore with `app.read`, `app.find`,
 `app.log` and the registry's actions. Each call re-enters the action
-checks and adds a ledger row. A call that raises a card waits for the answer
+checks and adds a ledger row: the call's identity and outcome, never its
+answer, which the script receives and returns as it chooses (the
+[receipts law](ONE_DOOR.md#authority-and-receipts)). A call that raises a card waits for the answer
 and continues or receives the refusal; a blocked action stops the script
 without undoing earlier calls. The script has no direct network or
 filesystem API; it cannot call every action merely because the action exists.
@@ -210,7 +212,7 @@ Beneath every ability is the Mac's own reach, raw and gated: `host.fetch` and `h
 Sources: [AppActions+Declarations.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppActions+Declarations.swift),
 [app door](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppToolExecutor+AppDoor.swift),
 [AppScriptRunner.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppScriptRunner.swift).
-The interface contract is [TOOL_LOADING.md](TOOL_LOADING.md).
+The interface contract is [ONE_DOOR.md](ONE_DOOR.md).
 
 ## Mac, files and web
 
@@ -343,10 +345,13 @@ connectors and agent communication under the saved policy.
   A separate caption read's failure
   yields one caption gap and `label_source:"unreadable"` on the control;
   sibling attributes are never reported as its own, and another name is not
-  substituted. Pixel masking requires readable values and name/role/frame
-  evidence for secrets, including static text: failures withhold the image
-  with element/attribute evidence, or mask the affected desktop window in full
-  and report its inspection error in `masking_failures`.
+  substituted. Pixel masking covers what it could not read: a text element with
+  a failed value, caption or subrole read is masked with everything its words
+  could have named, as is any element with an unread title, and the rest is
+  released; any other failed read is a reported gap and covers nothing. An unreadable role, a missing
+  frame on such an element or a cut walk withholds the image with its cause, or
+  masks the affected desktop window in full and reports its inspection error in
+  `masking_failures`.
   Action-name error `-25200` stays separate as `actions_unreadable` instead of
   an action list. Raw nodes, menu-bar paths, transient menu items and marks expose these gaps;
   screen replies report observed counts and first errors. Numbered views
@@ -458,8 +463,17 @@ connectors and agent communication under the saved policy.
   Menu reads retain checked availability and truncation in the screen page;
   an incomplete required menu branch cannot establish command absence or uniqueness.
   Press reads only the exact named branch and its duplicate-bearing siblings;
-  unrelated descendants and the listing's 60-child/160-item presentation caps do
-  not refuse a command. The shared AX node/time/depth bounds still apply.
+  sibling names are retained without reading unrelated children, whose submenu
+  state stays unknown. Unrelated child-read failures and the listing's
+  60-child/160-item presentation caps do not refuse a command. The shared AX
+  node/time/depth bounds still apply.
+  A missing path lists up to ten observed child paths of its deepest matched
+  submenu, in the app's order, excluding separators and empty titles. A matched
+  leaf is named as having no submenu; its containing menu supplies the alternatives.
+  Unreadable menu items report their read failure or incomplete coverage instead
+  of an empty menu.
+  A path whose observed AX address cannot be revalidated reports unavailable;
+  it does not claim the named command disappeared or reuse stale alternatives.
   Menu-bar optional attribute failures stay on the item as `attribute_gaps`,
   with indexed gaps on the reading for unnamed or unreadable items. An unreadable
   name leaves branch coverage incomplete and never becomes an alternate name.
@@ -632,7 +646,11 @@ connectors and agent communication under the saved policy.
   lists and names. An unreadable folder or note is a named `gaps` entry while readable siblings
   return with `status: partial` and `total_is_complete: false`; an empty partial
   result never establishes no matches. Shared Automation/channel failures still
-  fail the read. Updates return the exact note id and observed title; if only the title
+  fail the read. A note's modification date crosses from AppleScript as numbers
+  (year, month, day, seconds since midnight) and is built in the Mac's time zone,
+  so reads do not depend on the Mac's language or region; a date that cannot be
+  read keeps its note, with `modified_at: null` and `modified_at_unknown` saying
+  why, and is not a gap. Updates return the exact note id and observed title; if only the title
   readback fails after the update, the completed receipt retains that id and a
   failed `readback` with its actual error, without an invented title.
   Exact Messages history completes only when its history owner reports
@@ -642,7 +660,17 @@ connectors and agent communication under the saved policy.
   from a missing existing-message selector (`missing_message_selector`). Reply
   results accept only the script's known codes or checked draft id; unexpected
   output retains unknown effects and asks for reconciliation in Mail before
-  repeating. Mailbox pages and inbox sender counts share one checked account
+  repeating. A message's actions (archive, mark read, reply, draft, delete) take
+  the one locator its read produced: `message_id`, `expected_message_id`,
+  `expected_account`, `expected_account_id`, `position` and `scope`. They check
+  the account by Mail's account id and act on an inbox message only: a message
+  whose scope is not the inbox is refused (`not_an_inbox_message`), and a page
+  offers them only on inbox messages. `mail.delete` moves an inbox message to
+  its account's Trash after checking its identity there. When no inbox message
+  matches what was given (`mail_delete_no_match`) nothing moves, and the refusal
+  says only that, asks for a fresh inbox read, and notes that a message outside
+  an inbox (archived mail, for example) is not reachable by this action yet.
+  Mailbox pages and inbox sender counts share one checked account
   header decoder: malformed records or escapes report the transport failure,
   and an empty valid header reports unavailable coverage, never an empty inbox.
   Mailbox pages publish `account_coverage: complete|partial`; omitted accounts
@@ -737,6 +765,11 @@ connectors and agent communication under the saved policy.
   normal permissions and limited retention. Neither continuation recovers bytes
   beyond the response bound. Network failures name `no_such_host`,
   `connection_refused` or `timeout` when those are the cause.
+  HTTP failures retain `http_status` and reason `http_status`: 404 and 410 say
+  the page is not there and suggest a different address or a search; other
+  statuses say the server answered with that status and supply no guessed
+  remedy. SearXNG search failures retain the same status evidence and wording,
+  without treating a server answer as a transport failure.
   A successful thin/JavaScript-gated extraction selects Chrome's rendered
   reader through its normal app door in a new NativeAgent background tab.
   This also applies from workspace: the nested navigation owns its page readback
@@ -769,6 +802,9 @@ Chrome setup is in the [extension guide](../Extensions/NativeAgentChrome/README.
 
 Make allocates positive, increasing artifact versions with checked arithmetic;
 exhausted version numbers refuse the append without changing its metadata.
+A version the person saved by changing a table in the window records
+`person_edit_of`, the version it was changed from, and is appended only while
+that version is still the newest.
 Decoded refs must match their lookup; local version filenames and resolved
 destinations must stay inside that ref's Make folder, including through symlinks.
 The registered Make page reads all retained refs newest first in pages of 25,
@@ -893,13 +929,14 @@ they cannot execute through Chat. Picker failures retain forward intent and
 report each projection's checked state, without compensating writes. The
 [provider admission contract](INTERNAL_WORKINGS.md) owns catalog credential
 binding and route-specific control evidence, including unknown Moonshot controls.
-Meta's pay-as-you-go API-key route offers Muse Wonder 1.0 and Muse Spark 1.3
+Meta's pay-as-you-go API-key route offers the Muse models Meta lists for the key
+(this build knows Muse Wonder 1.0, Muse Ember 1.0 and Muse Spark 1.3, 1.2 and 1.1; what is offered is Meta's list)
 through the shared Anthropic-format Messages transport, native streamed tools,
 client-side text/tool history and low/medium/high/xhigh effort controls. Returned
 thinking blocks replay across tool rounds through the shared bounded in-memory
 ledger, only while the model, system, tools and earlier messages are the ones that
-produced them; they are not persisted in conversation history. Providers, onboarding and the iPhone read the same shipped catalog
-and checked routing; keys are entered on
+produced them; they are not persisted in conversation history. Providers, onboarding and the iPhone read the same
+[model list](INTERNAL_WORKINGS.md#model-lists) and checked routing; keys are entered on
 the Mac. See [Meta setup and limits](USER_GUIDE.md#meta-model-api).
 
 Quiet account settings, model/effort choices, Fast writes and image-model

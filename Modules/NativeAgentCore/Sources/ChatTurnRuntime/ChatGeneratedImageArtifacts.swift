@@ -29,9 +29,13 @@ public enum ChatGeneratedImageArtifacts {
         // Preserve artifacts before bounding a saved receipt so recovery retains them.
         if let kept = fields["generatedImages"] { return [.object(["images": kept])] }
         if case .array(let calls)? = fields["calls"] {
+            // A nested call carries its generated-image references in artifacts, never its raw result; a stored older row is reduced first,
+            // and only an image the enclosing output names (everything of the receipt but its calls) is attached.
+            let said = CallLedger.texts(.object(fields.filter { $0.key != "calls" }))
             return calls.flatMap { row -> [JSONValue] in
-                guard case .object(let ran) = row, let action = ran["call"] else { return [] }
-                return generations(ToolNameAliases.ranTool("app", input: ["action": action]), [:], row)
+                guard case .object(let ran) = CallLedger.shown(CallLedger.published(row), naming: said), let action = ran["call"] else { return [] }
+                let made: JSONValue = .object(["images": ran["artifacts"]?.objectValue?["images"] ?? .array([])])
+                return generations(ToolNameAliases.ranTool("app", input: ["action": action]), [:], made)
             }
         }
         guard case .array(let receipts)? = fields["receipts"] else {

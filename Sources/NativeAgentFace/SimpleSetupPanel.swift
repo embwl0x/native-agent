@@ -5,7 +5,7 @@ import NativeAgentShared
 
 // Blueprint: | `SimpleSetupPanel.swift` | Setup hosts hold conversation-bound return verification, cancellation and dismissible feedback |
 
-// Simple has no pages; host canonical setup views over chat while Advanced uses its page routes.
+// A setup page opens in place in Simple and Advanced alike; Simple hosts the connector wizard over chat, Advanced in a sheet.
 
 extension View {
     func inlineCardSetup(_ cards: CardControls, sessionID: String, active: Bool = true) -> some View {
@@ -42,20 +42,16 @@ struct InlineCardSetupPresentation: ViewModifier {
         let simple = appModel.face.slot(.settings).select("viewMode.simple", as: SettingsFace.self) {
             $0?.preferences[SimpleViewMode.key] == .string(SimpleViewMode.simple)
         }
-        let panelOpen = simple && (cards.panelPage != nil || cards.connectorSheet != nil)
+        let panelOpen = simple && cards.connectorSheet != nil
         content
             .disabled(panelOpen)
             .overlay {
-                if panelOpen {
-                    SimpleSetupPanel(showsClose: cards.panelPage != nil) {
-                        closePanel()
+                if panelOpen, let request = cards.connectorSheet {
+                    SimpleSetupPanel(showsClose: false) {
+                        closeConnector()
                     } content: {
-                        if let request = cards.connectorSheet {
-                            ConnectorWizardView(provider: request.provider) {
-                                closePanel()
-                            }
-                        } else if let page = cards.panelPage {
-                            Self.page(page, appModel: appModel)
+                        ConnectorWizardView(provider: request.provider) {
+                            closeConnector()
                         }
                     }
                     .onChange(of: appModel.face.slot(.settings).value(as: SettingsFace.self)) {
@@ -139,23 +135,9 @@ struct InlineCardSetupPresentation: ViewModifier {
         cancelVerification()
         issues.removeAll()
     }
-    private func closePanel() {
-        cards.panelClosed()
-        requestVerification()
-    }
     private func closeConnector() {
         cards.connectorSheetClosed()
         requestVerification()
-    }
-
-    /// Simple has no rail, so Providers reads its owner on arrival here; every page draws through the one page map.
-    @ViewBuilder
-    static func page(_ item: SidebarItem, appModel: AppModel) -> some View {
-        if item == .providers {
-            ShellPageContent(item: item).quietReadTask { _ = await appModel.refreshForSidebarItem(.providers) }
-        } else {
-            ShellPageContent(item: item)
-        }
     }
 }
 

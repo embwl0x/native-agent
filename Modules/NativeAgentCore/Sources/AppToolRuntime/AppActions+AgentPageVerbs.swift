@@ -18,7 +18,7 @@ extension AppActions {
                           tool: "upkeep", input: verb("desk_remind")),
                 AppAction("desk.veto", "desk", "Veto a pursuit: close it as the person's no", ["handle"], subject: ["handle"],
                           owner: .person("a veto is the person's no to the agent's own pursuit",
-                                         instead: "desk.close {handle, reason} closes a pursuit of your own", asks: false),
+                                         instead: "desk.close {handle, reason} closes a pursuit of your own", asks: false, name: "Vetoing one of my pursuits"),
                           irreversible: true, tool: "upkeep", input: verb("desk_veto")),
                 AppAction("memories.search", "memories", "Search the Memories page (three letters or more; empty shows every memory)",
                           ["value"], tool: "upkeep", input: verb("memories_search"), read: true),
@@ -30,10 +30,11 @@ extension AppActions {
                           tool: "upkeep", input: verb("graph_apply")),
                 AppAction("personality.mind", "personality", """
                     Choose the Memory and mind model: value is an option id the Personality page's mind row offers
-                    """, ["value"], owner: .person("the Memory and mind model is the person's choice of the agent's mind"),
+                    """, ["value"], owner: .person("the Memory and mind model is the person's choice of the agent's mind",
+                        name: "Choosing my Memory and mind model"),
                           tool: "upkeep", input: verb("personality_mind")),
                 AppAction("personality.reset", "personality", "Reset identity: back up, then clear SOUL, VOICE, USER, GROWTH and AGENTS",
-                          owner: .person("resetting identity clears who the agent is; the person does it on the Mac", asks: false),
+                          owner: .person("resetting identity clears who the agent is; the person does it on the Mac", asks: false, name: "Resetting who I am"),
                           irreversible: true, tool: "upkeep", input: verb("personality_reset")),
                 AppAction("bots.check", "bots", "Run a helper once; its reply stays in the helper's own conversation", ["id"], subject: ["id"],
                           tool: "upkeep", input: verb("bots_check")),

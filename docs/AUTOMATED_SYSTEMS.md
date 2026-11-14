@@ -55,6 +55,24 @@ itself. A deadline joining an active pass retains one follow-up reconciliation
 after that pass exits, so age crossings during the pass are assessed. Stop and
 replacement cancel pending waits and retained loop tasks.
 
+**The scheduler's passes wait for setup.** Before onboarding has completed
+(`NativeAgentPublicSafety.hasCompletedOnboarding`: the `.onboarded` sentinel, with
+no pending completion or reset) there is no agent. A runner that declares
+`needsAgent` (heartbeat, cognition maintenance and replay, off-disk backup, Auto
+Doctor) is not started by `ManagedLoopRunner`; its tick reads `not needed: Waiting
+for setup to finish`, records no failure and advances no durable clock, so after
+setup it is due by its ordinary rhythm. This replaces the per-pass setup checks:
+the off-disk backup's own "setup is not complete" skip and the launch Doctor
+tick's separate onboarding guard.
+
+**Known gap: the mind still starts before setup finishes.** The mind's own
+attention, night and microcycles start at launch, before setup, because nothing
+holds the mind until the agent exists. Example: on a wiped Mac first launched at
+16:58, the night opened 30 minutes after the person left, REM failed at 17:31
+reading a `persona/GROWTH.md` that setup wrote at 18:48, and Doctor's Body row
+kept that failure afterwards. The design to close it is to start the mind only
+once setup finishes, in one place, not to gate its paths one by one.
+
 A tick returns `LoopTickOutcome.completed`, `skipped` or `failed`.
 A skip preserves an existing failure streak and updates live status only. Durable clocks
 survive restart, and timing accounts for time already elapsed rather than
@@ -205,10 +223,24 @@ eligibility has no fixed lifetime-use or installation-volume floor.
 
 Saved-provider read failures and failed native provider probes report `fail`;
 explicit connection checks probe the current saved credential, including OAuth,
-instead of reusing historical successful traffic. An unhealthy provider path reports `warn`. A stale probe retains an adverse
+and a model call the provider answered leaves the same receipt for the credential
+it sent. An unhealthy provider path reports `warn`. A stale probe retains an adverse
 registry verdict and otherwise reports `unmeasured`; a readable compensation
 scan without a v2 turn is also `unmeasured`. `off` and `not needed` remain
 distinct non-fault states, not evidence of healthy work.
+**Doctor says `fail` only for something that was set up and does not work.**
+Something never set up is `off`, with one plain sentence on how to turn it on
+in `human_action`; an `off` row is not adverse, so it neither owes repair
+(`DoctorReadout.recordReadings` settles an open one) nor joins the inbox ask
+(`DoctorSafeRepairPolicy.isUserAsk`). Search with no service set reads `off`
+("Web search is off: no search service is set."), as Telegram never enabled
+does; a set address that is malformed or does not answer stays a fault. This
+replaces Search's former `fail` for a missing SearXNG address. Phone sync with no
+iCloud account and no phone paired reads `off` ("Phone sync is off: this Mac is
+not signed in to iCloud."), replacing its warning and sign-in ask; with a paired
+phone, a missing account still warns and asks. The bridge's health snapshot
+carries the pairing owner's paired-phone count for this. Before setup
+finishes, the persona check reads `not needed` ("Waiting for setup to finish").
 Doctor and Support rollups retain `unknown` for empty inventories or unclear
 statuses and `unmeasured` for readings without a verdict, after preserving any
 failure or warning. A healthy sibling cannot turn an incomplete check healthy.
@@ -235,7 +267,8 @@ malformed saved bytes remain available for the owning repair.
 
 The configured `doctor_auto_run` lane runs once at launch, off their turn's path
 (`EngineLaunch` ticks it once), then on its configured interval (at least an
-hour); it runs every safe repair and files one inbox ask for the sign-ins and
+hour); before setup finishes it reads `not needed` like every pass that needs
+the agent; it runs every safe repair and files one inbox ask for the sign-ins and
 permissions it cannot do itself. Its `doctor/latest.json` contains:
 
 - `measuredAt`: when measurement began;
@@ -301,11 +334,11 @@ Local file and snapshot reads still can fail. Repair remains a separate action.
 | `live.browser_operation_recovery` | `EngineRuntime/EngineDoctorRuntime.swift`; `Browser/Browser+OperationStore.swift` | Browser owner's launch-recovery state and individual damaged run causes. Uncertain damaged runs refuse new effects; valid sibling rows remain readable and damaged row bytes stay intact. | No; reads owner state and canonical runs, never runs recovery. |
 | `live.agent_connections` | `EngineRuntime/EngineDoctorMeasurements.swift`; `AgentConversations/AgentContactHealth.swift` | Contact readiness, saved reply-path evidence and open connection repairs. | Refreshes readiness; definite unsent failures remain `not_reached` with current readable prerequisites, without reply-path repair. May schedule bounded connection verification for a possibly delivered failed path, without resending its message. |
 | `live.telegram` | `EngineRuntime/EngineDoctorMeasurements.swift` | Configuration, credential availability, poller state and fresh successful-poll evidence. | No new Telegram request; reads the transport's evidence, separately from loop registration. |
-| `live.search` | `EngineRuntime/EngineDoctorMeasurements.swift` | Configured SearXNG URL and bounded checked search response, retaining probe failures separately from refused listeners. | Doctor runs probe; ordinary live refresh reads the retained result, valid for that URL for less than ten minutes. Repair checks/starts only that configured server; explicit setup owns discovery and endpoint selection. Only the Repair button may open Docker Desktop; background repair reports unavailable inventory when its daemon is down. |
+| `live.search` | `EngineRuntime/EngineDoctorMeasurements.swift` | Configured SearXNG URL and bounded checked search response, retaining probe failures separately from refused listeners; no address set reads `off`. | Doctor runs probe; ordinary live refresh reads the retained result, valid for that URL for less than ten minutes. Repair checks/starts only that configured server; explicit setup owns discovery and endpoint selection. Only the Repair button may open Docker Desktop; background repair reports unavailable inventory when its daemon is down. |
 | `live.tools` | `EngineRuntime/EngineDoctorMeasurements.swift` | Authored tool registry readability and saved admission states. | No tool invoked; execution remains unmeasured. |
 | `live.autonomy` | `EngineRuntime/EngineDoctorMeasurements.swift` | Saved enable posture and reported autonomy runtime state. | No unattended work started. |
 | `install.data_root` | `EngineRuntime/EngineDoctorMeasurements.swift` | Installation move marker and any recorded backup location. | No; reads local installation evidence. |
-| `live.inspector_feed` | `DoctorChecks/DoctorRunsInspectorChecks.swift` (`InspectorFeedHealth`) | Whether an open Inspector observes persisted trace changes. | No; reads observation state. |
+| `live.inspector_feed` | `DoctorChecks/DoctorRunsInspectorChecks.swift` (`InspectorFeedHealth`) | Whether an open Inspector observes persisted trace changes. A window with no connection to answer (`face_disconnected`, `face_reply_lost`, `renderer_unavailable`, a closed link) is the closed case. | No; reads observation state. |
 | `live.embedding_download` | `EngineRuntime/DoctorEmbeddingDownloadCheck.swift` | Runtime mode, distribution descriptor, installed release/epoch and retained transfer state. | No transfer or model-load check started; reads local owners and saved parts. |
 | `live.background_loops` | `BackgroundWork/DoctorLoopHealth.swift` | Aggregate manager execution, cadence and listener health. | No tick started; evaluates manager/receipt evidence. |
 | `live.background_loop.<loopId>` | `BackgroundWork/DoctorLoopRecovery.swift` | Each configured registration's health and any repair still awaiting a clean tick. | No tick or restart started. |
@@ -325,7 +358,7 @@ Local file and snapshot reads still can fail. Repair remains a separate action.
 
 Domain laws remain in the [memory map](MEMORY_SYSTEM_MAP.md),
 [authored-part manifest](skill_manifest_spec.md),
-[action authority](TOOL_LOADING.md#authority-and-receipts),
+[action authority](ONE_DOOR.md#authority-and-receipts),
 [cross-surface ownership](INTERNAL_WORKINGS.md#6-one-agent-across-every-surface),
 [capability map](CAPABILITIES.md), [cognition wiring](COGNITION_WIRING.md)
 and [experience/repair law](EXPERIENCE.md). This table identifies measurements;
@@ -341,7 +374,8 @@ event deadlines, backoff and saved configuration determine actual work.
 
 Senses registration never gates this manifest or its resident observations.
 Loops start together, including Telegram/Slack ingress, reply reconciliation
-and Desk notifications. A loop's work that actually selects a sense waits at
+and Desk notifications. Rows marked *needs the agent* read `not needed` until
+setup finishes (§2). A loop's work that actually selects a sense waits at
 the shared read door; sense wakes and file subscriptions wait at their own
 owners. Doctor retains registration failures and their repair instructions.
 An explicit run of a stopped loop follows the same per-read rule. See
@@ -349,15 +383,15 @@ An explicit run of a stopped loop follows the same per-read rule. See
 
 | loopId | Declared wake | Work |
 |---|---|---|
-| `doctor_auto_run` | Launch, ok→adverse health reading, weekly; configured intervals at least 1h | Repair, publish Doctor snapshot, file one sign-in/permission ask. |
-| `offdisk_backup` | Daily rhythm, identity changes, daily deadline | Back up when due or identity changes; skip alternate roots and unavailable iCloud. |
+| `doctor_auto_run` | Launch, ok→adverse health reading, weekly; configured intervals at least 1h | Repair, publish Doctor snapshot, file one sign-in/permission ask. *Needs the agent.* |
+| `offdisk_backup` | Daily rhythm, identity changes, daily deadline | Back up when due or identity changes; skip alternate roots and unavailable iCloud. *Needs the agent.* |
 | `data_root_disk_hygiene` | Daily rhythm/boundary; hourly retry while unreserved | Detect oversized state and file a notice; never delete it. |
-| `cognition_maintenance` | Daily | Substrate maintenance. |
-| `cognition_replay` | Daily | Episodic replay. |
-| `heartbeat` | 12h rhythm + assessment-input changes + age deadlines | Assess health; surface stable anomaly cards. Clean assessments skip the model. |
+| `cognition_maintenance` | Daily | Substrate maintenance. *Needs the agent.* |
+| `cognition_replay` | Daily | Episodic replay. *Needs the agent.* |
+| `heartbeat` | 12h rhythm + assessment-input changes + age deadlines | Assess health; surface stable anomaly cards. Clean assessments skip the model. *Needs the agent.* |
 | `desk_notify` | Declared changes, next nag or quiet end, launch | Notify about eligible tracked Desk changes. |
 | `delegation_outcome` | Events/deadlines; 6h repair | Reconcile terminal delegation jobs and their notifications. |
-| `heartbeat` | Assessment-input changes + age deadlines; 12h integrity | Assess health; surface stable anomaly cards. Clean assessments skip the model. |
+| `heartbeat` | Assessment-input changes + age deadlines; 12h integrity | Assess health; surface stable anomaly cards. Clean assessments skip the model. *Needs the agent.* |
 | `desk_notify` | Events/deadlines; daily repair | Notify about eligible tracked Desk changes. |
 | `delegation_outcome` | Events/deadlines and a 6h integrity rhythm | Reconcile jobs and notifications; failed settlement still needs this rhythm. |
 | `delegation_outcome` | Events/deadlines; 6h repair | Delegation outcomes; the contact doors' reply reads and settled Desk waits. |
@@ -715,7 +749,7 @@ preference is saved, but DOCX attachment ingestion remains unsupported.
 Screen capture, cloud voice and image generation keep their Trust rules;
 the keep gate, memory disclosure and REM proposal approval are unchanged.
 
-See [Tool loading](TOOL_LOADING.md#authority-and-receipts) for the action
+See [One door](ONE_DOOR.md#authority-and-receipts) for the action
 boundary and [Approval schema](approval-schema.md) for stored records.
 
 ## 8. Bounded inspection
@@ -811,7 +845,7 @@ their launch and termination lifetimes.
 | Part resume wakes | `EngineRuntime/EnginePartWake.swift` | Launch delivers `resumed` after registering source observers. | Reading status does not resume a part. [Wake contract](skill_manifest_spec.md#wake-signals). |
 | First-terminal Doctor refresh | `EngineRuntime/EngineDoctor+FirstTurnRefresh.swift` | Once per launch, the first persisted terminal triggers a fresh Doctor pass under its configured gate. | The terminal event measures afresh; reading the saved report does not. See [Doctor](#3-doctor--the-health-authority). |
 | Approval / Desk waits | `ApprovalTransactions/ApprovalReconciliation.swift` (`settleDeskWaitsOnEveryResolve`) | Manager-owned observation subscribes before launch reconciliation, then settles Desk waits on approval resolution. | Observation performs reconciliation; reading a card grants nothing. [Approval law](approval-schema.md#resolution-and-execution). |
-| Grant observation | `ApprovalTransactions/InlineInteractionResolver+ChatLifecycle.swift` (`GrantWatch`) | Manager-owned permission-change observation and card taps coalesce grant rechecks. On each wake a running permission card records what it waits on (`waitingOn`) and, once that item is on, asks macOS for the next one in friction order, opening its pane; launch-applied grants share one restart, performed only by the person's tap on the card. | Its observation reads grants; only a card the person tapped asks for the next one, and a saved health read requests none. [Authority](TOOL_LOADING.md#authority-and-receipts). |
+| Grant observation | `ApprovalTransactions/InlineInteractionResolver+ChatLifecycle.swift` (`GrantWatch`) | Manager-owned permission-change observation and card taps coalesce grant rechecks. On each wake a running permission card records what it waits on (`waitingOn`) and, once that item is on, asks macOS for the next one in friction order, opening its pane; launch-applied grants share one restart, performed only by the person's tap on the card. | Its observation reads grants; only a card the person tapped asks for the next one, and a saved health read requests none. [Authority](ONE_DOOR.md#authority-and-receipts). |
 | Interaction delivery | `ApprovalTransactions/InlineInteractionDelivery.swift` | Manager-owned launch recovery restores card delivery pointers, then exact session changes refresh delivery. | The observer performs delivery work; reading saved status does not. [Delivery obligations](EXPERIENCE.md). |
 
 The manager retains approval, grant and interaction observation together through

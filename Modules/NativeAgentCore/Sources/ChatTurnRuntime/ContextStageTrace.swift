@@ -35,6 +35,33 @@ enum ContextStageName: String, CaseIterable, Sendable {
     case render = "history.render"
     case checkpoint = "turn.checkpoint"
     case historyContext = "turn.history_context"
+    // Partition steps of `turn.history_context`, `history.build`, `history.prompt_read` and `context.base`,
+    // except `context.episodic`, which nests inside `prompt.render`.
+    case historyContextReturn = "turn.history_context.return"
+    case historyBuild = "history.build"
+    case historyEntry = "history.entry"
+    case historyBudget = "history.budget"
+    case historyQuietHours = "history.quiet_hours"
+    case promptReadReaderHop = "history.prompt_read.reader_hop"
+    case promptReadFile = "history.prompt_read.file"
+    case promptReadLines = "history.prompt_read.lines"
+    case promptReadRowMemo = "history.prompt_read.row_memo"
+    case promptReadSelect = "history.prompt_read.select"
+    case promptReadMemoWrite = "history.prompt_read.memo_write"
+    case historyExchanges = "history.exchanges"
+    case contextBaseReturn = "context.base.return"
+    case historyAdmission = "history.admission"
+    case historyReceipts = "history.receipts"
+    case factsCompose = "context.facts.compose"
+    case contextBudget = "context.budget"
+    case queryEmbeddingStart = "contextFlow.query_embedding_start"
+    case contextFlowMode = "contextFlow.mode"
+    case recallGate = "memory.recall_gate"
+    case queryEmbeddingWait = "contextFlow.query_embedding_wait"
+    case userCore = "memory.user_core"
+    case toolsCatalog = "tools.catalog"
+    case intentions = "context.intentions"
+    case episodic = "context.episodic"
     case cognitionJoin = "turn.cognition_join"
     case cognitiveAppend = "turn.cognitive_append"
     case turnPart = "turn.part_open"
@@ -189,6 +216,9 @@ enum MemoryRecallTraceOutcome: Sendable, Equatable {
     }
 }
 
+/// Stage times by name, plus exact partitions: a stage recorded `of` a parent is one step of that parent's interval,
+/// steps of one parent never overlap, and `partitionNs` adds `<parent>.other` so the steps sum to the parent in
+/// nanoseconds before any rounding. A stage recorded without a parent is nested diagnostic time, never part of a sum.
 struct ContextStageTrace: Sendable {
     private let turn: Turn?
     struct Timing: Sendable {
@@ -197,47 +227,62 @@ struct ContextStageTrace: Sendable {
     }
 
     private let startedNs: UInt64
+    /// The parent this trace's own interval stands for; its steps sum to `totalNs`.
+    private let root: ContextStageName?
     private var timings: [Timing] = []
+    /// Clock-read intervals by stage name, so a parent recorded here has an exact whole.
+    private var spanNs: [String: UInt64] = [:]
+    /// Partition steps by parent name, then step name.
+    private var stepNs: [String: [String: UInt64]] = [:]
     private var counts: [String: Int64] = [:]
     private var flags: [String: Bool] = [:]
     private var labels: [String: String] = [:]
     private var memoryRecallOutcome: MemoryRecallTraceOutcome?
     private var injectedMemoryIDs: [String]?
 
-    init(turn: Turn?) {
+    /// `startedNs` lets a caller's own clock read open the interval, so the call into this trace's owner is timed too.
+    init(turn: Turn?, partitioning root: ContextStageName? = nil, startedNs: UInt64 = DispatchTime.now().uptimeNanoseconds) {
         self.turn = turn
-        self.startedNs = DispatchTime.now().uptimeNanoseconds
+        self.root = root
+        self.startedNs = startedNs
     }
 
     mutating func measure<T>(
         _ name: ContextStageName,
-        _ work: () async throws -> T
-    ) async rethrows -> T {
-        return try await measure(name.rawValue, work)
-    }
-
-    private mutating func measure<T>(
-        _ name: String,
+        of parent: ContextStageName? = nil,
         _ work: () async throws -> T
     ) async rethrows -> T {
         let start = DispatchTime.now().uptimeNanoseconds
         do {
             let value = try await work()
-            record(name, since: start)
+            record(name, since: start, of: parent)
             return value
         } catch {
-            record(name, since: start)
+            record(name, since: start, of: parent)
             throw error
         }
     }
 
-    mutating func record(_ name: ContextStageName, since startNs: UInt64) {
-        record(name.rawValue, since: startNs)
+    mutating func record(
+        _ name: ContextStageName,
+        since startNs: UInt64,
+        until endNs: UInt64 = DispatchTime.now().uptimeNanoseconds,
+        of parent: ContextStageName? = nil
+    ) {
+        let elapsedNs = endNs &- startNs
+        timings.append(Timing(name: name.rawValue, elapsedMs: Int64(elapsedNs / 1_000_000)))
+        keep(name, nanoseconds: elapsedNs, of: parent)
     }
 
-    private mutating func record(_ name: String, since startNs: UInt64) {
-        let elapsed = Int64((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
-        timings.append(Timing(name: name, elapsedMs: elapsed))
+    /// A step whose duration its owner measured and returned rather than this trace's own clock reads.
+    mutating func record(_ name: ContextStageName, nanoseconds: UInt64, of parent: ContextStageName) {
+        timings.append(Timing(name: name.rawValue, elapsedMs: Int64(nanoseconds / 1_000_000)))
+        keep(name, nanoseconds: nanoseconds, of: parent)
+    }
+
+    private mutating func keep(_ name: ContextStageName, nanoseconds: UInt64, of parent: ContextStageName?) {
+        spanNs[name.rawValue, default: 0] &+= nanoseconds
+        if let parent { stepNs[parent.rawValue, default: [:]][name.rawValue, default: 0] &+= nanoseconds }
     }
 
     /// Positive stage times round up to whole milliseconds; zero means no measured work, and counts retain raw microseconds.
@@ -248,9 +293,10 @@ struct ContextStageTrace: Sendable {
     }
 
     /// Preserve microseconds so sub-millisecond stages remain measurable on the same clock.
-    mutating func recordMicroseconds(_ name: ContextStageName, since startNs: UInt64) {
-        let elapsed = Int64((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000)
-        setMicroseconds(name, microseconds: elapsed)
+    mutating func recordMicroseconds(_ name: ContextStageName, since startNs: UInt64, of parent: ContextStageName? = nil) {
+        let elapsedNs = DispatchTime.now().uptimeNanoseconds &- startNs
+        setMicroseconds(name, microseconds: Int64(clamping: elapsedNs / 1_000))
+        keep(name, nanoseconds: elapsedNs, of: parent)
     }
 
     mutating func setTiming(_ name: ContextStageName, milliseconds: Int64) {
@@ -284,13 +330,15 @@ struct ContextStageTrace: Sendable {
         counts["memory.recallHits"] = Int64(ids.count)
     }
 
+    /// `endNs` closes the interval at a clock read the caller keeps, so it can time what follows the summary.
     @discardableResult
-    func emit(kind: String, surface: String) -> Int64 {
+    func emit(kind: String, surface: String, closedAt endNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Int64 {
         var stageObject: [String: JSONValue] = [:]
         for timing in timings {
             stageObject[timing.name] = .int(timing.elapsedMs)
         }
-        let totalMs = Int64((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
+        let totalNs = endNs &- startedNs
+        let totalMs = Int64(totalNs / 1_000_000)
         var payload: [String: JSONValue] = [
             "totalMs": .int(totalMs),
             "preparationMs": .int(totalMs),
@@ -300,6 +348,10 @@ struct ContextStageTrace: Sendable {
             "labels": .object(labels.mapValues(JSONValue.string)),
             "stageCount": .int(Int64(timings.count)),
         ]
+        if !stepNs.isEmpty {
+            payload["totalNs"] = .int(Int64(clamping: totalNs))
+            payload["partitionNs"] = .object(partitionPayload(totalNs: totalNs))
+        }
         if let injectedMemoryIDs {
             payload["injectedMemoryIds"] = .array(injectedMemoryIDs.map(JSONValue.string))
         }
@@ -316,6 +368,21 @@ struct ContextStageTrace: Sendable {
             turn: turn
         )
         return totalMs
+    }
+
+    /// Each parent's steps plus `<parent>.other`, the time no step names. A parent without a whole here (never
+    /// recorded in this trace) lists its steps alone. A negative other means two steps overlapped; it is shown, not clamped.
+    private func partitionPayload(totalNs: UInt64) -> [String: JSONValue] {
+        stepNs.reduce(into: [:]) { partition, entry in
+            let (parent, steps) = entry
+            var object = steps.mapValues { JSONValue.int(Int64(clamping: $0)) }
+            let whole: UInt64? = parent == root?.rawValue ? totalNs : spanNs[parent]
+            if let whole {
+                let named = steps.values.reduce(UInt64(0)) { $0 &+ $1 }
+                object[parent + ".other"] = .int(Int64(clamping: whole) &- Int64(clamping: named))
+            }
+            partition[parent] = .object(object)
+        }
     }
 
     static func emitStage(

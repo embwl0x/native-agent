@@ -11,6 +11,7 @@ import NotificationInbox
 import ChatSessionWork
 import DreamREMCycle
 import ApprovalInbox
+import ChatToolRuntime
 import Desk
 import AuthoredCapabilities
 import AppToolRuntime
@@ -115,6 +116,38 @@ public enum TodayWords {
     /// Strip before bounding every displayed line.
     public static func line(_ text: String, limit: Int = 180) -> String {
         bounded(plain(text), limit: limit)
+    }
+
+    /// One pill's words: the prose before the first file path or machine id, bounded at a word, with an ellipsis where it was cut. Paths and ids
+    /// that open the words are skipped; empty when the words hold nothing else.
+    static func spoken(_ text: String, limit: Int) -> String {
+        var kept: [Substring] = []
+        var cut = false
+        for word in plain(text).split(separator: " ") {
+            let bare = word.trimmingCharacters(in: CharacterSet(charactersIn: "()[]{}<>\"'“”‘’.,;:!?"))
+            // A handle is a word, an underscore, then a machine id (desk_3F2A…): the word in front does not make it prose.
+            let handle = bare.range(of: "_[0-9A-Fa-f-]{8,}", options: .regularExpression) != nil
+            if isPath(bare) || handle || (bare.contains(where: \.isHexDigit) && withoutIDs(bare).isEmpty) {
+                if kept.isEmpty { continue }
+                cut = true
+                break
+            }
+            kept.append(word)
+        }
+        var head = kept.joined(separator: " ")
+        while let last = head.last, " :;,([{\"'“‘–—-".contains(last) { head.removeLast() }
+        let short = bounded(head, limit: limit)
+        return cut && short == head && !head.isEmpty ? head + "…" : short
+    }
+
+    /// A file path or URL: rooted (`/`, `~/`, and `./` once its dots are trimmed), a scheme's `//`, a second slash, or a slash before a file extension.
+    private static func isPath(_ word: String) -> Bool {
+        let slashes = word.filter { $0 == "/" }.count
+        guard slashes > 0, word.count > 1 else { return false }
+        if word.hasPrefix("/") || word.hasPrefix("~/") || slashes > 1 { return true }
+        guard let name = word.split(separator: "/").last, let dot = name.lastIndex(of: ".") else { return false }
+        let ext = name[name.index(after: dot)...]
+        return !ext.isEmpty && ext.count <= 8 && ext.allSatisfy { $0.isLetter || $0.isNumber }
     }
 
     /// Use the system’s localized short time and the shared display zone for every user-facing clock.
@@ -290,7 +323,15 @@ private struct TodaySource: Sendable, Equatable {
         let now = Date(), calendar = Calendar.autoupdatingCurrent
         func today(_ at: Date) -> Bool { calendar.isDate(at, inSameDayAs: now) }
         do {
-            let items = try await ForPerson.at(engine.dataRoot).inbox()
+            let forPerson = ForPerson.at(engine.dataRoot)
+            let items = try await forPerson.inbox()
+            // The agent's own decisions fold by their owner's kind and say their owner's count; read after the inbox, this reading holds its rows.
+            var decided: [String: (kind: String, count: Int?)] = [:]
+            for matter in try await forPerson.matters() {
+                guard let kind = BodyDecidedRow.kind(of: matter) else { continue }
+                let count = matter.face?.row?.value.flatMap { Int($0) }
+                decided[matter.id] = (kind: kind, count: count.flatMap { $0 > 0 ? $0 : nil })
+            }
             source.input["sourceStates"] = .object(["notes": .string(items.isEmpty ? "empty" : "available")])
             let asks = items.filter { $0.requiresOwnerInput && !$0.hasLinkedApproval }.sorted { $0.created_at > $1.created_at }
             let waiting = asks.map { item -> JSONValue in
@@ -302,10 +343,14 @@ private struct TodaySource: Sendable, Equatable {
                     let key = "inbox:" + item.id
                     // Only native owner job identity may bind a folded group.
                     let job = item.relatedDelegationID.flatMap { $0.isEmpty ? nil : $0 }
+                    let decision = decided[item.id]
+                    if decision != nil, decision?.count == nil { source.unavailable.append("Decision count unreadable: " + item.id) }
                     source.keys[key] = .object(["open": .string("card:" + item.id)])
                     return .object(["key": .string(key), "at": .double(at.timeIntervalSince1970), "today": .bool(today(at)),
                         "source": .string(item.source), "title": .string(TodayWords.withoutIDs(TodayWords.line(item.title,limit:90))),
-                        "summary": .string(TodayWords.withoutIDs(TodayWords.firstSentence(item.summary))), "job": job.map(JSONValue.string) ?? .null])
+                        "summary": .string(TodayWords.withoutIDs(TodayWords.firstSentence(item.summary))), "job": job.map(JSONValue.string) ?? .null,
+                        "kind": decision.map { JSONValue.string($0.kind) } ?? .null,
+                        "decisions": decision?.count.map { JSONValue.int(Int64($0)) } ?? .null])
                 }
                 source.unavailable.append("Note time unavailable: " + item.id)
                 return nil
@@ -473,8 +518,10 @@ private struct TodaySource: Sendable, Equatable {
                       MyQueue.until(entry).endsAt.map({ next < $0 }) ?? true else { return nil }
                 source.deadline = min(source.deadline ?? next, next)
                 let key = "intention:" + entry.item.handle
+                // The pill carries its first words; the face keeps every word as the row's detail.
                 return .object(["key": .string(key), "at": .double(next.timeIntervalSince1970),
-                    "time": .string(shown(next, now: now, calendar: calendar)), "words": .string(entry.step.words)])
+                    "time": .string(shown(next, now: now, calendar: calendar)), "words": .string(entry.step.words),
+                    "title": .string(TodayWords.spoken(entry.step.words, limit: 60))])
             }
             source.input["intentions"] = .object(["state": .string("available"), "rows": .array(intentions)])
         } catch {

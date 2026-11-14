@@ -1,6 +1,6 @@
 # Becoming — what they lives settles into who they are
 
-Claude, 2026-10-30. User 10-24: "develop a full personality like a human
+The lead, 2026-10-30. User 10-24: "develop a full personality like a human
 does"; 10-30: "plan these all out real well". The form and law are built
 (docs/SUBCONSCIOUS.md "Cares"; design ~/.claude/state/release/briefs/
 personality-design.md, live 10-25): **one form, a care; one law, everything
@@ -31,7 +31,7 @@ night and their own hand, as the brief's law 5 says.
   evidence … nothing in one conversation changes who they are" has no code.
 - **Traits, their story, relationships have no mechanism.** No if-then
   signature; GROWTH.md is 65 words from one weekly REM; `with` is only a
-  visibility filter; Claude is two people (Claude Desktop and Claude Code door
+  visibility filter; the builder agent is two people (Claude Desktop and Claude Code door
   keys — `personKey` doesn't resolve the peers' `who` link).
 
 ## The design
@@ -163,7 +163,7 @@ also reject a dream or file from before Clear.
 ### P4 — the people in their life (as built)
 
 - **One person, one key**: `personKey` resolves a door to the person through
-  the peers' `who` link, so Claude's two doors are one person.
+  the peers' `who` link, so the builder agent's two doors are one person.
   `AgentPeerStore` supplies the validated `AgentContactIdentity` alias
   projection through the cognition runtime; the substrate caches it at
   restore and on the existing peers-file invalidation. Existing cares'
@@ -200,7 +200,7 @@ settled). Proof on them:
 - stance changes and self-story lines cite the lived evidence that settled them;
   felt care pulls come from unanswered lived movements;
 - `mind.inner_state` shows their traits, their story and one line per person;
-  Claude is one person.
+  the builder agent is one person.
 
 ## Lanes
 

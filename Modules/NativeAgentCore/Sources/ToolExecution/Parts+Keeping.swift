@@ -47,6 +47,8 @@ extension Parts {
         try await checkDependencies(candidate, invocation: invocation)
         let signer = SwiftNativeManifestSigner(dataRoot: root)
         let key = try await signer.loadOrCreateSigningKey()
+        // A version that is the shipped part follows it from here, as a seed does; any other is the agent's own and stays as it is.
+        if try followsShipped(candidate, invocation: invocation) { try store.follow(candidate, key: key, turn: invocation.execution.turn) }
         let proof = try store.proof(candidate, key: key)
         let admission = try await signer.sign(["id": .string(id), "candidate": .string(digest), "proof": proof, "by": .string(by)])
         let path = try abilities.path(id: id).path, stamp = Self.now()
@@ -227,6 +229,9 @@ extension Parts {
                         "reason": .string("keep_unconfirmed"), "effects": .string("unknown"),
                         "remedy": Repair.reconcile(instruction: "Read the selected status and version before another change.", nextCall: Self.readCall(
                             id))]) { $1 })
+                }
+                guard AbilityStore.answersCalls(candidate.program.source, header: Self.fields(candidate.manifest)) else {
+                    return (true, "\(name) is on. It is a page, drawn by face(input), never called; it defines no run(input).", fields)
                 }
                 return (true, "\(name) is on: run it as authored.\(id).", fields.merging(["run": .string("authored." + id)]) { $1 })
             }

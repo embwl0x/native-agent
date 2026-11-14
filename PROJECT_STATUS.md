@@ -12,21 +12,23 @@ execution. StandingBots owns helpers' model/tool loops over their own transcript
 Mac, iPhone, Telegram, Slack and local agent bridges reach that
 shared engine.
 
-The Mac has Simple, Advanced and Agent views. Simple presents chat, contacts
-and helpers; Advanced exposes the full page rail; Agent draws their Home face
-with row actions and keeps the other rooms as read-only text.
+The Mac has Simple, Advanced and Agent views. Simple presents chat, the
+places Chat, Desk, the agent's own and Control, and folded contacts and
+helpers; Advanced adds Diagnostics, the conversation list and the Work pane;
+Agent draws their Home face with row actions and keeps the other rooms as
+read-only text.
 
 ## Where things stand
 
 | Area | Current source contract |
 |---|---|
 | Releases | Mac v0.6.9 is the current public release as of 2026-10-20 (Developer ID signed, notarized, Sparkle). The iPhone companion ships through TestFlight. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
-| Agent interface | `app` is the only always-on tool. `app {}` is home; `page`, `item`, `find`, `action` and JavaScriptCore `script` reach capabilities through `AppActionRegistry`. |
-| Discovery | Pages and actions arrive in tool results. Argument binding and refused-call advice follow [the tool contract](docs/TOOL_LOADING.md). |
-| macOS grants | Owned permission remedies automatically file `permissions.request` through the composed tool return; already-allowed access skips the card and an open card for the capability is reused. Results retain the original outcome and name the card for the person. Only the person's foreground Allow tap invokes macOS acquisition. Card and Settings acquisition await activation or cancellation, release observation on every exit, and request no grant while inactive or cancelled; Settings retains acquisition problems as failures. See [the tool contract](docs/TOOL_LOADING.md). |
+| Agent interface | The agent's one door, `app`, is always on. `app {}` is home; `page`, `item`, `find`, `action` and JavaScriptCore `script` reach capabilities through `AppActionRegistry`. |
+| Discovery | Pages and actions arrive in tool results. Argument binding and refused-call advice follow [the one-door contract](docs/ONE_DOOR.md). |
+| macOS grants | Owned permission remedies automatically file `permissions.request` through the composed tool return; already-allowed access skips the card and an open card for the capability is reused. Results retain the original outcome and name the card for the person. Only the person's foreground Allow tap invokes macOS acquisition. Card and Settings acquisition await activation or cancellation, release observation on every exit, and request no grant while inactive or cancelled; Settings retains acquisition problems as failures. See [the one-door contract](docs/ONE_DOOR.md). |
 | Growth and MCP | Authored executable tools and legacy executable skills migrated into `data/abilities/` alongside senses and turns: one current file, optional previous/proposed files and independent run state, with exact admission/proof and explicit lifecycle actions. Built-in skill guidance remains in the persona's `skills/bodies/`, read and never run; the [manifest spec](docs/skill_manifest_spec.md) owns that distinction. An MCP server they wants is an ability they grows; NativeAgent keeps no MCP client. |
 | Web search | `web.search` uses the configured SearXNG endpoint; without one it returns `searxng_not_configured`. Discovery/selection is explicit Research setup, never search or Doctor recovery through another endpoint. Checked discovery distinguishes refused listeners from failed probes/inventory: a candidate's failure is a named gap while other candidates proceed, including when a reachable endpoint is selected; required configuration/inventory failures stop discovery. Responses validate current result fields and engine-failure evidence before admission: malformed result and engine-failure rows become named gaps while valid siblings return; required envelope failures still fail the search. The Research view and tool result retain result gaps. Doctor answering/readiness checks stay unverified when no usable results remain and parse gaps prevent a conclusive empty response. Fetch receipt retention reports its own checked failure independently of completed reads. Research Lab uses the same search route; the editable `research-lab.js` part selects sources and writes the brief from explicit native evidence, while Swift commits locked capped history and receipts and requires the complete current saved run shape. No browser search route or Codex search implementation remains. |
-| Web reads and maps | Chrome 0.4.70 waits for readable content. [Chrome](Extensions/NativeAgentChrome/README.md), [maps](docs/TOOL_LOADING.md). |
+| Web reads and maps | Chrome 0.4.70 waits for readable content. [Chrome](Extensions/NativeAgentChrome/README.md), [maps](docs/ONE_DOOR.md). |
 | Memory | MemoryV2 stores durable memories; Fluid Context prepares bounded context. [Recall unavailability](docs/ANATOMY_OF_A_TURN.md#recall-unavailability) names its cause. Conversation replay follows the [input-budget law](docs/conversation-context-history.md), without a stored cut pointer or summary. |
 | REM proposals | The [replacement-evidence contract](docs/COGNITION_WIRING.md#rem-proposal-replacement-evidence) owns displaced-content provenance, review and approval behavior. |
 | Work | Desk holds durable work. Helpers run their own model/tool loops with their names, personalities, jobs and transcripts; they follow Chat's Providers settings unless explicitly pinned and reach the resident through the contact path. Following helpers refuse conflicting settings at the submitted field and acknowledge inherited-value no-ops. See [helper settings](docs/USER_GUIDE.md#helpers-standing-bots). |
@@ -140,9 +142,9 @@ failures. Retired tool names run nothing; there is nothing to load or unload.
   main from a detached conversation; preference edits open it only when navigation
   is unmounted and leave an existing scene's focus alone. Each task consumes only
   its own request. The tour's temporary Advanced presentation is renderer-local;
-  it does not write or restore the saved view mode on teardown. Simple's More
-  settings uses checked Settings navigation. These feedback changes still need
-  installed acceptance.
+  it does not write or restore the saved view mode on teardown. Settings
+  navigation stays in Simple and opens Control's Settings tab there. These
+  feedback changes still need installed acceptance.
   Native composer model, thinking, Fast, Trust and hand-back controls keep ordered
   requests in their visible conversation. Leaving that conversation or closing its
   view cancels held work, clears pending controls and settles without feedback on
@@ -213,6 +215,6 @@ failures. Retired tool names run nothing; there is nothing to load or unload.
 - [README](README.md) — install and first run.
 - [User and Agent Guide](docs/USER_GUIDE.md) — pages and everyday operation.
 - [Capabilities](docs/CAPABILITIES.md) — source-backed capability map.
-- [App tool contract](docs/TOOL_LOADING.md) — the single tool interface.
+- [One door: the contract](docs/ONE_DOOR.md) — the agent's one door, `app`.
 - [Documentation guide](docs/README.md) — documents and their readers.
 - [AGENTS.md](AGENTS.md) — repository working rules.

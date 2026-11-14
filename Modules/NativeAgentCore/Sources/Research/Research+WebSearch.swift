@@ -42,6 +42,10 @@ public enum WebSearchRoutes {
             return cancelled
         } catch ResearchClientError.notConfigured {
             return failure("searxng_not_configured", "SearXNG is not configured. Configure SearXNG in Research settings, then retry the search.")
+        } catch ResearchClientError.httpStatus(let status) {
+            return .object(["status": .string("failed"), "reason": .string("http_status"), "route": .string("searxng"),
+                "elapsed_ms": elapsed(), "http_status": .int(Int64(status)),
+                "message": .string("SearXNG: " + ResearchClientError.httpStatus(status).localizedDescription)])
         } catch {
             return failure("searxng_failed", "SearXNG did not answer (\(error.localizedDescription)). Run Doctor to check SearXNG.")
         }

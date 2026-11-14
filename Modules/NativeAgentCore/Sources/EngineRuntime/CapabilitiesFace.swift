@@ -57,26 +57,11 @@ enum CapabilitiesFace {
         }
         let grown = await grownRows(engine.tools)
         if case .failure(let error) = grown {
-            sections.append(issue("abilities-read", "Abilities I grew", "Their versions and switches could not be read: " + error.localizedDescription))
-        }
-        let grownRow = { (record: CapabilityRecord) -> PartFace.Row? in
-            guard case .success(let rows) = grown else { return nil }
-            return rows[record.id]
+            sections.append(issue("abilities-read", "My abilities", "Their versions and switches could not be read: " + error.localizedDescription))
         }
         if let summary = state.summary {
-            let records = CapabilityRecord.displayRecords(summary.records)
-            let review = records.filter { TrustFacade.capabilityNeedsReview($0.status) }
-            if !review.isEmpty {
-                sections.append(.init(id: "review", title: "Waiting for your review",
-                    footer: state.summaryError == nil ? nil : "Review state is from the last successful read.", rows: review.map {
-                    grownRow($0) ?? capabilityRow($0, tone: .attention)
-                }))
-            }
-            sections.append(.init(id: "inventory", title: "What I can do",
-                footer: state.summaryError == nil ? "Open an ability I grew to read its exact version, code and evidence before approving it."
-                    : "These are the last read capabilities; the read above failed.",
-                rows: records.isEmpty ? [.init(id: "inventory-empty", title: "No capabilities in the read inventory", tone: .quiet)]
-                    : records.map { grownRow($0) ?? capabilityRow($0) }))
+            let abilities: [String: Ability] = if case .success(let read) = grown { read } else { [:] }
+            sections += inventory(CapabilityRecord.displayRecords(summary.records), abilities: abilities, stale: state.summaryError != nil)
         }
         sections.append(await catalog(engine.trust))
         sections += await senses()
@@ -108,10 +93,57 @@ enum CapabilitiesFace {
         return line + "."
     }
 
-    nonisolated private static func capabilityRow(_ record: CapabilityRecord, tone forced: PartFace.Tone? = nil) -> PartFace.Row {
+    /// The inventory in sections. First, ungrouped, whatever waits on the person or is not ready: waiting for review or approval, failing.
+    /// What is only switched off asks for nothing and sits under its own fold, last. Then my abilities, one parent row per purpose with the abilities nested and their count as its value; then what is built in.
+    /// An ability whose own record was not read (`abilities` lacks it) is drawn from its inventory record, after the groups.
+    nonisolated private static func inventory(_ records: [CapabilityRecord], abilities: [String: Ability], stale: Bool) -> [PartFace.Section] {
+        let staleNote = "These are the last read capabilities; the read above failed."
+        guard !records.isEmpty else {
+            return [.init(id: "inventory", title: "My abilities", footer: stale ? staleNote : nil,
+                rows: [.init(id: "inventory-empty", title: "No capabilities in the read inventory", tone: .quiet)])]
+        }
+        var waiting: [PartFace.Row] = [], ungrouped: [PartFace.Row] = [], builtIn: [PartFace.Row] = [], switchedOff: [PartFace.Row] = []
+        var groups: [String: (title: String, rows: [PartFace.Row])] = [:]
+        for record in records {
+            if let ability = abilities[record.id] {
+                if ability.off { switchedOff.append(ability.row) }
+                else if ability.waits { waiting.append(ability.row) }
+                else { groups[ability.purpose, default: (ability.title, [])].rows.append(ability.row) }
+                continue
+            }
+            let row = capabilityRow(record)
+            let off = ["disabled", "off"].contains(record.status?.lowercased() ?? "")
+            if off { switchedOff.append(row) }
+            else if row.tone == .attention || row.tone == .failed { waiting.append(row) }
+            // `tool:<id>` is an ability's inventory id (capabilityRecordsFull); every other record is built in.
+            else if record.id.hasPrefix("tool:") { ungrouped.append(row) }
+            else { builtIn.append(row) }
+        }
+        let parents = groups.sorted { $0.value.title.localizedCaseInsensitiveCompare($1.value.title) == .orderedAscending }.map {
+            PartFace.Row(id: "abilities:" + $0.key, title: $0.value.title, value: String($0.value.rows.count), rows: $0.value.rows)
+        }
+        var sections: [PartFace.Section] = []
+        if !waiting.isEmpty {
+            sections.append(.init(id: "review", title: "Waiting on you or not ready", footer: stale ? "Review state is from the last successful read."
+                : "Open an ability to read its exact version, code and evidence before approving it.", rows: waiting))
+        }
+        if !(parents + ungrouped).isEmpty {
+            sections.append(.init(id: "inventory", title: "My abilities", footer: stale ? staleNote : nil, rows: parents + ungrouped))
+        }
+        if !builtIn.isEmpty {
+            sections.append(.init(id: "built-in", title: "Built in", footer: stale ? staleNote : nil, rows: builtIn))
+        }
+        if !switchedOff.isEmpty {
+            sections.append(.init(id: "off", title: "Switched off", footer: "Off until turned on again. Open one to read its exact version first.",
+                                  rows: switchedOff, folded: true))
+        }
+        return sections
+    }
+
+    nonisolated private static func capabilityRow(_ record: CapabilityRecord) -> PartFace.Row {
         .init(id: record.id, title: CapabilityRecord.title(for: record), detail: CapabilityRecord.description(for: record),
             value: "\(record.kind ?? "Kind unavailable") · \(record.riskClass ?? "Risk unavailable") · \(record.status ?? "Status unavailable")",
-            tone: forced ?? tone(record.status))
+            tone: tone(record.status))
     }
 
     private static func catalog(_ owner: TrustFacade) async -> PartFace.Section {
@@ -168,8 +200,9 @@ extension CapabilitiesFace {
     /// An ability's row carries the exact version its fold shows, so Approve keeps only what the person read.
     nonisolated static func abilityRowID(_ tool: ToolRecord) -> String { "ability." + tool.id + "@" + (tool.reviewedKeepDigest ?? "") }
 
-    /// The senses as their registry holds them now. On or off is the person's consent (`sense.switch`, a lever); the registry records who
-    /// switched a sense off, so the person's off stays off across launches.
+    /// The senses as their registry holds them now, those not on first. A sense is on unless switched off, so its row says its state in words
+    /// and carries no switch; turning it off or on stays an action on the row (`sense.switch`). The registry records who switched a sense
+    /// off, so the person's off stays off across launches.
     @concurrent nonisolated static func senses() async -> [PartFace.Section] {
         let footer = "Live watches and recent sense changes are on Home, under My senses."
         guard SensesHub.shared.registry != nil else {
@@ -180,7 +213,7 @@ extension CapabilitiesFace {
         let records: [SenseRecord]
         do { records = try await SensesHub.shared.presentationRecords().0 }
         catch { return [issue("senses", "Senses", "Senses registry unavailable: " + error.localizedDescription)] }
-        let rows = records.map { record -> PartFace.Row in
+        let rows = (records.filter { $0.status != .on } + records.filter { $0.status == .on }).map { record -> PartFace.Row in
             let state = switch record.status {
             case .unavailable: "Unavailable"
             case .draft: "Not ready yet"
@@ -200,33 +233,49 @@ extension CapabilitiesFace {
             } else {
                 cost = "Growth cost: not recorded"
             }
-            var lines = ["\(state) · \(origin) · \(record.uses) uses · \(record.corrections) corrections"]
+            var lines = ["\(origin) · \(record.uses) uses · \(record.corrections) corrections"]
             if let reason = record.unavailableReason { lines.append(reason) }
             lines.append(record.lastUsedAt == nil ? "Never used · \(cost)" : cost)
-            // The switch and Share name the exact version the row shows.
+            // Turning it off or on and Share name the exact version the row shows; the switch's call carries the new state as its value.
             let version: [String: PartFace.Value] = ["sense_id": .string(record.id), "version": .int(Int64(record.version))]
+            var actions: [PartFace.Action] = []
+            if record.status != .draft {
+                let on = record.status == .on
+                actions.append(.init(id: "sense.switch", label: on ? "Turn off" : "Turn on",
+                    call: .init("sense.switch", version.merging(["value": .bool(!on)]) { _, new in new })))
+            }
+            if record.language != .native {
+                actions.append(.init(id: "sense.share", label: "Share sense", doors: ["mac"], call: .init("sense.share", version)))
+            }
             return .init(id: senseRowID(record), title: "\(record.corner.surfaceName) · v\(record.version)",
-                detail: lines.joined(separator: "\n"), value: record.status == .draft ? state : nil,
+                detail: lines.joined(separator: "\n"), value: state,
                 at: record.lastUsedAt.map { ISO8601DateFormatter().string(from: $0) }, tone: record.status == .unavailable ? .attention : nil,
-                actions: record.language == .native ? nil
-                    : [.init(id: "sense.share", label: "Share sense", doors: ["mac"], call: .init("sense.share", version))],
-                control: record.status == .draft ? nil : .toggle(record.status == .on, call: .init("sense.switch", version)))
+                actions: actions.isEmpty ? nil : actions)
         }
         return [.init(id: "senses", title: "Senses", footer: footer,
             rows: rows.isEmpty ? [.init(id: "senses-empty", title: "No senses yet", tone: .quiet)] : rows)]
     }
 
-    /// The abilities the agent grew, from the tool registry's checked records. Approving a waiting version and turning one off are the
-    /// person's levers; each ability's exact waiting version, code and evidence fold beneath the list, to read before approving.
-    /// The grown abilities' rows, keyed by the inventory record each one is (`tool:<id>`): the inventory draws a grown ability as this row, so
-    /// one row carries it, its status, an open to its exact version and code, and the person's Approve and Turn off.
+    /// One of my abilities as the inventory draws it: its row, what it is for (`purpose`, the parent row it is drawn under, and that parent's
+    /// `title`), and whether it waits on the person or is not ready (drawn first, ungrouped).
+    struct Ability: Sendable {
+        let row: PartFace.Row
+        let purpose: String
+        let title: String
+        let waits: Bool
+        /// Switched off and nothing else: no new version, nothing failing. It asks for nothing, so it is not drawn as waiting.
+        var off = false
+    }
+
+    /// My abilities from the tool registry's checked records, keyed by the inventory record each one is (`tool:<id>`): one row carries it, its
+    /// status, an open to its exact version, code and evidence (to read before approving), and the person's Approve and Turn off.
     /// Catalog failures return failure so the page can name the unavailable source.
-    @concurrent nonisolated static func grownRows(_ tools: ToolsFacade) async -> Result<[String: PartFace.Row], Error> {
+    @concurrent nonisolated static func grownRows(_ tools: ToolsFacade) async -> Result<[String: Ability], Error> {
         let records: [ToolRecord]
         do { records = try await tools.listAuthored() }
         catch { return .failure(error) }
         return await Task.detached(priority: .userInitiated) {
-            Result<[String: PartFace.Row], Error>.success(Dictionary(records.map { tool -> (String, PartFace.Row) in
+            Result<[String: Ability], Error>.success(Dictionary(records.map { tool -> (String, Ability) in
                 let status = tool.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 let word = switch status {
                 case "active": "On"
@@ -237,6 +286,7 @@ extension CapabilitiesFace {
                 }
                 var actions: [PartFace.Action] = []
                 var refusal: String?
+                let onlyOff = status == "disabled" && tool.candidateDigest == nil && tool.validationErrors?.isEmpty != false
                 if tool.status != "active" || tool.candidateDigest != nil {
                     refusal = (tool.candidateDigest ?? tool.codeFingerprint) != nil && tool.keepReview == nil
                         ? "Version unavailable. Read Capabilities again before approving." : tools.keepRefusal(tool, turn: nil)
@@ -244,7 +294,8 @@ extension CapabilitiesFace {
                     var keep: [String: PartFace.Value] = ["id": .string(tool.id)]
                     if let digest = tool.reviewedKeepDigest { keep["version"] = .string(digest) }
                     if refusal == nil {
-                        actions.append(.init(id: "ability.keep", label: "Approve", role: .primary, doors: ["mac"], call: .init("ability.keep", keep)))
+                        actions.append(.init(id: "ability.keep", label: onlyOff ? "Turn on" : "Approve", role: .primary, doors: ["mac"],
+                                             call: .init("ability.keep", keep)))
                     }
                 }
                 if tool.status != "disabled" {
@@ -255,10 +306,32 @@ extension CapabilitiesFace {
                 let tone: PartFace.Tone
                 if tool.validationErrors?.isEmpty == false { tone = .failed }
                 else { tone = status == "active" ? .done : status == "disabled" ? .quiet : .attention }
-                return ("tool:" + tool.id, .init(id: abilityRowID(tool), title: tool.name, detail: lines.joined(separator: "\n"), value: word,
-                    tone: tone, open: "page:capabilities/" + abilityRowID(tool), actions: actions.isEmpty ? nil : actions))
+                let row = PartFace.Row(id: abilityRowID(tool), title: tool.name, detail: lines.joined(separator: "\n"), value: word,
+                    tone: tone, open: "page:capabilities/" + abilityRowID(tool), actions: actions.isEmpty ? nil : actions)
+                let subject = purpose(tool)
+                // Anything but on and settled waits: a draft, a proposal, off, failing validation, or a new version waiting for approval.
+                return ("tool:" + tool.id, Ability(row: row, purpose: subject.key, title: subject.title,
+                    waits: tone != .done || tool.candidateDigest != nil, off: onlyOff))
             }, uniquingKeysWith: { first, _ in first }))
         }.value
+    }
+
+    /// What an ability is for, from what its record declares, first found: the page it is placed on (`face.page`); a face drawn with no page
+    /// (`face.projection`), which is a page I draw; the subject of a verb it answers, its face's action or an app action it calls
+    /// (`mail.search` → mail); the app it reaches (`app_read:`/`app_write:` → the bundle id's last word); else its id's first word. The title is
+    /// the app page of that name where one exists.
+    nonisolated static func purpose(_ tool: ToolRecord) -> (key: String, title: String) {
+        let face = tool.fields["face"]?.objectValue ?? [:]
+        if face["page"] == nil, face["projection"] == .bool(true) { return ("pages", "Pages I draw") }
+        let verbs = (tool.fields["answers"]?.objectValue?.keys.sorted() ?? []) + [face["action"]?.stringValue].compactMap { $0 } + (tool.actions ?? [])
+        let apps = (tool.permissions ?? []).compactMap { reach -> String? in
+            let parts = reach.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2, ["app_read", "app_write"].contains(String(parts[0])) else { return nil }
+            return parts[1].split(separator: ".").last.map(String.init)
+        }
+        let declared = [face["page"]?.stringValue].compactMap { $0 } + verbs.map { String($0.prefix { $0 != "." }) } + apps
+        let key = (declared.first { !$0.isEmpty } ?? String(tool.id.prefix { $0 != "-" })).lowercased()
+        return (key, QuietToolPage.page(named: key)?.title ?? key.prefix(1).uppercased() + String(key.dropFirst()))
     }
 
     /// The page's first line of a longer text.
@@ -460,7 +533,7 @@ extension CapabilitiesFace {
         }
         guard !skills.isEmpty else {
             return [.init(id: "guidance", title: "Guidance", rows: [.init(id: "guidance-empty", title: "No skills yet",
-                detail: "Ask me to build an ability in chat. You can review it here, under Abilities I grew.", tone: .quiet), build])]
+                detail: "Ask me to build an ability in chat. You can review it here, under My abilities.", tone: .quiet), build])]
         }
         let rows = skills.map { skill -> PartFace.Row in
             let unavailable = skill.status == "unavailable"
@@ -675,16 +748,17 @@ extension CapabilitiesFace {
         try await host(engine).buildSkillInChat()
     }
 
-    /// `sense.switch`: the person's switch through the registry's own owner-authorized write, on the version the row showed; the registry
-    /// records an owner's off so the agent cannot turn it back on.
-    static func switchSense(id: String, version: Int?, on: Bool?) async throws -> String? {
+    /// `sense.switch` on the version the row showed. Turning a sense on is always the person's decision (the door admits nothing else).
+    /// Turning one off is the person's when they did it, and the registry then records an owner's off that the agent cannot turn back
+    /// on; the agent's own off is recorded as its own.
+    static func switchSense(id: String, version: Int?, on: Bool?, byPerson: Bool) async throws -> String? {
         guard let on else { throw PartCallError(code: "bad_value", message: "A sense switch takes on or off; nothing changed.") }
         let (registry, record) = try await sense(id, version: version)
         guard record.status != .draft else {
             throw PartCallError(code: "not_ready", message: "This sense is not ready yet; nothing changed.")
         }
         let saved = try await registry.setStatus(id: record.id, version: record.version, status: on ? .on : .off,
-            ownerAuthorized: true, turn: nil)
+            ownerAuthorized: on || byPerson, turn: nil)
         return saved.corner.surfaceName + " is " + (saved.status == .on ? "on" : saved.status == .off ? "off" : saved.status.rawValue) + "."
     }
 

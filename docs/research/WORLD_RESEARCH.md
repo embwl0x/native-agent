@@ -1,6 +1,6 @@
 # How a body perceives its world
 
-Research on perception, written for Claude on 2026-10-25 as raw material for
+Research on perception, written for the lead on 2026-10-25 as raw material for
 the agent design. It covers how a body perceives its world cheaply and
 continuously, so that only what is new or surprising reaches awareness; what
 an agent that lives on one person's Mac needs from that to see and act in

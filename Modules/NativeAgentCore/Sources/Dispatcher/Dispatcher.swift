@@ -125,7 +125,7 @@ public enum DispatcherError: Error, LocalizedError, Equatable {
 
     public var errorDescription: String? {
         switch self {
-        case .missingTool: return "dispatcher: tool name is required"
+        case .missingTool: return "An action name is required."
         case .ledgerFailure(let m): return "dispatcher: ledger write failed: \(m)"
         }
     }
@@ -209,7 +209,7 @@ public actor SwiftNativeDispatcher {
                 ok: false, tool: trimmed, status: "failed", output: nil,
                 error: DispatchError(
                     code: "invalid_input",
-                    message: "tool name is required",
+                    message: "An action name is required.",
                     tool: nil,
                     argsHash: dispatcherArgsHash(input),
                     recoverable: false
@@ -263,7 +263,7 @@ public actor SwiftNativeDispatcher {
         let argsHash = dispatcherArgsHash(input)
         let err = DispatchError(
             code: "native_handler_missing",
-            message: "No Swift-native handler for tool '\(trimmed)'",
+            message: "No handler for action '\(trimmed)'",
             tool: trimmed,
             argsHash: argsHash,
             recoverable: false

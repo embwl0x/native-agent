@@ -90,7 +90,7 @@ extension BuiltInToolSchemaFactory {
             requestedSchema(name: "read_chat_message", toolClass: .read,
                 description: """
                     Page a full persisted message using the exact work.context/chat.search locator, rather than rephrasing a query for another \
-                    preview fragment. Tool messages contain retained receipt metadata, not fresh reads or unabridged original output. Coverage \
+                    preview fragment. Call-result messages contain retained receipt metadata, not fresh reads or unabridged original output. Coverage \
                     distinguishes missing evidence from unreadable history; incomplete lookups prove neither absence nor permission to replay \
                     actions.
                     """,

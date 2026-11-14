@@ -55,7 +55,7 @@ extension SwiftNativeChatOrchestrationClient {
         // A regenerate replaces the tail turn: its question is already on disk
         // and its old answer is not history for the new one.
         let historyRead = history.promptMessagesWithStats(
-            transcript: try await history.transcriptBytes(forSessionId: bot.sessionID),
+            transcript: try await history.transcriptBytes(forSessionId: bot.sessionID).bytes,
             excludingRunId: nil
         ).prompt
         var rows = try historyRead.checkedMessages()
@@ -127,6 +127,7 @@ extension SwiftNativeChatOrchestrationClient {
             userMessageID: replacingUserID, dataRoot: dataRoot)
         let flag = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: bot.sessionID, runId: run,
             turnId: turnID)
+        defer { ChatCancelFlag.finish(flag) }
         var modelCall = LLMCall(turn: turn, surface: "bot", purpose: "other", session: bot.sessionID)
         modelCall.systemSegments = layout.segments
         modelCall.currentUserIndex = seed.currentUserIndex
@@ -136,8 +137,8 @@ extension SwiftNativeChatOrchestrationClient {
         modelCall.prefixMeasurement = prefix
         let call = modelCall
         let roundPrefix = OSAllocatedUnfairLock(initialState: (context, seed))
-        let execute: @Sendable (Turn, LLMCall, ChatTurnWork) async throws -> BotTurnReply = { [self] turn, call, work in
-            try await BotTurnRunner.run(bot: bot, messages: seed.messages, system: layout.system,
+        let execute: @Sendable (Turn, LLMCall, ChatTurnWork) async -> BotTurnReply = { [self] turn, call, work in
+            await BotTurnRunner.run(bot: bot, messages: seed.messages, system: layout.system,
                 model: choice.model, llm: llm, schemas: codec.requestTools(providerNames.schemas),
                 turn: turn, call: call.with(\.turn, turn), options: work.botOptions,
                 admitRequest: { messages in
@@ -251,50 +252,65 @@ extension SwiftNativeChatOrchestrationClient {
                     }
                     if reply.isWaitingInteraction { return BotTurnReply(reply: "", status: .waitingOnPerson) }
                     return nil
-                }, attachments: {
-                    ChatGeneratedImageArtifacts.attachments(from: execution.toolRecords, chosen: choices.paths, dataRoot: self.dataRoot)
-                }, save: { outcome, attachments, turn in
-                    defer { ChatCancelFlag.finish(flag) }
-                    try await holding(turn.with(\.envelope, envelope)) { turn in
-                    try await holding(turn.with(\.peerSteering, taint)) { turn in
-                    if outcome.status == .stopped || outcome.status == .failed {
-                        _ = try await TurnTraceContext.$turnId.withValue(turnID) {
-                            try await self.persistPartialIfNeeded(sessionId: bot.sessionID, runId: run, text: outcome.reply,
-                                attachments: attachments,
-                                cancelled: outcome.status == .stopped,
-                                failure: BotRunnerError.cannotRun(outcome.detail ?? outcome.status.rawValue), source: "bot", replyRowID: answerID,
-                                    onNotice: { _, _ in }, turn: turn)
-                        }
-                        ChatLiveTap.emit(sessionId: bot.sessionID, surface: deliverySurface, runId: run,
-                            .incomplete(outcome.reply, status: outcome.status.rawValue), savedPartial: outcome.reply)
-                        return
-                    }
-                    let completion: TurnEngineResult.CompletionState = outcome.status == .completed ? .completed : .incomplete
-                    let result = TurnEngineResult(reply: outcome.reply, modelUsed: choice.model, recalledIds: [],
-                        toolDispatches: execution.toolRecords,
-                        elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000),
-                        completionState: completion)
-                    _ = try await self.appendMessage(sessionId: bot.sessionID, role: "assistant", content: outcome.reply,
-                        runId: run, attachments: attachments,
-                        source: "bot", canonicalAssistantCompletion: true,
-                        outcomeResult: result,
-                        outcomeTurnID: turnID, responseOutcomeStatus: "persisted",
-                        mechanicalRow: .botReceipt, messageId: answerID, turn: turn)
-                    ChatLiveTap.emit(sessionId: bot.sessionID, surface: deliverySurface, runId: run,
-                        outcome.status == .completed ? .answered(outcome.reply) : .incomplete(outcome.reply, status: outcome.status.rawValue))
-                    } }
                 })
         }
-        return try await withSessionContextMeasurement(sessionId: bot.sessionID, model: choice.model,
+        var reply = try await withSessionContextMeasurement(sessionId: bot.sessionID, model: choice.model,
             providerID: choice.provider, surface: "bot", runId: run, progress: progress,
             nextTurnOutputBudgetTokens: bot.budget.tokens, turn: turn, work: work) { work in
             try await Expansion.withTurn(dataRoot: dataRoot, turn: turn) {
                 try await SwiftNativeTurnEngine.untilStopped(flag) {
-                    try await execute(turn.with(\.offeredTools, ["app"])
+                    await execute(turn.with(\.offeredTools, ["app"])
                         .with(\.capabilityNote, { execution.keepCapabilityNote($0) }), call, work)
                 }
             }
         }
+        let stopReadFailure = ChatCancelFlag.readFailure(flag)
+        if let reason = stopReadFailure {
+            reply.status = .stopped
+            reply.detail = reason
+        }
+        let attachments = ChatGeneratedImageArtifacts.attachments(from: execution.toolRecords, chosen: choices.paths, dataRoot: dataRoot)
+        reply.artifacts = attachments.map {
+            var artifact = BotArtifact(name: $0.name ?? "Artifact", path: $0.path ?? "")
+            artifact.type = $0.type; artifact.mime = $0.mime; artifact.byteSize = $0.byteSize
+            return artifact
+        }
+        let outcome = reply
+        let persisted = await settle { [self] () -> Result<Void, Error> in
+            do {
+                try await holding(turn.with(\.envelope, envelope)) { turn in
+                try await holding(turn.with(\.peerSteering, taint)) { turn in
+                if let reason = stopReadFailure {
+                    await progress?(.notice(kind: "stop_marker_unreadable", text: reason))
+                }
+                if outcome.status == .stopped || outcome.status == .failed {
+                    _ = try await TurnTraceContext.$turnId.withValue(turnID) {
+                        try await self.persistPartialIfNeeded(sessionId: bot.sessionID, runId: run, text: outcome.reply,
+                            attachments: attachments, cancelled: outcome.status == .stopped,
+                            failure: BotRunnerError.cannotRun(outcome.detail ?? outcome.status.rawValue), source: "bot", replyRowID: answerID,
+                            onNotice: { _, _ in }, turn: turn)
+                    }
+                    ChatLiveTap.emit(sessionId: bot.sessionID, surface: deliverySurface, runId: run,
+                        .incomplete(outcome.reply, status: outcome.status.rawValue), savedPartial: outcome.reply)
+                    return
+                }
+                let completion: TurnEngineResult.CompletionState = outcome.status == .completed ? .completed : .incomplete
+                let result = TurnEngineResult(reply: outcome.reply, modelUsed: choice.model, recalledIds: [],
+                    toolDispatches: execution.toolRecords,
+                    elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000),
+                    completionState: completion)
+                _ = try await self.appendMessage(sessionId: bot.sessionID, role: "assistant", content: outcome.reply,
+                    runId: run, attachments: attachments, source: "bot", canonicalAssistantCompletion: true,
+                    outcomeResult: result, outcomeTurnID: turnID, responseOutcomeStatus: "persisted",
+                    mechanicalRow: .botReceipt, messageId: answerID, turn: turn)
+                ChatLiveTap.emit(sessionId: bot.sessionID, surface: deliverySurface, runId: run,
+                    outcome.status == .completed ? .answered(outcome.reply) : .incomplete(outcome.reply, status: outcome.status.rawValue))
+                } }
+                return .success(())
+            } catch { return .failure(error) }
+        }
+        try persisted.get()
+        return reply
         } } } }
     }
 }

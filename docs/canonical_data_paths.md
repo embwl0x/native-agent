@@ -182,7 +182,9 @@ rows of kind `body`, drawn by `Resources/abilities/native-home.js`. The contact'
 send receipt names its finding with `body_item`.
 `ChatToolRuntime/BodyDecidedRow.swift` records decision rollups in the existing
 experience store with `body_decided.<requester>.<tool>.<uuid>` identities and
-`face.from: "body_decided"`; the matter's row badge owns its count.
+`face.from: "body_decided"`; the matter's row badge owns its count. The Inbox
+folds these rows by kind: that identity without its source prefix and its last
+two parts (`BodyDecidedRow.kind`).
 
 `Cognition/CaringReceiptLog.swift` writes `caring.appraisal` and the body's later
 `caring.dosing` response. `ChatSessionWork/OutcomeFeedbackStore.swift` writes and

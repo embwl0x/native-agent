@@ -25,6 +25,8 @@ public final class ProvidersFacade {
     var providerProbeStarts: [String: Date] = [:] { didSet { publishProviderState() } }
     var catalogRefreshStarted: Date? { didSet { publishProviderState() } }
     var catalogRefreshTask: Task<SettingsRefreshOutcome, Never>?
+    /// Accounts whose provider is being asked for its list now, as the catalog's one refresh in flight.
+    var askingModelRoutes: Set<String> = []
     public var codexAuth: CodexAuthStatus? { didSet { publishProviderState() } }
     private let codexAuthRead = LatestRead()
 
@@ -131,12 +133,16 @@ public final class ProvidersFacade {
         faceProjectionTask = Task { await projection.consume(changes) }
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Accounts read their checks from the receipt file, which an answered model call also writes.
             let events = EventDeadlinePhysiology.storeAndFileEvents(
                 paths: ["providers", "providers/surfaces.json", "providers/active.json",
-                        "providers/pending-surface-configuration.json"].map { dataRoot.appendingPathComponent($0) },
+                        "providers/pending-surface-configuration.json", LLMProviderStatusFeed.relativePath].map { dataRoot.appendingPathComponent($0) },
                 notifications: [ChatGPTAccountModelRefresh.didRefresh])
             self.accountModelUpdatesTask = Task { [weak self] in
                 _ = await self?.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
+                // Launch starts asking, once, each connected provider with no complete list for its current credential (an install upgraded
+                // with a credential and no list). File events below only read again, never ask.
+                self?.startAskingMissingModelLists()
                 for await _ in events {
                     guard let self else { return }
                     _ = await self.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
@@ -173,6 +179,52 @@ public final class ProvidersFacade {
 
     public nonisolated var routing: SwiftNativeProviderRouting {
         SwiftNativeProviderRouting(dataRoot: dataRoot)
+    }
+
+    /// Entering Providers starts asking a connected provider for its models only when no complete list is saved for its current credential. File
+    /// events and writes never ask: they only read again.
+    public nonisolated func fetchMissingModelListsInBackground() {
+        Task { @MainActor [weak self] in self?.startAskingMissingModelLists() }
+    }
+
+    /// Starts asking and returns at once: each connected provider with no complete list for its current credential is asked once, the same
+    /// per-provider ask a Refresh makes, through the one fetch owner, as the catalog's one refresh in flight (Providers shows it refreshing;
+    /// `provider.cancel_refresh` stops it). While it runs those accounts say "Asking <provider> for its models…"; when it lands, or is cancelled,
+    /// settings are read again in a task of their own and show the list or the plain sentence. A read never waits for it, and nothing here reads a
+    /// credential on the main actor: which routes are missing (credential locks, the Keychain) is worked out off it, as the task's first step.
+    public func startAskingMissingModelLists() {
+        guard catalogRefreshTask == nil else { return }
+        let dataRoot = self.dataRoot
+        catalogRefreshTask = Task { [weak self] in
+            let routes = await Task.detached(priority: .utility) { FirstPartyModelDiscovery.missingRoutes(dataRoot: dataRoot) }.value
+            guard let self else { return .failed("The providers owner closed.") }
+            guard !routes.isEmpty, !Task.isCancelled else {
+                self.catalogRefreshTask = nil
+                return .failed("No model list is missing.")
+            }
+            // The asking state is set from what was found, and shown at once.
+            self.askingModelRoutes = Set(routes)
+            self.catalogRefreshStarted = Date()
+            Task { [weak self] in _ = await self?.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription } }
+            _ = await FirstPartyModelDiscovery.fetchMissing(dataRoot: dataRoot, routes: routes)
+            let cancelled = Task.isCancelled
+            self.askingModelRoutes = []
+            self.catalogRefreshTask = nil
+            self.catalogRefreshStarted = nil
+            // The final read runs outside this task, so a cancel cannot stop it from replacing "Asking…" with the account's true state.
+            Task { [weak self] in _ = await self?.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription } }
+            return .failed(cancelled ? "Model catalog refresh cancelled." : "The model lists were asked for.")
+        }
+    }
+
+    /// A saved key or a finished sign-in asks that provider for its model list at once, and shows the answer.
+    public nonisolated func fetchModelListInBackground(after providerID: String) {
+        guard FirstPartyModelDiscovery.isLiveRoute(providerID) else { return }
+        let dataRoot = self.dataRoot
+        Task { @MainActor [weak self] in
+            _ = await FirstPartyModelDiscovery.refresh(route: providerID, dataRoot: dataRoot)
+            _ = await self?.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
+        }
     }
 
     /// Account discovery must never hold a turn or UI maintenance.
@@ -369,8 +421,14 @@ extension ProvidersFacade {
             }
         }()
         async let openRouterRefresh = OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot, refresh: refresh)
-        async let moonshotRefresh: Void = {
-            if refresh { _ = await MoonshotModelCatalog.models(dataRoot: dataRoot, refresh: true) }
+        async let moonshotRefresh: String? = {
+            guard refresh else { return nil }
+            return await MoonshotModelCatalog.refreshSaved(dataRoot: dataRoot).map { "Moonshot: \($0)" }
+        }()
+        // Every connected first-party route asks its provider again; each failure names its account.
+        async let firstPartyRefresh: [String] = {
+            guard refresh else { return [] }
+            return await FirstPartyModelDiscovery.refreshConnected(dataRoot: dataRoot)
         }()
         let accountRefreshError = await accountRefresh
         let firstPartyModels = (
@@ -380,14 +438,22 @@ extension ProvidersFacade {
         ).enumerated().map { index, model in
             ModelCatalogItem(model, priority: 100 + index)
         }
-        let (openRouterRead, _) = await (openRouterRefresh, moonshotRefresh)
-        // Discovery failure belongs to that catalog; publish refreshed sibling provider lists.
-        let catalogFreshness = accountRefreshError == nil
-            ? openRouterRead.freshness : .staleAfterFailedRefresh
-        let catalogNote = accountRefreshError.map {
-            ([$0.localizedDescription] + [openRouterRead.note].compactMap { $0 })
-                .joined(separator: " — ")
-        } ?? openRouterRead.note
+        let (openRouterRead, moonshotFailure, firstPartyFailures) = await (openRouterRefresh, moonshotRefresh, firstPartyRefresh)
+        // Discovery failure belongs to that catalog; publish refreshed sibling provider lists. A refresh names every list it could not fetch, so it is
+        // never reported as fetched when one failed.
+        var refreshFailures: [String] = []
+        if refresh {
+            if let accountRefreshError { refreshFailures.append("Your ChatGPT sign-in: " + accountRefreshError.localizedDescription) }
+            if openRouterRead.freshness == .unavailable {
+                refreshFailures.append("OpenRouter: " + (openRouterRead.failure ?? "the list could not be fetched"))
+            }
+            if let moonshotFailure { refreshFailures.append(moonshotFailure) }
+            refreshFailures += firstPartyFailures
+        }
+        var catalogFreshness = refreshFailures.isEmpty ? openRouterRead.freshness : .staleAfterFailedRefresh
+        var catalogNote = refreshFailures.isEmpty
+            ? openRouterRead.note
+            : "These model lists could not be fetched: " + refreshFailures.joined(separator: "; ")
         let openRouterCatalogModels = openRouterRead.models
             .enumerated()
             .map { index, model in
@@ -407,6 +473,12 @@ extension ProvidersFacade {
             cacheURL: resolvedCodexCacheURL,
             useDefaultCacheWhenNil: false
         )
+        // OpenRouter's list is one of several: with it never fetched and another account's list in hand, the lists are not unavailable.
+        if catalogFreshness == .unavailable, refreshFailures.isEmpty, openRouterRead.failure == nil,
+           !codexSelectableModels.isEmpty || FirstPartyModelDiscovery.anyLiveList(dataRoot: dataRoot) {
+            catalogFreshness = .cached
+            catalogNote = nil
+        }
         var seenBaseline = Set<String>()
         let baseline = (codexSelectableModels + firstPartyModels + openRouterCatalogModels)
             .filter { seenBaseline.insert($0.id).inserted }
@@ -417,7 +489,8 @@ extension ProvidersFacade {
             source: "first_party_capabilities_plus_signed_codex_and_openrouter",
             models: baseline,
             reasoningEfforts: efforts,
-            updatedAt: nil,
+            // When the lists were last fetched: now for a refresh that fetched them all, else the saved list's own time.
+            updatedAt: (refresh && refreshFailures.isEmpty ? Date() : openRouterRead.fetchedAt).map { $0.formatted(.iso8601) },
             catalogFreshness: catalogFreshness.rawValue,
             catalogNote: catalogNote
         )
@@ -481,9 +554,17 @@ extension ProvidersFacade {
             config["api_key"] = .string(key)
         }
         if let model = defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            // A default-model choice: offered, or the default already saved (`ModelSlot.mayHold`); Save and Test keep the saved default. A model
+            // the account has no row for is left to routing, as before.
+            let row = provider.models.first { $0.id == model }
+            if row != nil, !ModelSlot.mayHold(model, row: row, savedInSlot: provider.default_model) {
+                throw NSError(domain: "NativeAgentProvider", code: 409, userInfo: [
+                    NSLocalizedDescriptionKey: ModelSlot.refusal(note: provider.models_note, accountName: provider.display_name)])
+            }
             config["default_model"] = .string(model)
         }
         _ = try await routing.configureProvider(id: id, config: .object(config), expectedRevision: expectedRevision)
+        if config["api_key"] != nil { fetchModelListInBackground(after: id) }
     }
 
     /// Admit selections under the routing transaction against the served picker catalog; nil `providerID` preserves the active-provider pin.

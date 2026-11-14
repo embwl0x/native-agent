@@ -112,6 +112,7 @@ public enum MacInjectionArgRedaction {
             return args
         }
         if normalized(tool) == "app" {
+            let input = ToolNameAliases.doorCall("app", input)
             var out = input
             if case .string(let script)? = input["script"], namesAppDoorSecretAction(script) {
                 out["script"] = .string(appDoorScriptPlaceholder)
@@ -193,6 +194,7 @@ public enum MacInjectionArgRedaction {
     /// Extracted secrets stay in caller memory only, never on disk or over a wire.
     public static func extractSecrets(tool: String, input: [String: JSONValue], turn: Turn?) throws -> [String: String] {
         if normalized(tool) == "app" {
+            let input = ToolNameAliases.doorCall("app", input)
             guard case .object(let args)? = input["args"] else { return [:] }
             guard let binding = try AppActionBinding.action(input: input, turn: turn) else {
                 throw ToolFailureError("This call has no argument contract for protected replay. Nothing ran.", effects: .none,

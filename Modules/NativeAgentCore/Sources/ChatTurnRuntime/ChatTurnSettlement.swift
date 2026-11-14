@@ -202,10 +202,11 @@ extension SwiftNativeChatOrchestrationClient {
         _ outcome: Result<ProducedChatTurn, any Error>, observation: ToolLoopTraceObservation, context: TurnContext?,
         message: String, sessionId resolvedSession: String, runId: String, turnId boundTurnId: String, replyRowID: String?,
         heardID: String, model: String, reasoningEffort: String, persona: String?, surface: String,
-        suppressUserAppend: Bool, chosenPaths: [String], outputMilestoneGate: TurnLifecycleFirstOutputGate,
+        suppressUserAppend: Bool, chosenPaths: [String], cancelFlagPath: URL?, outputMilestoneGate: TurnLifecycleFirstOutputGate,
         noticeSink: @escaping @Sendable (String, String) async -> Void,
         turn: Turn, work: ChatTurnWork
     ) async -> Result<StructuredChatExecution, any Error> {
+        let stopReadFailure = ChatCancelFlag.readFailure(cancelFlagPath).map(TurnTraceRedactor.redactText)
         var terminal: TurnTraceEvent
         switch outcome {
         case .success(let produced):
@@ -217,6 +218,9 @@ extension SwiftNativeChatOrchestrationClient {
                                      location: "structured_chat", observation: observation, turn: turn)
                 : turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
                                   error: error, observation: observation, turn: turn)
+        }
+        if let stopReadFailure {
+            await noticeSink("stop_marker_unreadable", stopReadFailure)
         }
         var settled: Result<StructuredChatExecution, any Error>
         var promotionStarted = false
@@ -318,6 +322,7 @@ extension SwiftNativeChatOrchestrationClient {
                     ?? "Waiting on your answer in the conversation."
             : turn.tokenBudget?.exhausted == true ? "Stopped at the per-run token limit." : nil
         response.statusDetail = runtimeExecution?.statusDetail(response.statusDetail)
+        if let stopReadFailure { response.statusDetail = stopReadFailure }
         response.pendingApprovalID = runtimeExecution?.pendingApprovalID
         if result.terminalReason == .replyCompleted,
            let journal = work.journal,
@@ -358,6 +363,7 @@ extension SwiftNativeChatOrchestrationClient {
             response.statusDetail = turn.tokenBudget?.exhausted == true ? "Stopped at the per-run token limit."
                 : cancelled ? (saved == nil ? "Stopped." : "Stopped. What was produced has been saved.") : String(describing: error)
             response.statusDetail = turn.execution?.statusDetail(response.statusDetail)
+            if let stopReadFailure { response.statusDetail = stopReadFailure }
             ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId,
                 cancelled ? .cancelled : .failed(ProviderFailure.report(error)?.personDescription ?? "The reply could not be completed."),
                 savedPartial: saved)
@@ -382,6 +388,12 @@ extension SwiftNativeChatOrchestrationClient {
                 if heard.outcome == nil { changes.append(.outcome(.init(domain: "turn", status: letGo.rawValue))) }
                 try await store.append(changes, to: heardID)
             }.value
+        }
+        if let stopReadFailure, case .object(var payload) = terminal.payload {
+            payload["stopMarkerError"] = .string(stopReadFailure)
+            terminal = TurnTraceEvent(turnId: terminal.turnId, ts: terminal.ts, kind: terminal.kind,
+                sessionId: terminal.sessionId, surface: terminal.surface, destinationId: terminal.destinationId,
+                threadId: terminal.threadId, payload: .object(payload), turn: nil)
         }
         do {
             try await settleTurnCheckpoint(terminal, sessionId: resolvedSession, runId: runId)

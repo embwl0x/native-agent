@@ -16,10 +16,12 @@ extension OwnedProgramRunner {
     /// Capture __call and __log before removing their global bindings; freeze input and namespace bindings while unknown actions retain door validation.
     public static func prelude(ids: String, strict: Bool = false, input: Bool = false, primitives: Bool = false,
                                turn: Bool = false) -> String {
+        // The static reading (`OwnedProgram.calls`) and the live one share these keys.
+        let requestKeys = OwnedProgram.Calls.requestKeys.map { "\"" + $0 + "\"" }.joined(separator: ", ")
         let marks = !strict ? "" : """
             ,
-                expect: function (ok, what) { invoke("expect", "", [!!ok, String(what)]); },
-                expect_fail: function (code, act) {
+                expect: (ok, what) => { invoke("expect", "", [!!ok, String(what)]); },
+                expect_fail: (code, act) => {
                   invoke("expect_fail", "", [String(code)]);
                   var caught = null, promised = false;
                   try { var back = act(); promised = !!back && typeof back.then === "function"; } catch (e) { caught = e; }
@@ -27,8 +29,8 @@ extension OwnedProgramRunner {
                   if (caught && (caught.name !== "AppError" || caught.reason !== code || caught.stopped)) throw caught;
                   return caught;
                 },
-                decide: function (question, data) { return invoke("decide", "", [String(question), data === undefined ? null : data]); },
-                step: function (label, guidance, options) {
+                decide: (question, data) => invoke("decide", "", [String(question), data === undefined ? null : data]),
+                step: (label, guidance, options) => {
                   invoke("step", "", [String(label), guidance === undefined ? "" : String(guidance), options === undefined ? null : options]);
                 }
             """
@@ -38,10 +40,12 @@ extension OwnedProgramRunner {
                 var namespace = () => {
                   throw new TypeError("app." + space + " is a namespace. Use app." + space + ".<verb>(args) or app({action:'" + space + ".<verb>',args:{}}).");
                 };
-                // A verb may itself be named name/length; those function
-                // properties are configurable until this namespace freezes.
+                // An arrow function's only own properties (name, length) are configurable, so any verb name binds as an own property.
                 Object.keys(base).forEach(function (key) {
-                  Object.defineProperty(namespace, key, {value: base[key], enumerable: true});
+                  // A deeper namespace (app.studio.intake) answers the same way.
+                  var value = base[key];
+                  if (value && typeof value === "object") value = named(space + "." + key, value);
+                  define(namespace, key, value);
                 });
                 return new Proxy(Object.freeze(namespace), { get: function (t, key) {
                   if (typeof key !== "string" || key in t) return t[key];
@@ -49,7 +53,7 @@ extension OwnedProgramRunner {
                   return function () { return invoke("action", space + "." + key, Array.prototype.slice.call(arguments)); };
                 } });
               }
-              Object.keys(api).forEach(function (key) { if (typeof api[key] === "object") api[key] = named(key, api[key]); });
+              Object.keys(api).forEach(function (key) { if (typeof api[key] === "object") define(api, key, named(key, api[key])); });
               return new Proxy(Object.freeze(api), { get: function (t, key) {
                 if (typeof key !== "string" || key in t) return t[key];
                 if (key.indexOf(".") >= 0) return function () { return invoke("action", key, Array.prototype.slice.call(arguments)); };
@@ -172,49 +176,100 @@ extension OwnedProgramRunner {
             throw e;
           }
           \(host)\(reach)
-          var api = Object.assign(function (request) {
+          // The door and every callable binding are arrow functions: no own prototype, arguments or caller, so no id segment can collide.
+          var api = Object.assign((request) => {
             if (!request || typeof request !== "object" || Array.isArray(request))
               throw new TypeError("Use app({action:'desk.read',args:{handle:'desk.1'}}) or app.desk.read({handle:'desk.1'}).");
-            var batch = request;
+            var batch = null;
             function action(request) {
-              if (!request || typeof request !== "object" || typeof request.action !== "string" || !request.action.trim())
+              if (typeof request.action !== "string" || !request.action.trim())
                 throw new TypeError("An app action needs {action:'space.verb',args:{}}; batches use app({actions:[{action:'space.verb',args:{}}]}).");
               var options = {};
               // Either preview protects the entry; its version overrides the batch's.
               ["preview", "expected_version"].forEach(function (key) {
                 if (Object.prototype.hasOwnProperty.call(request, key)) options[key] = request[key];
-                else if (request !== batch && Object.prototype.hasOwnProperty.call(batch, key)) options[key] = batch[key];
+                else if (batch && Object.prototype.hasOwnProperty.call(batch, key)) options[key] = batch[key];
               });
-              if (request.preview === true || batch.preview === true) options.preview = true;
-              return invoke("action", request.action, [request.args === undefined ? {} : request.args, options]);
+              if (request.preview === true || (batch && batch.preview === true)) options.preview = true;
+              // One reading, as the app tool's: with no args, every other key is the action's; beside args, another key is refused.
+              var others = Object.keys(request).filter(function (key) {
+                return [\(requestKeys)].indexOf(key) < 0;
+              });
+              var args = request.args;
+              if (args === undefined || args === null) {
+                args = {};
+                others.forEach(function (key) { args[key] = request[key]; });
+              } else if (others.length) {
+                throw new TypeError("app({action, args}) takes " + others.join(", ") + " inside args, or beside action when there is no args.");
+              }
+              return invoke("action", request.action, [args, options]);
             }
-            if (request.action !== undefined) return action(request);
-            if (request.actions !== undefined) {
-              if (!Array.isArray(request.actions)) throw new TypeError("app actions must be an array.");
-              return request.actions.map(action);
+            // One reading for a lone call and for each batch entry: an action, a find or a page/item read.
+            function one(request) {
+              if (!request || typeof request !== "object" || Array.isArray(request))
+                throw new TypeError("Each app actions entry is one call object: {action, args}, {page, item} or {find}.");
+              if (request.action !== undefined) return action(request);
+              if (request.actions !== undefined) {
+                if (batch) throw new TypeError("An app actions entry is one call; a batch does not hold another batch.");
+                if (!Array.isArray(request.actions)) throw new TypeError("app actions must be an array.");
+                batch = request;
+                return request.actions.map(function (entry) { return one(entry); });
+              }
+              if (request.find !== undefined) return api.find(request.find);
+              return request.item === undefined ? api.read(request.page) : api.read(request.page, request.item);
             }
-            if (request.find !== undefined) return api.find(request.find);
-            return request.item === undefined ? api.read(request.page) : api.read(request.page, request.item);
+            return one(request);
           }, {
             // Literal app.call names are checked at save; computed names keep runtime declaration checks.
-            call: function (id) { return invoke("action", id, Array.prototype.slice.call(arguments, 1)); },
-            read: function () { return invoke("read", "", Array.prototype.slice.call(arguments)); },
-            find: function (words) { return invoke("find", "", [words]); },
-            log: function () {
-              say(Array.prototype.map.call(arguments, function (a) {
+            call: (id, ...rest) => invoke("action", id, rest),
+            read: (...given) => invoke("read", "", given),
+            find: (words) => invoke("find", "", [words]),
+            log: (...parts) => {
+              say(parts.map(function (a) {
                 return typeof a === "string" ? a : JSON.stringify(a);
               }).join(" "));
             }\(marks)
           });
+          // Every id binds by its full segments (app.undo, app.desk.read, app.studio.intake.read) and whole (app["desk.read"]).
+          // A namespace that is itself an action is that action's arrow function, holding its members; a namespace alone is an object
+          // with no prototype. Members are own, configurable, enumerable properties, so they shadow anything inherited and __proto__ is
+          // an own property, never a prototype. A segment that still cannot be placed is left out of the member form, never thrown:
+          // its id stays reachable as app["id"] and app.call("id").
+          var own = Object.keys(api), made = Object.create(null), tree = {id: null, under: Object.create(null)};
+          function define(node, key, value) {
+            try { Object.defineProperty(node, key, {value: value, enumerable: true, writable: true, configurable: true}); return true; }
+            catch (e) { return false; }
+          }
           ids.forEach(function (id) {
-            var dot = id.indexOf("."), space = id.slice(0, dot);
-            // Bare door verbs already have their own binding (app.find).
-            if (dot < 0) return;
-            api[space] = api[space] || {};
-            api[id] = api[space][id.slice(dot + 1)] = function () {
-              return invoke("action", id, Array.prototype.slice.call(arguments));
-            };
+            var node = tree;
+            id.split(".").forEach(function (segment) {
+              node = node.under[segment] || (node.under[segment] = {id: null, under: Object.create(null)});
+            });
+            node.id = id;
           });
+          function member(node, value) {
+            if (!value && node.id !== null) {
+              var id = node.id;
+              value = made[id] = (...given) => invoke("action", id, given);
+            }
+            value = value || Object.create(null);
+            Object.keys(node.under).forEach(function (key) { define(value, key, member(node.under[key])); });
+            // A deeper action also answers under its dotted remainder (app.studio["intake.read"]), on a callable namespace as on a plain one.
+            (function below(from, path) {
+              Object.keys(from.under).forEach(function (key) {
+                var child = from.under[key], rest = path ? path + "." + key : key;
+                if (path && child.id !== null && made[child.id]) define(value, rest, made[child.id]);
+                below(child, rest);
+              });
+            })(node, "");
+            return Object.freeze(value);
+          }
+          Object.keys(tree.under).forEach(function (key) {
+            // Bare door verbs keep their own binding (app.find); an action under one hangs on it.
+            if (own.indexOf(key) >= 0) member({id: null, under: tree.under[key].under}, api[key]);
+            else define(api, key, member(tree.under[key]));
+          });
+          ids.forEach(function (id) { if (id.indexOf(".") >= 0 && made[id]) define(api, id, made[id]); });
           Object.keys(api).forEach(function (key) { Object.freeze(api[key]); });\(unknown)
           return Object.freeze(api);
         })(\(ids), __call, __log, \(primitives ? "__dataRoot, __workspace" : "undefined, undefined"));\(frozen)

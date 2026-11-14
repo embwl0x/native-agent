@@ -68,13 +68,59 @@ extension NativeAgentEngine {
         let extras = snapshot.extras.sections()
         return (PartFace(title: "Settings", line: "These make up who I am. Everything else I carry is below.", sections: [
             .init(id: "preferences", title: "Preferences", style: .list,
-                  footer: snapshot.settings.isEmpty ? "The settings registry returned no controls." : nil, rows: rows),
-            notifications, search,
+                  footer: snapshot.settings.isEmpty ? "The settings registry returned no controls." : nil,
+                  rows: Self.preferenceGroups(rows, search: search)),
+            notifications,
         ] + status + extras), epoch)
     }
 
     private static let notificationsMaster = "notifications.raise_unasked"
     private static let searchService = "research.search_url"
+
+    /// Preferences as a person names them, in page order: each group's settings in the order drawn. A setting no group names is drawn
+    /// in Other, so every setting the registry puts on this page stays on it.
+    private static let preferenceGroupMembers: [(id: String, title: String, settings: [String])] = [
+        ("preferences.reach", "Where I reach you", ["notifications.channel_push", "notifications.channel_telegram",
+                                                    "notifications.channel_in_app", "notifications.delivery_receipts"]),
+        ("preferences.reading", "What I can read", ["settings.image_understanding", "settings.pdf_reading"]),
+        ("preferences.memory", "Memory", ["memories.knowledge_graph", "memories.cross_session", "memories.recur_to_facts",
+                                          "memories.meaning_based", "settings.memory_in_every_reply"]),
+        ("preferences.inner_life", "Inner life", ["settings.inner_life", "settings.inner_life_background", "settings.reflection",
+                                                  "settings.organism_kernel", "settings.wander_hour", "settings.inner_life_capsule",
+                                                  "personality.dreams", "personality.rem_cycle", "personality.self_improvement"]),
+        ("preferences.look", "How I look", ["settings.dark_mode", "settings.haze_color", "settings.view_mode"]),
+        ("preferences.shortcuts", "Shortcuts", ["settings.global_hotkey", "settings.shotgun_shortcut"]),
+    ]
+    /// Developer dials, drawn last under Advanced with the search service.
+    private static let advancedSettings = ["settings.developer_surfaces", "settings.daily_reflection_budget"]
+
+    /// One parent row per group whose nested rows are its settings' own rows, unchanged; a group with none of its settings is not drawn.
+    private static func preferenceGroups(_ rows: [PartFace.Row], search: PartFace.Row) -> [PartFace.Row] {
+        let named = Set(preferenceGroupMembers.flatMap { $0.settings } + advancedSettings)
+        let members: ([String]) -> [PartFace.Row] = { ids in ids.flatMap { id in rows.filter { $0.id == id } } }
+        var groups = preferenceGroupMembers.map { (id: $0.id, title: $0.title, rows: members($0.settings)) }
+        groups.append((id: "preferences.other", title: "Other", rows: rows.filter { !named.contains($0.id) }))
+        groups.append((id: "preferences.advanced", title: "Advanced", rows: members(advancedSettings) + [search]))
+        return groups.filter { !$0.rows.isEmpty }.map { group in
+            // A setting that could not be read marks its group, so a closed group never hides the failure.
+            PartFace.Row(id: group.id, title: group.title, value: groupValue(group.rows),
+                         tone: group.rows.contains { $0.tone == .failed } ? .failed : nil, rows: group.rows)
+        }
+    }
+
+    /// A group's state in a few words: how many of its switches are on, each choice's selection, and how many could not be read.
+    private static func groupValue(_ rows: [PartFace.Row]) -> String? {
+        let switches = rows.compactMap { $0.control?.on }
+        let on = switches.filter { $0 }.count
+        var words: [String] = []
+        if !switches.isEmpty { words.append(on == switches.count ? "All on" : on == 0 ? "None on" : "\(on) of \(switches.count) on") }
+        words += rows.compactMap { row in
+            row.control?.selected.flatMap { selected in row.control?.options?.first(where: { $0.id == selected })?.label }
+        }
+        let unavailable = rows.filter { $0.tone == .failed }.count
+        if unavailable > 0 { words.append("\(unavailable) unavailable") }
+        return words.isEmpty ? nil : words.joined(separator: " · ")
+    }
 
     /// Raising things unasked and its triggers read from the Trust and inbox owners; while the master is off its triggers are not offered.
     private func settingsFaceNotifications() async throws -> PartFace.Section {
@@ -99,11 +145,10 @@ extension NativeAgentEngine {
             do {
                 let triggers = try await inbox.triggers()
                 rows += triggers.map {
-                    PartFace.Row(id: QuietSettings.inboxTriggerPrefix + $0.name, title: Self.triggerTitle($0.name), detail: $0.description,
+                    PartFace.Row(id: QuietSettings.inboxTriggerPrefix + $0.name, title: Self.triggerTitle($0.name), detail: Self.triggerNote($0.name) ?? $0.description,
                           control: .toggle($0.enabled, call: settingSetCall(QuietSettings.inboxTriggerPrefix + $0.name)))
                 }
-                footer = triggers.isEmpty ? "No notification options are configured yet."
-                    : "\(triggers.filter(\.enabled).count) of \(triggers.count) kinds are on."
+                footer = triggers.isEmpty ? "No notification options are configured yet." : nil
             } catch is CancellationError { throw CancellationError() }
             catch {
                 rows.append(.init(id: "notifications.triggers", title: "Notification options unavailable",
@@ -114,11 +159,16 @@ extension NativeAgentEngine {
         return .init(id: "notifications", title: "Notifications", style: .list, footer: footer, rows: rows + [history])
     }
 
+    /// The built-in brief says what it is beside a helper that may also send one; any other trigger keeps its own description.
+    private static func triggerNote(_ name: String) -> String? {
+        name == "morning_brief" ? "My own built-in daily brief at the set hour. A helper that sends a brief is separate and listed on Helpers." : nil
+    }
+
     /// A trigger's name as the person reads it.
     private static func triggerTitle(_ name: String) -> String {
         switch name {
         case "idle_checkin": return "Idle check-in"
-        case "morning_brief": return "Morning brief"
+        case "morning_brief": return "Built-in morning brief"
         default:
             let words = name.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces)
             guard let first = words.first else { return name }
@@ -127,28 +177,25 @@ extension NativeAgentEngine {
     }
 
     /// The search service is read from its saved configuration; a field sends the address, and Find sends auto, through the registry's write.
-    private func settingsFaceSearchService(setting: QuietSetting.Descriptor?) async throws -> PartFace.Section {
-        let placeholder = "http://localhost:8888, or auto"
-        let row: PartFace.Row
-        if let setting {
-            // Find is the search service's own discovery: the same write as typing auto.
-            let find = [PartFace.Action(id: "find", label: "Find", call: settingSetCall(setting.id, .string("auto")))]
-            do {
-                let url = try await configuration.readSearXNG(dataRoot: dataRoot)
-                row = .init(id: setting.id, title: setting.label, detail: setting.note,
-                            value: url.isEmpty ? "No search service configured." : nil, actions: find,
-                            control: .field(url, placeholder: placeholder, call: settingSetCall(setting.id)))
-            } catch is CancellationError { throw CancellationError() }
-            catch {
-                row = .init(id: setting.id, title: setting.label,
-                            detail: UserFacingError.message(error, action: "load the search service"), value: "Unavailable", tone: .failed,
-                            actions: find, control: .field("", placeholder: placeholder, call: settingSetCall(setting.id)))
-            }
-        } else {
-            row = .init(id: Self.searchService, title: "Search service", detail: "The settings registry has no search service setting.",
-                        value: "Unavailable", tone: .failed)
+    private func settingsFaceSearchService(setting: QuietSetting.Descriptor?) async throws -> PartFace.Row {
+        guard let setting else {
+            return .init(id: Self.searchService, title: "Search service", detail: "The settings registry has no search service setting.",
+                         value: "Unavailable", tone: .failed)
         }
-        return .init(id: "research", title: "Looking things up", style: .list, rows: [row])
+        let placeholder = "http://localhost:8888, or auto"
+        // Find is the search service's own discovery: the same write as typing auto.
+        let find = [PartFace.Action(id: "find", label: "Find", call: settingSetCall(setting.id, .string("auto")))]
+        do {
+            let url = try await configuration.readSearXNG(dataRoot: dataRoot)
+            return .init(id: setting.id, title: setting.label, detail: setting.note,
+                         value: url.isEmpty ? "No search service configured." : nil, actions: find,
+                         control: .field(url, placeholder: placeholder, call: settingSetCall(setting.id)))
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            return .init(id: setting.id, title: setting.label,
+                         detail: UserFacingError.message(error, action: "load the search service"), value: "Unavailable", tone: .failed,
+                         actions: find, control: .field("", placeholder: placeholder, call: settingSetCall(setting.id)))
+        }
     }
 
     private func settingsFaceRow(_ snapshot: QuietSetting.ReadSnapshot) async throws -> PartFace.Row {

@@ -49,8 +49,8 @@ The current sender produces:
 | `set_trust_policy` | Validated trust change through the Mac policy owner. |
 | `mac_control` | Remote Mac control through its policy/dispatch owner. |
 
-These are iOS wire actions, not Agent's tool names. Agent uses the single
-`app` tool and its action registry.
+These are iOS wire actions, not the agent's tool names. The agent uses its one
+door, `app`, and its action registry.
 
 ## Resolution and execution
 
@@ -72,7 +72,7 @@ carries signed-iOS provenance into the canonical approval owner.
 
 An exact pending approval can also be answered by the agent on the person's own
 authenticated Mac-chat, paired-phone or allowlisted Telegram message. The shared
-[decision authority](TOOL_LOADING.md#authority-and-receipts) refuses helpers,
+[decision authority](ONE_DOOR.md#authority-and-receipts) refuses helpers,
 wakes and peer-steered turns; permanent deletion stays tap-only by declared tool
 class. `resolutionProvenance` adds channel `person_message`, decidedBy
 `agent_on_person_message`, canonical `sessionID` and `messageID`, and `door`

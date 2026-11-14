@@ -1,10 +1,10 @@
 # Image generation
 
-Agent makes images through the always-on `app` tool. `AppActions+Declarations.swift`
+The agent makes images through its one always-on door, `app`. `AppActions+Declarations.swift`
 registers `image.generate` on the Chat page. Discover it with
 `app {"find":"image"}` or read `app {"page":"chat"}`.
 
-## How Agent uses it
+## How the agent uses it
 
 Pass the image request inside `args`:
 

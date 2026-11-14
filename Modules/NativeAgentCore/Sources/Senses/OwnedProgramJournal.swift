@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OwnedProgramJournal.swift` | Request-owned replay, read freshness and receipts; Stop retains each call's actual effects |
+// Blueprint: | `OwnedProgramJournal.swift` | Request-owned replay and read freshness; receipts show calls as metadata and name the private journal |
 extension OwnedProgramRunner {
     final class Journal {
         let lines: [Substring]
@@ -253,7 +253,7 @@ extension OwnedProgramRunner {
                 // At the stop point, return the supplied answer without repeating even a read.
                 out = encode(["ok": .bool(true), "value": answer], line: line, n: n)
                 if case .object(var fields) = row {
-                    for key in ["reason", "detail", "result"] { fields.removeValue(forKey: key) }
+                    for key in ["reason", "detail", "result", "result_bytes", "result_digest"] { fields.removeValue(forKey: key) }
                     fields["status"] = .string("answered")
                     row = .object(fields)
                 }
@@ -365,13 +365,14 @@ extension OwnedProgramRunner {
         }
         private func account(_ value: JSONValue) {
             do { ledgerBytes += try value.serializedData(pretty: false).count }
-            catch {
-                stopped = ["reason": .string("serialization_failed"),
-                           "detail": .string("""
-                               The produced receipt could not be serialized: \(error.localizedDescription). Its effects remain recorded; repair the \
-                               receipt before continuing.
-                               """)]
-            }
+            catch { unserializable(error) }
+        }
+        private func unserializable(_ error: Error) {
+            stopped = ["reason": .string("serialization_failed"),
+                       "detail": .string("""
+                           The produced receipt could not be serialized: \(error.localizedDescription). Its effects remain recorded; repair the \
+                           receipt before continuing.
+                           """)]
         }
         func dispatch(kind: String, id: String, args: String, line: Int) async -> String {
             readContent = .null
@@ -646,7 +647,12 @@ extension OwnedProgramRunner {
                 fields["effects"] = row["effects"] ?? .string(write ? "occurred" : "none")
                 return .object(fields)
             }
-            row["result"] = receipt
+            // The raw result stays in this call's private journal entry (`out`); its row keeps the result's measured identity only.
+            do { row.merge(try CallLedger.measured(receipt)) { _, new in new } }
+            catch {
+                row["result_bytes"] = .null
+                if part { unserializable(error) }
+            }
             if kind == "action" || kind == "primitive" { record(receipt, envelope: envelope, into: &row) } else if case .object(let read) = receipt {
                 if let version = read["version"] { row["version"] = version }
             }
@@ -712,7 +718,7 @@ extension OwnedProgramRunner {
                                "stopped": .bool(true), "receipt": receipt, "call": .string(name), "effects": row["effects"] ?? .string("none")])
             }
         }
-        /// Keep every answer, including steps the program does not return. Only the shared model-result owner bounds their view.
+        /// A nested call's row keeps its identity and outcome; its answer stays in the private journal entry, never in the row.
         func record(_ receipt: JSONValue, envelope: JSONValue, into row: inout [String: JSONValue]) {
             guard case .object(let fields) = receipt else { return }
             for key in ["try_instead", "remedy", "argument_path", "irreversible", "effect", "execution", "captured", "card_id",
@@ -744,24 +750,14 @@ extension OwnedProgramRunner {
             }
             if let given = fields["reason_given"] { row["reason_given"] = given }
             for key in ["would_card", "approver", "would_hand_back"] where fields[key] != nil { row[key] = fields[key] }
-            // Folded tools expose their own result without an enclosing door receipt.
-            if let result = fields["action"] == nil ? receipt : fields["result"] {
-                // Retain write destinations and shell directories even when the full result is too large.
-                if fields["read_only"] != .bool(true), case .object(let body) = result {
-                    let at = body.filter { key, value in
-                        guard ["path", "destination", "cwd"].contains(key), case .string(let place) = value else { return false }
-                        return place.hasPrefix("/")
-                    }
-                    if !at.isEmpty { row["at"] = .object(at) }
-                }
-                // Retain generated image references so they can accompany the reply.
-                if case .object(let body) = result, case .array(let images)? = body["images"] {
-                    let made = images.compactMap { image -> JSONValue? in
-                        guard case .object(let made) = image, let path = made["path"] else { return nil }
-                        return .object(["path": path])
-                    }
-                    if !made.isEmpty { row["images"] = .array(made) }
-                }
+            // Write destinations, shell directories and generated images travel with the receipt in one named field; the result itself does not.
+            row["artifacts"] = CallLedger.artifacts(of: receipt)
+            // The journal's own row also keeps `at` and `images` as before, so an older build replaying it keeps them; publication shows only
+            // `artifacts`. Folded tools expose their own result without an enclosing door receipt.
+            if let result = fields["action"] == nil ? receipt : fields["result"], case .object(let body) = result {
+                let at = CallLedger.places(body)
+                if fields["read_only"] != .bool(true), !at.isEmpty { row["at"] = .object(at) }
+                row["images"] = CallLedger.images(body["images"])
             }
             if case .object(let effects)? = fields["side_effects"] {
                 var seen: [String: JSONValue] = [:]
@@ -771,8 +767,12 @@ extension OwnedProgramRunner {
             }
         }
         func receipt() -> JSONValue {
-            // Aborted replay must retain effects beyond its stopping point.
-            let ledger = self.ledger + replay.dropFirst(journal.count).compactMap { $0.objectValue?["row"] }
+            // Aborted replay must retain effects beyond its stopping point. The ledger is published here and only here, as metadata: a row
+            // replayed from a journal written before that law still holds its raw result and is reduced on the way out. An image a call made
+            // travels only when what the program returns names it.
+            let said = CallLedger.texts(returned)
+            let ledger = (self.ledger + replay.dropFirst(journal.count).compactMap { $0.objectValue?["row"] })
+                .map { CallLedger.shown(CallLedger.published($0), naming: said) }
             var landed: [JSONValue] = [], changed: [JSONValue] = [], handed: [JSONValue] = []
             var unknown: [String] = [], unsure: [String] = []
             var card = false, partial = false
@@ -831,7 +831,8 @@ extension OwnedProgramRunner {
             out["effects"] = .string(!unknown.isEmpty || !unsure.isEmpty ? "unknown" : partial ? "partial"
                 : changed.isEmpty ? "none" : "occurred")
             if !changed.isEmpty { out["changed"] = .array(changed) }
-            if strict { out["journal"] = .array(journal) }
+            // A stopped strict run's journal is what its checkpoint or rehearsal replays; it stays private and the receipt names it.
+            if strict, status == "stopped" { out["journal_ref"] = .string(OwnedProgramRunner.journals.keep(journal)) }
             if strict {
                 out["steps"] = .array(steps.indices.map { i in
                     .object(["label": .string(steps[i].label), "status": .string(i == steps.count - 1 ? status : "ok")])
@@ -903,6 +904,32 @@ extension OwnedProgramRunner {
                 }
             }
             return .object(out)
+        }
+    }
+
+    /// The one owner that settles a stopped strict run (its checkpoint, or a rehearsal's next pass) takes the run's replay journal by the receipt's
+    /// `journal_ref`, once. Nothing else, no trace, transcript or experience included, ever holds the raw journal.
+    public static func journal(_ reference: JSONValue?) -> [JSONValue]? { journals.take(reference?.stringValue) }
+    static let journals = Journals()
+    /// Private replay journals waiting for their settling owner, in process only. At most `held` wait; the oldest unclaimed one leaves first.
+    final class Journals: @unchecked Sendable {
+        static let held = 16
+        private let lock = NSLock()
+        private var waiting: [(id: String, journal: [JSONValue])] = []
+        func keep(_ journal: [JSONValue]) -> String {
+            let id = "journal-" + UUID().uuidString.lowercased()
+            lock.withLock {
+                waiting.append((id, journal))
+                if waiting.count > Self.held { waiting.removeFirst(waiting.count - Self.held) }
+            }
+            return id
+        }
+        func take(_ id: String?) -> [JSONValue]? {
+            guard let id else { return nil }
+            return lock.withLock {
+                guard let at = waiting.firstIndex(where: { $0.id == id }) else { return nil }
+                return waiting.remove(at: at).journal
+            }
         }
     }
 }

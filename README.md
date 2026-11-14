@@ -10,7 +10,7 @@ Telegram, Slack and local agent bridges reach that same runtime.
 
 ## First run
 
-1. On a Mac running macOS 26 or newer, download the DMG from the
+1. On an Apple silicon Mac running macOS 26 or newer, download the DMG from the
    [releases page](https://github.com/embwl0x/native-agent/releases), open it,
    drag NativeAgent to Applications, and open the app.
 2. Enter your name and the agent's name.
@@ -35,7 +35,7 @@ main pages.
 
 | Area | Current behavior |
 |---|---|
-| Agent interface | One always-on `app` tool. `app {}` is home, “where I left off”; pages, items, search, actions and JavaScript reach the app's capabilities. |
+| Agent interface | The agent's one door, `app`, always on. `app {}` is home, “where I left off”; pages, items, search, actions and JavaScript reach the app's capabilities. |
 | Memory and context | MemoryV2 stores durable memory with lexical and semantic recall. Fluid Context prepares bounded context from the underlying stores. |
 | Work | Desk holds projects, dependencies, schedules, progress and outcomes; standing helpers have their own briefs, models and conversations. |
 | Mac and web | App actions reach files, shell, Mac apps, screen control, the built-in browser and the optional Chrome extension. `web.search` uses SearXNG (found on the Mac without setup) and searches in Chrome or their own browser when there is none; a failure says why. |
@@ -46,7 +46,7 @@ main pages.
 
 The action registry is
 [AppActionRegistry.swift](Modules/NativeAgentCore/Sources/AppToolRuntime/AppActionRegistry.swift).
-The [app tool contract](docs/TOOL_LOADING.md) explains discovery and execution;
+The [one-door contract](docs/ONE_DOOR.md) explains discovery and execution;
 the [capability map](docs/CAPABILITIES.md) covers boundaries and source owners.
 
 ## Codex and Claude Code as specialist builders
@@ -72,8 +72,8 @@ See [Support](SUPPORT.md) for installation and updates.
 
 ### From source
 
-The package requires macOS 26+ and Swift 6.1; app installation requires Xcode
-and XcodeGen.
+The package requires an Apple silicon Mac, macOS 26+ and Swift 6.1; app
+installation requires Xcode and XcodeGen.
 
 ```bash
 brew install xcodegen

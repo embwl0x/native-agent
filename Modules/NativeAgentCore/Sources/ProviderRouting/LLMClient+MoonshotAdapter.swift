@@ -167,7 +167,8 @@ public final class MoonshotTransport: LLMTransport {
             body["thinking"] = ["type": requested == "none" ? "disabled" : "enabled"]
         case .effort:
             let effort = requested ?? row.defaultReasoningEffort
-            if effort != "none" { body["reasoning_effort"] = effort }
+            // "default" is the provider's own: never written. No effort-wire row offers "none".
+            if effort != "none", effort != "default" { body["reasoning_effort"] = effort }
         }
     }
 

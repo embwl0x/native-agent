@@ -346,7 +346,7 @@ public struct SurpriseReading: Sendable {
             guard section == .failures else { return present.flatMap(\.lines) }
             let failed = present.filter { $0.kind == "failed" }
             return present.filter { $0.kind != "failed" }.flatMap(\.lines)
-                + (failed.isEmpty ? [] : ["Failed tool calls (by action and code):"] + failed.prefix(8).flatMap(\.lines))
+                + (failed.isEmpty ? [] : ["Failed calls (by action and code):"] + failed.prefix(8).flatMap(\.lines))
         })
     }
 }

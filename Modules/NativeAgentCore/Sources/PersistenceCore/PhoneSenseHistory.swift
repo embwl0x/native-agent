@@ -88,6 +88,8 @@ public enum PhoneSenseHistory {
         if let firstMovement, !kept.contains(where: { $0.id == firstMovement.id }) { kept.append(firstMovement) }
         let ids = Set(kept.map(\.id))
         events = Array(events.filter { !ids.contains($0.id) }.sorted { $0.timestamp < $1.timestamp }.suffix(64 - kept.count)) + kept
+        // A late reading the cap drops at once leaves the history as it was.
+        guard events.contains(where: { $0.id == event.id }) else { return }
         let file = url(dataRoot)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(events).write(to: file, options: .atomic)

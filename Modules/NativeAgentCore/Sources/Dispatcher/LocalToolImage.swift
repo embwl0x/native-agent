@@ -82,7 +82,7 @@ public enum LocalToolImage {
             return ProducedImage(
                 shown: true,
                 note: """
-                    Shown below this tool result as a JPEG thumbnail, long edge \(producedThumbnailMaxPixelSize)px. The full-size file is at the \
+                    Shown below this result as a JPEG thumbnail, long edge \(producedThumbnailMaxPixelSize)px. The full-size file is at the \
                     path above.
                     """,
                 width: thumbnail.pixels.width, height: thumbnail.pixels.height
@@ -163,19 +163,20 @@ public enum LocalToolImage {
         Set(messages.flatMap(\.content).compactMap { if case .image(_, _, let name?, _) = $0 { name } else { nil } })
     }
 
-    /// Replace superseded pixels with a stable label so each later screenshot rewrites only its own recent prefix.
+    /// A source keeps its two newest pictures, a before and its after; older ones become a stable label, so a later look rewrites only a recent prefix.
     static func supersede(_ messages: inout [LLMMessage]) {
         func source(_ block: LLMContentBlock) -> (name: String, source: String)? {
             guard case .image(_, _, let name?, _) = block, name.hasPrefix("screenshot of "),
                   let mark = name.range(of: sourceMark, options: .backwards) else { return nil }
             return (name, String(name[mark.upperBound...]))
         }
-        var newest: Set<String> = []
+        var kept: [String: Int] = [:]
         for index in messages.indices.reversed() {
             var content = messages[index].content, changed = false
             for blockIndex in content.indices.reversed() {
                 guard let shot = source(content[blockIndex]) else { continue }
-                if newest.insert(shot.source).inserted { continue }
+                kept[shot.source, default: 0] += 1
+                if kept[shot.source, default: 0] <= 2 { continue }
                 content[blockIndex] = .text("[" + shown(shot.name) + " replaced by a newer one]")
                 changed = true
             }
@@ -249,7 +250,7 @@ public enum LocalToolImage {
             return failure("Image must be nonempty and at most 8 MiB.")
         }
         guard let sink else {
-            return failure("Image pixels require a model tool turn; this direct text-only call cannot display an image.")
+            return failure("Image pixels require a model turn's call; this direct text-only call cannot display an image.")
         }
         guard !Task.isCancelled, sink.accept(.image(
             mediaType: mediaType, base64: data.base64EncodedString(),
@@ -261,7 +262,7 @@ public enum LocalToolImage {
             "status": .string("ok"), "image_pixels": .bool(true),
             "name": .string(name),
             "width": .int(Int64(width)), "height": .int(Int64(height)),
-            "note": .string("Actual image follows this tool result."),
+            "note": .string("Actual image follows this result."),
         ])
     }
 

@@ -119,6 +119,9 @@ actor BodyFaceProcess {
                 connected: { connection in
                     try await MacInputRouting.faceConnected(connection, processID: processID)
                     try await didConnect(connection)
+                }, ending: { connection in
+                    // Every renderer ends through its link's close (exit, quit, a lost pipe); Doctor forgets it before anything awaits.
+                    BodyFaceDoctor.disconnect(connection)
                 }, disconnected: { connection, detail in
                     if let connection { await MacInputRouting.faceDisconnected(connection) }
                     await self.disconnected(connection, detail)

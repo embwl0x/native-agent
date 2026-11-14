@@ -1,8 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 
-// Blueprint: | `FirstPartyModelCatalog.swift` | `FirstPartyModelCatalog`: route-owned model contracts |
+// Blueprint: | `FirstPartyModelCatalog.swift` | `FirstPartyModelCatalog`: shipped floor rows, route contracts, effective lookups and one output allowance |
 
 /// One route-specific catalog keeps pickers, validation and serialization aligned; account discovery owns account-scoped rows.
 public struct FirstPartyModelDescriptor: Sendable, Equatable {
@@ -23,6 +24,10 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
     /// The public OpenAI API serves this model through Responses, not Chat Completions.
     public let usesResponses: Bool
     public let reasoningWire: ReasoningWire
+    /// The model's output ceiling: the tighter of what its shipped row and its provider's list state; nil when neither states one.
+    public let maxOutputTokens: Int?
+    /// Why a model this build does not know runs on borrowed or minimal controls; nil for a shipped row.
+    public let controlsNote: String?
 
     public enum ReasoningWire: Sendable, Equatable {
         case effort
@@ -44,7 +49,9 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
         supportsMidConversationSystem: Bool = false,
         adaptiveThinking: Bool = true,
         usesResponses: Bool = false,
-        reasoningWire: ReasoningWire = .effort
+        reasoningWire: ReasoningWire = .effort,
+        maxOutputTokens: Int? = nil,
+        controlsNote: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -60,10 +67,40 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
         self.adaptiveThinking = adaptiveThinking
         self.usesResponses = usesResponses
         self.reasoningWire = reasoningWire
+        self.maxOutputTokens = maxOutputTokens
+        self.controlsNote = controlsNote
+    }
+
+    /// This row's controls under the provider's spelling of the same model, each limit the tighter of this row's and the provider's statement.
+    func withLimits(id: String, contextLength stated: Int?, maxOutputTokens statedOutput: Int?) -> FirstPartyModelDescriptor {
+        FirstPartyModelDescriptor(
+            id: id, name: name, contextLength: Self.tighter(contextLength, stated) ?? 0, supportsStreaming: supportsStreaming,
+            supportsVision: supportsVision, supportsTools: supportsTools, supportsJSONMode: supportsJSONMode,
+            defaultReasoningEffort: defaultReasoningEffort, supportedReasoningEfforts: supportedReasoningEfforts, supportsFast: supportsFast,
+            supportsMidConversationSystem: supportsMidConversationSystem, adaptiveThinking: adaptiveThinking, usesResponses: usesResponses,
+            reasoningWire: reasoningWire, maxOutputTokens: Self.tighter(maxOutputTokens, statedOutput), controlsNote: controlsNote)
+    }
+
+    /// The tighter of two stated limits; nil when neither states one.
+    static func tighter(_ lhs: Int?, _ rhs: Int?) -> Int? {
+        switch (lhs, rhs) {
+        case let (left?, right?): min(left, right)
+        case let (left?, nil): left
+        case let (nil, right?): right
+        case (nil, nil): nil
+        }
+    }
+
+    /// The picker row: the contract the route runs this model with.
+    public var providerModelInfo: ProviderModelInfo {
+        ProviderModelInfo(
+            id: id, name: name, context_length: contextLength, supports_streaming: supportsStreaming, supports_vision: supportsVision,
+            supports_tools: supportsTools, supports_json_mode: supportsJSONMode, default_reasoning_effort: defaultReasoningEffort,
+            supported_reasoning_efforts: supportedReasoningEfforts, supports_fast: supportsFast, controls_note: controlsNote)
     }
 
     public func providerJSON() -> [String: JSONValue] {
-        [
+        var row: [String: JSONValue] = [
             "id": .string(id),
             "name": .string(name),
             "context_length": .int(Int64(contextLength)),
@@ -76,6 +113,8 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
             "supports_fast": .bool(supportsFast),
             "supports_mid_conversation_system": .bool(supportsMidConversationSystem),
         ]
+        if let controlsNote { row["controls_note"] = .string(controlsNote) }
+        return row
     }
 }
 
@@ -86,6 +125,8 @@ public enum FirstPartyModelCatalog {
     public static let fullClaudeEfforts = ["low", "medium", "high", "xhigh", "max"]
     public static let claude46Efforts = ["low", "medium", "high", "max"]
     public static let grok45Efforts = ["low", "medium", "high"]
+    public static let publicGPT5Efforts = ["none", "low", "medium", "high", "xhigh"]
+    public static let publicGPTProEfforts = ["medium", "high", "xhigh"]
 
     /// Public GPT-6 requests require Responses.
     public static let publicOpenAIModels: [FirstPartyModelDescriptor] = [
@@ -101,13 +142,28 @@ public enum FirstPartyModelCatalog {
             supportedReasoningEfforts: publicGPT6AstraEfforts, supportsFast: true, usesResponses: true),
         // Terra's 1.05M window allows 922K input and 128K output.
         .init(id: "gpt-6.1-terra", name: "GPT-6.1-Terra", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
-            supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true, usesResponses: true),
+            supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true, usesResponses: true, maxOutputTokens: 128_000),
         .init(id: "gpt-6-sol", name: "GPT-6-Sol", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
             supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true, usesResponses: true),
         .init(id: gpt6AstraModelID, name: "GPT-6-Astra", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
             supportedReasoningEfforts: publicGPT6AstraEfforts, supportsFast: true, usesResponses: true),
         .init(id: "gpt-6-luna", name: "GPT-6-Luna", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
             supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true, usesResponses: true),
+        // From OpenAI's model pages on 11-13, not exercised by this build: every row allows 128K output; Pro rows serve only through Responses.
+        .init(id: "gpt-5.5", name: "GPT-5.5", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: publicGPT5Efforts, supportsFast: true, maxOutputTokens: 128_000),
+        .init(id: "gpt-5.5-pro", name: "GPT-5.5 Pro", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: publicGPTProEfforts, usesResponses: true, maxOutputTokens: 128_000),
+        .init(id: "gpt-5.4", name: "GPT-5.4", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: publicGPT5Efforts, supportsFast: true, maxOutputTokens: 128_000),
+        .init(id: "gpt-5.4-pro", name: "GPT-5.4 Pro", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: publicGPTProEfforts, usesResponses: true, maxOutputTokens: 128_000),
+        .init(id: "gpt-5.4-mini", name: "GPT-5.4 Mini", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: publicGPT5Efforts, supportsFast: true, maxOutputTokens: 128_000),
+        .init(id: "gpt-5.2", name: "GPT-5.2", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: publicGPT5Efforts, supportsFast: true, maxOutputTokens: 128_000),
+        .init(id: "gpt-5.2-pro", name: "GPT-5.2 Pro", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: publicGPTProEfforts, usesResponses: true, maxOutputTokens: 128_000),
     ]
 
     public static let anthropicModels: [FirstPartyModelDescriptor] = [
@@ -126,7 +182,7 @@ public enum FirstPartyModelCatalog {
             supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true),
         // Fable 5.1 allows 128K output and requires adaptive thinking without explicit budgets, forced tools or prefill.
         .init(id: "claude-fable-5-1", name: "Claude Fable 5.1", contextLength: 1_000_000, defaultReasoningEffort: "high",
-            supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true),
+            supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, maxOutputTokens: 128_000),
         // Capability/window fields INHERITED verbatim from claude-opus-4-8 and not independently verified for opus-5.
         .init(id: "claude-opus-5", name: "Claude Opus 5", contextLength: 1_000_000, defaultReasoningEffort: "high",
             supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true),
@@ -200,6 +256,9 @@ public enum FirstPartyModelCatalog {
             "high", "max"]),
         .init(id: "kimi-for-coding-highspeed", name: "Kimi for Coding (Highspeed)", contextLength: 262_144, supportsJSONMode: true,
             defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "high", "max"]),
+        // From Kimi Code's model page on 11-13, not exercised by this build.
+        .init(id: "k3-256k", name: "Kimi K3 (256K)", contextLength: 262_144, supportsJSONMode: true, defaultReasoningEffort: "high",
+            supportedReasoningEfforts: ["low", "high", "max"]),
     ]
 
     /// Exact subscription IDs must resolve before Moonshot classification; Moonshot's own IDs stay outside this set.
@@ -212,6 +271,14 @@ public enum FirstPartyModelCatalog {
             defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"]),
         .init(id: "muse-spark-1.3", name: "Muse Spark 1.3", contextLength: 1_048_576, supportsJSONMode: true,
             defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"]),
+        // From Meta's model pages on 11-13, not exercised by this build. Meta lists minimal through max for Ember; this build maps only the four
+        // levels the other Muse rows carry.
+        .init(id: "muse-ember-1.0", name: "Muse Ember 1.0", contextLength: 1_048_576, supportsJSONMode: true,
+            defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"]),
+        .init(id: "muse-spark-1.2", name: "Muse Spark 1.2", contextLength: 1_048_576, supportsJSONMode: true,
+            defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"]),
+        .init(id: "muse-spark-1.1", name: "Muse Spark 1.1", contextLength: 1_048_576, supportsJSONMode: true,
+            defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"]),
     ]
 
     public static func descriptor(for modelID: String) -> FirstPartyModelDescriptor? {
@@ -223,19 +290,36 @@ public enum FirstPartyModelCatalog {
             .min { $0.contextLength < $1.contextLength }
     }
 
-    /// Exact first-party capability lookup for a selected transport. The same model id can have different account/public controls, so command surfaces must
-    /// not use the provider-neutral context-budget lookup above.
+    /// The effective contract of a model on a selected transport: the row its provider listed for this credential (the same model whichever spelling
+    /// names it, controls from the shipped row of that model, limits the tightest either states, resolved by `FirstPartyModelDiscovery`), else its
+    /// exact shipped row. The same model id can have different account/public controls, so command surfaces must not use the provider-neutral
+    /// context-budget lookup above.
     public static func descriptor(
         for modelID: String,
-        providerID: String
+        providerID: String,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> FirstPartyModelDescriptor? {
-        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let provider = providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let models = self.models(forProviderID: provider)
-        return models.first { $0.id.lowercased() == id }
+        return FirstPartyModelDiscovery.liveDescriptor(for: modelID, route: provider, dataRoot: dataRoot)
+            ?? shippedDescriptor(for: modelID, providerID: provider)
     }
 
-    /// Shipped route catalogs are data; fetched routes return no fixed rows here.
+    /// The spelling to send for a pick on a route holding its provider's complete list: the pick when the provider listed that exact spelling, else
+    /// the provider's spelling of the same model. Nil when the route holds no complete list or no spelling of the pick is in it: the pick stays as
+    /// written, and `routeCarries` answers whether it is retired.
+    public static func listedSpelling(_ modelID: String, providerID: String, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> String? {
+        FirstPartyModelDiscovery.liveDescriptor(for: modelID, route: providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                                                dataRoot: dataRoot)?.id
+    }
+
+    /// The exact shipped row only.
+    static func shippedDescriptor(for modelID: String, providerID: String) -> FirstPartyModelDescriptor? {
+        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return models(forProviderID: providerID).first { $0.id.lowercased() == id }
+    }
+
+    /// Shipped route catalogs are data: the floor a live route shows when its provider cannot be asked, and the contracts of the models it ships.
+    /// Account routes return no fixed rows here.
     public static func models(forProviderID providerID: String) -> [FirstPartyModelDescriptor] {
         switch providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "openai": return publicOpenAIModels
@@ -279,52 +363,89 @@ public enum FirstPartyModelCatalog {
         }
     }
 
-    /// Saved picks are checked against their route's shipped catalog without literal replacements. Routes with fetched catalogs are not second-guessed
-    /// here.
-    public static func routeCarries(_ modelID: String, providerID: String?) -> Bool {
+    /// Saved picks are checked against their route's list without literal replacements. A live route retires a pick only when no spelling of it is in
+    /// its provider's complete list (`RouteList.row(for:)`); its shipped floor proves nothing absent, so such a pick stays and its unknown controls say
+    /// to refresh. Routes with account or gateway catalogs are not second-guessed here.
+    public static func routeCarries(_ modelID: String, providerID: String?, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> Bool {
         guard let providerID else { return true }
         let catalog = models(forProviderID: providerID)
         guard !catalog.isEmpty else { return true }
         let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let route = providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if FirstPartyModelDiscovery.isLiveRoute(route) {
+            let list = FirstPartyModelDiscovery.currentList(route: route, dataRoot: dataRoot)
+            return !list.isLive || list.row(for: id) != nil
+        }
         return catalog.contains { $0.id.lowercased() == id }
+    }
+
+    /// The row a picker list holds for a model, through the one answer: on a route holding its provider's complete list, the listed row of the same
+    /// model whichever spelling names it (from every spelling the provider listed, not only the ones a picker shows); else the list's exact row.
+    public static func pickerRow(_ modelID: String, providerID: String, rows: [JSONValue], dataRoot: URL) -> [String: JSONValue]? {
+        let route = providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let listed = FirstPartyModelDiscovery.liveDescriptor(for: modelID, route: route, dataRoot: dataRoot) { return listed.providerJSON() }
+        return rows.lazy.compactMap(\.objectValue).first { $0["id"] == .string(modelID) }
+    }
+
+    /// A pick the provider listed for this credential whose contract this build cannot know, so it is not offered.
+    public static func routeListsUnrunnable(_ modelID: String, providerID: String, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> Bool {
+        let route = providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard FirstPartyModelDiscovery.isLiveRoute(route) else { return false }
+        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return FirstPartyModelDiscovery.currentList(route: route, dataRoot: dataRoot).unrunnable
+            .contains { FirstPartyModelDiscovery.sameModel($0, id) }
     }
 
     /// Missing catalog evidence leaves supported efforts unknown.
     public static func routeSupportedEfforts(
         _ modelID: String,
-        providerID: String
+        providerID: String,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [String]? {
-        let catalog = models(forProviderID: providerID)
-        guard !catalog.isEmpty else { return nil }
-        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return catalog.first { $0.id.lowercased() == id }?.supportedReasoningEfforts
+        guard !models(forProviderID: providerID).isEmpty else { return nil }
+        return descriptor(for: modelID, providerID: providerID, dataRoot: dataRoot)?.supportedReasoningEfforts
     }
 
-    public static func anthropicDescriptor(for modelID: String) -> FirstPartyModelDescriptor? {
-        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return anthropicModels.first { $0.id.lowercased() == id }
+    /// The effective Anthropic contract on either Anthropic route.
+    public static func anthropicDescriptor(
+        for modelID: String, providerID: String = "anthropic", dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> FirstPartyModelDescriptor? {
+        descriptor(for: modelID, providerID: providerID, dataRoot: dataRoot)
     }
 
-    public static func xAIDescriptor(for modelID: String) -> FirstPartyModelDescriptor? {
-        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return xAIModels.first { $0.id.lowercased() == id }
+    public static func xAIDescriptor(for modelID: String, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> FirstPartyModelDescriptor? {
+        descriptor(for: modelID, providerID: "xai_oauth_direct", dataRoot: dataRoot)
     }
 }
 
 /// Provider-specific request controls. A picker capability is not considered implemented until the corresponding adapter emits it here.
 public enum FirstPartyExecutionControls {
+    /// One request's output allowance while a run's budget is bound: what is left of that aggregate budget, never above the model's effective
+    /// ceiling on this route (the tighter of its row's and its provider's statement, and the transport's own cap when it has one). Nil when no budget
+    /// is bound: the transport writes its own unbudgeted cap, or none. Every adapter that writes an output-cap field reads it here; a transport that
+    /// writes none leaves the provider's own ceiling in force while the routing stream holds the budget.
+    public static func budgetedOutputTokens(
+        model: String, providerID: String, call: LLMCall, transportCap: Int? = nil, dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> Int? {
+        guard let remaining = call.turn?.tokenBudget?.available else { return nil }
+        let ceiling = FirstPartyModelDescriptor.tighter(
+            FirstPartyModelCatalog.descriptor(for: model, providerID: providerID, dataRoot: dataRoot)?.maxOutputTokens, transportCap)
+        return min(remaining, ceiling ?? remaining)
+    }
+
     /// The output ceiling includes thinking and tool arguments; defaults must leave room to act without lowering the selected effort. Explicit caller caps
     /// stay exact.
     public static func anthropicMaxOutputTokens(
         model: String,
         requestedEffort: String?,
         explicitOverride: Int?,
-        providerID: String = "anthropic"
+        providerID: String = "anthropic",
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws -> Int {
         if let explicitOverride {
             return max(1, explicitOverride)
         }
-        guard let descriptor = FirstPartyModelCatalog.descriptor(for: model, providerID: providerID) else {
+        guard let descriptor = FirstPartyModelCatalog.descriptor(for: model, providerID: providerID, dataRoot: dataRoot) else {
             throw LLMError.providerError(message: "Output budget for \(model) on \(providerID) is unknown. Refresh Providers and select a catalog model.")
         }
         let requested = requestedEffort?
@@ -334,22 +455,28 @@ public enum FirstPartyExecutionControls {
             throw LLMError.providerError(message: "Think level '\(requested)' is unsupported for \(model). Choose a supported level in Providers.")
         }
         let effort = requested ?? descriptor.defaultReasoningEffort
+        let budget: Int
         switch effort {
+        case "default":
+            // No think level is sent: the provider's own ceiling when its list states one, else the conservative default.
+            return descriptor.maxOutputTokens ?? 8_192
         case "xhigh", "max":
-            return 65_536
+            budget = 65_536
         case "high":
-            return descriptor.supportedReasoningEfforts.contains("xhigh")
+            budget = descriptor.supportedReasoningEfforts.contains("xhigh")
                 || descriptor.supportedReasoningEfforts.contains("max")
                 ? 65_536
                 : 32_768
         case "medium":
-            return 32_768
+            budget = 32_768
         case "low":
-            return 16_384
+            budget = 16_384
         default:
             // Non-adaptive models still need room for builder tool arguments.
-            return 8_192
+            budget = 8_192
         }
+        // A stated ceiling bounds a budget borrowed from a sibling.
+        return min(budget, descriptor.maxOutputTokens ?? budget)
     }
 
     public static func anthropicEmptyStreamError(
@@ -370,23 +497,30 @@ public enum FirstPartyExecutionControls {
             + "(stop_reason=\(reason))")
     }
 
-    public static func anthropicEffort(model: String, requested: String?) throws -> String? {
+    public static func anthropicEffort(
+        model: String, requested: String?, providerID: String = "anthropic", dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) throws -> String? {
         guard let requested else { return nil }
-        guard let descriptor = FirstPartyModelCatalog.anthropicDescriptor(for: model) else {
+        guard let descriptor = FirstPartyModelCatalog.anthropicDescriptor(for: model, providerID: providerID, dataRoot: dataRoot) else {
             throw LLMError.providerError(message: "Think controls for \(model) are unknown. Choose a catalog model in Providers.")
         }
         let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard descriptor.supportedReasoningEfforts.contains(normalized) else {
             throw LLMError.providerError(message: "Think level '\(requested)' is unsupported for \(model). Choose a supported level in Providers.")
         }
-        return normalized == "none" ? nil : normalized
+        // "default" is the provider's own default: no effort field at all.
+        return normalized == "none" || normalized == "default" ? nil : normalized
     }
 
-    public static func applyAnthropicControls(to body: inout [String: Any], model: String, call: LLMCall) throws {
-        if FirstPartyModelCatalog.anthropicDescriptor(for: model)?.adaptiveThinking == true {
+    public static func applyAnthropicControls(
+        to body: inout [String: Any], model: String, call: LLMCall,
+        providerID: String = "anthropic", dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) throws {
+        if FirstPartyModelCatalog.anthropicDescriptor(for: model, providerID: providerID, dataRoot: dataRoot)?.adaptiveThinking == true {
             body["thinking"] = ["type": "adaptive", "display": "summarized"]
         }
-        guard let effort = try anthropicEffort(model: model, requested: call.admission?.reasoningEffort) else {
+        guard let effort = try anthropicEffort(model: model, requested: call.admission?.reasoningEffort,
+                                               providerID: providerID, dataRoot: dataRoot) else {
             return
         }
         var outputConfig = body["output_config"] as? [String: Any] ?? [:]
@@ -394,28 +528,32 @@ public enum FirstPartyExecutionControls {
         body["output_config"] = outputConfig
     }
 
-    public static func xAIReasoningEffort(model: String, requested: String?) throws -> String? {
+    public static func xAIReasoningEffort(model: String, requested: String?, dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> String? {
         guard let requested else { return nil }
-        guard let descriptor = FirstPartyModelCatalog.xAIDescriptor(for: model) else {
+        guard let descriptor = FirstPartyModelCatalog.xAIDescriptor(for: model, dataRoot: dataRoot) else {
             throw LLMError.providerError(message: "xAI Think controls for \(model) are unknown. Choose a catalog model in Providers.")
         }
         let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard descriptor.supportedReasoningEfforts.contains(normalized) else {
             throw LLMError.providerError(message: "Think level '\(requested)' is unsupported for \(model) on xAI. Choose a supported level in Providers.")
         }
-        guard normalized != "none", descriptor.supportedReasoningEfforts.count > 1 else { return nil }
+        // An explicit level the row offers is sent as written, `none` included. "default" (the provider's own) and a model with minimal controls
+        // (one level, nothing to choose) send no field.
+        guard normalized != "default", descriptor.supportedReasoningEfforts.count > 1 else { return nil }
         return normalized
     }
 
-    public static func applyXAIControls(to body: inout [String: Any], model: String, call: LLMCall) throws {
-        if let effort = try xAIReasoningEffort(model: model, requested: call.admission?.reasoningEffort) {
+    public static func applyXAIControls(
+        to body: inout [String: Any], model: String, call: LLMCall, dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) throws {
+        if let effort = try xAIReasoningEffort(model: model, requested: call.admission?.reasoningEffort, dataRoot: dataRoot) {
             body["reasoning_effort"] = effort
         }
         let tier = call.admission?.serviceTier?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         if let tier, tier != "default" {
-            guard tier == "priority", FirstPartyModelCatalog.xAIDescriptor(for: model)?.supportsFast == true else {
+            guard tier == "priority", FirstPartyModelCatalog.xAIDescriptor(for: model, dataRoot: dataRoot)?.supportsFast == true else {
                 throw LLMError.providerError(message: "Service tier '\(tier)' is unsupported for \(model) on xAI. Choose a supported tier in Providers.")
             }
             body["service_tier"] = "priority"

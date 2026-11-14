@@ -34,6 +34,9 @@ public enum LoopTickOutcome: Sendable, Equatable {
         .skipped(reason: notNeededPrefix + reason)
     }
 
+    /// Why a pass that needs the agent was not started: before setup finishes there is no agent.
+    public static let waitingForSetup = "Waiting for setup to finish"
+
     /// A shared slot held by other work is busy, not broken; the words name the holder and when to try again.
     public static let busyPrefix = "busy: "
 
@@ -109,6 +112,9 @@ public protocol LoopRunner: Sendable {
     var wake: OrganWake { get }
     /// A nil timeout override uses the scheduler’s 300-second default.
     var tickTimeoutOverride: TimeInterval? { get }
+    /// True for a pass that works on the agent's persona, memory, mind or growth. Before setup finishes there is no agent, so the scheduler does not
+    /// start it: its tick reads "not needed" and records no failure.
+    var needsAgent: Bool { get }
     /// Require explicit outcomes; no default completion can stand in for work.
     func tickOutcome() async -> LoopTickOutcome
     /// Do not reimplement tick: its sole purpose is to discard the required tickOutcome result.
@@ -119,6 +125,7 @@ public protocol LoopRunner: Sendable {
 
 public extension LoopRunner {
     var tickTimeoutOverride: TimeInterval? { nil }
+    var needsAgent: Bool { false }
 
     func tick() async {
         _ = await tickOutcome()

@@ -759,7 +759,8 @@ public actor MemoryStorage {
         persona: String? = nil,
         status: String? = "active",
         limit: Int? = nil,
-        keepingGraduated: Bool = false
+        keepingGraduated: Bool = false,
+        pinnedOnly: Bool = false
     ) async throws -> [StoredMemory] {
         try await dbPool.read { db in
             var sql = "SELECT * FROM memories WHERE 1=1"
@@ -770,6 +771,7 @@ public actor MemoryStorage {
                 sql += " AND (lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)"
                     + (keepingGraduated ? " OR lifecycle = '\(MemoryLifecycle.graduated)')" : ")")
             }
+            if pinnedOnly { sql += " AND json_extract(metadata_json, '$.pinned') = 1" }
             sql += " ORDER BY created_at DESC"
             if let limit { sql += " LIMIT ?"; args.append(limit) }
             let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))

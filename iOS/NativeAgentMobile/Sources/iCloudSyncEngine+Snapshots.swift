@@ -228,7 +228,9 @@ extension iCloudSyncEngine {
                             default_reasoning_effort: model.defaultReasoningEffort,
                             supported_reasoning_efforts: model.supportedReasoningEfforts,
                             supports_fast: model.supportsFast,
-                            controls_note: model.controlsNote
+                            controls_note: model.controlsNote,
+                            offered: model.offered,
+                            offer_note: model.offerNote
                         )
                     }
                 )

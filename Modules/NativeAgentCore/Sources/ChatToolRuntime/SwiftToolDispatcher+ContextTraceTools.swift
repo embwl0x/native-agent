@@ -128,7 +128,7 @@ extension SwiftToolDispatcher {
             next["kind"] = .string("tool.dispatch")
             next["name"] = .string(kindFilter)
             return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("trace_kind_is_tool"),
-                "detail": .string("kind selects events such as tool.dispatch; name selects a tool or action. Nothing was read."),
+                "detail": .string("kind selects events such as tool.dispatch; name selects an action. Nothing was read."),
                 "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("trace.recent"), "args": .object(next)])])])
         }
         let nameFilter = input["name"]?.stringValue.map { ToolNameAliases.appAction(ToolNameAliases.canonical($0)) ?? $0.trimmingCharacters(

@@ -64,6 +64,7 @@ extension SwiftToolDispatcher {
         do {
             let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
             let sequencing = DeskSequencing.compute(state)
+            let peerName = deskPeerName()
             let matches = state.items.compactMap { item -> (item: DeskItem, score: Int)? in
                 let searchable = [item.title, item.project, item.summary ?? ""]
                     + item.notes.suffix(3).map(\.text)
@@ -85,7 +86,7 @@ extension SwiftToolDispatcher {
                 "has_more": .bool(deskOffset + limit < matches.count),
                 "offset": .int(Int64(deskOffset)),
                 "items": .array(items.map {
-                    Self.workContextDeskItem($0, state: state, plan: sequencing.byHandle[$0.handle])
+                    Self.workContextDeskItem($0, state: state, plan: sequencing.byHandle[$0.handle], peerName: peerName)
                 }),
                 "meaning": .string("Current recorded Desk state. Notes and receipts are attributed records, not fresh external verification."),
             ])
@@ -110,7 +111,7 @@ extension SwiftToolDispatcher {
                 var lane: [String: JSONValue] = [
                     "status": .string("ok"), "source": .string("canonical_chat_history"),
                     "meaning": .string("""
-                        Historical excerpts balanced across work turns and the newest matching context. Recorded tool activity helps ranking; it \
+                        Historical excerpts balanced across work turns and the newest matching context. Recorded action activity helps ranking; it \
                         does not establish success or authority. Excerpts may contain proposals, superseded decisions or claims, not \
                         current-state verification or automatically the last agreement.
                         """),
@@ -212,9 +213,11 @@ extension SwiftToolDispatcher {
         .object(["tool": .string(tool), "arguments": .object(arguments)])
     }
 
-    static func workContextDeskItem(_ item: DeskItem, state: DeskState, plan: DeskSequencing.ItemPlan?) -> JSONValue {
+    static func workContextDeskItem(_ item: DeskItem, state: DeskState, plan: DeskSequencing.ItemPlan?,
+                                    peerName: (String) -> String?) -> JSONValue {
         var out: [String: JSONValue] = [
-            "handle": .string(item.handle), "alias": .string(item.alias), "title": .string(String(item.title.prefix(300))),
+            "handle": .string(item.handle), "alias": .string(item.alias),
+            "title": .string(String(item.displayTitle(peerName: peerName).prefix(300))),
             "project": .string(String(item.project.prefix(200))),
             "status": .string(item.statusDescription), "display_status": .string(AgentScreen.deskState(item)), "updated_at": .string(item.updatedAt),
             "is_open": .bool(!item.status.isTerminal),
@@ -248,8 +251,8 @@ extension SwiftToolDispatcher {
         }
         let children = state.children(of: item.handle)
         out["children"] = .array(children.prefix(5).map {
-            .object(["handle": .string($0.handle), "alias": .string($0.alias), "title": .string(String($0.title.prefix(300))), "status": .string(
-                $0.statusDescription),
+            .object(["handle": .string($0.handle), "alias": .string($0.alias),
+                     "title": .string(String($0.displayTitle(peerName: peerName).prefix(300))), "status": .string($0.statusDescription),
                      "read_locator": workContextRead("desk_read", ["handle": .string($0.handle)])])
         })
         out["additional_children"] = .bool(children.count > 5)
@@ -266,14 +269,14 @@ extension SwiftToolDispatcher {
         return .object(out)
     }
 
-    /// Preserve structured evidence, visibly clip large free text. Full records remain at the exact Desk locator; this projection never reads files.
+    /// Preserve structured evidence, visibly clip large free text. The whole record is desk.read with detail_offset 0; this projection never reads files.
     static func boundedWorkContextValue(_ value: JSONValue) -> JSONValue {
         switch value {
         case .string(let text):
-            return .string(text.count > 800 ? String(text.prefix(800)) + " … [truncated; open Desk record]" : text)
+            return .string(text.count > 800 ? String(text.prefix(800)) + " … [truncated; desk.read with detail_offset 0 reads the record whole]" : text)
         case .array(let values):
             var result = values.prefix(8).map(boundedWorkContextValue)
-            if values.count > 8 { result.append(.string("[\(values.count - 8) more entries; open Desk record]")) }
+            if values.count > 8 { result.append(.string("[\(values.count - 8) more entries; desk.read with detail_offset 0 reads the record whole]")) }
             return .array(result)
         case .object(let fields): return .object(fields.mapValues(boundedWorkContextValue))
         default: return value

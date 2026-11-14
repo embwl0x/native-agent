@@ -48,8 +48,12 @@ extension SwiftNativeTurnEngine {
             clockNowOverride: clockNowOverride,
             quietHoursSnapshot: quietHoursWindow,
             offeredToolNames: offeredToolNames,
-         turn: turn, work: work)
+            budget: nil,
+            startedNs: DispatchTime.now().uptimeNanoseconds,
+         turn: turn, work: work).context
     }
+    /// `budget` is the turn's budget when the caller already resolved it from the same data root; nil resolves it here.
+    /// `startedNs` opens `context.base` at the caller's clock read; the result carries the instant its summary closed.
     func buildTurnContext(
         surface: String,
         userMessage: String,
@@ -65,16 +69,23 @@ extension SwiftNativeTurnEngine {
         quietHoursSnapshot: TurnQuietHoursWindow?,
         offeredToolNames: Set<String>? = nil,
         recallHistory: [SessionHistoryPromptRenderer.Renderable]? = nil,
+        budget: ContextBudgetPolicy.Resolved?,
+        startedNs: UInt64,
         turn: Turn, work: ChatTurnWork
-    ) async throws -> TurnContext {
+    ) async throws -> (context: TurnContext, closedNs: UInt64) {
         try Task.checkCancellation()
-        var trace = ContextStageTrace(turn: turn)
+        var trace = ContextStageTrace(turn: turn, partitioning: .contextBase, startedNs: startedNs)
         if userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && imageBlocks.isEmpty
         {
             throw TurnEngineError.emptyMessage
         }
-        let turnBudget = try ContextBudgetPolicy.resolve(turn: turn, dataRoot: remPinsDataRoot)
+        let turnBudget: ContextBudgetPolicy.Resolved
+        if let budget { turnBudget = budget } else {
+            let budgetStart = DispatchTime.now().uptimeNanoseconds
+            turnBudget = try ContextBudgetPolicy.resolve(turn: turn, dataRoot: remPinsDataRoot)
+            trace.record(.contextBudget, since: budgetStart, of: .contextBase)
+        }
         guard let admission = turn.admission,
               let effort = admission.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines),
               !effort.isEmpty else {
@@ -85,7 +96,7 @@ extension SwiftNativeTurnEngine {
         let admittedServiceTier = admission.serviceTier
         trace.setFlag("provider.admissionReused", true)
         // Explicit relevance text is authoritative even when blank, keeping wire hints out of recall.
-        // Blank text skips query embedding; selection can still use attention terms and entities.
+        // Blank text skips query embedding; attention's topic terms do not stand in for it, since they do not enter selection.
         let queryMessage = queryUserMessage ?? userMessage
         trace.setCount("contextFlow.queryMessageChars", queryMessage.count)
         // Pin one instant for prompt and receipt; configured quiet hours alone do not prove the turn is inside them.
@@ -97,6 +108,7 @@ extension SwiftNativeTurnEngine {
             : nil
         // Start the existing bge query lane before the bounded attention
         // read, so the vector embeds while that work runs.
+        let embeddingStartNs = DispatchTime.now().uptimeNanoseconds
         let semanticQuery = SessionHistoryPromptRenderer.semanticRecallQuery(
             userMessage: queryMessage, recentTurns: recentTurns
         )
@@ -105,21 +117,25 @@ extension SwiftNativeTurnEngine {
         let queryEmbeddingTicket = await contextFlow?.beginQueryEmbedding(
             semanticQuery, ownWords: semanticQuery == queryMessage ? nil : queryMessage, turn: turn
         )
-
         let attentionStartNs = DispatchTime.now().uptimeNanoseconds
+        trace.record(.queryEmbeddingStart, since: embeddingStartNs, until: attentionStartNs, of: .contextBase)
         let attention = try await resolvedAttentionInputs(now: clock(), message: queryMessage, trace: &trace, turn: turn)
-        trace.record(.contextFlowAttention, since: attentionStartNs)
+        let modeStartNs = DispatchTime.now().uptimeNanoseconds
+        trace.record(.contextFlowAttention, since: attentionStartNs, until: modeStartNs, of: .contextBase)
         // Work context remains query-selectable without coloring unrelated turns.
         let suppressActiveIntent = ContextSurface(rawValue: surface) == .workshop
             || attention.residentWorkIntent
         let contextFlowMode: ContextFlowMode
         do { contextFlowMode = try await contextFlow?.contextFlowMode() ?? .off }
         catch { throw TurnEngineError.contextLoadFailed(underlying: error) }
+        trace.record(.contextFlowMode, since: modeStartNs, of: .contextBase)
         trace.setFlag("budget.packetDerived", turnBudget.isDerived)
         // Read the automatic recall switch once per turn for both paths; explicit memory requests remain outside that switch.
+        let gateStartNs = DispatchTime.now().uptimeNanoseconds
         let crossSessionRecall = try MemoryPolicyGate.crossSessionRecallEnabled(
             dataRoot: remPinsDataRoot
         )
+        trace.record(.recallGate, since: gateStartNs, of: .contextBase)
         trace.setFlag("memory.crossSessionRecall", crossSessionRecall)
         // An unread recall input is a fact of this turn, never an empty successful
         // read and never a reason to replace the context owner or retry the read.
@@ -136,6 +152,7 @@ extension SwiftNativeTurnEngine {
             }
         }
         let readyQueryEmbedding: ContextQueryEmbeddingValue?
+        let embeddingWaitStartNs = DispatchTime.now().uptimeNanoseconds
         if contextFlowMode == .active, crossSessionRecall,
            !semanticQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             do {
@@ -157,6 +174,7 @@ extension SwiftNativeTurnEngine {
             RepairOwed.settle(recallRepairRoot, operation: "context.semantic_query",
                 evidence: .init(source: "memory.embedding", id: readyQueryEmbedding.modelFingerprint))
         }
+        trace.record(.queryEmbeddingWait, since: embeddingWaitStartNs, of: .contextBase)
         // The selector's recall gate excludes memory and graph sources. Other
         // context still comes from the same published generation and lease.
         let semanticRecallEnabled = crossSessionRecall && (contextFlowMode != .active
@@ -164,12 +182,15 @@ extension SwiftNativeTurnEngine {
             || readyQueryEmbedding != nil)
         let userMemoryCore: [String]
         var userCoreUnavailable = false
+        let userCoreStartNs = DispatchTime.now().uptimeNanoseconds
         if !crossSessionRecall {
             userMemoryCore = []
         } else if let dataRoot = remPinsDataRoot {
             do {
-                userMemoryCore = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
-                    .userPromptCore(surface: surface)
+                let core = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).userPromptCoreTimed(surface: surface)
+                userMemoryCore = core.facts
+                // The stage below is the whole call; this is the read itself, so the difference is the wait for the memory actor.
+                trace.setCount("memory.userCoreWorkMs", Int(core.workNanoseconds / 1_000_000))
             } catch {
                 if error is CancellationError { throw error }
                 try Task.checkCancellation()
@@ -193,6 +214,9 @@ extension SwiftNativeTurnEngine {
             RepairOwed.settle(recallRepairRoot, operation: "memory.user_core",
                 evidence: .init(source: "memory/memory.sqlite", id: "userPromptCore"))
         }
+        trace.record(.userCore, since: userCoreStartNs, of: .contextBase)
+        // Facts the core delivered after disclosure, not the rows its query read.
+        trace.setCount("memory.userCoreFacts", userMemoryCore.count)
         let contextFlowRequest = ContextTurnRequest(
             surface: ContextSurface(rawValue: surface),
             origin: Self.contextOrigin(for: surface),
@@ -222,7 +246,9 @@ extension SwiftNativeTurnEngine {
             packetAtomExpandThresholdChars:
                 ContextBudgetPolicy.packetAtomExpandThresholdChars,
             // ContextBudgetPolicy bounds both recall paths; the per-turn recall switch can admit zero rows.
-            memoryAtomRowLimit: crossSessionRecall ? turnBudget.recallRowLimit : 0
+            memoryAtomRowLimit: crossSessionRecall ? turnBudget.recallRowLimit : 0,
+            // Memory ages read the same pinned instant as the turn's clock facts; selection keeps its own bucket.
+            turnTime: currentTurnClock
         )
         var preparedContextTurn: ContextPreparedTurn?
         switch contextFlowMode {
@@ -253,10 +279,10 @@ extension SwiftNativeTurnEngine {
                         expansion.grantedPostMandatoryReserve
                     )
                 }
-                trace.record(.contextFlowPrepare, since: start)
+                trace.record(.contextFlowPrepare, since: start, of: .contextBase)
             } catch {
                 try Task.checkCancellation()
-                trace.record(.contextFlowPrepare, since: start)
+                trace.record(.contextFlowPrepare, since: start, of: .contextBase)
                 // Recall gaps were named above. Required context still must prepare;
                 // a stand-in prompt cannot replace a failed generation or persona.
                 throw TurnEngineError.contextLoadFailed(underlying: error)
@@ -346,9 +372,9 @@ extension SwiftNativeTurnEngine {
                 compiledPersonaPrompt = packet.compiledSystemPrompt
             }
             // Microseconds retain the cost of mapping an already-compiled kernel's documents.
-            trace.recordMicroseconds(.personaCompile, since: personaStartNs)
+            trace.recordMicroseconds(.personaCompile, since: personaStartNs, of: .contextBase)
         } catch {
-            trace.recordMicroseconds(.personaCompile, since: personaStartNs)
+            trace.recordMicroseconds(.personaCompile, since: personaStartNs, of: .contextBase)
             try Task.checkCancellation()
             throw TurnEngineError.personaLoadFailed(underlying: error)
         }
@@ -371,7 +397,7 @@ extension SwiftNativeTurnEngine {
                 noteRecallUnavailable(error, input: "REM pins", operation: "rem_pins.read", owner: "rem_pins.json")
             }
         }
-        trace.record(.remPinsRead, since: remStartNs)
+        trace.record(.remPinsRead, since: remStartNs, of: .contextBase)
 
         // Session-backed recall may expand the query with continuity anchors.
         let memoryStartNs = DispatchTime.now().uptimeNanoseconds
@@ -437,9 +463,10 @@ extension SwiftNativeTurnEngine {
         } else {
             trace.setMemoryRecallOutcome(.notConfigured)
         }
-        // Prepared turns report only the selector's measured recall latency; no sample means no timing.
+        // Prepared turns report only the selector's measured recall latency, nested in contextFlow.prepare;
+        // no sample means no timing. Without a prepared turn, recall is this builder's own step.
         if preparedContextTurn == nil {
-            trace.recordMicroseconds(.memoryRecall, since: memoryStartNs)
+            trace.recordMicroseconds(.memoryRecall, since: memoryStartNs, of: .contextBase)
         } else if let selectionMicros = preparedContextTurn?.packet.receipt
             .measuredSelectionMicroseconds {
             trace.setMicroseconds(.memoryRecall, microseconds: Int64(selectionMicros))
@@ -458,6 +485,8 @@ extension SwiftNativeTurnEngine {
         let toolNames: [String]
         let toolSchemas: [LLMToolSchema]
         trace.setFlag("tools.fullCatalogRequested", offeredToolNames == nil)
+        // One step for the catalog: names and schemas can read at once, so their own times are nested, never summed.
+        let catalogStartNs = DispatchTime.now().uptimeNanoseconds
         do {
             (toolNames, toolSchemas) = try await holding(work.with(\.preparedContext, preparedContextTurn)) { work in
                 let tools = self.tools
@@ -484,6 +513,8 @@ extension SwiftNativeTurnEngine {
             try Task.checkCancellation()
             throw TurnEngineError.toolCatalogLoadFailed(underlying: error)
         }
+        let intentionsStartNs = DispatchTime.now().uptimeNanoseconds
+        trace.record(.toolsCatalog, since: catalogStartNs, until: intentionsStartNs, of: .contextBase)
         // The stem gathers inputs and composes the prompt strings turn.js receives.
         let intentions: String
         do {
@@ -494,6 +525,7 @@ extension SwiftNativeTurnEngine {
             noteRecallUnavailable(unavailable, input: "intentions", operation: unavailable.operation, owner: unavailable.owner)
         }
         let renderStartNs = DispatchTime.now().uptimeNanoseconds
+        trace.record(.intentions, since: intentionsStartNs, until: renderStartNs, of: .contextBase)
         // A person picture establishes the person and suppresses first-run invitations.
         let established = !userMemoryCore.isEmpty
         let deliveredRows = Self.deliveredRecalledMemoryRows(recalled, budget: turnBudget)
@@ -509,10 +541,15 @@ extension SwiftNativeTurnEngine {
         let contextPacket = preparedContextTurn.map(Self.renderContextPacket) ?? ""
         let macContext = work.invocation.macContext(dataRoot: remPinsDataRoot ?? defaultDataRoot())
         let continuationContext = turn.envelope?.macContinuation?.modelContext(context: macContext) ?? ""
-        let recallNotice = recallUnavailableReasons.isEmpty ? "" : "Recall was unavailable this turn (\(recallUnavailableReasons.joined(separator: "; ")))."
+        // One availability notice: what could not be read, then what was chosen but held back by its owner's check.
+        let unreadNotice = recallUnavailableReasons.isEmpty ? "" : "Recall was unavailable this turn (\(recallUnavailableReasons.joined(separator: "; ")))."
             + " This is not evidence that a memory exists or does not exist."
+        let recallNotice = [unreadNotice, preparedContextTurn.flatMap(Self.withheldContextNotice) ?? ""]
+            .filter { !$0.isEmpty }.joined(separator: " ")
+        let episodicStartNs = DispatchTime.now().uptimeNanoseconds
         let episodic = try await episodicContext(sessionID: sessionID,
             crossSessionRecall: crossSessionRecall, now: currentTurnClock, turn: turn)
+        trace.record(.episodic, since: episodicStartNs)
         let packetSections: [String] = [userPicture, episodic.life, intentions, contextPacket, continuationContext, recallNotice]
         let packet = packetSections.filter { !$0.isEmpty }.joined(separator: "\n\n")
         // The agent's own line with written instructions is the one they write; everything else it reaches is the agent's.
@@ -523,7 +560,7 @@ extension SwiftNativeTurnEngine {
             recall: Self.renderRecalledMemoryBlock(deliveredRows) ?? "",
             packet: packet
         )
-        trace.record(.promptRender, since: renderStartNs)
+        trace.record(.promptRender, since: renderStartNs, of: .contextBase)
         var baseContext = TurnContext(
             surface: surface,
             personaID: resolvedPersonaID,
@@ -557,11 +594,14 @@ extension SwiftNativeTurnEngine {
         )
         let factsJoinStart = DispatchTime.now().uptimeNanoseconds
         if let facts = try await currentFacts {
-            trace.record(.factsJoin, since: factsJoinStart)
+            let joinedNs = DispatchTime.now().uptimeNanoseconds
+            trace.record(.factsJoin, since: factsJoinStart, until: joinedNs, of: .contextBase)
             // Prompt and summary share the same pinned active quiet-hour state.
             finalContext = try await contextByAppendingCurrentTurnFacts(
                 baseContext, facts: facts, sessionID: sessionID, clockNowOverride: currentTurnClock, trace: &trace, turn: turn, work: work)
-            trace.record(ContextStageName.contextClockRuntime, since: factsJoinStart)
+            let composedNs = DispatchTime.now().uptimeNanoseconds
+            trace.record(.factsCompose, since: joinedNs, until: composedNs, of: .contextBase)
+            trace.record(ContextStageName.contextClockRuntime, since: factsJoinStart, until: composedNs)
         } else {
             finalContext = baseContext
         }
@@ -584,7 +624,8 @@ extension SwiftNativeTurnEngine {
         trace.setCount("userMessageChars", userMessage.count)
         trace.setCount("imageBlockCount", imageBlocks.count)
         trace.setFlag("snapshot.requestScoped", true)
-        finalContext.preparationMs = trace.emit(kind: "context.summary", surface: surface)
+        let closedNs = DispatchTime.now().uptimeNanoseconds
+        finalContext.preparationMs = trace.emit(kind: "context.summary", surface: surface, closedAt: closedNs)
         // Credit only accepted, rendered memories after pin deduplication; undelivered rows must not gain eviction-protecting use counts.
         finalContext.usageCreditMemoryIDs = servedContextMemoryIDs
             + deliveredRows.compactMap { row in
@@ -592,7 +633,7 @@ extension SwiftNativeTurnEngine {
                       case .string(let id)? = extras["id"] else { return nil }
                 return id
             }
-        return finalContext
+        return (finalContext, closedNs)
     }
     private struct AttentionInputs {
         var contextualTerms: Set<String> = []
@@ -675,7 +716,8 @@ extension SwiftNativeTurnEngine {
         trace.setFlag("contextFlow.attentionPresent", true)
 
         var inputs = AttentionInputs()
-        // Only nonempty term keys enter the lexical query; weights cross the attention seam separately.
+        // Topic terms are counted in the trace and do not enter selection: taken out on purpose 10-07 (10e00a710b), because attention terms
+        // do not make an item relevant to the current message.
         inputs.contextualTerms = Set(signals.terms.keys.filter { !$0.isEmpty })
         inputs.predictedToolGroups = signals.predictedToolGroups
         inputs.unresolvedQuestion = Self.nonEmpty(signals.unresolvedQuestion)

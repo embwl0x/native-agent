@@ -138,6 +138,9 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
         }
         guard case .available = snapshot.health, let docsURL = snapshot.documentsURL else {
             let signedIn = FileManager.default.ubiquityIdentityToken != nil
+            if !signedIn, snapshot.pairedPhones == 0 {
+                return merging(Self.phoneSyncOff(containerID: containerID, id: id, title: title))
+            }
             return merging(CheckResult(source: "iCloud container " + containerID,
                 id: id, title: title, status: "warn",
                 detail: signedIn ? "The active iCloud Drive container is unavailable." : "The active iCloud Drive transport has no signed-in iCloud account.",
@@ -218,9 +221,14 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
     }
 
     private func cloudKitResult(_ snapshot: ICloudBridgeHealthSnapshot, containerID: String) -> CheckResult {
-        let receive = cloudKitResult(snapshot.health, operation: "receive", containerID: containerID)
+        let neverPaired = snapshot.pairedPhones == 0
+        let receive = cloudKitResult(snapshot.health, operation: "receive", containerID: containerID, neverPaired: neverPaired)
         let failures = snapshot.sendFailures.sorted { $0.key < $1.key }.map {
-            cloudKitResult($0.value, operation: "send (\($0.key))", containerID: containerID)
+            cloudKitResult($0.value, operation: "send (\($0.key))", containerID: containerID, neverPaired: neverPaired)
+        }
+        // No iCloud account and no phone ever paired here: phone sync was never set up, so it is off, not a fault.
+        if receive.status == "off", !([receive] + failures).contains(where: { DoctorSafeRepairPolicy.isAdverse($0.status) }) {
+            return Self.phoneSyncOff(containerID: containerID, id: id, title: title)
         }
         let send = failures.isEmpty
             ? (snapshot.sendMeasured ? "CloudKit has accepted outbound delivery; iOS receipt is not confirmed"
@@ -237,7 +245,15 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
         )
     }
 
-    private func cloudKitResult(_ health: ICloudBridgeHealthSnapshot.Health, operation: String, containerID: String) -> CheckResult {
+    /// Phone sync never set up on this Mac: no iCloud account and no phone paired. Off owes no repair and asks nothing.
+    private static func phoneSyncOff(containerID: String, id: String, title: String) -> CheckResult {
+        CheckResult(source: "iCloud container " + containerID, id: id, title: title, status: "off",
+                    detail: "Phone sync is off: this Mac is not signed in to iCloud.",
+                    human_action: "Sign in to iCloud in System Settings → Apple Account, then pair your iPhone in Connectors → iPhone.")
+    }
+
+    private func cloudKitResult(_ health: ICloudBridgeHealthSnapshot.Health, operation: String, containerID: String,
+                                neverPaired: Bool) -> CheckResult {
         var status = "warn"
         let detail: String
         var action: String?
@@ -253,7 +269,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
         case .signedOut:
             detail = "CloudKit \(operation) has no authenticated iCloud account."
             action = "Open System Settings → Apple Account and sign in to iCloud."
-            ask = .signIn
+            if neverPaired { status = "off" } else { ask = .signIn }
         case .notEntitled:
             owner = .builder
             detail = "CloudKit \(operation) is not configured with its required entitlements."
@@ -267,7 +283,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
             switch CKError.Code(rawValue: code) {
             case .notAuthenticated:
                 action = "Open System Settings → Apple Account and complete iCloud sign-in."
-                ask = .signIn
+                if neverPaired { status = "off" } else { ask = .signIn }
             case .missingEntitlement:
                 owner = .builder
                 action = "Install a signed NativeAgent build granting CloudKit and container \(containerID)."

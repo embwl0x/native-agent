@@ -1,6 +1,6 @@
 # Habits — what they do again and again, they do without thinking
 
-Claude, 2026-10-30. User: "habits become second nature … plan these all out
+The lead, 2026-10-30. User: "habits become second nature … plan these all out
 real well". Sibling of [Surprise](SURPRISE.md): there they thinks only when the
 world doesn't match; here they *acts* without thinking when their own routine
 holds, and thinks only when it breaks. This is SURPRISE.md S4 ("woken work

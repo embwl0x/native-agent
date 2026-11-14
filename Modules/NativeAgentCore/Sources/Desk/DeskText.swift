@@ -231,14 +231,15 @@ public extension DeskPage {
     static func renderRecord(
         _ item: DeskItem,
         in state: DeskState,
-        noteCap: Int = 30
+        noteCap: Int = 30,
+        peerName: (String) -> String?
     ) -> String {
         var lines: [String] = []
         func alias(_ handle: String) -> String {
             state.items.first { $0.handle == handle }?.alias ?? handle
         }
         func titleOf(_ handle: String) -> String {
-            state.items.first { $0.handle == handle }?.title ?? "(not on the live desk)"
+            state.items.first { $0.handle == handle }?.displayTitle(peerName: peerName) ?? "(not on the live desk)"
         }
         func statusOf(_ handle: String) -> String {
             state.items.first { $0.handle == handle }?.status.rawValue ?? "gone"
@@ -246,7 +247,7 @@ public extension DeskPage {
 
         lines.append("record \(item.alias) · \(item.kind.rawValue) · \(item.statusDescription)")
         lines.append("  project: \(item.project)")
-        lines.append("  title: \(item.title)")
+        lines.append("  title: \(item.displayTitle(peerName: peerName))")
         if let summary = item.summary, !summary.isEmpty { lines.append("  summary: \(summary)") }
         if let parent = item.parent { lines.append("  under: \(alias(parent)) \(titleOf(parent))") }
         if let assignee = item.assignee, !assignee.isEmpty { lines.append("  assignee: \(assignee)") }
@@ -267,7 +268,7 @@ public extension DeskPage {
         if !dependents.isEmpty {
             lines.append("  blocks:")
             for dep in dependents {
-                lines.append("    \(dep.alias) \(dep.statusDescription) \(dep.title)")
+                lines.append("    \(dep.alias) \(dep.statusDescription) \(dep.displayTitle(peerName: peerName))")
             }
         }
         let kids = state.children(of: item.handle)
@@ -275,7 +276,7 @@ public extension DeskPage {
         if !kids.isEmpty {
             lines.append("  parts:")
             for kid in kids {
-                lines.append("    \(kid.alias) \(kid.statusDescription) \(kid.title)")
+                lines.append("    \(kid.alias) \(kid.statusDescription) \(kid.displayTitle(peerName: peerName))")
             }
         }
 
@@ -314,7 +315,7 @@ public extension DeskPage {
             return "pr \(repo)#\(number)" + (title.map { " — \($0)" } ?? "")
                 + (status.map { " (\($0))" } ?? "") + (checks.map { " checks \($0)" } ?? "")
         case let .url(url, title):
-            return "url \(url)" + (title.map { " — \($0)" } ?? "")
+            return (DeskPiece.makeRef(ref) == nil ? "url " : "piece ") + url + (title.map { " — \($0)" } ?? "")
         case let .agent(name, handoffId, sessionId):
             return "agent \(name)" + (handoffId.map { " handoff \($0)" } ?? "")
                 + (sessionId.map { " session \($0)" } ?? "")

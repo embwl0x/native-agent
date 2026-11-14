@@ -71,7 +71,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
             QuietSetting(
                 id: "settings.shotgun_shortcut", page: "settings", label: "Shotgun shortcut", kind: .choice,
                 choices: ShotgunShortcut.allCases.map(\.rawValue),
-                note: "Saves and registers the shortcut immediately. If macOS refuses registration, the saved choice stays visible and the failure says so.",
+                note: "The keys that open Shotgun, saved and registered at once; if macOS refuses them, the choice stays saved and I say why.",
                 read: { _ in
                     guard let saved = UserDefaults.standard.object(forKey: ShotgunShortcut.storageKey) else {
                         return .string(ShotgunShortcut.optionSpace.rawValue)
@@ -91,8 +91,8 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
             QuietSetting(
                 id: "memories.meaning_based", page: "settings", label: "Meaning-based memory", kind: .boolean,
                 note: """
-                    true enables the on-device semantic model; false selects word matching. Re-indexes saved memories, just as the Settings control does. A \
-                    saved request does not prove the model loaded.
+                    On, I find memories by what they mean with a model on this Mac, off by matching words; either change re-indexes my saved \
+                    memories, and the switch alone does not prove the model loaded.
                     """,
                 read: .meaningBasedMemory,
                 write: { _, value, context in
@@ -139,8 +139,10 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                 read: { _ in .string("On the Mac, open Telegram → Bot token to add or replace the token in its secure field.") }
             )
         ]
-        // Read and choose accounts through the provider owner so the adapter keeps no second account state.
-        for account in model.engine.providers.connections {
+        // Read and choose accounts through the provider owner so the adapter keeps no second account state. Only a connected account
+        // (`auth_status.eligible`) has a default model to choose; an account that is not connected, or whose configuration is broken,
+        // has no setting here, and its own status and repair stay on its account row in the Providers page's content.
+        for account in model.engine.providers.connections where account.auth_status.eligible {
             let id = account.provider_id
             @MainActor @Sendable func checkedProvider() async throws -> ProviderInfo {
                 let provider = try await model.engine.providers.provider(id: id)
@@ -150,16 +152,22 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                         then reload Providers before reading or changing its default model.
                         """)
                 }
-                if let problem = provider.models_note {
+                // Choices are available when this credential has a list to choose from; a note beside the list is information, not a fault.
+                guard !provider.models.isEmpty else {
+                    let cause = provider.models_note.map { ": \($0)" } ?? "."
                     throw QuietSettingError.unavailable(
-                        "\(id)'s model choices are unavailable: \(problem) Refresh its models in Providers before reading or changing its default model."
+                        "\(id)'s model choices are unavailable\(cause) Refresh its models in Providers before reading or changing its default model."
                     )
                 }
                 return provider
             }
             rows.append(QuietSetting(
                 id: "providers.\(id).default_model", page: "providers", label: "\(account.display_name) default model", kind: .choice,
-                liveChoices: { _ in try await checkedProvider().models.map(\.id) },
+                // The choices are the rows this slot may hold (`ModelSlot.mayHold`): offered ones, and the saved default itself.
+                liveChoices: { _ in
+                    let provider = try await checkedProvider()
+                    return provider.models.filter { ModelSlot.mayHold($0.id, row: $0, savedInSlot: provider.default_model) }.map(\.id)
+                },
                 note: "The account sheet's default model. Empty means no default has been saved. Does not change credentials or surface overrides.",
                 read: { _ in
                     let provider = try await checkedProvider()
@@ -168,7 +176,12 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                 },
                 write: { _, value, _ in
                     let provider = try await checkedProvider()
-                    guard case .string(let wanted) = value, provider.models.contains(where: { $0.id == wanted }) else {
+                    guard case .string(let wanted) = value else { throw QuietSettingError.badValue("Choose one of this account's offered models.") }
+                    let row = provider.models.first { $0.id == wanted }
+                    guard ModelSlot.mayHold(wanted, row: row, savedInSlot: provider.default_model) else {
+                        if row != nil {
+                            throw QuietSettingError.unavailable(ModelSlot.refusal(note: provider.models_note, accountName: provider.display_name))
+                        }
                         throw QuietSettingError.badValue("Choose one of this account's offered models.")
                     }
                     // Patch only the model through ProviderRouting; this control has no credential or auth-mode input.
@@ -311,7 +324,8 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     func listQuietProviderAccounts() async throws -> [QuietProviderAccount] {
         try await appModel.engine.providers.list().providers.map {
             QuietProviderAccount(providerID: $0.provider_id, authState: $0.auth_status.state,
-                                 eligible: $0.auth_status.eligible, models: $0.models)
+                                 eligible: $0.auth_status.eligible, models: $0.models,
+                                 refusal: ModelSlot.refusal(note: $0.models_note, accountName: $0.display_name))
         }
     }
 

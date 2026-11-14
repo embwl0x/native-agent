@@ -319,6 +319,7 @@ extension Expansion {
 
     /// A call carrying a key or token (`:secret` args) is never kept.
     static func carriesSecret(_ call: [String: JSONValue], turn: Turn?) throws -> Bool {
+        let call = ToolNameAliases.doorCall("app", call)
         if NativeAgentSecretRedactor.secretPath(.object(call), at: "call") != nil { return true }
         guard let binding = try AppActionBinding.action(input: call, turn: turn), !binding.secretArgs.isEmpty else { return false }
         guard case .object(let args)? = call["args"] else { return false }

@@ -20,6 +20,7 @@ import AgentWorkspace
 import Desk
 import MacControl
 import Privacy
+import Studio
 // Blueprint: | `EngineTools.swift` | `PartDoor`, `withPartDoor`; gated native calls and owner-supplied page outcomes |
 
 /// A native operation holds its turn and dependencies, including in callbacks it keeps.
@@ -248,7 +249,8 @@ public final class ToolsFacade {
     /// with the device its router verified; Telegram's verified sender and chat), on the agent's own line, and as their own decision of that
     /// exact call when the stem composed the row (`PersonAct`). The agent's call of the same row is the same `app` call through its own
     /// turn's door, judged by the same law. The reply retains the owner's words, effects and page-specific settlement metadata.
-    public nonisolated func personTap(_ call: PartFace.Call, _ tap: PartFaces.Tap) async throws -> FaceActOutcome {
+    /// `personEditOf` is the Make version a person's edit in the window was made from (`Turn.personEditOf`).
+    public nonisolated func personTap(_ call: PartFace.Call, _ tap: PartFaces.Tap, personEditOf: Int? = nil) async throws -> FaceActOutcome {
         let work = "face:" + tap.page + "/" + tap.row + "/" + tap.action
         let envelope: TurnEnvelope = switch tap.door {
         case "phone": TurnEnvelope(surface: "ios", verifiedUserId: tap.device, commandSignatureVerified: tap.device != nil, workIdentity: work)
@@ -275,6 +277,7 @@ public final class ToolsFacade {
             tool: "app", input: input) : nil
         var turn = Turn(session: Happening.stream).with(\.verifiedSessionID, Happening.stream).with(\.personAct, act)
         turn[FacePresentationPart.self] = tap.renderer
+        turn.personEditOf = personEditOf
         let readOnly = try AppActionBinding.action(input: input, turn: turn)?.read == true
         // The tap's call leaves the same act receipt the agent's call of it leaves.
         let reply = try await withPartDoor(envelope: envelope, turn: turn, traced: true) { door in try await door.perform("app", input) }

@@ -419,6 +419,7 @@ targets:
           rm -rf "$res/docs"
           mkdir -p "$res/docs/release-notes"
           cp "$SRCROOT/docs/data-bounds.md" "$res/docs/data-bounds.md"
+          cp "$SRCROOT/docs/IMAGE_GENERATION.md" "$res/docs/IMAGE_GENERATION.md"
           find "$SRCROOT/docs/release-notes" -maxdepth 1 -type f -name '*.md' \
             -exec cp {} "$res/docs/release-notes/" \;
           # Dev builds only: the repo-owned data/ root. A release has none.

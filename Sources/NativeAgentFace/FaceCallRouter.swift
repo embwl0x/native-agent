@@ -69,7 +69,10 @@ final class FaceCallRouter {
             }
         } catch is CancellationError { return .cancelled }
         catch let failure as WireFailure { return .failed(failure) }
-        catch {
+        catch FaceWireError.disconnected {
+            // Not connected yet (no frame drawn) or any more: the window has nothing showing to answer from, which is not a failed presentation.
+            return .failed(.init(code: FaceWireError.disconnectedCode, message: "The window is not connected.", cause: nil, effects: .none))
+        } catch {
             return .failed(.init(code: "face_call_failed", message: "The window could not complete the requested presentation.",
                                  cause: error.localizedDescription, effects: .unknown))
         }

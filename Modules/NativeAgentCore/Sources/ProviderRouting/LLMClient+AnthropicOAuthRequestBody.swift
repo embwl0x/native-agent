@@ -8,7 +8,7 @@ import TurnTrace
 extension AnthropicOAuthTransport {
     /// The protocol's first line identifies text-tool requests.
     public static let textToolProtocolHeader =
-        "NativeAgent Swift tool protocol (text compatibility):"
+        "NativeAgent call protocol (text form):"
 
     /// Anthropic's API gates OAuth-mode on this EXACT string being the first system block.
     private static let claudeCodeIdentity =
@@ -213,7 +213,8 @@ extension AnthropicOAuthTransport {
         system: String?,
         coercedModel: String,
         maxTokens: Int,
-        stream: Bool, call: LLMCall
+        stream: Bool, call: LLMCall,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws -> [String: Any] {
         let usesPrefixShape = Self.usesV2PrefixShape(
             system, segments: call.systemSegments
@@ -244,7 +245,8 @@ extension AnthropicOAuthTransport {
             body["stream"] = true
         }
         Self.applyTextLaneStops(to: &body, system: system, call: call)
-        try FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: coercedModel, call: call)
+        try FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: coercedModel, call: call,
+                                                               providerID: "anthropic_oauth_direct", dataRoot: dataRoot)
         return body
     }
 

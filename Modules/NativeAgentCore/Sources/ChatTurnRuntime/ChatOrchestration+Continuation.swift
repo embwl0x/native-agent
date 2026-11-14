@@ -207,6 +207,8 @@ extension SwiftNativeChatOrchestrationClient {
             if case .int(let count)? = metadata["workingCommentaryChars"] { response.workingCommentaryCharacters = Int(count) }
             if state != .completed {
                 response.runtimeStatus = state == .waiting ? "waiting on you" : state.rawValue
+                // A failed reply's saved explanation is what its door tells the person.
+                if case .string(let failure)? = metadata["error"] { response.statusDetail = failure }
             }
             let answerRef = Self.transcriptRef(sessionId, outcome.messageID)
             let heardID = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])?.answerExperienceID ?? outcome.turnID
@@ -262,7 +264,8 @@ extension SwiftNativeChatOrchestrationClient {
                                                     runId: checkpoint.runId, turnId: checkpoint.turnId) {
             let state = response.terminalState ?? .completed
             let reason: TurnEngineResult.TerminalReason = state == .completed ? .replyCompleted
-                : state == .waiting ? .interactionRequired : state == .failed ? .executionFailed : .incomplete
+                : state == .waiting ? .interactionRequired : state == .failed ? .executionFailed
+                : state == .stopped ? .cancelled : .incomplete
             let terminal = TurnTraceEvent(turnId: checkpoint.turnId, kind: "turn.terminal",
                 sessionId: checkpoint.sessionId, surface: checkpoint.surface, payload: .object([
                     "schema": .string("metacognition.observed.v1"), "status": .string(state.rawValue),
@@ -465,7 +468,7 @@ extension SwiftNativeTurnEngine {
         return try await holding(work.with(\.checkpoint, checkpoint)) { work in
         return try await holding(work.with(\.journal, journal)) { work in
             do {
-                let result = try await Expansion.withTurn(dataRoot: remPinsDataRoot, turn: turn, afterReply: { $0.afterReply }) {
+                let returned = try await Expansion.withTurn(dataRoot: remPinsDataRoot, turn: turn, afterReply: { $0.afterReply }) {
                     try await Self.untilStopped(cancelFlagPath) { [self] in
                         try await executeContinuationTurnBody(
                             surface: surface, userMessage: userMessage, sessionId: sessionId,
@@ -475,6 +478,14 @@ extension SwiftNativeTurnEngine {
                             cancelFlagPath: cancelFlagPath, providerAdmission: providerAdmission, turn: turn, work: work, call: call)
                     }
                 }
+                let result: TurnEngineResult
+                if ChatCancelFlag.readFailure(cancelFlagPath) != nil {
+                    result = TurnEngineResult(reply: returned.reply, modelUsed: returned.modelUsed, recalledIds: returned.recalledIds,
+                        toolDispatches: returned.toolDispatches, elapsedMs: returned.elapsedMs, providerCallCount: returned.providerCallCount,
+                        completionState: .incomplete, afterReply: returned.afterReply,
+                        workingCommentaryCharacters: returned.workingCommentaryCharacters, terminalReason: .cancelled,
+                        loopCounters: returned.loopCounters, cognitiveContextDelivered: returned.cognitiveContextDelivered)
+                } else { result = returned }
                 let reason = result.terminalReason ?? .incomplete
                 let state: DeskContinuation.State
                 switch reason {
@@ -487,18 +498,27 @@ extension SwiftNativeTurnEngine {
                 let checkpoint = await journal?.snapshot()
                 let completingSuccessor = state == .complete && (checkpoint?.resumeCount ?? 0) > 0
                     && checkpoint?.pending.isEmpty == true
-                if ownsJournal && !completingSuccessor {
-                    try await journal?.finish(state: state, reply: result.reply, reason: reason.rawValue,
-                        peerSources: turn.peerSteering?.checkpointSources)
+                if ownsJournal && !completingSuccessor, let journal {
+                    let reply = result.reply, why = reason.rawValue, peerSources = turn.peerSteering?.checkpointSources
+                    // The journal's last write is settlement: a stop must not cancel it and leave the Desk continuation running.
+                    try await settle { () -> Result<Void, Error> in
+                        do { try await journal.finish(state: state, reply: reply, reason: why, peerSources: peerSources); return .success(()) }
+                        catch { return .failure(error) }
+                    }.get()
                 }
                 settleWorker()
                 return result
             } catch {
                 let canceled = Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath)
-                if ownsJournal {
-                    try await journal?.finish(state: canceled ? .canceled : .ready, reply: "",
-                        reason: canceled ? "canceled" : "turn_interrupted",
-                        peerSources: turn.peerSteering?.checkpointSources)
+                if ownsJournal, let journal {
+                    let peerSources = turn.peerSteering?.checkpointSources
+                    try await settle { () -> Result<Void, Error> in
+                        do {
+                            try await journal.finish(state: canceled ? .canceled : .ready, reply: "",
+                                reason: canceled ? "canceled" : "turn_interrupted", peerSources: peerSources)
+                            return .success(())
+                        } catch { return .failure(error) }
+                    }.get()
                 }
                 settleWorker()
                 throw error

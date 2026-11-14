@@ -276,9 +276,10 @@ extension ChatGPTTransport {
         return auth
     }
 
-    /// Caller holds the credential lock; child copies omit refresh authority.
-    static func writeCodexChildCopy(_ bytes: Data, of authPath: URL) throws {
-        guard let home = codexChildHome(mirroring: authPath) else { return }
+    /// Caller holds the credential lock; child copies omit refresh authority. Returns the access token the copy holds.
+    @discardableResult
+    static func writeCodexChildCopy(_ bytes: Data, of authPath: URL) throws -> String? {
+        guard let home = codexChildHome(mirroring: authPath) else { return nil }
         guard let blob = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
               let tokens = blob["tokens"] as? [String: Any] else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
@@ -297,20 +298,22 @@ extension ChatGPTTransport {
             JSONSerialization.data(withJSONObject: copy, options: [.prettyPrinted, .sortedKeys]),
             to: checkedCodexChildAuthPath(home: home)
         )
+        return childTokens["access_token"] as? String
     }
 
-    /// Child credentials must track app rotation and sign-out.
-    static func syncCodexChildCopy(from authPath: URL) throws {
-        guard let home = codexChildHome(mirroring: authPath) else { return }
-        try CredentialFileLock.withLock(authPath) {
+    /// Child credentials must track app rotation and sign-out. Returns the access token the child copy now holds; nil when sign-out removed it.
+    @discardableResult
+    static func syncCodexChildCopy(from authPath: URL) throws -> String? {
+        guard let home = codexChildHome(mirroring: authPath) else { return nil }
+        return try CredentialFileLock.withLock(authPath) { () -> String? in
             if FileManager.default.fileExists(atPath: authPath.path) {
-                try writeCodexChildCopy(Data(contentsOf: authPath), of: authPath)
-            } else {
-                let copy = try checkedCodexChildAuthPath(home: home)
-                if FileManager.default.fileExists(atPath: copy.path) {
-                    try FileManager.default.removeItem(at: copy)
-                }
+                return try writeCodexChildCopy(Data(contentsOf: authPath), of: authPath)
             }
+            let copy = try checkedCodexChildAuthPath(home: home)
+            if FileManager.default.fileExists(atPath: copy.path) {
+                try FileManager.default.removeItem(at: copy)
+            }
+            return nil
         }
     }
 

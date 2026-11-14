@@ -75,7 +75,7 @@ extension ProviderSettingsFace {
 extension ProviderSessionPresentation {
     func prepared(settings: ProviderSettingsSnapshot?) -> Self {
         let groups = ChatComposerModelGroup.groups(connections: settings?.providers ?? [], catalog: settings?.catalog,
-                                                   providerID: choice?.provider ?? "")
+                                                   providerID: choice?.provider ?? "", selectedModel: choice?.model)
         let models = Dictionary(groups.map { group in
             (group.id, Dictionary(group.models.map { model in
                 (model.id, ProviderModelPresentation(model: model,

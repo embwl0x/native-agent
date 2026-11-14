@@ -1,7 +1,7 @@
 import NativeAgentShared
 import SwiftUI
 
-// Blueprint: | `ShellSidebarRail.swift` | Canonical rail rows, unavailable page owners, selection and focus rings |
+// Blueprint: | `ShellSidebarRail.swift` | The rail; place rows shared with Simple, the Desk row's waiting mark, selection bar and focus ring |
 
 /// Retained rows must not hide the conversation list's unavailable cause.
 struct SessionNavigationNotice: View {
@@ -106,14 +106,6 @@ struct ShellRailItem: View {
     }
 }
 
-extension ShellRailItem {
-    init(item: SidebarItem, isSelected: Bool, needsYou: Bool, attentionUnavailable: Bool, onSelect: @escaping () -> Void,
-         barNamespace: Namespace.ID) {
-        self.init(title: item.shellRailTitle, help: item.displayName, identifier: "sidebar.item.\(item.rawValue)", isSelected: isSelected,
-                  needsYou: needsYou, attentionUnavailable: attentionUnavailable, onSelect: onSelect, barNamespace: barNamespace)
-    }
-}
-
 /// Match the rail's rounded plate instead of using the square system focus ring.
 struct ShellRailFocusRing: View {
     @FacePreference(HazeColor.key) private var hazeRaw = HazeColor.defaultValue.rawValue
@@ -142,10 +134,11 @@ struct ShellRailFocusRing: View {
 
 struct ShellSidebarRail: View {
     @Environment(AppModel.self) private var appModel
-    @Binding var selection: SidebarItem
-    /// The page of the agent's own the window shows (the selection is `.ownPage`), and how a row selects one.
-    var selectedPage: String?
-    var selectPage: (String) -> Void
+    @Environment(\.layoutProfile) private var layoutProfile
+    /// The surface the window shows: the one its selected page belongs to.
+    var surface: ShellSurface
+    /// Choosing a surface, with the pages the layout shows of it.
+    var choose: (ShellSurface, [ShellRailRow]) -> Void
 
     /// One identity preserves the bar's continuity between rows.
     static let selectionBarID = "shell.rail.selection-bar"
@@ -154,26 +147,22 @@ struct ShellSidebarRail: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
-        // Anchor Settings at the foot so setup stays distinct from work destinations.
+        // Anchor Diagnostics at the foot so the advanced view stays apart from the places of work.
         SurfaceLayoutContent(appModel.shellLayout) { layout in
-        let rail = SidebarItem.railRows(layout)
-        let pageIDs = Set(rail.compactMap { row -> String? in if case .page(let id) = row { id } else { nil } })
-        let own = Dictionary(uniqueKeysWithValues: QuietPages.own(appModel, ids: pageIDs).map { ($0.id, $0.title) })
-        let catalog = appModel.face.slot(PageFaceKey.catalog).value(as: PartFaceCatalog.self)
+        let surfaces = ShellSurface.shown(layout, profile: layoutProfile)
         VStack(spacing: 4) {
             SessionNavigationNotice()
-            ForEach(rail.dropLast(), id: \.self) { row($0, own: own, catalog: catalog) }
+            ForEach(surfaces.filter { $0.surface != .diagnostics }) { row($0) }
             Spacer(minLength: 8)
-            if let last = rail.last { row(last, own: own, catalog: catalog) }
+            if let foot = surfaces.first(where: { $0.surface == .diagnostics }) { row(foot) }
         }
         // Animate the whole rail in one transaction so departing and arriving bars stay in sync.
         .animation(
             NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
-            value: selection
+            value: surface
         )
-        .animation(NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion), value: selectedPage)
         }
-        // Align rail words to the header baseline and retain the same Settings inset.
+        // Align rail words to the header baseline and retain the same foot inset.
         .padding(.top, 14 - NativeAgentShellLayout.railPlateInset)
         .padding(.bottom, 14 - NativeAgentShellLayout.railPlateInset)
         .frame(width: NativeAgentShellLayout.railWidth)
@@ -192,49 +181,49 @@ struct ShellSidebarRail: View {
         .accessibilityLabel("Places")
     }
 
-    @ViewBuilder
-    private func row(_ row: ShellRailRow, own: [String: String], catalog: PartFaceCatalog?) -> some View {
-        switch row {
-        case .item(let item):
-            if item == .activity {
-                ShellAttentionRailItem(isSelected: selection == item, barNamespace: selectionBar) { selection = item }
-            } else {
-                ShellRailItem(item: item, isSelected: selection == item, needsYou: false, attentionUnavailable: false,
-                              onSelect: { selection = item }, barNamespace: selectionBar)
-            }
-        case .page(let page):
-            let words: (title: String, help: String) = if let title = own[page] { (title, title) }
-                else if let failure = catalog?.failure { ("\(page) · unavailable", failure.message) }
-                else if catalog == nil { ("\(page) · waiting", "Waiting on the authored-page inventory.") }
-                else { ("\(page) · unclaimed", "No active part claims this page. Open it to read its status.") }
-            ShellRailItem(title: words.title, help: words.help, identifier: "sidebar.page.\(page)",
-                          isSelected: selection == .ownPage && selectedPage == page,
-                          onSelect: { selectPage(page) }, barNamespace: selectionBar)
-        case .divider:
-            Rectangle()
-                .fill(NativeAgentShell.hairline)
-                .frame(height: 1)
-                .padding(.horizontal, NativeAgentShellLayout.railWordInset)
-                .padding(.vertical, 6)
-                .allowsHitTesting(false)
-                .focusable(false)
-                .accessibilityHidden(true)
-        }
+    private func row(_ shown: ShellSurfacePages) -> some View {
+        ShellPlaceRow(place: shown, isSelected: shown.surface == surface, barNamespace: selectionBar) { choose(shown.surface, shown.pages) }
     }
 }
 
-private struct ShellAttentionRailItem: View {
+/// One place's row, the same in Advanced's rail and Simple's sidebar: its word, the pages it holds as help, and on Desk whether something
+/// waits on the person.
+struct ShellPlaceRow: View {
     @Environment(AppModel.self) private var appModel
+    let place: ShellSurfacePages
     let isSelected: Bool
     let barNamespace: Namespace.ID
     let onSelect: () -> Void
 
     var body: some View {
-        let waiting: Bool? = appModel.countPart("deskWaiting.presence") { face in
-            guard let count = face?.deskWaiting, count.isAvailable, let value = count.value else { return nil }
-            return value > 0
+        let title = place.surface.title(appModel)
+        // The row's help names the pages it holds, in the order its tabs show them.
+        let words = ShellPageWords(appModel, pages: place.pages)
+        let help = place.pages.map { words.title($0) }.joined(separator: ", ")
+        let identifier = "sidebar.surface.\(place.surface.rawValue)"
+        if place.surface == .desk {
+            ShellAttentionRailItem(title: title, help: help, identifier: identifier, isSelected: isSelected,
+                                   barNamespace: barNamespace, onSelect: onSelect)
+        } else {
+            ShellRailItem(title: title, help: help, identifier: identifier, isSelected: isSelected,
+                          onSelect: onSelect, barNamespace: barNamespace)
         }
-        ShellRailItem(item: .activity, isSelected: isSelected, needsYou: waiting == true, attentionUnavailable: waiting == nil,
-                      onSelect: onSelect, barNamespace: barNamespace)
+    }
+}
+
+/// The Desk row carries whether something waits on the person; reading it here keeps the count's changes from redrawing the rail.
+private struct ShellAttentionRailItem: View {
+    @Environment(AppModel.self) private var appModel
+    let title: String
+    let help: String
+    let identifier: String
+    let isSelected: Bool
+    let barNamespace: Namespace.ID
+    let onSelect: () -> Void
+
+    var body: some View {
+        let waiting = appModel.waitingOnPerson
+        ShellRailItem(title: title, help: help, identifier: identifier, isSelected: isSelected, needsYou: waiting == true,
+                      attentionUnavailable: waiting == nil, onSelect: onSelect, barNamespace: barNamespace)
     }
 }

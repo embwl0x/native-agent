@@ -69,10 +69,14 @@ extension AppModel {
             if engine.providers.settings?.catalogError != nil { failedEndpoints.append("model catalog") }
             await reloadChatState()
             if chatStateLoadFailed { failedEndpoints.append("chat messages") }
-            _ = fresh("personality", try? await persona.loadDocuments())
+            // Before the first names are saved there is no personality to read: absent, not a failed refresh.
+            let named = FileManager.default.fileExists(atPath: engine.dataRoot.appendingPathComponent("memory/profile.json").path)
+            let documents = try? await persona.loadDocuments()
+            if named { _ = fresh("personality", documents) }
             // Load the profile on Chat entry so names come from their owner.
             if persona.profile == nil {
-                _ = fresh("personality profile", try? await persona.loadProfile())
+                let profile = try? await persona.loadProfile()
+                if named { _ = fresh("personality profile", profile) }
                 teachMemoryHygieneName(previousName: previousName)
             }
         case .bots:
@@ -110,6 +114,8 @@ extension AppModel {
             _ = fresh("connectors", try? await engine.connectors.refresh().get())
             _ = fresh("shared folders", try? await engine.connectors.refreshWorkspaces())
         case .providers:
+            // Arriving here asks only a connected provider with no list saved for its current credential.
+            engine.providers.fetchMissingModelListsInBackground()
             switch await engine.providers.refreshSettings(refreshCatalog: false, cause: UserFacingError.cause) {
             case .loaded(let settings):
                 if settings.catalogError != nil { failedEndpoints.append("model catalog") }

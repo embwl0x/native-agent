@@ -6,6 +6,7 @@ import Network
 import AgentWorkspace
 import AgentConversations
 import AgentLinkTransport
+import ChatToolRuntime
 import NativeAgentCore
 import PersistenceCore
 import Privacy
@@ -224,6 +225,13 @@ public struct AgentContactRoutes: Sendable {
                     let carriedHeld = response["error"] == nil
                     BridgeCore.writeJSON(conn, status: 200, obj: response, onSent: { fetched?(); settle(carriedHeld) },
                                          onFailed: { settle(false) })
+                }
+            case .table(let arguments, let project):
+                Task {
+                    let read = await Self.tableRead(arguments, principal: principal, dataRoot: dataRoot)
+                    let response = project(read.fields, read.failed)
+                    let carriedHeld = response["error"] == nil
+                    BridgeCore.writeJSON(conn, status: 200, obj: response, onSent: { settle(carriedHeld) }, onFailed: { settle(false) })
                 }
             case .immediate(let status, let response):
                 settle(false)
@@ -644,6 +652,54 @@ public struct AgentContactRoutes: Sendable {
 
 
 extension AgentContactRoutes {
+    /// A contact the person brought to the table reads the Desk, or a piece on it; one not at the table is told how to get there. The lever is read
+    /// again after the read, under the contact store's lock, by the same write that records the read on the contact: no lever or no record, no words.
+    static func tableRead(_ arguments: [String: JSONValue], principal: AgentBridgePrincipal, dataRoot: URL) async -> (fields: [String: Any], failed: Bool) {
+        let agent = PeerFacingIdentity.agentName
+        let notAtTable: (fields: [String: Any], failed: Bool) = (["status": "not_at_table", "detail": """
+            You are not at \(agent)'s table, so the Desk is not yours to read. Ask \(agent) with agent_message; \(agent) asks the person, \
+            whose choice it is. Nothing was read.
+            """], true)
+        func project(_ value: JSONValue, failed: Bool) -> (fields: [String: Any], failed: Bool) {
+            guard case .object(let fields) = value else { return (["result": value.foundationObject], failed) }
+            return (fields.mapValues(\.foundationObject), failed)
+        }
+        func unknown(_ error: Error) -> (fields: [String: Any], failed: Bool) {
+            (["status": "unavailable", "detail": """
+                \(agent)'s contacts could not be read, so whether you are at the table is not known: \
+                \(NativeAgentSecretRedactor.redactText(error.localizedDescription)). Nothing was read.
+                """], true)
+        }
+        guard let peerID = principal.peerID else {
+            return (["status": "refused", "detail": "Only a contact's own key reads the table. Nothing was read."], true)
+        }
+        let store = AgentPeerStore(dataRoot: dataRoot)
+        let found: AgentPeerContact?
+        do { found = try store.list().first { $0.id == peerID } }
+        catch { return unknown(error) }
+        // Only the person's lever, set on this contact, brings it to the table.
+        guard let contact = found, contact.readsDesk == true, contact.canReadTable else { return notAtTable }
+        let read: JSONValue
+        do { read = try await SwiftToolDispatcher(dataRoot: dataRoot, allowProcessGlobalTools: false).tableRead(input: arguments) }
+        catch {
+            // A refusal carries no Desk words and is no read, but it goes back only while the contact is still at the table.
+            do {
+                guard let now = try store.list().first(where: { $0.id == peerID }), now.readsDesk == true, now.canReadTable else { return notAtTable }
+            } catch { return unknown(error) }
+            return project(ChatToolOutcome.failure(error: error, tool: "agent_desk", effects: ToolFailureError.Effects.none), failed: true)
+        }
+        let piece = read.objectValue?["piece"]?.objectValue
+        let entry = AgentTableRead(at: Date(), piece: piece?["make_ref"]?.stringValue, title: piece?["title"]?.stringValue)
+        do { guard try store.recordTableRead(peerID: peerID, entry) else { return notAtTable } }
+        catch {
+            return (["status": "unavailable", "detail": """
+                The read could not be recorded on your contact (\(NativeAgentSecretRedactor.redactText(error.localizedDescription))), so its words \
+                were not returned. Read again.
+                """], true)
+        }
+        return project(read, failed: false)
+    }
+
     static func writeA2AJSON(_ connection: NWConnection, status: Int, object: [String: Any], onSent: (@Sendable () -> Void)? = nil,
                              onFailed: (@Sendable () -> Void)? = nil) {
         guard let body = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {

@@ -66,6 +66,107 @@ extension AbilityStore {
             "enum": .array(verbs.keys.sorted().map(JSONValue.string))])]), "required": .array([.string("verb")]),
             "additionalProperties": .bool(true)])
     }
+    /// The entry a part answers with is a fact of the part, read here alone: it answers calls with run(input), unless its header declares
+    /// face.projection and its code never names run, which makes it a page, drawn by face(input) and never offered as a call. A version's program
+    /// entry, catalog publication (`callable` on its registry row) and execution all take this one answer.
+    public static func answersCalls(_ source: String, header: [String: JSONValue]) -> Bool {
+        guard header["face"]?.objectValue?["projection"] == .bool(true) else { return true }
+        return definesRun(source)
+    }
+    /// Whether code names run at all, read through `lexed` so strings, comments and templates never count. Deliberately wider than "defines
+    /// run": however a part binds its entry (a declaration, one of several declarators, an assignment inside a wrapper), it names it. The
+    /// only way this can be wrong is to offer a page as a call, which refuses plainly when called; it can never hide a working action.
+    public static func definesRun(_ source: String) -> Bool {
+        let code = Array(lexed(source).code.utf16)
+        func word(_ c: UInt16) -> Bool { c >= 128 || (48...57).contains(c) || (65...90).contains(c) || (97...122).contains(c) || c == 95 || c == 36 }
+        var i = 0
+        while i < code.count {
+            guard word(code[i]) else { i += 1; continue }
+            let start = i
+            while i < code.count, word(code[i]) { i += 1 }
+            if i - start == 3, code[start] == 114, code[start + 1] == 117, code[start + 2] == 110 { return true }
+        }
+        return false
+    }
+    /// The one JavaScript source reader (`OwnedProgram.calls` and `answersCalls` read through it): strings, comments, template text and
+    /// regular expressions are masked to spaces with offsets and lines kept; template expressions stay code. Literal spans are returned.
+    public static func lexed(_ source: String) -> (code: String, literals: [Range<Int>]) {
+        let text = Array(source.utf16)
+        var masked = text, i = 0
+        var literals: [Range<Int>] = []
+        func word(_ c: UInt16) -> Bool { c >= 128 || (48...57).contains(c) || (65...90).contains(c) || (97...122).contains(c) || c == 95 || c == 36 }
+        func hide(_ start: Int) { for n in start..<i where text[n] != 10 && text[n] != 13 { masked[n] = 32 } }
+        func literal(_ delimiter: UInt16) {
+            let start = i
+            i += 1
+            var bracket = false
+            while i < text.count {
+                let c = text[i]; i += 1
+                if c == 92 { i = min(i + 1, text.count); continue }
+                if delimiter == 47, c == 91 { bracket = true }
+                if delimiter == 47, c == 93 { bracket = false }
+                if c == delimiter, !bracket { break }
+            }
+            if delimiter == 47 { while i < text.count, word(text[i]) { i += 1 } }
+            if delimiter != 47 { literals.append(start..<i) }
+            hide(start)
+        }
+        func code(_ interpolation: Bool = false) {
+            var regexAllowed = true, previous = "", parens: [Bool] = [], braces: [Bool] = []
+            while i < text.count {
+                let c = text[i], next = i + 1 < text.count ? text[i + 1] : 0
+                if c == 32 || c == 9 || c == 10 || c == 13 { i += 1; continue }
+                if c == 47, next == 47 || next == 42 {
+                    let start = i; i += 2
+                    while i < text.count {
+                        if next == 47, text[i] == 10 || text[i] == 13 { break }
+                        if next == 42, text[i] == 42, i + 1 < text.count, text[i + 1] == 47 { i += 2; break }
+                        i += 1
+                    }
+                    hide(start); continue
+                }
+                if c == 34 || c == 39 || (c == 47 && regexAllowed) {
+                    literal(c); regexAllowed = false; previous = "literal"; continue
+                }
+                if c == 96 {
+                    var start = i; i += 1
+                    while i < text.count {
+                        if text[i] == 92 { i = min(i + 2, text.count); continue }
+                        if text[i] == 96 { i += 1; literals.append(start..<i); hide(start); break }
+                        if text[i] == 36, i + 1 < text.count, text[i + 1] == 123 {
+                            i += 2; literals.append(start..<i); hide(start); code(true); start = i; continue
+                        }
+                        i += 1
+                    }
+                    hide(start); regexAllowed = false; previous = "literal"; continue
+                }
+                if word(c) {
+                    let start = i
+                    while i < text.count, word(text[i]) { i += 1 }
+                    previous = String(decoding: text[start..<i], as: UTF16.self)
+                    regexAllowed = ["return", "throw", "case", "delete", "void", "typeof", "new", "in", "of", "yield", "await", "else", "do"].contains(previous)
+                    continue
+                }
+                if (c == 43 || c == 45), next == c {
+                    i += 2; previous = "increment"; continue
+                }
+                i += 1
+                if c == 123 {
+                    braces.append(["=", "(", "[", ",", ":", "?", "return", "yield", "await"].contains(previous) || (interpolation && previous.isEmpty))
+                }
+                if c == 125 {
+                    if interpolation, braces.isEmpty { masked[i - 1] = 32; return }
+                    regexAllowed = !(braces.popLast() ?? false)
+                    previous = "}"; continue
+                }
+                if c == 40 { parens.append(["if", "while", "for", "with", "switch", "catch"].contains(previous)) }
+                regexAllowed = c == 41 ? (parens.popLast() ?? false) : ![93, 46].contains(c)
+                previous = String(decoding: [c], as: UTF16.self)
+            }
+        }
+        code()
+        return (String(decoding: masked, as: UTF16.self), literals)
+    }
     /// Identity normalization is shared below Parts.
     public static func normalizedID(_ given: String) -> String {
         given.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

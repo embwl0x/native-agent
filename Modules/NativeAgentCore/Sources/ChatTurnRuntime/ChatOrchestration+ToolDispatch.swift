@@ -60,9 +60,29 @@ extension SwiftNativeTurnEngine {
         let planned: [(call: PreparedToolCall, offered: Bool, input: [String: JSONValue], undeclared: [String])] = providerCalls
             .enumerated().compactMap { i, call in
                 guard !ToolCallParser.isIgnorableToolName(call.name) else { return nil }
-                let requestedName = providerTools.internalName(forProviderName: call.name)
-                let internalName = CanonicalToolNameDispatcher.canonical(requestedName)
-                let input = Self.inputWithSessionIfNeeded(toolName: internalName, input: call.input, sessionId: sessionId)
+                var requestedName = providerTools.internalName(forProviderName: call.name)
+                var internalName = CanonicalToolNameDispatcher.canonical(requestedName)
+                var callInput = call.input
+                var undeclared = call.undeclaredKeys
+                // A call written under an action's own name is that action through `app`: the same act through the same gates, with no round
+                // spent being told so. A name `app` has no action for is still refused.
+                if providerTools.providerName(forInternalName: internalName) == nil, providerTools.providerName(forInternalName: "app") != nil {
+                    let id = requestedName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    let args = callInput.filter { !$0.key.hasPrefix("__") }
+                    var folded = ToolNameAliases.appCall(internalName, input: callInput)
+                    // The name is an action's own id, a native one or an ability's: `app` with that action and these arguments.
+                    if folded == nil, (try? AppActionBinding.binding(id, turn: turn)) != nil {
+                        folded = args.isEmpty ? ["action": .string(id)] : ["action": .string(id), "args": .object(args)]
+                    }
+                    if let folded {
+                        // The call is dispatched by the name it was asked under, so the asked name becomes `app` with it.
+                        requestedName = "app"
+                        internalName = "app"
+                        callInput = folded
+                        undeclared = []
+                    }
+                }
+                let input = Self.inputWithSessionIfNeeded(toolName: internalName, input: callInput, sessionId: sessionId)
                 let prepared = PreparedToolCall(
                     pairedId: i < pairedIds.count ? pairedIds[i] : call.id,
                     requestedName: requestedName,
@@ -72,9 +92,9 @@ extension SwiftNativeTurnEngine {
                 )
                 // Every model call requires an offered descriptor. Internal app re-entry
                 // has its own checked gate and never passes through this provider layer.
-                let refusal = Self.modelCallRefusal(name: internalName, input: call.input,
-                    undeclaredKeys: call.undeclaredKeys, providerTools: providerTools)
-                return (prepared, refusal == nil, call.input, call.undeclaredKeys)
+                let refusal = Self.modelCallRefusal(name: internalName, input: callInput,
+                    undeclaredKeys: undeclared, providerTools: providerTools)
+                return (prepared, refusal == nil, callInput, undeclared)
             }
         // An undecided card owns its effect. Its resolution answers one re-proposal; later identical calls are fresh gated invocations.
         var approvalRecords: Result<[ApprovalRecord], Error>?
@@ -318,15 +338,19 @@ extension SwiftNativeTurnEngine {
     /// A text-lane block carrying fields its tool does not take is not a call
     /// it can run (`TextMarkerCodec.calls`); it ran nothing.
     nonisolated static func undeclaredFieldsResult(_ name: String, keys: [String]) -> JSONValue {
-        .object([
+        // On app, fields beside an action are that action's arguments in the wrong place: the words say where they go.
+        let app = name == "app"
+        return .object([
             "error": .string("\(name) takes no \(keys.joined(separator: ", ")), so this block was not run. "
-                + "To call \(name), use only its own parameters."),
+                + (app ? "An action's own arguments go inside args: put them there and send it again."
+                       : "To call \(name), use only its own parameters.")),
             "status": .string("skipped"),
             "reason": .string("undeclared_call_fields"),
             "effects": .string("none"),
             "remedy": .object(["kind": .string("correct_arguments"),
-                "instruction": .string("Find the action's accepted parameters, then remove the undeclared fields."),
-                "next_call": .object(["tool": .string("app"), "input": .object(["find": .string(name)])])]),
+                "instruction": .string(app ? "Move \(keys.joined(separator: ", ")) into args and call again."
+                                           : "Find the action's accepted parameters, then remove the undeclared fields."),
+                "next_call": app ? .null : .object(["tool": .string("app"), "input": .object(["find": .string(name)])])]),
         ])
     }
 

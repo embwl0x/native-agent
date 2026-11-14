@@ -16,8 +16,9 @@ delivery of the admitted message to the part. The part decides what happens next
 the Swift stem runs its effects under the ordinary authority gates.
 
 The model receives selected context, not direct access to the Mac's memory.
-NativeAgent offers one tool, `app`. Its home, pages and actions provide reach
-without sending a catalog of separate tool schemas on every request.
+NativeAgent offers the agent its one door, `app`. Its home, pages and actions
+provide reach without sending a catalog of separate tool schemas on every
+request.
 
 ## The complete turn
 
@@ -359,7 +360,15 @@ that recall for this turn. The same
 context owner still prepares the rest of the working set; no alternate recall,
 retry or longer wait runs. The dynamic packet carries one plain line beginning
 `Recall was unavailable this turn`, naming each cause and saying that it is not
-evidence that a memory exists or does not exist. An unread user core withholds
+evidence that a memory exists or does not exist. The same notice then says what
+selection chose and the owners' check held back
+(`SwiftNativeTurnEngine.withheldContextNotice`): how many memories or pieces of
+context, and each reason the owners gave (just saved and still being checked,
+unreadable saved dates, a changed source being read again, a store that could
+not confirm them), or that they changed or were removed since the context was
+prepared. Each reason speaks only for the withheld items of the source it names
+(an owner that cannot confirm anything names each source it held back), with a
+tally per reason when there are several. What is withheld does not change. An unread user core withholds
 generated USER facts and leaves `expression.established` unknown, so the seed
 does not infer a first conversation from a failed read.
 
@@ -443,7 +452,7 @@ The request carries only `app`. `app {}` opens home, `find` discovers reach,
 and `action` executes a registry entry; their own abilities are their own actions,
 `authored.<id>`, read through `ability.read` when useful. Discovery does not mount a schema or grant permission.
 
-See [Tool loading: the contract](TOOL_LOADING.md) for the exact interface.
+See [One door: the contract](ONE_DOOR.md) for the exact interface.
 
 ## 4. The provider request is assembled
 
@@ -566,7 +575,8 @@ from the person's other doors; a thought's closing words also stay out.
 
 At turn start, other conversations remain present for 24 hours: up to five compact
 lines, newest first, show the last message's time before the recent-word boundary,
-its opening 120 characters, and `app {page:"chat",item:"<session>"}` to open the
+who spoke it (the agent or the other side) and its opening 600 characters, the length
+an exchange is quoted at, and `app {page:"chat",item:"<session>"}` to open the
 conversation. This read runs ahead of every first word, so each recently modified
 other transcript is read back in 64 KiB chunks from captured EOF only until a chunk
 holds an eligible message or lies wholly before the day. Imported reply times need
@@ -586,6 +596,8 @@ door/count/time speech, and day door/time lines, with no private words.
 
 `SwiftNativeTurnEngine.personContinuityAllowed` is the shared turn gate for the life
 packet, elsewhere words and each later breath: a person's chat/iPhone arrival,
+their arrival at another door only on the owner-turn proof (`isUsersTurn`: a
+Telegram thread whose sender is the verified owner),
 or their own unsteered turn in a direct app/iPhone conversation. Peer origins,
 bridge doors and carried peers (including elevated ones) admit no cross-room
 private words; remote strangers receive no person's acts. A mixed session's
@@ -681,10 +693,41 @@ Source: `ChatSessionWork/SessionHistoryMessageProjection.swift`, `SessionHistory
 
 ### Measuring the work before the model
 
-`turn.accepted` is emitted after incoming-message persistence, before the acceptance checkpoint. `context.history.summary` carries
-the history read, rendering, base-context and current-facts timings;
-`context.summary` carries the nested selection, recall, persona and schema work.
-These stages overlap or nest, so their medians must not be added.
+`turn.accepted` is emitted after incoming-message persistence, before the acceptance checkpoint.
+Everything a turn does before its first model call is `turn.history_context`, and it is
+partitioned exactly. A summary row's `partitionNs` maps each parent to its steps in
+nanoseconds plus `<parent>.other`, the time no step names (glue between steps and the
+hops around an `await`). One parent's steps never overlap and sum to it exactly, before
+any rounding; a negative `.other` would mean two steps overlapped. A stage only in
+`stageMs` is nested diagnostic time and is never added. `totalNs` is the row's own interval.
+
+- `turn.preparation.summary`: `turn.history_context` is `history.build` (the builder's own
+  summary, from this caller's clock read to its close) plus `turn.history_context.return`
+  (emitting that summary and the hop back onto the client actor).
+- `context.history.summary`, `totalNs` equal to `history.build`: `history.entry` (task-local
+  binding and the hop onto the engine actor), `history.budget`, `history.quiet_hours`,
+  `history.prompt_read`, `history.prepare`, `history.exchanges` (pairing and the base call's
+  arguments), `context.base`, `context.base.return` (the inner summary's emission, its usage
+  credit list and the return), `history.admission`, `history.receipts`, `context.facts.join`
+  and `context.facts.compose`. `history.prompt_read` splits into `.file` (the read inside the
+  reader actor), `.reader_hop` (waiting for and leaving that actor), `.lines` (UTF-8 decode and
+  split), `.row_memo` (the memo snapshot and every per-line lookup or decode), `.select` and
+  `.memo_write`; its counts are `history.prompt.sourceBytes`, `linesRead`, `decodeCacheHits`
+  and `decodeCacheMisses`.
+- `context.summary`, `totalNs` equal to `context.base`: `context.budget` (only when the base is
+  built directly), `contextFlow.query_embedding_start`, `contextFlow.attention`,
+  `contextFlow.mode`, `memory.recall_gate`, `contextFlow.query_embedding_wait`,
+  `memory.user_core` (count `memory.userCoreFacts`, the facts it delivered), `contextFlow.prepare`,
+  `persona.compile`, `rem_pins.read`, `memory.recall` (only when no context flow prepared the
+  turn), `tools.catalog`, `context.intentions`, `prompt.render`, and with clock context
+  `context.facts.join` and `context.facts.compose`.
+
+Nested and never summed: `contextFlow.attention.actorAdmission`; `memory.recall` when the
+context flow prepared the turn (the selector's time, inside `contextFlow.prepare`);
+`history.recall_query`; `tools.names` and `tools.schemas`, which can read at once;
+`context.episodic` inside `prompt.render`; `context.clock_runtime` (join plus compose); the
+`context.facts.*` reads gathered beside history; and the elsewhere, arrivals and runtime stages
+inside compose. A build that throws emits no summary.
 
 `turn.preparation.summary` separates checkpoint, history/context, the remaining
 cognitive join and capsule append/filter. `turn.dispatch.summary` separates
@@ -704,6 +747,9 @@ opening-request snapshot is captured after tail fitting, from the final
 seed, codec system layout and the message array passed to streaming. Its system
 and schema measurements include the actual text-marker protocol/catalog when
 selected; the prompt fingerprint covers that system and every wire message.
+That catalog carries an always-on tool whole (its description, which ends with
+their hand, and each parameter's own words), as the native wire does; a tool
+loaded beside it is one line of at most 180 characters.
 Fed-context publication reserves its root/session identity before escaping into
 bookkeeping, rejects superseded reservations, serializes atomic writes and joins
 their actual result before turn settlement. It never infers the process's live
@@ -987,7 +1033,14 @@ snapshot immediately and coalesces later frames. Telegram private chats use
 native drafts; Telegram groups and Slack publish editable reply messages while
 tools run, then settle those same messages with the complete successful reply.
 A failed/stopped turn keeps its spoken group/channel words beside its failure
-notice or stopped card. First words have no accumulation delay; subsequent
+notice or stopped card. A private chat's draft expires, so the saved row keeps
+them: a stopped or failed turn's row is an incomplete reply carrying that
+`terminalState`. When a door recovers it (a resident turn's settlement, a
+Telegram claim after Stop, a live failure's notice, restart), Telegram and Slack
+send its words once, closed by that door's stop or failure words, over any
+preview; the phone marks them `partialReply`. The turn never runs again, and an
+engine restart hands them to the door's journal, not the generic reply
+lifecycle. First words have no accumulation delay; subsequent
 snapshots coalesce at the transport's
 edit interval. Durable delivery owners retain created message IDs and possible
 creation before touching the wire; missing acceptance never authorizes another
@@ -1019,7 +1072,7 @@ the tool loop:
 Full Mac gives the agent autonomy, including app actions otherwise marked the owner's.
 Explicit blocks and actual platform access still apply. macOS privacy
 permission resets ask the owner first. Peer turns follow the
-[authority contract](TOOL_LOADING.md#authority-and-receipts).
+[authority contract](ONE_DOOR.md#authority-and-receipts).
 
 A call runs beside another only when its declared class is read and its
 catalog bucket is core or file-ops; browser, Mac integration, Mac control,
@@ -1029,18 +1082,31 @@ Provider-facing results are bounded only after their complete redacted body
 is retained. `ProviderToolResultPage` and `ProviderToolResultRecoveryStore`
 own this boundary for every tool, dispatch preview and context-overflow
 pointer (whose `saved_result_path` remains with chat after its handle is
-released). Program returns cross the helper transport whole; script and part
-ledgers keep every journaled step's answer,
-including reads and answers the program does not return. No helper prefix or
-byte-count-only step result bypasses retention.
+released). Program returns cross the helper transport whole; a script's or
+part's journal keeps every step's answer privately for replay, and its receipt's
+`calls` show each step's identity and outcome, never its raw result (the
+[receipts law](ONE_DOOR.md#authority-and-receipts)). No helper prefix
+bypasses retention.
 
 A bounded view names `result_handle`, `full_result_retained:true` and
 `next_call`. `result.page` reads that session-and-turn-scoped handle: `page`
 is the zero-based page offset, `raw:true` reads exact UTF-8 bytes, `pages`
 joins that many pages in one answer up to what one inline result holds (omitted,
-a section read joins two and a raw read one; a single long value takes a page
-of its own, and `page` in the answer is where it started), and
+a read joins as many as that holds and an explicit raw read takes one; a long
+line takes a page of its own, a longer string is read as ordered pieces that
+join back to it exactly, and `page` in the answer is where it started), and
 `next_page` or `continue:true` advances without running the action again.
+A `query` returns where its terms are, not everything around them: from
+each section that holds every term (a term cut by the seam between two
+pieces still counts), one row per line holding a term (its first match),
+with its `path`, its `line` (where the value has no lines, an `offset`), the
+line itself or a bounded window of a long line around the match, the
+adjacent line on each side, and `section_page`, the page of a reading without
+query that shows the whole section. Rows fit a page by their serialized
+size, separators included. A search reads only as far as the page asked for
+and goes on from there on the next read, so its work follows the bytes it
+reads. Without a query, sections come whole and join back to the result
+exactly.
 The handle holds the answer, not its source: when the answer said its source
 has more (`has_more` with `next`), every page and the end of reading carry
 `source_continues`, whose `next_call` reads the source on; paging never does.
@@ -1057,7 +1123,18 @@ in its caller's dispatch record; model delivery marks the projection error.
 
 The loop handles cancellation, bounded dispatch response waits and malformed-call feedback. The original tool owns its actual receipt and checkpoint settlement after a wait expires. Native routes execute only structured calls, text-marker routes only their offered markers, and text-only routes execute none. Malformed text is refused without salvage, and helpers share the offered-descriptor admission before the gate chain. No schema-loading round is needed between iterations. [Turn resilience](TURN_RESILIENCE.md#3-tool-dispatch-deadline) owns this contract.
 Fenced and inline code examples remain answer text; markers inside them never
-execute or trigger protocol repair. Explicit refusal and Stop receipts keep
+execute or trigger protocol repair. On the text-marker wire a call is an
+offered tool name around one JSON object: the model's trained
+`<invoke name=…>` tag around a JSON object is the same call as `<tool_use>`,
+closed by either tag, and a call written inside another call's body is that
+call's text, never a second call. The body is read as JSON: it runs to its
+object's end and the closing tag after it, so nothing inside a string can end
+the call (a body that is not JSON ends at the first closing tag). The provider
+stops at a literal `</function_calls>`, so the call-format instructions ask
+for `</` inside a string as `<\/`, which JSON reads as the same text. A call written under an action's own name
+(`desk.read` instead of `app` with that action) is that action through `app`,
+run through the same gates; only a name `app` has no action for is refused as
+not offered. Explicit refusal and Stop receipts keep
 their typed outcomes even when an error field explains them.
 Text markers use the same object-argument validation as native and bare-JSON
 calls. A malformed argument body remains invalid for resident and helper
@@ -1219,7 +1296,7 @@ on without the note). There is no private model call after the reply and no
 A deed may carry its own ending. When the round ran one call, that call's
 input has `actions` and text `then_say`, and its result's `then_say` stands,
 the `result` event carries `say`: the filled words
-([contract](TOOL_LOADING.md)). An action's own answer cannot put words there,
+([contract](ONE_DOOR.md)). An action's own answer cannot put words there,
 because the call itself must have asked. The shipped `turn.js` then streams
 `say`, ends and asks for the after line, with no `tool_round` model call;
 any other result goes back to their mind as before. Their earlier prose in the
@@ -1249,7 +1326,7 @@ unreadable checkpoint keeps its own repair pending while other records proceed.
 Source paths above are under `Modules/NativeAgentCore/Sources/`.
 
 - [Internal Workings](INTERNAL_WORKINGS.md) — memory, action, growth and surfaces.
-- [Tool loading: the contract](TOOL_LOADING.md) — the one app interface.
+- [One door: the contract](ONE_DOOR.md) — the one app interface.
 - [Turn resilience](TURN_RESILIENCE.md) — interrupted and incomplete turns.
 - [Automated systems](AUTOMATED_SYSTEMS.md) — work outside the foreground turn.
 - [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md) — source ownership.

@@ -9,88 +9,53 @@ import SwiftUI
     private struct NoteTarget: Identifiable {
         let id: String
     }
-    @State private var note: NoteTarget?
-    @State private var pageSheet: DeskPageSheet?
-    @State private var newTask = false
-    @State private var finding = false
-    @State private var paletteAction: DeskCommandRequest?
-    @State private var actionMessage: String?
+    /// The Desk's sheets belong to the window, not to one drawing of the page: whichever Desk page is in the window shows them.
+    @State private var sheets = DeskWindowPresentation.shared
     func body(content: Content) -> some View { preferenceContent(content) }
 
     private func preferenceContent(_ content: Content) -> some View {
-        content
-            .onAppear { if !quietOffscreenRead { DeskWindowPresentation.shared.receiver = request } }
-            .onDisappear { if !quietOffscreenRead { DeskWindowPresentation.shared.receiver = nil } }
-            .sheet(item: $note) { target in DeskFaceNoteSheet(handle: target.id) }
-            .sheet(isPresented: $newTask) { NewDeskTaskSheet() }
-            .sheet(isPresented: $finding, onDismiss: answerPalette) {
-                CommandPaletteView(isPresented: $finding, desk: DeskPaletteScope(
-                    onSelect: select, onCommand: { paletteAction = $0 }))
+        @Bindable var sheets = sheets
+        let appModel = appModel
+        return content
+            .onAppear { if !quietOffscreenRead { sheets.receiver = { try await DeskWindowPresentation.shared.take($0, appModel: appModel) } } }
+            .onDisappear { if !quietOffscreenRead { sheets.receiver = nil } }
+            .sheet(item: Binding(get: { sheets.note.map(NoteTarget.init) }, set: { sheets.note = $0?.id })) { target in
+                DeskFaceNoteSheet(handle: target.id)
             }
-            .alert("Desk", isPresented: Binding(get: { actionMessage != nil }, set: { if !$0 { actionMessage = nil } })) {
-                Button("OK") { actionMessage = nil }
+            .sheet(isPresented: $sheets.newTask) { NewDeskTaskSheet() }
+            .sheet(isPresented: $sheets.finding, onDismiss: answerPalette) {
+                CommandPaletteView(isPresented: $sheets.finding, desk: DeskPaletteScope(
+                    onSelect: select, onCommand: { sheets.paletteAction = $0 }))
+            }
+            .alert("Desk", isPresented: Binding(get: { sheets.actionMessage != nil }, set: { if !$0 { sheets.actionMessage = nil } })) {
+                Button("OK") { sheets.actionMessage = nil }
             } message: {
-                Text(actionMessage ?? "")
+                Text(sheets.actionMessage ?? "")
             }
-            .sheet(item: $pageSheet) { which in
-                DeskPageSheetHost(sheet: which) { pageSheet = nil }
+            .sheet(item: $sheets.pageSheet) { which in
+                DeskPageSheetHost(sheet: which) { sheets.pageSheet = nil }
             }
             .onReceive(NotificationCenter.default.publisher(for: .openCommandPaletteRequest)) { _ in
                 guard !quietOffscreenRead else { return }
-                finding = true
+                sheets.finding = true
             }
     }
 
     private func select(_ handle: String) {
         appModel.pendingDeskHandle = handle
         Task {
-            do { actionMessage = try FaceWindowReply.message(await appModel.client.act(.deskCommand(.init(
+            do { sheets.actionMessage = try FaceWindowReply.message(await appModel.client.act(.deskCommand(.init(
                 command: "select", handle: handle, arguments: [:])))) }
-            catch { actionMessage = error.localizedDescription }
+            catch { sheets.actionMessage = error.localizedDescription }
         }
     }
 
     private func answerPalette() {
-        guard let command = paletteAction else { return }
-        paletteAction = nil
+        guard let command = sheets.paletteAction else { return }
+        sheets.paletteAction = nil
         Task {
-            do { actionMessage = try FaceWindowReply.message(await appModel.client.act(.deskCommand(command))) }
-            catch { actionMessage = error.localizedDescription }
-        }
-    }
-
-    private func request(_ request: DeskPresentationRequest) async throws -> String {
-        guard note == nil, !newTask, pageSheet == nil, !finding else {
-            throw PartCallError(code: "editor_in_use", message: "Close the current Desk sheet before opening another Desk editor.")
-        }
-        switch request {
-        case .select(let handle):
-            appModel.pendingDeskHandle = handle
-            return "Selected the Desk item on the Mac."
-        case .findItem:
-            finding = true
-            return "Opened Find item on the Mac."
-        case .newTask:
-            newTask = true
-            return "Opened New task on the Mac."
-        case .note(let handle):
-            note = NoteTarget(id: handle)
-            return "Opened the note editor on the Mac."
-        case .research:
-            pageSheet = .research
-            return "Opened research on the Mac."
-        case .reply(let handle):
-            let result = try await appModel.prepareChatDraft("About Desk item " + handle)
-            guard result.disposition == .applied else {
-                throw PartCallError(code: "composer_edit_conflict", message: "The composer changed. Its existing draft was preserved.")
-            }
-            return "Opened a chat draft about this item on the Mac."
-        case .copy(let text):
-            NSPasteboard.general.clearContents()
-            guard NSPasteboard.general.setString(text, forType: .string) else {
-                throw PartCallError(code: "clipboard_unavailable", message: "The Mac clipboard did not accept this reference.")
-            }
-            return "Copied the reference on the Mac."
+            do { sheets.actionMessage = try FaceWindowReply.message(await appModel.client.act(.deskCommand(command))) }
+            catch { sheets.actionMessage = error.localizedDescription }
         }
     }
 }
@@ -142,14 +107,56 @@ private struct DeskFaceNoteSheet: View {
     }
 }
 
-/// The renderer's reverse-call router invokes this mounted receiver.
-@MainActor final class DeskWindowPresentation {
+/// The window's Desk sheets. The renderer's reverse-call router asks through `present`; the Desk page in the window draws what is set here.
+@MainActor @Observable final class DeskWindowPresentation {
     static let shared = DeskWindowPresentation()
-    var receiver: ((DeskPresentationRequest) async throws -> String)?
+    var note: String?
+    var pageSheet: DeskPageSheet?
+    var newTask = false
+    var finding = false
+    var paletteAction: DeskCommandRequest?
+    var actionMessage: String?
+    @ObservationIgnored var receiver: ((DeskPresentationRequest) async throws -> String)?
+
     func present(_ request: DeskPresentationRequest) async throws -> String {
         guard let receiver else {
             throw PartCallError(code: "mac_window_unavailable", message: "Open Desk on the Mac to use this editor or the clipboard.")
         }
         return try await receiver(request)
+    }
+
+    func take(_ request: DeskPresentationRequest, appModel: AppModel) async throws -> String {
+        guard note == nil, !newTask, pageSheet == nil, !finding else {
+            throw PartCallError(code: "editor_in_use", message: "Close the current Desk sheet before opening another Desk editor.")
+        }
+        switch request {
+        case .select(let handle):
+            appModel.pendingDeskHandle = handle
+            return "Selected the Desk item on the Mac."
+        case .findItem:
+            finding = true
+            return "Opened Find item on the Mac."
+        case .newTask:
+            newTask = true
+            return "Opened New task on the Mac."
+        case .note(let handle):
+            note = handle
+            return "Opened the note editor on the Mac."
+        case .research:
+            pageSheet = .research
+            return "Opened research on the Mac."
+        case .reply(let handle):
+            let result = try await appModel.prepareChatDraft("About Desk item " + handle)
+            guard result.disposition == .applied else {
+                throw PartCallError(code: "composer_edit_conflict", message: "The composer changed. Its existing draft was preserved.")
+            }
+            return "Opened a chat draft about this item on the Mac."
+        case .copy(let text):
+            NSPasteboard.general.clearContents()
+            guard NSPasteboard.general.setString(text, forType: .string) else {
+                throw PartCallError(code: "clipboard_unavailable", message: "The Mac clipboard did not accept this reference.")
+            }
+            return "Copied the reference on the Mac."
+        }
     }
 }

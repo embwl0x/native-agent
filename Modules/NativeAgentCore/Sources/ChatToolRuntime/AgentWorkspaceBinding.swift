@@ -67,6 +67,8 @@ package enum ChatWorkspaceBinding {
         func liveHealth(dataRoot: URL) throws -> [String: AgentLocalHealth] {
             try AgentContactHealth.read(dataRoot: dataRoot)
         }
+        /// Dot's presence is read live from its transport, which announces its own changes.
+        var healthNotifications: [Notification.Name] { [ChatGPTDotIPCTransport.didChange] }
         func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord] {
             let store = AgentConversationStore(dataRoot: dataRoot)
             return try locked ? store.records() : store.recordsUnlocked()
@@ -156,7 +158,7 @@ package enum ChatWorkspaceBinding {
                     return $0.name < $1.name
                 }
                 let prefix = "Your live abilities you built or changed in 7d: "
-                let suffix = "; you can reach Mac apps through your tools."
+                let suffix = "; you can reach Mac apps through app."
                 var shown: [String] = []
                 for name in names {
                     let more = names.count - shown.count - 1

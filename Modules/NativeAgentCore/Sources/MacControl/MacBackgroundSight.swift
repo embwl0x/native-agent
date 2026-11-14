@@ -48,10 +48,12 @@ public enum MacBackgroundSight {
             let dockApps = hits.filter(\.isDockApp)
             let preferred = dockApps.isEmpty ? hits : dockApps
             guard let first = preferred.first else { return nil }
+            // This app runs as more than one process under one name: any of them is itself, never a choice between apps.
+            if preferred.contains(where: { PersonOnlyWindows.isOwnProcess($0.processIdentifier) }) { return .selfProcess }
             if Set(preferred.map(\.processIdentifier)).count > 1 {
                 return .ambiguous(candidates: candidateNames(preferred))
             }
-            return PersonOnlyWindows.isOwnProcess(first.processIdentifier) ? .selfProcess : .matched(first)
+            return .matched(first)
         }
         if let exact = resolution(apps.filter {
             normalized($0.name) == bare || normalized($0.bundleIdentifier ?? "") == bare

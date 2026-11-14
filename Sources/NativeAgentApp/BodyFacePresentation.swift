@@ -96,7 +96,9 @@ struct BodyFacePresentation: QuietToolPresentationPort {
             case .workPane: break
             default: try BodyInboxCardActionEffects.requirePresentation(reply)
             }
-            return .done(verb, "The window confirmed the presentation.")
+            var done = QuietComposerOutcome.done(verb, "The window confirmed the presentation.")
+            if case .navigation(let receipt) = reply { done.shownPage = receipt.destination?.page }
+            return done
         } catch { return .refuse(verb, "presentation_failed", error.localizedDescription, effects: .unknown) }
     }
 
@@ -123,6 +125,30 @@ struct BodyFacePresentation: QuietToolPresentationPort {
                 return AppToolExecutor.failure("invalid_height", "Screenshot height must be a finite number.")
             }
             height = min(max(supplied, 400), 2400)
+        }
+        // Picturing an item opens it first, as showing it does: the Desk's owner selects it, and the page is drawn open. The window stays on its page.
+        let asked = (input["item"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var selected: String?
+        if !asked.isEmpty {
+            let item = QuietPage(value: target).item
+            guard (SidebarItem.shellHome(for: item)?.parent ?? item) == .desk else {
+                return AppToolExecutor.failure("page_item_unavailable", "Only a Desk item opens in a picture; for this page, name one of its tabs with tab.")
+            }
+            do {
+                switch try await act(.deskCommand(.init(command: "select", handle: asked, arguments: [:]))) {
+                case .failed(let failure), .refused(let failure): throw failure
+                default: break
+                }
+            } catch let failure as WireFailure {
+                return AppToolExecutor.failure(failure.code, failure.localizedDescription)
+            } catch { return AppToolExecutor.failure("desk_item_unselected", error.localizedDescription) }
+            // Asking for the board lets the open item go, so there is none to name.
+            if asked != "board" {
+                guard let handle = model.engine.desk.faceItem else {
+                    return AppToolExecutor.failure("desk_item_unselected", "The Desk answered the selection but holds no item open.")
+                }
+                selected = handle
+            }
         }
         let reader = UUID()
         let transcripts = BodyFaceTranscripts(engine: model.engine)
@@ -203,10 +229,22 @@ struct BodyFacePresentation: QuietToolPresentationPort {
             if let failure = image.failure { throw failure }
             guard image.epoch == connection, image.appliedBarrier == barrier, let png = image.png,
                   image.pixelWidth > 0, image.pixelHeight > 0 else { throw FaceWireError.invalidFeedOrder }
+            // The page is drawn with whatever the Desk holds open: another item opened meanwhile is not the picture that was asked for.
+            if let selected, model.engine.desk.faceItem != selected {
+                throw PartCallError(code: "desk_item_changed", message: "The Desk's open item changed while \(asked) was being drawn; ask again.")
+            }
             result = await Self.save(target, tab: tabKey, root: model.engine.dataRoot, image: image, png: png, sink: imageSink)
         } catch { result = AppToolExecutor.failure("render_failed", error.localizedDescription) }
         await settle { await transcripts.close() }
-        return result
+        guard let selected, case .object(var fields) = result else { return result }
+        // The selection is the Desk's own and stays, so the reply names it, and a Desk on screen shows it open too.
+        fields["item"] = .string(asked)
+        fields["selected"] = .string(selected)
+        if fields["note"] != nil {
+            fields["note"] = .string("An offscreen drawing of this page with \(asked) open, not a capture of the screen. The app was not brought forward; "
+                + "\(asked) is now the Desk's open item, so a Desk on screen shows it open.")
+        }
+        return .object(fields)
     }
     @concurrent private static func save(_ page: QuietToolPage, tab: String, root: URL, image: PageRenderResult, png: Data,
                                         sink: LocalToolImage.Sink?) async -> JSONValue {

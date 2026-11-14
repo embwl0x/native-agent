@@ -14,7 +14,7 @@ import AgentWorkspace
 // Blueprint: | `AttentionRouter.swift` | One matter reaches the person's doors through ForPerson's delivery obligations |
 
 public actor AttentionRouter {
-    public typealias PhoneSender = @Sendable (String, String, [String: String]) async throws -> MobileNotificationDeliveryReceipt
+    public typealias PhoneSender = @Sendable (NativeAgentNotificationDefaults.Note, [String: String]) async throws -> MobileNotificationDeliveryReceipt
     let dataRoot: URL
     let delivery: AttentionDeliveryPorts
     private var inFlight: [String: Task<AttentionOutcome, Error>] = [:]
@@ -119,13 +119,13 @@ public actor AttentionRouter {
             let verdict: NotificationDeliveryOutcome
             switch door {
             case .phone:
-                let sent = await delivery.phone(payload.title, payload.summary, Self.phoneInfo(matter, payload: payload))
+                let sent = await delivery.phone(payload.note, Self.phoneInfo(matter, payload: payload))
                 (receipt, verdict) = (sent.receipt, sent.outcome)
             case .mac:
                 // The Mac routes and settles its banner on the matter's own id; only the phone needs the canonical event.
                 var info = Self.phoneInfo(matter, payload: payload)
                 info["eventId"] = id
-                let post = await NativeAgentNotifications.banner(title: payload.title, body: payload.summary,
+                let post = await NativeAgentNotifications.banner(title: payload.title, subtitle: payload.subtitle, body: payload.summary,
                     userInfo: info, identifier: id, dataRoot: dataRoot)
                 macPost = post
                 verdict = post.notificationOutcome
@@ -217,6 +217,7 @@ public actor AttentionRouter {
 
     private struct PersonPayload {
         let title: String
+        let subtitle: String?
         let summary: String
         let words: String
         let from: String
@@ -231,11 +232,14 @@ public actor AttentionRouter {
                     instruction: "Its owner must commit its title, summary, words and source before delivery.", recovery: .reconcile)
             }
             title = row.title
+            subtitle = face.subtitle
             self.summary = summary
             words = face.words
             self.from = from
             open = row.open
         }
+        /// What an alert door shows: title, subtitle and summary as one notification.
+        var note: NativeAgentNotificationDefaults.Note { .init(title: title, subtitle: subtitle, message: summary) }
     }
 
     /// What the phone and a banner click route on, read from the matter itself: the card, its approval, its conversation, its Desk item.

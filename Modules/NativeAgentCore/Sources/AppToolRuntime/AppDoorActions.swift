@@ -73,7 +73,7 @@ extension AppToolExecutor {
         }
         guard let perform = execution.perform else {
             return Self.doorRefusal("door_unavailable", "Use app from a chat turn. Nothing was written.",
-                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
+                remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
         }
         // Re-enter the original action's gates; only its owner applies the receipt.
         return try await perform("app", ["action": .string(action), "args": .object(args),
@@ -169,7 +169,7 @@ extension AppToolExecutor {
         // Who decides it: the person for a lever, the agent otherwise; a lever the person decided is still theirs.
         var receipt: [String: JSONValue] = [
             "action": .string(action.id), "page": .string(action.page), "label": .string(action.label),
-            "owner": .string(action.isPersonOwned || PermissionLaw.personDecided(tool: "app", input: [
+            "owner": .string(action.lever?.holds(input["args"]?.objectValue ?? [:]) == true || PermissionLaw.personDecided(tool: "app", input: [
                 "action": .string(action.id), "args": input["args"] ?? .object([:])], turn: turn) ? "person" : "agent"),
             "execution": .string("not_run"),
         ]
@@ -241,7 +241,7 @@ extension AppToolExecutor {
         let decided = PermissionLaw.personDecided(tool: "app", input: ["action": .string(action.id), "args": input["args"] ?? .object([:])],
             turn: turn)
         // A preview of a lever a card can carry is the gate's own check before it asks the person: it reads on, and the card decides.
-        if let lever = action.lever, !decided, !(lever.asks && input["preview"] == .bool(true)) {
+        if let lever = action.lever, lever.holds(input["args"]?.objectValue ?? [:]), !decided, !(lever.asks && input["preview"] == .bool(true)) {
             let why = lever.why
             receipt["owner"] = .string("person")
             receipt["why"] = .string(why)
@@ -269,7 +269,7 @@ extension AppToolExecutor {
                 receipt["detail"] = .string("Would refuse: that's the owner's, \(why). Nothing was done.")
                 return .object(receipt)
             }
-            return Self.failure("owners_call", "\(action.id) is the person's lever: \(why). "
+            return Self.failure("owners_call", "\(action.id) (\(lever.name)) is the person's lever: \(why). "
                 + (lever.asks ? "Your call asks them on a card; " : "It needs the person themself; ") + "nothing was done.", extra: receipt)
         }
         // Archive reasons must not use reason, which runners classify as the machine refusal code.
@@ -333,8 +333,8 @@ extension AppToolExecutor {
         }
         guard execution.perform != nil || inProcess else {
             return Self.doorRefusal("door_unavailable",
-                "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing was read or done.",
-                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
+                "This call did not come from inside a chat turn, so it has no gate to pass. Nothing was read or done.",
+                remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
         }
         if input["preview"] == .bool(true) {
             if !execution.argumentPreflightOnly, action.tool == "mind_run",
@@ -378,6 +378,12 @@ extension AppToolExecutor {
             let code = glass ? "needs_glass" : failureCode.isEmpty ? Self.doorText(refused["reason"]) : failureCode
             let why = glass ? Self.doorText(refused["reason"]) : ["detail", "message", "reason"]
                 .map { Self.doorText(refused[$0]) }.first { !$0.isEmpty } ?? ""
+            // A change that is the person's to decide is not refused: the real call asks them on a card, and the preview says so.
+            if refused["status"] == .string("needs_person") || (action.id == "setting.set" && code == "owners_call") {
+                receipt["would_card"] = .bool(true)
+                receipt["detail"] = .string("Would ask the person on a card. \(why) Nothing was done.")
+                return .object(receipt)
+            }
             receipt["would_refuse"] = .string(code)
             for (key, value) in refused where key.hasPrefix("would_") || ["versions", "tools", "argument_path", "backups", "remedy", "try_instead"].contains(
                 key) { receipt[key] = value }
@@ -471,7 +477,7 @@ extension AppToolExecutor {
                 ])
             } else {
                 receipt["effects"] = fields["effects"] ?? .string(read ? "none" : "unknown")
-                receipt["remedy"] = reply.remedy ?? Self.readRecovery(action, read: read)
+                receipt["remedy"] = reply.remedy
             }
         }
         var raised: JSONValue = .string("unreadable: the inbox did not read before and after")
@@ -558,16 +564,6 @@ extension AppToolExecutor {
     static func doorValidationArgs(_ action: AppAction, _ args: [String: JSONValue]) -> [String: JSONValue] {
         action.id == "setting.set" ? args.merging(["because": .string("")]) { _, check in check } : args
     }
-    private static func readRecovery(_ action: AppAction, read: Bool = true) -> JSONValue {
-        .object(["kind": .string("inspect"), "owner": .string(action.id),
-            "instruction": .string(read
-                ? "Read \(action.id)'s argument schema with next_call to choose a supported read and address the reported cause. This read changed nothing."
-                : """
-                    Read \(action.id)'s current requirements and correct the reported cause before another call. Check what took effect before repeating a \
-                    change.
-                    """),
-            "next_call": .object(["tool": .string("app"), "input": .object(["find": .string(action.id)])])])
-    }
     /// The registry's read contract supplies the evidence missing from a generic failure envelope. Preserve an explicitly uncertain mutation.
     private static func actionResult(_ result: JSONValue, action: AppAction, args: [String: JSONValue], root: URL = PersistenceCore.defaultDataRoot(
         )) -> JSONValue {
@@ -602,7 +598,6 @@ extension AppToolExecutor {
               fields["effects"] == nil || fields["effects"] == .string("unknown") || fields["effects"] == .string("none") else { return .object(fields) }
         fields["effects"] = .string("none")
         fields["outcome"] = .string("unmet")
-        if fields["remedy"] == nil || fields["remedy"] == .null { fields["remedy"] = readRecovery(action) }
         return .object(fields)
     }
     /// Owner refusals, previews and folded/native returns carry the same advice as door admission. Never replace an owner's recovery or replay a call.

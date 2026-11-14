@@ -62,9 +62,9 @@ Approve, Deny and Reply require foreground activation and authentication.
 Approve/Deny reread the canonical inbox, require a pending request with
 reviewable details, and use `ApprovalDecisionAction`, as the in-app buttons do.
 A normal notification click navigates without deciding the request.
-Approval and Desk destinations enter Advanced view from Simple or Agent view,
-independently of any chat shortcut overlay. A chat destination preserves the
-person's current view mode.
+Approval and Desk destinations show in place in Simple and enter Advanced view
+from Agent view, independently of any chat shortcut overlay. A chat destination
+preserves the person's current view mode.
 
 The approval observer establishes a startup baseline for Mac banners. New
 pending requests retain their Mac and phone intents on the canonical card.

@@ -145,7 +145,7 @@ package final class AgentMemo: @unchecked Sendable {
                 await withTaskCancellationHandler {
                     while !Task.isCancelled {
                         let watched = paths()
-                        let watcher = FileChangeWatcher(paths: watched) { _ in invalidate() }
+                        let watcher = FileChangeWatcher(paths: watched, onFailure: { _ in invalidate() }) { _ in invalidate() }
                         invalidate()
                         await withTaskCancellationHandler {
                             var lastReadRevision: Int?
@@ -158,8 +158,15 @@ package final class AgentMemo: @unchecked Sendable {
                                 }
                                 lastReadRevision = revision
                                 let value: Result<T, Error>
-                                do { value = .success(try await compute()) }
-                                catch { value = .failure(error) }
+                                do {
+                                    let read = try await compute()
+                                    // A read whose watch did not arm would be kept as current with nothing to say it changed.
+                                    let unarmed = watcher.unarmedPaths
+                                    guard unarmed.isEmpty else {
+                                        throw AgentScreen.NameFailure("Cannot observe changes at " + unarmed.map(\.path).joined(separator: ", "))
+                                    }
+                                    value = .success(read)
+                                } catch { value = .failure(error) }
                                 if !Task.isCancelled {
                                     lock.withLock {
                                         if observations[key]?.id == id { keep(key, stamp: [String(revision)], value: value) }

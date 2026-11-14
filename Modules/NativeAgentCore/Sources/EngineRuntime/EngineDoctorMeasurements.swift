@@ -355,10 +355,10 @@ extension EngineDoctorRuntime {
     }
     private func searchDoctorCoverageCheck(_ raw: String, probe: Bool) async -> CheckResult {
         let source = "research/config.json > searxng_base_url"
+        // Never set up is off, not failed: only a configured address that is malformed or does not answer is a fault.
         if raw.isEmpty {
-            return CheckResult(source: source, id: "live.search", title: "Search", status: "fail",
-                               detail: "Web search is unavailable because SearXNG is not configured.",
-                               harm: "The agent cannot search the web.",
+            return CheckResult(source: source, id: "live.search", title: "Search", status: "off",
+                               detail: "Web search is off: no search service is set.",
                                human_action: "Open Research → Search service, enter the SearXNG URL, then click Save.")
         }
         let validURL = URL(string: raw).map {

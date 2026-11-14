@@ -55,9 +55,96 @@ standing-view or open-question bridge. Saved policies, conditions and
 provenance decode completely; invalid saved values never become new defaults,
 empty peers, or next-turn readiness.
 
-An item's name is `handle`. A stable handle, its permanent visible number, or
-`desk.<number>` addresses it. On `desk.add_ref`, an `id` supplied beside `handle` identifies
-the linked approval or trace.
+An item's name is `handle`. A stable handle, its permanent visible number,
+`desk.<number>`, `#<number>`, the number followed by its title, or its exact
+title addresses it, read by one resolver (`DeskState.matching`) for every Desk
+action, `page.show`, `page.screenshot` and the window's own Desk commands. On `desk.add_ref`, an `id` supplied beside `handle` identifies
+the linked approval or trace. `page.show {page:"desk", item}` opens an item by
+either name, and `page.screenshot {page:"desk", item}` opens it the same way
+before drawing: the opened item is the Desk's own selection, so the picture
+shows it open and the window stays on its page. `page.show` answers with the
+Desk as it now reads, its "Open now" line naming the item.
+
+`desk.add` and a new `desk.breakdown` parent take `project` optionally. Left
+out, an item goes under its parent's project, and with no parent under `Tasks`
+(`DeskItem.tasksProject`), where a task the person starts is filed. `desk.add`
+takes `kind` optionally too; left out, it is `project` (`DeskItem.tasksKind`),
+the kind of that same task. `desk.open_pursuit` with no `project` files the
+pursuit under `workshop` (`DeskItem.workshopProject`), where the agent's own
+proposed pursuits go.
+
+A piece is something the agent made, laid on an item:
+`desk.add_ref {handle, ref_kind:"url", url:"make:<ref>", title?}` with the Make
+ref `make.add` returned. It is stored as an ordinary url reference, so every
+build reads it; `desk.add_ref` refuses a `make:` address whose Make ref holds no
+version. `desk.read` returns it as that url reference, and the Desk's text
+projection (`DeskPage.render`) lists it as `piece make:<ref>`. The Desk page draws
+pieces under **On the table**, after what waits, and, in the opened item, shows the
+newest version of each in the order it was laid. Mockups, pages and pictures stand
+side by side as one canvas (sections `piece:<refId>` sharing `beside:"pieces"`;
+narrow windows stack them); a document's words and a table keep the full width
+under them. `make.read {ref}` gives its versions and file paths and
+`make.add {path, ref}` (or `{content, name, ref}` for words already in hand) lays a
+new version, which the page shows without another Desk write.
+
+A table is a CSV or TSV piece (`SheetTable`). The window draws it as a table,
+on the Desk and in Make alike, up to 100 rows by 20 columns; past that it says
+how many rows and columns it leaves out and the table is changed only as a file.
+A table file over 2 MB (`MakePreviewFace.wordsLimit`, the one limit make.add
+uses) is not read at all and says so. **Find** marks the rows that hold the
+words; **Copy** takes the table's text as it is in the file. A click on a cell
+edits it in place: Return saves the whole table as the next Make version, Escape
+leaves it; **Add a row** at its foot and the add-a-column button at its right
+edge each save one version. Only what changed is written anew: every other field
+keeps its bytes as written and every row its own line break, and an added row
+ends with the file's own line break. A save is the person's own tap of
+`make.add {ref, name, content}` (`ToolsFacade.personTap`), recorded on the new
+version as `person_edit_of`, the version it was changed from. The body takes it
+only when the changed version of that ref is a table, the name is a file of the
+same type and the words are within the limit; Make appends it only while that
+version is still the newest, and otherwise refuses it in plain words with
+nothing written. What a save said stays above the version drawn next (the one
+just laid, or the newer one a refusal was for) until the person changes
+something or leaves. The agent's reading of the opened item gives a table's rows
+and columns and its first rows as text. A plan or project row with steps draws
+a bar of its closed steps out of all of them (`meter`) beside its words.
+
+A plan is a board. An opened item with steps under it (items whose `parent` is
+its handle) draws them as columns side by side, one per state and only when it
+holds a step: Now, Next, Waiting, Done (sections `steps:<state>` sharing
+`beside:"steps"`; narrow windows stack them). Each card is a step's title, one
+line of detail and its number; its row `step:<handle>` opens the step and offers
+the moves its column makes, through the Desk's own calls: **Start** is
+`desk.set_status {handle, status:"now"}` (a Next or Waiting step), **Done** is
+the row's `desk.close`. An open item that holds steps, or is a plan or project,
+also offers **Add a step**, a form whose one field is the title of
+`desk.add {parent, kind:"plan", project}`. Done shows the eight steps closed
+most recently and the open columns their first 64, each footer counting the
+rest, which `desk.read` lists. One `desk.breakdown {project, title,
+children:[{title}, …]}` lays a whole plan out.
+
+An agent reads an item two ways, and neither changes the window's selection.
+`desk.read {handle}` gives the item's record, its steps and what is on the
+table. `app {page:"desk", item}` gives the Desk page as it draws with that item
+open: its rows and actions, its board, its pieces and tables as text
+(`deskItemFace`, `EngineRuntime/DeskFace.swift`). The item is named by desk.N,
+its handle or its exact title, the resolver every Desk call uses. Steps move by
+`desk.set_status` and `desk.close`.
+
+The agent's own upkeep (items of the `body` project, the packet's `upkeep`)
+stands apart from the work. What closed today sits under **Done today**,
+gathered under one **My own upkeep** row with its count; everything else is one
+folded section at the end of the page, **My own upkeep**, its line counting
+what is open and naming the one under way: what is open first, then what
+closed on earlier days, by day. An upkeep item that waits on the person, is
+flagged or blocked, or whose activity is stale or blocked stands with the work
+instead. MY QUEUE intentions are not board items and are not on this page.
+A contact the person has brought to the table reads this same Desk, and the
+source of any piece laid on it, through its MCP `agent_desk` tool, and changes
+nothing; [the table](agent-communication.md#the-table) owns the lever, the read
+and the record of its last read. A piece is on the table while it is laid on a
+board item that is not finished (`DeskPiece.onTable`). The Desk page itself shows
+nothing of it.
 
 `desk.read` lists all live board items, including parts and recently closed
 items, with `limit` (default 25, 1–100), `offset` (default zero), `total`,
@@ -110,9 +197,9 @@ for example `--note='--literal text'`. Single-value options cannot repeat;
 `--ref` may repeat. Unknown options and options belonging to another command
 are refused before any ledger write.
 
-Bare defer days include the named day. Snooze choices therefore say
-**Through tomorrow** and **Through [date]**, resuming at the following local
-midnight; a full timestamp keeps its exact instant.
+A bare defer day is the day the work is back: the defer ends when that local
+day starts. The snooze choices say **Defer to tomorrow** and **Defer a week**;
+a full timestamp keeps its exact instant.
 
 `desk.add` takes an optional `summary`. `desk.close` takes `reason`, the same word
 `queue.done` and `queue.drop` take. For `desk.close`, reason names the owner's
@@ -126,7 +213,10 @@ the shared door binds a single alternative address word to the schema's sole
 declared one when that declared field is absent, before validation and Trust.
 
 `desk.wait {handle, on:"User", note?}` puts an item in **waiting on User** in
-one call. `on:"owner"` names the owner without needing their name.
+one call. `on:"owner"` names the owner without needing their name. `on` given
+as a sentence (what has to happen, in the agent's words) is kept as written:
+**waiting on <those words>**; only one unbroken unknown token that is not a
+plain name is refused, as an identifier that names nothing.
 `desk.set_status {handle, status:"waiting on User"}` reaches the same writer.
 Waiting status updates apply `remaining_work`, `progress`, `assignee`, and
 `lane_of` through the ordinary status path before confirming. Invalid fields
@@ -147,6 +237,11 @@ the status token for a top-level item still at `watch`, so a new plan reads
 `on` also accepts an observed Desk handle/number or experience id (a card,
 including the `approval:<id>` its Home row shows, message, reply delivery or repair), or a nonempty list of those dependency
 ids. These waits retain automatic release when the named conditions settle.
+A send to a contact that still awaits its answer returns that condition as
+`thread.wait_on`: waiting on it holds the item until the contact answers (or the
+send fails or expires), which is the way to be told when someone replies. A send
+held for a contact that collects its messages returns no `wait_on`: its answer
+comes as a message of its own, which nothing yet ties to the send.
 The wait action has its own typed guide. Unknown identifier-shaped conditions
 are refused; a single person's name is a person wait. `note` explains either
 kind of wait.
@@ -166,9 +261,11 @@ by `repair.let_go {id, reason}`. Release consults that delivery owner under its
 lock, even before the advisory experience projection arrives; the finding's
 next reconciliation reads the saved release and removes that reply from its count.
 
-The Desk page lists each item under one heading: Waiting on the owner,
-Blocked, or In play. Its count explains the `desk.wait` call that puts an item
-there. Input mistakes, including unknown handles, return `invalid_input`,
+The Desk page lists each item under one heading. It reads top to bottom: the
+Desk tools; Waiting and Needs you; On the table; Now, Watching, Queued and
+other work now; Parked; then the readings, Done today, recent work, lines,
+Finished history, the timers and the night; and last My own upkeep. `desk.wait` puts an
+item under Waiting. Input mistakes, including unknown handles, return `invalid_input`,
 the argument path, and `effects:"none"` rather than a blocked dispatch error.
 
 For a four-call work record (using the handle returned by the first call):

@@ -36,9 +36,14 @@ extension EngineFaceActs {
         case ("diagnostics", "Inspector"):
             let face = try await engine.trace.readLive(after: nil)
             await engine.face.post(face, at: .inspector(after: nil))
-        case ("simple", _), ("simple_settings_menu", _):
+        case ("simple", _):
             try await EngineFaceProjection.prepareCapture(.contacts, engine: engine)
             try await EngineFaceProjection.prepareCapture(.helpers, engine: engine)
+        case ("simple_settings_menu", _):
+            // Simple's settings picture shows Control's Settings tab beside the sidebar.
+            try await EngineFaceProjection.prepareCapture(.contacts, engine: engine)
+            try await EngineFaceProjection.prepareCapture(.helpers, engine: engine)
+            await engine.pages.refresh(page: "settings")
         default: break
         }
         await engine.pages.flush()

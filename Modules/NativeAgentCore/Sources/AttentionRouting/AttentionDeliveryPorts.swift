@@ -22,7 +22,7 @@ public struct AttentionDeliveryPorts: Sendable {
         _ approvalID: String, _ chatID: Int, _ dataRoot: URL
     ) async -> NotificationDeliveryOutcome
 
-    let phone: @Sendable (String, String, [String: String]) async -> PhoneResult
+    let phone: @Sendable (NativeAgentNotificationDefaults.Note, [String: String]) async -> PhoneResult
     let telegram: TelegramSender
     let slack: SlackSender
     let telegramApproval: TelegramApprovalSender
@@ -33,9 +33,9 @@ public struct AttentionDeliveryPorts: Sendable {
         slack: @escaping SlackSender,
         telegramApproval: @escaping TelegramApprovalSender
     ) {
-        self.phone = { title, body, info in
+        self.phone = { note, info in
             do {
-                let receipt = try await phone(title, body, info)
+                let receipt = try await phone(note, info)
                 return PhoneResult(outcome: receipt.notificationOutcome, receipt: receipt)
             } catch let failure as NotificationDeliveryFailure {
                 return PhoneResult(outcome: failure.outcome, receipt: nil)

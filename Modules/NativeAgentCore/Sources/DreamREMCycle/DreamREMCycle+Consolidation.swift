@@ -60,7 +60,23 @@ extension REMConsolidator {
     }
 
     /// Use an object reply because it supports reliable model output and future fields.
-    private struct LLMProposalReply: Decodable { let proposals: [LLMProposalDTO] }
+    private struct LLMProposalReply: Decodable {
+        let proposals: [LLMProposalDTO]
+        private enum CodingKeys: String, CodingKey { case proposals }
+        /// A model sometimes answers with the list alone; the list is the same reply.
+        init(from decoder: Decoder) throws {
+            if let keyed = try? decoder.container(keyedBy: CodingKeys.self) {
+                proposals = try keyed.decode([LLMProposalDTO].self, forKey: .proposals)
+            } else {
+                // The list alone must hold proposals: an empty array found anywhere inside a malformed reply is not one.
+                let list = try [LLMProposalDTO](from: decoder)
+                guard !list.isEmpty else {
+                    throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "An empty list is not a proposal reply."))
+                }
+                proposals = list
+            }
+        }
+    }
 
     private struct LLMProposalDTO: Decodable {
         let targetDoc: String
@@ -138,10 +154,24 @@ extension REMConsolidator {
             String(REMConstants._REM_PROPOSAL_TEXT_CAP)
         ])
         let call = LLMCall(turn: nil, surface: surface, purpose: "rem")
-        let raw = try await llm.complete(
+        var raw = try await llm.complete(
             prompt: prompt, system: system, model: model, tools: nil, call: call
         )
-        let proposals = parseLLMResponse(raw, diagnostics: &diagnostics)
+        var proposals = parseLLMResponse(raw, diagnostics: &diagnostics)
+        // A reply that cannot be read is asked for again at once, told what was wrong; only three unreadable replies are a failure.
+        var asks = 1
+        while diagnostics.decodeFailures > 0, asks < 3 {
+            let fault = diagnostics.parseErrors.last { $0.hasPrefix("decode failure:") } ?? "decode failure"
+            diagnostics.decodeFailures = 0
+            diagnostics.parseErrors.removeAll { $0.hasPrefix("decode failure:") }
+            raw = try await llm.complete(
+                prompt: prompt + "\n\nYour last reply could not be read (" + String(fault.prefix(300))
+                    + "). Reply again with one JSON object of the form {\"proposals\": [...]} and nothing else.",
+                system: system, model: model, tools: nil, call: call
+            )
+            proposals = parseLLMResponse(raw, diagnostics: &diagnostics)
+            asks += 1
+        }
 
         // Accept evidence dates only from the call's frozen entry set.
         var kept: [REMProposalRow] = []

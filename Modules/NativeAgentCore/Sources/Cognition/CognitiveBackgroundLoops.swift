@@ -13,6 +13,7 @@ public struct CognitiveMaintenanceLoop: LoopRunner {
     }
     public var loopId: String { "cognition_maintenance" }
     public var tickTimeoutOverride: TimeInterval? { 30 }
+    public var needsAgent: Bool { true }
 
     public func tickOutcome() async -> LoopTickOutcome {
         await runtime.runMaintenance(reason: loopId)
@@ -29,6 +30,7 @@ public struct CognitiveReplayLoop: LoopRunner {
     }
     public var loopId: String { "cognition_replay" }
     public var tickTimeoutOverride: TimeInterval? { 30 }
+    public var needsAgent: Bool { true }
 
     public func tickOutcome() async -> LoopTickOutcome {
         await runtime.runReplay(reason: loopId)

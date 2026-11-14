@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import CognitiveSubstrate
 import AgentConversations

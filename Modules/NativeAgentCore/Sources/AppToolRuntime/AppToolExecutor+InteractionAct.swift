@@ -711,8 +711,9 @@ extension AppToolExecutor {
         body["element"] = .string(outcome.element)
         body["changed"] = .bool(outcome.changed)
         body["detail"] = .string(outcome.detail)
-        if verb == "set_page", let page = presentation.currentPage {
-            body["showing_page"] = .string(page.id)
+        if verb == "set_page" {
+            if let page = outcome.shownPage { body["showing_page"] = .string(page) }
+            body["showing"] = .string(await showingLook(page: outcome.shownPage, turn: turn))
         }
         if let posture { body["trust_mode"] = .string(posture.name) }
         body["surface"] = .string(surface)
@@ -722,6 +723,37 @@ extension AppToolExecutor {
             + "window shows it now. No accessibility round trip, nothing brought forward, and no "
             + "click was synthesized.")
         return .object(body)
+    }
+
+    /// A look at a shown page: its title, what is open and its first rows. The rest is one page read away.
+    private static let showingLookCharacters = 4_000
+
+    /// What the window shows after page.show: the page its navigation receipt names, read as the agent reads it (`app {page}`) and cut
+    /// to a look. A Desk item shown is the Desk's selection, so the page reads with it open. A read that fails says so in words; the
+    /// presentation it follows stands.
+    @MainActor
+    private func showingLook(page: String?, turn: Turn) async -> String {
+        guard let page else { return "The window confirmed the presentation but did not name the page it shows, so it was not read." }
+        let read = await runAppPageRead(input: ["page": .string(page)], turn: turn)
+        guard case .object(let fields) = read, fields["status"] == .string("ok") || fields["status"] == .string("partial"),
+              case .array(let content)? = fields["content"] else {
+            return "The window confirmed the presentation, but what it now shows could not be read: "
+                + (ChatToolOutcome.explanation(read) ?? "the page read returned no page text") + "."
+        }
+        var lines: [String] = []
+        for case .object(let block) in content {
+            if !lines.isEmpty { lines.append("") }
+            if let heading = block["heading"]?.stringValue { lines.append(heading) }
+            lines += (block["lines"]?.arrayValue ?? []).compactMap(\.stringValue)
+            if block["status"] == .string("unavailable"), let detail = block["detail"]?.stringValue { lines.append("Unavailable: " + detail) }
+        }
+        let text = lines.joined(separator: "\n")
+        guard !text.isEmpty else { return "The page now showing read back with no text." }
+        guard text.count > Self.showingLookCharacters else { return text }
+        let head = text.prefix(Self.showingLookCharacters)
+        // Cut between lines, so a row and its reference stay whole.
+        let look = String(head.lastIndex(of: "\n").map { head[..<$0] } ?? head)
+        return look + "\n+\(text.count - look.count) more characters · app {page:\"\(page)\"}"
     }
 
     /// Preview shares read-only posture, file, screen, sound and draft checks with execution's app-owned fences.

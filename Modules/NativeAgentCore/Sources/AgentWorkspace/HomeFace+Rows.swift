@@ -92,7 +92,7 @@ extension HomeFace {
         })])
     }
 
-    /// A happening as the face reads it; `quoted`: an agent's words are among its words.
+    /// A happening as the face reads it; `quoted`: it arose in a turn an agent started, so its words may carry that agent's.
     private static func happening(_ happening: Happening) -> JSONValue {
         fact(["kind": .string(happening.kind.rawValue), "door": .string(happening.door), "words": .string(happening.words),
               "quoted": .bool(happening.peers != nil || happening.elevated != nil), "returns": .bool(happening.route != nil)])
@@ -150,7 +150,7 @@ extension HomeFace {
         }
         if case .object(let input)? = fields["input"], case .string(let action)? = input["action"] { return action }
         if case .string(let tool)? = fields["tool"] { return tool }
-        throw PersistenceCoreError.ioFailure("The recorded repair call names neither an input.action nor a tool; repair its next_call claim.")
+        throw PersistenceCoreError.ioFailure("The recorded repair call names neither an input.action nor a tool key; repair its next_call claim.")
     }
 
     /// MY QUEUE's steps with the stem's verdict on each (`state`): `unread` (its condition evidence has not landed), `blocked` (with `blockers`),
@@ -196,12 +196,14 @@ extension HomeFace {
                     world.contacts.first { $0.id == peer || $0.agents.contains(peer) }?.name ?? "an agent no longer in contacts"
                 } : nil
                 let step = PartFace.Value.string(entry.name)
+                // A lever closes with the Desk's own close reason, so a step closed by the person's hand reads the same wherever it was pressed.
+                let close: [String: PartFace.Value] = ["id": step, "reason": .string(DeskQuickAction.deskCloseOutcome)]
                 keys.add(entry.name, open: "page:desk/" + entry.item.handle,
-                    actions: [(PartFace.Call("queue.done", ["id": step]), false), (PartFace.Call("queue.drop", ["id": step]), true)])
+                    actions: [(PartFace.Call("queue.done", close), false), (PartFace.Call("queue.drop", close), true)])
                 rows.append(fact([
                     "key": .string(entry.name), "kind": .string("step"), "title": .string(AgentScreen.clip(entry.item.title, 100)),
                     "from": from.map { JSONValue.array($0.map(JSONValue.string)) },
-                    "words": entry.peerBorn ? nil : JSONValue.string(AgentScreen.clip(entry.step.words, 140)),
+                    "words": .string(AgentScreen.clip(entry.step.words, 140)),
                     "inferred": .bool(entry.step.source != nil),
                     "blockedReason": text(entry.item.blockedReason.map { AgentScreen.clip($0, 100) }),
                     "note": text(note.map { AgentScreen.clip($0.text, 100) }),
@@ -343,8 +345,10 @@ extension HomeFace {
         var doors: Set<String> = []
         let peers = Dictionary(world.routes.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
         return world.doors.filter { doors.insert($0.door == "bridge" ? $0.session : $0.door).inserted }.prefix(5).map { line -> JSONValue in
-            keys.add("elsewhere:" + line.session, open: "chat:" + line.session)
-            return fact(["key": .string("elsewhere:" + line.session), "door": .string(line.door),
+            // A row is one door (each bridge conversation its own), so the door is its key: two of the person's doors can share a conversation.
+            let key = "elsewhere:" + (line.door == "bridge" ? line.session : line.door)
+            keys.add(key, open: "chat:" + line.session)
+            return fact(["key": .string(key), "door": .string(line.door),
                 "who": .string(AgentScreen.who(line, person: person, peers: peers)), "at": .string(clock(line.at))])
         }
     }

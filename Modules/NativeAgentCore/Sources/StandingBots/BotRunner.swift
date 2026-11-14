@@ -145,7 +145,7 @@ public actor BotRunner {
         let condition = bot.notificationCondition?.trimmingCharacters(in: .whitespacesAndNewlines)
         let ask = condition.flatMap { $0.isEmpty ? nil : $0 }.map {
             """
-                \n\nTell me if: \($0)\nAfter finishing your work and tool calls, return only a JSON job result (no Markdown fence): \
+                \n\nTell me if: \($0)\nAfter finishing your work and calls, return only a JSON job result (no Markdown fence): \
                 {\"reply\":\"your complete result for the person\",\"condition_met\":true}. condition_met must be a JSON boolean: true \
                 if this run's result meets the condition, false if it does not. If you cannot determine it, use null. The app presents \
                 reply and uses this structured verdict for the requested notification.

@@ -12,7 +12,7 @@ For the memory standard, see [What a good memory is](memory-quality.md).
 Turn interpretation or an explicit save → MemoryV2 → canonical SQLite
 transaction → derived projections → selected context or explicit recall.
 
-Agent reaches memory through their one `app` tool:
+The agent reaches memory through their one door, `app`:
 
 ```text
 app {"page":"memories"}
@@ -912,6 +912,17 @@ the turn to continue with the named gap; other context preparation errors stop
 the turn. When ContextFlow is off, the engine can use explicit MemoryV2 retrieval
 for its automatic recall block.
 
+**Whatever turn preparation knows about the agent's context reaches the agent:
+what was selected, what was withheld and why, and the time as the turn actually
+has it.** Atoms selection chose that the owners' check then withheld are counted
+against the selection receipt and named, with the reasons verification appended
+to the packet's `degradedSources`, in that same availability notice. Memory age
+tags read `ContextPreparedTurn.turnTime`, the turn's pinned instant (the one its
+clock facts use), never the selection bucket's end, which in a day's last minute
+is already tomorrow. Selection, expiry and recency keep `NeedSignal.evaluationTime`,
+so the need fingerprint, receipt and selected packet stay keyed to the bucket;
+one pinned instant per turn keeps the packet and ambient recollection in agreement.
+
 Peer-sourced facts keep their author on every prompt line (`— from Claude`):
 the selected Context packet uses the source entities already compiled from
 `MemoryDataProvenance.sources`, and Context-off recall, default USER facts and
@@ -920,7 +931,7 @@ chosen pins use the same projection of the roots' `through`. The existing list's
 `MemoryDisplayText.attributed` owns the shared display suffix; USER precoverage
 compares the attributed atom text so the new label does not duplicate a fact.
 Ambient recollection uses the same `ContextMemoryLead.decorate` as packet
-rendering, with the prepared turn's clock, recorded time, roots and untrusted
+rendering, with the prepared turn's pinned instant, recorded time, roots and untrusted
 sources. Its body excerpt is capped at 280 characters before decoration, so
 clipping never strips the provenance suffix. `mind.came_to_mind.presented`
 records that same rendered nudge through the shared trace redactor, so installed

@@ -3,7 +3,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `ChatGPTAccountModelRefresh.swift` | `ChatGPTAccountModelRefresh`: account discovery outside dispatch |
+// Blueprint: | `ChatGPTAccountModelRefresh.swift` | `ChatGPTAccountModelRefresh`: account discovery outside dispatch; says when it cannot ask |
 
 /// Account discovery is UI/sign-in maintenance, never part of provider dispatch.
 public actor ChatGPTAccountModelRefresh {
@@ -23,13 +23,26 @@ public actor ChatGPTAccountModelRefresh {
             .appendingPathComponent("models_cache.json")
     }
 
-    /// Passive maintenance fetches an absent or differently bound cache; explicit refresh always asks the account.
+    /// What an explicit refresh says when the selected sign-in was adopted from the Codex command-line tool: the app never writes that tool's files,
+    /// so its list is the tool's own and cannot be asked for here.
+    public static let adoptedSignInCannotRefresh = """
+        this sign-in comes from the Codex command-line tool, so its model list is the tool's own and the app cannot refresh it. Sign in with \
+        ChatGPT in the app to get a list the app can refresh.
+        """
+
+    /// Passive maintenance fetches an absent or differently bound cache; explicit refresh always asks the account, and says so when it cannot.
     @discardableResult
     public func refresh(dataRoot: URL, force: Bool = false) async throws -> Bool {
         let root = dataRoot.standardizedFileURL
         let authPath = ChatGPTTransport.preferredAuthPath(dataRoot: root)
         // This maintenance operation writes only the app-owned account cache; do not discover an inactive sign-in when runtime selected another one.
-        guard authPath.standardizedFileURL == NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: root).standardizedFileURL else { return false }
+        // The only other selected path is an adopted command-line one. An explicit refresh says it could not ask only when that path holds a
+        // ChatGPT session; with none (the tool signed in with an API key, or nothing usable) there is nothing to refresh and nothing to report,
+        // as before. Its unreadable bytes stay readiness's to report.
+        guard authPath.standardizedFileURL == NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: root).standardizedFileURL else {
+            guard force, (try? ChatGPTTransport.storedAccessToken(at: authPath)) != nil else { return false }
+            throw Self.failure(Self.adoptedSignInCannotRefresh)
+        }
         guard let token = try ChatGPTTransport.storedAccessToken(at: authPath) else { return false }
         var key = CredentialKey(root: root, accessToken: token)
         if !force, let failure = failures[key] { throw failure }

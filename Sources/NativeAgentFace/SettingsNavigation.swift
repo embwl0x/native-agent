@@ -3,7 +3,7 @@ import SwiftUI
 import NativeAgentShared
 // Blueprint: | `SettingsNavigation.swift` | SettingsLink routes to canonical pages; ShellPageFrame supplies shared page layout |
 
-/// Open canonical rail pages; Simple and Agent routes switch to Advanced because they have no rail.
+/// Open a page and its tab. Simple and Advanced show it in place; any other view shows no pages, so the link opens Advanced first.
 @MainActor
 enum SettingsLink {
     static func open(_ item: SidebarItem, tab: String? = nil) {
@@ -12,7 +12,10 @@ enum SettingsLink {
     }
 
     static func openChecked(_ item: SidebarItem, tab: String?, appModel: AppModel) async throws {
-        _ = try await appModel.client.act(.setPreference(key: SimpleViewMode.key, value: .string(SimpleViewMode.advanced))).checkedCommit()
+        let view = appModel.facePreference(SimpleViewMode.key, as: String.self)
+        if view != SimpleViewMode.simple && view != SimpleViewMode.advanced {
+            _ = try await appModel.client.act(.setPreference(key: SimpleViewMode.key, value: .string(SimpleViewMode.advanced))).checkedCommit()
+        }
         try Task.checkCancellation()
         ApplicationLifetime.shared.request(.sidebar(item))
         if let tab {

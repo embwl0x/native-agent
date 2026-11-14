@@ -326,10 +326,11 @@ public enum AgentHostDirectory {
         peerDescriptorDirectory(dataRoot: dataRoot).appendingPathComponent("bridge.json").path
     }
 
-    /// Disclose exactly the two tools this entry serves.
+    /// Disclose exactly the tools this entry serves.
     public static let accessSummary =
-        "two tools, agent_message and agent_reply, over this Mac's loopback interface only. "
-        + "These are messaging tools, not restrictions on what the other program can do itself. "
+        "three tools over this Mac's loopback interface only: agent_message and agent_reply, and agent_desk, which reads my Desk only once you "
+        + "bring this agent to my table. "
+        + "These are tools to message and read me, not restrictions on what the other program can do itself. "
         + "This app applies its own permission settings when it handles a request."
 
     /// Seed only card location and local scan port; read its offers later.

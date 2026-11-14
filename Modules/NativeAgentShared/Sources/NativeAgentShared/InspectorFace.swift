@@ -37,6 +37,8 @@ public struct InspectorEventRow: Identifiable, Equatable, Sendable, Codable {
     public let durationMs: Int?
     public let isExpandable: Bool
     public let detailLines: [DetailLine]
+    /// The engine's name for the call this row is; nil for an event that is no call.
+    public let call: String?
 
     public struct DetailLine: Identifiable, Equatable, Sendable, Codable {
         public var id: String { label }
@@ -46,9 +48,9 @@ public struct InspectorEventRow: Identifiable, Equatable, Sendable, Codable {
     }
 
     public init(id: String, kind: String, ts: Date, status: InspectorRowStatus, title: String,
-                durationMs: Int?, isExpandable: Bool, detailLines: [DetailLine]) {
+                durationMs: Int?, isExpandable: Bool, detailLines: [DetailLine], call: String? = nil) {
         self.id = id; self.kind = kind; self.ts = ts; self.status = status; self.title = title
-        self.durationMs = durationMs; self.isExpandable = isExpandable; self.detailLines = detailLines
+        self.durationMs = durationMs; self.isExpandable = isExpandable; self.detailLines = detailLines; self.call = call
     }
 
     public var kindChip: String {
@@ -79,7 +81,9 @@ public struct InspectorTurnCard: Identifiable, Equatable, Sendable, Codable {
 
 extension InspectorTurnCard {
     public var pageRevision: String {
-        id + ":" + String(rows.count) + ":" + startedAt.formatted(.iso8601) + ":" + lastAt.formatted(.iso8601)
+        // A call's end settles the row its begin opened without adding one, so the settled count moves the revision too.
+        id + ":" + String(rows.count) + ":" + String(rows.filter { $0.durationMs != nil }.count) + ":"
+            + startedAt.formatted(.iso8601) + ":" + lastAt.formatted(.iso8601)
     }
 
     public var collectionCall: PartFace.Call { .init("inspector.events", ["turn": .string(id)]) }
@@ -99,20 +103,44 @@ extension InspectorTurnCard {
         guard !overflow else {
             throw PartCallError(code: "inspector_cursor_invalid", message: "The Inspector event position exceeds this window's range.")
         }
-        var metrics = ["\(eventCount) events", "\(wallMs)ms"]
-        if let llmTokens { metrics.append("\(llmTokens) tokens") }
-        if let ttftMs { metrics.append("\(ttftMs)ms to first token") }
+        // A row is one line: a timed row shows its duration, an untimed one its time.
         let projected: [PartFace.Row] = slice.map { event in
-            .init(id: event.id, title: event.title, detail: event.kindChip,
-                  value: event.durationMs.map { "\($0)ms" }, at: event.ts.formatted(.iso8601), tone: event.faceTone,
-                  expands: event.isExpandable, read: event.isExpandable ? event.detailCall(turn: id) : nil)
+            .init(id: event.id, title: event.title, detail: event.call ?? event.kindChip,
+                  value: event.durationMs.map(Self.duration), at: event.durationMs == nil ? event.ts.formatted(.iso8601) : nil,
+                  tone: event.faceTone, expands: event.isExpandable, read: event.isExpandable ? event.detailCall(turn: id) : nil,
+                  // A call's bar sits where the call ran within its turn.
+                  meter: event.durationMs.map { .init(value: Double($0), max: Double(max(wallMs, 1)),
+                                                      start: max(0, event.ts.timeIntervalSince(startedAt) * 1_000)) })
         }
+        // The turn's own row leads a reading that starts the turn; a continuation adds only the rows after it.
         return PartFace(sections: [
-            .init(id: "turn:" + id, title: (surface.map { $0 + " · " } ?? "") + metrics.joined(separator: " · "),
-                  footer: String(id.prefix(8)), rows: projected,
-                  more: next < rows.count ? .init(next: String(next), total: rows.count, revision: pageRevision, read: collectionCall) : nil,
+            .init(id: "turn:" + id, footer: String(id.prefix(8)), rows: cursor == nil ? [turnRow] + projected : projected,
+                  more: next < rows.count ? .init(next: String(next), total: rows.count + 1, revision: pageRevision, read: collectionCall) : nil,
                   revision: pageRevision),
         ])
+    }
+
+    /// The turn in one line: when it started, its whole time and how many calls it made, led by its slowest call.
+    private var turnRow: PartFace.Row {
+        let calls = rows.filter { $0.call != nil }
+        let slowest = calls.compactMap { call in call.durationMs.map { (title: call.title, ms: $0) } }.max { $0.ms < $1.ms }
+        var about = slowest.map { ["Slowest: " + $0.title + " · " + Self.duration($0.ms)] } ?? []
+        if let llmTokens { about.append("\(llmTokens) tokens") }
+        if let ttftMs { about.append(Self.duration(ttftMs) + " to first token") }
+        if let surface { about.append(surface) }
+        about.append(eventCount == 1 ? "1 event" : "\(eventCount) events")
+        let count = calls.isEmpty ? "no calls" : calls.count == 1 ? "1 call" : "\(calls.count) calls"
+        let when = Calendar.current.isDateInToday(startedAt) ? "at " + startedAt.formatted(date: .omitted, time: .shortened)
+            : "on " + startedAt.formatted(date: .abbreviated, time: .shortened)
+        return .init(id: "turn:" + id, title: "Turn " + when, detail: about.joined(separator: " · "),
+                     value: Self.duration(wallMs) + " · " + count)
+    }
+
+    /// Under a second in milliseconds, under ten with a tenth, longer as the chat card reads it.
+    private static func duration(_ ms: Int) -> String {
+        if ms < 1_000 { return "\(ms)ms" }
+        if ms < 10_000 { return (Double(ms) / 1_000).formatted(.number.precision(.fractionLength(1))) + "s" }
+        return MacChatTurnCardFormat.duration(Double(ms) / 1_000)
     }
 
     public func readFace(_ request: FaceReadRequest) throws -> PartFace {

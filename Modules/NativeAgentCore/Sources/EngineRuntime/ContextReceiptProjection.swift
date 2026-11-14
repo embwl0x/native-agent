@@ -84,7 +84,8 @@ public enum ContextReceipts {
         receipt.windowTokens = receipt.nativeWindowTokens
         receipt.windowModelName = windowModel.isEmpty
             ? nil
-            : FirstPartyModelCatalog.descriptor(for: windowModel)?.name ?? windowModel
+            : route.flatMap { FirstPartyModelCatalog.descriptor(for: windowModel, providerID: $0, dataRoot: dataRoot) }?.name
+                ?? FirstPartyModelCatalog.descriptor(for: windowModel)?.name ?? windowModel
         return .receipt(receipt)
     }
 

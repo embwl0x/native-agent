@@ -62,7 +62,6 @@ final class BodySettingsActHandler: FaceActHandler {
         BodyFacePresentation.disconnect(connection)
         await SettingsDock.shared.close()
         cards = nil
-        BodyFaceDoctor.disconnect(connection)
         observedKeys.removeAll()
         let composers = composerObservations
         composerObservations.removeAll()
@@ -201,6 +200,7 @@ final class BodySettingsActHandler: FaceActHandler {
             guard result.ok else {
                 throw PartCallError(code: "oauth_failed", message: result.error ?? "Sign-in did not complete.")
             }
+            engine.providers.fetchModelListInBackground(after: provider)
             var issue: WireFailure?
             _ = await engine.providers.adoptProviderForBlankSurfaces(provider, dataRoot: engine.dataRoot) { error, _ in
                 issue = WireFailure(code: "oauth_routing_publication_failed", message: "Sign-in was saved, but Chat could not select the account.",
@@ -299,6 +299,9 @@ final class BodySettingsActHandler: FaceActHandler {
             _ = try await engine.trust.load()
             await engine.macIntegration.refresh()
         case .panel(SidebarItem.providers.rawValue):
+            // Reading the accounts again (setup's "Read accounts again") starts asking any connected provider whose list is missing or failed,
+            // and reads at once: those accounts say they are being asked; the answer, or the plain sentence, arrives when the ask lands.
+            engine.providers.startAskingMissingModelLists()
             let saved = try await refreshProviders()
             if let issue = saved.catalogError { throw PartCallError(code: "provider_catalog_unavailable", message: issue) }
         case .panel(SidebarItem.connectors.rawValue):

@@ -355,6 +355,7 @@ extension ContextPreparation {
                 lease: lease,
                 generation: generation,
                 need: need,
+                turnTime: request.turnTime,
                 budgetExpansion: budgetExpansion,
                 deliveryHandler: deliveryHandler,
                 feedbackHandler: feedbackHandler,

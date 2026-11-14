@@ -3,8 +3,10 @@ import Foundation
 // Blueprint: | `ContextPreparedTurn+CameToMind.swift` | `cameToMind(by:embedding:excluding:limit:)`, `ambientStandoutDeviations` |
 
 extension NeedSignal {
-    /// A moment replaces only the query: retain the turn's authorization, rest state and embedding model.
-    func moment(_ text: String, embedding: ContextQueryEmbeddingValue, limit: Int) -> NeedSignal {
+    /// A moment replaces only the query: retain the turn's authorization, rest state, embedding model, what the turn already covers and the
+    /// budget its always-carried atoms fit in, so an atom the turn already carries is never demanded a second time. `covering` adds what the
+    /// caller knows is covered; `limit` alone bounds what a moment brings.
+    func moment(_ text: String, embedding: ContextQueryEmbeddingValue, limit: Int, covering: Set<ContextSourceID> = []) -> NeedSignal {
         NeedSignal(
             message: text,
             surface: surface,
@@ -13,6 +15,7 @@ extension NeedSignal {
             sessionID: sessionID,
             memoryReachability: memoryReachability,
             servedTurnsAgo: servedTurnsAgo,
+            precoveredSourceIDs: precoveredSourceIDs.union(covering),
             deletedAtomIDs: deletedAtomIDs,
             tombstonedAtomIDs: tombstonedAtomIDs,
             staleRuntimeAtomIDs: staleRuntimeAtomIDs,
@@ -22,7 +25,8 @@ extension NeedSignal {
             queryEmbeddingModelFingerprint: embedding.modelFingerprint,
             queryEmbeddingModelID: embedding.modelID,
             availableGenerationID: availableGenerationID,
-            characterBudget: 2_000,
+            characterBudget: characterBudget,
+            mandatoryCharacterBudget: mandatoryCharacterBudget,
             memoryAtomRowLimit: limit
         )
     }
@@ -42,8 +46,12 @@ extension ContextPreparedTurn {
         limit: Int
     ) async throws -> ContextAmbientRecallResult {
         guard limit > 0, !text.isEmpty else { return ContextAmbientRecallResult(items: [], unavailable: []) }
+        // A recollection looks at memories only and delivers nothing else, so every source that holds no memory counts as covered: none of
+        // its always-atoms is required here, and a moment's different words cannot admit some that outgrow the budget.
+        let memorySources = Set(generation.atoms.lazy.filter { $0.draft.kind == .memory }.map(\.draft.sourceID))
+        let others = Set(generation.atoms.lazy.map(\.draft.sourceID)).subtracting(memorySources)
         let picked = try ContextSelector(memoryStandout: ContextSelectionConfiguration.ambientStandoutDeviations).select(
-                need.moment(text, embedding: embedding, limit: limit),
+                need.moment(text, embedding: embedding, limit: limit, covering: others),
                 from: generation, pinnedTo: lease.snapshot,
                 sourceReadFailures: packet.degradedSources
               )

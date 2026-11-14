@@ -6,7 +6,7 @@
   "record": {
     "description": "Draw Home from its packet: my mind (awake or asleep, my latest thoughts, what is owed to me), then my layout's sections.",
     "actions": [], "inputSchema": {"type": "object",
-      "required": ["person","order","attention","thoughts","owed","mail","waits","queue","working","people","helpers","senses","elsewhere",
+      "required": ["person","order","attention","thoughts","owed","waits","queue","working","people","helpers","senses","elsewhere",
         "places","mac","gaps","keys"]}
   }
 }
@@ -35,7 +35,7 @@ function face(input) {
     };
     const OUTCOME = {hit: ["Did something", "done"], empty: ["Let it be", "quiet"], failed: ["Failed", "failed"]};
     const KIND = {returned: "Work returned", moment: "A moment I set", body: "My body", world: "The world", self: "A care of mine"};
-    const said = h => h.words + (h.quoted ? " (an agent's words)" : "");
+    const said = h => h.words + (h.quoted ? " (from an agent's turn)" : "");
     const attention = ATTENTION[input.attention.state] || {title: "Attention: " + input.attention.state, tone: "attention"};
     const mind = [row({id: "attention", title: attention.title, detail: attention.detail, tone: attention.tone})];
     for (const t of input.thoughts) {
@@ -86,9 +86,9 @@ function face(input) {
         queue: () => input.queue.map(q => {
             if (q.kind === "step") {
                 const [value, tone] = (STEP[q.state] || (() => [q.state, "attention"]))(q);
-                const detail = (q.from ? "Peer-carried step; open it to read." : q.words + (q.inferred ? " · inferred" : ""))
+                const detail = (q.from ? "Filed in " + q.from.join(", ") + "'s turn" : q.words + (q.inferred ? " · inferred" : ""))
                     + (q.blockedReason ? " · " + q.blockedReason : "") + (q.note ? " · note: " + q.note : "");
-                return row({id: q.key, title: q.from ? "A step from " + q.from.join(", ") + "'s turn" : q.title, detail, value, at: q.at, tone,
+                return row({id: q.key, title: q.from ? q.words : q.title, detail, value, at: q.at, tone,
                     open: open(q.key), actions: actions(q.key)});
             }
             if (q.kind === "blocked") return row({id: q.key, title: q.title, detail: q.detail, value: "Waits on " + q.waitsOn.join(", "),

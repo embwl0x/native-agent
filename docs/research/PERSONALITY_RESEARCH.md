@@ -1,7 +1,7 @@
 # How a person becomes someone
 
 Research on personality, emotion and conversational initiative, written for
-Claude on 2026-10-24 as raw material for the agent design. It covers how these
+the lead on 2026-10-24 as raw material for the agent design. It covers how these
 things form and work in people, drawn from primary and review literature. Each
 area ends with the mechanism an agent would need. It does not propose features.
 

@@ -24,8 +24,6 @@ const WORDS = {
     "body_and_append_mutually_exclusive": "Use body to replace or append to add, not both."
 };
 const NO_DEFAULT_FOLDER = "The default Notes account has no default folder; make that destination available in Notes before creating a note.";
-const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 // Foundation's whitespaceAndNewlineCharacterSet and newlines set.
 const SPACE = "\\t\\n\\u000b\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
 const TRIM = new RegExp("^[" + SPACE + "]+|[" + SPACE + "]+$", "g");
@@ -67,44 +65,24 @@ function clamp(raw, fallback, min, max) {
     return Math.max(min, Math.min(max, value));
 }
 
-// Accepts the four spellings AppleScript prints for a date; anything else is a named gap, never a guess.
-// Local-time spellings read in the Mac's time zone; a numeric offset is exact.
-function isoDate(raw) {
-    const given = trim(raw);
-    if (given === "") throw new Error("AppleScript returned no date. Read the source again.");
-    const day = "(?:" + DAYS.join("|") + ")", month = "(" + MONTHS.join("|") + ")";
-    const date = "(\\d{1,2}), (\\d{4}) at ";
-    const hour12 = (hour, pm) => hour >= 1 && hour <= 12 ? hour % 12 + (pm ? 12 : 0) : -1;
-    // Groups: month, day of month, year, hour, minute, second, then AM or PM when the form has one.
-    const forms = [
-        [new RegExp("^" + day + ", " + month + " " + date + "(\\d{1,2}):(\\d{2}):(\\d{2})\\s(AM|PM)$"), match => hour12(Number(match[4]), match[7] === "PM")],
-        [new RegExp("^" + day + ", " + month + " " + date + "(\\d{1,2}):(\\d{2}):(\\d{2})$"), match => Number(match[4]) <= 23 ? Number(match[4]) : -1],
-        [new RegExp("^" + month + " " + date + "(\\d{1,2}):(\\d{2}):(\\d{2})\\s(AM|PM)$"), match => hour12(Number(match[4]), match[7] === "PM")],
-    ];
-    let found;
-    for (const [pattern, hourOf] of forms) {
-        const match = pattern.exec(given);
-        if (!match) continue;
-        const year = Number(match[3]), monthIndex = MONTHS.indexOf(match[1]), dayOfMonth = Number(match[2]);
-        const minute = Number(match[5]), second = Number(match[6]);
-        const hour = hourOf(match);
-        const built = new Date(year, monthIndex, dayOfMonth, hour, minute, second);
-        if (hour >= 0 && minute < 60 && second < 60 && built.getFullYear() === year && built.getMonth() === monthIndex
-            && built.getDate() === dayOfMonth && built.getHours() === hour) found = built;
-        break;
+// An AppleScript date crosses as numbers, {year, month, day, seconds since midnight} (DATE_PARTS), never as the Mac's localized text, so it
+// reads the same on every Mac whatever its language or region. The instant is built in the Mac's time zone, as Notes shows it.
+const DATE_PARTS = date => `{year of ${date}, (month of ${date}) as integer, day of ${date}, time of ${date}}`;
+
+// The four numbers become an ISO instant, or this throws with what came back; a caller keeps its row and marks that date unknown.
+function appleDate(parts) {
+    if (typeof parts === "string") throw new Error(parts === "" ? "Notes returned no date." : parts);
+    if (!Array.isArray(parts) || parts.length !== 4 || !parts.every(Number.isInteger)) {
+        throw new Error("Notes returned a date that is not four whole numbers (year, month, day, seconds since midnight).");
     }
-    const numeric = found ? undefined : /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$/.exec(given);
-    if (numeric) {
-        const [year, month1, dayOfMonth, hour, minute, second] = numeric.slice(1, 7).map(Number);
-        const offsetHours = Number(numeric[8]), offsetMinutes = Number(numeric[9]);
-        const built = new Date(Date.UTC(year, month1 - 1, dayOfMonth, hour, minute, second));
-        if (built.getUTCFullYear() === year && built.getUTCMonth() === month1 - 1 && built.getUTCDate() === dayOfMonth && built.getUTCHours() === hour
-            && minute < 60 && second < 60 && offsetHours < 24 && offsetMinutes < 60) {
-            found = new Date(built.getTime() - (numeric[7] === "-" ? -1 : 1) * (offsetHours * 60 + offsetMinutes) * 60000);
-        }
+    const [year, month, day, seconds] = parts;
+    const hour = Math.floor(seconds / 3600), minute = Math.floor(seconds % 3600 / 60), second = seconds % 60;
+    const built = new Date(year, month - 1, day, hour, minute, second);
+    if (year < 1 || year > 9999 || month < 1 || month > 12 || seconds < 0 || seconds > 86399 || Number.isNaN(built.getTime())
+        || built.getFullYear() !== year || built.getMonth() !== month - 1 || built.getDate() !== day) {
+        throw new Error("Notes returned an impossible date: " + parts.join(", ") + ".");
     }
-    if (!found) throw new Error("AppleScript returned an unsupported localized date. Repair the source date adapter before reading it again.");
-    return found.toISOString().replace(/\.\d{3}Z$/, "Z");
+    return built.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 // The first line's length counting its terminator, as Foundation's line range does.
@@ -193,7 +171,14 @@ repeat with i from 1 to totalHits
         set fd to item 2 of candidate
         set nid to (id of n) as string
         set nm to (name of n) as string
-        set md to (modification date of n) as string
+        -- A date that cannot be read travels as its error text, so the note is kept with its date unknown.
+        try
+            set modifiedDate to modification date of n
+            set md to ${DATE_PARTS("modifiedDate")}
+        on error errorText number errorNumber
+            if errorNumber is in ${PASSED_UP} then error errorText number errorNumber
+            set md to ("modification date: " & errorText & " (" & errorNumber & ")")
+        end try
         set end of rows to {nid, nm, md, fd, ((plaintext of n) as string)}
         set countNote to countNote + 1
     on error errorText number errorNumber
@@ -204,7 +189,8 @@ end repeat
 return {totalHits, rows, gaps}
 `; }
 
-// Read gaps stay named: a note that cannot be read or dated never hides the others, and the total is then incomplete.
+// Read gaps stay named: a note that cannot be read never hides the others, and the total is then incomplete. A note whose date cannot be
+// read is not a gap: it returns with modified_at null and modified_at_unknown saying why.
 function read(selection, limit, whole, offset) {
     const value = script(readScript(selection, limit), true);
     if (typeof value === "string" && trim(value) === NOT_CONFIGURED) {
@@ -217,21 +203,22 @@ function read(selection, limit, whole, offset) {
     const total = value[0], gaps = value[2].slice(), rows = [];
     const wide = whole || total === 1;
     for (const [index, row] of value[1].entries()) {
-        if (!Array.isArray(row) || row.length !== 5 || !row.every(field => typeof field === "string") || row[0] === "") {
+        // Every field is text except the modification date, which is its numbers or the text of why it could not be read.
+        if (!Array.isArray(row) || row.length !== 5 || ![0, 1, 3, 4].every(at => typeof row[at] === "string") || row[0] === ""
+            || !(typeof row[2] === "string" || Array.isArray(row[2]))) {
             gaps.push("notes[" + index + "]: Notes returned an incomplete JSON record.");
             continue;
         }
         const [id, name, modified, folder, body] = row;
         const page = pageOf(body, name, offset, wide ? 4000 : 200);
         if (!page) return failed("invalid_note_body_offset");
-        let modifiedAt;
-        try { modifiedAt = isoDate(modified); }
-        catch (error) {
-            gaps.push("notes[" + index + "]: " + error.message);
-            continue;
-        }
+        // A date that does not read keeps its note: the date is unknown, never a guess, and the note is not a missing note.
+        let modifiedAt = null, dateUnknown;
+        try { modifiedAt = appleDate(modified); }
+        catch (error) { dateUnknown = error.message; }
         const note = {name, [wide ? "body" : "body_preview"]:body.slice(page.start, page.end), modified_at:modifiedAt, folder, id,
             body_offset:page.start, body_total:page.total, title_line_elided:page.elided, truncated:page.end < page.total};
+        if (dateUnknown !== undefined) note.modified_at_unknown = dateUnknown;
         if (page.end < page.total) note.next_body_offset = page.end;
         rows.push(note);
     }

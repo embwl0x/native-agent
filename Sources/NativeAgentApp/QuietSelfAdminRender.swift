@@ -58,15 +58,34 @@ enum QuietSelfAdminRender {
                 instruction: "Read this page again after its owner publishes; preserve the owner's failure if it remains unavailable.",
                 next: ["page": .string(page.id)])]
         }
-        return snapshot.text(title: page.title, door: true, page: page.id).components(separatedBy: "\n\n").filter { !$0.isEmpty }.map { block in
-            var lines = block.components(separatedBy: "\n")
-            var heading = page.title
-            if let first = lines.first, first == snapshot.face?.title || first.hasSuffix(":") {
-                heading = first.hasSuffix(":") ? String(first.dropLast()) : first
-                lines.removeFirst()
+        var sections: [JSONValue] = snapshot.text(title: page.title, door: true, page: page.id).components(separatedBy: "\n\n")
+            .filter { !$0.isEmpty }.map { block in
+                var lines = block.components(separatedBy: "\n")
+                var heading = page.title
+                if let first = lines.first, first == snapshot.face?.title || first.hasSuffix(":") {
+                    heading = first.hasSuffix(":") ? String(first.dropLast()) : first
+                    lines.removeFirst()
+                }
+                // The face's text already bounds each row's words and keeps its reference (id, link, calls) whole; it is not cut again.
+                return .object(["heading": .string(heading), "lines": .array(lines.map(JSONValue.string))])
             }
-            // The face's text already bounds each row's words and keeps its reference (id, link, calls) whole; it is not cut again.
-            return .object(["heading": .string(heading), "lines": .array(lines.map(JSONValue.string))])
+        // A page whose drawer is not known yet says nothing about it rather than guess.
+        if let drawer = await appModel.engine.pages.drawer(page: page.id) {
+            sections.append(.object(["heading": .string("How this page changes"), "lines": .array([.string(changeLine(drawer))])]))
+        }
+        return sections
+    }
+
+    /// One line on how the agent changes a shown page: the part that draws it and the calls that revise it, or that Swift draws it and what
+    /// is still the agent's to change there. Every page this reads is in the layout, so its place and its tabs' order are always the agent's.
+    private static func changeLine(_ drawer: PartFaces.Drawer) -> String {
+        let layout = "layout.read and layout.write move this page and order its tabs."
+        switch drawer {
+        case .part(let part):
+            return "Your part \(part) draws this page: ability.read with id \"\(part)\" shows its code, and ability.save with that id changes "
+                + "this page's words and rows. " + layout
+        case .stem:
+            return "The app draws this page in Swift, not a part of yours: the settings and actions above are what you can change here. " + layout
         }
     }
 
@@ -342,9 +361,9 @@ enum QuietPages {
     static var ids: [String] { QuietToolPage.ids }
     static let drawOnly: [QuietPage] = [
         QuietPage(value: QuietToolPage(id: "simple", title: "Simple view",
-                  summary: "The Simple shell: the sidebar with its pinned person row, and the chat.")),
-        QuietPage(value: QuietToolPage(id: "simple_settings_menu", title: "Simple view settings menu",
-                  summary: "The Simple shell with the person row's settings menu drawn open.")),
+                  summary: "The Simple shell on Chat: my card, the places, the folded Agents and Helpers lists, and the chat.")),
+        QuietPage(value: QuietToolPage(id: "simple_settings_menu", title: "Simple view settings",
+                  summary: "The Simple shell on Control's Settings tab, where Simple's settings live.")),
     ]
     /// An app page by name or alias, or a page of the agent's own by its id.
     @MainActor static func page(named raw: String) -> QuietPage? {

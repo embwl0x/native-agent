@@ -2,6 +2,11 @@ import SwiftUI
 import Foundation
 // Blueprint: | `FaceFormView.swift` | Shared public and protected field drawing, validation and retained form settlement |
 
+/// The one on-colour of a switch on the Mac: a quiet neutral that follows light and dark. The app's shell uses it for its own switches too.
+public enum FaceSwitchTint {
+    public static let on = Color.primary.opacity(0.5)
+}
+
 @MainActor enum FaceFieldInput {
     static func line(_ label: String, placeholder: String, text: Binding<String>) -> some View {
         TextField(placeholder, text: text).textFieldStyle(.roundedBorder).accessibilityLabel(label)
@@ -9,8 +14,13 @@ import Foundation
     static func lines(_ label: String, text: Binding<String>) -> some View {
         TextEditor(text: text).font(.body).frame(minHeight: 160).accessibilityLabel(label)
     }
+    /// The system switch, on in a quiet neutral on the Mac: a column of switches in the system's accent is colour on every control, and the
+    /// app's one accent means something else. The tint is on the switch itself, never on a page.
     static func toggle(_ label: String, value: Binding<Bool>) -> some View {
         Toggle(label, isOn: value).labelsHidden().toggleStyle(.switch)
+        #if os(macOS)
+            .tint(FaceSwitchTint.on)
+        #endif
     }
     static func choice(_ label: String, options: [PartFace.Control.Option], value: Binding<String>, allowsEmpty: Bool) -> some View {
         Picker(label, selection: value) {

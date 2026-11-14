@@ -3,10 +3,11 @@ import Synchronization
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `ProviderConnectionProbe.swift` | Native probe capabilities and request-bound OAuth credential evidence; API-key connection probes |
+// Blueprint: | `ProviderConnectionProbe.swift` | Native probe capabilities and request-bound credential evidence; API-key connection probes |
 
-/// One probe's sent-credential fingerprint; readiness never supplies request evidence.
-public final class OAuthProbeCredential: Sendable {
+/// The fingerprint of the credential one call used, stamped by the route that used it: the header its request carried at the transport send, or the
+/// account token handed to the Codex CLI. Readiness never stamps it.
+public final class SentCredential: Sendable {
     private let sent = Mutex<String?>(nil)
 
     public init() {}
@@ -15,10 +16,20 @@ public final class OAuthProbeCredential: Sendable {
         sent.withLock { $0 }
     }
 
+    /// A credential rides as a bearer token, or as `x-api-key` on Anthropic's first-party Messages wire.
     func sending(_ request: URLRequest) {
-        guard let authorization = request.value(forHTTPHeaderField: "Authorization"),
-              authorization.hasPrefix("Bearer ") else { return }
-        let fingerprint = LLMProviderStatusFeed.fingerprint(String(authorization.dropFirst("Bearer ".count)))
+        let key: String
+        if let authorization = request.value(forHTTPHeaderField: "Authorization"), authorization.hasPrefix("Bearer ") {
+            key = String(authorization.dropFirst("Bearer ".count))
+        } else if let header = request.value(forHTTPHeaderField: "x-api-key") {
+            key = header
+        } else { return }
+        sending(token: key)
+    }
+
+    /// A credential the route hands over itself rather than on a request NativeAgent builds.
+    func sending(token: String) {
+        let fingerprint = LLMProviderStatusFeed.fingerprint(token)
         sent.withLock { $0 = fingerprint }
     }
 }
@@ -156,6 +167,10 @@ public extension SwiftNativeProviderRouting {
                     if case .failure(let failure) = result, !failure.superseded {
                         catalogDetail = "; catalog not saved: \(failure.reason)"
                     }
+                } else if draftKey == nil, FirstPartyModelDiscovery.isLiveRoute(id),
+                          let failure = await FirstPartyModelDiscovery.publishChecked(route: id, firstPage: body, key: apiKey, dataRoot: dataRoot) {
+                    // The check fetched this key's model list: it is published through the same owner a refresh uses.
+                    catalogDetail = "; model list not saved: \(failure)"
                 }
                 return NativeAgentShared.ProviderTestResult(
                     provider_id: id, status: "ok", tested: true,
@@ -195,10 +210,11 @@ public extension ProviderCatalogSnapshot {
 
 }
 
-private enum ProbeCredentialPart: LLMCallPart { static let unset: OAuthProbeCredential? = nil }
+private enum SentCredentialPart: LLMCallPart { static let unset: SentCredential? = nil }
 extension LLMCall {
-    public var probeCredential: OAuthProbeCredential? {
-        get { self[ProbeCredentialPart.self] }
-        set { self[ProbeCredentialPart.self] = newValue }
+    /// Held by whoever records the verdict on the credential this call sends: the connection check, else the shared client.
+    public var sentCredential: SentCredential? {
+        get { self[SentCredentialPart.self] }
+        set { self[SentCredentialPart.self] = newValue }
     }
 }

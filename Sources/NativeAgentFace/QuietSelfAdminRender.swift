@@ -100,8 +100,9 @@ enum QuietSelfAdminRender {
         // Render tab destinations inside their rail frame so screenshots match the visible page.
         Group {
             if QuietPages.drawOnly.contains(page) {
-                SimpleShellView()
-                    .environment(\.simpleSettingsMenuDrawnOpen, page.id == "simple_settings_menu")
+                // A picture changes no selection: Simple is drawn on Chat, or on Control's Settings tab, where Simple's settings live.
+                SimpleShellView(shown: page.id == QuietPages.simpleSettings ? .item(.settings) : .item(.chat),
+                                choose: { _, _ in }, select: { _ in })
             } else {
                 ShellPageContent(item: page.item, ownPage: page.item == .ownPage ? page.id : nil)
             }
@@ -146,7 +147,8 @@ enum QuietSelfAdminRender {
             }
         }
         let capture = QuietCaptureSession(pane: drawsPane ? request.workPane : nil,
-            session: page.item == .chat ? appModel.activeChatSessionId : nil, reader: request.reader)
+            session: page.item == .chat ? appModel.activeChatSessionId : nil, reader: request.reader,
+            page: page.item == .chat ? nil : ShellPageContent.doorPage(page.item) ?? page.id)
         defer { capture.close() }
         return try await withTaskCancellationHandler {
             try await capture.prepare(appModel: appModel, size: size)
@@ -244,6 +246,9 @@ enum QuietSelfAdminRender {
             present = present && appModel.face.slot(.contacts).value(as: ContactsFace.self) != nil
                 && appModel.face.slot(.helpers).value(as: HelpersFace.self) != nil
         }
+        if page.id == QuietPages.simpleSettings {
+            present = present && appModel.face.slot(.page("settings")).value(as: PartFaceSnapshot.self) != nil
+        }
         guard present else {
             throw PartCallError(code: "render_data_unprepared", message: "The requested native page has no complete prepared capture frame.")
         }
@@ -310,11 +315,13 @@ struct QuietPage: Sendable, Equatable {
 enum QuietPages {
     static let all = QuietToolPage.all.map(QuietPage.init)
     static var ids: [String] { QuietToolPage.ids }
+    /// The draw-only page that pictures Simple on Control's Settings tab.
+    static let simpleSettings = "simple_settings_menu"
     static let drawOnly: [QuietPage] = [
         QuietPage(value: QuietToolPage(id: "simple", title: "Simple view",
-                  summary: "The Simple shell: the sidebar with its pinned person row, and the chat.")),
-        QuietPage(value: QuietToolPage(id: "simple_settings_menu", title: "Simple view settings menu",
-                  summary: "The Simple shell with the person row's settings menu drawn open.")),
+                  summary: "The Simple shell on Chat: my card, the places, the folded Agents and Helpers lists, and the chat.")),
+        QuietPage(value: QuietToolPage(id: simpleSettings, title: "Simple view settings",
+                  summary: "The Simple shell on Control's Settings tab, where Simple's settings live.")),
     ]
     /// An app page by name or alias, or a page of the agent's own by its id.
     @MainActor static func page(named raw: String) -> QuietPage? {

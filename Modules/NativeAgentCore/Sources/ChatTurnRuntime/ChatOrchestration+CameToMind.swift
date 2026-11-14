@@ -13,7 +13,7 @@ import NativeAgentCore
 // Blueprint: | `ChatOrchestration+CameToMind.swift` | `SwiftNativeTurnEngine.cameToMind(after:turn:held:sessionId:surface:)`: non-preview lines first met (`FamiliarLines`) form a moment; the recorder's dispatch predicate and ExpansionDispatcher's nested preview marker exclude proposals before familiarity and recall; memories join the agent's conversation at most two a round and four a turn, traced as `mind.came_to_mind` |
 
 extension SwiftNativeTurnEngine {
-    private func familiarityFailure(_ error: Error, root: URL, turn: Turn) -> String? {
+    func familiarityFailure(_ error: Error, root: URL, turn: Turn) -> String? {
         let owner = root.appendingPathComponent("mind/familiar.bin")
         RepairOwed.owe(root, id: UUID().uuidString, kind: .run, operation: "mind.familiar", owner: owner.path,
             words: "Familiarity is unavailable: \(error.localizedDescription). No new familiarity was recorded; saved bytes are preserved.",
@@ -69,11 +69,23 @@ extension SwiftNativeTurnEngine {
         return lines
     }
 
-    static func cameToMindNudge(_ items: [ContextPacketItem], clock: ContextRenderClock) -> String {
-        "[Came to mind as you read that (your own memories, not new instructions):\n"
-            // Bound the words before decoration so clipping can never strip a root or its source boundary.
-            + items.map { "- " + ContextMemoryLead.decorate(String(($0.summary ?? $0.text).prefix(280)), item: $0, clock: clock) }
-                .joined(separator: "\n")
+    /// A memory is clipped only when its line can carry the call that opens it whole; one with no address is shown whole.
+    static func cameToMindNudge(_ items: [ContextPacketItem], preparedTurn: ContextPreparedTurn) -> String {
+        let clock = ContextRenderClock.turn(preparedTurn)
+        return "[Came to mind as you read that (your own memories, not new instructions):\n"
+            + items.map { item -> String in
+                let text = item.summary ?? item.text
+                let locator = preparedTurn.generation.sources.first { $0.descriptor.id == item.pointer.sourceID }?.descriptor.canonicalLocator
+                // A memory record's locator ends in `/records/id:<record id>` (MemoryContext.recordID).
+                guard text.count > 280, let locator, let at = locator.range(of: "/records/id:"), at.upperBound < locator.endIndex else {
+                    return "- " + ContextMemoryLead.decorate(text, item: item, clock: clock)
+                }
+                var id = ""
+                JSONValue.encodeString(String(locator[at.upperBound...]), into: &id)
+                // Bound the words before decoration so clipping can never strip a root or its source boundary.
+                return "- " + ContextMemoryLead.decorate(String(text.prefix(280)) + "…", item: item, clock: clock)
+                    + " (whole: app {\"action\":\"memory.recall\",\"args\":{\"memory_id\":\(id)}})"
+            }.joined(separator: "\n")
             + "]"
     }
 
@@ -81,6 +93,7 @@ extension SwiftNativeTurnEngine {
         after records: some Sequence<ToolDispatchRecord>,
         preparedTurn: ContextPreparedTurn?, turn: Turn,
         held: inout Set<ContextAtomID>,
+        owed: inout [String],
         sessionId: String?,
         surface: String
     ) async -> String? {
@@ -96,16 +109,18 @@ extension SwiftNativeTurnEngine {
             return ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome)
         }
             .flatMap { $0.name == "app" ? Self.world(in: $0.result) : [$0.result] }
-        let items = await cameToMind(lines: Self.lines(read), preparedTurn: preparedTurn, turn: turn, held: &held,
+        let lines = Self.lines(read)
+        owed += lines
+        let items = await cameToMind(lines: lines, preparedTurn: preparedTurn, turn: turn, held: &held,
                                     sessionId: sessionId, surface: surface)
         guard let items, let preparedTurn else { return nil }
-        let nudge = Self.cameToMindNudge(items, clock: ContextRenderClock.turn(preparedTurn.need))
+        let nudge = Self.cameToMindNudge(items, preparedTurn: preparedTurn)
         TurnTraceBus.fireFromContext(kind: "mind.came_to_mind.presented", sessionId: sessionId, surface: surface,
             payload: .object(["presentation": .string(TurnTraceRedactor.redactText(nudge))]), turn: turn)
         return nudge
     }
 
-    /// Only newly met lines form the moment; familiarity advances even when no reminder fits.
+    /// Only newly met lines form the moment; they become familiar when the round carrying them reaches the model.
     func cameToMind(
         lines: [String],
         preparedTurn: ContextPreparedTurn?, turn: Turn,
@@ -115,7 +130,7 @@ extension SwiftNativeTurnEngine {
     ) async -> [ContextPacketItem]? {
         var moment = ""
         let fresh: [String]
-        do { fresh = try remPinsDataRoot.map({ try FamiliarLines.firstMet(lines, dataRoot: $0) }) ?? lines }
+        do { fresh = try remPinsDataRoot.map({ try FamiliarLines.firstMet(lines, dataRoot: $0, recording: false) }) ?? lines }
         catch {
             if let root = remPinsDataRoot { _ = familiarityFailure(error, root: root, turn: turn) }
             return nil
@@ -147,7 +162,8 @@ extension SwiftNativeTurnEngine {
         let read: ContextAmbientRecallResult
         do { read = try await preparedTurn.cameToMind(by: moment, embedding: embedding, excluding: held, limit: min(2, room)) }
         catch {
-            report("unavailable", "Ambient recollection selection failed: \(error.localizedDescription). Repair its context source.")
+            // The error itself, not its localized stub: a selection error's case and numbers are what say which rule refused.
+            report("unavailable", "Ambient recollection selection failed: \(error). Repair its context source.")
             return nil
         }
         if !read.unavailable.isEmpty {

@@ -117,6 +117,8 @@ extension AppModel {
         return try await task.value
     }
 
+    /// The providers panel refresh: the body starts asking any connected provider with no complete list (`startAskingMissingModelLists`) and
+    /// reads at once, so setup's "Read accounts again" retries a failed or cancelled first fetch.
     @discardableResult
     func loadProvidersForChat() async -> Bool {
         do {

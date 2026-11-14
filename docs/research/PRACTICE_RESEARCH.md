@@ -1,6 +1,6 @@
 # How a person gets good at things
 
-Research on practice and skill, written for Claude on 2026-10-25 as raw
+Research on practice and skill, written for the lead on 2026-10-25 as raw
 material for the agent design. It covers how people go from slow and
 deliberate to fast and automatic at a task, what an agent that does one
 person's recurring work on their Mac for months needs from that, and what

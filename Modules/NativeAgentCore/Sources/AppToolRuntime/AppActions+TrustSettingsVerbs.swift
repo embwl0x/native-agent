@@ -12,37 +12,40 @@ extension AppActions {
                 AppAction("trust.refresh_privacy", "trust", "Read macOS grants and the privacy inventory again", tool: "upkeep",
                           input: verb("trust_refresh_privacy"), read: true),
                 AppAction("trust.authorize_safe", "trust", "Preserve the damaged Trust policy and authorize Safe", owner: .person(
-                              "it rewrites the saved authority every judgment reads; the person does it on Trust", asks: false),
+                              "it rewrites the saved authority every judgment reads; the person does it on Trust", asks: false,
+                                  name: "Authorizing Safe after a damaged Trust policy"),
                           tool: "upkeep", input: verb("trust_authorize_safe")),
                 AppAction("trust.check_mail", "trust", "Check Mail access on this Mac", owner: .person(
-                              "it enters Mail, which can raise macOS's Automation prompt; " + foreground, asks: false),
+                              "it enters Mail, which can raise macOS's Automation prompt; " + foreground, asks: false, name: "Checking Mail access"),
                           tool: "upkeep", input: verb("trust_check_mail")),
                 AppAction("trust.ask_grant", "trust", "Ask macOS for these grants", ["targets:list"], owner: .person(
                               "only the person answers macOS's prompt; " + foreground,
-                              instead: "permissions.request raises the person's permission card", asks: false),
+                              instead: "permissions.request raises the person's permission card", asks: false, name: "Answering macOS's permission prompts"),
                           tool: "upkeep", input: verb("trust_ask_grant")),
                 AppAction("trust.grant_settings", "trust", "Open System Settings at a grant's pane", ["target"], subject: ["target"], owner: .person(
-                              "it opens System Settings; " + foreground, asks: false),
+                              "it opens System Settings; " + foreground, asks: false, name: "Opening System Settings at a permission"),
                           tool: "upkeep", input: verb("trust_grant_settings")),
                 AppAction("trust.test_notification", "trust", "Send a Mac control test notification", owner: .person(
-                              "it tests Mac control's notification, which can raise macOS's prompt; " + foreground, asks: false),
+                              "it tests Mac control's notification, which can raise macOS's prompt; " + foreground, asks: false,
+                                  name: "Sending a Mac control test notification"),
                           tool: "upkeep", input: verb("trust_test_notification")),
                 AppAction("trust.workbench", "trust", "Open the Mac control workbench", owner: .person(
-                              "it opens a window of freeform Mac commands; " + foreground, asks: false),
+                              "it opens a window of freeform Mac commands; " + foreground, asks: false, name: "Opening the Mac control workbench"),
                           tool: "upkeep", input: verb("trust_workbench")),
                 AppAction("trust.exclude_app", "trust", "Choose an app to exclude from activity capture and delete its history", owner: .person(
-                              "the person chooses the app and confirms the deletion; " + foreground, asks: false),
+                              "the person chooses the app and confirms the deletion; " + foreground, asks: false,
+                                  name: "Excluding an app from activity capture"),
                           irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"],
                           tool: "upkeep", input: verb("trust_exclude_app")),
                 AppAction("settings.update", "settings", "Open the software update control", owner: .person(
                               "it opens the updater's window to review and install; " + foreground,
-                              instead: "app.check_updates reads whether one is out", asks: false),
+                              instead: "app.check_updates reads whether one is out", asks: false, name: "Installing an update"),
                           tool: "upkeep", input: verb("settings_update")),
                 AppAction("settings.data_limits", "settings", "Open the data-limits reference", owner: .person(
-                              "it opens a document window; " + foreground, asks: false),
+                              "it opens a document window; " + foreground, asks: false, name: "Opening the data-limits reference"),
                           tool: "upkeep", input: verb("settings_data_limits")),
                 AppAction("settings.copy_build_identity", "settings", "Copy the running build identity", owner: .person(
-                              "it replaces the clipboard; " + foreground, asks: false),
+                              "it replaces the clipboard; " + foreground, asks: false, name: "Copying the build identity"),
                           tool: "upkeep", input: verb("settings_copy_build_identity")),
             ]
         }

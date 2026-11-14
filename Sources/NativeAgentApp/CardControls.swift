@@ -54,7 +54,7 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
         try await NativeAgentEngine.forRoot(root).providers.list().providers.map {
             (providerID: $0.provider_id, displayName: $0.display_name,
              authState: $0.auth_status.state, eligible: $0.auth_status.eligible, defaultModel: $0.default_model,
-             firstModel: $0.models.first?.id)
+             firstModel: $0.offeredModels.first?.id)
         }
     }
 

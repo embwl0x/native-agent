@@ -4,7 +4,7 @@ import PersistenceCore
 import CryptoKit
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `ModelCatalogCache.swift` | Credential-bound catalog reads and explicitly refreshed, ordered publication |
+// Blueprint: | `ModelCatalogCache.swift` | Credential-bound catalog reads, route-supplied credentials and explicitly refreshed, ordered publication |
 
 /// Catalog freshness records where the rows came from and whether the response is complete.
 public enum ModelCatalogFreshness: String, Sendable, Equatable {
@@ -82,12 +82,14 @@ public struct ModelCatalogRead: Sendable {
     public let freshness: ModelCatalogFreshness
     public var failure: String? = nil
     public var fetchedAt: Date? = nil
+    /// What would make the list available, when refreshing would not.
+    public var remedy: String? = nil
 
     /// The picker must name why rows are not the provider's current answer.
     public var note: String? {
         switch freshness {
         case .unavailable:
-            return "Couldn't load models: \(failure ?? "no list has been fetched yet"). Refresh to try again."
+            return "Couldn't load models: \(failure ?? "no list has been fetched yet"). \(remedy ?? "Refresh to try again.")"
         case .staleAfterFailedRefresh:
             let when = fetchedAt.map { " from \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
             return "Couldn't load models: \(failure ?? "the refresh failed"). The saved list\(when) is historical; refresh before choosing a model."
@@ -102,10 +104,13 @@ public struct ModelCatalogFetch: Sendable {
     public let models: [ProviderModelInfo]
     /// Completeness depends only on the response envelope, never the cached row count.
     public let isComplete: Bool
+    /// Per model id, fields saved beside its row: what the provider itself stated, so a later build resolves the contract again from it.
+    public let rowExtras: [String: [String: JSONValue]]
 
-    public init(models: [ProviderModelInfo], isComplete: Bool) {
+    public init(models: [ProviderModelInfo], isComplete: Bool, rowExtras: [String: [String: JSONValue]] = [:]) {
         self.models = models
         self.isComplete = isComplete
+        self.rowExtras = rowExtras
     }
 }
 
@@ -115,6 +120,29 @@ struct DecodedModelCatalog: Sendable {
     let isComplete: Bool?
     let fetchedAt: Date?
     let credentialBinding: String?
+    var rowExtras: [String: [String: JSONValue]] = [:]
+}
+
+/// How one route's list is bound to its credential. A sign-in renews in `prepare`, before any lock is held; binding and commit read the saved
+/// credential synchronously under its file lock.
+struct ModelCatalogCredential: Sendable {
+    /// The credential file whose lock orders saves against list binding and commit.
+    var file: @Sendable (URL) -> URL
+    /// The binding's kind as written in the cache: `api_key` or `sign_in`.
+    var kind: String
+    /// What a list is bound to, read under the file lock: the key itself, or a sign-in's account identity. Nil when nothing is saved.
+    var current: @Sendable (URL) throws -> String?
+    /// The secret the list request sends, made ready first; never called while a credential lock is held.
+    var prepare: @Sendable (URL) async throws -> String?
+
+    static func apiKey(providerConfigFile: String) -> ModelCatalogCredential {
+        let file: @Sendable (URL) -> URL = { $0.appendingPathComponent("providers/\(providerConfigFile)") }
+        let read: @Sendable (URL) throws -> String? = {
+            try LLMCredentialResolver.checkedAPIKey(providerConfigFile: providerConfigFile, dataRoot: $0)
+        }
+        return ModelCatalogCredential(file: file, kind: "api_key", current: read,
+                                      prepare: { root in try CredentialFileLock.withLock(file(root)) { try read(root) } })
+    }
 }
 
 /// Credential locks, decoding and durable catalog commits never occupy the UI actor.
@@ -128,7 +156,7 @@ struct ModelCatalogCache: Sendable {
     var endpoint: URL?
     /// Decode rows and authority stamps from the same bytes.
     var readCache: @Sendable (URL) throws -> DecodedModelCatalog?
-    var providerConfigFile: String
+    var credential: ModelCatalogCredential
     /// Fetch failures must stay visible to the cache owner.
     var fetchLive: @Sendable (String?, URLSession) async throws -> ModelCatalogFetch
 
@@ -147,13 +175,21 @@ struct ModelCatalogCache: Sendable {
         }
 
         func refresh(_ cache: ModelCatalogCache, dataRoot: URL, session: URLSession) async -> Result<ModelCatalogFetch, FetchFailure> {
+            let token: String?
             let credential: String?
             do {
-                credential = try CredentialFileLock.withLock(cache.configPath(dataRoot)) {
-                    try LLMCredentialResolver.checkedAPIKey(providerConfigFile: cache.providerConfigFile, dataRoot: dataRoot)
+                // A sign-in renews here, before any credential lock is held. The binding is read under the lock before and after: a credential
+                // replaced while this one was being prepared must never be given this one's list.
+                let before = try cache.savedCredential(dataRoot: dataRoot)
+                do { token = try await cache.credential.prepare(dataRoot) }
+                catch {
+                    // A renewal that failed is a failed refresh of this credential's list, and is kept as one.
+                    return cache.commit(.failure(FetchFailure(error.localizedDescription)), credential: before, dataRoot: dataRoot)
                 }
+                credential = try cache.savedCredential(dataRoot: dataRoot)
+                guard before == credential else { return .failure(.supersededRefresh) }
             } catch { return .failure(FetchFailure(error.localizedDescription)) }
-            let fingerprint = SHA256.hash(data: Data((credential ?? "").utf8)).description
+            let fingerprint = SHA256.hash(data: Data(((credential ?? "") + "\n" + (token ?? "")).utf8)).description
             if let flight = flights[fingerprint] {
                 return await withTaskCancellationHandler { await flight.value } onCancel: { flight.cancel() }
             }
@@ -161,15 +197,13 @@ struct ModelCatalogCache: Sendable {
                 defer { flights.removeValue(forKey: fingerprint) }
                 var committed: Result<ModelCatalogFetch, FetchFailure>?
                 let fetched = await reads.read({
-                    await cache.fetch(credential: credential, session: session)
+                    await cache.fetch(credential: token, session: session)
                 }, publish: { result in
                     committed = cache.commit(result, credential: credential, dataRoot: dataRoot)
                 })
                 // Even a read whose publication was superseded must not return another credential's list as this account's live answer.
                 do {
-                    let current = try CredentialFileLock.withLock(cache.configPath(dataRoot)) {
-                        try LLMCredentialResolver.checkedAPIKey(providerConfigFile: cache.providerConfigFile, dataRoot: dataRoot)
-                    }
+                    let current = try cache.savedCredential(dataRoot: dataRoot)
                     guard current == credential else { return .failure(FetchFailure.supersededRefresh) }
                 } catch { return .failure(FetchFailure(ProviderFailure.diagnosticDescription(error))) }
                 // Superseded readers still return their own fetched result.
@@ -191,23 +225,38 @@ struct ModelCatalogCache: Sendable {
     }
 
     private func configPath(_ dataRoot: URL) -> URL {
-        dataRoot.appendingPathComponent("providers/\(providerConfigFile)")
+        credential.file(dataRoot)
     }
 
-    private static func credentialBinding(_ credential: String?) -> String {
-        credential.map { "api_key:" + LLMProviderStatusFeed.fingerprint($0) } ?? "unauthenticated"
+    private func credentialBinding(_ saved: String?) -> String {
+        saved.map { "\(credential.kind):" + LLMProviderStatusFeed.fingerprint($0) } ?? "unauthenticated"
+    }
+
+    /// What the saved credential binds a list to now, read under its lock. Nil means nothing is saved.
+    func savedCredential(dataRoot: URL) throws -> String? {
+        try CredentialFileLock.withLock(configPath(dataRoot)) { try credential.current(dataRoot) }
     }
 
     /// Rows never outlive their credential authority, even across a restart. Read the binding under the same credential lock as fetch publication.
     private func checkedCache(dataRoot: URL) throws -> DecodedModelCatalog? {
         try CredentialFileLock.withLock(configPath(dataRoot)) {
-            let credential = try LLMCredentialResolver.checkedAPIKey(providerConfigFile: providerConfigFile, dataRoot: dataRoot)
+            let saved = try credential.current(dataRoot)
             guard let decoded = try readCache(dataRoot) else { return nil }
-            guard decoded.credentialBinding == Self.credentialBinding(credential) else {
+            guard decoded.credentialBinding == credentialBinding(saved) else {
                 throw ProviderRoutingError.configurationFailed(
                     "The saved model catalog has no evidence for the current credential. Refresh its models in Providers.")
             }
             return decoded
+        }
+    }
+
+    /// The saved credential and the list bound to it, read together under the credential lock. A list saved for another credential reads as
+    /// absent; only unreadable bytes throw. Refresh-failure provenance is the caller's to consult.
+    func boundRead(dataRoot: URL) throws -> (credential: String?, catalog: DecodedModelCatalog?) {
+        try CredentialFileLock.withLock(configPath(dataRoot)) {
+            let saved = try credential.current(dataRoot)
+            guard let decoded = try readCache(dataRoot), decoded.credentialBinding == credentialBinding(saved) else { return (saved, nil) }
+            return (saved, decoded)
         }
     }
 
@@ -299,11 +348,14 @@ struct ModelCatalogCache: Sendable {
             // LatestRead orders publication; the credential lock binds it to the selected key.
             return try CredentialFileLock.withLock(configPath(dataRoot)) {
                 try Self.lastFailedByPath.withLock { failures in
-                    let current = try LLMCredentialResolver.checkedAPIKey(providerConfigFile: providerConfigFile, dataRoot: dataRoot)
+                    let current = try self.credential.current(dataRoot)
                     guard current == credential else { return .failure(.supersededRefresh) }
                     switch result {
                     case .success(let fetched):
-                        do { try writeCache(fetched.models, dataRoot: dataRoot, credential: credential, isComplete: fetched.isComplete) }
+                        do {
+                            try writeCache(fetched.models, dataRoot: dataRoot, credential: credential, isComplete: fetched.isComplete,
+                                           rowExtras: fetched.rowExtras)
+                        }
                         catch {
                             let failure = FetchFailure("Could not save \(cachePath(dataRoot).path): \(error.localizedDescription)")
                             failures[key] = failure.reason
@@ -337,7 +389,8 @@ struct ModelCatalogCache: Sendable {
         _ models: [ProviderModelInfo],
         dataRoot: URL,
         credential: String?,
-        isComplete: Bool = true
+        isComplete: Bool = true,
+        rowExtras: [String: [String: JSONValue]] = [:]
     ) throws {
         let path = cachePath(dataRoot)
         guard let endpoint else { throw URLError(.badURL) }
@@ -345,9 +398,11 @@ struct ModelCatalogCache: Sendable {
             "schema_version": .int(1),
             "updated_at": .string(ISO8601DateFormatter().string(from: Date())),
             "source": .string(endpoint.absoluteString),
-            "credential_binding": .string(Self.credentialBinding(credential)),
+            "credential_binding": .string(credentialBinding(credential)),
             "complete": .bool(isComplete),
-            "models": .array(models.map { .object($0.providerJSON()) }),
+            "models": .array(models.map { row in
+                .object(row.providerJSON().merging(rowExtras[row.id] ?? [:]) { _, extra in extra })
+            }),
         ])
         try SwiftNativePersistenceCore.writeDataAtomicDurable(payload.serializedData(pretty: true), to: path)
     }

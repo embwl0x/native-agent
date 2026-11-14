@@ -166,4 +166,7 @@ public enum FaceWireError: Error, Sendable, LocalizedError {
         case .io(let code): "My face pipe failed (POSIX \(code))."
         }
     }
+
+    /// The code a window's reverse call answers with when it has no connection to answer on: not connected yet, or any more.
+    public static let disconnectedCode = "face_disconnected"
 }

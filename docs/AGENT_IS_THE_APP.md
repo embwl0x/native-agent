@@ -1,6 +1,6 @@
 # The agent is the app
 
-The design NativeAgent is building toward (User + Claude, 2026-10-14; draft 4). NORTHSTAR clause 8 is its one-paragraph form. Current implementation notes follow the design; the superseded phase-one plan is in [history](history/AGENT_IS_THE_APP_PHASE_ONE_2026-10-14.md).
+The design NativeAgent is building toward (User and the lead, 2026-10-14; draft 4). NORTHSTAR clause 8 is its one-paragraph form. Current implementation notes follow the design; the superseded phase-one plan is in [history](history/AGENT_IS_THE_APP_PHASE_ONE_2026-10-14.md).
 
 Each agent is called by their own configured name ([Project Direction](PROJECT_DIRECTION.md#product-principles)); “they” here means that agent.
 
@@ -43,14 +43,16 @@ microtask drain, and one still pending fails plainly. Only `id` is always
 required; a new ability also needs description and code, while a revision
 inherits omissions. The save owner and `sense.make` share header schemas from `AbilityStore.partHeader`'s owner;
 neither keeps a second reach or face shape. Declared `learned` and `choices`
-accept any JSON and remain metadata. The [app-door contract](TOOL_LOADING.md)
+accept any JSON and remain metadata. The [app-door contract](ONE_DOOR.md)
 applies this rule to every action and rejects fieldless object declarations at
 launch unless they explicitly declare open contents.
 `app` is a frozen callable door in that code: actions use `app({action,args})`,
-`app.<page>.<action>(args)` or literal bracket members such as
-`app["page.action"](args)`; `app({actions:[{action,args},…]})` answers in order as
-an array, stopping at the first throw. Find and item/page requests call the same
-`app.find` and `app.read` bindings. Indirect calls use
+`app.<page>.<action>(args)` (every id by its full segments: `app.undo()`,
+`app.studio.intake.read(args)`) or literal bracket members such as
+`app["page.action"](args)`; `app({actions:[…]})` answers in order as an array,
+stopping at the first throw, each entry read as a lone request is. Find and
+item/page requests, alone or as batch entries, call the same `app.find` and
+`app.read` bindings. Indirect calls use
 `app.call(actionID,args)` or `host.call(actionID,args)` with declared actions.
 Before staging, save statically checks literal calls in every app/host binding,
 including literal callable action/batch requests, host file/PIM aliases, action
@@ -91,7 +93,7 @@ The stem enforces one law for every part, with the turn-program recovery excepti
 - **It changes only by their hand** (or the owner's), and keeps its last self beside it.
 - **Its keep is theirs under Full Mac; under Work/Safe/Builder, the owner's.** The owner's off-switch stays theirs.
 - **It owes repair at its cause.** Ordinary ability runs with captured input owe source-fault repair through Experiences (OWED on Home with its lever); file-backed sense completions record failures without this obligation. Ordinary abilities and senses are revised forward; their retained previous bytes are history, with no public version-swap action. Their own turn program is the one exception: any non-Stop program/helper failure selects an unfailed `turn.prev.js` or shipped seed, replays the same turn and brings their the original cause, selected program and owed repair (`ChatTurnRuntime/TurnPart.swift`). The [turn recovery contract](skill_manifest_spec.md#turn-recovery) owns selection, once-per-source bounds and storage failure behavior.
-- **Fading unused parts is future design.** There is no idle-expiration archive. Current launch behavior only disables an untouched bundled seed the app no longer ships, leaving it restorable; a seed they edited or explicitly re-enabled stays (`EngineRuntime/EngineLaunch.swift`, `fadeRetiredSeeds`).
+- **Fading unused parts is future design.** There is no idle-expiration archive. Current launch behavior only disables a bundled seed they follows that the app no longer ships, leaving it restorable; a seed they edited or explicitly re-enabled stays (`EngineRuntime/EngineLaunch.swift`, `fadeRetiredSeeds`).
 - **Its face is drawn** by the stem on their interface and on the person's, Mac and iPhone, from the same description. What they reads is what they see.
 
 ## The stem: what it is, and nothing else
@@ -123,7 +125,7 @@ Swift, compiled, CPU, shipped as one DMG with iOS. It never thinks and has no mo
   row of theirs with that key), never in a face they writes ([manifest](skill_manifest_spec.md#calling-a-part-and-projecting-its-face)).
   A row's action is a door call they and they share: their tap runs it as their decision, theirs is judged by the same Trust law, and a lever is never
   theirs at any posture. Approval answers also accept an exact waiting card on their own authenticated message through the
-  [shared decision authority](TOOL_LOADING.md#authority-and-receipts), recording that message and door rather than a tap. Helpers, wakes and
+  [shared decision authority](ONE_DOOR.md#authority-and-receipts), recording that message and door rather than a tap. Helpers, wakes and
   peer-steered turns remain refused; permanent deletion requires their tap by declared class. A joined message makes exact authorization
   unattributable, so message decisions refuse until a fresh message after the turn ends; missing or mismatched open-turn evidence also refuses.
   The decision never guesses an authorizing row. A message decision requires a fresh turn with
@@ -138,7 +140,7 @@ The stem has no features and no opinions. Every feature NativeAgent has today is
 ## What falls out, with nothing special-cased
 
 - **Growth:** what they works out by hand repeatedly, they keeps, and what their mind only repeated, their part carries, inside the same turn. After each tool round the native stem meets the turn's hand work (ordered tool/action ids of landed writes or irreversible non-ability calls, or one call with the same input 3 rounds in a row), without arguments or incidental reads, as a `practice: ` line through `FamiliarLines` in `mind/familiar.bin`. Its first meeting is only recorded; a later meeting, unless an active ability's current recorded route already covers those ids in order, rides their next `model.call` in that turn as its note, once a turn ([Habits H3](HABITS.md#h3--keep-what-repeats-not-what-happened-once)). Keeping the route with `ability.save`, revising the part they worked around or looped, or keeping nothing is one of their acts in the work. There is no private call after the reply. Familiarity uses the existing bounded line record. Under Full Mac a newly kept part is live at once; its first real run is its proof.
-- **Their hands report what they did:** an act checks its own effect and returns the screen after it, so their mind looks again only when a step did not happen or it needs what the act did not show, and the steps it can already see go in one act (mac.act steps, each checked against the screen the last one left).
+- **Their hands report what they did:** an act checks its own effect and returns the screen after it, and a verb that waits on a surface or puts one in front returns that surface as it now reads, through the reader the surface already has (a Chrome wait its page, a direct menu press its screen, `page.show` the page it shows), so their mind looks again only when a step did not happen or it needs what the act did not show, and the steps it can already see go in one act (mac.act steps, each checked against the screen the last one left).
 - **Effort is felt:** the stem measures what each turn took (model rounds, tokens, minutes, the longest stretch of one call repeated). Their after-turn mind reads it as one line beside the exchange, so a slog or a breeze moves a care about their craft the way a lost game does; their parts' records keep the rounds per use; the practice note names a looped call's stretch.
 - **Craft:** they sees their body: each turn starts with their own parts in front of them, each with how often they have used it, best match for the message first, so they reaches for the part instead of redoing its work.
 - **Noticing:** what nobody asked about is worth what it touches of the agent's cares; the seed gives a line below the chance bar zero worth.
@@ -155,7 +157,7 @@ The stem has no features and no opinions. Every feature NativeAgent has today is
 
 - **Stays stem (~128k + design kit):** Mac control, sync and push, the agent wires, transports, storage and embeddings, Keychain/OAuth, model clients, the sandbox, Trust, the loop runner and scheduler, the turn guarantee, the glass kit, the face renderer and the live world (new).
 - **Becomes parts (~128k, seed on touch, Swift deleted as each proves):** their turn, Desk nags (the unused cadence learner is retired), attention policy, their door pages, the layout blocks, persona procedures, and last, their mind policy (dreams, reflection, organism policy).
-- **Their hands (done):** Mail, Notes, Messages, Music and Chrome history are parts that answer their door verbs through their headers' `answers`; the stem keeps the AppleScript executor and its per-event write checks, Trust, the cards and `host.files.query`/`host.files.mime` ([Tool loading](TOOL_LOADING.md#where-actions-come-from)).
+- **Their hands (done):** Mail, Notes, Messages, Music and Chrome history are parts that answer their door verbs through their headers' `answers`; the stem keeps the AppleScript executor and its per-event write checks, Trust, the cards and `host.files.query`/`host.files.mime` ([One door](ONE_DOOR.md#where-actions-come-from)).
 - **Stays stem (~128k + design kit):** Mac control, sync and push, the agent wires, transports, storage and embeddings, Keychain/OAuth, model clients, the
   sandbox, Trust, the loop runner and the one clock, attention's intake and field, the turn guarantee, the glass kit, the face renderer and the live world
   (new).
@@ -191,7 +193,7 @@ The dated phase-one lane assignments and proofs are retained in [history](histor
 2. **Their turn first:** yes; built as `abilities/turn.js` (0.6.7).
 3. **Mind as parts (phase 7):** they changes it through Trust; direct persona writes are theirs under Full Mac, while REM→GROWTH proposals stay approval-gated ([NORTHSTAR clause 1](NORTHSTAR.md#clause-1--one-mind-alive-means-convergent)).
 4. **Repair:** their own failing turn program is set aside and replayed under the recovery contract above, with repair owed to them; other parts keep their version and owe repair at its cause.
-5. **Seeds:** the app reserves the shipped catalog's ids and `native-` for its own parts; `ability.save` refuses new parts taking those ids, but permits revisions of installed parts, including shipped ones, under normal admission. Future seeds use `native-`. An untouched admitted bundled seed follows the changed complete authored contract (`EngineLaunch`, `AbilityStore`), including header and dependency changes. An already-current seed skips signing and proof work at launch; execution still verifies admission on use. Changed seeds retain the displaced version and off switch; installation preserves any authored version or occupied slot. The [manifest spec](skill_manifest_spec.md) owns the exact comparison and admission law. The installed turn program keeps its current form: it has no historical shipped-body upgrade table. Missing-turn seed creation and the turn-program recovery exception remain.
+5. **Seeds:** the app reserves the shipped catalog's ids and `native-` for its own parts; `ability.save` refuses new parts taking those ids, but permits revisions of installed parts, including shipped ones, under normal admission. Future seeds use `native-`. A part they have not edited follows the shipped one: a seed, or a version they keeps that is the shipped part, sealed as a seed when kept and replaced in place by the seed at launch. It follows the changed complete authored contract (`EngineLaunch`, `AbilityStore`), including header and dependency changes, and they are told of each change. An already-current seed skips signing and proof work at launch; execution still verifies admission on use. Changed seeds retain the displaced version and off switch; installation preserves any edited version, telling their once of each shipped version beside it, and any occupied slot. The [manifest spec](skill_manifest_spec.md) owns the exact comparison and admission law. The installed turn program keeps its current form: it has no historical shipped-body upgrade table. Missing-turn seed creation and the turn-program recovery exception remain.
 6. **Version:** no jump. Releases step the patch number (User 10-17: "we gotta make sure when we hit 1.0 this is HUGE"); phase 1 shipped across 0.6.x.
 
 ---
@@ -226,7 +228,7 @@ The grant is `card.request {kind:"api_key", target:"secret:<name>", hosts, progr
 
 Notion, Gmail, Google Calendar, X, AgentMail, TradingView, GitHub and Slack's service actions follow the same rule: grow an ability when asked, request its key on a card. Their action/descriptors, tools, rooms/pages, setup/sign-in, credential readers, Doctor checks and watch templates are removed, including GitHub's tracking loop, Desk lane and completion hook; ProviderRouting's device-code owner stays. Old service credential files and GitHub Keychain items remain untouched and unread. Connectors shows keyring metadata—name, destinations, account, grant time, never values—with Remove, beside Slack and Telegram. Slack's Socket Mode door retains its tokens and reply calls; old approved post cards resolve without sending. Removed scheduled `connector_action` payloads stay paused with their cause; GitHub-woken bots are off with their cause. They can grow an ability and schedule or signal it instead.
 
-## Parts sweep decisions (10-23, Claude; plan: ~/.claude/state/release/sweeps/parts/plan.md)
+## Parts sweep decisions (10-23, the lead; plan: ~/.claude/state/release/sweeps/parts/plan.md)
 
 Phase 2 (hands) and the first of phase 6 (faces) land through one shared layer, then file-owned domain lanes. These settle the calls the sweep raised:
 
@@ -371,7 +373,7 @@ brief's uncertainty statement rather than disappearing from it.
 
 ## Phase 4, as built (10-26): a part is a prediction
 
-The law (User and Claude, 10-26): deliberation is the price of surprise. What the stem can predict, it does; only what it cannot predict reaches the model. The model names the intent; the stem learns the mechanics from each mind's own practice. Every part gains one form, three fields:
+The law (User and the lead, 10-26): deliberation is the price of surprise. What the stem can predict, it does; only what it cannot predict reaches the model. The model names the intent; the stem learns the mechanics from each mind's own practice. Every part gains one form, three fields:
 
 - **applies:** the situation it is for.
 - **after:** what will be true when it has run, checked by the stem against what the mind did next.

@@ -6,7 +6,8 @@ import NativeAgentShared
 import os
 // Blueprint: | `LLMProviderStatusFeed.swift` | checked, credential-bound observation |
 
-/// A user-initiated check is one bounded observation, not continuous monitoring; failure must replace an earlier green row.
+/// A check is one bounded observation of one credential: a connection check, or a model call its provider answered. Failure must replace an earlier green
+/// row.
 public enum LLMProviderStatusFeed {
     public static let relativePath = "llm/provider_status.json"
     public static let staleAfter: TimeInterval = 30 * 24 * 60 * 60
@@ -86,15 +87,51 @@ public enum LLMProviderStatusFeed {
         try await write(record(for: result, checkedAt: checkedAt), to: path(in: dataRoot), credential: result.credential)
     }
 
+    /// What a model call's provider said about the credential the call sent.
+    public enum Answer: Sendable {
+        case answered
+        /// The call path classified the provider's reply as a rejection of that credential; the words are its redacted diagnostic.
+        case rejected(String)
+    }
+
+    /// The receipt names a proof's day and time, not every call, so one credential's answered calls re-prove it at most this often.
+    static let answerProofInterval: TimeInterval = 60 * 60
+
+    /// A model call its provider answered checks the credential it sent, as a connection check does, and leaves the same receipt. Proof is written only
+    /// when this credential has none from the last hour, a rejection only when its row does not already say so.
+    public static func recordAnswer(_ answer: Answer, providerID: String, model: String, credential: String, dataRoot: URL,
+                                    answeredAt: Date = Date()) async {
+        let saved = receipts(dataRoot: dataRoot)
+        // Unreadable checks are already every account's stated failure, and the merge refuses to write through them.
+        guard saved.unreadable == nil else { return }
+        let verdict = saved.verdict(providerID: providerID, credential: credential)
+        let result: NativeAgentShared.ProviderTestResult
+        switch answer {
+        case .answered:
+            if case .proven(let checkedAt) = verdict, answeredAt.timeIntervalSince(checkedAt) < answerProofInterval { return }
+            result = .init(provider_id: providerID, status: "ok", tested: true, model_used: model,
+                           detail: "A model call was answered.", credential: credential)
+        case .rejected(let why):
+            if verdict == .rejected { return }
+            result = .init(provider_id: providerID, status: "error", tested: true, model_used: model,
+                           error: why, cause: ProviderFailure.authExpired.encoded, credential: credential)
+        }
+        do {
+            try await write(result, dataRoot: dataRoot, checkedAt: answeredAt)
+        } catch {
+            nativeLog("provider_status: %@'s answered call left no receipt: %@", providerID, ProviderFailure.diagnosticDescription(error))
+        }
+    }
+
     /// Hash the checked credential so only a new credential clears its failure, never a metadata save.
     public static func credentialFingerprint(providerID: String, dataRoot: URL) throws -> String? {
         let key: String?
         switch SwiftNativeProviderRouting.connectionProbe(providerID, authMode: nil) {
-        case .oauth:
+        // The Codex CLI has no connection check, yet the calls it answers bind receipts to its sign-in's token.
+        case .oauth, .unsupported:
             key = try SwiftNativeProviderRouting.signedInAccessToken(providerID: providerID, dataRoot: dataRoot)
         case .apiKey:
             key = try LLMCredentialResolver.checkedAPIKey(providerConfigFile: "\(providerID).json", dataRoot: dataRoot)
-        case .unsupported: return nil
         }
         guard let key, !key.isEmpty else { return nil }
         return fingerprint(key)
@@ -118,11 +155,11 @@ public enum LLMProviderStatusFeed {
             case failed(String)
         }
 
-        /// A check without the same credential fingerprint proves nothing about this key.
-        public func verdict(providerID: String, key: String) -> Verdict {
+        /// A check without the same credential fingerprint proves nothing about this credential.
+        public func verdict(providerID: String, credential: String) -> Verdict {
             if case .failed(let why)? = rows[providerID] { return .failed(why) }
             guard case .current(let record)? = rows[providerID], record.tested,
-                  record.credential == fingerprint(key) else { return .unchecked }
+                  record.credential == credential else { return .unchecked }
             guard record.checkedAt.timeIntervalSinceNow <= allowedClockSkew else {
                 return .failed("Provider check timestamp is too far in the future.")
             }
@@ -233,6 +270,8 @@ public enum LLMProviderStatusFeed {
             if let data = try ProviderStateValidation.dataIfPresent(at: url) {
                 byProvider = try envelope(data, at: url)
             }
+            // An untested row observed no credential, so it never replaces a check that did.
+            if !record.tested, let id = record.providerID, case .object(let saved)? = byProvider[id], saved["tested"] == .bool(true) { return }
             let row = JSONValue.object(object.filter { $0.key != "schema" })
             _ = try decode(row, at: url, providerID: record.providerID)
             if let id = record.providerID { byProvider[id] = row }

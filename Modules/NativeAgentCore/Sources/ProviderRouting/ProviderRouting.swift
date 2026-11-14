@@ -77,6 +77,10 @@ public actor SwiftNativeProviderRouting: Sendable {
         guard Set(surfaces.keys) == Set(routes.keys), surfaces.keys.allSatisfy(MODEL_SURFACES.contains) else {
             throw ProviderRoutingError.configurationFailed("Reconstruction needs an explicit model and account for every selected surface.")
         }
+        // The model each slot holds now, from the saved values when they are readable: a slot may keep it.
+        let savedSurfaces = (try? Self.loadProviderStateObjectChecked(at: surfacesPath, description: "surface preference")) ?? [:]
+        let savedActive = (try? Self.loadActiveProviderStateChecked(at: activeProviderPath)) ?? [:]
+        let soleConnected = soleConnectedProviderID()
         let providers = try nativeListProviders(
             openRouterModels: OpenRouterModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() },
             moonshotModels: MoonshotModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
@@ -91,8 +95,16 @@ public actor SwiftNativeProviderRouting: Sendable {
             guard let model, let route = routes[surface],
                   let provider = providers.first(where: { $0.id == route }), provider.configured == true,
                   case .array(let models)? = provider.modelCatalog,
-                  models.contains(where: { if case .object(let row) = $0 { return row["id"] == .string(model) }; return false }) else {
+                  let row = FirstPartyModelCatalog.pickerRow(model, providerID: route, rows: models, dataRoot: dataRoot) else {
                 throw ProviderRoutingError.configurationFailed("Reconstruction needs a connected account and an available model for \(surface).")
+            }
+            // A model choice: offered, or the model the slot holds now (`ModelSlot.mayHold`).
+            guard ModelSlot.mayHold(model, rowOffered: row["offered"] != .bool(false),
+                                    savedInSlot: savedModelInSlot(surface, route: route, surfaces: savedSurfaces, active: savedActive,
+                                                                  soleConnectedRoute: soleConnected)) else {
+                var note: String?
+                if case .object(let extras)? = provider.extras { note = extras["models_note"]?.stringValue }
+                throw ProviderRoutingError.configurationFailed(ModelSlot.refusal(note: note, accountName: Self.displayName(for: route)))
             }
         }
         let transactionPath = surfaceTransactionPath

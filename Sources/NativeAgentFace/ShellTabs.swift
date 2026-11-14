@@ -84,6 +84,10 @@ private struct PageActionsModifier<Actions: View>: ViewModifier {
 struct ShellTab<Key: Hashable>: Identifiable {
     let key: Key
     let title: String
+    /// The segment's accessibility identifier, where one already names the page the tab selects.
+    var identifier: String? = nil
+    /// Something waits on the person here, the mark the rail's Desk row carries too.
+    var needsYou = false
     var id: Key { key }
 }
 
@@ -95,7 +99,11 @@ struct ShellTabs<Key: Hashable>: View {
         HStack(spacing: 0) {
             Picker("Sections", selection: $selection) {
                 ForEach(tabs) { tab in
-                    Text(tab.title).tag(tab.key)
+                    if let identifier = tab.identifier {
+                        word(tab).accessibilityIdentifier(identifier).tag(tab.key)
+                    } else {
+                        word(tab).tag(tab.key)
+                    }
                 }
             }
             .pickerStyle(.segmented)
@@ -104,6 +112,13 @@ struct ShellTabs<Key: Hashable>: View {
             Spacer(minLength: 0)
         }
         .accessibilityLabel("Sections")
+    }
+
+    /// The one accent's dot marks a tab where something waits on the person, as it marks the rail row.
+    private func word(_ tab: ShellTab<Key>) -> Text {
+        guard tab.needsYou else { return Text(tab.title) }
+        return Text("\(tab.title) \(Text("●").foregroundStyle(NativeAgentShell.needsYou))")
+            .accessibilityLabel("\(tab.title), waiting for you")
     }
 }
 

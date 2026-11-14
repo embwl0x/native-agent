@@ -176,9 +176,17 @@ private struct ProviderConnectStep: View {
         ]
         if state.providerConnected {
             let options = state.providers.filter { $0.auth_status.eligible }.flatMap { provider in
-                provider.models.filter { $0.supported_reasoning_efforts != nil }.map {
+                provider.offeredModels.filter { $0.supported_reasoning_efforts != nil }.map {
                     PartFace.Control.Option(id: provider.provider_id + "::" + $0.id, label: provider.display_name + " · " + $0.name)
                 }
+            }
+            // A connected account that offers nothing yet says its own sentence; its choices appear here when its provider's list arrives.
+            let waiting = state.providers.filter { $0.auth_status.eligible && $0.offeredModels.isEmpty }.compactMap(\.models_note)
+            if options.isEmpty, !waiting.isEmpty {
+                sections.append(.init(id: "onboarding.model.waiting", rows: [
+                    .init(id: "onboarding.model.waiting", title: "No models to choose yet",
+                          detail: waiting.joined(separator: " ") + " Read accounts again to ask.", tone: .attention)
+                ]))
             }
             sections.append(.init(id: "onboarding.model", rows: [], block: .init(kind: "form", key: "onboarding.model", fields: [
                 .init(id: "model", label: "Chat model", kind: "choice",
@@ -235,6 +243,8 @@ private struct ProviderConnectStep: View {
                     guard outcome.accepted, !outcome.unresolved else { return outcome }
                     return .init(words: "Chat model saved.", effects: .known, accepted: true, committed: [.init(id: "model", value: .string(model))])
                 case "back": state.goBack()
+                // Reading the accounts again asks: the providers panel refresh act reaches the body's settings owner, which starts asking each
+                // connected provider with no complete list and reads at once ("Asking…", then the list or the plain sentence).
                 case "read": await state.reloadProviders(refresh: { await appModel.loadProvidersForChat() })
                 case "continue":
                     guard state.canContinue else {

@@ -43,7 +43,7 @@ public enum CapabilityLifecycle {
     public static func writeRefusal(turn: Turn?) -> String? { turnWriteCheck(turn)()?.message }
 
     public static func peerRefusal(_ who: String, tap: String?) -> ToolFailureError {
-        ToolFailureError("\(who) is an untrusted source, so it cannot change senses, tools or skills on this run. "
+        ToolFailureError("\(who) is an untrusted source, so it cannot change senses, abilities or skills on this run. "
             + (tap.map { "The owner can trust this source at \($0) to authorize future runs." }
                ?? """
                    The saved steer has no authenticated contact binding. It cannot be elevated by renaming it; obtain a new request through an authenticated \

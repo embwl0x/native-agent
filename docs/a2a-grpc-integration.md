@@ -12,7 +12,7 @@ JSON-RPC and HTTP+JSON remain available, with 0.3 JSON-RPC compatibility.
 HTTP+JSON subscriptions use `GET /a2a/tasks/{id}:subscribe`. Work stopped by
 a data restore projects as terminal `canceled`, with its restore reason in
 the status message, on every A2A binding.
-Agent reaches peers through `app` agent actions; see
+The agent reaches peers through `app` agent actions; see
 [Agent conversations](agent-communication.md).
 
 ## Runtime ownership

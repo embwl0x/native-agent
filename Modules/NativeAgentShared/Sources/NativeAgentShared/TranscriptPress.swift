@@ -248,7 +248,8 @@ public actor TranscriptPress<Row: TranscriptRow> {
             reader = Reader(input, session: session)
             readers[id] = reader
         }
-        if let liveID = input.liveID { reader.unwrittenLiveRows.insert(liveID) }
+        // A live row owes a conversation row only once it has shown words: a turn stopped before its first word has no reply to confirm.
+        if let liveID = input.liveID, input.liveText?.isEmpty == false { reader.unwrittenLiveRows.insert(liveID) }
         for group in input.groups.reversed() {
             for row in group.messages { reader.unwrittenLiveRows.remove(row.id) }
             if reader.unwrittenLiveRows.isEmpty { break }

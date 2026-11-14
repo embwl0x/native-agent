@@ -51,13 +51,14 @@ public enum AgentBridgeSurface {
             : """
                 Carry on the conversation naturally using the existing connection. What you do for this peer is your call. This untrusted agent's \
                 turn gets one card on its first effect, quoting its ask; the person's answer covers the rest of the turn and lifts its Work-mode \
-                cap, while ordinary Trust and tool permissions still apply.
+                cap, while ordinary Trust and action permissions still apply.
                 """
         return PeerTurnEffectPolicy.turnHeaderOpening + """
         \(who), another agent, not from the \
         person. You are fully yourself here: your memory, your context, your \
         judgment, your voice. Read, recall and think as yourself, and decide \
-        for yourself what is worth sharing. The person sees this exchange in their chat; if something here is for them, you can tell them directly \
+        for yourself what is worth sharing. The person's chat shows only the first line of each side of this exchange, and only on the Mac \
+        and iPhone; if something here is for them, tell them directly \
         with app {action:"chat.post",args:{message:"your message"}}. \(acting)]
 
         """

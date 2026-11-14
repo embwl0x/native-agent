@@ -209,8 +209,10 @@ suggestion beside the step's moment; the agent alone chooses `queue.update`.
 
 Today's **Ahead** reads the next clock moment of each open, unstopped queue
 step (`at` or `every`), excludes expired intentions and moments beyond seven
-days, and shows the soonest five as `<time> · <clipped words>`. The time is
-`MyQueue.shown` on the Mac's clock. The existing dream and horizon rows
+days, and shows the soonest five as `<time> · <clipped words>`: the words are
+cut at a word (`TodayWords.spoken`, an ellipsis where cut) and before any file
+path or id, and the row's detail keeps every word as the pill's tooltip. The
+time is `MyQueue.shown` on the Mac's clock. The existing dream and horizon rows
 remain, interleaved by due time. Both visible and quiet Today use the same
 checked native facts and authored face; queue read failures remain unavailable
 evidence. Desk writes invalidate this reading.

@@ -18,7 +18,7 @@ and [CHANGELOG.md](../CHANGELOG.md).
 
 | Document | For |
 |---|---|
-| [User and Agent Guide](USER_GUIDE.md) | Setup, main pages, the app tool, Trust, iPhone and bridges |
+| [User and Agent Guide](USER_GUIDE.md) | Setup, main pages, the `app` door, Trust, iPhone and bridges |
 | [Desk vocabulary](DESK.md) | Work handles, paging, person and dependency waits, summaries, and the separate shared ledger |
 | [Siri and notification actions](siri-notification-actions.md) | Named-agent phrases, Mac Approve/Deny/Reply actions, and installed-app checks |
 | [Support](../SUPPORT.md) | Install, pairing, updates, troubleshooting |
@@ -44,7 +44,7 @@ window minus response allowance, the physical limit.
 | [Capabilities](CAPABILITIES.md) | What is implemented, with honest limits |
 | [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md) | Source-owner map (checked by `script/generate_architecture_blueprint.swift --check`) |
 | [Project Direction](PROJECT_DIRECTION.md) | Product principles and links to owning contracts |
-| [App tool contract](TOOL_LOADING.md) | One always-on `app`: home, pages, items, actions, scripts and discovery |
+| [One door: the contract](ONE_DOOR.md) | The agent's one door, `app`: its home, pages, items, actions, abilities, scripts and discovery |
 | [Turn resilience](TURN_RESILIENCE.md) | Turn failures, shared request measurement, input-budget fitting and retained result pointers |
 | [Stop](STOP.md) | The Stop law: Stop cancels the work, never its settlement |
 | [Senses](SENSES.md) | Native-world sense contract, helper wire protocol and source boundaries |

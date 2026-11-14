@@ -64,6 +64,14 @@ extension MacFourVerbs {
                                               "outcome_unknown": .bool(true),
                                               "menu_path": .string(path)])
         }
+        return await pressedMenu(pressed, path: path, app: nil, screen: screen, turn: turn, context: context)
+    }
+
+    /// What a menu press says, for an act's menu path and the direct `menu_press` alike: the sentence, then the screen after it (`app`'s
+    /// window, the front one when nil or when `app` is gone), or why that screen could not be read. A refusal carries `screen`, the look
+    /// it was refused against.
+    public func pressedMenu(_ pressed: MacControlResult, path: String, app: String?, screen: String, turn: Turn,
+        context: MacOperationContext) async -> MacFourVerbsReply {
         if pressed.error == "front_changed" {
             // The person took the front during the lookup: their choice stands.
             return MacFourVerbsReply(ok: false, text: "The person changed apps; nothing pressed.",
@@ -72,7 +80,15 @@ extension MacFourVerbs {
         if pressed.ok {
             let output = Self.object(pressed.output)
             var text = "Pressed the menu command \(path). " + (Self.string(output["status_note"]) ?? "")
-            if case .seen(let after) = await sight(part: nil, turn: turn, context: context) { text += "\n" + after.render }
+            // A press can end the app it was pressed in (Quit, closing its last window); what the person then sees is the front screen.
+            var look = await sight(part: nil, app: app, turn: turn, context: context)
+            if app != nil, case .blind = look { look = await sight(part: nil, turn: turn, context: context) }
+            switch look {
+            case .seen(let after): text += "\n" + after.render
+            case .blind(let unseen):
+                text = text.trimmingCharacters(in: .whitespaces) + " The screen after could not be read: "
+                    + (Self.string(unseen.detail["message"]) ?? unseen.text)
+            }
             var detail = Self.operationDetail(pressed)
             detail["menu_path"] = .string(path)
             return MacFourVerbsReply(ok: true, text: text, detail: detail)

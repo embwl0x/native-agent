@@ -143,7 +143,7 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         guard invocation.imageSink != nil else {
             return """
                 Pixels (\(why)): image_delivery_unavailable. This call cannot carry an image. The text read above retains its stated coverage; \
-                request pixels from a model tool turn if an image is needed.
+                request pixels from a model turn's call if an image is needed.
                 """
         }
         var scope = "the window"

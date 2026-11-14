@@ -45,24 +45,30 @@ extension NativeAgentEngine {
             .map { dataRoot.appendingPathComponent("telegram/" + $0) }
     }
 
-    /// A failed Telegram read stays in its section; the other connectors still draw.
-    @concurrent func telegramFaceSections() async -> [PartFace.Section] {
+    /// Telegram's settings, which sit behind its connector row, and its diagnostics and records, folded after everything else. A failed
+    /// Telegram read is its one settings row; the other connectors still draw.
+    @concurrent func telegramFace() async -> (settings: [PartFace.Row], records: [PartFace.Section]) {
         let status: TelegramPresentationSnapshot
         do {
             status = try await telegram.refresh()
         } catch {
-            return [.init(id: "telegram", title: "Telegram", style: .list, rows: [.init(id: "telegram.unavailable",
+            return ([PartFace.Row(id: "telegram.unavailable",
                 title: "Telegram's records could not be read.", detail: TurnSecretRedactor.redactText(error.localizedDescription), tone: .failed,
-                actions: [.init(id: "refresh", label: "Read again", call: .init("telegram.refresh"))])])]
+                actions: [.init(id: "refresh", label: "Read again", call: .init("telegram.refresh"))])], [])
         }
         let state = await MainActor.run { (choice: providers.selection(for: "telegram"),
                                            connections: providers.connections, catalog: providers.catalog) }
-        return [telegramSettingsSection(status,
-            modelRows: telegramModelRows(status, choice: state.choice, connections: state.connections, catalog: state.catalog))]
-            + telegramRecordSections(status)
+        let diagnostics = PartFace.Section(id: "telegram-diagnostics", title: "Telegram diagnostics", style: .list, rows: [
+            PartFace.Row(id: "telegram.logs", title: "Clear Telegram's records",
+                detail: "Clearing permanently removes recent replies, blocked-message records, errors and diagnostic logs from this Mac.",
+                symbol: "trash", actions: [.init(id: "clear", label: "Clear logs", role: .destructive, call: .init("telegram.clear_logs"))])
+        ], folded: true)
+        return (telegramSettingsRows(status,
+            modelRows: telegramModelRows(status, choice: state.choice, connections: state.connections, catalog: state.catalog)),
+            [diagnostics] + telegramRecordSections(status))
     }
 
-    private func telegramSettingsSection(_ status: TelegramPresentationSnapshot, modelRows: [PartFace.Row]) -> PartFace.Section {
+    private func telegramSettingsRows(_ status: TelegramPresentationSnapshot, modelRows: [PartFace.Row]) -> [PartFace.Row] {
         // A face carries source times, never words recalculated from the moment it was read.
         func moment(_ iso: String?) -> String {
             guard let iso else { return "None" }
@@ -134,35 +140,18 @@ extension NativeAgentEngine {
                 actions: voice.enabled ? [.init(id: "voice", label: "Set up Telegram voice", doors: ["mac"], call: .init("telegram.voice_setup"))]
                     : nil))
         }
-        rows.append(.init(id: "telegram.logs", title: "Telegram diagnostics",
-            detail: "Clearing permanently removes recent replies, blocked-message records, errors and diagnostic logs from this Mac.",
-            symbol: "trash", actions: [.init(id: "clear", label: "Clear logs", role: .destructive, call: .init("telegram.clear_logs"))]))
-        return .init(id: "telegram", title: "Telegram", style: .list, rows: rows)
+        return rows
     }
 
     private func telegramModelRows(_ status: TelegramPresentationSnapshot, choice: ProviderTurnChoice,
                                   connections: [ProviderInfo], catalog: ModelCatalogResponse?) -> [PartFace.Row] {
-        let models = ProvidersFacade.modelOptions(providers: connections, providerID: choice.provider, current: choice.model, limit: 40)
-        let efforts = ProvidersFacade.reasoningOptions(from: catalog, providers: connections,
-                                                      providerID: choice.provider, model: choice.model)
-        let normalized = ProvidersFacade.normalizedReasoningEffort(from: catalog, providers: connections,
-            providerID: choice.provider, model: choice.model, selected: choice.reasoningEffort)
-        // The model's choice and field, and the thinking level, call telegram.choose with their setting and the new value.
-        let model = PartFace.Call("telegram.choose", ["setting": .string("model")])
+        // Telegram is Chat: its model and thinking are set once, on Providers, and only read here.
+        _ = catalog
+        let name = ProvidersFacade.modelOptions(providers: connections, providerID: choice.provider, current: choice.model, limit: 40)
+            .first { $0.id == choice.model }?.displayName ?? choice.model
         var rows: [PartFace.Row] = [.init(id: "telegram.model", title: "Model",
-            detail: status.routingIssue.map { "Routing unavailable: " + $0 }, tone: status.routingIssue == nil ? nil : .failed,
-            control: .choice(models.map { .init(id: $0.id, label: $0.displayName) }, selected: choice.model, call: model))]
-        rows.append(.init(id: "telegram.model-id", title: "Or paste a model ID",
-            detail: "The list stays short so it opens fast. Paste any provider's model ID here if it is not listed.",
-            control: .field(choice.model, placeholder: "Model ID", call: model)))
-        if !efforts.isEmpty {
-            rows.append(.init(id: "telegram.think", title: "How hard it thinks",
-                detail: normalized == choice.reasoningEffort ? nil
-                    : "Saved think level '\(choice.reasoningEffort)' is unsupported for \(choice.model). Choose a level to use \(normalized).",
-                tone: normalized == choice.reasoningEffort ? nil : .attention,
-                control: .choice(efforts.map { .init(id: $0.id, label: $0.label) }, selected: choice.reasoningEffort,
-                                 call: .init("telegram.choose", ["setting": .string("think")]))))
-        }
+            detail: status.routingIssue.map { "Routing unavailable: " + $0 } ?? "Set with Chat on Providers.",
+            value: name, tone: status.routingIssue == nil ? .quiet : .failed)]
         rows.append(.init(id: "telegram.commands", title: "Commands in the chat", value: "/model, /think, /fast, /brain", tone: .quiet))
         return rows
     }

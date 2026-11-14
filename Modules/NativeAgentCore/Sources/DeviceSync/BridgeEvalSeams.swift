@@ -40,7 +40,9 @@ enum ICloudIncomingMessageDisposition: Equatable, Sendable {
             return .permanentlyRejected(reason: "signature_invalid")
         }
         let age = now.timeIntervalSince(message.timestamp)
-        guard age <= 24 * 60 * 60, age >= -15 * 60 else {
+        // A request expires so it is never acted on late; a sense reading is a dated fact, true at its own time however late it lands.
+        let expires = message.metadata?["kind"] != PhoneSenseEvent.messageKind
+        guard age >= -15 * 60, !expires || age <= 24 * 60 * 60 else {
             return .permanentlyRejected(reason: "stale_timestamp")
         }
         return .deliver

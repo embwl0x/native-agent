@@ -249,7 +249,7 @@ enum EngineFaceProjection {
         case .runs: await engine.face.post(RunsFace(ids: [], rows: [], state: state), at: key)
         case .run(let id): await engine.face.post(RunFace(id: id, record: nil, rows: [], status: nil, state: state), at: key)
         case .contacts: await engine.face.post(ContactsFace(contacts: [], state: state), at: key)
-        case .helpers: await engine.face.post(HelpersFace(rows: [], runningIDs: [], waitingIDs: [], state: state), at: key)
+        case .helpers: await engine.face.post(HelpersFace(rows: [], runningIDs: [], waitingIDs: [], needsYouIDs: [], state: state), at: key)
         default: break
         }
     }
@@ -465,14 +465,15 @@ enum EngineFaceProjection {
     }
     private static func contactsFace(_ contacts: [AgentContactPresentation], loaded: Bool, issue: String?) -> ContactsFace {
         ContactsFace(contacts: contacts.map { FaceContact(id: $0.id, label: $0.name, portrait: nil, appBundleID: $0.appBundleID,
-            state: $0.sendRestriction.map { .unavailable(EngineFaceActs.failure("contact_restricted", $0)) } ?? .ready) },
+            state: $0.sendRestriction.map { .unavailable(EngineFaceActs.failure("contact_restricted", $0)) } ?? .ready, needsYou: $0.needsYou) },
             state: readState(issue: issue, ready: loaded, owner: "contacts"))
     }
     private static func helpersFace(_ helpers: [BotsShelfRecord], loaded: Bool, issue: String?) -> HelpersFace {
         let rows = helpers.map { row($0.id.uuidString, title: $0.definition.name, detail: $0.modelChoiceIssue ?? $0.runReadIssue,
             state: $0.status.rawValue) }
         return HelpersFace(rows: rows, runningIDs: helpers.filter(\.running).map { $0.id.uuidString },
-            waitingIDs: helpers.filter(\.queued).map { $0.id.uuidString }, state: readState(issue: issue, ready: loaded, owner: "helpers"))
+            waitingIDs: helpers.filter(\.queued).map { $0.id.uuidString }, needsYouIDs: helpers.filter(\.needsYou).map { $0.id.uuidString },
+            state: readState(issue: issue, ready: loaded, owner: "helpers"))
     }
     private static func entity(_ value: KnowledgeGraphEntity) -> FaceGraphEntity {
         FaceGraphEntity(id: value.id, name: NativeAppSecretRedactor.redactText(value.name), kind: value.type,

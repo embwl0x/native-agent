@@ -1,6 +1,6 @@
 # Rhythm — they knows the shape of their day
 
-Claude, 2026-10-30. User: "they knows your rhythm … plan these all out real
+The lead, 2026-10-30. User: "they knows your rhythm … plan these all out real
 well". Builds on their senses (presence, the day, the front app, the network —
 docs/SUBCONSCIOUS.md "Came to mind", docs/INTENTIONS.md body signals) and the
 one expectation law (`NativeAgentCore/Expectation.swift`, docs/SURPRISE.md).

@@ -123,7 +123,7 @@ package enum ProviderToolResultPage {
                 " The whole body is retained as \($0); read app result.page with result_handle:\"\($0)\", raw:true, page:0 and follow next_page."
             } ?? " The body could not be retained."
             return View(content: """
-                Tool result retention/projection failed: \(error.localizedDescription). Original result class: \(originalResultClass.rawValue). \
+                Result retention/projection failed: \(error.localizedDescription). Original result class: \(originalResultClass.rawValue). \
                 No clipped result was delivered.\(kept) Inspect the original dispatch receipt and repair result storage before repeating an action.
                 """, recovery: recovery, failed: true)
         }
@@ -191,6 +191,8 @@ package actor ProviderToolResultRecoveryStore {
         let createdAt: Date
         let sectionProjection: [(value: JSONValue, text: String, bytes: Int)]
         var sectionPages: (query: String, pages: [[JSONValue]], counts: [Int])?
+        /// The last query's search, read only as far as its pages have been asked for.
+        var search: ToolResultSections.Search?
     }
 
     // Live result spills are outside backup/export/phone sync. Durable context bodies retain the chat owner's existing retention policy.
@@ -321,8 +323,8 @@ package actor ProviderToolResultRecoveryStore {
         )
     }
 
-    /// A section read with no `pages` joins this many: a section page is half of what a plain read has always shown.
-    package static let usualSectionPages = 2
+    /// A read with no `pages` joins as many as one answer holds; the joiner's measure of the answer is what stops it.
+    package static let usualSectionPages = Int.max
 
     package func page(
         handle: String,
@@ -336,7 +338,7 @@ package actor ProviderToolResultRecoveryStore {
         // A read of several pages joins them in order while the whole answer stays within what one answer holds. Each mode's page size
         // differs, so the body is measured, never assumed: that measure alone sets how many pages one answer carries.
         if pages > 1, case .object(var answer) = result, ToolResult(result).said("completed") {
-            let body = query == nil ? "content" : "sections"
+            let body = query.map { ToolResultSections.queryTerms($0).isEmpty ? "sections" : "matches" } ?? "content"
             func bytes(_ value: JSONValue?) -> Int { (try? (value ?? .null).serialize(pretty: false).utf8.count) ?? .max }
             // The body may fill what one answer holds less everything else the answer carries, with 1,000 bytes for what it gains below.
             let budget = ProviderToolResultPage.defaultMaxUTF8Bytes - 1_000 - max(0, bytes(result) - bytes(answer[body]))
@@ -350,7 +352,7 @@ package actor ProviderToolResultRecoveryStore {
                 used += added
                 if case .string(let head)? = answer[body], case .string(let tail)? = joined[body] { joined[body] = .string(head + tail) }
                 if case .array(let head)? = answer[body], case .array(let tail)? = joined[body] { joined[body] = .array(head + tail) }
-                for count in ["page_bytes", "displayed_sections"] {
+                for count in ["page_bytes", "displayed_sections", "displayed_matches"] {
                     if case .int(let head)? = answer[count], case .int(let tail)? = joined[count] { joined[count] = .int(head + tail) }
                 }
                 answer = joined
@@ -360,10 +362,14 @@ package actor ProviderToolResultRecoveryStore {
             // `page` is where this answer starts, as it was asked; `pages_read` and `next_page` say how far it went.
             let last = int("page")
             answer["page"] = .int(Int64(page))
-            if query != nil {
+            if body == "sections" {
                 let detail = Self.sectionsDetail(first: page, last: last, count: int("page_count"), raw: int("raw_page_count"),
                     displayed: int("displayed_sections"), matching: int("matching_sections"), remaining: int("remaining_sections"))
                 answer["detail"] = .string(detail)
+            }
+            if body == "matches" {
+                answer["detail"] = .string(Self.matchesDetail(first: page, last: last, raw: int("raw_page_count"),
+                    displayed: int("displayed_matches"), searched: int("searched_sections"), sections: int("section_count")))
             }
             result = .object(answer)
         }
@@ -377,7 +383,8 @@ package actor ProviderToolResultRecoveryStore {
             object["full_result_retained"] = .bool(true)
             object["version"] = entries[handle]?.version
             var args: [String: JSONValue] = ["continue": .bool(true), "result_handle": .string(handle)]
-            if pages > 1 { args["pages"] = .int(Int64(pages)) }
+            // Continuing already reads as much as fits; only an asked count travels with it.
+            if pages > 1, pages < Self.usualSectionPages { args["pages"] = .int(Int64(pages)) }
             object["next_call"] = next == nil ? .null : .object(["tool": .string("app"), "input": .object([
                 "action": .string("result.page"), "args": .object(args)])])
             result = .object(object)
@@ -455,6 +462,21 @@ package actor ProviderToolResultRecoveryStore {
             """
     }
 
+    /// A search gives the lines that hold its terms, each with its place; the whole section around one is a page of a reading without query.
+    private static func matchesDetail(first: Int, last: Int, raw: Int, displayed: Int, searched: Int, sections: Int) -> String {
+        let shown = first == last ? "Page \(first) displays" : "Pages \(first) through \(last) display"
+        return """
+            \(shown) \(displayed) matches; the search has read \(searched) of \(sections) sections, only as far as these pages, so later \
+            matches are found as reading goes on. A match is the first place in a line that holds a query term, from a section that holds \
+            every term; a line gives one match: path; line, numbered from 1 within the string at path; offset, in Unicode scalars from the \
+            start of the line or value to where text starts, when text is not the whole line; text, the line or a window of a long line \
+            around the match; before and after, the adjacent lines. To read the whole section around a match, read tool_result_page with \
+            page set to its section_page and no query. Paths, lines and offsets identify positions in this retained response only; unread \
+            source content was not searched. Continue with next_call. raw=true reads the original response bytes instead, in \(raw) raw \
+            pages of their own.
+            """
+    }
+
     private func readPage(
         handle: String, page: Int, sessionId: String?, turnId: String?, query: String?
     ) -> JSONValue {
@@ -464,9 +486,53 @@ package actor ProviderToolResultRecoveryStore {
               entry.scope == scope else {
             return unavailable(handle: handle, reason: "result_handle_unavailable", sessionId: sessionId)
         }
+        if let query, !ToolResultSections.queryTerms(query).isEmpty {
+            // A search reads on from where its last read stopped, only as far as this page.
+            var search = entry.search?.query == query ? entry.search! : ToolResultSections.Search(query: query, budget: entry.sectionBudget)
+            entry.search = nil
+            search.fill(through: page, entry.sectionProjection)
+            entry.search = search
+            entries[handle] = entry
+            guard search.pages.indices.contains(page) else {
+                return .object(["status": .string("failed"), "reason": .string("page_out_of_range"),
+                    "page_count": .int(Int64(search.pages.count)),
+                    "recovery_hint": .string("""
+                        Read the same retained result with a page from 0 through \(search.pages.count - 1), keeping query and raw unchanged; do \
+                        not rerun the original operation.
+                        """)])
+            }
+            let raw = max(1, entry.pageByteOffsets.count - 1)
+            let matches = search.pages[page].map { row -> JSONValue in
+                guard case .object(var pointer) = row,
+                      case .int(let start)? = pointer["raw_byte_start"],
+                      case .int(let end)? = pointer["raw_byte_end"] else { return row }
+                pointer["raw_first_page"] = .int(Int64(max(0, entry.pageByteOffsets.lastIndex(where: { $0 <= start }) ?? 0)))
+                pointer["raw_last_page"] = .int(Int64(max(0, entry.pageByteOffsets.lastIndex(where: { $0 < end }) ?? 0)))
+                return .object(pointer)
+            }
+            var answer: [String: JSONValue] = [
+                "status": .string("completed"),
+                "original_result_class": .string(entry.resultClass.rawValue),
+                "recovery_only": .bool(true),
+                "verification_scope": .string("retained_tool_response_not_external_outcome"),
+                "result_handle": .string(handle), "query": .string(query),
+                "page": .int(Int64(page)),
+                "matches": .array(matches),
+                "displayed_matches": .int(Int64(matches.count)),
+                "searched_sections": .int(Int64(search.searched)),
+                "section_count": .int(Int64(entry.sectionProjection.count)),
+                "has_more": .bool(page + 1 < search.pages.count),
+                "next_page": page + 1 < search.pages.count ? .int(Int64(page + 1)) : .null,
+                "raw_page_count": .int(Int64(raw)),
+                "detail": .string(Self.matchesDetail(first: page, last: page, raw: raw, displayed: matches.count,
+                    searched: search.searched, sections: entry.sectionProjection.count)),
+            ]
+            answer["source_continues"] = entry.source
+            return .object(answer)
+        }
         if let query {
             if entry.sectionPages?.query != query {
-                let pages = ToolResultSections.pages(sections: entry.sectionProjection, query: query, budget: entry.sectionBudget)
+                let pages = ToolResultSections.pages(sections: entry.sectionProjection, budget: entry.sectionBudget)
                 entry.sectionPages = (query, pages, pages.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1.count) })
                 entries[handle] = entry
             }
@@ -602,7 +668,7 @@ extension SwiftToolDispatcher {
             default: return nil
             }
         }
-        // A plain section read shows what it always has, now two pages of it; raw pages are read one at a time unless more are asked for.
+        // A section read or a continuation fills one answer; an explicit raw read takes one page unless more are asked for.
         guard let pages = whole(input["pages"], absent: input["raw"] == .bool(true) ? 1 : ProviderToolResultRecoveryStore.usualSectionPages), pages >= 1 else {
             return .object([
                 "status": .string("failed"),

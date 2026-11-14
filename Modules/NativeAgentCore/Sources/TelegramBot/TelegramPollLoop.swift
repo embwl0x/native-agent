@@ -195,7 +195,7 @@ public struct TelegramPollLoop: LoopRunner {
     public func recoverReply(_ response: ChatResponse, originRunId: String, destination: TelegramDestination? = nil,
                              requesterUserId: Int?, silent: Bool = false, priorVerdict: String? = nil) async throws -> String {
         guard let sessionId = response.sessionId else { throw TelegramBotError.invalidRequest }
-        let runId = response.runId, reply = response.output, imagePaths = Self.replyImagePaths(response)
+        let runId = response.runId, reply = Self.replyText(response), imagePaths = Self.replyImagePaths(response)
         let inbox = TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot)
         let claims = try await inbox.snapshots()
         if response.isSilentCompletion {
@@ -298,6 +298,17 @@ public struct TelegramPollLoop: LoopRunner {
         await inbox.pruneTerminalClaims(dataRoot: dataRoot)
         return verdict
         }
+    }
+
+    /// A stopped or failed turn's saved words go out once, closed by the words this door already uses for a stop or a failure.
+    static func replyText(_ response: ChatResponse) -> String {
+        let ending: String
+        switch response.terminalState {
+        case .stopped?: ending = "Stopped."
+        case .failed?: ending = response.statusDetail ?? "The reply could not be completed; try again."
+        default: return response.output
+        }
+        return [response.output, ending].filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 
     func settleReplyCheckpoint(sessionId: String, runId: String, verdict: String) async throws {
@@ -758,9 +769,11 @@ public struct TelegramPollLoop: LoopRunner {
                         let shuttingDown = await turnCoordinator.shutdownInterruptedTurn(destination: msg.destination, turnId: turnId)
                         let retryAfterShutdown = canceled && shuttingDown && !runStop.isRaised
                             && (voiceAttachment != nil || mediaAttachment != nil)
+                        let stopReadFailure = runStop.readFailure
                         await settle {
                             await card.transition(canceled ? .canceled(reason: retryAfterShutdown
-                                ? "Interrupted by shutdown; message saved for retry" : "Stopped by user") : .failed(reason: Self.chatErrorNotice(for: error)))
+                                ? "Interrupted by shutdown; message saved for retry" : stopReadFailure ?? "Stopped by user")
+                                : .failed(reason: Self.chatErrorNotice(for: error)))
                             if !canceled {
                                 let notice = voiceAttachment != nil ? Self.voiceTranscriptionNotice(for: error) : Self.attachmentDroppedNotice(for: error)
                                 do {
@@ -772,7 +785,8 @@ public struct TelegramPollLoop: LoopRunner {
                                 }
                             }
                             if !retryAfterShutdown {
-                                await recordError(context: "media_preparation", error: String(describing: error), update: update, message: msg, text: text)
+                                await recordError(context: "media_preparation", error: stopReadFailure ?? String(describing: error),
+                                    update: update, message: msg, text: text)
                             }
                             do {
                                 _ = try await updateInbox.transition(updateId: update.updateId, from: [.processing],
@@ -927,5 +941,6 @@ final class TelegramRunStop: Sendable {
     private let flag: URL
     init(_ flag: URL) { self.flag = flag }
     var isRaised: Bool { ChatCancelFlag.isRaised(flag) }
+    var readFailure: String? { ChatCancelFlag.readFailure(flag) }
     deinit { ChatCancelFlag.finish(flag) }
 }

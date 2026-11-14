@@ -8,12 +8,10 @@ import NativeAgentShared
 final class CardControls {
     static let shared = CardControls()
     var connectorSheet: ConnectorSheetRequest?
-    var panelPage: SidebarItem?
     @ObservationIgnored private var awaitingReturn: [String: CardIdentity] = [:]
 
     func disconnect() {
         connectorSheet = nil
-        panelPage = nil
         awaitingReturn.removeAll()
     }
 
@@ -63,25 +61,17 @@ final class CardControls {
             guard let item = SidebarItem(rawValue: page) else {
                 throw PartCallError(code: "card_page_unknown", message: "The request names an unavailable setup page.")
             }
-            try openPage(item, for: identity.card, sessionID: identity.session, revision: identity.revision)
+            openPage(item, for: identity.card, sessionID: identity.session, revision: identity.revision)
         case .connector(let provider):
             awaitingReturn[identity.card] = identity
             connectorSheet = .init(id: identity.card, provider: provider, sessionID: identity.session, revision: identity.revision)
         }
     }
 
-    func openPage(_ item: SidebarItem, for id: String? = nil, sessionID: String = "", revision: Int? = nil) throws {
-        guard let mode = ApplicationLifetime.shared.appModel?.facePreference(SimpleViewMode.key, as: String.self),
-              SimpleViewMode.choices.contains(mode) else {
-            throw PartCallError(code: "view_preference_unavailable", message: "Read or repair the view preference before opening this setup page.")
-        }
+    /// A setup page opens in place, as every page does; the card is verified when its chat shows again.
+    func openPage(_ item: SidebarItem, for id: String? = nil, sessionID: String = "", revision: Int? = nil) {
         if let id, let revision { awaitingReturn[id] = .init(card: id, session: sessionID, revision: revision) }
-        if mode == SimpleViewMode.simple { panelPage = item }
-        else { _ = ApplicationLifetime.shared.request(.sidebar(item)) }
-    }
-    func panelClosed() {
-        panelPage = nil
-        connectorSheetClosed()
+        _ = ApplicationLifetime.shared.request(.sidebar(item))
     }
     func connectorSheetClosed() {
         if let request = connectorSheet {
@@ -95,7 +85,6 @@ final class CardControls {
         guard awaitingReturn[identity.card] == identity else { return }
         awaitingReturn[identity.card] = nil
         if connectorSheet?.id == identity.card { connectorSheet = nil }
-        if awaitingReturn.isEmpty { panelPage = nil }
     }
 }
 

@@ -98,6 +98,50 @@ public enum ToolNameAliases {
         "agent_connect": ["name": "agent"],
     ]
 
+    /// The app tool's own keys. Keys beginning with __ belong to the gate chain.
+    public static let appDoorKeys: Set<String> = ["page", "item", "action", "args", "actions", "preview", "expected_version", "find", "script"]
+    /// A batch step's own keys: what must come back, its name for found, and whether it puts back what the deed moved.
+    public static let appStepKeys: Set<String> = ["expect", "as", "cleanup"]
+    /// The deed's own keys beside actions, and on no other form: the agent's closing words and the slots they take from what came back.
+    public static let appDeedKeys: Set<String> = ["then_say", "with"]
+
+    /// The door's reading keys: beside an action they read nothing, so an action that declares one of these names takes it as its own.
+    public static let appReaderKeys: Set<String> = ["page", "item", "find"]
+    /// The words an action's address goes by; an action that declares exactly one of them is addressed by any of them.
+    public static let addressWords: Set<String> = ["id", "item", "handle"]
+
+    /// One reading of an app call. A call that names an action and has no args object takes every key outside the app tool's own as that
+    /// action's arguments, and a reading key the action declares too, or an item where the action declares one address word. A call that
+    /// has args keeps each key where it was sent, so a key beside args is refused, never merged into them; only the door's own preview
+    /// and expected_version, sent inside args, are read as the door's.
+    public static func doorCall(_ tool: String, _ input: [String: JSONValue]) -> [String: JSONValue] {
+        guard canonical(tool) == "app", case .string(let action)? = input["action"],
+              !action.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return input }
+        let binding = AppActionBinding.declaredBinding(action)
+        let declared = binding?.declaredArguments ?? []
+        // The door's own guards sent inside args are still the door's, unless the action takes an argument by that name: a preview stays
+        // a preview, and a version guard still guards. An action the agent authored declares its arguments in its own part, unread
+        // here, so its args stay as sent.
+        if case .object(var args)? = input["args"], binding != nil {
+            var call = input
+            for key in ["preview", "expected_version"] where call[key] == nil && !declared.contains(key) {
+                if let value = args.removeValue(forKey: key) { call[key] = value }
+            }
+            guard args.count != input["args"]?.objectValue?.count else { return input }
+            call["args"] = .object(args)
+            return call
+        }
+        guard input["args"] == nil || input["args"] == .null else { return input }
+        var taken = appReaderKeys.intersection(declared)
+        if declared.intersection(addressWords).count == 1 { taken.insert("item") }
+        let own = appDoorKeys.union(appStepKeys).union(appDeedKeys).subtracting(taken)
+        let args = input.filter { !own.contains($0.key) && !$0.key.hasPrefix("__") }
+        guard !args.isEmpty else { return input }
+        var call = input.filter { own.contains($0.key) || $0.key.hasPrefix("__") }
+        call["args"] = .object(args)
+        return call
+    }
+
     public static func doorArgs(_ tool: String, _ input: [String: JSONValue], reportShim: Bool = false) -> [String: JSONValue] {
         renamed(input, doorArgNames[tool] ?? [:], reportShim: reportShim)
     }
@@ -197,6 +241,7 @@ public enum ToolNameAliases {
     }
 
     public static func ranCall(_ name: String, input: [String: JSONValue]) -> (tool: String, input: [String: JSONValue]) {
+        let input = doorCall(name, input)
         let args: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
         if name == "app", case .string(let item)? = input["action"] ?? input["item"],
            item.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasSuffix(".say"),
@@ -223,9 +268,10 @@ public enum ToolNameAliases {
 
     /// Display folded actions by their executed tool identity while retaining each call's own arguments.
     public static func shown(_ name: String, input: JSONValue) -> (name: String, input: JSONValue) {
-        guard name == "app", case .object(let fields) = input, case .string(let raw)? = fields["action"] else {
+        guard name == "app", case .object(let given) = input, case .string(let raw)? = given["action"] else {
             return (name, input)
         }
+        let fields = doorCall(name, given)
         let action = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !action.isEmpty else { return (name, input) }
         // Historical generated labels survive unmounting or dropping their executable.

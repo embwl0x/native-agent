@@ -95,7 +95,7 @@ enum PersistedToolReceipt {
                 "evidence_fields_omitted": .array(omitted.map(JSONValue.string)),
                 "verification_scope": .string("historical_tool_response_not_current_source_state"),
                 "note": .string("""
-                    Tool result truncated in transcript. Evidence fields describe the original read; the preview is incomplete. Temporary result \
+                    Result truncated in transcript. Evidence fields describe the original read; the preview is incomplete. Temporary result \
                     handles only work in their originating turn. This receipt does not promise that the full source is still retained. Do not repeat \
                     an action merely to recover its output.
                     """),

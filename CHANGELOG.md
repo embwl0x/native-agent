@@ -4,6 +4,14 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.18 — current and calm (2026-11-14)
+
+- Each account's model list is what its provider says, refreshed on demand; one effective contract per model; an account offers only what its provider listed
+- Trust locks what the permission law and the levers make ask first; each app's Read and Write share a row; a folded section opens whole; controls take no system accent
+- A clean Mac shows no false alarms: Doctor says off for what was never set up; a never-written Desk is empty; a window with no connection shows no Inspector
+- The text wire reads a call's body as JSON; the hand grows with what the agent has done; a long write shows what is being written; receipts show only what their call may
+- Telegram voice notes decode with the Mac's own reader; Stop runs when its marker cannot be read; pages are not offered as calls; a notification carries its subtitle
+
 ## 0.6.17 — never clueless (2026-11-10)
 
 - The chat status box lists the last finished steps above the running one; past thirty seconds a step says the agent is still on it; a running step is never "no movement"; only calls are steps
@@ -531,7 +539,7 @@ warm glow, so cards sit in the room instead of on top of it. Full notes:
   accessibility) plus a mounted MCP server's own; everything
   else is lazy and leaves after two turns without a real call. No family is
   resident, Full Mac included. Four classes of schema-caused tool failure that
-  read as the agent's fault are fixed. Contract: `docs/TOOL_LOADING.md`.
+  read as the agent's fault are fixed. Contract: `docs/ONE_DOOR.md`.
 - Bots: scheduled runs sit behind the master Autonomy switch; **Continue in
   Chat** carries the bot's own model, effort and approval rule; bots get Fluid
   Context and memory recall like any other turn.

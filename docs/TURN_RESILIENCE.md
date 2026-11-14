@@ -9,11 +9,11 @@ authority. Time since movement is descriptive; it never changes phase or
 expires a streaming marker. See the [face feed](designs/separate-face.md#stage-one-turn-status).
 Source paths below are relative to `Modules/NativeAgentCore/Sources/`.
 
-The agent's one always-on tool is `app`. `app {}` returns home, where they left
+The agent's one door, `app`, is always on. `app {}` returns home, where they left
 off; `page`, `item`, `find`, `action` and `script` reach its contents.
 `AppToolRuntime/AppActions+Declarations.swift` defines the actions and
 `AppScriptRunner.swift` binds scripts to the shared executor. The model-facing tool
-contract is in [Tool loading](TOOL_LOADING.md).
+contract is in [One door](ONE_DOOR.md).
 
 ## The rule each piece follows
 
@@ -390,7 +390,7 @@ work at once, wherever it waits. The Mac registers the run at admission,
 before any await, so a Stop always names the live run. A door that stops listening only detaches;
 the accepted turn runs on and lands in its transcript.
 
-Dispatch interruption follows the [tool receipt contract](TOOL_LOADING.md).
+Dispatch interruption follows the [door receipt contract](ONE_DOOR.md).
 A late tool result cannot replace the dispatch race's first terminal outcome.
 
 ### 8. Conversation tail and result pointers
@@ -567,7 +567,7 @@ terminal payload together. The record forgets details after two weeks
 Trace token and duration measurements accept nonnegative integers and use
 checked accumulation. Invalid or unrepresentable totals report damaged evidence;
 Inspector leaves the total unavailable and shows the measurement error in the
-turn's first row. Inspector call titles and grouping use the same checked
+turn's first event row. Inspector call titles and grouping use the same checked
 `inputTokens`/`outputTokens` reader; each absent count is shown as `unavailable`,
 never zero. A damaged count also marks its call row failed with its measurement
 error. Statistics fail explicitly rather than returning wrapped totals.

@@ -93,19 +93,52 @@ struct FaceSectionView: View {
         else { rows }
     }
 
-    private var rows: some View {
+    @ViewBuilder private var rows: some View {
         ForEach(flatRows, id: \.row.id) { entry in
-            rowView(entry.row).padding(.leading, CGFloat(entry.depth) * 16)
-            if entry.row.rows != nil || entry.row.expands == true {
-                Button(session.expanded.contains(item(entry.row)) ? "Collapse " + entry.row.title : "Expand " + entry.row.title) {
-                    let id = item(entry.row)
-                    if session.expanded.contains(id) { session.expanded.remove(id) }
-                    else { session.expanded.insert(id) }
-                }.buttonStyle(.plain).font(style.detail)
-                    .accessibilityValue(session.expanded.contains(item(entry.row)) ? "Expanded" : "Collapsed")
+            let id = item(entry.row)
+            let open = session.expanded.contains(id)
+            HStack(alignment: .center, spacing: 0) {
+                // A row that holds more opens from its own chevron; it has no second line asking to be expanded.
+                if entry.row.holdsBeneath || entry.row.expands == true {
+                    Button {
+                        withAnimation(.snappy) {
+                            if open { session.expanded.remove(id) } else { session.expanded.insert(id) }
+                        }
+                    } label: {
+                        Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(open ? 90 : 0)).frame(width: 24, height: 24).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text((open ? "Collapse " : "Expand ") + entry.row.title))
+                    .accessibilityValue(open ? "Expanded" : "Collapsed")
+                    .padding(.leading, inList ? 0 : 6)
+                }
+                rowView(entry.row)
             }
-            if entry.row.expands == true, session.expanded.contains(item(entry.row)) { demanded(entry.row) }
+            .padding(.leading, CGFloat(entry.depth) * 16)
+            .listRowInsets(style.insets)
+            if entry.row.expands == true, open { demanded(entry.row) }
         }
+        let hidden = session.hiddenRows(section)
+        if hidden > 0 {
+            foldLine("\(hidden) more", symbol: "chevron.down") { session.opened.insert(section.id) }
+        } else if session.opened.contains(section.id), section.rows.count > FacePageSession.foldAfter + 2 {
+            foldLine("Show fewer", symbol: "chevron.up") { session.opened.remove(section.id) }
+        }
+    }
+
+    private func foldLine(_ words: String, symbol: String, act: @escaping () -> Void) -> some View {
+        Button { withAnimation(.snappy) { act() } } label: {
+            HStack(spacing: 6) {
+                Image(systemName: symbol).font(.caption2.weight(.semibold))
+                Text(words)
+            }
+            .font(style.detail).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, minHeight: max(0, style.minimumHeight - style.insets.top - style.insets.bottom), alignment: .leading)
+            .padding(inList ? EdgeInsets() : style.insets)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func item(_ row: PartFace.Row) -> FaceItemID { .init(section: section.id, row: row.id) }
@@ -152,9 +185,24 @@ struct FaceSectionView: View {
         FaceRowView(row: row, item: FaceItemID(section: section.id, row: row.id), door: rowDoor(row),
                     session: session, focus: focus, move: move, sectionStyle: section.style ?? .list,
                     waiting: (section.style == .waiting && section.rows.first?.id == row.id) || row.running == true,
-                    connectsTimeline: section.style == .timeline && section.rows.last?.id != row.id)
+                    connectsTimeline: section.style == .timeline && section.rows.last?.id != row.id, columns: groupColumns)
             .listRowInsets(style.insets)
             .id(FaceItemID(section: section.id, row: row.id))
+    }
+
+    /// The section's inline groups share columns, one per child word, in the order the rows give them (a word first met is placed after
+    /// the word before it in its own row). Each column is the first child met with that word; a row without it ("Write" only) draws that
+    /// child unseen to hold the column's width, so every "Write" stands under every other.
+    private var groupColumns: [PartFace.Row] {
+        var columns: [PartFace.Row] = []
+        for group in section.rows.flatMap(\.lineRows).map(\.group) where !group.isEmpty {
+            var place = 0
+            for child in group {
+                if let at = columns.firstIndex(where: { $0.title == child.title }) { place = at + 1 }
+                else { columns.insert(child, at: place); place += 1 }
+            }
+        }
+        return columns
     }
 
     private func rowDoor(_ row: PartFace.Row) -> any FaceDoor {

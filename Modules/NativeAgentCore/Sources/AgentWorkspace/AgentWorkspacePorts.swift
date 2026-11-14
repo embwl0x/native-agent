@@ -9,6 +9,8 @@ import NativeAgentCore
 /// Synchronous projections over the existing conversation owner. The lower target shares values, never the store, settlement, or send authority.
 package protocol AgentWorkspaceConversationPort: Sendable {
     func liveHealth(dataRoot: URL) throws -> [String: AgentLocalHealth]
+    /// What announces a change in live health that no watched file carries.
+    var healthNotifications: [Notification.Name] { get }
     func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord]
     func acceptedSends(dataRoot: URL) throws -> Set<String>
     func find(dataRoot: URL, scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord?

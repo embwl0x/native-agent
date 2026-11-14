@@ -4,7 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `TrustCenter+Autonomy.swift` | `PermissionLaw`: one posture, class, reach and effective level for authorization and scheduling |
+// Blueprint: | `TrustCenter+Autonomy.swift` | `PermissionLaw`: one posture, class, reach and level for authorization and scheduling; `verdict` by act kind |
 
 // MARK: - The permission law
 
@@ -49,9 +49,10 @@ public enum PermissionLaw {
         return nil
     }
 
-    public static let fullMacContract = """
-        Under Full Mac I make changes without asking. Permanent deletion still asks, and an untrusted agent's initiating turn asks once at its first \
-        effect, quoting its ask; your answer covers that turn and lifts its Work-mode cap. macOS privacy resets still ask.
+    /// What Full Mac's posture cannot show for a standing: a turn an untrusted peer steers is judged as Work (`answer`'s cap).
+    public static let fullMacSteeredTurn = """
+        A turn an agent you have not trusted steers is held to Work mode: it asks once at its first effect, quoting its ask; your answer \
+        covers that turn and lifts the cap.
         """
 
     public static func posture(_ policy: [String: JSONValue]) -> PermissionPosture {
@@ -94,7 +95,7 @@ public enum PermissionLaw {
             return (toolClass, level, "The person decided \(named) themself; it runs as theirs.", nil)
         }
         if let input, let lever = try lever(tool: tool, input: input, turn: turn) {
-            let why = "\(named) is the person's lever: \(lever.why)."
+            let why = "\(named)" + (lever.name.isEmpty ? "" : " (\(lever.name))") + " is the person's lever: \(lever.why)."
             let reason = level == "confirm" ? why + " The agent's call asks them on a card and runs only on their yes."
                 : lever.asks ? why + " Safe allows no ask for it; nothing ran."
                 : why + " It needs the person themself, so the agent's call is refused; nothing ran."
@@ -114,7 +115,7 @@ public enum PermissionLaw {
             remedy = Repair.why(owner: peer.owner ?? "trust/policy.json", tap: tap)
         } else {
             remedy = Repair.why(owner: "Trust posture: \(mode)", tap: toolClass == .destructive
-                ? "Today > approval card > Approve or Decline" : capped ? "Trust > Connected agents" : "Trust > Access and policy > Access")
+                ? "Today > approval card > Approve or Decline" : capped ? "Trust > Connected agents" : "Trust > What I may do > Standing")
         }
         return (toolClass, level, reason, remedy)
     }
@@ -128,18 +129,56 @@ public enum PermissionLaw {
         // A lever is never the agent's call, at any posture: it raises the person's card, or is refused where no card can carry it or Safe
         // allows no ask.
         if let input, let lever = try lever(tool: tool, input: input, turn: turn) {
-            return (toolClass, lever.asks && posture != .readOnly ? "confirm" : "blocked")
+            return (toolClass, leverVerdict(asks: lever.asks, posture: posture))
         }
         let users = try toolClass >= .send || reachesUser(tool, input: input, capabilities: capabilities ?? [], turn: turn)
-        let level: String = switch (toolClass, posture) {
+        return (toolClass, verdict(toolClass, reachesPerson: users, posture: posture))
+    }
+
+    /// The law's table: a class, which side it reaches and the posture decide act ("auto"), ask ("confirm") or refuse ("blocked").
+    static func verdict(_ toolClass: ToolClass, reachesPerson: Bool, posture: PermissionPosture) -> String {
+        switch (toolClass, posture) {
         case (.read, _): "auto"
-        case _ where !users: "auto"
+        case _ where !reachesPerson: "auto"
         case (_, .readOnly): "blocked"
         case (.destructive, _): "confirm"
         case (_, .fullMac): "auto"
         case (_, .work): "confirm"
         }
-        return (toolClass, level)
+    }
+
+    /// A lever raises the person's card where a card can carry it, and Safe allows no ask.
+    static func leverVerdict(asks: Bool, posture: PermissionPosture) -> String {
+        asks && posture != .readOnly ? "confirm" : "blocked"
+    }
+
+    /// The kinds of act the table tells apart, read whole for one standing: the Trust page draws what each kind gets at the saved posture from
+    /// `verdict(_:posture:)`, the same table `judge` reads for every call, so the page cannot lock what runs or leave out what asks.
+    public enum Act: String, CaseIterable, Sendable {
+        /// A change that reaches the person's side: their files and apps, the Mac, command lines, remote machines.
+        case change
+        /// A send to other people.
+        case send
+        /// An irreversible change on the person's side: permanent deletion, an irreversible command line, a macOS privacy reset.
+        case delete
+        /// The person's own lever over the agent that a card can carry (Trust, models, keys, who may reach the agent, forgetting, reset).
+        case lever
+        /// A change on the agent's own side: its data and the workspace roots.
+        case own
+        /// A read.
+        case read
+    }
+
+    /// What the gate does with every call of this kind under this posture: "auto", "confirm" or "blocked".
+    public static func verdict(_ act: Act, posture: PermissionPosture) -> String {
+        switch act {
+        case .change: verdict(.write, reachesPerson: true, posture: posture)
+        case .send: verdict(.send, reachesPerson: true, posture: posture)
+        case .delete: verdict(.destructive, reachesPerson: true, posture: posture)
+        case .lever: leverVerdict(asks: true, posture: posture)
+        case .own: verdict(.write, reachesPerson: false, posture: posture)
+        case .read: verdict(.read, reachesPerson: false, posture: posture)
+        }
     }
 
     /// Authorization and scheduling share input-aware class resolution; only owner-certified shell commands narrow to reads.

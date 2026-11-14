@@ -14,9 +14,7 @@ public enum TurnInspectorGrouping {
         groups.map { group in
             InspectorTurnCard(
                 id: group.id, surface: group.surface, sessionId: group.sessionId,
-                rows: group.events.enumerated().map { offset, event in
-                    makeRow(event, id: "\(group.id)#\(offset)", measurementError: offset == 0 ? group.measurementError : nil)
-                },
+                rows: rows(group),
                 startedAt: group.startedAt, lastAt: group.lastAt,
                 eventCount: group.eventCount, wallMs: group.wallMs,
                 llmTokens: group.llmTokens, ttftMs: group.ttftMs
@@ -24,9 +22,35 @@ public enum TurnInspectorGrouping {
         }
     }
 
-    /// Caller-supplied turn/position ids preserve SwiftUI identity; omitted ids use a UUID.
-    public static func makeRow(_ ev: TurnTraceEvent, id: String = UUID().uuidString, measurementError: String? = nil) -> InspectorEventRow {
-        let p = (ev.payload.objectValue ?? [:])
+    /// One row per call: a dispatch's begin and end share its receipt id, so the end settles the row the begin opened and the call reads
+    /// once, at its start, with its duration and verdict. A begin with no end yet stays running; an end with no begin is its own row.
+    private static func rows(_ group: TurnTraceGroup) -> [InspectorEventRow] {
+        var begun: Set<String> = []
+        var ends: [String: (offset: Int, event: TurnTraceEvent)] = [:]
+        for (offset, event) in group.events.enumerated() {
+            guard let call = dispatch(event) else { continue }
+            if call.phase == "begin" { begun.insert(call.receipt) }
+            else if call.phase == "end", begun.contains(call.receipt), ends[call.receipt] == nil { ends[call.receipt] = (offset, event) }
+        }
+        return group.events.enumerated().compactMap { offset, event -> InspectorEventRow? in
+            let call = dispatch(event)
+            if let call, call.phase == "end", ends[call.receipt]?.offset == offset { return nil }
+            let end = call.flatMap { $0.phase == "begin" ? ends[$0.receipt]?.event : nil }
+            return makeRow(event, ended: end, id: "\(group.id)#\(offset)", measurementError: offset == 0 ? group.measurementError : nil)
+        }
+    }
+
+    private static func dispatch(_ event: TurnTraceEvent) -> (receipt: String, phase: String)? {
+        guard event.kind == "tool.dispatch", let payload = event.payload.objectValue, let phase = payload["phase"]?.stringValue,
+              let receipt = payload["receipt"]?.objectValue?["id"]?.stringValue else { return nil }
+        return (receipt, phase)
+    }
+
+    /// Caller-supplied turn/position ids preserve SwiftUI identity; omitted ids use a UUID. A call's `ended` event supplies its verdict,
+    /// duration and evidence; the row keeps the begin's time.
+    public static func makeRow(_ ev: TurnTraceEvent, ended end: TurnTraceEvent? = nil, id: String = UUID().uuidString,
+                               measurementError: String? = nil) -> InspectorEventRow {
+        let p = ((end ?? ev).payload.objectValue ?? [:])
         var measurementError = measurementError
         let title: String
         do { title = try rowTitle(kind: ev.kind, payload: p) }
@@ -37,6 +61,10 @@ public enum TurnInspectorGrouping {
         let status = measurementError == nil ? rowStatus(kind: ev.kind, payload: p) : .failed
         let duration = p["durationMs"]?.integerValue.flatMap(Int.init(exactly:))
         var details = detailLines(kind: ev.kind, payload: p)
+        if let end {
+            details.insert(contentsOf: [.init(label: "started", value: ev.ts.formatted(.iso8601)),
+                                        .init(label: "ended", value: end.ts.formatted(.iso8601))], at: 0)
+        }
         if let measurementError { details.append(.init(label: "Measurement error", value: measurementError)) }
         // Expand only projected details so plain events stay compact.
         let expandable = !details.isEmpty
@@ -48,7 +76,8 @@ public enum TurnInspectorGrouping {
             title: title,
             durationMs: duration,
             isExpandable: expandable,
-            detailLines: details
+            detailLines: details,
+            call: ev.kind == "tool.dispatch" ? p["name"]?.stringValue ?? p["tool"]?.stringValue : nil
         )
     }
 
@@ -73,9 +102,8 @@ public enum TurnInspectorGrouping {
     private static func rowTitle(kind: String, payload p: [String: JSONValue]) throws -> String {
         switch kind {
         case "tool.dispatch":
-            let name = p["name"]?.stringValue ?? p["tool"]?.stringValue ?? "tool"
-            let phase = p["phase"]?.stringValue
-            return phase.map { "\(name) (\($0))" } ?? name
+            // The step box's words for the same trace event (MacChatTurnLifecycleIntake); the engine's name is the row's detail.
+            return ToolActivityPresentation.progress(p["shown"]?.stringValue ?? p["name"]?.stringValue ?? p["tool"]?.stringValue ?? "tool")
         case "file.touch":
             let tool = p["tool"]?.stringValue ?? "file"
             let mode = p["mode"]?.stringValue.map { " · \($0)" } ?? ""

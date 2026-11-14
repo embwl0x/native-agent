@@ -18,14 +18,17 @@ public struct ICloudBridgeHealthSnapshot: Sendable {
     public let documentsURL: URL?
     public let sendMeasured: Bool
     public let sendFailures: [String: Health]
+    /// Phones paired with this Mac, as the pairing owner reads them; nil when that read failed. With none, phone sync was never set up here.
+    public let pairedPhones: Int?
 
     public init(transport: Transport, health: Health, documentsURL: URL? = nil,
-                sendMeasured: Bool = false, sendFailures: [String: Health] = [:]) {
+                sendMeasured: Bool = false, sendFailures: [String: Health] = [:], pairedPhones: Int? = nil) {
         self.transport = transport
         self.health = health
         self.documentsURL = documentsURL
         self.sendMeasured = sendMeasured
         self.sendFailures = sendFailures
+        self.pairedPhones = pairedPhones
     }
 }
 

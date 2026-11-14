@@ -139,12 +139,15 @@ extension ChatGPTTransport {
     private static let codexChildRefreshBufferSec: Int = 3_600
 
     /// Validate the selected credential before spawning. App-owned credentials renew through the normal refresh queue and sync their access-only copy;
-    /// CLI-owned sessions remain read-only. Never resolve a second path here.
-    public static func prepareCodexChildHome(_ codexHome: URL, authPath: URL) async throws {
-        guard credentialStatus(try loadAuthBlob(at: authPath), path: authPath).usable else {
+    /// CLI-owned sessions remain read-only. Never resolve a second path here. Returns the access token the child is handed.
+    @discardableResult
+    public static func prepareCodexChildHome(_ codexHome: URL, authPath: URL) async throws -> String? {
+        let auth = try loadAuthBlob(at: authPath)
+        guard credentialStatus(auth, path: authPath).usable else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
-        guard let childHome = codexChildHome(mirroring: authPath) else { return }
+        // A CLI-owned session has no copy: the child reads this file in place.
+        guard let childHome = codexChildHome(mirroring: authPath) else { return (auth?["tokens"] as? [String: Any])?["access_token"] as? String }
         guard childHome.standardizedFileURL == codexHome.standardizedFileURL else {
             throw LLMError.underlying(message: "Codex child home does not match the selected credential.")
         }
@@ -155,7 +158,7 @@ extension ChatGPTTransport {
             _ = try await ChatGPTTransport(authPathOverride: authPath)
                 .ensureFreshAccessToken(forceRefresh: true, staleToken: access)
         }
-        try syncCodexChildCopy(from: authPath)
+        return try syncCodexChildCopy(from: authPath)
     }
     @discardableResult
     private func refreshTokens(

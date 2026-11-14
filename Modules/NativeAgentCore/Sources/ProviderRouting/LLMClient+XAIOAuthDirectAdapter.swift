@@ -93,7 +93,8 @@ public final class XAIOAuthTransport: LLMTransport {
                         messages: messages,
                         system: system,
                         tools: tools,
-                        stream: true, call: call
+                        stream: true, call: call,
+                        dataRoot: self.tokenPath.deletingLastPathComponent().deletingLastPathComponent()
                     )
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
@@ -136,7 +137,8 @@ public final class XAIOAuthTransport: LLMTransport {
         messages: [LLMMessage],
         system: String?,
         tools: [LLMToolSchema]?,
-        stream: Bool, call: LLMCall
+        stream: Bool, call: LLMCall,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws -> [String: Any] {
         var body: [String: Any] = [
             "model": model,
@@ -146,7 +148,7 @@ public final class XAIOAuthTransport: LLMTransport {
         // Streaming requests ask for token usage on the final SSE frame.
         if stream { body["stream_options"] = ["include_usage": true] }
         try OpenAITransport.applyTools(to: &body, tools: tools)
-        try FirstPartyExecutionControls.applyXAIControls(to: &body, model: model, call: call)
+        try FirstPartyExecutionControls.applyXAIControls(to: &body, model: model, call: call, dataRoot: dataRoot)
         return body
     }
 

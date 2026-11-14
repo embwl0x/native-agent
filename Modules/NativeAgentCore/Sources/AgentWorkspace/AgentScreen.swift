@@ -14,7 +14,7 @@ import StandingBots
 import Senses
 import NativeAgentShared
 // Blueprint: | `AgentScreen.swift` | `AgentScreen`, `withNames`, `resolve`: stable names and checked owner projections |
-// Home acknowledges displayed identities only; retain hidden/capped changes and unreadable observation timestamps.
+// Home acknowledges what it told, in full or counted; a wait it only counted, and what an unread source drew, stay news.
 // Home and turn context share registry/news sense changes and live ability state.
 
 /// Home renders retained owner state in layout order without reading another domain.
@@ -311,15 +311,17 @@ package enum AgentScreen {
             var shown: [String: Mark] = [:]
             if let transition = presence.transition {
                 let word = transition.here ? " here" : " away"
-                shown["home:presence"] = Mark(fp: word, line: person + word, at: now.timeIntervalSince1970)
+                shown["home:presence"] = Mark(fp: word, line: person + word, at: now.timeIntervalSince1970, what: transition.here ? "here" : "away")
             }
             shown["home:browser"] = Mark(fp: connected ? "on" : "off",
-                line: "browser: " + (connected ? person + "'s Chrome connected" : "Chrome not connected"), at: now.timeIntervalSince1970)
+                line: "browser: " + (connected ? person + "'s Chrome connected" : "Chrome not connected"), at: now.timeIntervalSince1970,
+                what: connected ? "connected" : "not connected")
             for name in ["calendar", "reminders"] {
                 let words = AgentReadBadges.shared.latest(name, dataRoot: dataRoot)
                     .flatMap { Calendar.current.isDate($0.at, inSameDayAs: now) ? $0.words : nil }
                     ?? ""
-                shown["home:" + name] = Mark(fp: words, line: words.isEmpty ? "" : name + ": " + words, at: now.timeIntervalSince1970)
+                shown["home:" + name] = Mark(fp: words, line: words.isEmpty ? "" : name + ": " + words, at: now.timeIntervalSince1970,
+                    what: "read")
             }
             let tabs: [(id: String, title: String)] = page.map { [("tab:" + String($0.tab), tabTitle($0))] }
                 ?? browserPages.compactMap { place in AgentWorkspaceNavigation.placeIdentity(place).map { ($0, place.title) } }
@@ -337,7 +339,7 @@ package enum AgentScreen {
             let changed = changes(since: seen, now: marks, excluding: scope)
             if !baseline { marks.merge(shown) { a, _ in a } }
 
-            var header = [agent.uppercased(), "Snapshot as of " + now.formatted(.iso8601), freshness(world, now: now)]
+            var header = [agent.uppercased(), "Snapshot as of " + now.formatted(.iso8601), freshness(world)]
             if let failure = layout.failure { header.append(failure.localizedDescription) }
             header.append(person + ": " + presence.line)
             let defaults = UserDefaults.standard
@@ -350,10 +352,10 @@ package enum AgentScreen {
 
             let outside: Set<String> = ["people", "helpers", "senses", "elsewhere", "places", "mac"]
             var visible = face.sections.filter { $0.id != "changed" }
+            let book = try withNames(workspace: workspace, dataRoot) { $0 }
+            let told = tell(changed, limit: 5, width: 70, book: book)
             var acknowledged: Set<String> = presence.transition == nil ? [] : ["home:presence"]
-            if face.sections.contains(where: { $0.id == "changed" }) {
-                for change in changed.prefix(5) { acknowledged.formUnion(change.names) }
-            }
+            if face.sections.contains(where: { $0.id == "changed" }) { acknowledged.formUnion(told.names) }
             let compared = PartFace(sections: visible.filter { outside.contains($0.id) }).text()
             var same: String?
             let outsideUnsettled = visible.filter { outside.contains($0.id) }.flatMap(\.rows).contains {
@@ -367,9 +369,7 @@ package enum AgentScreen {
             let rule = String(repeating: "─", count: 61)
             var lines = [header.joined(separator: " · "), rule]
             if face.sections.contains(where: { $0.id == "changed" }) {
-                lines += section("CHANGED", ["Tracked home records since last look; not all activity."]
-                    + changed.prefix(5).map { "● " + clip($0.line, 70) }
-                    + (changed.count > 5 ? ["+\(changed.count - 5) more"] : []))
+                lines += section("CHANGED", ["Tracked home records since last look; not all activity."] + told.lines.map { "● " + $0 })
             }
             if !windows.isEmpty {
                 lines.append("This chat's OPEN · " + windows.prefix(3).map { clip($0, 40) }.joined(separator: " · ")
@@ -392,7 +392,6 @@ package enum AgentScreen {
             if let same { lines.append(same) }
             lines.append(rule)
             lines += homeFooter
-            let book = try withNames(workspace: workspace, dataRoot) { $0 }
             if visible.contains(where: { $0.id == "people" }) {
                 for contact in world.contacts {
                     if let slug = book.slugs.first(where: { $0.value.id == contact.id })?.key { acknowledged.insert(slug) }
@@ -409,8 +408,15 @@ package enum AgentScreen {
                 for place in ["browser", "calendar", "reminders"] where places.contains(place) { acknowledged.insert("home:" + place) }
                 if places.contains("browser"), let page { acknowledged.insert(ownTabs + "tab:" + String(page.tab)) }
             }
-            if markSeen, world.pending.isEmpty, world.failures.isEmpty {
-                Self.markSeen(dataRoot, marks: marks, only: acknowledged, now: now)
+            if markSeen {
+                // A look acknowledges what it could read. A mark an unread or failed source would draw keeps its last-seen state; a pending
+                // source was read, and its retained reading only moves forward. A name nothing drew is let go: unread Desk and helper marks
+                // are kept above, and a name that comes back is told as it appears.
+                var read = world
+                read.pending = []
+                let drawn = try worldMarks(workspace: workspace, read, dataRoot: dataRoot, person: person, now: now, currentOnly: true)
+                    .merging(shown) { a, _ in a }
+                Self.markSeen(dataRoot, marks: marks, only: acknowledged.filter { drawn[$0] != nil || marks[$0] == nil }, now: now)
             }
             return lines.joined(separator: "\n")
         } catch {
@@ -419,7 +425,7 @@ package enum AgentScreen {
                 .init(id: "changed.failed", title: "This Home look is incomplete", detail: nameFailure(error), tone: .failed),
             ])
             return PartFace(title: face.title, line: face.line,
-                sections: [failedLook] + face.sections.filter { $0.id != "changed" }).text(door: true)
+                sections: [failedLook] + face.sections.filter { $0.id != "changed" }, opened: face.opened).text(door: true)
                 + "\nNothing was marked seen.\n" + homeFooter.joined(separator: "\n")
         }
     }
@@ -512,6 +518,12 @@ package enum AgentScreen {
             chats[index].answered = tail.last?.mine == true
         }
         return chats
+    }
+
+    /// A peer id named as Home names it: the contact whose id or merged identities carry it.
+    package static func peerName(identity: AgentContactIdentity) -> (String) -> String? {
+        let people = contacts(identity: identity)
+        return { peer in people.first { $0.id == peer || $0.agents.contains(peer) }?.name }
     }
 
     /// Saved contacts, grouped only by their explicit identities.

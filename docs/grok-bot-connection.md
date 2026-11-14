@@ -139,10 +139,10 @@ its pending handover in one durable transition. A failed write leaves it
 claimable; an identical webhook replay keeps the saved handover intact.
 `GrokInboundReply` projects that saved answer onto the exact conversation
 exchange, repeating only this projection after a failed response or restart.
-If Agent's waiting turn, a read in the asking chat or the room already took the
+If the agent's waiting turn, a read in the asking chat or the room already took the
 answer, it does not start a second turn; otherwise the answer is handed into the initiating
 chat with peer authorship. A person-initiated quiet send settles without waking
-Agent.
+The agent.
 
 Disconnect with the exact `peer:<id>` from `agent.contacts`. It revokes local
 keys and removes the contact. When routine setup was confirmed, cleanup asks

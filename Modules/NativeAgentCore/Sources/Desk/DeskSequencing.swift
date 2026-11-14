@@ -78,10 +78,9 @@ public enum DeskSequencing {
         return until > now
     }
 
-    /// A local day defers through its end; an ISO instant keeps its exact time.
+    /// "Until a day" ends when that local day starts, so the day written is the day the work is back; an ISO instant keeps its exact time.
     public static func parseDeferStamp(_ raw: String) -> Date? {
-        if let d = DeskClock.parseDay(raw) { return Calendar.autoupdatingCurrent.date(byAdding: .day, value: 1, to: d) }
-        return DeskClock.parseISO(raw)
+        DeskClock.parseDay(raw) ?? DeskClock.parseISO(raw)
     }
 
     public static func deferDisplayDay(_ raw: String) -> String? {
@@ -124,7 +123,8 @@ public enum DeskSequencing {
                 if ancestor.status == .blocked || ancestor.requiresOwnerInput || ancestor.blockedReason?.trimmingCharacters(
                     in: .whitespacesAndNewlines).isEmpty == false { return true }
                 if deferred[cur] == true { return true }
-                if !(effectiveBlockers[cur] ?? []).isEmpty { return true }
+                // An ancestor waiting on this item, or on what lies between them, is waiting for this very work and does not hold it back.
+                if !(effectiveBlockers[cur] ?? []).allSatisfy(seen.contains) { return true }
                 if onCycle.contains(cur) { return true }
                 current = ancestor.parent
             }

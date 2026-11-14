@@ -94,7 +94,7 @@ extension BuiltInToolSchemaFactory {
                         maximum: 3)),
                     ("full", ToolSchema.boolSchema("""
                         With find: return the whole extracted text instead of the matching passages. Without find the whole text is returned \
-                        anyway; large results use tool-output paging.
+                        anyway; large results are paged.
                         """)),
                     ("raw", ToolSchema.boolSchema("""
                         Read the original fetched-text view instead of its sense, with raw provenance; find/full still control the text selection.

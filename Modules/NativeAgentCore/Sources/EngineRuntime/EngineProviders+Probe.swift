@@ -37,8 +37,7 @@ extension ProvidersFacade {
     private nonisolated func performProviderTest(
         _ id: String, apiKeyOverride: String?, authMode: String?
     ) async throws -> NativeAgentShared.ProviderTestResult {
-        // Persist verification only from the explicit native probe; readable credentials prove no reachability, and transport success does not excuse a failed
-        // status write.
+        // Readable credentials prove no reachability, and a check's transport success does not excuse a failed status write.
         let draftKey: String? = {
             let trimmed = apiKeyOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed?.isEmpty == false ? trimmed : nil
@@ -58,7 +57,7 @@ extension ProvidersFacade {
         case .apiKey: break
         case .oauth:
             let start = Date()
-            let credential = OAuthProbeCredential()
+            let credential = SentCredential()
             var probeModel: String?
             let result: NativeAgentShared.ProviderTestResult
             do {
@@ -71,7 +70,7 @@ extension ProvidersFacade {
                 turn.envelope = .native("provider:probe:" + id)
                 turn.admission = ModelAdmission(provider: id, model: model)
                 var call = LLMCall(turn: turn, surface: "chat", purpose: "probe")
-                call.probeCredential = credential
+                call.sentCredential = credential
                 let heldCall = call
                 let probe = Task.detached {
                     try await llm.complete(prompt: "ping", system: "This is a provider connection check.", model: model,
@@ -120,7 +119,9 @@ extension ProvidersFacade {
         guard !id.isEmpty, id != ".", id != "..",
               id.allSatisfy({ "abcdefghijklmnopqrstuvwxyz0123456789_-".contains($0) }),
               !["registry", "models", "active", "surfaces", "pending-surface-configuration",
-                "openrouter-models-cache", "moonshot-models-cache"].contains(id) else {
+                "openrouter-models-cache", "moonshot-models-cache"].contains(id),
+              // A live route's saved model list is never a provider to remove.
+              !FirstPartyModelDiscovery.cacheFileNames.contains("\(id).json") else {
             throw ProviderRoutingError.invalidRequest
         }
         let credFile = dataRoot

@@ -31,7 +31,7 @@ public enum ToolArguments {
     public static func itemAddress<Value>(_ input: [String: Value], schema: JSONValue)
         -> (args: [String: Value], understood: [String]) {
         guard case .object(let properties)? = schema.objectValue?["properties"] else { return (input, []) }
-        let words = ["id", "item", "handle"]
+        let words = ToolNameAliases.addressWords.sorted()
         let declared = words.filter { properties[$0] != nil }
         guard declared.count == 1, let target = declared.first, input[target] == nil else { return (input, []) }
         let supplied = words.filter { $0 != target && input[$0] != nil }
@@ -76,7 +76,9 @@ public enum ToolArguments {
                                 recordShims: Bool = true) throws -> [String: JSONValue] {
         // Contacts owns its raw contract: nulls and numeric entries must not disappear or become strings before the owner can reject them.
         try MacContactsExecutor.validateArguments(tool: canonical, input: input)
-        let input = ToolNameAliases.hostArgs(canonical, ToolNameAliases.doorArgs(canonical, input, reportShim: recordShims), reportShim: recordShims)
+        // The call's one reading comes first, so the address binding, gates and receipts all see an action's arguments inside args.
+        let input = ToolNameAliases.hostArgs(canonical, ToolNameAliases.doorArgs(canonical, ToolNameAliases.doorCall(canonical, input),
+            reportShim: recordShims), reportShim: recordShims)
         try SwiftToolDispatcher.validateDeskMutationArguments(canonical, input: input)
         let authoring = canonical == "sense_make" || (canonical == "ability_manage" && input["verb"] == .string("save"))
         // No executor runs without the current catalog contract.
@@ -451,9 +453,12 @@ extension ChatToolInvocation {
 public protocol ChatToolExecuting: ToolExecutor {
     func execute(tool: String, input: [String: JSONValue], surface: String,
                  turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue
+    /// What a turn's collection offers the model now. A registered descriptor never changes; a schema the model reads may.
+    var modelSchemas: [LLMToolSchema] { get }
 }
 
 extension ChatToolExecuting {
+    public var modelSchemas: [LLMToolSchema] { descriptors.map(\.schema) }
     public func execute(tool: String, input: [String: JSONValue], surface: String, turn: Turn) async throws -> JSONValue {
         try await execute(tool: tool, input: input, surface: surface, turn: turn, invocation: .init())
     }

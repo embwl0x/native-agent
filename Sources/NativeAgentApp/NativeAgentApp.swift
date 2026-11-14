@@ -506,8 +506,9 @@ extension Agents.NativeAgentA2AGRPCListener {
 
 extension AttentionRouter {
     static let shared: AttentionRouter = {
-        let router = AttentionRouter(delivery: .engineDelivery(phone: { title, body, userInfo in
-            try await NativeAgentEngine.liveDeviceSync.relay.sendNotification(title: title, body: body, userInfo: userInfo)
+        let router = AttentionRouter(delivery: .engineDelivery(phone: { note, userInfo in
+            try await NativeAgentEngine.liveDeviceSync.relay.sendNotification(title: note.title, subtitle: note.subtitle, body: note.message,
+                userInfo: userInfo)
         }))
         let root = PersistenceCore.defaultDataRoot()
         let doors = EventDeadlinePhysiology.storeAndFileEvents(paths: [

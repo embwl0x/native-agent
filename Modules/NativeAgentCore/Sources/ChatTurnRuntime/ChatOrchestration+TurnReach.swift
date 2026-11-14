@@ -6,7 +6,7 @@ import Context
 import CognitiveSubstrate
 import PersonaEngine
 import MemoryV2
-// Blueprint: | `ChatOrchestration+TurnReach.swift` | `SwiftNativeTurnEngine`; Frozen packet rendering and exact delivery credit |
+// Blueprint: | `ChatOrchestration+TurnReach.swift` | `SwiftNativeTurnEngine`; Frozen packet rendering, withheld-context notice and exact delivery credit |
 
 extension SwiftNativeTurnEngine {
     // MARK: - Mind-into-circulation attention inputs
@@ -141,7 +141,7 @@ extension SwiftNativeTurnEngine {
         if !contextItems.isEmpty {
             let thresholdChars = prepared.need.packetAtomExpandThresholdChars
             // Freeze one clock and local zone for the packet so memories agree on relative dates across midnight.
-            let clock = ContextRenderClock.turn(prepared.need)
+            let clock = ContextRenderClock.turn(prepared)
             let items = orderedItems
                 .map { renderPacketAtom($0, thresholdChars: thresholdChars, clock: clock) }
                 .joined(separator: "\n")
@@ -176,6 +176,42 @@ extension SwiftNativeTurnEngine {
             )
         }
         return sections.joined(separator: "\n\n")
+    }
+
+    /// What owner verification held back after selection, said plainly: how many and why. Nil when everything chosen was delivered.
+    nonisolated static func withheldContextNotice(_ prepared: ContextPreparedTurn) -> String? {
+        let packet = prepared.packet
+        let delivered = Set(packet.selectedItems.map(\.pointer.atomID) + packet.expandablePointers.map(\.atomID))
+        let withheldIDs = Set(packet.receipt.selectedAtomIDs + packet.receipt.pointerAtomIDs).subtracting(delivered)
+        // The receipt keeps the selection's own notices; verification appends its reasons after them.
+        let notices = Array(packet.degradedSources.dropFirst(packet.receipt.degradedSources.count))
+        guard !withheldIDs.isEmpty || !notices.isEmpty else { return nil }
+        let withheld = prepared.generation.atoms.filter { withheldIDs.contains($0.draft.id) }
+        let withheldSources = Set(withheld.map(\.draft.sourceID))
+        // A notice speaks only for the withheld items of its own source; an item with no reason of its own changed or was removed.
+        var reasonsBySource: [ContextSourceID: [String]] = [:]
+        for notice in notices where !(reasonsBySource[notice.sourceID] ?? []).contains(notice.reason) {
+            reasonsBySource[notice.sourceID, default: []].append(notice.reason)
+        }
+        var order: [String] = []
+        var counts: [String: Int] = [:]
+        for atom in withheld {
+            for reason in reasonsBySource[atom.draft.sourceID] ?? ["changed or removed since this context was prepared"] {
+                if counts[reason] == nil { order.append(reason) }
+                counts[reason, default: 0] += 1
+            }
+        }
+        var stray: [String] = []
+        for notice in notices where !withheldSources.contains(notice.sourceID) && !stray.contains(notice.reason) { stray.append(notice.reason) }
+        let unconfirmed = stray.isEmpty ? "" : "context chosen for this turn could not be confirmed (" + stray.joined(separator: "; ") + ")."
+        let count = withheld.count
+        guard count > 0 else { return unconfirmed.isEmpty ? nil : "Some " + unconfirmed }
+        // One reason needs no tally; several say how many each held back.
+        let because = order.count == 1 ? order[0] : order.map { "\($0): \(counts[$0, default: 0])" }.joined(separator: "; ")
+        let memories = withheld.allSatisfy { $0.draft.kind == .memory || $0.draft.kind == .correction }
+        let what = memories ? (count == 1 ? "memory" : "memories") : (count == 1 ? "piece of context" : "pieces of context")
+        return "\(count) \(what) chosen for this turn \(count == 1 ? "was" : "were") held back until confirmed (\(because))."
+            + (unconfirmed.isEmpty ? "" : " Other " + unconfirmed)
     }
 
     // MARK: - Recalled-memory prompt block

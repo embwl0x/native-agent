@@ -46,9 +46,23 @@ for the separate dispatch and bookkeeping timing receipts.
 
 ## The exchange and its time
 
-Replay sends each held row's words (a user row's sent `userText` when present)
-without historical whitespace normalization, role caps or display labels,
-which would rewrite an item already sent. A replayed user row opens with its
+**An earlier message is replayed in the form it was sent, and every replayed
+row passes the same three boundaries whichever source its words come from:
+credentials are redacted, a row says who spoke it when that was recorded, and
+a row that carried an attachment says so.** One projection,
+`SessionHistoryPromptRenderer.Renderable.replay(words:)`, makes that form: its
+words are a user row's saved `userText` when present, else the stored message,
+and redaction, the recorded `[origin: …]` speaker and the `[sent image: …]`
+attachment marker are applied there alone. The saved words already hold their
+attachments' text (voice evidence, document text), so only the marker is
+added; a label the words already open with is not added again. An image-only
+row keeps the marker as its body instead of dropping out. A row with no
+credential, no recorded speaker and no attachment replays its saved words
+byte for byte, so its cached prefix holds. The form reads only the saved row,
+so it is the same on every later turn; rows saved before this law need no
+migration. Request measurement reads the same projected bytes for every row,
+the current one included. Replay applies no historical whitespace normalization or role
+caps, which would rewrite an item already sent. A replayed user row opens with its
 own absolute local time from the row's `createdAt`, on its own line before the
 words: a bracketed weekday, full date, time of day and time zone. The time
 comes from the saved row, so its bytes are the same on every later call; a
@@ -113,7 +127,7 @@ time, its role, at most 400 characters (`packetAtomExpandThresholdChars`) and
 `[context.expand history:<id>]`, which opens the saved row across conversations.
 An exact history id is not constrained by the serving conversation; offered
 context atoms retain their turn-generation scope. The
-[tool contract](TOOL_LOADING.md) owns history-reference argument binding and
+[one-door contract](ONE_DOOR.md) owns history-reference argument binding and
 unreadable coverage. Beyond the leads,
 the agent reaches older words itself: it opens the conversation, recalls, or
 asks. What it still owes rides its intentions in the now-block.
@@ -239,7 +253,9 @@ unstamped retained history uses the historical provenance reader.
 Prompt preparation reads its provider/model from the admission on the turn it
 serves through `ContextBudgetPolicy.resolve(turn:dataRoot:)`. Its ingress admits
 that turn before preparation, including fresh Desk synthesis; preparation cannot
-choose a route or reconstruct one from its output context. Structured replay and
+choose a route or reconstruct one from its output context. A history turn
+resolves it once and hands that value to the base builder, whose data root is the
+same one the history reader holds; a base build entered directly resolves its own. Structured replay and
 earlier snippets require the same resolved budget, with no optional-window
 overload. `ContextBudgetPolicy` retains its memory, packet, capsule and relevance
 allowances; it no longer defines a compaction-summary allowance. Speech rows

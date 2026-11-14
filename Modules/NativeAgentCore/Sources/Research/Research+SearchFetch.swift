@@ -114,7 +114,7 @@ extension SwiftNativeResearchClient {
             throw ResearchClientError.transportFailure(error, url: url)
         }
         if !(200...299).contains(response.status) {
-            throw ResearchClientError.malformedResponse("SearXNG returned HTTP \(response.status)")
+            throw ResearchClientError.httpStatus(response.status)
         }
         guard !response.truncated else {
             throw ResearchClientError.malformedResponse("SearXNG response exceeds 1,000,000 bytes")
@@ -254,7 +254,7 @@ extension SwiftNativeResearchClient {
             "note": .string(extracted
                 ? """
                     Text covers the retained response body, without a DOM node cutoff. HTML keeps paragraphs, list items, table rows and inline link targets; \
-                    scripts and page chrome are omitted. Tool-output paging may expose sections: follow next_call (result.page with next_page), or sense_more \
+                    scripts and page chrome are omitted. Result paging may expose sections: follow next_call (result.page with next_page), or sense_more \
                     when a sense serves the page, to read on. Body truncation means the source was not fully read; a continuation cannot recover bytes beyond \
                     the response bound.
                     """

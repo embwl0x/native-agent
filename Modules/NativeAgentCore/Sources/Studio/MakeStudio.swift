@@ -24,6 +24,9 @@ public struct MakeStudio: Sendable {
         public let created: String
         /// Native provenance for another agent's output registered as the agent's: "made by ‹contact› for ‹job›". The agent's own versions have none.
         public var madeBy: String?
+        /// The version the person changed by hand to make this one (a table edited in the window). Absent on every other version; a build
+        /// without this field reads the record and drops it from the record when it next appends a version.
+        public var personEditOf: Int?
     }
 
     public struct Meta: Codable, Sendable, Equatable {
@@ -107,6 +110,7 @@ public struct MakeStudio: Sendable {
                 if let prompt = version.prompt { row["prompt"] = .string(prompt) }
                 if let model = version.model { row["model"] = .string(model) }
                 if let madeBy = version.madeBy { row["made_by"] = .string(madeBy) }
+                if let edited = version.personEditOf { row["person_edit_of"] = .int(Int64(edited)) }
                 return .object(row)
             })])
     }
@@ -136,6 +140,7 @@ public struct MakeStudio: Sendable {
                     "path": .string(url(ref, latest).path),
                     "next_call": .object(["page": .string("make"), "item": .string(ref)])]
                 if let madeBy = latest.madeBy { row["made_by"] = .string(madeBy) }
+                if let edited = latest.personEditOf { row["person_edit_of"] = .int(Int64(edited)) }
                 rows.append((ref, created, .object(row)))
             } catch {
                 rows.append((ref, nil, .object(["ref": .string(ref), "status": .string("unavailable"),
@@ -160,9 +165,11 @@ public struct MakeStudio: Sendable {
             "next_call": end < rows.count ? .object(["page": .string("make"), "args": .object(["offset": .int(Int64(end))])]) : .null])
     }
 
+    /// `personEditOf` lays the person's edit of that version: it is appended only while that version is still the ref's newest, so an edit
+    /// never lands on top of newer work.
     @discardableResult
     public func add(_ file: URL, ref: String? = nil, prompt: String? = nil, model: String? = nil,
-                    madeBy: String? = nil) throws -> (ref: String, version: Version) {
+                    madeBy: String? = nil, personEditOf: Int? = nil) throws -> (ref: String, version: Version) {
         let ref = ref?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         return try CredentialFileLock.withLock(root) {
             var meta: Meta
@@ -174,13 +181,19 @@ public struct MakeStudio: Sendable {
                 }
                 meta = found
             }
+            if let personEditOf, ref.isEmpty || meta.versions.last?.n != personEditOf {
+                throw Refusal(reason: "version_superseded", message: """
+                    Version \(personEditOf), the one you changed, is not the newest of \(meta.ref) any more, so I saved nothing. \
+                    The newest is the one to change.
+                    """)
+            }
             let (n, exhausted) = (meta.versions.last?.n ?? 0).addingReportingOverflow(1)
             guard !exhausted else {
                 throw Refusal(reason: "version_exhausted", message: "Make has no version numbers left for this ref. Nothing was written.")
             }
             let ext = file.pathExtension.lowercased()
             let version = Version(n: n, file: ext.isEmpty ? "v\(n)" : "v\(n).\(ext)", prompt: prompt, model: model,
-                                  created: NativeTimestampFormat.sixDigitUTCOffset(Date()), madeBy: madeBy)
+                                  created: NativeTimestampFormat.sixDigitUTCOffset(Date()), madeBy: madeBy, personEditOf: personEditOf)
             let dir = folder(meta.ref)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let copy = try checkedDestination(meta.ref, file: version.file)
@@ -205,6 +218,17 @@ public struct MakeStudio: Sendable {
 
 }
 
+private enum PersonEditPart: TurnPart { static let unset: Int? = nil }
+
+extension Turn {
+    /// The Make version the person's own tap edited (a table saved from the window); make.add lays the edit as that version's successor.
+    /// Only the stem sets it, through `ToolsFacade.personTap`.
+    public var personEditOf: Int? {
+        get { self[PersonEditPart.self] }
+        set { self[PersonEditPart.self] = newValue }
+    }
+}
+
 extension MakeStudio {
     /// Prepare off-main without mutating the image handed to the renderer.
     public struct Preview: Sendable {
@@ -217,6 +241,8 @@ extension MakeStudio {
 
     public static let webTypes: Set = ["html", "htm", "xhtml", "svg"]
     public static let imageTypes: Set = ["png", "jpg", "jpeg", "gif", "webp", "heic", "tiff"]
+    /// Plain text, Markdown and delimited sheets: what a page can show as its own words.
+    public static let textTypes: Set = ["txt", "text", "md", "markdown", "csv", "tsv"]
 
     public static func exportDestination(projectPath: String?, name: String) -> (project: URL?, target: URL?) {
         let project = projectPath.flatMap { path -> URL? in

@@ -18,7 +18,7 @@ extension SwiftToolDispatcher {
         throw AutonomyGateError.toolDenied(
             reason: "\(tool): '\(url.path)' is under a sensitive data sub-tree "
                 + "(OAuth tokens, pairing secrets, provider credentials, trust policy). "
-                + "Use dedicated runtime tools such as app agent.introspect or memory.recall instead."
+                + "Use the app's own actions such as app agent.introspect or memory.recall instead."
         )
     }
 

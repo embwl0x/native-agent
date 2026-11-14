@@ -53,7 +53,9 @@ extension SwiftNativeTurnEngine {
         return words
     }
 
-    /// Only the person's local arrival, or the agent's unsteered work in the person's local conversation, may carry private life across rooms.
+    /// Only the person's own arrival, or the agent's unsteered work in the person's local conversation, may carry private life across rooms.
+    /// The Mac and the phone are his by where they are; any other door is his only on the proof that stamps an owner's turn (a Telegram
+    /// thread whose sender is the verified owner), so he is the same person to her at every door he is proven at.
     static func personContinuityAllowed(root: URL, sessionID: String, turn: Turn) throws -> Bool {
         guard !peerContinuityTurn(turn), let envelope = turn.envelope else { return false }
         switch turn.originPrincipal {
@@ -61,7 +63,9 @@ extension SwiftNativeTurnEngine {
             if let origin = turn.origin {
                 guard origin.authored != .agent, origin.agent == nil, ["chat", "ios"].contains(origin.surface) else { return false }
             }
-            return envelope.agent == nil && ["chat", "ios"].contains(envelope.surface)
+            guard envelope.agent == nil else { return false }
+            return ["chat", "ios"].contains(envelope.surface) || SwiftNativeChatOrchestrationClient.isUsersTurn(
+                surface: envelope.surface, sessionId: sessionID, dataRoot: root, turn: turn)
         case "self":
             guard let row = try SessionConversation.checkedRow(sessionID, dataRoot: root),
                   SessionConversation(rows: [row]).kind(sessionID)?.isPersonConversation == true,

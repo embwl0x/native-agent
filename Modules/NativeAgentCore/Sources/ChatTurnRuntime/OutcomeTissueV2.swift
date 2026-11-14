@@ -81,7 +81,9 @@ extension ResponseOutcomeObservationV2 {
                 closedToken($0.receipt.id, maximum: 128)
             },
             providerID: context.flatMap { closedToken($0.providerId, maximum: 128) },
-            providerModel: result.flatMap { closedToken($0.modelUsed, maximum: 256) },
+            // A turn that ended before its result names the model its admitted context ran.
+            providerModel: result == nil ? context.flatMap { closedToken($0.modelId, maximum: 256) }
+                : result.flatMap { closedToken($0.modelUsed, maximum: 256) },
             reasoningEffort: observation.flatMap { closedToken($0.reasoningEffort, maximum: 64) },
             turnElapsedMs: result.map { min(24 * 60 * 60 * 1_000, max(0, $0.elapsedMs)) },
             tools: toolReferences,

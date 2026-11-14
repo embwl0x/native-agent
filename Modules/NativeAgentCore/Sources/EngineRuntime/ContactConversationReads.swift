@@ -18,6 +18,8 @@ public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
     public let via: String
     /// A saved connection stays visible even when it cannot initiate a turn.
     public var sendRestriction: String? = nil
+    /// The connection's program waits on the person's approval before it can start a turn.
+    public var needsYou = false
     /// Retain proven traffic counts independently of transcript retention.
     public var lastActivityAt: Date? = nil
     public var appBundleID: String? = nil
@@ -36,7 +38,10 @@ public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
         if let flight, !flight.inFlight, flight.queued.contains(where: { $0.waitingForMac }) {
             return "Waiting for the Mac to be free"
         }
-        if !owedExperiences.isEmpty { return "\(owedExperiences.count) \(owedExperiences.count == 1 ? "message" : "messages") still owed" }
+        // These are sends of mine the contact has not answered: said that way round, so nobody reads them as messages I owe.
+        if !owedExperiences.isEmpty {
+            return owedExperiences.count == 1 ? "1 of my messages is unanswered" : "\(owedExperiences.count) of my messages are unanswered"
+        }
         if let problem = health?.problem { return problem }
         if let flight {
             if flight.stop?.state == "stopping" { return "Stopping…" }
@@ -247,11 +252,16 @@ public enum AgentContactThreads {
     private static func sendRestriction(_ row: AgentContactRow) -> String? {
         guard let contact = row.contact else { return nil }
         if ChatGPTDotIPCTransport.owns(contact), !contact.canStartTurn { return ChatGPTDotIPCTransport.detail }
-        if !contact.canStartTurn {
-            return contact.transport == .mcpHost ? "Replies only"
-                : "Reconnect to approve its program before sending a message."
-        }
+        if needsApproval(row) { return "Reconnect to approve its program before sending a message." }
+        if !contact.canStartTurn { return "Replies only" }
         return contact.unavailableAt != nil || !row.credentialAvailable ? "This connection is unavailable for sending." : nil
+    }
+
+    /// A connection that cannot start a turn until the person approves its program: neither Dot, whose readiness is its own, nor an MCP
+    /// host, which only replies.
+    private static func needsApproval(_ row: AgentContactRow) -> Bool {
+        guard let contact = row.contact else { return false }
+        return contact.transport != .mcpHost && !ChatGPTDotIPCTransport.owns(contact) && !contact.canStartTurn
     }
 
     public static func mobileThreads(root: URL, contacts: ContactListFacade) async throws -> [MobileAgentThread] {
@@ -314,6 +324,7 @@ public enum AgentContactThreads {
                                  name: row.name,
                                  via: via(row),
                                  sendRestriction: restrictions[index],
+                                 needsYou: needsApproval(row),
                                  lastActivityAt: [row.contact?.provenInboundAt, row.contact?.provenOutboundAt]
                                    .compactMap { $0.flatMap(NativeTimestampFormat.parseISO8601) }.max(),
                                  appBundleID: appBundleID(row),

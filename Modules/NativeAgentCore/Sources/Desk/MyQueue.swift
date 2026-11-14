@@ -46,7 +46,8 @@ public enum MyQueue {
             waits.append("Desk dependency readiness unavailable")
         }
         if let reason = entry.item.blockedReason { waits.append("blocked: " + reason) }
-        if let person = entry.item.waitingOn { waits.append("message from " + person) }
+        // Said as the Desk says it: what is waited for may be a person or an event in her words, so no kind is claimed for it.
+        if let waiting = entry.item.waitingOn { waits.append("waiting on " + waiting) }
         if entry.step.status == "stopped" { waits.append("stopped; reconcile before acting") }
         if when(entry) == nil { waits.append("condition unavailable; repair " + entry.step.when) }
         return .object([

@@ -10,7 +10,7 @@ extension SwiftNativePersonaEngine {
     // Exclude USER from mutations because direct writes would split its projection from MemoryV2 authority.
     static let personaWriteKinds: Set<String> = ["soul", "voice", "growth", "agents"]
     static let memoryOwnedUserDocMessage =
-        "USER.md is generated from MemoryV2; use app memory.commit or memory proposal tools for durable user facts."
+        "USER.md is generated from MemoryV2; use app memory.commit or memory proposal actions for durable user facts."
 
     /// Normalize protected reads and writes identically before selecting documents.
     package static func canonicalizeKind(_ kind: String) -> String {

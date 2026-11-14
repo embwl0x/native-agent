@@ -30,7 +30,7 @@ public enum TrustCenterError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .invalidRequest: return """
-            trust_request_invalid: This request cannot be applied to the current Trust policy. Inspect Trust > Access and policy and correct the \
+            trust_request_invalid: This request cannot be applied to the current Trust policy. Inspect Trust > What I may do and correct the \
             request.
             """
         case .policyConflict: return """

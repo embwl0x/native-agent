@@ -10,6 +10,7 @@ import ProviderRouting
 import PersonaEngine
 import PersistenceCore
 import StandingBots
+import Studio
 import TrustCenter
 // Blueprint: | `EnginePages.swift` | The pages registered on `engine.pages`: the agent's pages (the part that draws each and its owner's packet read, levers included), the stem's lever pages (their native read), the agent's own pages, and the one way a tap runs a row's call |
 
@@ -60,8 +61,15 @@ extension NativeAgentEngine {
                 await pages?.refresh(page: "desk")
             }
         }
-        await watch(page: "desk", part: "native-desk", paths: desk.pageUpdatePaths, notifications: [.NSSystemClockDidChange, .NSSystemTimeZoneDidChange],
+        await watch(page: "desk", part: Self.deskPart, paths: desk.pageUpdatePaths, notifications: [.NSSystemClockDidChange, .NSSystemTimeZoneDidChange],
               read: { try await self.deskPacket() })
+        // A Desk item read is the Desk opened on that item, for whoever reads it; the window keeps its own selection.
+        await pages.register(page: "desk", contains: { [self] item in try await deskItemHandle(item) != nil },
+                             item: { [self] item, _ in try await deskItemFace(item) })
+        // A piece on the Desk is a Make ref: what the Make shelf publishes (a new version, a ref read or lost) draws the Desk again.
+        Task { [make, pages] in
+            await EngineFaceProjection.watch(read: { (make.allMetadata, make.loaded, make.fault) }) { _ in _ = await pages.refresh(page: "desk") }
+        }
         await watch(page: "settings", paths: [
             "trust/policy.json", "config/embeddings.json", "security/mac_integration_permissions.json",
             "memory/memory.sqlite", "memory/memory.sqlite-wal", "triggers/trigger_config.json", "research/config.json",
@@ -88,7 +96,7 @@ extension NativeAgentEngine {
         await pages.register(page: "memories", part: "native-memories", read: { try await self.memoriesPacket() })
         await phoneMemoryPages.register(page: "memories", part: "native-memories", read: { try await self.memoriesPacket(surface: "ios") })
         Task { @MainActor [pages, phoneMemoryPages] in
-            await EventDeadlinePhysiology.refreshOnChanges(paths: memoryPaths, notifications: [AgentPeerStore.trustDidChange]) {
+            await EventDeadlinePhysiology.refreshOnChanges(paths: memoryPaths, notifications: [AgentPeerStore.trustDidChange, .NSCalendarDayChanged]) {
                 await pages.refresh(page: "memories")
                 await phoneMemoryPages.refresh(page: "memories")
             }

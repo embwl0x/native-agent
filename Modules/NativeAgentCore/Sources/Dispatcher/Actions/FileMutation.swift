@@ -24,7 +24,8 @@ extension FileSystemActions {
             return errResult("Path '\(entry.path)' is outside writable sandbox roots: \(rootsRepr(allowed))", code: "path_not_allowed")
         }
         if isSensitiveDataPath(folder, ctx) {
-            return errResult("Path '\(entry.path)' is under a sensitive data sub-tree. Use dedicated Swift runtime tools instead.", code: "path_not_allowed")
+            return errResult("Path '\(entry.path)' is under a sensitive data sub-tree. Use the app's own actions for this data instead.",
+                             code: "path_not_allowed")
         }
         if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: entry.path, write: true) {
             return errResult(reason, code: "path_not_allowed")
@@ -61,7 +62,8 @@ extension FileSystemActions {
             return errResult("Path '\(resolved.path)' is outside writable sandbox roots: \(rootsRepr(allowed))", code: "path_not_allowed")
         }
         if isSensitiveDataPath(resolved, ctx) {
-            return errResult("Path '\(resolved.path)' is under a sensitive data sub-tree. Use dedicated Swift runtime tools instead.", code: "path_not_allowed")
+            return errResult("Path '\(resolved.path)' is under a sensitive data sub-tree. Use the app's own actions for this data instead.",
+                             code: "path_not_allowed")
         }
         if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: resolved.path, write: write) {
             return errResult(reason, code: "path_not_allowed")

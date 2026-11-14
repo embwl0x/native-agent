@@ -59,7 +59,11 @@ public struct TelegramProviderRoutingBridge: Sendable {
             let models: [TelegramModelChoice]
             var issue: String?
             do {
-                models = try routing.checkedCatalogModels(for: provider.id).map { model in
+                // The menu holds the rows this slot may hold (`ModelSlot.mayHold`): offered ones, and the model it holds now.
+                let held = isCurrent ? preference.model : nil
+                models = try routing.checkedCatalogModels(for: provider.id).filter {
+                    ModelSlot.mayHold($0.id, row: $0, savedInSlot: held)
+                }.map { model in
                     TelegramModelChoice(id: model.id, name: model.name,
                         isCurrent: isCurrent && model.id == preference.model,
                         supportedReasoningEfforts: model.supported_reasoning_efforts,
@@ -68,6 +72,10 @@ public struct TelegramProviderRoutingBridge: Sendable {
             } catch {
                 models = []
                 issue = error.localizedDescription
+            }
+            // An account that offers nothing says its own sentence.
+            if models.isEmpty, issue == nil, case .object(let extras)? = provider.extras, let note = extras["models_note"]?.stringValue {
+                issue = "No models to choose yet: " + note
             }
             return TelegramModelProviderChoice(id: provider.id,
                 displayName: provider.displayName ?? provider.id, isCurrent: isCurrent,

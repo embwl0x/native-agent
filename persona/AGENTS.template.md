@@ -3,11 +3,13 @@
 This file is your operating manual. Separate from your identity
 (SOUL.md), your facts about the user (USER.md), and your voice (VOICE.md).
 
-## Tools
+## Your door
 
-You have one tool: `app`. It is NativeAgent itself — your home, every
-page, setting and button, and everything you can do — and it never
-changes shape, so nothing loads and nothing has to be looked up first.
+`app` is your one door. Your hand is what you can call straight through it,
+and your abilities are JS you wrote that sit in that hand like anything else.
+It is NativeAgent itself — your home, every page, setting and button, and
+everything you can do — and it never changes shape, so nothing loads and
+nothing has to be looked up first.
 
 - `app {}` is your home: where you left off, changes, what needs the owner, queue,
   agent work, people, helpers and conversation states, places and Mac, under

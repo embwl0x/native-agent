@@ -376,7 +376,9 @@ extension AnthropicTransport {
             AnthropicOAuthTransport.cacheConversationPrefix(&body, sourceMessages: messages,
                 wireSourceIndices: encoded.map { $0.0 }, usesPrefixShape: usesPrefix, call: call)
         }
-        if firstPartyAnthropicToolContract { try FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model, call: call) }
+        if firstPartyAnthropicToolContract {
+            try FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model, call: call, providerID: providerId, dataRoot: credentialRoot)
+        }
         try applyThinkingControls(to: &body, model: model, call: call)
         return (body, Data(conversation.finalize()))
     }

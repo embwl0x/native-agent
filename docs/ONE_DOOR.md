@@ -1,10 +1,15 @@
-# Tool loading: the contract
+# One door: the contract
 
-NativeAgent is Agent's only tool: one always-on `app` schema. Pages, action
-arguments and results travel through that tool. This is a design contract;
-changing it requires User's authorization.
+The agent has one door, `app`: one always-on `app` schema. Through it the agent
+reads its home and pages, does actions, finds what it has not used and runs
+scripts; pages, action arguments and results travel through that door. Its hand
+is the actions it can call straight. Its abilities are JS it wrote or was given;
+they join its hand like any other action. The basic actions the app itself
+provides (files, shell, the Mac, the Desk and so on) are the app's own actions,
+and abilities are built from them. This is a design contract; changing it
+requires User's authorization.
 
-## One tool, every action
+## One door, every action
 
 `SwiftToolDispatcher.alwaysOnCoreNames` contains only `app`. Ordinary chat
 requests offer it alone. The schema is defined in
@@ -149,6 +154,15 @@ For actions, `preview:true` reports proposed effects without performing them.
 Native preflight checks policy and selected targets; authored preview runs live
 reads with writes previewed; resume preview only inspects stopped work.
 `expected_version` can guard against a page changing after it was read.
+A call that names an action and has no `args` object takes every key outside
+the `app` door's own, a batch step's and the deed's keys as that action's `args`,
+and of the reading keys `page`, `item` and `find` each one the action declares
+(an `item` too where the action declares one address word); it is read so once
+where the call is admitted (`ToolNameAliases.doorCall`), so gates, receipts and
+advice see the canonical `{action, args}`, and a call that has `args` keeps each
+other key where it was sent, to be refused rather than merged. With an action
+the action is what runs: an `item` left beside it is refused
+(`beside_action`), never opened in its place.
 At the shared action door, if the schema declares exactly one of `id`, `item`
 and `handle`, and that field is absent while exactly one of the other two is
 supplied, its value binds to the declared field before validation, Trust and
@@ -291,7 +305,7 @@ overlap and full-text overlap; ties retain inventory order, and each action
 appears once. Semantic evidence stands two deviations above the inventory, the
 bar a memory clears for their message (10-29: the attention chance bar over ~420
 actions sat near 4.5 deviations, so find ranked by shared words). Action vectors are shared per model epoch; `-<action id>` explicitly excludes
-that action. Active authored tools, enabled skills and current on senses share
+that action. Active authored abilities, enabled skills and current on senses share
 this ranking, including declared descriptions, operations and input schemas. Skills
 and sense readers appear in `actions`, rather than separate ranked lists;
 sense verbs require a served thing from the current enabled version.
@@ -311,33 +325,51 @@ counts usable rows; a gap is never evidence of absence. That action's admission
 still refuses, without manufacturing arguments from display text. Shared
 inventory or semantic-index failures still fail the search.
 
-The always-on description ends with their hand: the verbs a hand is born knowing
-(`AppActions.bornKnowing`) together with every native action their own mind has
-done in what their record still holds, in one alphabetical list, each written
-as its `id(args)` form from the current admitted schema (`*` marks a required
-argument), the form every receipt's `argument_form` carries. Their own mind's
-calls are the top-level `tool.dispatch` rows that ended `ok` and `succeeded`,
-not as a preview, with no `parentId` and no `automaticOrigin`; the record keeps
-those rows for its two-week detail horizon, and that horizon is the window:
-no second number is kept here. A verb they stops using fades from their hand at a later launch. Only
-native actions this release admits enter it: authored ability names, removed
-verbs and ids that do not resolve do not, and an action whose schema does not
-render is left out. The
-record is read once per process, when the door is first built (the engine
-builds it as it is made, off the main thread, and launch waits for the engine,
-so their hand is whole before anything asks for it), by one SQLite query over the record
-(`TurnTracePersistLane.doneVerbs`); the description then stays byte-identical
-for the life of the process, as the provider's cached prefix and the registered
-descriptor require. A newborn agent's hand is what it was born knowing; an
-unreadable record or an unrendered verb is traced as `app.hand` and never fails
-a turn. Checked schemas and examples still arrive through discovery.
+The always-on description ends with their hand. **Their hand is what they have done.
+An action their own mind completed is in their hand from the next turn on, a native
+action and an ability they wrote alike. A turn's hand never changes while the
+turn runs.** (User's word, 11-13; until then it was read once per process and
+held only native actions.)
+
+Their hand is the verbs a hand is born knowing (`AppActions.bornKnowing`) and
+everything their own mind has done in what their record still holds, in one
+alphabetical list, native and authored together. Each enters once, resolved
+against the current inventory and written under the id they calls it by (an
+ability done as `x` and as `authored.x` is one), as its `id(args)` form from
+the current admitted schema (`*` marks a required argument), the form every
+receipt's `argument_form` carries. Their own mind's deeds are the top-level
+`tool.dispatch` rows that ended `ok` and `succeeded`, not as a preview, with no
+`parentId` and no `automaticOrigin`, inside a turn holding an admitted model
+(`receipt.model`). What the app runs by itself holds no admitted model and never
+enters their hand: a runner's ability, a part's wake or carried habit, a person's
+tap, a page's own read. One predicate (`TurnTracePersistLane`'s `Deed`) answers
+for the record and for each row as it is written. The record keeps those rows
+for its two-week detail horizon, and that horizon is the window: no second
+number is kept here. A verb they stops using fades from their hand at a later
+launch. An id that no longer resolves is not in their hand, and an action whose
+schema does not render is left out.
+
+The record is read once per process, when the door is first drawn (the engine
+draws it as it is made, off the main thread, and launch waits for the engine,
+so their hand is whole before anything asks for it), by one SQLite query
+(`TurnTracePersistLane.doneVerbs`); after that each deed joins their done set in
+memory as its row is written, never by another query. A turn's catalog is
+collected once (`modelSchemas`, which the dispatcher serves) and that turn's
+rounds keep it. The door is drawn again only when a verb entered their done set
+or an ability's definition changed (`AbilityStore.didChange`), and a drawing
+whose forms come out byte-identical keeps the door it had, so the provider's
+cached prefix breaks only when their hand changed. The registered descriptor keeps
+the first drawing, as a registered descriptor must. A newborn agent's hand is
+what it was born knowing; an unreadable record, an unread inventory or an
+unrendered verb is traced as `app.hand` and never fails a turn. Checked schemas
+and examples still arrive through discovery.
 
 Settings propagate unavailable model/account catalogs, Trust/Slack policy, helper
 definitions, shelf and trigger reads. Thinking levels come only from the selected
 model's descriptor; a declared empty list offers no levels, while missing
 capability evidence is unavailable. An OpenRouter model with no effort selector
 can run with its provider's default, omitting that optional request control.
-An absent view preference uses Simple, without reading saved chats. UI and tool
+An absent view preference uses Simple, without reading saved chats. UI and action
 reads share the checked preference resolver; an existing invalid value stays
 unavailable until the person explicitly chooses a supported view.
 
@@ -454,7 +486,8 @@ or per-session active-tools store. Installed schema updates apply next turn.
 
 `ToolNameAliases` binds current internal executors to app actions and translates
 only their declared public/internal argument names, such as `path` to `cwd`.
-Retired tool/action spellings and discovery/load names are unknown calls.
+Retired tool-call names, action spellings and discovery/load names are unknown
+calls.
 Argument interpretation belongs to the shared action binding described above.
 Current internal executors direct callers to their app action;
 provider-safe wire names remain a separate transport encoding.
@@ -492,14 +525,15 @@ be read reports that failure with the command evidence and repair; stdout
 never stands in for its promised reply.
 
 Internal executors and saved Trust keys still exist where actions need them.
-A folded action re-enters the gated dispatcher under its underlying tool name;
-home likewise re-enters its internal executor. Saved blocks and domain gates
-continue to apply. Internal names are not additional tools offered to Agent.
+A folded action re-enters the gated dispatcher under its underlying executor
+name; home likewise re-enters its internal executor. Saved blocks and domain
+gates continue to apply. Internal names are not additional request schemas
+offered to the agent.
 
-Studio-wander and bridge execution paths can have their own
-declared tool lists. Their internal dispatch contracts do not enlarge the
-ordinary chat request. The Tools UI reads the manifest rather than calling a
-discovery tool. The manifest reports `always_on_tools` and each schema's
+Studio-wander and bridge execution paths can have their own declared lists
+for the provider request's tools field. Their internal dispatch contracts do
+not enlarge the ordinary chat request. The Tools UI reads the manifest rather
+than calling discovery. The manifest reports `always_on_tools` and each schema's
 `model_visible` flag; it has no `currently_loaded` or `load_state` fields.
 Catalog/schema and result-section encoding errors surface with their owner;
 there is no invented empty contract or empty successful result. Inline model
@@ -508,8 +542,8 @@ provider selection.
 
 ## Extending their reach
 
-- Built-in capabilities are registered app actions, not additional request
-  schemas.
+- Built-in capabilities are the app's own actions: registered app actions, not
+  additional request schemas.
 - The built-in search action appears as `web.search`. `web.read {url,find:"context window"}`
   returns up to eight paragraphs containing every find word (case-insensitively),
   with surrounding paragraphs (`around:0...3`, default 1), in source order.
@@ -592,7 +626,10 @@ a verb that reads the person's files with no app switch over them needs admitted
 No direct filesystem, network, process or timer API is exposed; every nested app call re-enters the same gate chain.
 The callable `app({action, args, preview?, expected_version?})` form and each
 entry of `app({actions:[…]})` carry the same options as the method form's
-second object. A named method call takes at most those two objects: a supplied nonobject options argument or any surplus argument refuses
+second object, and read the call the door's way: with no `args`, every other
+key is the action's argument; beside `args`, another key throws a TypeError.
+Saving an ability reads its literal `app({…})` calls by the same keys
+(`OwnedProgram.Calls.requestKeys`), so its fit check sees the same arguments. A named method call takes at most those two objects: a supplied nonobject options argument or any surplus argument refuses
 before execution. Static source admission rejects the same known malformed shapes; computed values are checked at the live call.
 `preview:true` on either a batch or an entry dominates; an
 entry can add preview to a live batch but cannot disable a batch preview.
@@ -623,19 +660,21 @@ person on a card.
 Its receipt retains completed effects if a later step fails; a script is not
 an atomic transaction or a rollback mechanism.
 Stop ends the helper immediately and cancels its host call, then waits for
-the host's actual terminal result. The final journal and receipt retain
-that result, its effects and returned handles even when it arrives after
+the host's actual terminal result. The final journal retains that result, and
+the receipt its effects and returned handles, even when it arrives after
 Stop. A completed call replays from its saved answer rather than running again.
-Program returns and every journaled step's answer stay whole until the shared
+Program returns stay whole until the shared
 [result boundary](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool) retains and bounds the
-model view. A long result names its `result_handle` and `next_call`; use
+model view; each journaled step's answer stays in the private journal
+([receipts](#authority-and-receipts)). A long result names its `result_handle` and `next_call`; use
 `result.page` with that handle and the zero-based `page` offset, following
 `next_page` (or `continue:true`). `raw:true` reads exact retained bytes.
 `pages` says how many pages to read in one answer, from that offset; the
 answer joins them in order, says `pages_read` and where the reading stands,
 and holds only as many as one inline result can carry.
-The helper's former 16 KiB return prefix and byte-count-only step results are
-removed. Retention failures are explicit and do not establish the action's
+The helper's former 16 KiB return prefix is removed, and a program receives
+each step's whole answer; its receipt's `calls` measure that answer instead of
+carrying it ([receipts](#authority-and-receipts)). Retention failures are explicit and do not establish the action's
 outcome.
 
 ## Authority and receipts
@@ -643,10 +682,27 @@ outcome.
 Registry discovery fails explicitly if its required `ability.read` action is
 missing; it cannot publish a skill inventory without that canonical reader.
 
-Every tool declares its effect where it is defined: class (read, write, send, destructive), reach (theirs or their), capabilities and an argument policy.
+Every action and internal executor declares its effect where it is defined: class (read, write, send, destructive), reach (theirs or their), capabilities and an argument policy.
 The forms carry the common case: a read is a safe read; a door action is a read when it says `read:`, else a write to app data unless it says otherwise.
-The security profile projects that declaration, and argument policy only narrows it; nothing is inferred from a tool's name.
+The security profile projects that declaration, and argument policy only narrows it; nothing is inferred from an action's or executor's name.
 The execution result owns its effect verdict; receipts preserve it and the outer door fills only missing metadata.
+
+**A receipt shows only what its call's own output is allowed to show.** A nested
+call (a row of a script's, ability's or part-backed action's `calls`) keeps its
+identity and outcome, never its raw result: position (`n`, `line`, `step`,
+`run`), action (`call`), status, reason, detail and structured remedy, execution
+and effects, its classes (`read_only`, `irreversible`, `effect` and the card
+fields), returned `ids` and `version`, the result's measured identity
+(`result_bytes`, `result_digest`) and `artifacts`: where a write landed (file
+destination, shell directory), and a generated image only when the enclosing
+output names its path. Raw answers live only in
+the run's private replay journal; a stopped strict run's receipt names it by
+`journal_ref` and never carries it, so no trace, transcript or experience holds
+it. When its settlement fails, the journal moves to the sealed run store on disk
+under that reference (`unsettled_journal`), taken once by its settling owner. `CallLedger` is the
+allowlist: the journal publishes its ledger through it, and a reader of a row
+stored before this law reduces it the same way. What a program wants seen of a
+call, it returns.
 
 Ability admission, Trust/consent, input and part gates, wake admission and resume
 refusals use the same dispatch completion writer as executed calls. Their receipts
@@ -666,9 +722,9 @@ nor success.
 
 Every tool result delivered to the turn's model passes the same repeat
 annotation owner, including standing-bot turns before their records are kept
-and their feedback is serialized. If the same tool and arguments already
-returned an identical answer in that turn, its receipt adds `repeat:n` and
-`repeat_note`: "Same call, same
+and their feedback is serialized. If the same call, by name and arguments,
+already returned an identical answer in that turn, its receipt adds `repeat:n`
+and `repeat_note`: "Same call, same
 answer as your last n; nothing has changed." The count reads the turn's
 existing dispatch records, including earlier results in the same round; bots
 read their own execution records before keeping the current call.
@@ -738,7 +794,7 @@ encoding failures retain their cause and remedy in their existing presentation.
 Offscreen screenshot settling ends on cancellation and releases its host before
 returning the cancelled result; its four-second wait never becomes a spin.
 
-Under Full Mac, Agent can also perform actions otherwise marked the owner's.
+Under Full Mac, the agent can also perform actions otherwise marked the owner's.
 Explicit blocks, checked policy, actual macOS grants and connector
 authentication still apply. An unavailable Trust policy returns its actual
 read failure and repair; it never becomes an ordinary denied-policy result.
@@ -756,9 +812,9 @@ grant, retaining transport verification. Phone and Mac share file-access modes
 the turn runs. Phone controls always carry their supplied file-access field,
 including a blank value; serialization never turns invalid input into absence.
 The phone offers Auto, Read only, Workspace and Full Mac. It does not offer
-"No files": the current file gate does not enforce `none` across all file tools.
+"No files": the current file gate does not enforce `none` across all file actions.
 An explicit request's `read_only` ceiling reaches canonical Trust admission
-before consent and blocks every effectful tool class, including changes inside
+before consent and blocks every effectful action class, including changes inside
 the agent's own workspace or data, regardless of broader saved permission or
 approved replay. Folded actions and authored calls re-enter that same admission.
 The request binds before expansion and conversation coordination, so a refused
@@ -793,7 +849,7 @@ wakes, schedules and every turn carrying peer steering remain `owners_call`,
 including trusted or previously elevated peers. An absent message or unverifiable
 door grants nothing. Putting away a pending approval passes the same authority
 check before declining it. Permanent deletion remains the person's tap, by the
-tool's declared destructive class, never the card's wording. Other levers keep
+action's declared destructive class, never the card's wording. Other levers keep
 their own tap authority. Decisions on a message record `person_message`
 provenance, its session, message id and verifying door; cards and retained history
 name the agent deciding on that message rather than presenting a tap.
@@ -810,7 +866,7 @@ turn ends can be answered under its own identity.
 Message decisions require a fresh turn that has started only Inbox reads or
 approval-decision calls. The shared canonical dispatch entry marks every other
 call in shared call evidence held on `Turn` before execution, without a list of outside
-tools or inspection of text. Web, mail, files, memory, senses, authored programs,
+actions or inspection of text. Web, mail, files, memory, senses, authored programs,
 scripts and batches therefore close message authority, including failed calls.
 Nested model executions retain that evidence. Missing call evidence and checkpoint resumes also refuse. The refusal says
 to read the card first or ask the person to tap; the agent can answer in a fresh
@@ -832,7 +888,7 @@ redacted write failures into the existing card settlement. A failed write
 keeps its cause and any completed grant writes on the receipt; successful
 setup still requires the resolver's authority readback before success.
 
-A tool result whose owned `remedy.next_call` is `permissions.request` files
+A call result whose owned `remedy.next_call` is `permissions.request` files
 that action automatically on its return through `AppChatToolDispatcher`.
 The same gated action checks whether access is already allowed; otherwise
 the transcript owner saves a permission card or reuses the open card for that
@@ -873,8 +929,9 @@ Declared scalar forms normalize exactly: numbers to strings, numeric strings
 to numbers (integers only when exact), `"true"`/`"false"` to booleans, and one
 scalar to a declared scalar array. This is protocol normalization, without
 receipt notes, like `1.0` to integer `1`; invalid values still refuse. A present
-unreadable or nonobject tool schema fails before dispatch and names the schema
-that must be repaired; it never sends unchecked input to an executor.
+unreadable or nonobject action or executor schema fails before dispatch and
+names the schema that must be repaired; it never sends unchecked input to an
+executor.
 
 `queue.add` and `queue.update` accept a plain local date/time for `when`, with
 an optional weekday (for example `Sun Nov 1 at 06:00`), through the system date
@@ -910,7 +967,7 @@ All paths below are under `Modules/NativeAgentCore/Sources/`.
 | `AppToolRuntime/AppScriptRunner.swift` | Door binding to the shared executor. |
 | `ToolRegistry/ToolNameAliases.swift` | Action translations and underlying dispatch identity. |
 | `ChatToolRuntime/SwiftToolDispatcher+ToolCatalog.swift` | The single always-on name. |
-| `ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift`, `ChatTurnSettlement.swift` | Request filtering and tool-contract traces. |
+| `ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift`, `ChatTurnSettlement.swift` | Request filtering and `tools.contract` traces. |
 | `Research/Research+WebSearch.swift` | Search routing. |
 
 See [Anatomy of a Turn](ANATOMY_OF_A_TURN.md) for the surrounding lifecycle.

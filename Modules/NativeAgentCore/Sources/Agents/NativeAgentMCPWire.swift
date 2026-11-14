@@ -1,8 +1,10 @@
 import Foundation
 import ChatToolParsing
+import ChatToolRuntime
 import CoreFoundation
 import CryptoKit
 import NativeAgentCore
+import PersistenceCore
 // Blueprint: | `NativeAgentMCPWire.swift` | MCP negotiation, parsing, caller-supplied request identity and reply projection |
 
 /// Stateless MCP transport projection only. Chat admission, context and receipts stay with the canonical bridge and chat owners.
@@ -12,6 +14,8 @@ enum NativeAgentMCPWire {
                      project: @Sendable (Int, [String: Any]) -> [String: Any])
         case reply(requestID: String, sessionID: String, offset: Int, waitSeconds: Int, artifactID: String?,
                    project: @Sendable ([String: Any]) -> [String: Any])
+        /// A read of the table; the route decides whether this contact is at it.
+        case table(arguments: [String: JSONValue], project: @Sendable ([String: Any], Bool) -> [String: Any])
         case immediate(status: Int, body: [String: Any])
         case acceptedNotification
     }
@@ -71,7 +75,8 @@ enum NativeAgentMCPWire {
                 "instructions": """
                     Talk with \(PeerFacingIdentity.agentName) through persistent full chat sessions. agent_message waits for the reply (up to \
                     wait_seconds) and returns it; status enqueued means queued, not finished, so read the rest with agent_reply. Keep the returned \
-                    session and request IDs. Never resend solely because a reply is missing. \(heldNote)
+                    session and request IDs. Never resend solely because a reply is missing. agent_desk reads \(PeerFacingIdentity.agentName)'s \
+                    Desk once the person brings you to the table. \(heldNote)
                     """
             ])
         case "ping": return success(id, result: [:])
@@ -79,7 +84,8 @@ enum NativeAgentMCPWire {
             guard params["cursor"] == nil else {
                 return failure(id, code: -32602, message: "This complete tool list has no cursor.")
             }
-            return success(id, result: ["tools": tools])
+            do { return success(id, result: ["tools": try tools()]) }
+            catch { return failure(id, code: -32603, message: "The tool list could not be built: \(error.localizedDescription)") }
         case "tools/call":
             guard let name = params["name"] as? String,
                   let args = params["arguments"] as? [String: Any] else {
@@ -230,6 +236,12 @@ enum NativeAgentMCPWire {
                                       held: held)
                 })
             }
+            if name == "agent_desk" {
+                // The Desk's own reader checks the arguments, so the contact gets the same refusals the agent does.
+                return .table(arguments: args.mapValues { JSONValue(fromFoundation: $0) }, project: { fields, failed in
+                    toolResult(id, fields: fields, failed: failed, held: held)
+                })
+            }
             return failure(id, code: -32602, message: "Unknown tool. Use tools/list.")
         default: return failure(id, code: -32601, message: "Method not supported.")
         }
@@ -361,16 +373,17 @@ enum NativeAgentMCPWire {
     /// Pull hosts have no push command; queued messages leave through their next call’s result.
     static var heldNote: String {
         """
-            Every agent_message and agent_reply result may also carry held_messages: what \(PeerFacingIdentity.agentName) wrote to you since your \
-            last call, oldest first, each {at, text, conversation_id, conversation_name}, with held_remaining saying how many more wait for your \
-            next call. Messages in your own conversation come only to you; one from a conversation whose caller has ended comes to whoever calls \
-            next, named by its conversation_name. They are delivered by being returned there and nowhere else, so read them every time; answer one \
-            with agent_message, session_id set to its conversation_id.
+            Every agent_message, agent_reply and agent_desk result may also carry held_messages: what \(PeerFacingIdentity.agentName) wrote to \
+            you since your last call, oldest first, each {at, text, conversation_id, conversation_name}, with held_remaining saying how many \
+            more wait for your next call. Messages in your own conversation come only to you; one from a conversation whose caller has ended \
+            comes to whoever calls next, named by its conversation_name. They are delivered by being returned there and nowhere else, so read them \
+            every time; answer one with agent_message, session_id set to its conversation_id.
             """
     }
 
-    static var tools: [[String: Any]] {
+    static func tools() throws -> [[String: Any]] {
         let agent = PeerFacingIdentity.agentName
+        let table = try SwiftToolDispatcher.tableReadParameters().foundationObject
         return [
             ["name": "agent_message", "description": """
                 Talk with \(agent). This session of yours has its own conversation with \(agent): every message goes on in it, and its mcp- \
@@ -409,6 +422,15 @@ enum NativeAgentMCPWire {
                 "wait_seconds": ["type": "integer", "minimum": 0, "maximum": maximumWaitSeconds, "default": 0,
                                  "description": "How long this call waits for a reply still in progress; back the moment it settles. 0 reads it as it is now."]
              ], "required": ["session_id", "request_id"], "additionalProperties": false],
+             "annotations": ["readOnlyHint": true, "idempotentHint": true, "openWorldHint": false]],
+            ["name": "agent_desk", "description": """
+                Read \(agent)'s Desk, once the person has brought you to \(agent)'s table: the same reading \(agent) has of it, with handles. \
+                With handle, one item, whose on_the_table lists the pieces laid on it; with piece set to a make_ref from there, that piece's \
+                source. next_read and next_archive_read name \(agent)'s own desk_read and desk.read: pass their arguments to agent_desk. It \
+                only reads: make.read, make.add and the other calls named in a result are \(agent)'s; to change anything, ask \(agent) with \
+                agent_message. Not at the table, it says how to get there. \(heldNote)
+                """,
+             "inputSchema": table,
              "annotations": ["readOnlyHint": true, "idempotentHint": true, "openWorldHint": false]]
         ]
     }

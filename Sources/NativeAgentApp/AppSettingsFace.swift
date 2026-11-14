@@ -101,7 +101,9 @@ private struct MacSettingsFaceSnapshot: SettingsFaceExtrasSnapshot {
             rows.append(.init(id: "shortcut-status", title: "Shotgun shortcut unavailable",
                               detail: "\(shortcutTitle) is taken by another app. Pick another, or use View ▸ Show Shotgun.", tone: .attention))
         }
-        return [.init(id: "app", title: "Updates and help", style: .list, rows: rows)]
+        // Folded until opened, unless a row in it needs the person: a fold never hides a failure or a conflict.
+        return [.init(id: "app", title: "Updates and help", style: .list, rows: rows,
+                      folded: rows.contains { $0.tone == .attention || $0.tone == .failed } ? nil : true)]
     }
 }
 

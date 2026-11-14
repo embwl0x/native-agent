@@ -149,18 +149,20 @@ extension MacFourVerbs {
         }
         switch landing {
         case .blind(let reply):
-            if opened {
-                var detail = openedDetail(Self.operationDetail(result))
+            // A failed landing read cannot undo the navigation owner's completed work.
+            if result.ok {
+                var detail = Self.operationDetail(result)
+                if opened { detail = openedDetail(detail) }
                 detail["landing_read"] = .string(reply.text)
-                return MacFourVerbsReply(ok: true, text: moved, detail: detail)
+                return MacFourVerbsReply(ok: true, text: moved + " " + reply.text, detail: detail)
             }
             var detail = reply.detail
             detail["navigation"] = .object(Self.operationDetail(result).merging(["ok": .bool(result.ok)]) { _, new in new })
             let ownWindow = reply.detail["status"] == .string("in_process_route")
-            if ownWindow, !result.ok { detail["execute_in_process"] = .bool(false) }
+            if ownWindow { detail["execute_in_process"] = .bool(false) }
             return MacFourVerbsReply(
-                ok: result.ok && reply.ok,
-                text: (result.ok ? moved : "I couldn't confirm that I got to \(trimmed).")
+                ok: false,
+                text: "I couldn't confirm that I got to \(trimmed)."
                     + " " + (ownWindow ? "My own window uses app page inspection." : reply.text),
                 detail: detail
             )

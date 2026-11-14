@@ -41,14 +41,16 @@ extension SwiftNativeProviderRouting {
                 return MoonshotModelCatalog.supportedReasoningEfforts(for: model)
             }
             return accountCatalogs[route ?? ""]?.first { $0.id == model }?.supportedReasoningEfforts
-                ?? FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: route ?? "")
+                ?? FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: route ?? "", dataRoot: dataRoot)
         }
         var cachedModelIDs = accountCatalogs.mapValues { Set($0.map { $0.id.lowercased() }) }
         if let moonshotModels = MoonshotModelCatalog.readCache(dataRoot: dataRoot) {
             cachedModelIDs["moonshot"] = Set(moonshotModels.map { $0.id.lowercased() })
         }
+        // A live route retires a pick only when no spelling of it is in its provider's complete list for this credential (`routeCarries`); its
+        // shipped floor proves nothing absent.
         let retiredCandidates = Self.surfacesWithRetiredPicks(
-            parsedSurfaceModels, accountModels: cachedModelIDs
+            parsedSurfaceModels, accountModels: cachedModelIDs, dataRoot: dataRoot
         ) {
             [weak self] surface, model in
             activeProviders[surface]
@@ -66,10 +68,15 @@ extension SwiftNativeProviderRouting {
             for surface in retiredPickSurfaces {
                 guard case .string(let unusable)? = parsed[surface] else { continue }
                 let route = activeProviders[surface] ?? activeProviders["chat"]
-                if FirstPartyModelCatalog.descriptor(for: unusable) == nil {
+                if let route, FirstPartyModelCatalog.routeListsUnrunnable(unusable, providerID: route, dataRoot: dataRoot) {
+                    unusablePicks[surface] = """
+                        \(FirstPartyModelDiscovery.providerName(route)) lists \(unusable), but this build does not know how to run it, so an \
+                        available model must be chosen in Providers.
+                        """
+                } else if FirstPartyModelCatalog.descriptor(for: unusable) == nil {
                     unusablePicks[surface] = "Your model, \(unusable), is no longer offered, so an available model must be chosen in Providers."
                 } else if let route {
-                    unusablePicks[surface] = "\(unusable) isn't offered on \(route), so an available model must be chosen in Providers."
+                    unusablePicks[surface] = "\(unusable) isn't offered on \(Self.displayName(for: route)), so an available model must be chosen in Providers."
                 } else {
                     unusablePicks[surface] = "\(unusable) isn't offered, so an available model must be chosen in Providers."
                 }
@@ -99,8 +106,8 @@ extension SwiftNativeProviderRouting {
             guard Self.stringFrom(parsedSurfaceModels, key: surface) == nil,
                   case .model(let saved)? = savedDefaults[route] else { continue }
             let offered = offeredModels[route] ?? []
-            if !offered.isEmpty, !offered.contains(saved) {
-                unusablePicks[surface] = "\(saved) isn't offered on \(route), so an available model must be chosen in Providers."
+            if !offered.isEmpty, !offered.contains(saved), FirstPartyModelCatalog.listedSpelling(saved, providerID: route, dataRoot: dataRoot) == nil {
+                unusablePicks[surface] = "\(saved) isn't offered on \(Self.displayName(for: route)), so an available model must be chosen in Providers."
             }
         }
         // An unusable Chat pick stays unset; provider-sheet defaults are explicit picks too.
@@ -113,7 +120,7 @@ extension SwiftNativeProviderRouting {
         let chatEffortRaw = Self.stringFrom(surfaceEfforts, key: "chat")
             ?? (chatRoute == "openrouter" ? openRouterCatalog?.first { $0.id == chatModel }?.default_reasoning_effort : nil)
             ?? accountCatalogs[chatRoute ?? ""]?.first { $0.id == chatModel }?.defaultReasoningEffort
-            ?? chatRoute.flatMap { FirstPartyModelCatalog.descriptor(for: chatModel, providerID: $0)?.defaultReasoningEffort }
+            ?? chatRoute.flatMap { FirstPartyModelCatalog.descriptor(for: chatModel, providerID: $0, dataRoot: dataRoot)?.defaultReasoningEffort }
             ?? ""
         // Validate after group inheritance, so a failed Chat route cannot prevent an independent Work or Memory route from being resolved.
         let chatEffort = chatEffortRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -223,6 +230,11 @@ extension SwiftNativeProviderRouting {
                 mismatchedPicks[surface] = "\(model) isn't available on \(route). Choose one."
                 effectiveModel = ""
             }
+            // One model whichever spelling names it: a live route runs the pick under the spelling its provider listed, the pick's own when listed.
+            if !effectiveModel.isEmpty, let route,
+               let listed = FirstPartyModelCatalog.listedSpelling(effectiveModel, providerID: route, dataRoot: dataRoot) {
+                effectiveModel = listed
+            }
             var effort = canonical.effort
             do {
                 if let route, let fault = catalogFaults[route] {
@@ -238,7 +250,7 @@ extension SwiftNativeProviderRouting {
                 }
                 if canonical.serviceTier == "priority", !effectiveModel.isEmpty, let route {
                     let supportsFast = accountCatalogs[route]?.first { $0.id == effectiveModel }?.supportsFast
-                        ?? FirstPartyModelCatalog.descriptor(for: effectiveModel, providerID: route)?.supportsFast
+                        ?? FirstPartyModelCatalog.descriptor(for: effectiveModel, providerID: route, dataRoot: dataRoot)?.supportsFast
                     guard supportsFast == true else {
                         throw ProviderRoutingError.configurationFailed(
                             "Fast is unsupported or unknown for \(effectiveModel) on \(route). Choose a supported tier in Providers.")
@@ -299,7 +311,9 @@ extension SwiftNativeProviderRouting {
         let openRouter = providerID == "openrouter"
             ? await OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot) : nil
         let catalog = catalogRows(providerID, openRouterModels: openRouter?.models, preview: preview)
-        let length = Self.contextLength(of: modelID, in: catalog.rows)
+        // The one "which row is this model" answer: a live route's listed spelling of the same model.
+        let listed = FirstPartyModelCatalog.listedSpelling(modelID, providerID: providerID, dataRoot: dataRoot) ?? modelID
+        let length = Self.contextLength(of: listed, in: catalog.rows)
         return (length, catalog.fault ?? openRouter?.failure)
     }
     /// Picker rows come from the selected route's own catalog; unreadable saved discovery yields a fault, never substitute rows.
@@ -355,9 +369,12 @@ extension SwiftNativeProviderRouting {
         if lower.hasPrefix("grok") { return "xai_oauth_direct" }
         // Subscription IDs must resolve on the Kimi Code route.
         if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(lower) { return "kimi-code" }
-        if FirstPartyModelCatalog.descriptor(for: lower, providerID: "meta") != nil { return "meta" }
+        // Meta by declared id or the live list read at this root; without a root only shipped rows answer.
+        let metaRow = if let dataRoot { FirstPartyModelCatalog.descriptor(for: lower, providerID: "meta", dataRoot: dataRoot) }
+            else { FirstPartyModelCatalog.shippedDescriptor(for: lower, providerID: "meta") }
+        if metaRow != nil { return "meta" }
         // Moonshot by declared id: its shipped rows and its live catalog, never a prefix.
-        if FirstPartyModelCatalog.descriptor(for: lower, providerID: "moonshot") != nil
+        if FirstPartyModelCatalog.shippedDescriptor(for: lower, providerID: "moonshot") != nil
             || dataRoot.map({ MoonshotModelCatalog.isKnownCatalogModelID(lower, dataRoot: $0) }) == true {
             return "moonshot"
         }
@@ -371,7 +388,8 @@ extension SwiftNativeProviderRouting {
         // A saved provider-sheet choice may be inherited. Catalog ordering never chooses a model for a surface without an explicit pick.
         switch savedDefaults?[providerId] ?? configuredDefaultModel(providerId) {
         case .model(let saved):
-            if offered.isEmpty || offered.contains(saved) { return saved }
+            if offered.isEmpty || offered.contains(saved)
+                || FirstPartyModelCatalog.listedSpelling(saved, providerID: providerId, dataRoot: dataRoot) != nil { return saved }
             FileHandle.standardError.write(Data(
                 "[provider-routing] \(providerId) no longer offers saved default '\(saved)'; choose a model in the picker\n".utf8
             ))
@@ -452,6 +470,9 @@ public func verifiedContextLength(
     // A route with neither a shipped nor a fetched catalog carries no evidence.
     guard provider == "openrouter" || CodexAccountModelCatalog.isAccountBackedProvider(provider)
         || !FirstPartyModelCatalog.models(forProviderID: provider).isEmpty else { return nil }
-    let rows = SwiftNativeProviderRouting(dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()).catalogRows(provider, preview: preview).rows
-    return SwiftNativeProviderRouting.contextLength(of: model, in: rows)
+    let root = dataRoot ?? PersistenceCore.defaultDataRoot()
+    let rows = SwiftNativeProviderRouting(dataRoot: root).catalogRows(provider, preview: preview).rows
+    // The one "which row is this model" answer: a live route's listed spelling of the same model.
+    let listed = FirstPartyModelCatalog.listedSpelling(model, providerID: provider, dataRoot: root) ?? model
+    return SwiftNativeProviderRouting.contextLength(of: listed, in: rows)
 }

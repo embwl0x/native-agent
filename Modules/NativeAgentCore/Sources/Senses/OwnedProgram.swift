@@ -87,83 +87,10 @@ extension OwnedProgram {
         lexed(source).code
     }
 
-    /// Share literal boundaries with call inspection so comments and regular expressions cannot become action names.
+    /// Share literal boundaries with call inspection so comments and regular expressions cannot become action names. The one reader is
+    /// `AbilityStore.lexed`, below Senses so a part's own entry is read by it too.
     static func lexed(_ source: String) -> (code: String, literals: [Range<Int>]) {
-        let text = Array(source.utf16)
-        var masked = text, i = 0
-        var literals: [Range<Int>] = []
-        func word(_ c: UInt16) -> Bool { c >= 128 || (48...57).contains(c) || (65...90).contains(c) || (97...122).contains(c) || c == 95 || c == 36 }
-        func hide(_ start: Int) { for n in start..<i where text[n] != 10 && text[n] != 13 { masked[n] = 32 } }
-        func literal(_ delimiter: UInt16) {
-            let start = i
-            i += 1
-            var bracket = false
-            while i < text.count {
-                let c = text[i]; i += 1
-                if c == 92 { i = min(i + 1, text.count); continue }
-                if delimiter == 47, c == 91 { bracket = true }
-                if delimiter == 47, c == 93 { bracket = false }
-                if c == delimiter, !bracket { break }
-            }
-            if delimiter == 47 { while i < text.count, word(text[i]) { i += 1 } }
-            if delimiter != 47 { literals.append(start..<i) }
-            hide(start)
-        }
-        func code(_ interpolation: Bool = false) {
-            var regexAllowed = true, previous = "", parens: [Bool] = [], braces: [Bool] = []
-            while i < text.count {
-                let c = text[i], next = i + 1 < text.count ? text[i + 1] : 0
-                if c == 32 || c == 9 || c == 10 || c == 13 { i += 1; continue }
-                if c == 47, next == 47 || next == 42 {
-                    let start = i; i += 2
-                    while i < text.count {
-                        if next == 47, text[i] == 10 || text[i] == 13 { break }
-                        if next == 42, text[i] == 42, i + 1 < text.count, text[i + 1] == 47 { i += 2; break }
-                        i += 1
-                    }
-                    hide(start); continue
-                }
-                if c == 34 || c == 39 || (c == 47 && regexAllowed) {
-                    literal(c); regexAllowed = false; previous = "literal"; continue
-                }
-                if c == 96 {
-                    var start = i; i += 1
-                    while i < text.count {
-                        if text[i] == 92 { i = min(i + 2, text.count); continue }
-                        if text[i] == 96 { i += 1; literals.append(start..<i); hide(start); break }
-                        if text[i] == 36, i + 1 < text.count, text[i + 1] == 123 {
-                            i += 2; literals.append(start..<i); hide(start); code(true); start = i; continue
-                        }
-                        i += 1
-                    }
-                    hide(start); regexAllowed = false; previous = "literal"; continue
-                }
-                if word(c) {
-                    let start = i
-                    while i < text.count, word(text[i]) { i += 1 }
-                    previous = String(decoding: text[start..<i], as: UTF16.self)
-                    regexAllowed = ["return", "throw", "case", "delete", "void", "typeof", "new", "in", "of", "yield", "await", "else", "do"].contains(previous)
-                    continue
-                }
-                if (c == 43 || c == 45), next == c {
-                    i += 2; previous = "increment"; continue
-                }
-                i += 1
-                if c == 123 {
-                    braces.append(["=", "(", "[", ",", ":", "?", "return", "yield", "await"].contains(previous) || (interpolation && previous.isEmpty))
-                }
-                if c == 125 {
-                    if interpolation, braces.isEmpty { masked[i - 1] = 32; return }
-                    regexAllowed = !(braces.popLast() ?? false)
-                    previous = "}"; continue
-                }
-                if c == 40 { parens.append(["if", "while", "for", "with", "switch", "catch"].contains(previous)) }
-                regexAllowed = c == 41 ? (parens.popLast() ?? false) : ![93, 46].contains(c)
-                previous = String(decoding: [c], as: UTF16.self)
-            }
-        }
-        code()
-        return (String(decoding: masked, as: UTF16.self), literals)
+        AbilityStore.lexed(source)
     }
 
 }

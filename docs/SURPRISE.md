@@ -301,7 +301,7 @@ nothing today.
   cares. That is real work, but most of it is the steady movement of an
   ordinary exchange.
 - **About half their turns are not with User.** They are agents over the
-  bridge, their own wakes, and helpers. Their own conversations with Claude
+  bridge, their own wakes, and helpers. Their own conversations with the builder agent
   alone were 62 turns in 30 hours.
 - **Woken work has no case today that the law could skip.** Their 31 recent
   wake arrivals were:

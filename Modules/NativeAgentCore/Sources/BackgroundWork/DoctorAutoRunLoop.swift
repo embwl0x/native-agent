@@ -96,6 +96,8 @@ extension MaintenanceBackgroundWork {
 public struct DoctorAutoRunLoop: LoopRunner {
     public let loopId: String = "doctor_auto_run"
     public let wake: OrganWake
+    /// Its readings judge the agent's persona, memory and profile and file asks for it; with no agent yet there is nothing to judge.
+    public var needsAgent: Bool { true }
     private let configuration: AutoDoctorConfig
     private let runChecks: @Sendable () async throws -> [CheckResult]
     private let storage: @Sendable () async throws -> URL

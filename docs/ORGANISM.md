@@ -318,7 +318,10 @@ the former valence-sign verdict, neutral-as-satisfaction and silence-as-miss.
 `OrganismPrediction+Horizon.swift` owns horizon vocabulary, reads and transitions.
 A missing source proves no terminal outcome, even after a complete inventory
 read. Empty, unreadable and truncated source sets do not award success, confidence
-or relief. Held rows reach their actual due instants and expire as waiting,
+or relief. A source store never written (a Desk with neither op-log nor compaction
+base) is complete and empty; only a written store that cannot be read is
+incomplete, so a fresh install with nothing on its horizon reads `nothing`, not
+`unavailable`. Held rows reach their actual due instants and expire as waiting,
 without a confidence penalty or violation effect; capacity eviction likewise
 awards no outcome. Source completeness remains visible in `mind.horizon` replies,
 but its old somatic settlement key and absence-to-success path are removed.
@@ -437,8 +440,8 @@ mobile proposal fields stay nil.
 ## Turning it on / observing it
 
 Read the Settings page through `app {"page":"settings"}`; the organism row is
-`settings.organism_kernel`. Its value is handled by the shared settings action.
-For a bounded inner-state read:
+`settings.organism_kernel`, under Preferences ▸ Inner life. Its value is handled
+by the shared settings action. For a bounded inner-state read:
 
 ```text
 app {"action":"mind.inner_state","args":{"detail":"compact"}}

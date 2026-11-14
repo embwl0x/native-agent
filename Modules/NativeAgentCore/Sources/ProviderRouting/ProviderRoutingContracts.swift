@@ -25,7 +25,8 @@ public enum ProviderModelChoice {
         reasoningEffort: String?,
         accountModels: [CodexAccountModelCatalog.Model]? = nil,
         moonshotModels: [ProviderModelInfo]? = nil,
-        openRouterModels: [ProviderModelInfo]? = nil
+        openRouterModels: [ProviderModelInfo]? = nil,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> String? {
         let route = provider?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let id = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -52,13 +53,13 @@ public enum ProviderModelChoice {
         let openRouter = ProviderFamilyIdentity.normalize(route) == "openrouter" ? openRouterModels : nil
         guard moonshot.map({ $0.contains { $0.id.lowercased() == id.lowercased() } })
             ?? accountModels.map({ $0.contains { $0.id.lowercased() == id.lowercased() } })
-            ?? FirstPartyModelCatalog.routeCarries(id, providerID: route) else {
+            ?? FirstPartyModelCatalog.routeCarries(id, providerID: route, dataRoot: dataRoot) else {
             return "\(route) does not serve \(id). Pick a model that account offers."
         }
         guard let supported = openRouter?.first(where: { $0.id == id })?.supported_reasoning_efforts
             ?? moonshot.flatMap({ _ in MoonshotModelCatalog.supportedReasoningEfforts(for: id) })
             ?? accountModels?.first(where: { $0.id.lowercased() == id.lowercased() })?.supportedReasoningEfforts
-            ?? FirstPartyModelCatalog.routeSupportedEfforts(id, providerID: route), !supported.isEmpty else {
+            ?? FirstPartyModelCatalog.routeSupportedEfforts(id, providerID: route, dataRoot: dataRoot), !supported.isEmpty else {
             return "Think controls for \(id) on \(route) are unknown. Refresh its model catalog in Providers."
         }
         if !supported.contains(effort) {

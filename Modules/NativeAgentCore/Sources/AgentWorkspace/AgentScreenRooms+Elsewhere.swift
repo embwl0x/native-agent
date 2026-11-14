@@ -220,6 +220,8 @@ extension AgentScreen {
         let at: Date
         let text: String
         let stamp: TranscriptRowStamp
+        /// The row's role. Whose words that makes them depends on the room: see the day line.
+        let assistant: Bool
     }
 
     private static func transcript(_ url: URL) throws -> (lines: [DoorLine], mine: Date?, reply: String?) {
@@ -674,7 +676,7 @@ extension AgentScreen {
                 guard try answeredSends.contains(send) || acceptedSends.get().contains(send) else { return }
             }
             if last == nil || last.map({ $0.at < at }) == true {
-                last = SpokenLine(at: at, text: ChatSecretRedactor.redactText(text), stamp: speech.stamp)
+                last = SpokenLine(at: at, text: ChatSecretRedactor.redactText(text), stamp: speech.stamp, assistant: speech.role == "assistant")
             }
         }
         while offset > 0 {
@@ -764,12 +766,9 @@ extension AgentScreen {
                             cause = read
                         }
                     }
-                    guard let transcript else {
-                        if cause.kind == .heard {
-                            throw unavailable("Transcript evidence is unavailable for heard experience " + cause.id + ".")
-                        }
-                        continue
-                    }
+                    // A turn that began with no message row (hidden input, a wake) has no speaker, so its acts have no door here:
+                    // the same class as a mechanical row, and nothing to repair.
+                    guard let transcript else { continue }
                     let session = String(transcript.source.dropFirst("chat/messages/".count).dropLast(".jsonl".count))
                     guard NativeAgentChatSessionID.normalizedPathComponent(session) == session, !transcript.id.isEmpty else {
                         throw unavailable("Experience " + cause.id + " has unreadable transcript evidence.")
@@ -900,7 +899,16 @@ extension AgentScreen {
         lines += reading.day.map { conversation in
             var line = (peer ? conversation.surface : conversation.door) + ": earlier today, last "
                 + NativeTimestampFormat.fractionalZulu(conversation.last.at)
-            if !peer, conversation.words { line += ": " + said(conversation.last.text, limit: 120) }
+            // The delta lines forget a conversation once she answers here; this line is what she still holds of it: who spoke last there and
+            // what was said, at the length an exchange is quoted.
+            if !peer, conversation.words {
+                // Whose words: her own work is all hers; in a helper's room the assistant is the helper and the brief is hers; anywhere else
+                // the assistant is her and the other row is the other side's.
+                let last = conversation.last
+                let speaker = conversation.surface == ownDoor ? "I"
+                    : conversation.surface == "helper" ? (last.assistant ? "it" : "I") : (last.assistant ? "I" : "they")
+                line += "; " + speaker + " last said " + said(last.text, limit: 600)
+            }
             return line + ". app {page:\"chat\",item:\"" + conversation.session + "\"}"
         }
         lines += reading.dayFailures

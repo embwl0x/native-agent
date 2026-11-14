@@ -254,6 +254,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
     /// Callers owning this event's prediction set predictDelivery false so a single notification cannot count twice.
     public func sendNotification(
         title: String,
+        subtitle: String? = nil,
         body: String,
         userInfo: [String: String] = [:],
         predictDelivery: Bool = true
@@ -267,7 +268,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             await beginDeliveryPrediction(eventID: eventID, source: userInfo["source"] ?? "notification")
         }
         do {
-            return try await sendSignedNotification(title: notificationTitle, body: body,
+            return try await sendSignedNotification(title: notificationTitle, subtitle: subtitle, body: body,
                                                     userInfo: userInfo, eventID: eventID)
         } catch let unknown as DeviceSyncSendOutcomeUnknown {
             // Server acceptance is unknown: the prediction stays open, never a confirmed failure.
@@ -288,14 +289,15 @@ public struct MacSyncMobileNotificationRelay: Sendable {
     }
 
     /// CloudKit renders ordinary alerts; signed readers deliver results. Transport failure cannot select another renderer.
-    private func sendSignedNotification(title: String, body: String, userInfo: [String: String],
+    private func sendSignedNotification(title: String, subtitle: String?, body: String, userInfo: [String: String],
                                         eventID: String) async throws -> MobileNotificationDeliveryReceipt {
         var eventInfo = userInfo
         eventInfo["eventId"] = eventID
         let publication = try await retainPublication(
-            title: title, body: body, userInfo: eventInfo, eventID: eventID, timestamp: Date())
-        // The retained intent is what goes out on every attempt, byte for byte.
+            title: title, subtitle: subtitle, body: body, userInfo: eventInfo, eventID: eventID, timestamp: Date())
+        // The retained intent is what goes out on every attempt, byte for byte. The phone's notification service draws the subtitle.
         var metadata = ["kind": "notification", "title": publication.title, "body": publication.body]
+        if let subtitle = publication.subtitle { metadata["subtitle"] = subtitle }
         for (key, value) in publication.userInfo { metadata["userInfo.\(key)"] = value }
         let message = try await sync.bridge.sendChatMessage(
             text: publication.body, metadata: metadata, messageID: eventID, timestamp: publication.timestamp
@@ -310,13 +312,14 @@ public struct MacSyncMobileNotificationRelay: Sendable {
 
     private struct NotificationPublication: Codable, Sendable {
         let title: String
+        let subtitle: String?
         let body: String
         let userInfo: [String: String]
         let timestamp: Date
     }
 
     /// Retain intent and time before sending; timeout, restart and concurrency must reuse them, while unreadable bytes remain failures.
-    private func retainPublication(title: String, body: String, userInfo: [String: String],
+    private func retainPublication(title: String, subtitle: String?, body: String, userInfo: [String: String],
                                    eventID: String, timestamp: Date) async throws -> NotificationPublication {
         let path = sync.dataRoot.appendingPathComponent("notifications/publications/\(eventID).json")
         do {
@@ -324,13 +327,13 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                 let data: Data
                 do { data = try Data(contentsOf: path) }
                 catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-                    let publication = NotificationPublication(title: title, body: body, userInfo: userInfo, timestamp: timestamp)
+                    let publication = NotificationPublication(title: title, subtitle: subtitle, body: body, userInfo: userInfo, timestamp: timestamp)
                     try SwiftNativePersistenceCore.writeDataAtomicDurable(try JSONEncoder().encode(publication), to: path)
                     return publication
                 }
                 let publication = try JSONDecoder().decode(NotificationPublication.self, from: data)
                 // One event keeps its exact words and route; a retry reuses the first publication's time.
-                guard publication.title == title, publication.body == body, publication.userInfo == userInfo else {
+                guard publication.title == title, publication.subtitle == subtitle, publication.body == body, publication.userInfo == userInfo else {
                     throw NSError(domain: "NativeAgentMobileNotify", code: 2, userInfo: [
                         NSLocalizedDescriptionKey: """
                             This notification event already has different retained content. Preserve its publication and repair the producer's event \

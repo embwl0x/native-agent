@@ -123,6 +123,7 @@ struct ChatComposerSettings: View {
             Toggle("Shotgun", isOn: $shotgunEnabled)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
+                .tint(FaceSwitchTint.on)
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.text.opacity(0.85))
                 .help("""

@@ -215,7 +215,7 @@ extension AgentWorkspaceNavigation {
                 session.nextPersistenceAttempt = Date().addingTimeInterval(5)
                 session
                     .persistenceIssue = """
-                        Navigation could not be saved. A later workspace action will retry storage only; the tool outcome is unchanged and no \
+                        Navigation could not be saved. A later workspace action will retry storage only; the action's outcome is unchanged and no \
                         effect is repeated.\u{20}
                         """ + error.localizedDescription
             }

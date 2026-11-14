@@ -38,7 +38,9 @@ public struct AppAction: Sendable {
         case agent
         /// A lever: the person's authority over the agent. It names why it is theirs and an agent-safe alternative when one exists; `asks`
         /// says whether a card can carry the agent's ask for it (false: it needs the person themself, so the agent's call is refused).
-        case person(String, instead: String? = nil, asks: Bool = true)
+        /// `freely` names arguments under which the call only narrows what the agent has, so that call is the agent's own. `name` is the act
+        /// in the person's words: Trust's card lists it, and a refusal of the agent's call names it.
+        case person(String, instead: String? = nil, asks: Bool = true, freely: [String: JSONValue] = [:], name: String)
     }
 
     public let id: String
@@ -159,7 +161,9 @@ public struct AppAction: Sendable {
 
     public var isPersonOwned: Bool { lever != nil }
     public var lever: AppActionBinding.Lever? {
-        if case .person(let why, _, let asks) = owner { AppActionBinding.Lever(why: why, asks: asks) } else { nil }
+        if case .person(let why, _, let asks, let freely, let name) = owner {
+            AppActionBinding.Lever(why: why, asks: asks, freely: freely, name: name)
+        } else { nil }
     }
     var reaches: ToolClass { read ? .read : folded ? schema?.toolClass ?? toolClass : toolClass }
     /// Parts retain their own identity when a row declares a tool call.
@@ -188,7 +192,7 @@ public struct AppAction: Sendable {
                          tool: tool, fixedInput: input, rename: rename, folded: isFold,
                          descriptor: schema.map { ToolDescriptor(schema: $0, bucket:
                              SwiftToolDispatcher.catalogBucket(forRegisteredToolNamed: tool) ?? AppToolExecutor.buckets[tool] ?? .unclassified) },
-                         toolClass: toolClass, reach: reach, capabilities: capabilities)
+                         toolClass: toolClass, reach: reach, capabilities: capabilities, declaredArguments: Set(argSpecs.flatMap(\.names)))
     }
 
     func readOnly(args: [String: JSONValue]) -> Bool {
@@ -224,11 +228,13 @@ public struct AppAction: Sendable {
         if screen { text += " · screen" }
         if irreversible { text += " · irreversible" }
         if !warn.isEmpty { text += " · \(warn)" }
-        // Only while Simple view is on screen does showing a page change the view itself.
-        if id == "page.show", SimpleViewMode.isShowing { text += " · " + SimpleViewMode.noPagesNote }
-        if case .person(let why, let instead, let asks) = owner {
+        if case .person(let why, let instead, let asks, let freely, _) = owner {
             // A lever is the person's at every posture: the agent's call raises their card, or is refused when no card can carry it.
             text += (asks ? " · the person's (your call asks them): " : " · the person's: ") + why + (instead.map { ". Instead: \($0)" } ?? "")
+            if !freely.isEmpty {
+                text += ". Yours with " + freely.sorted { $0.key < $1.key }.map { $0.key + " " + ($0.value.scalarText ?? "") }
+                    .joined(separator: ", ")
+            }
         }
         return text
     }

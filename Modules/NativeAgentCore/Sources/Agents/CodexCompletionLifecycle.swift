@@ -689,7 +689,9 @@ public struct CodexCompletionLifecycle: Sendable {
     private func recover(_ state: State, at path: URL,
                          detail: String? = "recovered_from_canonical_assistant_transcript") async throws -> ClaimDecision? {
         if let response = try await recoverTranscriptResponse(deliveryId: state.deliveryId, requestDigest: state.requestDigest,
-            sessionId: state.sessionId, runId: state.responseRunId) {
+            sessionId: state.sessionId, runId: state.responseRunId),
+            // A failed turn's saved words are not an answer for a caller.
+            response.terminalState != .failed {
             var state = state
             state.response = response
             state.ownerInstanceId = ownerInstanceId

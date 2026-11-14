@@ -27,6 +27,8 @@ public struct Matter: Sendable, Equatable {
     /// The part that tells the person: the wire's `source`.
     public let from: String
     public let title: String
+    /// An alert's line between title and summary, as the telling call gave it; the Mac and phone alerts draw it.
+    public let subtitle: String?
     public let summary: String
     /// What the text doors say (Telegram, the agent's conversation): the long words.
     public let words: String
@@ -39,10 +41,10 @@ public struct Matter: Sendable, Equatable {
     public let evidence: [Experience.Ref]
     public let artifacts: [Experience.Ref]
 
-    public init(id: String, form: Form, from: String, title: String, summary: String, words: String? = nil, symbol: String? = nil,
-                badge: String? = nil, open: String? = nil, choices: [PartFace.Action] = [], evidence: [Experience.Ref] = [],
+    public init(id: String, form: Form, from: String, title: String, subtitle: String? = nil, summary: String, words: String? = nil,
+                symbol: String? = nil, badge: String? = nil, open: String? = nil, choices: [PartFace.Action] = [], evidence: [Experience.Ref] = [],
                 artifacts: [Experience.Ref] = []) {
-        (self.id, self.form, self.from, self.title, self.summary) = (id, form, from, title, summary)
+        (self.id, self.form, self.from, self.title, self.subtitle, self.summary) = (id, form, from, title, subtitle, summary)
         (self.words, self.symbol, self.badge, self.open) = (words ?? summary, symbol, badge, open)
         (self.choices, self.evidence, self.artifacts) = (choices, evidence, artifacts)
     }
@@ -64,7 +66,7 @@ public struct Matter: Sendable, Equatable {
 
     func face(at: String) -> Experience.Face {
         Experience.Face(words: words, artifacts: artifacts, row: PartFace.Row(id: id, title: title, detail: summary, value: badge, at: at,
-                        symbol: symbol, tone: form.tone, open: open, actions: choices.isEmpty ? nil : choices), from: from)
+                        symbol: symbol, tone: form.tone, open: open, actions: choices.isEmpty ? nil : choices), from: from, subtitle: subtitle)
     }
 }
 
@@ -129,6 +131,8 @@ public actor ForPerson {
     }
 
     public static let person = "person"
+    /// Posted after the reading takes a matter, so a reader of the inbox rereads what it now holds.
+    public static let didChange = Notification.Name("NativeAgent.forPersonChanged")
     static let horizon: TimeInterval = 30 * 24 * 60 * 60
     static let bound = 500
     private static let owners = OSAllocatedUnfairLock(initialState: [URL: ForPerson]())
@@ -390,6 +394,7 @@ public actor ForPerson {
             }
         }
         for observer in observers.values { observer.yield(()) }
+        NotificationCenter.default.post(name: Self.didChange, object: nil)
     }
 
     /// Ordered with every other owner's writes to the same experience; the reading takes the result before the call returns.

@@ -43,6 +43,8 @@ extension AbilityStore {
             if let digest = identity(file) { versions.append(.string(digest)) }
             row["versions"] = .array(versions)
             if file.kind != .part { return .object(row) }
+            // Read from the selected version's own code and header each time, never stored: a page is not a call.
+            row["callable"] = .bool(Self.answersCalls(file.body, header: file.part))
             row.removeValue(forKey: "candidateReview")
             row.removeValue(forKey: "keepReview")
             var reviewFile = file
@@ -148,7 +150,7 @@ extension AbilityStore {
     }
     static func storedRecord(_ input: [String: JSONValue], kind: Kind) -> [String: JSONValue] {
         var row = input.filter { !statistics.contains($0.key) && !obsolete.contains($0.key)
-            && !partKeys.contains($0.key) && !["kind", "permissions", "bundledDefault", "body", "run_counts"].contains($0.key)
+            && !partKeys.contains($0.key) && !["kind", "permissions", "bundledDefault", "body", "run_counts", "callable"].contains($0.key)
             && (kind == .sense || $0.key != "version") }
         if var script = row["script"]?.objectValue { script.removeValue(forKey: "source"); row["script"] = .object(script) }
         return row
@@ -167,7 +169,13 @@ extension AbilityStore {
     }
     func record(_ file: File, previous: File?, redactedStatistics: JSONValue?) throws -> [String: JSONValue] {
         var row = file.record
-        row.merge(redactedStatistics?.objectValue ?? [:]) { _, new in new }
+        var statistics = redactedStatistics?.objectValue ?? [:]
+        // A run accounted before receipts kept only metadata still holds its calls' raw results; they leave as metadata.
+        if case .object(var last)? = statistics["lastRun"], case .array(let calls)? = last["calls"] {
+            last["calls"] = .array(calls.map(CallLedger.published))
+            statistics["lastRun"] = .object(last)
+        }
+        row.merge(statistics) { _, new in new }
         row["validation_evidence"] = Self.validationEvidence(file.metadata["proof"], fixtures: file.metadata["candidate"]?.objectValue?["fixtures"])
         if let status = Self.validationStatus(file.metadata["proof"]) { row["validationStatus"] = .string(status) }
         let evidence = row["runs"]?.objectValue?["versions"]?.objectValue ?? [:]

@@ -45,7 +45,7 @@ See [ARCHITECTURE_BLUEPRINT.md](ARCHITECTURE_BLUEPRINT.md) for source ownership.
 
 ## Agent Interface
 
-[TOOL_LOADING.md](TOOL_LOADING.md) owns the `app` interface, discovery and
+[ONE_DOOR.md](ONE_DOOR.md) owns the `app` interface, discovery and
 execution contract; the [manifest spec](skill_manifest_spec.md) owns authored
 abilities and built-in guidance.
 

@@ -488,6 +488,11 @@ public struct TurnContinuationRuntime: Sendable {
                 receiptURL: dataRoot.appendingPathComponent("chat/human-reply-delivery/receipts.jsonl"),
                 ownerInstanceId: CodexCompletionLifecycle.processOwnerInstanceId, dataRoot: dataRoot)
             _ = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
+            // A stopped or failed turn's words settle once in their door's own journal; this lifecycle would hold them as a stopped answer.
+            if response.terminalState == .stopped || response.terminalState == .failed {
+                return try await sender.deliverReply(response, deliveryId: deliveryID, route: route,
+                    priorVerdict: nil, notifyRequestedResult: notifyRequestedResult).status
+            }
             switch try await lifecycle.claim(deliveryId: deliveryID, requestDigest: digest, sessionId: response.sessionId, responseRunId: response.runId,
                 route: route) {
             case .start:

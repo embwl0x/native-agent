@@ -55,12 +55,15 @@ extension AgentWorkspace {
 
 /// Reads use exact inbox identity, with the RFC identifier when available. Replies require that identifier; display text never selects a recipient.
 enum AgentWorkspaceMail {
+    /// Every action carries the read's one locator (`MailReadLocator.fields`), the mailbox under its own name `scope`, which each action declares.
     static func itemActions(input: [String: JSONValue], title: String) -> [String: AgentWorkspaceAction] {
-        let bound = input.filter { MailReadLocator.fields.union(["mailbox"]).contains($0.key) }
+        var bound = input.filter { MailReadLocator.fields.contains($0.key) }
+        bound["scope"] = input["scope"] ?? input["mailbox"] ?? .string("inbox")
         guard bound["message_id"] != nil, case .string(let id)? = bound["expected_message_id"], !id.isEmpty else { return [:] }
-        var actions: [String: AgentWorkspaceAction] = ["delete": .perform(tool: "mail.delete", input: bound, title: "Delete " + title, textField: nil,
-            isEffect: true)]
-        if (bound["scope"] ?? bound["mailbox"] ?? .string("inbox")) == .string("inbox") {
+        // Every message action, delete included, reaches inbox mail only, so a message read in another mailbox offers none.
+        var actions: [String: AgentWorkspaceAction] = [:]
+        if bound["scope"] == .string("inbox") {
+            actions["delete"] = .perform(tool: "mail.delete", input: bound, title: "Delete " + title, textField: nil, isEffect: true)
             actions["draft"] = .perform(tool: "mail.draft", input: bound, title: "Draft: " + title, textField: "body", isEffect: true)
             actions["reply"] = .perform(tool: "mail.reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true)
             actions["reply-all"] = .perform(tool: "mail.reply", input: bound.merging(["reply_all": .bool(true)]) { _, new in new }, title: "Reply all: "

@@ -15,7 +15,7 @@ extension NativeAgentEngine {
             let preference = snapshot.routing.preferences[surface]
             let providerID = snapshot.routing.activeProviders[surface]
             var options = try connections.filter { $0.auth_status.eligible }.flatMap { provider in
-                try provider.models.filter { $0.supported_reasoning_efforts != nil }.map { model in
+                try provider.offeredModels.filter { $0.supported_reasoning_efforts != nil }.map { model in
                     PartFace.Control.Option(id: try personalityMindID(provider.provider_id, model.id),
                         label: provider.display_name + " · " + model.name)
                 }
@@ -25,17 +25,27 @@ extension NativeAgentEngine {
                 selected = try personalityMindID(providerID, preference.model)
             } else { selected = nil }
             let saved = [providerID, preference?.model].compactMap { $0 }.joined(separator: " · ")
-            // A saved choice no ready provider offers stays visible as the selection, marked unavailable; choosing it again is refused.
+            // A saved choice no ready provider offers stays visible as the selection: with its row's note when its provider has not listed it,
+            // else marked unavailable.
             let unoffered = selected.map { id in !options.contains { $0.id == id } } ?? false
-            if unoffered, let selected, !options.isEmpty { options.insert(.init(id: selected, label: saved + " (saved; unavailable)"), at: 0) }
+            let savedRow = connections.first { $0.provider_id == providerID }?.models.first { $0.id == preference?.model }
+            // A saved model whose row is only awaiting its provider's list runs: it is the slot's current model with its note, not unavailable.
+            let awaitingList = savedRow.map { !$0.isOffered } ?? false
+            let unavailable = unoffered && !awaitingList
+            if unoffered, let selected, !options.isEmpty || savedRow != nil {
+                options.insert(.init(id: selected, label: saved + " (" + (savedRow?.offer_note ?? "saved; unavailable") + ")"), at: 0)
+            }
+            let savedState = awaitingList ? savedRow?.offer_note.map { " (\($0))" } ?? "" : unavailable ? " (unavailable)" : ""
             var rows = [PartFace.Row(id: "mind", title: ProviderSurfaceGroups.mind.title,
                 detail: (options.isEmpty ? "No selectable models are available. Connect or refresh a provider."
-                    : ProviderSurfaceGroups.mind.caption) + (saved.isEmpty ? "" : "\nSaved: " + saved + (unoffered ? " (unavailable)" : "")),
-                value: saved.isEmpty ? "No saved selection" : saved, tone: unoffered ? .attention : nil,
+                    : ProviderSurfaceGroups.mind.caption) + (saved.isEmpty ? "" : "\nSaved: " + saved + savedState),
+                value: saved.isEmpty ? "No saved selection" : saved, tone: unavailable ? .attention : nil,
                 control: options.isEmpty ? nil : .choice(options, selected: selected, call: PartFace.Call("personality.mind")))]
             for provider in connections {
+                // The note is shown beside the list; only an account with no list to choose from asks for attention.
                 if let note = provider.models_note, !note.isEmpty {
-                    rows.append(.init(id: "mind-catalog:" + provider.provider_id, title: provider.display_name, detail: note, tone: .attention))
+                    rows.append(.init(id: "mind-catalog:" + provider.provider_id, title: provider.display_name, detail: note,
+                                      tone: provider.offeredModels.isEmpty ? .attention : nil))
                 }
             }
             rows.append(.init(id: "mind-providers", title: "Thinking, Fast and each activity",
@@ -87,6 +97,13 @@ extension NativeAgentEngine {
         for provider in connections where provider.auth_status.eligible {
             for model in provider.models where model.supported_reasoning_efforts != nil {
                 guard try personalityMindID(provider.provider_id, model.id) == value else { continue }
+                // A model choice: offered, or the model Memory and mind holds now (`ModelSlot.mayHold`).
+                let slot = NativeCognitionRuntime.studioWanderSurface
+                let held = snapshot.routing.activeProviders[slot] == provider.provider_id ? snapshot.routing.preferences[slot]?.model : nil
+                guard ModelSlot.mayHold(model.id, row: model, savedInSlot: held) else {
+                    throw PartCallError(code: "model_unavailable",
+                        message: ModelSlot.refusal(note: provider.models_note, accountName: provider.display_name))
+                }
                 let preference = snapshot.routing.preferences[NativeCognitionRuntime.studioWanderSurface]
                 _ = try await saveProviderGroupSelection(group: ProviderSurfaceGroups.mind,
                     providerID: provider.provider_id, model: model.id,

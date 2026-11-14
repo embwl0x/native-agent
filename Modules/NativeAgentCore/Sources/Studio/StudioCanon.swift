@@ -614,7 +614,7 @@ public enum StudioCanonError: Error, LocalizedError, Sendable, Equatable {
                 + "Nothing was written."
         case .decisionHasNoLiveTurn:
             return "studio canon: a canon decision has to be made IN a turn — yours, on a local "
-                + "surface, live. This call did not come from one (a bridge tool run, an "
+                + "surface, live. This call did not come from one (a bridge call, an "
                 + "approval replay, or a background pass), so the seat cannot be established "
                 + "and nothing was written. Decide it in chat."
         case .unreadableHistory:

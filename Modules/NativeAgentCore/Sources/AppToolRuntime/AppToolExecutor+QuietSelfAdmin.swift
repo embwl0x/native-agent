@@ -66,7 +66,7 @@ extension AppToolExecutor {
 
     /// Work and Builder share balanced permissionLevel; outside-workspace writes (deny/ask) distinguish them.
     /// App settings admission uses ownerOnly and each row's direction check independently of Mac effects and workspace fences.
-    /// Permission acquisition follows docs/TOOL_LOADING.md#authority-and-receipts.
+    /// Permission acquisition follows docs/ONE_DOOR.md#authority-and-receipts.
     public struct QuietPosture: Sendable {
         public let name: String
         let changesAllowed: Bool

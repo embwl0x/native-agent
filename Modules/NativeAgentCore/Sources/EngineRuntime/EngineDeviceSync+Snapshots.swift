@@ -80,7 +80,10 @@ extension NAProviderCatalogProvider {
                     defaultReasoningEffort: model.default_reasoning_effort,
                     supportedReasoningEfforts: model.supported_reasoning_efforts,
                     supportsFast: model.supports_fast,
-                    controlsNote: model.controls_note
+                    controlsNote: model.controls_note,
+                    // The phone offers only what the account offers.
+                    offered: model.offered,
+                    offerNote: model.offer_note
                 )
             }
         )

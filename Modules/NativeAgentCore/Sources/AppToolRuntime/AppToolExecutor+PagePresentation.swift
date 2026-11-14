@@ -15,8 +15,9 @@ public enum DoorPageAccess {
 
 extension AppToolExecutor {
     /// A door-only page has no screen: it is a group of the door's actions. It reads as its summary, the actions registered on it and, for
-    /// a page whose access the person sets on Trust, the Trust page's own rows for it (`integration.<page>.*`), as Trust draws them.
-    /// Trust's words for a face that did not draw stand in for those rows; a page Trust draws no row for says so.
+    /// a page whose access the person sets on Trust, the Trust page's own row for it (`integration.<page>`, its `.read` and `.write`
+    /// switches inline), as Trust draws it. Trust's words for a face that did not draw stand in for that row; a page Trust draws no row
+    /// for says so.
     @MainActor public static func doorPageRead(_ page: QuietToolPage, access: DoorPageAccess, turn: Turn?) -> [JSONValue] {
         func section(_ heading: String, _ lines: [String]) -> JSONValue {
             .object(["heading": .string(heading), "lines": .array(lines.map(JSONValue.string))])
@@ -33,8 +34,8 @@ extension AppToolExecutor {
         }
         guard case .trust(let trust) = access else { return content }
         guard let snapshot = trust else { return content + [section("Access in Trust", ["Trust has not published its page."])] }
-        let prefix = "integration." + page.id + "."
-        let rows = ((snapshot.levers ?? []) + (snapshot.drawnFace?.sections ?? [])).flatMap(\.rows).filter { $0.id.hasPrefix(prefix) }
+        // The app's own row, `integration.<page>`, holds its Read and Write switches inline.
+        let rows = ((snapshot.levers ?? []) + (snapshot.drawnFace?.sections ?? [])).flatMap(\.rows).filter { $0.id == "integration." + page.id }
         func lines(_ words: String) -> [String] { words.components(separatedBy: "\n").filter { !$0.isEmpty } }
         if snapshot.drawnFace == nil, rows.isEmpty {
             return content + [section("Access in Trust", lines(snapshot.text(title: "Trust", door: true)))]

@@ -56,7 +56,7 @@ extension MacFourVerbs {
             let name = Self.string(Self.object(output["app"])["name"]) ?? "The app"
             return MacFourVerbsReply(
                 ok: true,
-                text: "\(name)'s menus, read without opening anything (press one with app mac.menu_press, or menu_press where that is your tool)"
+                text: "\(name)'s menus, read without opening anything (press one with app mac.menu_press, or menu_press where you call it directly)"
                     + (output["enabled_state"] != nil ? "; which are greyed out is unknown until it's in front" : "")
                     + ":\n"
                     + rows.joined(separator: "\n"),

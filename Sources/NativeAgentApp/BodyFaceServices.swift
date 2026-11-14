@@ -1,4 +1,5 @@
 import AppKit
+import AuthoredCapabilities
 import BackgroundLoops
 import ChatTurnRuntime
 import ChatToolParsing
@@ -126,30 +127,50 @@ final class BodyFaceServices {
     }
 
     private func desk(_ request: DeskCommandRequest) async throws -> PartFace.Value {
-        guard let handle = request.handle else { throw Self.failure("desk_item_required", "Choose a Desk item for this command.") }
+        guard let asked = request.handle else { throw Self.failure("desk_item_required", "Choose a Desk item for this command.") }
         switch request.command {
         case "validate":
             guard request.arguments.isEmpty else { throw Self.failure("desk_command_invalid", "Reading a Desk item takes only its handle.") }
-            guard try await engine.desk.store.liveState().items.contains(where: { $0.handle == handle }) else {
-                throw Self.failure("desk_item_missing", "No Desk item has this handle.")
-            }
+            _ = try await deskItem(asked)
             return .string("The Desk item is present.")
         case "make_again":
+            // Its subject is a Make reference, not a Desk item.
             guard case .string(let version)? = request.arguments["version"], request.arguments.count == 1 else {
                 throw Self.failure("make_version_required", "Choose the image version to make again.")
             }
-            let prompt = try await Self.imagePrompt(handle, version: version, root: engine.dataRoot)
+            let prompt = try await Self.imagePrompt(asked, version: version, root: engine.dataRoot)
             let value = try await DeskToolDispatchRouter(dataRoot: engine.dataRoot).run(tool: "image_generate",
-                input: ["prompt": .string(prompt), "__make_ref": .string(handle)])
+                input: ["prompt": .string(prompt), "__make_ref": .string(asked)])
             try Self.requireSuccess(value, action: "make_again")
             return .string("Image made.")
-        case "close", "defer", "note": return try await paletteCommand(request, handle: handle)
+        case "save_sheet":
+            // Its subject is a Make reference: the person changed a table drawn from one version, and their own tap lays the whole table
+            // as that version's successor (`make.add`, recorded as the person's edit of it).
+            guard case .string(let from)? = request.arguments["version"], let edited = Int(from),
+                  case .string(let name)? = request.arguments["name"], case .string(let content)? = request.arguments["content"],
+                  request.arguments.count == 3 else {
+                throw Self.failure("sheet_save_invalid", "A table is saved whole, with its file name and the version it was changed from.")
+            }
+            try await Self.checkSheetSave(asked, edited: edited, name: name, content: content, root: engine.dataRoot)
+            let call = PartFace.Call("make.add", ["ref": .string(asked), "name": .string(name), "content": .string(content)])
+            let outcome = try await engine.tools.personTap(call, PartFaces.Tap(page: "make", row: asked, action: "make.add", door: "mac",
+                device: nil, chat: nil, decided: true), personEditOf: edited)
+            if let failure = outcome.failure { throw failure }
+            guard !outcome.unresolved else {
+                throw Self.failure("sheet_save_unconfirmed", "I can't confirm the table was saved. Look at its versions in Make before saving again.",
+                                   effects: .unknown)
+            }
+            return .string("Saved as a new version.")
+        case "close", "defer", "note": return try await paletteCommand(request, handle: try await deskItem(asked))
         case "select":
-            engine.desk.faceItem = handle
+            // "board" is the page's own name for no item: the open item is let go, as its Back to the board does.
+            engine.desk.faceItem = asked == "board" ? nil : try await deskItem(asked)
             _ = await engine.desk.refreshPage()
             return .string("Desk item selected.")
         case "open":
-            if let opening = try await engine.deskOpening(item: handle) {
+            // The page's own command identifiers (new-task, find-item, research, board, note:, reply:, copy:, execution:) open what they name;
+            // anything else names a Desk item.
+            if let opening = try await engine.deskOpening(item: asked) {
                 switch opening {
                 case .show(let item): engine.desk.faceItem = item
                 case .request(let presentation):
@@ -171,12 +192,24 @@ final class BodyFaceServices {
                     default: throw FaceWireError.invalidFeedOrder
                     }
                 }
-            } else { engine.desk.faceItem = handle }
+            } else { engine.desk.faceItem = try await deskItem(asked) }
             _ = await engine.desk.refreshPage()
             return .string("Desk item opened.")
         default:
             throw Self.failure("desk_command_owner_unmounted", "This Desk command has no mounted body owner.")
         }
+    }
+
+    /// A Desk item's handle from its name, read as every Desk call reads one (`DeskState.matching`): its handle, desk.4, 4, #4 or its exact title.
+    private func deskItem(_ asked: String) async throws -> String {
+        let state = try await engine.desk.store.liveState()
+        let found: DeskItem?
+        do { found = try state.matching(asked).first }
+        catch { throw Self.failure("desk_item_ambiguous", error.localizedDescription) }
+        guard let handle = found?.handle else {
+            throw Self.failure("desk_item_missing", "No Desk item is named \(asked). Name it as desk.read does: desk.<number>, its handle or its exact title.")
+        }
+        return handle
     }
 
     private func paletteCommand(_ request: DeskCommandRequest, handle: String) async throws -> PartFace.Value {
@@ -230,6 +263,28 @@ final class BodyFaceServices {
             }
             throw WireFailure(code: action + "_" + result.outcome.rawValue, message: "The action reported: " + result.outcome.receipt.label,
                 cause: try NativeAppSecretRedactor.redactArguments(value).serialize(pretty: true), effects: effects)
+        }
+    }
+
+    /// The window says what the person changed; the body decides what that may lay. The version they changed is a table (CSV or TSV) of an
+    /// existing ref, the new words are a file of that same type, and they fit make.add's own limit. Anything else writes nothing.
+    @concurrent private static func checkSheetSave(_ reference: String, edited: Int, name: String, content: String, root: URL) async throws {
+        let studio = MakeStudio(dataRoot: root)
+        guard MakeStudio.isRef(reference), let meta = try studio.readMeta(reference) else {
+            throw failure("sheet_ref_missing", "No Make ref is called \(reference). Nothing was saved.")
+        }
+        guard let version = meta.versions.first(where: { $0.n == edited }) else {
+            throw failure("sheet_version_missing", "\(reference) has no version \(edited). Nothing was saved.")
+        }
+        let type = studio.url(reference, version).pathExtension.lowercased()
+        guard SheetTable.delimiter(type: type) != nil else {
+            throw failure("sheet_not_a_table", "Version \(edited) of \(reference) is not a table, so no table is saved as its next version. Nothing was saved.")
+        }
+        guard (name as NSString).lastPathComponent == name, (name as NSString).pathExtension.lowercased() == type else {
+            throw failure("sheet_type_changed", "A table changed from a .\(type) version is saved as .\(type). Nothing was saved.")
+        }
+        guard content.utf8.count <= MakePreviewFace.wordsLimit else {
+            throw failure("sheet_too_large", "This table is over 2 MB, too large to save from here. Nothing was saved.")
         }
     }
 

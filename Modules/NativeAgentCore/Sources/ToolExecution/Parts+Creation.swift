@@ -13,7 +13,7 @@ import Privacy
 
 extension Parts {
     static let descriptionLimit = 500
-    /// A trial's or setting aside's why: trimmed, then refused past this many characters so the stored words are exactly the agent's.
+    /// A save's why is trimmed and bounded without shortening the agent's words.
     static let whyLimit = 500
     static let parameterNamePattern = "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
     static let parameterTypes = ["string": "string", "int": "int", "integer": "int", "number": "number",
@@ -122,15 +122,18 @@ extension Parts {
         // A phase this save never ran is absent from its timing, never a zero.
         var validateMS: Double?, proofMS: Double?
         var descriptionNote: String?
+        var whyNote: String?
         func milliseconds(since start: ContinuousClock.Instant) -> Double {
             let elapsed = start.duration(to: .now).components
             return Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15
         }
         func timed(_ receipt: [String: JSONValue]) -> [String: JSONValue] {
             var receipt = receipt
-            if let descriptionNote {
-                receipt["description_note"] = .string(descriptionNote)
-                receipt["detail"] = .string((Self.string(receipt, "detail").map { $0 + " " } ?? "") + descriptionNote + ".")
+            for (key, note) in [("description_note", descriptionNote), ("why_note", whyNote)] {
+                if let note {
+                    receipt[key] = .string(note)
+                    receipt["detail"] = .string((Self.string(receipt, "detail").map { $0 + " " } ?? "") + note + ".")
+                }
             }
             var timing: [String: JSONValue] = ["write_ms": .double(max(0, milliseconds(since: started) - (validateMS ?? 0) - (proofMS ?? 0)))]
             timing["validate_ms"] = validateMS.map(JSONValue.double)
@@ -171,11 +174,13 @@ extension Parts {
         guard !(trial && settingAside) else { throw refuse("Send trial or set_aside, not both.") }
         var why: String?
         if input["why"] != nil {
-            guard trial || settingAside else { throw refuse("why belongs to a trial or a setting aside; send it with trial: true or set_aside: true.") }
             let text = (Self.string(input, "why") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { throw refuse("why is nonempty text after trimming.") }
             guard text.count <= Self.whyLimit else { throw refuse("why is at most \(Self.whyLimit) characters after trimming; this one has \(text.count).") }
             why = text
+            if !trial && !settingAside {
+                whyNote = "The reason was not kept because only trials and setting a trial aside have a saved reason record"
+            }
         }
         // The stem's own record decides whether a trial is open, read unredacted, after any trial whose version left both slots is closed.
         if trial || settingAside { try abilities.changeTrial(id: id, .reconcile(by: "stem"), turn: invocation.execution.turn) }
@@ -257,7 +262,7 @@ extension Parts {
             declared = try Self.declaredStrings(given, name: "actions").map { spelled in
                 guard let action = Self.dependencyID(spelled) else {
                     throw refuse("""
-                        actions entry \"\(spelled)\" is not an app action id. Use a current dotted action id; app's own \
+                        actions entry \"\(spelled)\" is not an app action id. Use a current action id; app's own \
                         read/find/log/step/decide/expect/expect_fail verbs need no declaration.
                         """)
                 }
@@ -318,7 +323,8 @@ extension Parts {
             }
         }
         let candidate = try OwnedProgramStore.Candidate(
-            program: OwnedProgram(kind: .part, id: id, version: "candidate", source: source, entry: .run, schema: schema,
+            program: OwnedProgram(kind: .part, id: id, version: "candidate", source: source,
+                                  entry: AbilityStore.answersCalls(source, header: part) ? .run : .face, schema: schema,
                                   dependencies: actions, permissions: permissions, resident: part["resident"] == .bool(true)),
             manifest: .object(manifest), fixtures: fixtures, dependencyShapes: shapes,
             prior: OwnedProgramStore.selection(existing.map(JSONValue.object)))
@@ -368,8 +374,13 @@ extension Parts {
                     receipt["trial"] = closed
                 }
                 receipt["status"] = .string("kept"); receipt["ability_status"] = .string("active")
-                receipt["next_call"] = .object(["action": .string("authored." + id), "args": .object([:])])
-                receipt["detail"] = .string("\(name) is kept and on: run it as authored.\(id); its first real run is its proof.")
+                if candidate.program.entry == .run {
+                    receipt["next_call"] = .object(["action": .string("authored." + id), "args": .object([:])])
+                    receipt["detail"] = .string("\(name) is kept and on: run it as authored.\(id); its first real run is its proof.")
+                } else {
+                    receipt["next_call"] = .object(["action": .string("ability.read"), "args": .object(["id": .string(id)])])
+                    receipt["detail"] = .string("\(name) is kept and on. It is a page, drawn by face(input), never called; it defines no run(input).")
+                }
                 return timed(receipt)
             }
             receipt["ability_status"] = try row(id)?["status"] ?? .null
@@ -664,12 +675,13 @@ extension Parts {
         return ["type": .string((declaredType ?? "string") + (optional ? "?" : "")), "description": .string(description)]
     }
 
-    /// Runner verbs and malformed references cannot become action IDs.
+    /// Runner verbs and malformed references cannot become action IDs; a bare action id (undo) can, as its member form app.undo() does.
     public static func dependencyID(_ spelled: String) -> String? {
         let id = spelled.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if id == "find" { return id }
         let bare = id.hasPrefix("app.") ? String(id.dropFirst(4)) : id
-        return !OwnedProgram.verbs.contains(bare) && id.range(of: "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$", options: .regularExpression) != nil ? id : nil
+        guard !OwnedProgram.verbs.contains(bare), !["app", "call"].contains(bare) else { return nil }
+        return id.range(of: "^[a-z0-9_-]+(\\.[a-z0-9_-]+)*$", options: .regularExpression) != nil ? id : nil
     }
 
 }

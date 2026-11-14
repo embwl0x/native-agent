@@ -48,12 +48,12 @@ public struct FaceView: View {
     }
 
     public init(snapshot: PartFaceSnapshot, title: String, header: Bool = true, door: any FaceDoor, session: FacePageSession,
-                retaining: Bool = true) {
+                retaining: Bool = true, leaf: ((PartFace.Block) -> AnyView)? = nil) {
         let drawn = snapshot.drawnFace
         let face = drawn ?? PartFace(sections: [])
         self.init(face: header ? face : PartFace(sections: face.sections, detail: face.detail), levers: snapshot.levers ?? [],
                   words: drawn == nil ? snapshot.error?.message ?? title + " is " + snapshot.status.rawValue + "." : nil,
-                  keyed: drawn == nil ? snapshot.keyLevers ?? [] : [], door: door, session: session, retaining: retaining)
+                  keyed: drawn == nil ? snapshot.keyLevers ?? [] : [], door: door, session: session, retaining: retaining, leaf: leaf)
     }
 
     #if os(iOS)
@@ -202,12 +202,25 @@ public struct FaceView: View {
         sectionViews(shown(face.sections, scope: "face"))
     }
 
-    private func sectionViews(_ sections: [PartFace.Section]) -> some View {
-        ForEach(sections) { section in
-            FaceSectionView(section: filtered(section), door: adapter, session: session, focus: $focus, move: move, leaf: leaf,
-                            collection: collectionSources.first { section.id == "face:" + $0.id
-                                || section.id == "keyed:" + $0.id || section.id == "levers:" + $0.id })
+    /// A list draws its sections one under another; anywhere else, consecutive sections that share `beside` stand side by side.
+    @ViewBuilder private func sectionViews(_ sections: [PartFace.Section]) -> some View {
+        if inList {
+            ForEach(sections) { sectionView($0) }
+        } else {
+            ForEach(FaceColumnRun.runs(sections)) { run in
+                if run.sections.count > 1 {
+                    FaceColumns(spacing: NativeAgentSpacing.section) { ForEach(run.sections) { sectionView($0) } }
+                } else {
+                    ForEach(run.sections) { sectionView($0) }
+                }
+            }
         }
+    }
+
+    private func sectionView(_ section: PartFace.Section) -> some View {
+        FaceSectionView(section: filtered(section), door: adapter, session: session, focus: $focus, move: move, leaf: leaf,
+                        collection: collectionSources.first { section.id == "face:" + $0.id
+                            || section.id == "keyed:" + $0.id || section.id == "levers:" + $0.id })
     }
 
     private func move(_ item: FaceItemID, _ direction: Int) {
@@ -247,6 +260,64 @@ enum FaceTime {
         guard let date = UserDisplayFormatters.parseISOTimestamp(iso) else { return nil }
         return Calendar.current.isDateInToday(date) ? date.formatted(date: .omitted, time: .shortened)
             : date.formatted(.dateTime.month(.abbreviated).day())
+    }
+}
+
+/// Sections drawn together: one alone, or consecutive sections that name the same `beside`.
+struct FaceColumnRun: Identifiable {
+    let id: String
+    let sections: [PartFace.Section]
+
+    static func runs(_ sections: [PartFace.Section]) -> [FaceColumnRun] {
+        var groups: [[PartFace.Section]] = []
+        for section in sections {
+            if let beside = section.beside, var last = groups.popLast() {
+                if last.last?.beside == beside { last.append(section); groups.append(last) }
+                else { groups.append(last); groups.append([section]) }
+            } else { groups.append([section]) }
+        }
+        return groups.compactMap { group in group.first.map { FaceColumnRun(id: $0.id, sections: group) } }
+    }
+}
+
+/// Columns of equal width, as many to a line as stay readable: all of them in one row on a wide page, one under another where the width
+/// holds fewer than two.
+struct FaceColumns: Layout {
+    var spacing: CGFloat
+    /// The narrowest a column reads well at: a row's title with its detail beside it.
+    static let readable: CGFloat = 260
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let width = proposal.width, width.isFinite else {
+            // Asked for its ideal size, the run is as wide as its widest column and as tall as its columns stacked.
+            let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+            let gaps = spacing * CGFloat(max(0, sizes.count - 1))
+            return CGSize(width: sizes.map(\.width).max() ?? 0, height: sizes.map(\.height).reduce(0, +) + gaps)
+        }
+        return CGSize(width: width, height: frames(width, subviews).map(\.maxY).max() ?? 0)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for (view, frame) in zip(subviews, frames(bounds.width, subviews)) {
+            view.place(at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY), anchor: .topLeading,
+                       proposal: ProposedViewSize(width: frame.width, height: frame.height))
+        }
+    }
+
+    private func frames(_ width: CGFloat, _ subviews: Subviews) -> [CGRect] {
+        let room = width.isFinite ? ((width + spacing) / (Self.readable + spacing)).rounded(.down) : 1
+        let across = Int(min(CGFloat(max(1, subviews.count)), max(1, room)))
+        let column = max(0, (width - spacing * CGFloat(across - 1)) / CGFloat(across))
+        var frames: [CGRect] = []
+        var y: CGFloat = 0, tallest: CGFloat = 0
+        for (index, view) in subviews.enumerated() {
+            let place = index % across
+            if place == 0, index > 0 { y += tallest + spacing; tallest = 0 }
+            let height = view.sizeThatFits(ProposedViewSize(width: column, height: nil)).height
+            frames.append(CGRect(x: CGFloat(place) * (column + spacing), y: y, width: column, height: height))
+            tallest = max(tallest, height)
+        }
+        return frames
     }
 }
 

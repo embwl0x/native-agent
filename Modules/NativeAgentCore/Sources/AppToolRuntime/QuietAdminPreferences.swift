@@ -43,11 +43,8 @@ extension SimpleViewMode {
         catch { return "unavailable" }
     }
 
-    /// Simple has no sidebar pages to navigate to.
+    /// Whether Simple is the window's view; Simple shows no conversation list.
     public static var isShowing: Bool { current == simple }
-    public static let noPagesNote = """
-        Simple view is on screen and has no pages: this switches it to Advanced, so use it only when asked to see a page; otherwise say where it is.
-        """
 
     /// Persist the first-launch default only while no preference exists.
     public static func settle(_ defaults: UserDefaults = .standard) {

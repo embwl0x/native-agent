@@ -8,12 +8,23 @@ extension PartFace {
     public static func decode(_ value: JSONValue, documentRead: Bool = false) throws -> PartFace {
         func object(_ value: JSONValue, keys: Set<String>) throws -> [String: JSONValue] {
             guard case .object(let fields) = value, Set(fields.keys).isSubset(of: keys) else {
-                throw PartCallError(code: "bad_face", message: "A face holds title, line, detail and sections; a section id, title, style, footer, rows, "
-                    + "folded, more and filter; a section may hold a document, form or leaf block instead of rows; a row id, title, detail, value, at, "
-                    + "symbol, tone, open, actions, control, rows and expands; "
+                throw PartCallError(code: "bad_face", message: "A face holds title, line, detail, opened and sections; a section id, title, style, "
+                    + "footer, rows, folded, beside, more and filter; a section may hold a document, form or leaf block instead of rows; "
+                    + "a row id, title, detail, value, at, symbol, tone, open, actions, control, rows, expands and meter; a meter value, max and start; "
                     + "an action id, label, role and unavailable.")
             }
             return fields
+        }
+        func finite(_ value: JSONValue?, _ what: String) throws -> Double? {
+            guard let value else { return nil }
+            let result: Double
+            switch value {
+            case .int(let value): result = Double(value)
+            case .double(let value): result = value
+            default: throw PartCallError(code: "bad_face", message: "\(what) is a finite number.")
+            }
+            guard result.isFinite else { throw PartCallError(code: "bad_face", message: "\(what) is a finite number.") }
+            return result
         }
         func list(_ value: JSONValue?, at most: Int, _ what: String) throws -> [JSONValue] {
             guard let value else { return [] }
@@ -33,7 +44,7 @@ extension PartFace {
                     throw PartCallError(code: "bad_face", message: "A section holds at most 256 rows including nested rows; use more for a continuation.")
                 }
                 let fields = try object(row, keys: ["id", "title", "detail", "value", "at", "symbol", "tone", "open", "actions", "control",
-                                                    "rows", "expands"])
+                                                    "rows", "inline", "expands", "meter"])
                 guard case .string(let id)? = fields["id"], !id.isEmpty, ids.insert(id).inserted else {
                     throw PartCallError(code: "bad_face", message: "Row ids are nonempty and unique within their section, including nested rows.")
                 }
@@ -42,6 +53,9 @@ extension PartFace {
                 }
                 if let expands = fields["expands"], expands != .bool(true), expands != .bool(false) {
                     throw PartCallError(code: "bad_face", message: "A row's expands is a Boolean.")
+                }
+                if let inline = fields["inline"], inline != .bool(true), inline != .bool(false) {
+                    throw PartCallError(code: "bad_face", message: "A row's inline is a Boolean: true draws its rows as named controls on its own line.")
                 }
                 for action in try list(fields["actions"], at: 4, "row actions") {
                     let fields = try object(action, keys: ["id", "label", "role", "unavailable"])
@@ -56,19 +70,7 @@ extension PartFace {
                     for option in try list(fields["options"], at: 32, "control options") { _ = try object(option, keys: ["id", "label"]) }
                     if let number = fields["number"] {
                         let bounds = try object(number, keys: ["value", "min", "max", "step"])
-                        func numeric(_ key: String) throws -> Double? {
-                            guard let value = bounds[key] else { return nil }
-                            let result: Double
-                            switch value {
-                            case .int(let value): result = Double(value)
-                            case .double(let value): result = value
-                            default: throw PartCallError(code: "bad_face", message: "A number control's \(key) is a finite number.")
-                            }
-                            guard result.isFinite else {
-                                throw PartCallError(code: "bad_face", message: "A number control's \(key) is a finite number.")
-                            }
-                            return result
-                        }
+                        func numeric(_ key: String) throws -> Double? { try finite(bounds[key], "A number control's \(key)") }
                         guard let value = try numeric("value") else {
                             throw PartCallError(code: "bad_face", message: "A number control has a value.")
                         }
@@ -88,10 +90,30 @@ extension PartFace {
                         throw PartCallError(code: "bad_face", message: "A control holds exactly one switch, choice, text, number or date value.")
                     }
                 }
+                // A meter is drawn as value out of max, from start (PartFace.Row.Meter); its words stay in the row's value.
+                if let meter = fields["meter"] {
+                    let bar = try object(meter, keys: ["value", "max", "start"])
+                    guard let value = try finite(bar["value"], "A meter's value"), let whole = try finite(bar["max"], "A meter's max") else {
+                        throw PartCallError(code: "bad_face", message: "A meter has a value and a max.")
+                    }
+                    let start = try finite(bar["start"], "A meter's start") ?? 0
+                    guard whole > 0, value >= 0, value <= whole, start >= 0, start <= whole else {
+                        throw PartCallError(code: "bad_face", message: "A meter's max is above 0, and its value and start lie between 0 and its max.")
+                    }
+                }
                 try rows(fields["rows"], depth: depth + 1, count: &count, ids: &ids)
             }
         }
-        let fields = try object(value, keys: ["title", "line", "sections", "detail"])
+        let fields = try object(value, keys: ["title", "line", "sections", "detail", "opened"])
+        if let opened = fields["opened"] {
+            guard case .object(let held) = opened, Set(held.keys) == ["link", "title"],
+                  case .string(let link)? = held["link"], case .page? = FaceLink(link),
+                  case .string(let title)? = held["title"], !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !title.contains(where: \.isNewline) else {
+                throw PartCallError(code: "bad_face", message: "A face's opened says what the page has open now: exactly a page link (such as "
+                    + "page:desk/<item>) and a one-line nonempty title in the person's words.")
+            }
+        }
         if let detail = fields["detail"] {
             let fields = try object(detail, keys: ["of"])
             guard case .string(let id)? = fields["of"], !id.isEmpty else {
@@ -100,7 +122,8 @@ extension PartFace {
         }
         guard fields["sections"] != nil else { throw PartCallError(code: "bad_face", message: "A face has sections.") }
         for section in try list(fields["sections"], at: 64, "sections") {
-            let fields = try object(section, keys: ["id", "title", "style", "footer", "rows", "folded", "block", "more", "filter", "revision"])
+            let fields = try object(section, keys: ["id", "title", "style", "footer", "rows", "folded", "block", "more", "filter", "revision",
+                                                    "beside"])
             if let block = fields["block"] {
                 guard fields["rows"] == nil else {
                     throw PartCallError(code: "bad_face", message: "A section holds rows or a block, never both.")
@@ -124,6 +147,9 @@ extension PartFace {
                 }
                 if let copy = block["copy"], copy != .bool(true), copy != .bool(false) {
                     throw PartCallError(code: "bad_face", message: "A document's copy is a Boolean.")
+                }
+                if let revision = block["revision"], revision.stringValue == nil {
+                    throw PartCallError(code: "bad_face", message: "A block's revision is a string.")
                 }
                 if kind == "leaf" {
                     guard case .string(let leaf)? = block["leaf"], !leaf.isEmpty,
@@ -195,13 +221,13 @@ extension PartFace {
                             throw PartCallError(code: "bad_face", message: "A form's doors are nonempty door names.")
                         }
                     }
-                    if let revision = block["revision"], revision.stringValue == nil {
-                        throw PartCallError(code: "bad_face", message: "A form's revision is a string.")
-                    }
                 }
             }
             guard fields["folded"] == nil || fields["folded"] == .bool(true) || fields["folded"] == .bool(false) else {
                 throw PartCallError(code: "bad_face", message: "A section's folded is a Boolean.")
+            }
+            if let beside = fields["beside"], beside.stringValue?.isEmpty != false {
+                throw PartCallError(code: "bad_face", message: "A section's beside is a nonempty string its column neighbours share.")
             }
             var count = 0
             var ids: Set<String> = []

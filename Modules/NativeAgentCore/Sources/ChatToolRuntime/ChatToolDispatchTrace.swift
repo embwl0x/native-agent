@@ -241,7 +241,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                 sessionId: turn.resultRecoveryScope?.sessionId, turnId: turn.id,
                 originalResultClass: ToolResult(result).outcome, appDoor: true, inlineLimit: 500, includeSections: false)
         } catch {
-            return .init(content: "Tool result could not be encoded for retention: \(error.localizedDescription). Inspect its effect before repeating it.",
+            return .init(content: "The result could not be encoded for retention: \(error.localizedDescription). Inspect its effect before repeating it.",
                 recovery: nil, failed: true)
         }
     }

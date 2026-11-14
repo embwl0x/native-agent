@@ -144,10 +144,10 @@ extension ExperienceStore {
     }
 
     /// The distinct strings one JSON path holds across the committed details a query matches, where each `holding` path holds exactly that JSON
-    /// (`"\"end\""`, `"false"`) and each `lacking` path is absent. SQLite answers from the rows; none is decoded here. A store not yet written holds
-    /// none, and reading never initializes it.
+    /// (`"\"end\""`, `"false"`), each `lacking` path is absent and each `bearing` path holds text. SQLite answers from the rows; none is decoded
+    /// here. A store not yet written holds none, and reading never initializes it.
     public nonisolated func recordedDetailValues(_ query: DetailQuery, at value: String, holding: [String: String] = [:],
-                                                 lacking: [String] = []) throws -> [String] {
+                                                 lacking: [String] = [], bearing: [String] = []) throws -> [String] {
         guard let found = Self.conditions(query) else { return [] }
         do { _ = try FileManager.default.attributesOfItem(atPath: path.path) }
         catch CocoaError.fileReadNoSuchFile { return [] }
@@ -160,6 +160,10 @@ extension ExperienceStore {
         }
         for key in lacking {
             clauses.append("json_type(row, ?) IS NULL")
+            arguments += [key]
+        }
+        for key in bearing {
+            clauses.append("json_type(row, ?) = 'text'")
             arguments += [key]
         }
         let sql = "SELECT DISTINCT json_extract(row, ?) FROM detail WHERE " + clauses.joined(separator: " AND ")

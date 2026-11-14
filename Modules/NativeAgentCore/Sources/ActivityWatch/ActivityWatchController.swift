@@ -282,9 +282,21 @@ public final class ActivityWatchController {
                 return true
             }
             let wasAvailable = isPolicyAvailable
-            guard let safe = ActivityWatcher.safelyPolled(
-                loaded, current: policy, currentlyEnabled: policy.captureEnabled
-            ) else {
+            let admitted = ActivityWatcher.safelyPolled(loaded, current: policy, currentlyEnabled: policy.captureEnabled)
+            // Queries read the file, so it holds the policy in force: an outside edit this refused or trimmed is written back out of it.
+            let inForce = admitted ?? policy
+            if loaded != inForce {
+                do {
+                    let policyStore = policyStore
+                    try await Task.detached(priority: .utility) {
+                        // Only over the bytes this decision read: a newer outside edit is its own reload's to judge, never this one's to
+                        // overwrite (an outside disable must not be lost to an older trim).
+                        guard try policyStore.loadChecked() == loaded else { return }
+                        try policyStore.save(inForce)
+                    }.value
+                } catch { await recordIssue(errorMessage(error, "restore the activity policy in force"), severity: .critical) }
+            }
+            guard let safe = admitted else {
                 // A readable external enable is still not consent. Keep the
                 // existing choices and require a settings decision to enable.
                 policyAvailability = .available

@@ -568,10 +568,10 @@ public struct DeskTaskStart: Sendable {
 
 extension NativeAgentEngine {
     /// A Desk task starts a line of the agent's carrying that item; its ending wakes the agent's own work conversation, where the agent settles the item.
-    public static func submitDeskTask(title: String, objective: String, project: String = "Tasks",
+    public static func submitDeskTask(title: String, objective: String, project: String = DeskItem.tasksProject,
                                       dataRoot root: URL = PersistenceCore.defaultDataRoot()) async throws -> DeskTaskStart {
         let store = SwiftNativeDeskStore(dataRoot: root)
-        let item = try await store.createItem(kind: .project, project: project, title: String(title.prefix(160)),
+        let item = try await store.createItem(kind: DeskItem.tasksKind, project: project, title: String(title.prefix(160)),
             summary: String(objective.prefix(600)))
         let receipt = await AgentJobs.commission(["agent": .string(AgentJob.own), "brief": .string(objective), "desk": .string(item.handle)],
             session: nil, surface: "desk", ceiling: .denied(reason: "a Desk task starts a line of the agent's own, never another agent"),

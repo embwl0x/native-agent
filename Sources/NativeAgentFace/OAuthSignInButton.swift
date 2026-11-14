@@ -170,9 +170,10 @@ struct OAuthSignInButton: View {
         lastError = nil
         do {
             _ = try await appModel.committedFaceAct(.beginOAuth(provider: provider.id))
-        } catch is CancellationError {
-            lastError = "Sign-in cancelled."
-        } catch { lastError = error.localizedDescription }
+        } catch {
+            // The person pressing Cancel ends this task; the link then reports its own "stopped waiting" failure, which is not news to them.
+            lastError = Task.isCancelled || error is CancellationError ? "Sign-in cancelled." : error.localizedDescription
+        }
     }
 
     @MainActor

@@ -20,7 +20,7 @@ public enum StudioCanonSeatGate {
         public var spoken: String {
             switch self {
             case .notALiveTurn:
-                return "this did not come from a live chat turn — a bridge tool run, an "
+                return "this did not come from a live chat turn — a bridge call, an "
                     + "approval replay, or a background pass cannot decide the canon"
             case .untrustedPeer:
                 return "the owner must trust this peer before it can steer a canon decision"

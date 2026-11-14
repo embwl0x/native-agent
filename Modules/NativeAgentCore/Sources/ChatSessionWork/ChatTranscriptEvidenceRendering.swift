@@ -4,7 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Transcripts
-// Blueprint: | `ChatTranscriptEvidenceRendering.swift` | ChatTranscriptEvidenceRendering owner. |
+// Blueprint: | `ChatTranscriptEvidenceRendering.swift` | Persisted receipt evidence for history; a script's calls read as metadata, never raw results |
 
 /// Present only persisted evidence, shared by history and recall; no fetch, storage, permission decision or model call belongs here.
 package enum ChatTranscriptEvidenceRendering {
@@ -98,44 +98,21 @@ package enum ChatTranscriptEvidenceRendering {
                 }
             }
             if call == "app script", case .array(let calls)? = fields["calls"] {
+                // A script's calls read as their identity and outcome; what a call answered is the script's to return. A row stored
+                // with its raw result is reduced to that result's size and digest first.
                 var ops: [JSONValue] = []
-                var results: [Int: JSONValue] = [:]
                 var omittedOps = 0
                 for row in calls {
-                    guard case .object(let fields) = row else { omittedOps += 1; continue }
-                    var op: [String: JSONValue] = [:]
-                    for key in ["n", "call", "status", "effects", "changed", "ids", "version", "result_bytes", "reason"] {
-                        if let value = fields[key] { op[key] = value }
-                    }
-                    if let result = fields["result"] {
-                        do { op["result_bytes"] = .int(Int64(try result.serializedData(pretty: false).count)) }
-                        catch { op["result_bytes"] = .null; op["result_encoding_error"] = .string(
-                            "Retained result cannot be encoded: \(error.localizedDescription)") }
-                    }
-                    // Only the ledger's result envelope supplies a returned id.
-                    if case .object(let result)? = fields["result"],
-                       result["status"] != nil || result["effects"] != nil || result["receipt"] != nil,
-                       let id = returnedIdentifier(.object(result)) {
-                        op["id"] = .string(id)
+                    guard case .object(let fields) = CallLedger.published(row) else { omittedOps += 1; continue }
+                    let op = fields.filter {
+                        ["n", "call", "status", "effects", "changed", "ids", "version", "result_bytes", "result_digest", "reason"].contains($0.key)
                     }
                     let candidate = JSONValue.array(ops + [.object(op)])
                     guard let encoded = try? candidate.serialize(pretty: false), encoded.count <= 3_000 else {
                         omittedOps += 1
                         continue
                     }
-                    if let result = fields["result"] { results[ops.count] = result }
                     ops.append(.object(op))
-                }
-                // Reserve every retained row's facts before optional bodies.
-                for index in ops.indices {
-                    guard let result = results[index], case .object(var op) = ops[index] else { continue }
-                    op["result"] = result
-                    op.removeValue(forKey: "result_bytes")
-                    var candidate = ops
-                    candidate[index] = .object(op)
-                    if let encoded = try? JSONValue.array(candidate).serialize(pretty: false), encoded.count <= 3_000 {
-                        ops = candidate
-                    }
                 }
                 keep("ops", .array(ops), limit: 3_000)
                 if omittedOps > 0 { evidence["ops_omitted"] = .int(Int64(omittedOps)) }
@@ -167,6 +144,10 @@ package enum ChatTranscriptEvidenceRendering {
         }
         var fields = fields
         fields.removeValue(forKey: "undo")
+        // Evidence saved before receipts kept only metadata may hold a call's small raw result; it leaves as that result's size and digest.
+        if case .array(let ops)? = fields["ops"] {
+            fields["ops"] = .array(ops.map { op in op.objectValue.map { JSONValue.object(CallLedger.withoutResult($0)) } ?? op })
+        }
         for key in ["ops", "returned"] {
             if let value = fields[key] { fields[key] = withoutUndoCue(value) }
         }
@@ -189,10 +170,8 @@ package enum ChatTranscriptEvidenceRendering {
             fields["source_boundary"] = names.isEmpty ? nil : .bool(true)
             return fields
         }
-        let hasResults = if case .array(let ops)? = fields["ops"] {
-            ops.contains { if case .object(let op) = $0 { return op["result"] != nil } else { return false } }
-        } else { false }
-        guard hasResults || (fields["returned"] != nil && fields["returned"] != .null) else { return fields }
+        // Ops carry no call's answer, so only the script's own return can carry untrusted text.
+        guard fields["returned"] != nil && fields["returned"] != .null else { return fields }
         fields["untrusted_remote_data"] = .bool(true)
         if fields["agent"] == nil { fields["agent"] = .string("historical script output (source not attested)") }
         fields["source_boundary"] = .string(
@@ -208,14 +187,6 @@ package enum ChatTranscriptEvidenceRendering {
         var omitted: [JSONValue] = if case .array(let list)? = fields["fields_omitted"] { list } else { [] }
         for key in ["returned", "ops", "next", "changed", "landed", "id", "effects"] {
             if receiptValue(.object(fields)).count <= maximumCharacters { break }
-            if key == "ops", case .array(let ops)? = fields[key] {
-                fields[key] = .array(ops.map { op in
-                    guard case .object(var facts) = op, facts.removeValue(forKey: "result") != nil else { return op }
-                    facts["fields_omitted"] = .array([.string("result")])
-                    return .object(facts)
-                })
-                if receiptValue(.object(fields)).count <= maximumCharacters { break }
-            }
             if fields.removeValue(forKey: key) != nil {
                 omitted.append(.string(key))
                 fields["fields_omitted"] = .array(omitted)
@@ -397,10 +368,12 @@ package enum ChatTranscriptEvidenceRendering {
         return markers.joined(separator: " ") + " " + content
     }
 
-    package static func contentIncludingAttachments(_ content: String, attachments: JSONValue?) -> String {
+    /// Words that already carry their attachments' text (the exact sent words hold each voice note's evidence) gain only the marker.
+    package static func contentIncludingAttachments(_ content: String, attachments: JSONValue?,
+                                                    wordsCarryAttachmentText: Bool = false) -> String {
         let marker = attachmentMarker(attachments)
         var parts = [marker.map { content.isEmpty ? $0 : "\($0) \(content)" } ?? content]
-        if case .array(let rows)? = attachments {
+        if !wordsCarryAttachmentText, case .array(let rows)? = attachments {
             for row in rows {
                 guard case .object(let item) = row, let evidence = item["utterance"] else { continue }
                 do {

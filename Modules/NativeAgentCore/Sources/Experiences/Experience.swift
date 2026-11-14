@@ -150,6 +150,12 @@ public actor ExperienceStore {
             if let born = try String.fetchOne(db, sql: "SELECT born FROM experience WHERE id = ?", arguments: [new.id]) {
                 var existing = try Self.decoder.decode(Experience.self, from: Data(born.utf8))
                 var proposed = new
+                // One happening per key (`Happening.once`): a second post from the same door about the same subject, owed to the same place
+                // with the same authority, is that happening, whatever it read this time. What it carried the first time stands. A different
+                // door, subject, destination or authority under one key is a reused id, refused below so the change is never dropped unseen.
+                if let was = existing.happening, let now = proposed.happening,
+                   was.once == now.once, was.kind == now.kind, was.door == now.door, was.subject == now.subject, was.who == now.who,
+                   was.route == now.route, was.reply == now.reply, was.peers == now.peers, was.elevated == now.elevated { return nil }
                 (existing.at, proposed.at) = ("", "")
                 (existing.sequence, proposed.sequence) = (nil, nil)
                 guard existing == proposed else { throw LawError.reused(new.id) }

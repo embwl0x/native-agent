@@ -436,7 +436,7 @@ extension SwiftToolDispatcher {
         if workContextQuery != nil {
             response["selection_policy"] = .string("""
                 Prefer matching turns with recorded activity outside history lookup, newest within each tier; retain the newest matching context \
-                and one excerpt per known run. Tool activity is a retrieval hint, not proof of success. Ordinary history search remains \
+                and one excerpt per known run. Action activity is a retrieval hint, not proof of success. Ordinary history search remains \
                 available for every matching row.
                 """)
         }

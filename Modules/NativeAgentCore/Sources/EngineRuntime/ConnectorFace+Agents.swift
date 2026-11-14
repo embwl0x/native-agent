@@ -26,8 +26,9 @@ extension NativeAgentEngine {
     /// The contact owner's change signals beyond its files: a direct chat's transport reports a reply or a status change.
     static let agentFaceNotifications = [ChatGPTDotIPCTransport.didChange]
 
-    /// Reads the contact owner's doors and threads; offscreen and page reads never start discovery.
-    @concurrent func agentFaceSections() async -> [PartFace.Section] {
+    /// Reads the contact owner's doors, one connector row each with its unfinished setup behind it, and its conversations as their own
+    /// section; offscreen and page reads never start discovery.
+    @concurrent func agentFace() async -> (rows: [PartFace.Row], sections: [PartFace.Section]) {
         let root = dataRoot, owner = contacts
         let threads: [MobileAgentThread]?
         let threadsFailure: String?
@@ -52,11 +53,11 @@ extension NativeAgentEngine {
         if state.loaded && state.error == nil && primary.isEmpty {
             rows.append(.init(id: "agents.none", title: "No agent contacts or supported apps found on this Mac.", tone: .quiet))
         }
-        rows += primary.flatMap { agentDoorRows($0) }
+        rows += primary.map { agentDoorRow($0) }
         rows.append(.init(id: "agents.look", title: "Look for agents",
             detail: "Finds A2A cards, MCP settings and ACP programs on this Mac; it may run a program's --help or initialize.",
             symbol: "magnifyingglass", actions: [.init(id: "discover", label: "Look for agents", call: .init("agent.look"))]))
-        var sections: [PartFace.Section] = [.init(id: "agents", title: "Agents", style: .list, rows: rows)]
+        var sections: [PartFace.Section] = []
         if let threads {
             if !threads.isEmpty {
                 sections.append(.init(id: "agent-threads", title: "Agent conversations", style: .list, rows: threads.map { agentThreadRow($0) }))
@@ -65,12 +66,13 @@ extension NativeAgentEngine {
             sections.append(.init(id: "agent-threads", title: "Agent conversations", style: .list, rows: [.init(id: "agents.threads-error",
                 title: "Agent conversations could not be read", detail: threadsFailure, tone: .failed)]))
         }
-        return sections
+        return (rows, sections)
     }
 
-    private func agentDoorRows(_ row: AgentContactRow) -> [PartFace.Row] {
+    private func agentDoorRow(_ row: AgentContactRow) -> PartFace.Row {
         var detail = [row.route, row.status]
         if let contact = row.contact { detail.append("Trusted switch: " + (contact.elevationAllowed ? "on" : "off")) }
+        if row.contact?.readsDesk == true { detail.append("Reads my Desk") }
         if let last = row.lastExchange { detail.append("Last exchange · " + last) }
         if let at = row.contact?.provenInboundAt { detail.append("Received a message · " + at) }
         if let at = row.contact?.provenOutboundAt { detail.append("Sent a message · " + at) }
@@ -81,12 +83,11 @@ extension NativeAgentEngine {
             actions = row.repliesOnly ? [] : [PartFace.Action(id: "test", label: "Send a test message", doors: ["mac"], call: ask("test"))]
             actions.append(PartFace.Action(id: "disconnect", label: "Disconnect agent", doors: ["mac"], call: ask("disconnect")))
         }
-        var rows = [PartFace.Row(id: "agent:" + row.id, title: row.displayName, detail: detail.joined(separator: "\n"), value: row.pillWord,
-            symbol: "person.2", tone: row.state == .connected ? .live : nil, actions: actions)]
+        var setup: [PartFace.Row] = []
         // A Grok Bot routine finishes setup by reading its credentials natively; the credentials themselves never enter a face.
         if let contact = row.contact, contact.transport == .grokBot, ["creating", "secure-paste"].contains(contact.grokSetup ?? "") {
             let peer: [String: PartFace.Value] = ["agent": .string(contact.id)]
-            rows.append(.init(id: "agent-grok:" + contact.id, title: row.displayName + " · Routine credentials", detail: contact.grokSetup == "creating"
+            setup.append(.init(id: "agent-grok:" + contact.id, title: "Routine credentials", detail: contact.grokSetup == "creating"
                 ? """
                     Routine setup is not confirmed. Connect again to continue this contact's setup. If a request was already submitted, it will not be \
                     sent again; approve it in Grok Bot if asked.
@@ -96,13 +97,27 @@ extension NativeAgentEngine {
                                             .init(id: "paste", label: "Paste credentials securely", doors: ["mac"],
                                                   call: .init("agent.grok_paste", peer))]))
             if contact.grokConversation == nil {
-                rows.append(.init(id: "agent-grok-bot:" + contact.id, title: "Grok Bot name", detail: """
+                setup.append(.init(id: "agent-grok-bot:" + contact.id, title: "Grok Bot name", detail: """
                     Connect briefly brings Grok Bot forward to send the routine request. If the current Bot cannot be identified, enter its exact \
                     sidebar name here, then Connect again.
                     """, control: .field("", placeholder: "Bot name", call: .init("agent.grok_bot", peer))))
             }
         }
-        return rows
+        // A contact that calls the MCP tools with its own key can be brought to the table; the switch is the person's lever, its setting lower-only.
+        var table: [PartFace.Row] = []
+        if let contact = row.contact, contact.canReadTable {
+            let on = contact.readsDesk == true
+            let about = "At my table, \(row.displayName) reads my Desk and the pieces on it through its own connection. It changes nothing; it asks me."
+            table.append(.init(id: "agent-desk:" + contact.id, title: "Reads my Desk",
+                detail: contact.lastRead.map { about + "\nLast " + $0.words(desk: "my Desk") } ?? about,
+                control: .toggle(on, confirm: on ? nil : "Let \(row.displayName) read my Desk and the pieces on it?",
+                                 call: settingSetCall("agent.reads_desk_" + contact.id))))
+        }
+        // Unfinished setup sits behind the agent's row, which says it waits on the person.
+        let nested = setup + table
+        return .init(id: "agent:" + row.id, title: row.displayName, detail: detail.joined(separator: "\n"), value: row.pillWord,
+            symbol: "person.2", tone: row.state == .connected ? .live : setup.isEmpty ? nil : .attention, actions: actions,
+            rows: nested.isEmpty ? nil : nested)
     }
 
     /// A conversation is one row: its state, the person's send, and an open to its lines, which are a document read on demand.

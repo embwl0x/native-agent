@@ -202,7 +202,7 @@ public actor AppRelaunch {
                                 The last restart stamp (\(NativeTimestampFormat.plainZulu(last))) is in the future relative to now — cross-process \
                                 race or clock skew. Treating as cooling-down; refusing to restart.
                                 """
-                            : "A tool-initiated restart fired \(Int(elapsed))s ago; refusing to restart again within \(Int(cooldown))s."
+                            : "A restart called through app fired \(Int(elapsed))s ago; refusing to restart again within \(Int(cooldown))s."
                         return .object([
                             "status": .string("failed"),
                             "tool": .string("restart_app"),

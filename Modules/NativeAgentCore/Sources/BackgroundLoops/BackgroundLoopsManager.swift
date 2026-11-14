@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Synchronization
 // Blueprint: | `BackgroundLoopsManager.swift` | BackgroundLoopLifetimes registration, execution, status, resident observation and lifecycle settlement |
 
 // EngineRuntime composes registrations; this owner keeps their lifecycle, execution and status together.
@@ -61,6 +62,18 @@ public actor BackgroundLoopLifetimes {
         _ outcome: (@Sendable (_ loopId: String, _ error: String) async -> Void)?
     ) async {
         await scheduler.setFailureOutcome(outcome)
+    }
+
+    /// The app's one fact that setup has finished, so the agent exists. Until it is installed every pass may start.
+    private nonisolated let agentFact = Mutex<(@Sendable () -> Bool)?>(nil)
+
+    /// Install the fact before start: a pass that needs the agent is not started until it holds.
+    public nonisolated func admitAgentPasses(when agentExists: @escaping @Sendable () -> Bool) {
+        agentFact.withLock { $0 = agentExists }
+    }
+
+    nonisolated func agentExists() -> Bool {
+        agentFact.withLock { $0 }?() ?? true
     }
 
     public func setFailureRecoveryPush(
@@ -434,7 +447,8 @@ public actor BackgroundLoopLifetimes {
             clock: clock,
             onFinished: { [weak self] in
                 await self?.reschedulePhysiologyDeadline(loopId: loop.loopId)
-            }
+            },
+            agentExists: { [weak self] in self?.agentExists() ?? true }
         )
         registrations[loop.loopId] = .enabled(runner)
         if let physiology = loop as? any EventDeadlineLoopRunner {

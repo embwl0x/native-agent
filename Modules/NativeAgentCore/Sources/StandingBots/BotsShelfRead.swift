@@ -81,6 +81,8 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     public var statusWord: String {
         status.rawValue
     }
+    /// Whether the helper waits on the person: for their answer, their approval or their choice of model.
+    public var needsYou: Bool { [.waitingOnPerson, .waitingForApproval, .needsModelChoice].contains(status) }
     public var missedLine: String? {
         guard let missed else { return nil }
         return "Missed \(Self.metadataDate(missed.dueAt)) · \(missed.words)"

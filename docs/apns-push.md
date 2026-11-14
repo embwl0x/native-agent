@@ -54,11 +54,13 @@ token reads, provider rejections and unknown wake outcomes remain diagnostic
 ordinary notification fails at publication rather than claiming a Drive record
 will produce a CloudKit alert.
 
-Before transport, immutable title, body, userInfo and timestamp are retained in
-`notifications/publications/<eventId>.json` under a per-event lock (five-second
-acquisition limit). Retries send the retained publication itself, byte for byte
-(its title, body, userInfo and timestamp); an incoming attempt must match its
-words, and a requested result its settlement time. Retained bytes are preserved. Conflicting or
+Before transport, immutable title, subtitle (when the call gave one), body, userInfo and
+timestamp are retained in `notifications/publications/<eventId>.json` under a per-event
+lock (five-second acquisition limit). Retries send the retained publication itself, byte
+for byte (its title, subtitle, body, userInfo and timestamp); an incoming attempt must
+match its words, and a requested result its settlement time. CloudKit's alert names only
+title and body; the subtitle rides in the signed envelope's metadata and the phone's
+notification service extension draws it from the exact notified record. Retained bytes are preserved. Conflicting or
 unreadable publication state reports `notification_publication_unavailable`
 with its bytes preserved. Exact server replay proof re-signals the existing
 record rather than creating a second event, including when an already-published

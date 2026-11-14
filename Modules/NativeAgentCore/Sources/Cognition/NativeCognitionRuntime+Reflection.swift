@@ -150,6 +150,14 @@ extension NativeCognitionRuntime {
                 return Self.beatReflection(.failed(error: "the background work lease refused window \(window), but no claim on it was read"))
             }
             let opens = NativeTimestampFormat.plainZulu(host.backgroundWorkWindowEnd(now))
+            // For the loop, a slot reflection already took is the rule working (one reflection a slot), not a hold that counts toward a
+            // stuck organ. A dream's reflection is still owed, so for it the slot is busy.
+            if held.holder == "reflection", !retainForDream {
+                if let failed = failedReflection, failed.window == window {
+                    return Self.beatReflection(.failed(error: "\(failed.error); this slot is spent, the next opens at \(opens)"))
+                }
+                return Self.beatReflection(.notNeeded("I already reflected in this two-hour slot, at \(held.acquiredAt); the next slot opens at \(opens)"))
+            }
             return Self.beatReflection(.busy("\(held.holder) took this two-hour background slot at \(held.acquiredAt); the next slot opens at \(opens)"))
         }
         switch await substrate.planReflectionChecked(
@@ -172,6 +180,7 @@ extension NativeCognitionRuntime {
             // Return the unused slot if routing refused before provider work; cancellation after dispatch spends it.
             _ = await lease.releaseUnused(holder: "reflection", window: window)
         }
+        if case .failed(let error) = reflectionOutcome { failedReflection = (window, error) }
         publishRuntimeChange(reason: "reflection:finished")
         Self.beatReflection(reflectionOutcome)
         if case .completed = reflectionOutcome, !retainForDream, !Task.isCancelled, !isFlushedForTermination {

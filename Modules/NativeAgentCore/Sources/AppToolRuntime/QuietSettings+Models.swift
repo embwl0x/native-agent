@@ -130,7 +130,10 @@ extension QuietSettings {
             label: "\(group.title) model",
             kind: .text,
             liveChoices: { host in
-                try await offeredModels(host(), providerID: try await leadProvider(group)).map(\.id)
+                // The rows this slot may hold (`ModelSlot.mayHold`): offered ones, and the model it holds now.
+                let held = try await currentPreference(surface: group.surfaces.first ?? group.id)?.model
+                return try await offeredModels(host(), providerID: try await leadProvider(group))
+                    .filter { ModelSlot.mayHold($0.id, rowOffered: $0.offered, savedInSlot: held) }.map(\.id)
             },
             note: "Covers \(group.surfaces.joined(separator: ", ")). Another account's models need providers.\(group.id)_account first.",
             read: { _ in
@@ -158,10 +161,14 @@ extension QuietSettings {
                 guard !offered.isEmpty else {
                     throw QuietSettingError.unavailable("\(providerID)'s model catalog is unavailable. Refresh it in Providers before changing models.")
                 }
+                if let row = offered.first(where: { $0.id == model }),
+                   !ModelSlot.mayHold(model, rowOffered: row.offered, savedInSlot: preference.model) {
+                    throw QuietSettingError.unavailable(row.refusal ?? ModelSlot.refusal(note: nil, accountName: providerID))
+                }
                 guard let choice = offered.first(where: { $0.id == model }) else {
                     throw QuietSettingError.badValue(
                         "\(model) is not a model \(providerID) offers. \(group.title) model takes one "
-                        + "of: \(offered.map(\.id).joined(separator: ", ")). For another account's "
+                        + "of: \(offered.filter(\.offered).map(\.id).joined(separator: ", ")). For another account's "
                         + "models, set providers.\(group.id)_account first.")
                 }
                 guard choice.reasoningCapabilitiesKnown else {
@@ -402,7 +409,9 @@ extension QuietSettings {
             kind: .text,
             liveChoices: { host in
                 guard let appModel = host() else { return [] }
-                return try await offeredModels(appModel, providerID: appModel.chatProvider).map(\.id)
+                let held = appModel.chatModel
+                return try await offeredModels(appModel, providerID: appModel.chatProvider)
+                    .filter { ModelSlot.mayHold($0.id, rowOffered: $0.offered, savedInSlot: held) }.map(\.id)
             },
             note: "Empty means Chat follows the Providers Chat group. Setting it here pins this surface only. "
                 + "The choices are the models of the account Chat is on.",
@@ -410,11 +419,16 @@ extension QuietSettings {
             write: { appModel, value, context in
                 let model = try stringValue(value, "Chat's own model")
                     .trimmingCharacters(in: .whitespaces)
-                let offered = try await offeredModels(appModel, providerID: appModel.chatProvider).map(\.id)
+                let rows = try await offeredModels(appModel, providerID: appModel.chatProvider)
+                if !model.isEmpty, let row = rows.first(where: { $0.id == model }),
+                   !ModelSlot.mayHold(model, rowOffered: row.offered, savedInSlot: appModel.chatModel) {
+                    throw QuietSettingError.unavailable(row.refusal ?? ModelSlot.refusal(note: nil, accountName: appModel.chatProvider))
+                }
+                let offered = rows.map(\.id)
                 if !model.isEmpty, !offered.isEmpty, !offered.contains(model) {
                     throw QuietSettingError.badValue(
                         "\(model) is not a model \(appModel.chatProvider), the account Chat is on, offers. "
-                        + "Chat's own model takes one of: \(offered.joined(separator: ", ")), or empty to "
+                        + "Chat's own model takes one of: \(rows.filter(\.offered).map(\.id).joined(separator: ", ")), or empty to "
                         + "follow the Providers Chat group.")
                 }
                 appModel.chatModel = model

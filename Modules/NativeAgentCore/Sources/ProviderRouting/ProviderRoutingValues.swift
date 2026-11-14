@@ -41,6 +41,7 @@ extension SwiftNativeProviderRouting {
     nonisolated static func surfacesWithRetiredPicks(
         _ models: JSONValue,
         accountModels: [String: Set<String>] = [:],
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
         routeForSurface: (String, String) -> String?
     ) -> Set<String> {
         guard case .object(let obj) = models else { return [] }
@@ -53,7 +54,7 @@ extension SwiftNativeProviderRouting {
                 accountModels[$0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
             }.map {
                 $0.contains(model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-            } ?? FirstPartyModelCatalog.routeCarries(model, providerID: route)
+            } ?? FirstPartyModelCatalog.routeCarries(model, providerID: route, dataRoot: dataRoot)
             if !carried {
                 retired.insert(surface)
             }

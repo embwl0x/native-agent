@@ -290,8 +290,8 @@ public final class CodexProcess: LLMTransport {
         return environment
     }
 
-    /// Preparation and execution must use the same pinned credential.
-    private static func prepareCodexHome(_ authPath: URL) async throws {
+    /// Preparation and execution must use the same pinned credential. Returns the access token the child is handed.
+    private static func prepareCodexHome(_ authPath: URL) async throws -> String? {
         try await ChatGPTTransport.prepareCodexChildHome(
             ChatGPTTransport.codexHomeForChild(authPath: authPath), authPath: authPath
         )
@@ -375,7 +375,8 @@ public final class CodexProcess: LLMTransport {
                         stdin: Self.composedPrompt(system: system, prompt: prompt),
                         environment: childEnvironment(authPath: authPath), lifetime: call.lifetime, call: call
                     )
-                    try await Self.prepareCodexHome(authPath)
+                    // The call's receipt binds to the token the child is handed; with none, the call proves nothing.
+                    if let handed = try await Self.prepareCodexHome(authPath), !handed.isEmpty { call.sentCredential?.sending(token: handed) }
                     if work.isStopped { throw CancellationError() }
                     let upstream = streamingRunner(invocation)
                     for try await chunk in upstream {

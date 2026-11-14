@@ -43,6 +43,8 @@ private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
 
     var loopId: String { "offdisk_backup" }
     var tickTimeoutOverride: TimeInterval? { 15 * 60 }
+    /// It copies the agent's persona, memory and profile; before setup there is nothing of the agent to keep, and no iCloud prompt comes first.
+    var needsAgent: Bool { true }
 
     func physiologyEvents() -> AsyncStream<Void> {
         guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL else {
@@ -54,6 +56,9 @@ private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
             identityFiles = try FileManager.default.contentsOfDirectory(
                 at: personaRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
                 .filter { !$0.lastPathComponent.hasSuffix(".lock") }
+        } catch CocoaError.fileReadNoSuchFile {
+            // Before setup the persona folder does not exist yet: no identity file to watch is not a fault.
+            identityFiles = []
         } catch {
             let cause = """
                 Off-disk backup source watches are incompletely armed at \(personaRoot.path): \(error.localizedDescription). Repair persona directory access \
@@ -62,7 +67,7 @@ private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
             Task { await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId, outcome: .failed(error: cause)) }
             identityFiles = []
         }
-        // The onboarding sentinel and its transaction folder are what onboarded() reads, so completing setup mid-run wakes the first pass.
+        // The onboarding sentinel and its transaction folder are the fact the agent's passes wait for, so completing setup mid-run wakes the first pass.
         return EventDeadlinePhysiology.storeAndFileEvents(
             paths: [personaRoot, dataRoot.appendingPathComponent("memory/profile.json"), dataRoot.appendingPathComponent(".onboarded"),
                 dataRoot.appendingPathComponent("onboarding", isDirectory: true)] + identityFiles,
@@ -114,7 +119,6 @@ private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
         guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL else {
             return .skipped(reason: "alternate data root")
         }
-        guard onboarded else { return .skipped(reason: "setup is not complete; the first backup runs when it is") }
         let parent = port.offDiskBackupParent()
         let port = port
         do {

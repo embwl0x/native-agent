@@ -173,6 +173,8 @@ public final class iCloudBridge: ObservableObject {
     }
     private var doctorHealthSnapshot: ICloudBridgeHealthSnapshot? {
         guard isSetUp || setupTask != nil else { return nil }
+        // The pairing owner's checked count, so Doctor can tell phone sync never set up from phone sync broken; unreadable stays unknown.
+        let pairedPhones = try? PairedPhoneStore.pairedCountChecked(at: sync.dataRoot.appendingPathComponent("paired_phones.json"))
         if usesCloudKitDeviceTransport {
             let health: ICloudBridgeHealthSnapshot.Health
             if let accountFailure {
@@ -181,13 +183,14 @@ public final class iCloudBridge: ObservableObject {
                 health = doctorTransportHealth
             }
             return .init(transport: .cloudKit, health: health,
-                         sendMeasured: doctorSendMeasured, sendFailures: doctorSendFailures)
+                         sendMeasured: doctorSendMeasured, sendFailures: doctorSendFailures, pairedPhones: pairedPhones)
         }
         guard deviceTransport == nil else { return nil }
         return .init(
             transport: .iCloudDrive,
             health: doctorTransportHealth,
-            documentsURL: driveURL
+            documentsURL: driveURL,
+            pairedPhones: pairedPhones
         )
     }
     static func transportHealth(_ error: Error) -> ICloudBridgeHealthSnapshot.Health {

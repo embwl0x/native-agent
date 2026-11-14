@@ -14,7 +14,7 @@ import PersistenceCore
 import Privacy
 import TrustCenter
 import TrustPersistence
-// Blueprint: | `EngineTrustFace.swift` | Trust's checked policy, Mac grants, peers, receipts, privacy and backup controls |
+// Blueprint: | `EngineTrustFace.swift` | Trust's What I may do card, checked policy, Mac grants, peers, receipts, privacy and backup controls |
 
 extension NativeAgentEngine {
     var trustFacePaths: [URL] {
@@ -32,13 +32,19 @@ extension NativeAgentEngine {
          MacIntegrationFacade.systemStatusesDidChange, MacIntegrationFacade.watchesDidChange, NSApplication.didBecomeActiveNotification]
     }
 
+    /// The standing leads alone. Every other block is one line until opened, unless a row in it needs the person: those are drawn open,
+    /// ahead of the folded ones. Backups stays open, its restore points nested: their rows carry the ids `backup.restore` takes, and the
+    /// agent's reading of a folded section keeps only rows it can call. The security receipts and the Mac control audit come last.
     @concurrent func trustFace() async throws -> (PartFace, UInt64) {
         try Task.checkCancellation()
         let epoch = UInt64(Date().timeIntervalSince1970 * 1000)
         var sections: [PartFace.Section] = []
+        var blocks: [PartFace.Section] = []
         do {
             let policy = try await trust.load()
-            sections += await trustPolicyFace(policy)
+            let (standing, policyBlocks) = await trustPolicyFace(policy)
+            sections.append(standing)
+            blocks += policyBlocks
         } catch {
             sections.append(trustFaceFailure("policy", "Access and policy", error))
             sections.append(.init(id: "repair", title: "Repair saved authority", rows: [
@@ -55,66 +61,79 @@ extension NativeAgentEngine {
         async let activityRead = trustActivityFace()
         let (security, peers, integrations, system, watches, activity) = await (
             securityRead, peerRead, integrationRead, systemRead, watchRead, activityRead)
-        sections += security
-        sections += [peers, integrations, system, watches]
-        sections += activity
+        blocks.append(security.security)
+        blocks += [peers, integrations, system, watches, activity]
         try Task.checkCancellation()
         // Inventory walks the data root. Keep its owner's sampled reading until the person asks for a fresh inventory.
         if await trust.privacyMap == nil { await trust.refreshPrivacyMap() }
         if let map = await trust.privacyMap {
-            sections.append(.init(id: "privacy", title: "Privacy map", style: .list, footer: map.dataRoot, rows: [
+            // Protected says the category stays off export; it asks nothing of the person.
+            blocks.append(.init(id: "privacy", title: "Privacy map", style: .list, footer: "My data folder: " + map.dataRoot, rows: [
                 .init(id: "privacy.read", title: "Inventory reading", detail: "Refresh reads the inventory again.")
             ] + map.categories.map {
                 .init(id: "privacy." + $0.id, title: $0.title, detail: $0.contains + "\n" + $0.path,
-                      value: $0.exportable ? "Exportable" : "Protected", tone: $0.exportable ? .quiet : .attention)
+                      value: $0.exportable ? "Exportable" : "Protected", tone: $0.exportable ? .quiet : nil)
             }))
         } else {
-            sections.append(.init(id: "privacy", title: "Privacy map", rows: [
+            blocks.append(.init(id: "privacy", title: "Privacy map", rows: [
                 .init(id: "privacy.unavailable", title: "The privacy map has not published a reading.", tone: .attention)
             ]))
         }
+        let backups: PartFace.Section
         do {
-            let backups = try await trust.refreshBackups()
+            let points = try await trust.refreshBackups()
             var rows: [PartFace.Row] = [.init(id: "backup.create", title: "Back up now",
                 detail: "Copies app-owned settings, memory, chats, abilities, connectors and jobs. Your own files are outside this operation.",
                 actions: [.init(id: "create", label: "Back up now", call: PartFace.Call("backup.now"))])]
-            rows += backups.prefix(8).map { backup in
-                .init(id: "backup." + backup.id, title: backup.reason,
-                      detail: "Scopes: " + backup.scope.joined(separator: ", ")
-                        + ". A safety backup comes first; if it fails, nothing is replaced. Restored work stays stopped; Resume starts it fresh.",
-                      at: backup.createdAt, actions: [.init(id: "restore", label: "Restore backup", role: .destructive,
-                                                            call: PartFace.Call("backup.restore", ["id": .string(backup.id)]))])
+            if !points.isEmpty {
+                rows.append(.init(id: "backups.restore_points", title: "Restore points",
+                    detail: "A safety backup comes first; if it fails, nothing is replaced. Restored work stays stopped; Resume starts it fresh.",
+                    rows: points.prefix(8).map { backup in
+                        .init(id: "backup." + backup.id, title: backup.reason, detail: "Scopes: " + backup.scope.joined(separator: ", ") + ".",
+                              at: backup.createdAt, actions: [.init(id: "restore", label: "Restore backup", role: .destructive,
+                                                                    call: PartFace.Call("backup.restore", ["id": .string(backup.id)]))])
+                    }))
             }
-            sections.append(.init(id: "backups", title: "Backups", style: .list,
-                footer: backups.isEmpty ? "No app-data restore points listed. The file-write backup policy is separate." : nil, rows: rows))
+            backups = .init(id: "backups", title: "Backups", style: .list,
+                footer: points.isEmpty ? "No app-data restore points listed. The file-write backup policy is separate." : nil, rows: rows)
         } catch {
-            sections.append(trustFaceFailure("backups", "Backups", error))
+            backups = trustFaceFailure("backups", "Backups", error)
         }
+        sections += (blocks + [backups]).filter(trustFaceNeedsPerson)
+        sections += blocks.filter { !trustFaceNeedsPerson($0) }.map(trustFaceFolded)
+        if !trustFaceNeedsPerson(backups) { sections.append(backups) }
         sections.append(.init(id: "refresh", rows: [.init(id: "trust.refresh", title: "Read Trust again",
             actions: [.init(id: "refresh", label: "Refresh", call: PartFace.Call("trust.refresh_privacy"))])]))
+        sections += security.record.map { trustFaceNeedsPerson($0) ? $0 : trustFaceFolded($0) }
         return (.init(title: "Trust", line: "What I may do on my own.", sections: sections), epoch)
     }
 
-    private func trustPolicyFace(_ policy: TrustPolicy) async -> [PartFace.Section] {
+    /// What I may do: the standing, with what it reaches as its own nested rows; a locked row for each kind of act the permission law makes
+    /// ask the person first at this posture; the rest folded. Then the policy's blocks: Features, Chrome control, Mac access and control.
+    private func trustPolicyFace(_ policy: TrustPolicy) async -> (standing: PartFace.Section, blocks: [PartFace.Section]) {
         let mode = TrustAccessModeCapabilityCatalog.agentAccessMode(from: policy)
         let full = TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy)
         let preset = MobileTrustAction.Preset.matching(policy: policy, accessMode: mode)
-        var sections: [PartFace.Section] = [.init(id: "access", title: "Access and policy", style: .list, rows: [
-            .init(id: "trust.preset", title: "Standing", detail: (preset?.summary ?? "Custom access: " + mode)
-                + (full ? ". Full Mac stays on until you change it." : ""),
-                control: .choice(MobileTrustAction.Preset.allCases.map { .init(id: $0.rawValue, label: $0.title) },
-                    selected: preset?.rawValue, confirm: "Apply the selected standing? If you select Full Mac:\n" + MobileTrustAction.fullMacMessage,
-                    call: settingSetCall("trust.preset"))),
-            // The standing and "What this allows" already say the level, the default before acting and files outside workspaces in words.
-            .init(id: "trust.backups", title: "Backup before changes",
-                detail: "The file-write backup policy. App-data restore points are listed under Backups.",
-                value: (policy.filePolicy?.requireBackupBeforeWrite).map { $0 ? "Required" : "Not required" })
-        ])]
-        sections.append(.init(id: "guardrails", title: "What this allows", rows:
-            TrustGuardrailSummary.rows(policy: policy, accessMode: mode).map {
-                .init(id: "guardrail." + $0.id, title: $0.title, detail: $0.detail, value: $0.value,
-                    tone: $0.tone == .danger ? .attention : .plain)
-            }))
+        // What the standing reaches explains it: files, the backup before a file write and Mac control are said there in words; under
+        // Full Mac, so is unattended work. Asking first is the lock rows' alone.
+        var allows: [PartFace.Row] = TrustGuardrailSummary.rows(policy: policy, accessMode: mode).map {
+            .init(id: "guardrail." + $0.id, title: $0.title, detail: $0.detail, value: $0.value,
+                tone: $0.tone == .danger ? .attention : .plain)
+        }
+        if full {
+            allows.append(.init(id: "trust.unattended_work", title: "Let me work unattended",
+                detail: "Choose a narrower standing to change it.", value: "On"))
+        }
+        let standingRow = PartFace.Row(id: "trust.preset", title: "Standing", detail: (preset?.summary ?? "Custom access: " + mode)
+            + (full ? ". Full Mac stays on until you change it. " + PermissionLaw.fullMacSteeredTurn : ""),
+            control: .choice(MobileTrustAction.Preset.allCases.map { .init(id: $0.rawValue, label: $0.title) },
+                selected: preset?.rawValue, confirm: "Apply the selected standing? If you select Full Mac:\n" + MobileTrustAction.fullMacMessage,
+                call: settingSetCall("trust.preset")),
+            rows: allows)
+        // The locks are read from the saved posture the gate reads, through the gate's own table, and from the levers' declarations.
+        let locks = TrustLockCard.rows(posture: TrustAccessModeCapabilityCatalog.posture(policy), levers: trustLevers())
+        let standing = PartFace.Section(id: "access", title: "What I may do", style: .list, rows: [standingRow] + locks)
+        var sections: [PartFace.Section] = []
         var features: [PartFace.Row] = []
         if let multimodal = policy.multimodalPolicy {
             features += [
@@ -132,12 +151,10 @@ extension NativeAgentEngine {
             features.append(trustFaceToggle("chat.read_replies_aloud", "Read replies aloud automatically",
                 UserDefaults.standard.bool(forKey: "voiceAutoRead"), "Uses your saved voice settings; the cloud voice needs its own permission."))
         }
-        features.append(full
-            ? .init(id: "trust.unattended_work", title: "Let me work unattended",
-                detail: "Full Mac keeps unattended work on. Choose a narrower standing to change it.",
-                value: "On with Full Mac")
-            : trustFaceToggle("trust.unattended_work", "Let me work unattended", policy.enableAutonomy,
+        if !full {
+            features.append(trustFaceToggle("trust.unattended_work", "Let me work unattended", policy.enableAutonomy,
                 "Scheduled helpers and background improvement. Run once still works either way because you asked."))
+        }
         sections.append(.init(id: "features", title: "Features", footer: "Background work picks up changes next time it runs; other changes apply right away.",
             rows: features))
         // Rows that act in the foreground on this Mac run from the Mac's door.
@@ -157,7 +174,7 @@ extension NativeAgentEngine {
                 detail: "Full Mac allows it; the extension must still be connected. " + (chrome.map {
                     "The saved switch for narrower modes is " + ($0.enabled ? "On." : "Off.")
                 } ?? "The saved switch for narrower modes is unavailable."),
-                value: "On with Full Mac")
+                value: "On")
                 : chrome.map { trustFaceToggle("trust.chrome_control", "Chrome control", $0.enabled,
                     "I use inactive tabs in my group while you stay signed in. Selecting a tab gives it back to you.") }
                     ?? .init(id: "trust.chrome_control", title: "Chrome control policy is unavailable.", tone: .attention),
@@ -168,7 +185,7 @@ extension NativeAgentEngine {
         if let mac = policy.macControlPolicy {
             let effective = TrustAccessModeCapabilityCatalog.effectiveMacControlPolicy(policy)
             let macPreset = full ? MacIntegrationPreset.full : effective.map { TrustAccessModeCapabilityCatalog.macIntegrationPreset(for: $0) }
-            sections.append(.init(id: "mac_preset", title: "Mac access", rows: [
+            let access: [PartFace.Row] = [
                 .init(id: "mac.preset", title: "Mac control preset", control: .choice(
                     [MacIntegrationPreset.off, .watch, .assistant, .full].map {
                         .init(id: $0.rawValue, label: $0 == .full ? "Full Mac" : $0.rawValue.capitalized)
@@ -188,7 +205,7 @@ extension NativeAgentEngine {
                 .init(id: "mac.notification", title: "Mac notifications",
                     actions: [.init(id: "send_notification", label: "Send a notification on this Mac", doors: macDoor,
                                     call: PartFace.Call("trust.test_notification"))])
-            ]))
+            ]
             let fields: [(String, String, Bool)] = [
                 ("enabled", "Mac control", mac.enabled), ("notifications", "Notifications", mac.notificationsAllowed),
                 ("spotlight", "Spotlight search", mac.spotlightAllowed), ("file_ops", "File operations", mac.fileOpsAllowed),
@@ -196,9 +213,9 @@ extension NativeAgentEngine {
                 ("applescript", "AppleScript", mac.applesScriptAllowed), ("jxa", "JavaScript for Automation", mac.jxaAllowed),
                 ("shell", "Shell commands", mac.shellAllowed), ("remote_from_iphone", "iPhone remote control", mac.remoteFromIosAllowed)
             ]
-            sections.append(.init(id: "mac_control", title: "Mac control", footer: full
+            sections.append(.init(id: "mac_control", title: "Mac access and control", footer: full
                 ? "These are saved choices for narrower modes. Full Mac's effective permissions apply until you change standing."
-                : "Each switch saves immediately. File rules, macOS grants and Trust still apply.", rows: fields.map { id, title, on in
+                : "Each switch saves immediately. File rules, macOS grants and Trust still apply.", rows: access + fields.map { id, title, on in
                     trustFaceToggle(id == "enabled" ? "trust.mac_control" : "trust.mac_control_" + id, title, on)
                 } + [
                     .init(id: "mac.shortcuts", title: "macOS Shortcuts", value: "Not built yet"),
@@ -207,11 +224,16 @@ extension NativeAgentEngine {
                         actions: [.init(id: "workbench", label: "Open workbench on this Mac", doors: macDoor, call: PartFace.Call("trust.workbench"))])
                 ]))
         } else {
-            sections.append(.init(id: "mac_control", title: "Mac control", rows: [
+            sections.append(.init(id: "mac_control", title: "Mac access and control", rows: [
                 .init(id: "mac.unavailable", title: "The saved policy has no Mac control block.", tone: .attention)
             ]))
         }
-        return sections
+        return (standing, sections)
+    }
+
+    /// Every lever as its declaration names it, in declaration order, and whether a card can carry the agent's ask for it.
+    private func trustLevers() -> Result<[(name: String, asks: Bool)], Error> {
+        Result { try AppActions.all.compactMap { action in action.lever.map { (name: $0.name, asks: $0.asks) } } }
     }
 
     private func trustPeersFace() async -> PartFace.Section {
@@ -225,6 +247,8 @@ extension NativeAgentEngine {
                     detail: row.route + "\n" + row.pillWord + " · " + row.status
                         + (row.elevationFailure.map { "\nYour grant cannot take effect: " + $0.localizedDescription } ?? ""),
                     value: peer.elevationAllowed && row.elevationFailure == nil ? "Authority on" : "Authority off",
+                    // A grant that cannot take effect is the person's to see, so its block stays open.
+                    tone: peer.elevationAllowed && row.elevationFailure != nil ? .attention : nil,
                     control: !peer.elevationAllowed && row.elevationFailure != nil ? nil
                         : .toggle(peer.elevationAllowed, confirm: peer.elevationAllowed ? nil : "Let this agent use your existing permissions?",
                                   call: settingSetCall("trust.agent_elevation_" + peer.id)))
@@ -237,23 +261,39 @@ extension NativeAgentEngine {
     private func trustIntegrationsFace() async -> PartFace.Section {
         do {
             let snapshot = try await MacIntegrationPermissionStore(dataRoot: dataRoot).snapshotChecked()
-            let rows = MacIntegrationID.all.flatMap { id -> [PartFace.Row] in
-                [MacIntegrationPermissionMode.read, .write].compactMap { mode in
+            // One row per app, its Read and Write switches side by side on its line; each switch keeps its own row id and setting.
+            let rows = MacIntegrationID.all.map { id -> PartFace.Row in
+                let name = MacIntegrationID.displayName(for: id)
+                let modes = [MacIntegrationPermissionMode.read, .write].compactMap { mode -> PartFace.Row? in
                     guard mode == .read ? MacIntegrationID.supportsRead(id) : MacIntegrationID.supportsWrite(id) else { return nil }
-                    return trustFaceToggle("integration." + id + "." + mode.rawValue,
-                        MacIntegrationID.displayName(for: id) + " · " + mode.rawValue.capitalized, snapshot.allows(id, mode: mode),
-                        "Checked before each use. Off fences Full Mac too.", setting: "trust.mac_integration_" + id + "_" + mode.rawValue)
+                    let word = mode.rawValue.capitalized
+                    return trustFaceToggle("integration." + id + "." + mode.rawValue, word, snapshot.allows(id, mode: mode),
+                        setting: "trust.mac_integration_" + id + "_" + mode.rawValue, named: name + " · " + word)
                 }
+                return PartFace.Row(id: "integration." + id, title: name, rows: modes, inline: true)
             }
-            return .init(id: "integrations", title: "Apps and features", rows: rows)
+            return .init(id: "integrations", title: "Apps and features", footer: "Checked before each use. Off fences Full Mac too.", rows: rows)
         } catch { return trustFaceFailure("integrations", "Apps and features", error) }
     }
 }
 
-/// A Trust switch: its change is `setting.set` on `setting`, or on the setting the row's own id names.
-func trustFaceToggle(_ id: String, _ title: String, _ on: Bool, _ detail: String? = nil, safe: Bool = false, setting: String? = nil) -> PartFace.Row {
+/// A Trust switch: its change is `setting.set` on `setting`, or on the setting the row's own id names. `named` is its whole name when the
+/// title is only its word in an inline group ("Read" under "Mail"), so the confirmation still says which switch it is.
+func trustFaceToggle(_ id: String, _ title: String, _ on: Bool, _ detail: String? = nil, safe: Bool = false, setting: String? = nil,
+                     named: String? = nil) -> PartFace.Row {
     .init(id: id, title: title, detail: detail, control: .toggle(on,
-        confirm: on == safe ? "Change what I may do: " + title + "?" : nil, call: settingSetCall(setting ?? id)))
+        confirm: on == safe ? "Change what I may do: " + (named ?? title) + "?" : nil, call: settingSetCall(setting ?? id)))
+}
+
+/// A block needs the person when a row in it, nested rows included, asks for attention or failed.
+func trustFaceNeedsPerson(_ section: PartFace.Section) -> Bool {
+    section.allRows.contains { $0.tone == .attention || $0.tone == .failed }
+}
+
+func trustFaceFolded(_ section: PartFace.Section) -> PartFace.Section {
+    var folded = section
+    folded.folded = true
+    return folded
 }
 
 func trustFaceFailure(_ id: String, _ title: String, _ error: Error) -> PartFace.Section {

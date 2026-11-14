@@ -1,6 +1,6 @@
 # How a person notices what matters
 
-Research on noticing, written for Claude on 2026-10-25 as raw material for the
+Research on noticing, written for the lead on 2026-10-25 as raw material for the
 agent design. It covers how people pick out what is worth their attention from
 everything happening around them, what an agent that lives on one person's Mac
 for months needs from that, and what artificial systems that tried to notice

@@ -89,7 +89,7 @@ package enum FileSystemActions {
     static func sensitiveReadRefusal(_ resolved: URL) -> String {
         "Path '\(resolved.path)' is under a sensitive data sub-tree (OAuth tokens, "
             + "pairing secrets, provider credentials, trust policy). "
-            + "Use dedicated Swift runtime tools such as app agent.introspect or memory.recall instead."
+            + "Use the app's own actions such as app agent.introspect or memory.recall instead."
     }
     static func truncate(_ text: String, maxChars: Int = connectorResultMaxChars) -> String {
         if text.count <= maxChars { return text }

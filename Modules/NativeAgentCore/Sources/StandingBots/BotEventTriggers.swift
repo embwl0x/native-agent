@@ -77,15 +77,18 @@ public struct BotEventRecord: Codable, Equatable, Sendable {
     public var at: Date
     public var outcome: BotEventOutcome
     public var detail: String?
+    /// The accepted request this event queued, so a later hold settles this event and no other.
+    public var requestID: UUID?
 
     public init(source: BotEventSource, target: String, summary: String, at: Date = Date(),
-                outcome: BotEventOutcome, detail: String? = nil) {
+                outcome: BotEventOutcome, detail: String? = nil, requestID: UUID? = nil) {
         self.source = source
         self.target = target
         self.summary = summary
         self.at = at
         self.outcome = outcome
         self.detail = detail
+        self.requestID = requestID
     }
 }
 
@@ -106,11 +109,11 @@ public struct BotEventStore: Sendable {
         }, uniquingKeysWith: { first, _ in first })
     }
 
-    /// Update the admitted event's existing evidence; a later gate refusal must not invent another event.
-    func hold(bot id: UUID, detail: String) throws {
+    /// Update the held request's own evidence; a later event queued for the same bot keeps its label.
+    func hold(bot id: UUID, request: UUID, detail: String) throws {
         try disk.locked {
             var saved = try records()
-            guard var record = saved[id.uuidString], record.outcome == .queued else { return }
+            guard var record = saved[id.uuidString], record.outcome == .queued, record.requestID == request else { return }
             record.outcome = .held
             record.detail = detail
             saved[id.uuidString] = record
@@ -196,7 +199,7 @@ public struct BotEventRouter: Sendable {
             do {
                 try store.record(BotEventRecord(source: event.source, target: event.target,
                     summary: event.summary, outcome: receipt.accepted ? .queued : .notRun,
-                    detail: receipt.accepted ? nil : receipt.reason), bot: bot.id)
+                    detail: receipt.accepted ? nil : receipt.reason, requestID: receipt.accepted ? receipt.runID : nil), bot: bot.id)
             } catch {
                 throw StandingBotsError.corruptStore("""
                     Helper wake record unavailable for \(bot.id), request \(receipt.runID): \(error). The queue retains any accepted \

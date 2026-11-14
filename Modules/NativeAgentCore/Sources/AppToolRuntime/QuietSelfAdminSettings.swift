@@ -64,7 +64,7 @@ public enum QuietSettings {
     public static func usersCall(_ change: String, _ whereUserDoesIt: String, setting id: String, value: JSONValue,
                                  turn: Turn) -> QuietSettingError? {
         personDecided(setting: id, value: value, turn: turn) ? nil : .users(
-            "\(change) widens what the agent may do, so it is the person's at every posture (\(whereUserDoesIt)): this exact change asks "
+            "\(change) is the person's to decide at every posture (\(whereUserDoesIt)): this exact change asks "
             + "them on a card, and their Approve makes it.")
     }
 
@@ -251,7 +251,7 @@ public enum QuietSettings {
     ) -> QuietSetting {
         liveBool(
             id: id, page: page, label: label, key: key, defaultOn: defaultOn,
-            note: "Runs inside the inner life (settings.inner_life).",
+            note: "Part of my inner life, so it runs only while that is on.",
             apply: { appModel, enabled, context in
                 if enabled, !storedBool("cognitiveSubstrateEnabled", true) {
                     throw QuietSettingError.unavailable(
@@ -699,34 +699,27 @@ public enum QuietSettings {
             id: "notifications.channel_push", page: "settings",
             label: "Deliver to the phone", key: NotificationChannelPreference.pushKey,
             defaultOn: true,
-            note: "Covers the morning brief and agent alerts. Off, the phone is not used and "
-                + "nothing is re-routed to a louder channel in its place."
+            note: "On, I reach you on the phone with the morning brief and my alerts; off, I never use the phone and never send "
+                + "those somewhere louder instead."
         ))
         rows.append(defaultsBool(
             id: "notifications.channel_telegram", page: "settings",
             label: "Deliver to Telegram", key: NotificationChannelPreference.telegramKey,
             defaultOn: true,
-            note: "Off, Telegram is not used even when it is the last surface the person was on."
+            note: "On, I reach you on Telegram when it is where you last talked to me; off, I never reach you there."
         ))
         rows.append(defaultsBool(
             id: "notifications.channel_in_app", page: "settings",
             label: "Deliver as a Mac notification", key: NotificationChannelPreference.inAppKey,
             defaultOn: true,
-            note: "The banner this Mac posts. The inbox card and the activity row are records of "
-                + "what happened, not ways of reaching out, so they are always written."
+            note: "On, I post a banner on this Mac; the Inbox card and Activity row are records of what happened, so I write them either way."
         ))
         rows.append(QuietSetting(
             id: "notifications.delivery_receipts", page: "settings",
             label: "Delivery receipts recorded", kind: .text,
-            note: "Read-only, and not a switch: a receipt is per channel, not one thing that is "
-                + "on. Only the phone route returns a paired-device receipt (bridge id and APNS "
-                + "acceptance). A Telegram send returns none; what is always written for it is "
-                + "the attention router's own delivery ledger entry. An inbox card is NOT a "
-                + "given: it exists when the caller wrote one first, as a trigger fire and a "
-                + "scheduled job do, and a direct router call such as a shoulder tap writes no "
-                + "card. The Mac banner is posted by this Mac and records only whether it "
-                + "posted. Reported as it is so a claim that something was sent is checked "
-                + "against the right thing.",
+            note: "Not a switch but what proves I reached you, per channel: only the phone returns a delivery receipt, for Telegram "
+                + "I keep only my own record of sending, the Mac banner records only whether it posted, and an Inbox card exists only "
+                + "when a trigger or scheduled job wrote one first (a direct tap on your shoulder writes none).",
             // Name each channel's actual delivery evidence; an inbox card exists only when its caller wrote one.
             read: { _ in
                 .string(
@@ -740,11 +733,10 @@ public enum QuietSettings {
         for (id, label, field, keyPath) in [
             ("image_understanding", "Image understanding", "vision_api_calls", \TrustMultimodalPolicy.vision_api_calls),
             ("pdf_reading", "Read PDFs", "file_ingestion_pdf", \TrustMultimodalPolicy.file_ingestion_pdf),
-            ("docx_reading", "Read Word documents", "file_ingestion_docx", \TrustMultimodalPolicy.file_ingestion_docx),
         ] as [(String, String, String, KeyPath<TrustMultimodalPolicy, Bool> & Sendable)] {
             rows.append(QuietSetting(
                 id: "settings.\(id)", page: "settings", label: label, kind: .boolean,
-                note: field == "file_ingestion_docx" ? "Saved reading preference; DOCX attachments are not yet supported." : "",
+                note: "",
                 read: .multimodal(keyPath),
                 write: { host, value, _ in
                     let enabled = try boolValue(value, label)
@@ -772,7 +764,7 @@ public enum QuietSettings {
         rows.append(QuietSetting(
             id: "memories.cross_session", page: "settings", label: "Remember across conversations",
             kind: .boolean,
-            note: "Brings in what is relevant from every past conversation, not just this one.",
+            note: "On, I bring in what is relevant from every past conversation, not just this one.",
             read: .memory(\TrustMemoryPolicy.cross_session_recall),
             write: { appModel, value, context in
                 let enabled = try boolValue(value, "Remember across conversations")
@@ -784,7 +776,7 @@ public enum QuietSettings {
         rows.append(QuietSetting(
             id: "memories.recur_to_facts", page: "settings", label: "Recurring memories are proposed as facts",
             kind: .boolean,
-            note: "What keeps coming back is proposed as a durable fact to accept.",
+            note: "On, what keeps coming back in my memories is proposed as a lasting fact to accept.",
             read: .memory(\TrustMemoryPolicy.adaptive_promotion),
             write: { appModel, value, context in
                 let enabled = try boolValue(value, "Recurring memories are proposed as facts")
@@ -802,8 +794,7 @@ public enum QuietSettings {
             id: "settings.haze_color", page: "settings",
             label: "Haze colour", kind: .choice,
             choices: HazeColor.allCases.map(\.rawValue),
-            note: "The one colour of the soft light drifting behind the window. "
-                + "Only these presets; there are no custom colours.",
+            note: "The colour of the soft light drifting behind my window, from these presets only.",
             read: { _ in
                 guard let saved = UserDefaults.standard.object(forKey: HazeColor.key) else {
                     return .string(HazeColor.defaultValue.rawValue)
@@ -820,8 +811,8 @@ public enum QuietSettings {
         rows.append(QuietSetting(
             id: "settings.view_mode", page: "settings",
             label: "View", kind: .choice, choices: SimpleViewMode.choices,
-            note: "simple: the agent, its agents and helpers beside one chat, no settings pages. "
-                + "advanced: the full app. agent: a window onto the agent's own screen.",
+            note: "simple shows me, my places (Chat, Desk, mine and Control, where Settings is a tab) and my folded agents and helpers "
+                + "beside one chat; advanced adds Diagnostics and the Work pane; agent shows a window onto my own screen.",
             read: { _ in .string(try SimpleViewMode.checkedCurrent()) },
             write: { _, value, context in UserDefaults.standard.set(try choiceValue(value, "View", SimpleViewMode.choices), forKey: SimpleViewMode.key) }
         ).watchingDefaults(SimpleViewMode.key))
@@ -837,7 +828,7 @@ public enum QuietSettings {
         rows.append(liveBool(
             id: "settings.inner_life", page: "settings",
             label: "An inner life", key: "cognitiveSubstrateEnabled", defaultOn: true,
-            note: "The master over the lanes below. On turns them all on with it; off turns them all off.",
+            note: "The master over my inner life: on turns its lanes on with it, and off turns them all off.",
             apply: { appModel, enabled, context in
                 let (running, problem) = await appModel.setInnerLifeEnabled(enabled)
                 if running != enabled {
@@ -862,7 +853,7 @@ public enum QuietSettings {
         rows.append(QuietSetting(
             id: "settings.daily_reflection_budget", page: "settings",
             label: "Reflections in 24 hours", kind: .number,
-            note: "Reflections in any 24 hours, 0 to 8 — the Cognition page's stepper.",
+            note: "How many times I may reflect in any 24 hours, 0 to 8, the same number as Cognition's stepper.",
             read: { _ in
                 .int(Int64(UserDefaults.standard.object(
                     forKey: "cognitiveSubstrateDailyReflectionBudget") as? Int ?? 2))
@@ -882,7 +873,8 @@ public enum QuietSettings {
         rows.append(QuietSetting(
             id: "settings.memory_in_every_reply", page: "settings",
             label: "Memory in every reply", kind: .choice, choices: ["off", "active"],
-            note: "Takes effect on the next reply. Setup or safety can hold it off; the receipt says so.",
+            note: "active brings what I remember into every reply from the next one on; setup or safety can hold it off, and the "
+                + "change says so when it does.",
             read: { _ in
                 guard let saved = UserDefaults.standard.object(forKey: "contextFlowMode") else { return .string("active") }
                 guard let raw = saved as? String, ContextFlowMode(rawValue: raw) != nil else {
@@ -905,8 +897,7 @@ public enum QuietSettings {
         rows.append(liveBool(
             id: "settings.wander_hour", page: "settings",
             label: "My hour", key: StudioWanderLane.enabledDefaultsKey, defaultOn: StudioWanderLane.enabledByDefault,
-            note: "When you step away, I can take an hour of my own, with no task set. Runs inside the "
-                + "inner life (settings.inner_life).",
+            note: "When you step away, I can take an hour of my own with no task set; it runs only while my inner life is on.",
             apply: { _, enabled, context in
                 if enabled, !storedBool("cognitiveSubstrateEnabled", true) {
                     throw QuietSettingError.unavailable(
@@ -919,8 +910,7 @@ public enum QuietSettings {
         rows.append(QuietSetting(
             id: "research.search_url", page: "desk", label: "Search service",
             kind: .text,
-            note: "The SearXNG address research searches through, as http://host:port. auto looks for "
-                + "one running on this Mac and saves what it finds.",
+            note: "The SearXNG address I search through, as http://host:port; auto finds one running on this Mac and saves it.",
             read: { appModel in .string(appModel.searchServiceURL) },
             write: { appModel, value, context in
                 let raw = try stringValue(value, "Search service").trimmingCharacters(in: .whitespaces)

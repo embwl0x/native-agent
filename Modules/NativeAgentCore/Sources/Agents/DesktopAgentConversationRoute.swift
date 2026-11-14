@@ -212,7 +212,7 @@ package actor DesktopConversationTools: ToolDispatchClient {
             throw refusal("This courier only offers its scoped screen, go, read, result paging and act operations. That call did not run.")
         }
         calls += 1
-        guard calls <= 24 else { throw refusal("Desktop conversation tool budget exceeded.") }
+        guard calls <= 24 else { throw refusal("Desktop conversation call budget exceeded.") }
         var args = input.filter { $0.value != .null }
         var typing = false, submitting = false, selecting = false
         if tool == "screen" {

@@ -95,7 +95,7 @@ public struct MacChatTurnLifecycleInput: Sendable, Equatable {
         case cancellationRequested
         case completed
         case failed(reason: String?)
-        case cancellationConfirmed
+        case cancellationConfirmed(reason: String?)
         case outcomeUnknown(reason: String?)
     }
 
@@ -203,10 +203,10 @@ public enum MacChatTurnLifecycleReducer {
                 at: max(input.occurredAt, state.cancellationRequestedAt ?? input.occurredAt)
             )
             nextTerminalEvidence = .explicitTypedFailure
-        case .cancellationConfirmed:
+        case .cancellationConfirmed(let reason):
             nextPresentation = lifecycle(
                 state.presentation,
-                .canceled(reason: nil),
+                .canceled(reason: reason),
                 at: max(input.occurredAt, state.cancellationRequestedAt ?? input.occurredAt)
             )
             nextTerminalEvidence = .cancellationAcknowledged

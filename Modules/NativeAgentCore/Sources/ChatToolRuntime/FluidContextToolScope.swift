@@ -41,7 +41,7 @@ extension SwiftToolDispatcher {
                 "reason": .string("context_generation_unavailable"),
                 "message": .string("""
                     No context packet was prepared for this turn (context flow off, or its build failed), so there is nothing to expand; read the \
-                    source directly instead (memory_search, read_file, or the tool that produced it).
+                    source directly instead (memory_search, read_file, or the action that produced it).
                     """),
             ])
         }

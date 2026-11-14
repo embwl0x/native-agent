@@ -118,8 +118,8 @@ function dynamic(context, recall) {
   var facts = context.facts.slice();
   if (context.runtime) {
     var runtime = context.runtime, line = facts[runtime.fact_index] + " If asked what model or provider you are using, answer from Current runtime; do not guess.";
-    if (runtime.view_mode === "simple") line += ' Simple view has no settings pages; for connector, provider, key, sign-in or permission setup, use app {action:"card.request"}.';
-    if (runtime.view_mode === "advanced") line += ' For setup the person must do, use app {action:"card.request"} instead of sending them to a page.';
+    if (runtime.view_mode === "simple" || runtime.view_mode === "advanced")
+      line += ' For setup the person must do, use app {action:"card.request"} instead of sending them to a page.';
     if (runtime.contacts.status === "unavailable") line += '\n[agents reason=contacts_unreadable] Saved contacts could not be read. Read app {page:"agents"} for the storage cause and recovery before relying on a contact.';
     else if (runtime.contacts.rows.length) line += "\nSaved contacts: " + runtime.contacts.rows.join(", ") + ".";
     facts[runtime.fact_index] = line;

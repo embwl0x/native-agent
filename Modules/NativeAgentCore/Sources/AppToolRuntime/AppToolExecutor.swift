@@ -46,8 +46,9 @@ public final class AppToolExecutor: ChatToolExecuting {
     public let securityCenter: SwiftNativeSecurityCenter
     public let enforceAutonomySecurity: Bool
     public let browserActionRunner: @Sendable (String, Bool, [String: JSONValue], Turn, AppActionExecution) async throws -> JSONValue
-    private let mobileNotificationSender: @Sendable (String, String, [String: String], Turn) async throws -> AttentionOutcome
-    private let macNotificationSender: @Sendable (String, String, Turn, ContinuousClock.Instant?) async throws -> NativeAgentNotificationPostResult
+    private let mobileNotificationSender: @Sendable (NativeAgentNotificationDefaults.Note, [String: String], Turn) async throws -> AttentionOutcome
+    private let macNotificationSender: @Sendable (NativeAgentNotificationDefaults.Note, Turn, ContinuousClock.Instant?) async throws
+        -> NativeAgentNotificationPostResult
     /// Executors share persisted authority; injected stores must retain the same gate.
     private let macIntegrationPermissionStore: MacIntegrationPermissionStore
     private let doctorStatusProvider: @Sendable (_ repair: Bool?, _ checkID: String?, _ turn: Turn) async throws -> JSONValue
@@ -63,8 +64,9 @@ public final class AppToolExecutor: ChatToolExecuting {
         browserActionRunner: @escaping @Sendable (String, Bool, [String: JSONValue], Turn, AppActionExecution) async throws -> JSONValue,
         chrome: @escaping @Sendable () -> ChromeControlRuntime,
         motorActionObserver: @escaping @Sendable (MotorActionReadModel) async -> Void,
-        mobileNotificationSender: @escaping @Sendable (String, String, [String: String], Turn) async throws -> AttentionOutcome,
-        macNotificationSender: @escaping @Sendable (String, String, Turn, ContinuousClock.Instant?) async throws -> NativeAgentNotificationPostResult,
+        mobileNotificationSender: @escaping @Sendable (NativeAgentNotificationDefaults.Note, [String: String], Turn) async throws -> AttentionOutcome,
+        macNotificationSender: @escaping @Sendable (NativeAgentNotificationDefaults.Note, Turn, ContinuousClock.Instant?) async throws
+            -> NativeAgentNotificationPostResult,
         macIntegrationPermissionStore: MacIntegrationPermissionStore,
         doctorStatusProvider: @escaping @Sendable (_ repair: Bool?, _ checkID: String?, _ turn: Turn) async throws -> JSONValue,
         telegramStatusProvider: @escaping @Sendable () async throws -> JSONValue,
@@ -182,7 +184,8 @@ public final class AppToolExecutor: ChatToolExecuting {
     package static let buckets: [String: ChatToolCatalogBucket] = Dictionary(uniqueKeysWithValues:
         browserToolNames.map { ($0, .browser) } + [("chat_reply", .core)] + doorToolNames.map { ($0, .alwaysOn) })
 
-    /// Immutable schemas are shared because Core reads them on every call.
+    /// Immutable schemas are shared because Core reads them on every call. They hold the door's first drawing, since a registered descriptor never
+    /// changes; a turn offers the model `modelSchemas`, the door as the agent's hand is now.
     public var descriptors: [ToolDescriptor] { Self.sharedDescriptors }
     private static let sharedDescriptors = appToolSchemas().compactMap { schema in
         buckets[schema.name].map { ToolDescriptor(schema: schema, bucket: $0) }
@@ -214,7 +217,7 @@ public final class AppToolExecutor: ChatToolExecuting {
             let admission = await securityCenter.fullMacYoloAuthority(
                 origin: AppChatToolDispatcher.securityOrigin(turn: turn, surface: surface), turn: turn)
             guard let access = SwiftToolDispatcher.macIntegrationAccess(forTool: tool) else {
-                throw ToolFailureError("Mac integration tool has no permission declaration: \(tool)", effects: .none)
+                throw ToolFailureError("Mac integration action has no permission declaration: \(tool)", effects: .none)
             }
             let allowed = try await macIntegrationPermissionStore.allows(access.integration, mode: access.mode)
             guard allowed else {
@@ -240,11 +243,11 @@ public final class AppToolExecutor: ChatToolExecuting {
     }
 
     public static func defaultMobileNotificationSender(
-        title: String, body: String, userInfo: [String: String], router: AttentionRouter, turn: Turn
+        _ note: NativeAgentNotificationDefaults.Note, userInfo: [String: String], router: AttentionRouter, turn: Turn
     ) async throws -> AttentionOutcome {
             // Each explicit send is its own happening, even when its words match an earlier send.
             let matter = Matter(id: "mobile_notify:" + UUID().uuidString.lowercased(), form: .words,
-                from: userInfo["source"] ?? "mobile_notify", title: title, summary: body,
+                from: userInfo["source"] ?? "mobile_notify", title: note.title, subtitle: note.subtitle, summary: note.message,
                 open: turn.verifiedSessionID.map { "chat:" + $0 })
             return try await router.tell(matter, reach: .pinned(.phone, from: nil), turn: turn)
     }
@@ -253,23 +256,19 @@ public final class AppToolExecutor: ChatToolExecuting {
 
     private func runMacNotify(input: [String: JSONValue], surface: String, turn: Turn,
                               execution: AppActionExecution) async throws -> JSONValue {
-        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mac.notify")
-        let result = try await macNotificationSender(title, message, turn, execution.invocation.waitDeadline)
+        let note = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mac.notify")
+        let result = try await macNotificationSender(note, turn, execution.invocation.waitDeadline)
         var obj = result.deliveryFields()
-        obj.merge([
-            "tool": .string("mac.notify"),
-            "surface": .string(surface),
-            "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
-        ]) { _, new in new }
+        obj.merge(Self.notificationEcho(note)) { _, new in new }
+        obj.merge(["tool": .string("mac.notify"), "surface": .string(surface)]) { _, new in new }
         return .object(obj)
     }
 
     public static func mobileNotify(input: [String: JSONValue], surface: String, toolName: String, turn: Turn,
-        sender: (String, String, [String: String], Turn) async throws -> AttentionOutcome
+        sender: (NativeAgentNotificationDefaults.Note, [String: String], Turn) async throws -> AttentionOutcome
     ) async throws -> JSONValue {
         let input = input.filter { $0.value != .string("") }
-        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: toolName)
+        let note = try NativeAgentNotificationDefaults.parseInput(input, toolName: toolName)
         let screen = input["screen"]?.scalarText ?? "inbox"
         let source = input["source"]?.scalarText ?? "chat_tool"
         let urgency = input["urgency"]?.scalarText ?? "normal"
@@ -284,18 +283,27 @@ public final class AppToolExecutor: ChatToolExecuting {
             .trimmingCharacters(in: .whitespacesAndNewlines), !sessionId.isEmpty {
             userInfo["sessionId"] = sessionId
         }
-        let outcome = try await sender(title, message, userInfo, turn)
+        let outcome = try await sender(note, userInfo, turn)
         var obj = try outcome.phoneDeliveryFields()
+        obj.merge(Self.notificationEcho(note)) { _, new in new }
         obj.merge([
             "tool": .string("mobile.notify"),
             "surface": .string(surface),
             "screen": .string(screen),
             "source": .string(source),
             "urgency": .string(urgency),
-            "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
         ]) { _, new in new }
         return .object(obj)
+    }
+
+    /// What a notification receipt says back of what it was given: title, subtitle when one was given, and the message's start.
+    public static func notificationEcho(_ note: NativeAgentNotificationDefaults.Note) -> [String: JSONValue] {
+        var echo: [String: JSONValue] = [
+            "title": .string(NativeAppSecretRedactor.redactText(note.title)),
+            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(note.message).prefix(200))),
+        ]
+        if let subtitle = note.subtitle { echo["subtitle"] = .string(NativeAppSecretRedactor.redactText(subtitle)) }
+        return echo
     }
 
     // MARK: - Health
@@ -323,8 +331,8 @@ public final class AppToolExecutor: ChatToolExecuting {
         if action.isFold || action.id == "agent.verify" {
             guard let perform = execution.perform else {
                 return Self.doorRefusal("door_unavailable",
-                    "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing ran.",
-                    remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
+                    "This call did not come from inside a chat turn, so it has no gate to pass. Nothing ran.",
+                    remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
             }
             // Preview contact sends under agent_message's own gates.
             if action.id == "agent.verify" {
@@ -348,6 +356,13 @@ public final class AppToolExecutor: ChatToolExecuting {
             }
             do {
                 let result = try await perform(action.tool, call, turn, execution)
+                // Home does not tell the agent of a Desk change its own mind just made: a turn a model is running, not the person's tap and
+                // not another agent's call that reached this tool without her.
+                if action.id.hasPrefix("desk."), turn.personAct == nil, turn.admission != nil, case .object(let done) = result,
+                   done["status"] == .string("ok"),
+                   let handle = done["handle"]?.stringValue {
+                    await AgentScreen.sawOwnDeskChange(handle, dataRoot: securityCenter.dataRoot)
+                }
                 if action.partAction, execution.valueCall?.id != action.tool,
                    case .object(let fields) = result, let returned = fields["returned"] {
                     var answer: [String: JSONValue] = if case .object(let answer) = returned { answer } else { ["result": returned] }
@@ -497,8 +512,8 @@ public final class AppToolExecutor: ChatToolExecuting {
         case "agent_job" where action.id == "agent.apply":
             // The merge re-enters the chain as the agent's own git call, so git's gates, Trust key and cards judge it; a card it files replays that git call.
             guard let perform = execution.perform else {
-                return Self.doorRefusal("door_unavailable", "This call did not come through a chat's tool chain, so it has no git to merge with. Nothing ran.",
-                    remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
+                return Self.doorRefusal("door_unavailable", "This call did not come from inside a chat turn, so it has no git to merge with. Nothing ran.",
+                    remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
             }
             let session = input["__session_id"]?.scalarText
             return await AgentJobs.apply(input["job"]?.scalarText ?? "", dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()) {

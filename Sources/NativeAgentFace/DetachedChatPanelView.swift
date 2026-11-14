@@ -165,10 +165,7 @@ struct DetachedChatPanelView: View {
 
     private var document: some View {
         TranscriptDocumentView(sessionID: sessionId, bottomInset: turnCardHeight, handle: transcriptHandle)
-            .environment(\.transcriptOpenSettings) { [inlineCards, appModel] in
-                do { try inlineCards.openPage(.settings) }
-                catch { appModel.setFailureStatus(error, action: "open Settings") }
-            }
+            .environment(\.transcriptOpenSettings) { [inlineCards] in inlineCards.openPage(.settings) }
     }
 
     /// This session's turn card, faded in and out; its measured height (zero when hidden) is the document's bottom inset.

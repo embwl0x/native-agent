@@ -192,7 +192,9 @@ public actor MacChatTurnTranscriptProofReader {
                 case (_, .string?): return .incomplete
                 default: return .absent
                 }
-            case "failed" where !partial && !canceled:
+            case "failed" where !partial && !canceled,
+                 // A failed turn's saved words are its partial row.
+                 "partial" where partial && !canceled:
                 return .failed
             case "cancelled" where partial && canceled:
                 return .canceled
@@ -230,7 +232,7 @@ public enum MacChatTurnLifecycleRestartRepair {
         case .incomplete:
             kind = .outcomeUnknown(reason: "This reply was saved, but the turn did not finish.")
         case .failed: kind = .failed(reason: nil)
-        case .canceled: kind = .cancellationConfirmed
+        case .canceled: kind = .cancellationConfirmed(reason: nil)
         case .absent, .unavailable:
             if hasCheckpoint { return restored }
             kind = .outcomeUnknown(reason: "This reply did not finish before the app restarted.")

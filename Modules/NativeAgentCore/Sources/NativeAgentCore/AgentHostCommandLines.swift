@@ -70,7 +70,9 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
             let text = object[reply] as? String
             if object[status] as? String != success || fields["error"].map({ object[$0] as? Bool != false }) == true {
                 let errors = fields["errors"].flatMap { object[$0] as? [String] } ?? []
-                return (nil, ([object[status] as? String, text].compactMap { $0 } + errors).joined(separator: "\n"), confirmed)
+                // A run can end with its success word and its error mark both set: the word then says nothing of the failure.
+                let ending = (object[status] as? String).flatMap { $0 == success ? nil : $0 }
+                return (nil, ([ending, text].compactMap { $0 } + errors).joined(separator: "\n"), confirmed)
             }
             return (text, nil, confirmed)
         }

@@ -312,7 +312,9 @@ extension AppQuietToolHost {
             refresh: {
                 switch await appModel.engine.providers.refreshSettings(refreshCatalog: true, cause: UserFacingError.cause) {
                 case .loaded(let snapshot):
-                    return (snapshot.providers, nil)
+                    // A read that loaded can still carry lists that were not fetched; they are named, never reported as fetched.
+                    let failed = snapshot.catalog?.catalogFreshness == ModelCatalogFreshness.staleAfterFailedRefresh.rawValue
+                    return (snapshot.providers, snapshot.catalogError ?? (failed ? snapshot.catalog?.catalogNote ?? "a model list was not fetched" : nil))
                 case .failed(let detail): return ([], detail)
                 }
             }, cancelRefresh: { await appModel.engine.providers.cancelCatalogRefresh() },

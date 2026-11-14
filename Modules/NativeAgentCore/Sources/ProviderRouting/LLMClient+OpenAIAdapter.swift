@@ -4,12 +4,12 @@ import PersistenceCore
 
 // Blueprint: | `LLMClient+OpenAIAdapter.swift` | `OpenAITransport`: checked API transport and message encoding |
 
-/// GPT-6 requires Responses; other declared models use Chat Completions.
+/// A declared model that serves only through Responses (GPT-6, the Pro rows) goes there; other declared models use Chat Completions.
 public final class OpenAITransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
-    /// Both OpenAI wires send exactly the remaining per-turn cap, when bound.
+    /// Both OpenAI wires send one request's allowance while a run's budget is bound (`budgetedOutputTokens`), else no cap.
     public func requestOutputTokens(model: String, call: LLMCall) throws -> Int {
-        call.turn?.tokenBudget?.available ?? 0
+        FirstPartyExecutionControls.budgetedOutputTokens(model: model, providerID: providerId, call: call, dataRoot: credentialRoot) ?? 0
     }
 
     public let providerId: String = "openai"
@@ -97,7 +97,7 @@ public final class OpenAITransport: LLMTransport {
                 }
             }
         }
-        guard hasImage || hasToolBlocks || OpenAIExecutionControls.usesResponses(model: model) else {
+        guard hasImage || hasToolBlocks || OpenAIExecutionControls.usesResponses(model: model, dataRoot: credentialRoot) else {
             let flattened = try llmCompatibilityPrompt(messages: messages) { role in
                 role == .user ? "USER:" : "ASSISTANT:"
             }
@@ -117,7 +117,7 @@ public final class OpenAITransport: LLMTransport {
         model: String,
         tools: [LLMToolSchema]?, call: LLMCall
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
-        if OpenAIExecutionControls.usesResponses(model: model) {
+        if OpenAIExecutionControls.usesResponses(model: model, dataRoot: credentialRoot) {
             return streamResponses(messages: messages, system: system, model: model, tools: tools, call: call)
         }
         let session = self.session
@@ -149,7 +149,7 @@ public final class OpenAITransport: LLMTransport {
                         "stream_options": ["include_usage": true],
                     ]
                     try Self.applyTools(to: &body, tools: tools)
-                    try OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model, call: call)
+                    try OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model, call: call, dataRoot: credentialRoot)
                     if call.turn?.tokenBudget != nil {
                         body["max_completion_tokens"] = try self.requestOutputTokens(model: model, call: call)
                     }
@@ -206,8 +206,11 @@ public final class OpenAITransport: LLMTransport {
         req.httpMethod = "POST"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         applyStreamingLLMHeaders(to: &req)
+        // The route's effective row (listed by OpenAI for this key, else shipped) owns the public controls.
+        let row = FirstPartyModelCatalog.descriptor(for: model, providerID: "openai", dataRoot: credentialRoot)
         var body = try ChatGPTTransport.buildResponsesBodyFromMessages(
-            model: model, messages: messages, system: system, tools: tools, transport: .publicAPI, call: call
+            model: model, messages: messages, system: system, tools: tools, transport: .publicAPI,
+            supportedEfforts: row?.supportedReasoningEfforts ?? [], supportsFast: row?.supportsFast ?? false, call: call
         )
         body["prompt_cache_options"] = ["ttl": "30m"]
         if call.turn?.tokenBudget != nil {

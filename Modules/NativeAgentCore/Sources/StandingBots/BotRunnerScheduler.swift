@@ -166,7 +166,7 @@ public actor BotRunnerScheduler {
                 defer { self.finished(id) }
                 do {
                     let holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { claimed in
-                        try await self.holdUnattendedRun(bot: id, paused: claimed.paused)
+                        try await self.holdUnattendedRun(bot: id, request: nil, paused: claimed.paused)
                     }
                     if try await runner.run(bot: id, parent: nil, scope: BotRunScope(), holdUnattended: holdUnattended) != nil {
                         try self.completed(id)
@@ -202,7 +202,7 @@ public actor BotRunnerScheduler {
                     if !enabled || paused {
                         try queue.rejectPending(bot: id, requestID: requestID,
                             detail: enabled ? "The bot is paused. No helper turn ran." : "Autonomy is off. No helper turn ran.")
-                        try events.hold(bot: id, detail: enabled ? "the bot is paused" : "Autonomy is off")
+                        try events.hold(bot: id, request: requestID, detail: enabled ? "the bot is paused" : "Autonomy is off")
                         continue
                     }
                 }
@@ -210,7 +210,7 @@ public actor BotRunnerScheduler {
                 let isEvent = request.isEvent
                 let holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { claimed in
                     guard isEvent else { return false }
-                    return try await self.holdUnattendedRun(bot: id, paused: claimed.paused)
+                    return try await self.holdUnattendedRun(bot: id, request: requestID, paused: claimed.paused)
                 }
                 inFlight[id] = Task {
                     defer { self.finished(id) }
@@ -231,12 +231,13 @@ public actor BotRunnerScheduler {
     // MARK: - Outcomes
 
     /// Recheck after the claim wait using its locked definition; record any hold before spending.
-    private func holdUnattendedRun(bot id: UUID, paused: Bool) async throws -> Bool {
+    private func holdUnattendedRun(bot id: UUID, request: UUID?, paused: Bool) async throws -> Bool {
         let enabled = await isAutonomyEnabled()
         guard Task.isCancelled || !enabled || paused else { return false }
         let detail = Task.isCancelled ? "Background work stopped" : (enabled ? "the bot is paused" : "Autonomy is off")
         lastUnattendedHold[id] = enabled ? (.notRun, detail) : (.autonomyOff, nil)
-        try events.hold(bot: id, detail: detail)
+        // A scheduled occurrence has no request, so it never touches event evidence.
+        if let request { try events.hold(bot: id, request: request, detail: detail) }
         return true
     }
 

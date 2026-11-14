@@ -48,6 +48,13 @@ public struct ProviderModelInfo: Codable, Hashable, Identifiable, Sendable {
     public var supports_fast: Bool? = nil
     /// Why this row's controls cannot yet be selected; nil when declared.
     public var controls_note: String? = nil
+    /// False for a row the build knows that stands where the provider's list is missing: its contract still runs, shows and adjusts the model,
+    /// but no picker offers it. Nil and true are offered.
+    public var offered: Bool? = nil
+    /// What a picker shows beside such a row when it is a slot's current model ("Saved. Anthropic has not listed it yet.").
+    public var offer_note: String? = nil
+
+    public var isOffered: Bool { offered != false }
 
     public init(
         id: String,
@@ -62,7 +69,9 @@ public struct ProviderModelInfo: Codable, Hashable, Identifiable, Sendable {
         default_reasoning_effort: String? = nil,
         supported_reasoning_efforts: [String]? = nil,
         supports_fast: Bool? = nil,
-        controls_note: String? = nil
+        controls_note: String? = nil,
+        offered: Bool? = nil,
+        offer_note: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -77,6 +86,8 @@ public struct ProviderModelInfo: Codable, Hashable, Identifiable, Sendable {
         self.supported_reasoning_efforts = supported_reasoning_efforts
         self.supports_fast = supports_fast
         self.controls_note = controls_note
+        self.offered = offered
+        self.offer_note = offer_note
     }
 }
 
@@ -115,6 +126,27 @@ public struct ProviderInfo: Codable, Hashable, Identifiable, Sendable {
         self.connectionRevision = connectionRevision
     }
 
+    /// The rows a picker lists: the ones the provider offers.
+    public var offeredModels: [ProviderModelInfo] { models.filter(\.isOffered) }
+}
+
+/// The one question every model choice asks.
+public enum ModelSlot {
+    /// May this slot hold this model? Yes when its row is offered, or when it is the model already in the slot (saved there or inherited into it):
+    /// re-saving it with other Think or Fast is not a choice. `rowOffered` is the model's row's flag, nil when the account has no row for it.
+    public static func mayHold(_ model: String, rowOffered: Bool?, savedInSlot: String?) -> Bool {
+        guard let rowOffered else { return false }
+        return rowOffered || (!model.isEmpty && model == savedInSlot)
+    }
+
+    public static func mayHold(_ model: String, row: ProviderModelInfo?, savedInSlot: String?) -> Bool {
+        mayHold(model, rowOffered: row?.isOffered, savedInSlot: savedInSlot)
+    }
+
+    /// The refusal a choice of a not-offered model gets: the account's own sentence.
+    public static func refusal(note: String?, accountName: String) -> String {
+        "No models to choose yet: " + (note ?? "\(accountName) has not listed its models. Refresh to try again.")
+    }
 }
 
 extension ProviderInfo {

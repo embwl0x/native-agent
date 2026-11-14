@@ -3,7 +3,7 @@
  "id":"native-memories", "kind":"ability", "version":1,
  "reach":{"capabilities":[],"readPaths":[],"hosts":[],"apps":[]},
  "face":{"projection":true},
- "record":{"description":"Draw the Memories page from the memory owner's packet: what I keep, what is waiting, what search found, what I let go, and every gap by name.","actions":[],"inputSchema":{"type":"object","required":["kept","waiting","query","search","rejected","misses","statusFailures","total","momentSource","clusters","keys"]}}
+ "record":{"description":"Draw the Memories page from the memory owner's packet: what I keep, what is waiting, what search found, what I let go, and every gap by name.","actions":[],"inputSchema":{"type":"object","required":["kept","waiting","rejected","misses","statusFailures","momentSource","clusters","keys"]}}
 }
 */
 function face(input) {
@@ -42,14 +42,19 @@ function face(input) {
         return (head || window.join("")) + "…";
     }
     const line = (text, limit) => bounded(plain(text), limit);
+    // Where a memory came from, read from the run that wrote it: a few words for the row's value and the sentence its detail tells.
     function provenance(source) {
         const raw = source === null ? "" : source.trim().toLowerCase();
-        if (raw === "manual" || raw === "user") return "Shared by you";
-        if (raw.startsWith("chat.commit_memory") || raw.startsWith("commit_memory")) return "I wrote it down myself";
-        if (raw.startsWith(input.momentSource)) return "I kept it from something that happened";
-        if (raw.startsWith("adaptive-promoter") || raw.startsWith("semantic-adaptive-extractor")) return "I picked it up while we talked";
-        if (raw.startsWith("consolidat") || raw.startsWith("hygiene")) return "I tidied it up from older notes";
-        return "I don't remember where this came from";
+        if (raw === "manual" || raw === "user") return {words: "you said", sentence: "Shared by you"};
+        if (raw.startsWith("chat.commit_memory") || raw.startsWith("commit_memory")) return {words: "I wrote it", sentence: "I wrote it down myself"};
+        if (raw.startsWith(input.momentSource)) return {words: "a moment", sentence: "I kept it from something that happened"};
+        if (raw.startsWith("adaptive-promoter") || raw.startsWith("semantic-adaptive-extractor") || raw.startsWith("memory-manager")) {
+            return {words: "picked up", sentence: "I picked it up while we talked"};
+        }
+        if (raw.startsWith("standing-correction")) return {words: "you corrected me", sentence: "You corrected me"};
+        if (raw.startsWith("dream:")) return {words: "a dream", sentence: "It came to me while dreaming"};
+        if (raw.startsWith("consolidat") || raw.startsWith("hygiene")) return {words: "tidied up", sentence: "I tidied it up from older notes"};
+        return {words: null, sentence: "I don't remember where this came from"};
     }
     // Who else's words a memory holds travels beside it, each name one clean line of at most 160 characters.
     function attributed(text, sources) {
@@ -63,14 +68,15 @@ function face(input) {
         if (memory.pinned) meta.push("Pinned");
         if (memory.lifecycle === "graduated") meta.push("graduated → GROWTH");
         if (!memory.atReadable) meta.push("when, I'm not sure");
-        meta.push(attributed(provenance(memory.source), memory.from));
+        const from = provenance(memory.source);
+        meta.push(attributed(from.sentence, memory.from));
         // Under it, the moments I came to know it, each with its own date: all of them up to three, past three the earliest, the latest and how
         // many more, so the row says it whole in four lines.
         const roots = memory.roots, count = roots.length;
         const told = count <= 3 ? roots.map(root => root.line) : [roots[0].line, roots[count - 1].line, "+" + (count - 2) + " more"];
         const detail = [meta.join(" · ")].concat(told).join("\n");
         const id = "memory:" + memory.id, excerpt = line(memory.text, 96);
-        const row = {id, title: excerpt || "An empty note", detail, open: keys[id].open,
+        const row = {id, title: excerpt || "An empty note", detail, value: from.words, open: keys[id].open,
             actions: [memory.pinned ? {id: "unpin", label: "Unpin"} : {id: "pin", label: "Pin to the top"}]};
         if (memory.at !== null) row.at = memory.at;
         if (memory.pinned) row.symbol = "pin.fill";
@@ -86,17 +92,37 @@ function face(input) {
         });
     }
     const issue = (id, title, reason) => ({id: id + "-error", style: "list", rows: [{id: id + "-error", title, detail: reason, tone: "failed"}]});
-    // A list longer than a section holds continues in untitled sections of its own.
-    function list(id, title, rows) {
+    // A list longer than a section holds continues in untitled sections of its own; a folded list names each part, since each folds to its title.
+    function list(id, title, rows, folded) {
         const out = [];
         for (let i = 0; i < rows.length; i += 256) {
-            out.push(i === 0 ? {id, title, style: "list", rows: rows.slice(0, 256)} : {id: id + "-" + i, style: "list", rows: rows.slice(i, i + 256)});
+            const part = i === 0 ? {id, title, style: "list", rows: rows.slice(0, 256)} : {id: id + "-" + i, style: "list", rows: rows.slice(i, i + 256)};
+            if (folded) { part.title = title; part.folded = true; }
+            out.push(part);
         }
         return out;
     }
+    // What I've kept, by when its row's time falls: each span one row holding its count and its memories, newest first; a memory whose time
+    // cannot be read is Earlier.
+    function spans(memories) {
+        return [["kept-today", "Today", "sun.max", "today"], ["kept-week", "This week", "calendar", "week"],
+            ["kept-earlier", "Earlier", "clock.arrow.circlepath", null]].map(([id, title, symbol, when]) => {
+            const held = memories.filter(memory => when === null ? memory.when !== "today" && memory.when !== "week" : memory.when === when);
+            return {id, title, symbol, value: String(held.length), rows: held.map(memoryRow)};
+        }).filter(span => span.rows.length);
+    }
+    const total = input.statusFailures.length === 0 && input.total !== null ? input.total : null;
 
     const sections = [];
     if (input.kept.state === "unavailable") sections.push(issue("kept", "Saved memories unavailable", input.kept.reason));
+    else {
+        // How many I remember is the store's own count, unknown when its status could not be read; pinned and this week count the memories read here.
+        const memories = input.kept.memories, pinned = memories.filter(memory => memory.pinned).length;
+        const week = memories.filter(memory => memory.when === "today" || memory.when === "week").length;
+        sections.push({id: "readout", style: "list", rows: [{id: "readout", symbol: "brain.head.profile",
+            title: total === null ? "I can't read how many things I remember" : "I remember " + total + (total === 1 ? " thing" : " things"),
+            detail: pinned + " pinned · " + week + " this week"}]});
+    }
     if (input.waiting.state === "unavailable") sections.push(issue("waiting", "Proposals unavailable", input.waiting.reason));
     else sections.push(...list("waiting", "Waiting for you", input.waiting.proposals.map(proposal => ({id: "proposal:" + proposal.id,
         title: proposal.content, detail: proposal.kind === "correction" ? "Correction" : "Fact", at: proposal.createdAt, tone: "attention"}))));
@@ -119,8 +145,10 @@ function face(input) {
     } else if (input.kept.state === "available") {
         const all = ordered(input.kept.memories);
         const pinned = all.filter(memory => memory.pinned), recent = all.filter(memory => !memory.pinned);
-        if (pinned.length) sections.push({id: "pinned", title: "Pinned", style: "list", rows: pinned.map(memoryRow)});
-        if (recent.length) sections.push({id: "recent", title: "What I've kept", style: "list", rows: recent.map(memoryRow)});
+        // Every pin is drawn: a section holds 256 rows, so more pins continue in the next one.
+        for (let at = 0; at < pinned.length; at += 256) sections.push({id: at ? "pinned:" + at : "pinned",
+            title: at ? "Pinned, continued" : "Pinned", style: "list", rows: pinned.slice(at, at + 256).map(memoryRow)});
+        if (recent.length) sections.push({id: "recent", title: "What I've kept", style: "list", rows: spans(recent)});
         else if (!all.length) sections.push({id: "empty", style: "note", rows: [{id: "empty", title: "It fills up as we talk."}]});
     }
     if (input.rejected.state === "unavailable") {
@@ -129,12 +157,13 @@ function face(input) {
     } else {
         sections.push(...list("rejected", "Things I let go", input.rejected.proposals.map(proposal => ({id: "rejected:" + proposal.id,
             title: line(proposal.content, 96), detail: "I didn't keep this", at: proposal.createdAt, tone: "quiet",
-            open: keys["rejected:" + proposal.id].open}))));
+            open: keys["rejected:" + proposal.id].open})), false));
     }
     // Corrections by lesson, this week against last; the newest correction's words ride its lesson. A ledger that could not be read says so.
     if (input.misses.state === "unavailable") sections.push(issue("misses", "Corrections unavailable", input.misses.reason));
     else if (!input.misses.lessons.length) {
-        sections.push({id: "misses", title: "Misses", style: "list", rows: [{id: "misses-none", title: "No corrections this week or last.", tone: "quiet"}]});
+        sections.push({id: "misses", title: "Misses", style: "list",
+            rows: [{id: "misses-none", title: "No corrections this week or last.", tone: "quiet"}]});
     } else {
         sections.push(...list("misses", "Misses", input.misses.lessons.map(lesson => {
             const row = {id: "miss:" + lesson.lesson, title: line(lesson.lesson, 96) || "An unnamed lesson",
@@ -145,7 +174,7 @@ function face(input) {
                 row.at = lesson.latest.at;
             }
             return row;
-        })));
+        }), false));
     }
     for (const failure of input.statusFailures) sections.push(issue("status-" + failure.endpoint, failure.label, failure.reason));
     sections.push({id: "details", title: "Upkeep and details", style: "list", rows: [
@@ -156,8 +185,7 @@ function face(input) {
     ]});
     let pageLine = "Saved memories could not be read.";
     if (input.kept.state === "available") {
-        const total = input.statusFailures.length === 0 && input.total !== null ? " of " + input.total + " saved" : " · total unavailable";
-        pageLine = input.kept.memories.length + " memories loaded" + total + ".";
+        pageLine = input.kept.memories.length + " memories loaded" + (total === null ? " · total unavailable" : " of " + total + " saved") + ".";
     }
     return {title: "Memories", line: pageLine, sections};
 }

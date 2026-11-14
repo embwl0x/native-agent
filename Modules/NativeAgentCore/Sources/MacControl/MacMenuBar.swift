@@ -24,8 +24,8 @@ public enum MacMenuBar {
         /// Child-index addresses stay private; the model names paths rather than AX bookkeeping.
         public let path: [Int]
         public let enabled: Bool?
-        /// Submenu openers remain actionable so callers can discover and enter deeper paths.
-        public let hasSubmenu: Bool
+        /// Nil when an unrelated sibling's children were not read; submenu openers remain actionable.
+        public let hasSubmenu: Bool?
         public let commandKey: String?
         public let attributeGaps: [String]
 
@@ -33,7 +33,7 @@ public enum MacMenuBar {
             titlePath: [String],
             path: [Int],
             enabled: Bool?,
-            hasSubmenu: Bool,
+            hasSubmenu: Bool?,
             commandKey: String? = nil,
             attributeGaps: [String] = []
         ) {
@@ -175,26 +175,25 @@ public enum MacMenuBar {
                     guard let title, !title.isEmpty else { continue }
                     if titles.isEmpty {
                         // Each top-level menu gets its own budget; explicit paths restrict it to the named branch.
-                        if let wantedTop, !normalized(title).contains(wantedTop) { continue }
+                        if wantedPath == nil, let wantedTop, !normalized(title).contains(wantedTop) { continue }
                         inMenu = 0
                     }
                     let names = titles + [title]
-                    if let wantedPath {
-                        guard names.count <= wantedPath.count,
-                              names.map(normalized) == Array(wantedPath.prefix(names.count)) else { continue }
-                    }
+                    let followsPath = wantedPath.map { names.map(normalized) == Array($0.prefix(names.count)) } ?? true
                     // Record the AXMenu child’s actual offset; assuming zero could press a different item.
                     var submenu: (offset: Int, element: MacAXElementRef)?
-                    for (offset, candidate) in try children(child).enumerated() {
-                        guard nodeCount < maxNodes else { truncated = true; break }
-                        nodeCount += 1
-                        if try attributes(candidate, path: indexPath + [offset]).role == "AXMenu" { submenu = (offset, candidate); break }
+                    if followsPath {
+                        for (offset, candidate) in try children(child).enumerated() {
+                            guard nodeCount < maxNodes else { truncated = true; break }
+                            nodeCount += 1
+                            if try attributes(candidate, path: indexPath + [offset]).role == "AXMenu" { submenu = (offset, candidate); break }
+                        }
                     }
                     let item = Item(
                         titlePath: names,
                         path: indexPath,
                         enabled: observed.enabled,
-                        hasSubmenu: submenu != nil,
+                        hasSubmenu: followsPath ? submenu != nil : nil,
                         commandKey: observed.menuCommandKey,
                         attributeGaps: observed.attributeGaps
                     )
@@ -204,6 +203,7 @@ public enum MacMenuBar {
                         done = true
                         break
                     }
+                    guard followsPath else { continue }
                     if wantedPath?.count == names.count {
                         // Target and same-level siblings establish identity; descendants cannot change it.
                         continue
@@ -231,8 +231,7 @@ public enum MacMenuBar {
 
     public enum Resolution: Sendable, Equatable {
         case matched(Item)
-        /// Misses offer observed same-depth alternatives so the caller can repair the path.
-        case notFound(nearest: [String])
+        case notFound
         case ambiguous(candidates: [String])
         /// Disabled commands differ from absent ones; report them to prevent futile retries.
         case disabled(Item)
@@ -303,14 +302,14 @@ public enum MacMenuBar {
         // Normalize both sides so printed paths with ellipses can be passed back unchanged.
         let selected = selection(raw)
         let wanted = components(selected.path).map(normalized)
-        guard !wanted.isEmpty else { return .notFound(nearest: topLevelNames(items)) }
+        guard !wanted.isEmpty else { return .notFound }
         func levels(_ item: Item) -> [String] { item.titlePath.map(normalized) }
 
         let sameDepth = items.filter { $0.titlePath.count == wanted.count }
         let hits = uniqueCommands(sameDepth.filter { levels($0) == wanted }, prefer: prefer)
         if let occurrence = selected.occurrence {
             guard hits.indices.contains(occurrence - 1) else {
-                return .notFound(nearest: hits.map { choice($0, among: hits) })
+                return .notFound
             }
             let item = hits[occurrence - 1]
             guard let enabled = item.enabled else { return .unavailable(item) }
@@ -323,7 +322,7 @@ public enum MacMenuBar {
         if hits.count > 1 {
             return .ambiguous(candidates: hits.map { choice($0, among: hits) })
         }
-        return .notFound(nearest: nearest(to: wanted, among: items))
+        return .notFound
     }
 
     /// Ellipses and surrounding space are presentation rather than the spoken command name.
@@ -338,22 +337,30 @@ public enum MacMenuBar {
         items.filter { $0.titlePath.count == 1 }.map(\.display)
     }
 
-    /// Observed alternatives make missing paths recoverable.
-    static func nearest(to wanted: [String], among items: [Item], limit: Int = 10) -> [String] {
-        let sameDepth = items.filter { $0.titlePath.count == wanted.count }
-        let pool = sameDepth.isEmpty ? items.filter { $0.titlePath.count == 1 } : sameDepth
-        guard let head = wanted.first.map(normalized) else {
-            return Array(pool.prefix(limit).map(\.display))
+    /// Offer the deepest matched submenu's children in observed order, naming any leaf that blocked descent.
+    static func missingPathContext(for wanted: [String], among items: [Item], limit: Int = 10) -> (paths: [String], leaf: String?) {
+        let levels = wanted.map(normalized)
+        var parent: [String] = []
+        var leaf: Item?
+        for item in items {
+            let path = item.titlePath.map(normalized)
+            guard path.count < levels.count, path == Array(levels.prefix(path.count)) else { continue }
+            if item.hasSubmenu == true, path.count > parent.count {
+                parent = path
+            } else if item.hasSubmenu == false, path.count > (leaf?.titlePath.count ?? 0) {
+                leaf = item
+            }
         }
-        // Prefer the correctly named first level so one typo does not return the whole menu bar.
-        let sameBranch = pool.filter { normalized($0.titlePath.first ?? "").hasPrefix(head) }
-        let chosen = sameBranch.isEmpty ? pool : sameBranch
-        return Array(chosen.prefix(limit).map(\.display))
+        let paths = Array(items.lazy.filter {
+            $0.titlePath.count == parent.count + 1 && $0.titlePath.dropLast().map(normalized) == parent
+        }.prefix(limit).map(\.display))
+        // A same-named submenu can coexist with a leaf; only a deeper leaf proves descent stopped there.
+        return (paths, leaf.flatMap { $0.titlePath.count > parent.count ? $0.display : nil })
     }
 
     // MARK: - Words and JSON
 
-    public static func words(for resolution: Resolution, requested raw: String) -> String? {
+    public static func words(for resolution: Resolution, requested raw: String, among items: [Item]) -> String? {
         func safe(_ title: String) -> String {
             if case .string(let text) = MacScreenViewTextRedaction.redactedLegendString(
                 title, valueChars: pathChars(findPathDepth) + 24
@@ -372,12 +379,15 @@ public enum MacMenuBar {
             return "\"\(safe(raw))\" matches more than one menu path — "
                 + candidates.map(safe).joined(separator: ", ")
                 + ". Use a displayed choice including its [first]/[second] suffix, or its key chord if one is shown."
-        case .notFound(let nearest):
-            guard !nearest.isEmpty else {
-                return "There is no \"\(safe(raw))\" in this app's menu bar. Read the menu again and use a path it shows."
+        case .notFound:
+            let missing = missingPathContext(for: components(selection(raw).path), among: items)
+            let leafWords = missing.leaf.map { "\"\(safe($0))\" is a leaf item with no submenu. " } ?? ""
+            let message = "I couldn't find \"\(safe(raw))\" in this app's menu bar. " + leafWords
+            guard !missing.paths.isEmpty else {
+                return message + "No alternative item titles were read. Read the menu again."
             }
-            return "There is no \"\(safe(raw))\" in this app's menu bar. What is there: "
-                + nearest.map(safe).joined(separator: ", ") + ". Read the menu again and choose an exact path."
+            return message + "What is there: "
+                + missing.paths.map(safe).joined(separator: ", ") + ". Read the menu again and choose an exact path."
         }
     }
 
@@ -406,7 +416,7 @@ public enum MacMenuBar {
                 ),
             ]
             if statesKnown { row["enabled"] = item.enabled.map(JSONValue.bool) ?? .null }
-            if item.hasSubmenu { row["opens_submenu"] = .bool(true) }
+            if item.hasSubmenu == true { row["opens_submenu"] = .bool(true) }
             if !item.attributeGaps.isEmpty { row["attribute_gaps"] = .array(item.attributeGaps.map(JSONValue.string)) }
             return .object(row)
         })

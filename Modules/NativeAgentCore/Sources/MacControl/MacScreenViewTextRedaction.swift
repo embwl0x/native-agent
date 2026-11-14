@@ -514,6 +514,14 @@ public enum MacScreenViewTextRedaction {
         let names = MacScreenViewBuilder.LabelIndex(nodes)
         // If indexing exceeds the share’s deadline, mask the whole window rather than disclose unchecked pixels.
         guard Date() < deadline else { return nil }
+        // A text element with an unread attribute may hold a secret, or be a caption nobody could read. Elsewhere an app answers "failure" for
+        // what it does not have (a window's value, an image's description, a button's subrole): there are no words there to cover.
+        // An unread title is unread words on any element: a group's title can caption all it holds.
+        let unread = nodes.filter { node in
+            let gaps = node.attributes.attributeGaps
+            return !gaps.isEmpty && (MacAXAttributeRead.textValueRoles.contains(node.attributes.role)
+                || gaps.contains { $0.hasPrefix("AXTitle:") })
+        }
         var frames: [MacAXFrame] = []
         for node in nodes {
             guard Date() < deadline else { return nil }
@@ -528,7 +536,16 @@ public enum MacScreenViewTextRedaction {
             }
             let control = MacScreenViewBuilder.isMarkable(attributes)
             let name = control ? MacScreenViewBuilder.inferLabel(for: node, in: names).label : attributes.title
-            if !attributes.attributeGaps.isEmpty || withheld(name, under: nil) || withheld(attributes.value, under: name)
+            // Whatever an unread element could name is covered with it: what it holds, a row or cell named by what it holds, and what
+            // sits where its words would be the label.
+            let underUnread = unread.contains { other in
+                guard other.path != node.path else { return true }
+                guard let caption = other.attributes.frame else { return true }
+                return isStrictAncestor(other.path, of: node.path)
+                    || (MacLookHandle.contentIdentityRoles.contains(attributes.role) && isStrictAncestor(node.path, of: other.path))
+                    || labelDistance(caption, forValueAt: frame, proximity: proximityPoints) != nil
+            }
+            if underUnread || withheld(name, under: nil) || withheld(attributes.value, under: name)
                 || (control && MacScreenViewBuilder.isSecretField(role: attributes.role, subrole: attributes.subrole,
                         label: name, value: attributes.value)) {
                 frames.append(frame)

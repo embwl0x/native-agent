@@ -621,7 +621,15 @@ extension TelegramPollLoop {
             await recordError(context: "chat_handler", error: String(describing: error), update: update, message: message, text: text)
             let notice = Self.chatErrorNotice(for: error)
             await card.transition(.failed(reason: notice))
-            await deliverTurnNotice(notice, delivery: delivery, receiptKind: "error_notice",
+            // The failed turn's saved words go out once in the same delivery, closed by its notice.
+            var words = ""
+            do {
+                if let saved = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot,
+                    sessionId: sessionId, runId: turnId.uuidString), saved.terminalState == .failed { words = saved.output }
+            } catch {
+                await recordError(context: "saved_partial_read", error: String(describing: error), update: update, message: message, text: text)
+            }
+            await deliverTurnNotice([words, notice].filter { !$0.isEmpty }.joined(separator: "\n\n"), delivery: delivery, receiptKind: "error_notice",
                 sendErrorContext: "send_error_notice", update: update, message: message, text: text)
         }
         await settle { [readBy, silent] in

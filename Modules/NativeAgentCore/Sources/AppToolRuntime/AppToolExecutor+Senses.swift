@@ -79,7 +79,7 @@ extension AppToolExecutor {
         guard try await SenseDoor.selectedRecord(for: corner) != nil else { return nil }
         guard let perform = execution.perform else {
             return Self.doorRefusal("door_unavailable", "Read this corner from a chat turn.",
-                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
+                remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
         }
         var args: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
         if item.hasPrefix("{"), case .object(let fields) = try JSONValue.parse(Data(item.utf8)) {

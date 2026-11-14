@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `UserMessageIntentSignals.swift` | `UserMessageIntentSignals`: lexical signals grant no effect authority |
+// Blueprint: | `UserMessageIntentSignals.swift` | `UserMessageIntentSignals`: lexical signals grant no effect authority; the window and the body read one control-phrase match |
 
 /// Pure lexical work and control-handoff recognition; never effect authority.
 public enum UserMessageIntentSignals {

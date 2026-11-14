@@ -69,7 +69,7 @@ struct AgentScreenView: View {
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
             if let snapshot = appModel.face.slot(.page("home")).value(as: PartFaceSnapshot.self) {
                 FaceView(snapshot: snapshot, title: "Home", door: appModel.pageDoor(page: "home", open: open),
-                         session: appModel.pageSessions.page("home"))
+                         session: appModel.pageSessions.page("home"), leaf: { FacePageView.leaf($0) })
                     .onAppear {
                         appModel.pageSessions.page("home").notice = { [weak appModel] words in appModel?.systemToasts.push(success: words) }
                     }

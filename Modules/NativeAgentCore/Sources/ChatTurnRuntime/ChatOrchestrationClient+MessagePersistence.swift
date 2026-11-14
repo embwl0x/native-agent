@@ -420,6 +420,9 @@ extension SwiftNativeChatOrchestrationClient {
             metadata["cancelled"] = .bool(cancelled)
             metadata["untrusted_sources"] = .array((turn.peerSteering?.checkpointSources ?? []).map(JSONValue.string))
             if let responseFailure { metadata["error"] = .string(responseFailure) }
+            // The saved words are an incomplete reply whose turn ended stopped or failed; recovery reads that ending, never a completed answer.
+            metadata["completionState"] = .string("incomplete")
+            metadata["terminalState"] = .string((cancelled ? TurnEngineResult.TerminalState.stopped : .failed).rawValue)
         }
         if awaitingConsumption { metadata["awaitingConsumption"] = .bool(true) }
         if let proactiveSpeechIdempotencyKey {

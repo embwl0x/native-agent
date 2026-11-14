@@ -89,7 +89,7 @@ public enum TranscriptGrouping {
         while let open = rest.range(of: "<tool_use") {
             visible += rest[rest.startIndex..<open.lowerBound]
             let after = rest[open.upperBound...]
-            if let close = after.range(of: "</tool_use>") {
+            if let close = jsonFramedClose(after) ?? after.range(of: "</tool_use>") {
                 rest = after[close.upperBound...]
             } else if let end = after.range(of: ">") {
                 rest = after[end.upperBound...]
@@ -99,5 +99,19 @@ public enum TranscriptGrouping {
         }
         visible += rest
         return visible
+    }
+
+    /// A marker's closing tag read through its arguments, as the call parser frames it: one JSON object runs to its own end and the closing
+    /// marker right after it, so a closing marker inside one of its strings stays in the call. nil leaves the first closing marker.
+    private static func jsonFramedClose(_ after: Substring) -> Range<String.Index>? {
+        guard let tag = after.range(of: ">") else { return nil }
+        let body = after[tag.upperBound...]
+        guard case .closed(_, let closer?)? = JSONByteScanner.objectRead(body, closers: ["</tool_use>"]) else { return nil }
+        let units = body.utf16
+        let lower = units.index(units.startIndex, offsetBy: closer.lowerBound)
+        let upper = units.index(units.startIndex, offsetBy: closer.upperBound)
+        guard after.range(of: "</tool_use>")?.lowerBound != lower,
+              (try? JSONSerialization.jsonObject(with: Data(body[..<lower].utf8))) is [String: Any] else { return nil }
+        return lower..<upper
     }
 }

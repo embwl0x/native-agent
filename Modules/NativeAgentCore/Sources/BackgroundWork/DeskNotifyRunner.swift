@@ -133,7 +133,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         var deferred = Set<String>()
         let nagCount = await publishNags(proposal, read: read, failures: &failures, deferred: &deferred)
         if decisions.isEmpty && nagCount == 0 && released == 0 && failures.isEmpty {
-            return .skipped(reason: "no Desk notification due")
+            return .notNeeded("no Desk notification due")
         }
         // Retain every due decision now; the router owns quiet-hours holding and its release.
         for decision in decisions {

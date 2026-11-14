@@ -81,6 +81,9 @@ extension OwnedProgram {
             /// Nil means the argument list is computed, so its fields cannot be inferred.
             public let given: [Argument]?
         }
+        /// The callable `app({…})` request's own keys. With no `args`, every other key is the action's argument; beside `args`, another key is
+        /// refused. The prelude reads a live call by these same keys.
+        public static let requestKeys = ["action", "args", "preview", "expected_version"]
         public var literal: [Literal] = []
         public var refusals: [String] = []
         public var warnings: [String] = []
@@ -323,7 +326,20 @@ extension OwnedProgram {
                   case .string(let id)? = fields["action"]?.value else {
                 unknownShape("app(request)", line); return
             }
-            let args = fields["args"] ?? .object([:])
+            let others = fields.filter { !Calls.requestKeys.contains($0.key) }
+            let args: Calls.Argument
+            switch fields["args"] {
+            case nil, .value(.null)?: args = .object(others)
+            case .unknown?: args = .unknown
+            case let given?:
+                if !others.isEmpty {
+                    result.refusals.append("""
+                        app({action, args}) at line \(line) takes \(others.keys.sorted().joined(separator: ", ")) inside args, or beside action when \
+                        there is no args.
+                        """)
+                }
+                args = given
+            }
             if case .unknown = args { unknownShape("app args", line) }
             add(id, inferred: true, line: line, given: [args])
         }
@@ -334,7 +350,11 @@ extension OwnedProgram {
             if fields["action"] != nil { doorAction(request, line: line); return }
             guard let batch = fields["actions"] else { return }
             guard case .array(let requests) = batch else { unknownShape("app actions", line); return }
-            for request in requests { doorAction(request, line: line) }
+            // An entry is read as a lone request is: an action is a call; a page, item or find entry is a read.
+            for request in requests {
+                if case .object(let fields) = request, fields["action"] == nil { continue }
+                doorAction(request, line: line)
+            }
         }
         for start in tokens.indices where roots.contains(text(start)) {
             // A property named app is not the bound app object.
@@ -385,12 +405,14 @@ extension OwnedProgram {
                     continue
                 } else if members.count == 1, members[0].contains(".") {
                     add(members[0], inferred: true, line: line, given: given(cursor))
-                } else if members.count == 2, !verbs.contains(members[0]), members[0] != "call", !members[0].contains(".") {
+                } else if !verbs.contains(members[0]), members[0] != "call", !members[0].contains(".") {
+                    // Every form the prelude binds names the id its members join to: the full-segment chain (app.undo(), app.desk.read(),
+                    // app.studio.intake.read()) and a namespace's bracket member, whose dots the namespace dispatches (app.studio["intake.read"]()).
                     add(members.joined(separator: "."), inferred: true, line: line, given: given(cursor))
                 } else {
                     result.refusals.append("""
-                        \(spelling)(…) at line \(line) is not a callable app binding. Use app.<page>.<action>(args), app[\"page.action\"](args), or \
-                        app.call(actionID,args).
+                        \(spelling)(…) at line \(line) is not a callable app binding. Use app.<action id's segments>(args) such as app.desk.read(args), \
+                        app[\"page.action\"](args), or app.call(actionID,args).
                         """)
                 }
             } else if root == "host" {

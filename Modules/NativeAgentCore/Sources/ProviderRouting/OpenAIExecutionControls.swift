@@ -23,7 +23,8 @@ public enum OpenAIExecutionControls {
     }
 
 
-    /// The selected account's checked row for account transports; public API controls belong only to its shipped descriptor. No row means unknown.
+    /// The selected account's checked row for account transports; public API controls belong to the route's effective row (listed by OpenAI for this
+    /// key, else shipped). No row means unknown.
     public static func supportedReasoningEfforts(
         model: String,
         transport: Transport = .publicAPI,
@@ -32,7 +33,7 @@ public enum OpenAIExecutionControls {
     ) -> Set<String> {
         switch transport {
         case .publicAPI:
-            return FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: transport.route).map(Set.init) ?? []
+            return FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: transport.route, dataRoot: dataRoot).map(Set.init) ?? []
         case .chatGPTOAuth, .codexCLI:
             return accountModel(model: model, transport: transport, dataRoot: dataRoot, oauthAuthURL: oauthAuthURL, preview: preview)
                 .map { Set($0.supportedReasoningEfforts) } ?? []
@@ -48,8 +49,8 @@ public enum OpenAIExecutionControls {
         ).first { $0.id == model }
     }
 
-    static func usesResponses(model: String) -> Bool {
-        FirstPartyModelCatalog.descriptor(for: model, providerID: Transport.publicAPI.route)?.usesResponses == true
+    static func usesResponses(model: String, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> Bool {
+        FirstPartyModelCatalog.descriptor(for: model, providerID: Transport.publicAPI.route, dataRoot: dataRoot)?.usesResponses == true
     }
 
     public static func reasoningEffort(
@@ -71,7 +72,8 @@ public enum OpenAIExecutionControls {
                     level.
                     """)
         }
-        return normalized
+        // "default" is the provider's own default: no effort field at all.
+        return normalized == "default" ? nil : normalized
     }
 
     /// Account presets max/ultra map to xhigh on direct Responses, which rejects those literal presets. The CLI retains them for its own preset behavior.
@@ -110,7 +112,7 @@ public enum OpenAIExecutionControls {
         if let supportsFast { declaredFast = supportsFast }
         else {
             switch transport {
-            case .publicAPI: declaredFast = FirstPartyModelCatalog.descriptor(for: model, providerID: transport.route)?.supportsFast
+            case .publicAPI: declaredFast = FirstPartyModelCatalog.descriptor(for: model, providerID: transport.route, dataRoot: dataRoot)?.supportsFast
             case .chatGPTOAuth, .codexCLI:
                 declaredFast = accountModel(model: model, transport: transport, dataRoot: dataRoot, oauthAuthURL: oauthAuthURL, preview: preview)?.supportsFast
             }
@@ -147,14 +149,19 @@ public enum OpenAIExecutionControls {
         }
     }
 
-    static func applyChatCompletionsControls(to body: inout [String: Any], model: String, call: LLMCall) throws {
+    static func applyChatCompletionsControls(
+        to body: inout [String: Any], model: String, call: LLMCall, dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) throws {
+        let row = FirstPartyModelCatalog.descriptor(for: model, providerID: Transport.publicAPI.route, dataRoot: dataRoot)
         if let effort = try wireReasoningEffort(
             model: model,
-            requested: call.admission?.reasoningEffort, preview: call.preview
+            requested: call.admission?.reasoningEffort,
+            supportedEfforts: row?.supportedReasoningEfforts ?? [], preview: call.preview
         ) {
             body["reasoning_effort"] = effort
         }
-        if let tier = try serviceTier(model: model, requested: call.admission?.serviceTier, preview: call.preview) {
+        if let tier = try serviceTier(model: model, requested: call.admission?.serviceTier, supportsFast: row?.supportsFast ?? false,
+                                      preview: call.preview) {
             body["service_tier"] = tier
         }
     }

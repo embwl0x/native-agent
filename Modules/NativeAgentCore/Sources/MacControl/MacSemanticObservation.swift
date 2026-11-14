@@ -356,7 +356,7 @@ extension SwiftNativeMacControl {
             let pid = turn.macContinuation.flatMap { $0.isPending ? $0.app?.processIdentifier : nil }
                 ?? anchorPid ?? accessibilitySource(context: context).frontmostApp()?.processIdentifier
             if let pid {
-                if let refusal = await macAdmissionRefusal(pid: pid, action: "look", context: context) { return (refusal, nil) }
+                if let refusal = await macAdmissionRefusal(pid: pid, action: "look", reading: true, context: context) { return (refusal, nil) }
                 anchorPid = pid
                 if grade == "stare", accessibilitySource(context: context).frontmostApp()?.processIdentifier != pid {
                     return (injectionRefusal(action: "look", error: "front_changed", status: 409), nil)

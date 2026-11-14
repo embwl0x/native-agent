@@ -12,7 +12,7 @@ extension SwiftNativeProviderRouting {
         let providersDir = dataRoot.appendingPathComponent("providers", isDirectory: true)
         let reading: (Bool, String, String?, unavailable: Bool)
         switch providerID {
-        case "openai_oauth_direct": reading = validateOpenAIOAuthDirect(dataRoot: dataRoot)
+        case "openai_oauth_direct", "codex": reading = validateOpenAIOAuthDirect(dataRoot: dataRoot)
         case "anthropic_oauth_direct": reading = validateAnthropicOAuthDirect(providersDir: providersDir)
         case "xai_oauth_direct": reading = validateXAIOAuthDirect(providersDir: providersDir)
         default: return nil

@@ -83,7 +83,8 @@ public extension MacChatTurnPresentationPort {
                     proof = response.output.isEmpty && response.attachments?.isEmpty != false
                         && (response.terminalState == .stopped || helper)
                         ? .absent : (response.terminalState == .stopped ? .canceled : .failed)
-                    kind = response.terminalState == .stopped ? .cancellationConfirmed : .failed(reason: response.statusDetail)
+                    kind = response.terminalState == .stopped
+                        ? .cancellationConfirmed(reason: response.statusDetail) : .failed(reason: response.statusDetail)
                 } catch {
                     proof = .unavailable
                     kind = .outcomeUnknown(reason: "The conversation owner could not be read: \(error.localizedDescription)")
@@ -99,10 +100,10 @@ public extension MacChatTurnPresentationPort {
             case .completed: kind = .completed
             case .incomplete: kind = .outcomeUnknown(reason: "This reply was saved, but the turn did not finish.")
             case .failed: kind = .failed(reason: nil)
-            case .canceled: kind = .cancellationConfirmed
+            case .canceled: kind = .cancellationConfirmed(reason: nil)
             case .absent:
                 if case .failure(let error)? = result {
-                    kind = error is CancellationError ? .cancellationConfirmed : .failed(reason: error.localizedDescription)
+                    kind = error is CancellationError ? .cancellationConfirmed(reason: nil) : .failed(reason: error.localizedDescription)
                 } else {
                     kind = .outcomeUnknown(reason: "This turn's outcome could not be confirmed.")
                 }

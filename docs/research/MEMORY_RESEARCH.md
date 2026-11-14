@@ -1,6 +1,6 @@
 # How a person remembers
 
-Research on memory, written for Claude on 2026-10-25 as raw material for the
+Research on memory, written for the lead on 2026-10-25 as raw material for the
 agent design. It covers how human memory works, what an agent that lives with
 one person for months needs from it, what artificial agent memory has tried,
 and what storage should sit underneath. Each area ends with the mechanism an

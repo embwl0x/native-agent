@@ -377,7 +377,8 @@ package enum MacAXAttributeRead {
     }
 
     static let placeholderRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
-    private static let textValueRoles = placeholderRoles.union(MacScreenViewBuilder.textRoles).union(["AXSecureTextField"])
+    /// The roles whose value is words a person typed or reads; only these can hold a secret of their own.
+    static let textValueRoles = placeholderRoles.union(MacScreenViewBuilder.textRoles).union(["AXSecureTextField"])
 
     private static let hintNamedRoles: Set<String> = [
         "AXButton", "AXTextField", "AXTextArea", "AXComboBox", "AXPopUpButton", "AXMenuButton",

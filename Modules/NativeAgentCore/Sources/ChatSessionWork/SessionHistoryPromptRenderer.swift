@@ -9,7 +9,7 @@ import Synchronization
 import PersistenceCore
 import Transcripts
 import ProviderRouting
-// Blueprint: | `SessionHistoryPromptRenderer.swift` | `renderDetailed`, `recallQuery`. |
+// Blueprint: | `SessionHistoryPromptRenderer.swift` | `renderDetailed`, `recallQuery`; `Renderable.replay(words:)`, the one form every replayed row takes. |
 
 public enum SessionHistoryPromptRenderer {
     static let recallQueryCharCap = 1_200
@@ -34,9 +34,10 @@ public enum SessionHistoryPromptRenderer {
         package var runId: String? = nil
         /// Wire context belongs only to structured replay and its budget; other prose reads content.
         package var sentContext: SentTurnContext? = nil
-
-        // Request measurement can supply exact model-facing text without changing the saved row.
-        var structuredContent: String = ""
+        /// The saved row's attachment records, read as evidence only.
+        var attachments: JSONValue? = nil
+        /// What structured replay sends for this row; `replay(words:)` sets it.
+        fileprivate(set) var replayed = ""
 
         /// Display provenance must not alter lexical relevance, roles or authority.
         var displayContent: String {
@@ -44,11 +45,18 @@ public enum SessionHistoryPromptRenderer {
                 content, originLabel: originLabel, incompleteReplyLabel: incompleteReplyLabel)
         }
 
-        var structuredDisplayContent: String {
-            ChatTranscriptEvidenceRendering.displayContent(
-                structuredContent.isEmpty ? content : structuredContent,
-                originLabel: originLabel,
-                incompleteReplyLabel: incompleteReplyLabel)
+        /// The one form a replayed row takes. Its words are the exact words it was sent with when they were saved, else the stored message;
+        /// whichever the source, credentials are redacted, an attachment is named and a recorded speaker leads the row. The exact words
+        /// already hold their attachments' text, and a label they already open with is not added again. Only the saved row is read.
+        mutating func replay(words exact: String?) {
+            // `content` is the stored message through the same two boundaries: redacted, then its attachments' evidence.
+            let body = exact.map {
+                ChatTranscriptEvidenceRendering.contentIncludingAttachments(
+                    ChatSecretRedactor.redactText($0), attachments: attachments, wordsCarryAttachmentText: true)
+            } ?? content
+            let spoken = originLabel.flatMap { body.hasPrefix("[origin: \($0)]") ? nil : $0 }
+            replayed = ChatTranscriptEvidenceRendering.displayContent(
+                body, originLabel: spoken, incompleteReplyLabel: incompleteReplyLabel)
         }
     }
 
@@ -138,7 +146,6 @@ public enum SessionHistoryPromptRenderer {
         let isTool = role == "tool" || kind == "tool_use"
 
         var content: String
-        var structured = ""
         if isTool {
             content = ChatTranscriptEvidenceRendering.replayedReceipt(content: message.content, metadata: metadata)
             if let id = extrasObject?["id"]?.stringValue, !id.isEmpty {
@@ -146,21 +153,16 @@ public enum SessionHistoryPromptRenderer {
             }
         } else {
             content = ChatSecretRedactor.redactText(message.content)
-            structured = content
         }
-        if structured == content { structured = "" }
         // Attachment identity survives even when the caption is empty; history never reads its bytes.
         content = ChatTranscriptEvidenceRendering.contentIncludingAttachments(
             content, attachments: metadata?["attachments"])
-        if !structured.isEmpty {
-            structured = ChatTranscriptEvidenceRendering.contentIncludingAttachments(
-                structured, attachments: metadata?["attachments"])
-        }
         guard !content.isEmpty else { return nil }
         guard let historyIdentity = message.historyIdentity(),
               let messageID = extrasObject?["id"]?.stringValue else { return nil }
         let at = NativeTimestampFormat.parseISO8601FractionalFirst(message.timestamp)
-        return Renderable(
+        let sent = role == "user" ? SentTurnContext(metadata: metadata) : nil
+        var row = Renderable(
             role: role,
             content: content,
             historyIdentity: historyIdentity,
@@ -173,9 +175,11 @@ public enum SessionHistoryPromptRenderer {
             messageID: messageID,
             isTool: isTool,
             runId: extrasObject?["runId"]?.stringValue ?? metadata?["runId"]?.stringValue,
-            sentContext: role == "user" ? SentTurnContext(metadata: metadata) : nil,
-            structuredContent: structured
+            sentContext: sent,
+            attachments: metadata?["attachments"]
         )
+        row.replay(words: sent?.userText)
+        return row
     }
 
     private static let stampFormat = Mutex<DateFormatter>({
@@ -275,11 +279,6 @@ public enum SessionHistoryPromptRenderer {
         ]
         .filter { !$0.isEmpty }
         .joined(separator: " ")
-    }
-
-    // Replay preserves whole speech; relevance has its own snippet allowance.
-    static func projectedHistoryText(_ msg: Renderable, budget: Budget) -> String {
-        msg.structuredDisplayContent
     }
 
     /// Use each turn's closing file evidence, newest per file first; never treat a historical record as a current disk read.

@@ -126,7 +126,15 @@ extension SwiftNativeTurnEngine {
         var cognitiveContextDelivered = false
         var commitPartsDelivery = resolvedTurnContext.partsDelivery
         var cameToMindHeld: Set<ContextAtomID> = []
+        /// The result lines recollection weighed; they become familiar only once the model has read the round that carried them.
+        var familiarOwed: [String] = []
         func commitDelivery() async throws {
+            if !familiarOwed.isEmpty, let root = remPinsDataRoot {
+                let lines = familiarOwed
+                familiarOwed = []
+                do { try FamiliarLines.firstMet(lines, dataRoot: root) }
+                catch { _ = familiarityFailure(error, root: root, turn: turn) }
+            }
             if let acknowledge = commitPartsDelivery {
                 commitPartsDelivery = nil
                 acknowledge(Self.deliveredInput(resolvedTurnContext))
@@ -239,6 +247,8 @@ extension SwiftNativeTurnEngine {
         // The words she streams read as the kept reply does (`joinedProse`): words that follow a call start a new paragraph.
         var liveLast: Character?
         var liveBreakOwed = false
+        // Her own reply arrives in chunks of one piece of text: only the first chunk after something else starts a paragraph.
+        var liveInAuthoredReply = false
         func live(_ text: String) async {
             guard !text.isEmpty else { return }
             if liveBreakOwed, let last = liveLast, !last.isNewline, text.first?.isNewline == false { await progress?(.delta("\n\n")) }
@@ -490,7 +500,8 @@ extension SwiftNativeTurnEngine {
             switch effect["effect"] {
             case .string("reply.stream"):
                 if case .string(let text)? = effect["text"], !text.isEmpty {
-                    liveBreakOwed = true
+                    if !liveInAuthoredReply { liveBreakOwed = true }
+                    liveInAuthoredReply = true
                     await live(text)
                     visibleText += text
                     part.sent(text)
@@ -546,6 +557,7 @@ extension SwiftNativeTurnEngine {
                 }
                 if let reminded = await cameToMind(after: dispatches.dropFirst(roundStart),
                                                    preparedTurn: resolvedTurnContext.fluidContextTurn, turn: turn, held: &cameToMindHeld,
+                                                   owed: &familiarOwed,
                                                    sessionId: sessionId, surface: surface) {
                     Self.appendStructuredUserNudge(reminded, to: &conversation)
                 }
@@ -649,6 +661,7 @@ extension SwiftNativeTurnEngine {
             let rawProviderEvents = OSAllocatedUnfairLock<String>(initialState: "")
             let roundBaseVisibleText = visibleText
             liveBreakOwed = true
+            liveInAuthoredReply = false
 
             // Only prose can survive an incomplete stream; none of its calls ran.
             func keepPartial() async -> String {
@@ -884,7 +897,11 @@ extension SwiftNativeTurnEngine {
                                 await live(safe)
                                 await moved(nil, words: true)
                             } else if !delta.isEmpty {
-                                await moved(nil)
+                                // Held text is a call being written as words: the card names it and counts it, as a native call's input does.
+                                // Read at most once a second, when a tick is due.
+                                let due = lastMovement.map { ContinuousClock.now - $0 >= .seconds(1) } ?? true
+                                let written = due ? ToolCallParser.callBeingWritten(in: pendingProtocolDelta) : nil
+                                await moved(written.map { LLMStreamCallInput(name: $0.name, input: $0.input.utf8) })
                             }
                         case .toolCall(let call):
                             emitted = true

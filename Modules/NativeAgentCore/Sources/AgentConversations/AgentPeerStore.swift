@@ -36,6 +36,24 @@ struct AgentConnectionProbe: Codable, Sendable, Equatable {
     var receivedAt: String?
 }
 
+/// A contact's last read of the table: when, and what it read (the Desk, or one piece by its Make ref and title).
+public struct AgentTableRead: Codable, Sendable, Equatable {
+    public let at: Date
+    /// Both absent for a read of the Desk.
+    public let piece: String?
+    public let title: String?
+
+    public init(at: Date, piece: String?, title: String?) { (self.at, self.piece, self.title) = (at, piece, title) }
+
+    /// "read my Desk today at 3:04 PM": `desk` names the Desk as the reader of these words calls it.
+    public func words(desk: String) -> String {
+        let calendar = Calendar.current
+        let day = calendar.isDateInToday(at) ? "today" : calendar.isDateInYesterday(at) ? "yesterday"
+            : "on " + at.formatted(.dateTime.month(.abbreviated).day())
+        return "read " + (title ?? piece ?? desk) + " " + day + " at " + at.formatted(date: .omitted, time: .shortened)
+    }
+}
+
 /// Configuration only: neither presence, trust, nor permission to send a message.
 public struct AgentPeerContact: Codable, Sendable, Equatable {
     var appBundleIDs: [String] {
@@ -94,6 +112,15 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     /// explicitly set so untouched persisted rows remain byte-identical.
     public var allowElevation: Bool?
     public var elevationAllowed: Bool { allowElevation == true }
+    /// The person brought this contact to the table: it reads the Desk and the pieces laid on it through its own key, and changes nothing. Absent until
+    /// set, like the grant above; only `setReadsDesk` writes it.
+    public var readsDesk: Bool?
+    /// Its last read while at the table, written by `recordTableRead` before the words go back; absent off the table, so taking the contact away leaves
+    /// the record as an older build wrote it.
+    public var lastRead: AgentTableRead?
+    /// The table's one door is the MCP tools a host (`nativeagent-link mcp`) or an ACP session calls with this contact's own key; messaging-only
+    /// routes, Grok Bot's reply-scoped key and desktop chats have none.
+    public var canReadTable: Bool { [.mcpHost, .acp].contains(transport) && credentialKey == Self.credentialKey(for: id) }
 
     /// Credential authority owns whether the person’s grant can take effect; unavailable keys cannot imply permission.
     public func elevationUnavailable(peers: [AgentPeerContact], availability: Result<Bool, ToolFailureError>? = nil) -> ToolFailureError? {
@@ -305,8 +332,10 @@ public struct AgentPeerStore: Sendable {
             return try result.get()
         }
         let summaries = peers.map { peer in
-            let waits = AgentContactHealth.checkIn(peer) == nil ? ""
-                : "; messages wait for their next check-in, so sending does not interrupt them"
+            let notes = (AgentContactHealth.checkIn(peer) == nil ? ""
+                : "; messages wait for their next check-in, so sending does not interrupt them")
+                + (peer.readsDesk == true ? "; at your table: it reads your Desk and its pieces itself, and asks you to change anything" : "")
+                + (peer.lastRead.map { "; last " + $0.words(desk: "your Desk") } ?? "")
             let observed = health["peer:" + peer.id]
             let available: Bool
             switch AgentPeerCredentials.availability(peer, peers: peers, readCredential: credential) {
@@ -314,14 +343,14 @@ public struct AgentPeerStore: Sendable {
             case .failure(let failure):
                 return """
                     \(peer.name) (reachability: unavailable; credential error: \(failure.localizedDescription); trusted: \
-                    \(peer.elevationAllowed ? "on" : "off")\(waits))
+                    \(peer.elevationAllowed ? "on" : "off")\(notes))
                     """
             }
             let unavailable = peer.grokSetup == "disconnected" || peer.unavailableAt != nil
                 || !available
             let reachability = unavailable ? "unavailable"
                 : observed?.current == true ? observed!.replyStatus.replacingOccurrences(of: "_", with: " ") : "not checked"
-            return "\(peer.name) (reachability: \(reachability); trusted: \(peer.elevationAllowed ? "on" : "off")\(waits))"
+            return "\(peer.name) (reachability: \(reachability); trusted: \(peer.elevationAllowed ? "on" : "off")\(notes))"
         }.sorted()
         TurnTraceBus.fireFromContext(kind: "context.contacts.summary", payload: .object([
             "elapsedMs": .int(Int64((DispatchTime.now().uptimeNanoseconds &- start) / 1_000_000)),
@@ -353,8 +382,8 @@ public struct AgentPeerStore: Sendable {
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) {
             var peers = try read()
-            // Only setElevation may change the person’s grant, and only recordProof may stamp traffic evidence. Configure cannot grant, erase grants or
-            // manufacture proof; explicit reconnect retires prior consent proof under the same lock.
+            // Only setElevation and setReadsDesk may change the person’s levers, and only recordProof may stamp traffic evidence. Configure cannot grant,
+            // erase grants or manufacture proof; explicit reconnect retires prior consent proof under the same lock.
             var merged = contact
             if let index = peers.firstIndex(where: { $0.id == contact.id }) {
                 // A key belongs to the route it was minted for. Changing a workspace or endpoint requires a new contact and key.
@@ -363,6 +392,8 @@ public struct AgentPeerStore: Sendable {
                     throw AgentPeerStoreError.invalidContact.failure(file: fileURL)
                 }
                 merged.allowElevation = peers[index].allowElevation
+                merged.readsDesk = peers[index].readsDesk
+                merged.lastRead = peers[index].lastRead
                 merged.ability = peers[index].ability
                 merged.provenInboundAt = resetProof ? nil : peers[index].provenInboundAt
                 merged.provenOutboundAt = resetProof ? nil : peers[index].provenOutboundAt
@@ -373,6 +404,8 @@ public struct AgentPeerStore: Sendable {
                 peers[index] = merged
             } else {
                 merged.allowElevation = nil
+                merged.readsDesk = nil
+                merged.lastRead = nil
                 merged.ability = nil
                 merged.provenInboundAt = nil
                 merged.provenOutboundAt = nil
@@ -413,6 +446,35 @@ public struct AgentPeerStore: Sendable {
             peers[index].allowElevation = allowed ? true : nil
             try write(peers)
             return peers[index]
+        }
+    }
+
+    /// The person's table lever: only the contact's lower-only setting reaches this writer, so the agent takes a contact away from the table and
+    /// bringing one asks the person. Off removes the last read with the lever.
+    @discardableResult public func setReadsDesk(peerID: String, on: Bool) throws -> AgentPeerContact? {
+        try prepareDirectory()
+        return try CredentialFileLock.withLock(fileURL) {
+            var peers = try read()
+            guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return nil }
+            peers[index].readsDesk = on ? true : nil
+            if !on { peers[index].lastRead = nil }
+            try write(peers)
+            return peers[index]
+        }
+    }
+
+    /// Records a read under the store lock, only while the contact is still at the table: false means the lever is off now (or the contact is gone),
+    /// so the read's words must not go back.
+    public func recordTableRead(peerID: String, _ entry: AgentTableRead) throws -> Bool {
+        try prepareDirectory()
+        return try CredentialFileLock.withLock(fileURL) {
+            var peers = try read()
+            guard let index = peers.firstIndex(where: { $0.id == peerID }), peers[index].readsDesk == true, peers[index].canReadTable else {
+                return false
+            }
+            peers[index].lastRead = entry
+            try write(peers)
+            return true
         }
     }
 
@@ -595,6 +657,8 @@ public struct AgentPeerStore: Sendable {
             // A discovered peer is never elevated. See `setElevation`.
             var fresh = contact
             fresh.allowElevation = nil
+            fresh.readsDesk = nil
+            fresh.lastRead = nil
             fresh.provenInboundAt = nil
             fresh.provenOutboundAt = nil
             fresh.roundTripProof = nil

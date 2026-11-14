@@ -1,13 +1,14 @@
 import PersistenceCore
 import ApprovalInbox
 import ApprovalTransactions
+import ChatToolRuntime
 import AuthoredCapabilities
 import Experiences
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import Privacy
-// Blueprint: | `InboxFace.swift` | Inbox's one face reads ForPerson's matters, put-away ones as folded history; each answer is its one door call, the person's tap and the agent's call alike |
+// Blueprint: | `InboxFace.swift` | Inbox's one face reads ForPerson's matters, put-away ones as folded history, the agent's own decisions of one kind under one row; each answer is its one door call, the person's tap and the agent's call alike |
 
 extension NativeAgentEngine {
     @MainActor func inboxFaceRead() -> PartFaces.Read {
@@ -51,21 +52,68 @@ extension NativeAgentEngine {
             guard let stamp = matter.outcome?.at ?? matter.updatedAt else { return true }
             return NativeTimestampFormat.parseISO8601(stamp) == nil
         }.count
+        // News is what happened for the person. What I decided on my own is a record, kept under its own fold so it never buries the news.
+        let decided = news.filter { BodyDecidedRow.kind(of: $0) != nil }
+        let told = news.filter { BodyDecidedRow.kind(of: $0) == nil }
         var sections: [PartFace.Section] = [
             .init(id: "waiting", title: "Waiting for you", style: .list,
                   footer: waiting.isEmpty ? "No requests in the current reading." : nil,
                   rows: waiting.map { inboxFaceRow($0, tone: .attention) }),
-            .init(id: "went-wrong", title: "Went wrong", style: .list,
-                  rows: failed.map { inboxFaceRow($0, tone: .failed) }),
-            .init(id: "news", title: "News", style: .list, footer: news.isEmpty ? "No news in the current reading." : nil,
-                  rows: news.map { inboxFaceRow($0) }),
         ]
+        if !failed.isEmpty {
+            sections.append(.init(id: "went-wrong", title: "Went wrong", style: .list, rows: failed.map { inboxFaceRow($0, tone: .failed) }))
+        }
+        sections.append(.init(id: "news", title: "News", style: .list, footer: told.isEmpty ? "No news in the current reading." : nil,
+                              rows: told.map { inboxFaceRow($0) }))
+        if !decided.isEmpty {
+            let unread = decided.filter { ForPerson.reading($0) == .unread }.count
+            sections.append(.init(id: "decided", title: "What I decided on my own", style: .list,
+                footer: "\(decided.count) \(decided.count == 1 ? "decision" : "decisions")" + (unread == 0 ? "." : ", \(unread) unread."),
+                rows: inboxDecisionGroups(decided.map { (matter: $0, row: inboxFaceRow($0)) }, section: "news", together: true),
+                folded: true))
+        }
         // The history: every matter put away, newest first, folded under its counts.
         let counts = "\(recent.count) archived in the last day; \(earlier.count) put away in all."
             + (undated == 0 ? "" : " \(undated) archived matters have no settlement time; the day's count excludes those matters.")
         sections.append(.init(id: "earlier", title: "Earlier", style: .list, footer: counts,
-                              rows: history, folded: true))
+                              rows: inboxDecisionGroups(zip(earlier, history).map { (matter: $0, row: $1) }, section: "earlier"),
+                              folded: true))
         return (.init(title: "Inbox", line: "Requests, things that went wrong, and news.", sections: sections), epoch)
+    }
+
+    /// The agent's own decisions of one kind (`BodyDecidedRow.kind`) fold under one row: the first of them this section draws and how many more, with
+    /// the unread count as its value. Each decision stays its own nested row, newest first, with its id and actions; a kind with one decision
+    /// stays a plain row. Folding only draws: no decision is read, put away or left out.
+    /// `together` puts the kind's answers on its one row (mark every unread one read, archive them all) and leaves its nested decisions to be
+    /// read: a kind is answered as one thing, and the agent's reading lists the kind, not each decision.
+    private func inboxDecisionGroups(_ entries: [(matter: Experience, row: PartFace.Row)], section: String,
+                                     together: Bool = false) -> [PartFace.Row] {
+        var kinds: [String: [(matter: Experience, row: PartFace.Row)]] = [:]
+        for entry in entries {
+            if let kind = BodyDecidedRow.kind(of: entry.matter) { kinds[kind, default: []].append(entry) }
+        }
+        var drawn: Set<String> = []
+        return entries.compactMap { entry -> PartFace.Row? in
+            guard let kind = BodyDecidedRow.kind(of: entry.matter), let group = kinds[kind], group.count > 1 else { return entry.row }
+            guard drawn.insert(kind).inserted else { return nil }
+            let unread = group.filter { ForPerson.reading($0.matter) == .unread }.count
+            let newest = group.sorted { ($0.matter.at, $0.matter.id) > ($1.matter.at, $1.matter.id) }
+            var actions: [PartFace.Action] = []
+            if together {
+                func ids(_ entries: [(matter: Experience, row: PartFace.Row)]) -> PartFace.Value { .array(entries.map { .string($0.matter.id) }) }
+                let fresh = group.filter { ForPerson.reading($0.matter) == .unread }
+                if !fresh.isEmpty {
+                    actions.append(.init(id: "read", label: "Mark all read",
+                        call: .init("inbox.mark_read", ["ids": ids(fresh), "reason": .string("read together from their Inbox row")])))
+                }
+                actions.append(.init(id: "archive", label: "Archive all", role: .destructive,
+                    call: .init("inbox.archive", ["ids": ids(group), "reason": .string("put away together from their Inbox row")])))
+            }
+            return .init(id: section + ".decided." + kind, title: entry.row.title + ", and \(group.count - 1) more",
+                         value: unread == 0 ? nil : "\(unread) unread", at: entry.row.at, symbol: entry.row.symbol, tone: entry.row.tone,
+                         actions: actions.isEmpty ? nil : actions,
+                         rows: together ? newest.map { var row = $0.row; row.actions = nil; return row } : newest.map { $0.row })
+        }
     }
 
     /// Retained approval faces may predate their latest execution receipt. Read that saved owner once, only for history, without writing a copy.

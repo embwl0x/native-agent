@@ -190,7 +190,7 @@ extension SwiftToolDispatcher {
                 "note": .string("These ids identify this running process only and change on relaunch; they are not your durable identity."),
             ]),
             "tool_state": .string("""
-                app is your one tool; app {find} finds an action by what you want done. Request detail=full for diagnostic roots and outcome \
+                app is your one door; app {find} finds an action by what you want done. Request detail=full for diagnostic roots and outcome \
                 population health
                 """),
         ]
@@ -242,8 +242,14 @@ extension SwiftToolDispatcher {
         response["active_tool_count"] = .int(Int64(activeTools.count))
         response["available_tool_count"] = .int(Int64(modelVisibleAvailableTools.count))
         response["tool_count_semantics"] = .object([
-            "active_tool_count": .string("Tools advertised to the model this turn: always-on core + turn-scoped, intersected with the model-visible catalog."),
-            "available_tool_count": .string("Every model-visible tool in the catalog."),
+            "active_tool_count": .string("""
+                How many names the model is offered to call directly this turn: the always-on app door plus any the turn added, counted only \
+                where this surface's catalog has them and they are directly callable. Only app is, so this is 1, or 0 when app is missing.
+                """),
+            "available_tool_count": .string("""
+                How many names in this surface's catalog the model can call directly. Only app is, so this is 1, or 0 when app is missing; \
+                actions are reached through app and are not counted here.
+                """),
         ])
         response["discovery"] = .string("every capability is an app action: app {} is home and the pages, app {find} finds an action")
         response["build"] = Self.buildStamp(identity: .current)

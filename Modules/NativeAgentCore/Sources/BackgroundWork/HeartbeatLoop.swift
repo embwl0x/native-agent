@@ -16,6 +16,8 @@ import Cognition
 public struct HeartbeatLoop: EventDeadlineLoopRunner {
     public let loopId: String = "heartbeat"
     public let wake: OrganWake
+    /// Its checklist is the agent's own HEARTBEAT.md.
+    public var needsAgent: Bool { true }
     private let configurationError: String?
     /// Twice-daily health rhythm. Additional assessments follow
     /// input invalidations and their age deadlines; urgent faults also reach Doctor.

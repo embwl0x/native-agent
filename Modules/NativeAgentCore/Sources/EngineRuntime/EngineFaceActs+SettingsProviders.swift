@@ -123,6 +123,7 @@ extension EngineFaceActs {
         if let issue = await NativeOAuthFlow.saveAnthropicSetupToken(token, dataRoot: engine.dataRoot) {
             throw Self.failure("setup_token_failed", NativeAppSecretRedactor.redactText(issue))
         }
+        engine.providers.fetchModelListInBackground(after: "anthropic_oauth_direct")
         _ = try await providerReadback()
         return try Self.committed(true, identities: ["anthropic_oauth_direct"])
     }

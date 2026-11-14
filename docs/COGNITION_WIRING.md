@@ -47,7 +47,7 @@ uses nontrapping generation arithmetic.
 The canonical lifecycle and compatibility rules are in
 [Subconscious — Lived moments](SUBCONSCIOUS.md#lived-moments).
 
-Agent's only always-on tool is `app`. `app {}` reads home, where they left off;
+The agent's one door, `app`, is always on. `app {}` reads home, where they left off;
 `page`, `item`, `find` and `action` navigate the app and its actions.
 `script` uses JavaScriptCore for the registry's scriptable reads/actions.
 `AppToolRuntime/AppActions+Declarations.swift` defines those actions;
@@ -275,6 +275,8 @@ resident attention read that context selection uses.
 with its source completion window, memory-record activation and suppressed-memory
 signatures. The organism publishes predicted tool groups; `NativeCognitionRuntime+Pursuit.swift`
 adds resident Desk task/goal intent. Resident reads enforce the absolute completion window.
+Resident attention's topic terms are counted in the trace (`contextFlow.attentionTerms`) and do not enter selection: they were taken
+out on purpose on 10-07 (commit 10e00a710b), because attention terms do not make an item relevant to the current message.
 
 The hot `NativeCognitionRuntime.attentionSignals` read uses this published
 resident value without waiting on the source actors or loading Desk files.
@@ -527,5 +529,5 @@ route-seeding callable or competing configuration write.
 `TrustCenter/SecurityCenter.swift` applies checked Full Mac authority and
 retains owner confirmation for macOS privacy permission resets.
 `TrustCenter/PeerTurnEffectPolicy.swift` applies the
-[peer-turn authority contract](TOOL_LOADING.md#authority-and-receipts).
+[peer-turn authority contract](ONE_DOOR.md#authority-and-receipts).
 A cognitive suggestion is not an approval.

@@ -6,7 +6,8 @@ import PersistenceCore
 import ProviderRouting
 // Blueprint: | `SessionHistoryMessageProjection.swift` | `admission`, `project`. |
 
-/// Replay the held conversation in order without rewriting its words; a moment's context block stays on its row and never replays.
+/// Replay the held conversation in order, each row as it was sent through the history boundaries; a moment's context block stays on its row
+/// and never replays.
 /// Prior tool rounds lack provider call IDs, so render text evidence rather than inventing executable tool pairs.
 /// Rows that share a role join into one text block, so an exchange is two blocks whatever its tool count and the provider's
 /// lookback from the boundary before the current message always reaches the previous boundary.
@@ -39,30 +40,23 @@ package enum SessionHistoryMessages {
     package static func admission(
         messages: [ChatMessage],
         historyLimit: Int,
-        budget: ContextBudgetPolicy.Resolved,
-        unboundedUserIdentities: Set<String> = []
+        budget: ContextBudgetPolicy.Resolved
     ) -> Admission? {
         admission(
             renderables: messages.compactMap(SessionHistoryPromptRenderer.renderable),
-            historyLimit: historyLimit, budget: budget,
-            unboundedUserIdentities: unboundedUserIdentities
+            historyLimit: historyLimit, budget: budget
         )
     }
 
+    /// Each row's body is its one replayed form (`Renderable.replay(words:)`), whichever source its words come from.
     package static func admission(
         renderables: [SessionHistoryPromptRenderer.Renderable],
         historyLimit: Int,
-        budget: ContextBudgetPolicy.Resolved,
-        unboundedUserIdentities: Set<String> = []
+        budget: ContextBudgetPolicy.Resolved
     ) -> Admission? {
         guard max(0, historyLimit) > 0 else { return nil }
         guard !renderables.isEmpty else { return nil }
-        let rendered = renderables.map { row in
-            (row: row, body: row.sentContext?.userText
-                ?? (unboundedUserIdentities.contains(row.historyIdentity)
-                    ? row.structuredDisplayContent : SessionHistoryPromptRenderer.projectedHistoryText(row, budget: budget)))
-        }
-        return Admission(renderables: rendered)
+        return Admission(renderables: renderables.map { (row: $0, body: $0.replayed) })
     }
 
     package static func project(
@@ -100,10 +94,10 @@ package enum SessionHistoryMessages {
         }
 
         for (row, body) in admitted {
-            // Nonempty sent words retain exact bytes, including whitespace-only content.
+            // Nonempty bodies retain exact bytes, including whitespace-only content; an image-only row's body is its attachment evidence.
             if body.isEmpty { continue }
             if out.isEmpty, row.isTool || row.role == "assistant" {
-                append(.user, "[Earlier conversation; retained assistant and tool messages follow.]", identity: nil)
+                append(.user, "[Earlier conversation; your retained replies and call results follow.]", identity: nil)
             }
             if row.isTool {
                 rowCharacters[row.historyIdentity] = body.count

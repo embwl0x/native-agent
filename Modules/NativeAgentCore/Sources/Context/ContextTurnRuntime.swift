@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ContextTurnRuntime.swift` | `ContextPreparedTurn`: turn leases, query handoff and delivery |
+// Blueprint: | `ContextTurnRuntime.swift` | `ContextPreparedTurn`: turn leases, pinned turn instant, query handoff and delivery |
 
 /// One-shot handoff for all requested semantic readings. A deadline ends only the wait: the runtime retains the embedding task until settlement. A missing or
 /// late result is unavailable, never permission to rank by words.
@@ -164,6 +164,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
     public let packetAtomExpandThresholdChars: Int
     /// Shared quota for nonmandatory memory and correction atoms. `nil` uses the selector's quota. Mandatory atoms bypass it; other kinds do not count.
     public let memoryAtomRowLimit: Int?
+    /// The turn's own frozen instant, for presentation only. Selection keeps the need's time bucket, so this never enters a fingerprint.
+    public let turnTime: Date
 
     public init(
         surface: ContextSurface,
@@ -190,7 +192,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
         userMemoryCore: [String],
         memoryRecallEnabled: Bool = true,
         packetAtomExpandThresholdChars: Int = 0,
-        memoryAtomRowLimit: Int? = nil
+        memoryAtomRowLimit: Int? = nil,
+        turnTime: Date
     ) {
         self.surface = surface
         self.origin = origin
@@ -220,6 +223,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
         self.memoryRecallEnabled = memoryRecallEnabled
         self.packetAtomExpandThresholdChars = max(0, packetAtomExpandThresholdChars)
         self.memoryAtomRowLimit = memoryAtomRowLimit.map { max(0, $0) }
+        self.turnTime = turnTime
     }
 }
 
@@ -241,6 +245,8 @@ public final class ContextPreparedTurn: @unchecked Sendable {
     public let lease: ContextGenerationLease
     public let generation: ContextStoredGeneration
     public let need: NeedSignal
+    /// The turn's frozen instant: memory ages read it, while selection and expiry keep `need.evaluationTime`.
+    public let turnTime: Date
     public let budgetExpansion: ContextFlowBudgetExpansion?
     private let feedbackHandler: (@Sendable (
         ContextFeedbackSignal,
@@ -265,6 +271,7 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         lease: ContextGenerationLease,
         generation: ContextStoredGeneration,
         need: NeedSignal,
+        turnTime: Date,
         budgetExpansion: ContextFlowBudgetExpansion? = nil,
         deliveryHandler: (@Sendable ([ContextPacketItem]) async -> Void)? = nil,
         feedbackHandler: (@Sendable (
@@ -282,6 +289,7 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         self.lease = lease
         self.generation = generation
         self.need = need
+        self.turnTime = turnTime
         self.budgetExpansion = budgetExpansion
         self.feedbackHandler = feedbackHandler
         self.deliveryHandler = deliveryHandler

@@ -271,7 +271,7 @@ extension AgentScreen {
             } else {
                 lines.append("You queued this step for after this card (\(entry.name) in MY QUEUE): \"\(entry.step.words)\""
                     + (entry.step.actionText.map { "\nHabit: " + $0 } ?? ""))
-                lines.append("Do it now with your usual tools; it closes by itself once the work is seen done.")
+                lines.append("Do it now with your usual actions; it closes by itself once the work is seen done.")
             }
         }
         return (lines.joined(separator: "\n"), sources, elevated)

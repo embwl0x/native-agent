@@ -568,7 +568,9 @@ actor ToolPrimitiveBroker {
         }
         let (reply, cut) = try await { () async throws -> (String, LLMToolBoundaryReason?) in
             if args["tools"] != nil || args["surface"] != nil {
-                guard let profile else { throw SenseFailure(code: "unavailable", message: "Tool-capable thinking requires the part's restricted host.") }
+                guard let profile else {
+                    throw SenseFailure(code: "unavailable", message: "model.call with tools or a surface requires the part's restricted host.")
+                }
                 let thought = await host.think(messages: messages, tools: toolNames, surface: surface, host: profile, execution: execution,
                     purpose: auditPurpose)
                 effects = thought.effects

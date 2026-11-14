@@ -95,6 +95,9 @@ public actor PartFaces {
         }
     }
     private var sources: [String: Source] = [:]
+    /// A reading drawn from a source epoch older than the page's publication: its caller keeps it as its own coherent reading, and it leaves
+    /// the gate without publishing, so publication never moves back and no newer read still in flight is retired by it. It is never content.
+    private struct Superseded: Error { let reading: PartFaceSnapshot }
     private var observers: [any NSObjectProtocol] = []
     private var keyringObservation: Task<Void, Never>?
     private var stopped = false
@@ -222,6 +225,8 @@ public actor PartFaces {
             return try await gate(id).read({ try await projectSource(source, page: id) }, publish: {
                 self.publish($0, page: id, source: source)
             })
+        } catch let superseded as Superseded {
+            return superseded.reading
         } catch {
             return source.snapshot(nil, .failed, nil,
                                    (error as? PartCallError) ?? .init(code: "cancelled", message: "The projection owner was stopped."))
@@ -270,9 +275,7 @@ public actor PartFaces {
         }.value
         try Task.checkCancellation()
         if let error = snapshot.error, error.code == "cancelled" { throw error }
-        if let current = sources[id], source.epoch < current.epoch {
-            throw PartCallError(code: "stale_source", message: "A newer source epoch is already present.")
-        }
+        if let current = sources[id], source.epoch < current.epoch { throw Superseded(reading: snapshot) }
         return snapshot
     }
 
@@ -314,6 +317,18 @@ public actor PartFaces {
     /// A source owner pushes its finished packets; opening this page only reads the last posted snapshot.
     public func register(page id: String) {
         stemPages.insert(id)
+    }
+
+    /// Who draws a page: a part (the agent's), or the stem's own read in Swift.
+    public enum Drawer: Sendable, Equatable { case part(String), stem }
+
+    /// Who draws `id`, from its registration: the stem for a lever page; the part a packet page or a claimed page of the agent's own names;
+    /// the part a pushed page was last projected by. Nil while nothing has registered or published it, or its claim failed.
+    public func drawer(page id: String) -> Drawer? {
+        if natives[id] != nil { return .stem }
+        if let part = packets[id]?.part { return .part(part) }
+        if let source = sources[id], !source.native { return .part(source.part) }
+        return nil
     }
 
     /// The owner's whole page list has been registered; every caller waiting on it goes on.
@@ -378,6 +393,8 @@ public actor PartFaces {
                 self.publish(snapshot, page: id, source: source)
             })
             return result.0
+        } catch let superseded as Superseded {
+            return superseded.reading
         } catch is CancellationError {
             return .init(part: reader.part, version: nil, sourceEpoch: floor, status: .failed, face: nil,
                          error: .init(code: "cancelled", message: "The page read was cancelled."), owed: owed)
@@ -500,7 +517,6 @@ public actor PartFaces {
             let (face, epoch) = try await readOffMain(read)
             return .init(part: id, version: "native", sourceEpoch: epoch, status: .ready, face: face, error: nil, owed: owed)
         } catch is CancellationError { throw CancellationError() }
-        catch let error as PartCallError where error.code == "stale_source" { throw error }
         catch {
             return .init(part: id, version: "native", sourceEpoch: floor, status: .failed, face: nil,
                 error: (error as? PartCallError) ?? .init(code: "read_failed", message: error.localizedDescription), owed: owed)
@@ -512,21 +528,18 @@ public actor PartFaces {
         do {
             return try await gate(id).read({
                 let snapshot = try await Self.project(page: id, at: floor, owed: owed, read: read)
-                if snapshot.status == .ready {
-                    let epoch = snapshot.sourceEpoch
-                    if let source = sources[id], epoch < source.epoch {
-                        throw PartCallError(code: "stale_source", message: "A newer source epoch is already present.")
-                    }
-                }
                 try Task.checkCancellation()
+                if snapshot.status == .ready, let source = sources[id], snapshot.sourceEpoch < source.epoch {
+                    throw Superseded(reading: snapshot)
+                }
                 return snapshot
             }, publish: {
                 let source: Source? = $0.status == .ready
                     ? Source(part: id, epoch: $0.sourceEpoch, input: .null, unavailable: nil, owed: owed, native: true) : nil
                 self.publish($0, page: id, source: source)
             })
-        } catch let error as PartCallError {
-            return .init(part: id, version: nil, sourceEpoch: floor, status: .failed, face: nil, error: error, owed: owed)
+        } catch let superseded as Superseded {
+            return superseded.reading
         } catch {
             return .init(part: id, version: nil, sourceEpoch: floor, status: .failed, face: nil,
                 error: .init(code: "cancelled", message: "The projection owner was stopped."), owed: owed)

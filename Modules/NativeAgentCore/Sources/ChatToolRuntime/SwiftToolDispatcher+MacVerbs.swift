@@ -538,11 +538,23 @@ extension SwiftToolDispatcher {
                     reason: "injection_approval_missing: \(tool) could not mint a capability"
                 )
             }
-            return try await impl.dispatchApprovedInjection(
+            let result = try await impl.dispatchApprovedInjection(
                 action: action,
                 body: input,
                 capability: capability, turn: turn, context: context
-            ).toJSON(readContent: invocation.readContent)
+            )
+            guard Self.macMenuPressToolNames.contains(tool) else { return result.toJSON(readContent: invocation.readContent) }
+            // A direct press answers as an act's menu path does, through the same words and screen after, beside its own receipt.
+            let path: String = if case .array(let levels)? = input["path"] {
+                levels.compactMap(\.stringValue).joined(separator: " › ")
+            } else { input["path"]?.stringValue ?? "" }
+            // The screen after is the window of the app the receipt says was pressed, front or behind.
+            let pressedApp = result.output.objectValue?["app"]?.objectValue
+            let verbs = MacFourVerbs(host: impl, supplementalSource: SwiftToolDispatcherFourVerbPerceptionSource(
+                invocation: invocation, host: impl, liveScene: fourVerbLiveScene))
+            let said = await verbs.pressedMenu(result, path: path, app: pressedApp?["bundle_id"]?.stringValue ?? pressedApp?["name"]?.stringValue,
+                screen: "", turn: turn, context: context)
+            return result.toJSON(readContent: invocation.readContent, text: said.text)
         }
         var body = input
         if tool == "menu" { body["words"] = input["find"] }

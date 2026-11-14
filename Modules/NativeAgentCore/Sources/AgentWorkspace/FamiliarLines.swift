@@ -16,9 +16,9 @@ public enum FamiliarLines {
         dataRoot.appendingPathComponent("mind/familiar.bin")
     }
 
-    /// Mark all encountered lines familiar, but return only first encounters.
+    /// Return only first encounters; when recording, mark every encountered line familiar.
     @discardableResult
-    public static func firstMet(_ lines: some Sequence<String>, dataRoot: URL) throws -> [String] {
+    public static func firstMet(_ lines: some Sequence<String>, dataRoot: URL, recording: Bool = true) throws -> [String] {
         do { return try met.withLock { state in
             var seen: [UInt64: UInt64]
             if let kept = state.roots[dataRoot.path] { seen = kept }
@@ -28,6 +28,7 @@ public enum FamiliarLines {
                 state.tick += 1
                 if seen.updateValue(state.tick, forKey: key(line)) == nil { fresh.append(line) }
             }
+            guard recording else { return fresh }
             // Batch forgetting to avoid sorting once per line.
             if seen.count > keep + keep / 8 {
                 for (key, _) in seen.sorted(by: { $0.value < $1.value }).prefix(seen.count - keep) {

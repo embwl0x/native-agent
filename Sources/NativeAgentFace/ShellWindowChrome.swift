@@ -74,6 +74,9 @@ struct ShellFrame<Sidebar: View, Detail: View>: View {
         .overlay { if reduceTransparency && !shellLampUnderContent { ShellLamp() } }
         // One masked mood tint warms the sheet, rail and composer without tinting transcript prose.
         .moodTintWindow()
+        // The window has no accent of its own: controls take the text colour in every place, as the settings pages already did, so the
+        // system's accent never lands on the glass. A switch carries its own neutral; the one colour that means something is drawn where it means it.
+        .tint(NativeAgentShell.text)
         .environment(\.shellKeyboardOrder, keyboardOrder)
     }
 }

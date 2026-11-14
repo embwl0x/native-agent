@@ -34,8 +34,9 @@ extension NativeAgentEngine {
     /// The phone's evidence files whose change re-reads the Connectors page.
     var phoneFacePaths: [URL] { [dataRoot.appendingPathComponent("paired_phones.json"), PhoneSenseHistory.url(dataRoot)] }
 
-    /// Takes the pairing owner's published values on main and awaits the phone's file-backed evidence off main.
-    @concurrent func phoneFaceSections() async -> [PartFace.Section] {
+    /// The iPhone as one connector row: its state in words, with its setup, paired devices and senses behind it. Takes the pairing owner's
+    /// published values on main and awaits the phone's file-backed evidence off main.
+    @concurrent func phoneFaceRow() async -> PartFace.Row {
         let state = await MainActor.run {
             (connection: sync.connection, status: sync.status, standing: sync.standing, pairingError: sync.pairingError,
              phonePairedElsewhere: sync.phonePairedElsewhere, isCheckingPairing: sync.isCheckingPairing, phones: sync.phones, message: sync.message)
@@ -44,6 +45,7 @@ extension NativeAgentEngine {
             Open the Mac app and the companion app on your iPhone or iPad, using the same Apple Account on both devices. The pairing key arrives \
             automatically through iCloud. Once it arrives, tap Connect on your phone or tablet.
             I run on your Mac. Keep it awake with NativeAgent running for replies and actions from your phone.
+            Match the phone's code before choosing Pair. Removing a phone stops it from deciding approvals.
             """, symbol: "iphone", tone: .quiet)]
         if let connection = state.connection {
             rows += connection.facts.map { item in
@@ -66,6 +68,7 @@ extension NativeAgentEngine {
                 """, tone: .attention, actions: [.init(id: "use-here", label: "Use my iPhone with this Mac", role: .primary, doors: ["mac"],
                                                        call: .init("pairing.use_here"))]))
         }
+        rows += phoneDeviceRows(state.phones, connected: state.standing?.connected == true, message: state.message)
         rows.append(.init(id: "iphone.delivery", title: "Pairing delivery", detail: """
             Use the same Apple Account on both devices and keep both apps online. The facts above show what iCloud needs. After fixing it, check \
             delivery here, then tap Check for Mac on your phone.
@@ -77,11 +80,25 @@ extension NativeAgentEngine {
             delivery needs attention, follow the facts above and check iCloud delivery.
             """, symbol: "arrow.triangle.2.circlepath",
             actions: [.init(id: "rotate", label: "Regenerate", role: .destructive, doors: ["mac"], call: .init("pairing.rotate"))]))
-        return [.init(id: "iphone", title: "iPhone", style: .list, rows: rows),
-                phoneDevicesSection(state.phones, connected: state.standing?.connected == true, message: state.message), await phoneSensesSection()]
+        rows.append(await phoneSensesRow())
+        // The pairing owner's own assessment names the first unmet fact; a pairing error or another Mac holding the phone comes first.
+        let (value, tone): (String, PartFace.Tone) =
+            if state.pairingError != nil { ("Needs attention", .failed) }
+            else if state.phonePairedElsewhere { ("Paired with another Mac", .attention) }
+            else if let waiting = state.standing?.waiting, waiting > 0 { ("Waiting for Pair", .attention) }
+            else {
+                switch state.connection?.headline.state {
+                case .holds?: ("Connected", .live)
+                case .waiting?: ("Waiting", .attention)
+                case .broken?: ("Needs fixing", .failed)
+                case nil: ("Not checked", .quiet)
+                }
+            }
+        return .init(id: "iphone", title: "iPhone", detail: state.connection?.headline.line ?? state.status, value: value, symbol: "iphone",
+                     tone: tone, rows: rows)
     }
 
-    private func phoneDevicesSection(_ devices: [PairedPhoneStore.Phone], connected: Bool, message: String?) -> PartFace.Section {
+    private func phoneDeviceRows(_ devices: [PairedPhoneStore.Phone], connected: Bool, message: String?) -> [PartFace.Row] {
         let phones = devices.filter { $0.status != .removed }
         var rows = phones.map { phone in
             let id: [String: PartFace.Value] = ["id": .string(phone.id)]
@@ -99,8 +116,7 @@ extension NativeAgentEngine {
                 : "No phone can approve yet. Open the companion app and tap Connect to request pairing.", tone: .quiet))
         }
         if let message { rows.append(.init(id: "iphone.devices-error", title: message, tone: .failed)) }
-        return .init(id: "iphone-devices", title: "Paired devices", style: .list,
-                     footer: "Match the phone's code before choosing Pair. Removing a phone stops it from deciding approvals.", rows: rows)
+        return rows
     }
 
     @concurrent nonisolated private func phoneNotificationRow() async -> PartFace.Row {
@@ -114,8 +130,8 @@ extension NativeAgentEngine {
         }
     }
 
-    /// The phone's last reported setup per sense, then the steps any agent follows to help the person set one up.
-    @concurrent nonisolated private func phoneSensesSection() async -> PartFace.Section {
+    /// The phone's last reported setup per sense, then the steps any agent follows to help the person set one up, behind one row.
+    @concurrent nonisolated private func phoneSensesRow() async -> PartFace.Row {
         let rows: [PartFace.Row]
         do {
             rows = try PhoneSenseHistory.setupLines(dataRoot).enumerated().map { PartFace.Row(id: "iphone.sense:\($0.offset)", title: $0.element) }
@@ -124,7 +140,7 @@ extension NativeAgentEngine {
         }
         let guide = PartFace.Row(id: "iphone.senses-guide", title: "Phone senses guide",
             detail: "The steps to set up a phone sense, read when opened.", open: "page:connectors/iphone.senses-guide")
-        return .init(id: "iphone-senses", title: "Phone senses", style: .list, rows: rows + [guide], folded: true)
+        return .init(id: "iphone.senses", title: "Phone senses", rows: rows + [guide])
     }
 
     /// `pairing.check_delivery`: the pairing owner checks iCloud delivery of the pairing key.

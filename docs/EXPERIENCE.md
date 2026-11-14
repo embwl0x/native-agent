@@ -128,8 +128,9 @@ filters in that snapshot. Missing attention provenance remains unknown.
   is never inferred from absent rows. Missing current membership refuses that node's claim with repair owed, leaving drive unconsumed
   ([Subconscious](SUBCONSCIOUS.md#attention)). The waiting read selects all unweighed `world`/`self` births without an age or row-count limit.
   Presence occurrence keys come from the settled here/away transition and its time. Its words describe that transition alone; source evidence
-  belongs to the parts' signal payload. Every posted occurrence reaches `ExperienceStore.begin`: an identical repeat writes nothing, and
-  conflicting content is refused.
+  belongs to the parts' signal payload. Every posted occurrence reaches `ExperienceStore.begin`: a repeat under the same key from the same door
+  about the same subject, owed to the same place with the same authority, writes nothing, whatever it read this time (what the happening
+  carried first stands); a different door, subject, destination or authority under one key is refused as a reused id.
 - **A thought is one experience.** `thought:<run>`, kind `thought`, addressed to `conversation:mind`, caused by the
   happenings it attended; its outcome (domain `attention`) is `hit` (an act with effects occurred), `empty`, `failed` or `withheld`,
   and a care's movement adds the claim `care.moved` only to thoughts settled after the preceding story entry and by the
@@ -289,6 +290,11 @@ the installed iOS build or prove its renderer supports this revision.
 - **Only the work settles it.** The obligation is accepted when that operation, or its lever, works again (`RepairOwed.settle`, called by every successful act), or let go by their with a reason (`app repair.let_go {id, reason}`). A Doctor repair settles on the owning check's passing postcondition: `ok`, or a reading that the part is `off` or `not needed`. A loop's recovery requires a clean tick newer than the obligation: completed work, or a legitimate "nothing to do" tick. A separate repair action is not required. A retry, restart or recheck that has not proved recovery, and any unrelated success, is evidence only. Meeting the same no again while its debt is open is evidence on that debt, one line on their home however often it recurs; once it settled, meeting it again is a new debt.
 - **It stays in their picture.** Their home's MY QUEUE carries each repair they owes with its lever, and the person's waits carry each one that is their with its exact control, until settled.
 - **What it is not.** A correction to the call's own arguments owes nothing; the corrected call is the repair (remedy kinds `correct_arguments` and `inspect`). A lawful refusal never becomes a debt to override Trust: a Trust ask or block, a posture, a saved entry or a peer's elevation names its owner and the person's control with `Repair.why` (kind `person_decides`), which owes nothing. An unknown effect owes reconciliation, never a blind resend. A decision that should not exist is deleted, not given a lever. An unauthenticated caller gets no diagnostics; the owner and lever go to them.
+
+The app door preserves cause-specific remedies supplied by the failure owner.
+Without one it supplies no generic schema-discovery remedy: a server's HTTP
+status does not establish bad arguments. Argument correction guidance requires
+the owner's argument evidence.
 
 Senses and hands keep the failed reach separate from a successful side effect: a launch cannot verify its failed landing read, and a requested image must actually arrive. TCC refusals carry the person's exact switch and their pane-opening call. Window streams stop on incomplete secret inspection and retain their actual terminal cause. Outside an enclosing act, missing grants owe repair through the same experience form, scoped to the grant; an inspected captured frame proves those grants work. Other capture failures carry inspection corrections requesting pixels, without inventing durable wrong state. `abilities.restore_state` accepts recovered accounting under the failed file's digest, preserving damaged bytes and readable rows without changing any ability's authority. An unreadable abilities/state.json first offers files.read of its exact path; the remedy instruction retains the captured digest for reconstruction.
 

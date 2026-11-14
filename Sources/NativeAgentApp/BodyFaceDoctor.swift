@@ -3,6 +3,7 @@ import EngineRuntime
 import Foundation
 import NativeAgentShared
 import Privacy
+import Synchronization
 import TurnTrace
 // Blueprint: | `BodyFaceDoctor.swift` | Doctor reads the only Inspector and binds subscription repair to its connection and view |
 
@@ -13,20 +14,26 @@ enum BodyFaceDoctor {
         let engine: NativeAgentEngine
         var report: RendererInspectorReport?
     }
-    private static var renderer: Renderer?
+    /// The one renderer and its cached report, held outside the main actor so the link can forget it synchronously as it ends.
+    nonisolated private static let held = Mutex<Renderer?>(nil)
+    private static var renderer: Renderer? { held.withLock { $0 } }
 
     static func connect(_ connection: UUID, engine: NativeAgentEngine) {
-        renderer = Renderer(connection: connection, engine: engine, report: nil)
+        held.withLock { $0 = Renderer(connection: connection, engine: engine, report: nil) }
     }
 
-    static func disconnect(_ connection: UUID?) {
-        if renderer?.connection == connection { renderer = nil }
+    /// The one way a renderer ends for Doctor: the link calls it first when it closes, before any await, so no check reads a closed window's
+    /// cached report. A newer connection is left as it is.
+    nonisolated static func disconnect(_ connection: UUID?) {
+        held.withLock { if $0?.connection == connection { $0 = nil } }
     }
 
     static func report(_ report: RendererInspectorReport) throws {
-        guard renderer?.connection == report.connection, report.mounted == (report.view != nil),
-              !report.observing || (report.mounted && report.subscription != nil) else { throw FaceWireError.invalidFeedOrder }
-        renderer?.report = report
+        try held.withLock { current in
+            guard current?.connection == report.connection, report.mounted == (report.view != nil),
+                  !report.observing || (report.mounted && report.subscription != nil) else { throw FaceWireError.invalidFeedOrder }
+            current?.report = report
+        }
     }
 
     static func check() async -> CheckResult {
@@ -36,10 +43,17 @@ enum BodyFaceDoctor {
             if let reported = renderer.report { report = reported }
             else { report = try await read(.readInspectorHealth, renderer: renderer) }
             let sourceActive = await renderer.engine.trace.observationActive
+            // The window may have gone while this read awaited: a renderer no longer held shows no Inspector.
+            guard self.renderer?.connection == renderer.connection else {
+                return InspectorFeedHealth.check(isOpen: false, observationActive: false)
+            }
             var face = InspectorFeedHealth.check(isOpen: report.mounted,
                 observationActive: sourceActive && report.observing && report.issue == nil)
             if let issue = report.issue { face.detail += " " + NativeAppSecretRedactor.redactText(issue) }
             return face
+        } catch let error where noWindowToAnswer(error) {
+            // A window with no connection shows no Inspector: that is the closed case, not a failure of something the person opened.
+            return InspectorFeedHealth.check(isOpen: false, observationActive: false)
         } catch {
             let face = CheckResult(source: "FaceLink", id: "live.inspector_feed", title: "Inspector feed", status: "fail",
                 detail: "Inspector health could not be read: " + NativeAppSecretRedactor.redactText(error.localizedDescription),
@@ -47,6 +61,14 @@ enum BodyFaceDoctor {
                 human_action: "Check the window and its connection before requesting Inspector repair.")
             return face
         }
+    }
+
+    /// Decided by the error's own code: the body's link is gone or never reached a window, or the window answered that it has no connection,
+    /// or its reply was lost when its connection closed. A connected window that answers with a fault is none of these.
+    private static func noWindowToAnswer(_ error: any Error) -> Bool {
+        if case FaceWireError.disconnected? = error as? FaceWireError { return true }
+        guard let failure = error as? WireFailure else { return false }
+        return [FaceWireError.disconnectedCode, "face_reply_lost", "renderer_unavailable"].contains(failure.code)
     }
 
     static func repair(for check: CheckResult) async -> DoctorExecutableRepair? {

@@ -172,11 +172,11 @@ public struct AppConnectorActionPlatform: ConnectorActionPlatform {
     let dataRoot: URL
     private let statusPlatform: AppConnectorStatusPlatform
     private let macAssistant: any MacAssistantStatusClient
-    private let notification: @Sendable (String, String, Turn) async -> [String: JSONValue]
+    private let notification: @Sendable (NativeAgentNotificationDefaults.Note, Turn) async -> [String: JSONValue]
 
     public init(dataRoot: URL, statusPlatform: AppConnectorStatusPlatform,
                 macAssistant: any MacAssistantStatusClient,
-                notification: @escaping @Sendable (String, String, Turn) async -> [String: JSONValue]) {
+                notification: @escaping @Sendable (NativeAgentNotificationDefaults.Note, Turn) async -> [String: JSONValue]) {
         self.dataRoot = dataRoot
         self.statusPlatform = statusPlatform
         self.macAssistant = macAssistant
@@ -191,8 +191,8 @@ public struct AppConnectorActionPlatform: ConnectorActionPlatform {
         return try await impl.dispatch(action: "spotlight", body: input, turn: turn, context: .init(dataRoot: dataRoot))
     }
 
-    public func postMessage(title: String, body: String, turn: Turn) async -> [String: JSONValue] {
-        await notification(title, body, turn)
+    public func postMessage(_ note: NativeAgentNotificationDefaults.Note, turn: Turn) async -> [String: JSONValue] {
+        await notification(note, turn)
     }
 
     /// Every provider reads local state the app already owns — no network.

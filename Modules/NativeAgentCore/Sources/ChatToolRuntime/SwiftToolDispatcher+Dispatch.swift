@@ -167,9 +167,15 @@ extension SwiftToolDispatcher {
             let fetched: JSONValue
             do { fetched = try await self.pageReader.fetchURL(url).readJSON(find: find, around: around, full: full) }
             catch ResearchClientError.httpStatus(let status) {
-                return .object(["status": .string("failed"), "http_status": .int(Int64(status)),
+                var failure: [String: JSONValue] = ["status": .string("failed"), "reason": .string("http_status"),
+                    "http_status": .int(Int64(status)),
                     "url": .string(url), "effects": .string("none"),
-                    "message": .string("HTTP \(status) refused this public read.")])
+                    "message": .string(ResearchClientError.httpStatus(status).localizedDescription)]
+                if [404, 410].contains(status) {
+                    failure["remedy"] = .object(["kind": .string("inspect"),
+                        "instruction": .string("Use a different address or search for the page."), "next_call": .null])
+                }
+                return .object(failure)
             }
             catch let error as ResearchClientError where error.failureReason != nil {
                 return .object(["status": .string("failed"), "reason": .string(error.failureReason!),

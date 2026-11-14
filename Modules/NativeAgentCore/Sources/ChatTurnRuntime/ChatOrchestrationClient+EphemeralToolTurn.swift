@@ -27,7 +27,7 @@ extension SwiftNativeChatOrchestrationClient {
             throw ChatOrchestrationError.underlying("A part thought can select only an existing routing surface.")
         }
         guard let last = messages.last, last.role == .user else {
-            throw ChatOrchestrationError.underlying("A tool-capable thought ends its messages with a user prompt.")
+            throw ChatOrchestrationError.underlying("A thought that can call app ends its messages with a user prompt.")
         }
         @Sendable func text(_ message: LLMMessage) -> String {
             message.content.compactMap { if case .text(let text) = $0 { text } else { nil } }.joined(separator: "\n")
@@ -252,7 +252,7 @@ extension SwiftNativeChatOrchestrationClient {
         if requireCompleted, result.completionState != .completed {
             throw EphemeralToolTurnIncomplete(
                 output: result.reply,
-                reason: "worker tool turn ended without a completed final reply; retained output is partial and attempted effects remain unverified"
+                reason: "worker turn ended without a completed final reply; retained output is partial and attempted effects remain unverified"
             )
         }
         await result.afterReply?.start()

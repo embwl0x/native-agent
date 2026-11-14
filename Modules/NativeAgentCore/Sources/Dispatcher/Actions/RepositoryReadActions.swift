@@ -60,7 +60,7 @@ extension FileSystemActions {
             return errResult(
                 "Path '\(searchPath.path)' is under a sensitive data sub-tree (OAuth tokens, "
                 + "pairing secrets, provider credentials, trust policy). "
-                + "Use dedicated Swift runtime tools instead.",
+                + "Use the app's own actions for this data instead.",
                 code: "path_not_allowed"
             )
         }

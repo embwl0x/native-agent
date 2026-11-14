@@ -177,22 +177,25 @@ private final class MacAppReplyState: Sendable {
 }
 
 extension SwiftNativeMacControl {
-    func macAdmissionRefusal(pid: Int32, action: String, context: MacOperationContext) async -> MacControlResult? {
+    func macAdmissionRefusal(pid: Int32, action: String, reading: Bool, context: MacOperationContext) async -> MacControlResult? {
         if PersonOnlyWindows.isOwnProcess(pid) {
             return injectionRefusal(action: action, error: Self.selfInspectionError, status: 409)
         }
         let failure = MacAppReplyState()
         let reply = await macAdmit(pid: pid, context: context) { cause in failure.value.withLock { $0.cause = cause } }
         guard reply != .answered else { return nil }
-        let message: String
+        var message: String
         switch reply {
-        case .busy: message = "The app is busy; nothing was pressed. Wait for it to answer before another action."
-        case .gone: message = "The app exited before answering; nothing was pressed."
-        case .stopped: message = "Stopped while waiting for the app; nothing was pressed."
-        case .unreachable: message = "The app's accessibility channel could not answer; nothing was pressed. Inspect its accessibility availability."
-        case .running: message = "The app is running but its window content is not ready yet; nothing was pressed. Look again, then act."
+        case .busy: message = reading
+            ? "The app is busy and did not answer the read. Wait for it to answer before reading again."
+            : "The app is busy and did not answer before the action. Wait for it to answer before another action."
+        case .gone: message = "The app exited before answering."
+        case .stopped: message = "Stopped while waiting for the app to answer."
+        case .unreachable: message = "The app's accessibility channel could not answer. Inspect its accessibility availability."
+        case .running: message = "The app is running but its window content is not ready yet. Look again before continuing."
         case .answered: return nil
         }
+        if !reading { message += " Nothing was pressed." }
         var evidence: [String: JSONValue] = ["message": .string(message), "effects": .string("none"), "posted_events": .int(0)]
         if let cause = failure.value.withLock({ $0.cause }) {
             evidence["cause"] = .string(cause)

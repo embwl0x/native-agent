@@ -149,7 +149,8 @@ struct FacePageView: View {
     @ViewBuilder private func collection(_ snapshot: PartFaceSnapshot, face: PartFace) -> some View {
         if face.detail != nil {
             let combined = PartFace(title: face.title, line: face.line, sections: (snapshot.levers ?? []) + face.sections, detail: face.detail)
-            FaceSelectionView(face: combined, session: session, selection: $selectedItem, door: door, page: page) { selected, row in
+            FaceSelectionView(face: combined, session: session, selection: $selectedItem, door: door, page: page,
+                              leaf: { Self.leaf($0) }) { selected, row in
                 var item = selected
                 if let row {
                     guard let open = row.open, case .page(let target, item: let linked?)? = FaceLink(open), target == page else {
@@ -158,26 +159,40 @@ struct FacePageView: View {
                     item = linked
                 }
                 return AnyView(FaceItemView(item: item, readCall: row?.read, door: appModel.pageDoor(page: page + "/" + item, open: self.open),
-                                           reader: door, session: appModel.pageSessions.page(page + "/" + item)))
+                                           reader: door, session: appModel.pageSessions.page(page + "/" + item), leaf: { Self.leaf($0) }))
             }
         } else {
-            List { FaceView(snapshot: snapshot, title: title, header: !asTab, door: door, session: session).environment(\.faceInList, true) }
+            List { FaceView(snapshot: snapshot, title: title, header: !asTab, door: door, session: session, leaf: { Self.leaf($0) })
+                .environment(\.faceInList, true) }
                 .listStyle(.plain)
         }
     }
 
+    /// The page's own words stay put above what scrolls: its title and its one sentence, or the page's name until its face arrives.
+    /// A page says its name once and then its one sentence, held still above what scrolls. Under the rail's tabs the selected tab is the name,
+    /// so only the sentence follows it; a page on its own carries both in the house type.
+    @ViewBuilder private var pinnedHeader: some View {
+        let face = snapshot?.status == .ready ? snapshot?.face : nil
+        if !asTab {
+            AlivePageHeader(title: face?.title.flatMap { $0.isEmpty ? nil : $0 } ?? title, line: face?.line)
+        } else if let line = face?.line, !line.isEmpty {
+            Text(line).font(ShellType.pageSentence).foregroundStyle(NativeAgentShell.secondary).lineLimit(1).truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
     private var scrollingContent: some View {
+        // The page is one frame: its header holds still and only what is under it scrolls.
+        VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+        pinnedHeader
         ScrollViewReader { reader in
         ScrollView {
             // Nothing empty takes a section's space: the first thing shown sits at the top, under the rail's tabs when it is a tab.
             VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
-                if !asTab, snapshot?.face?.title?.isEmpty != false || snapshot?.status != .ready {
-                    AlivePageHeader(title: title)
-                }
                 // A page that shows its face never moves while it re-reads: the read status stands only until the first face arrives.
                 if isReading, snapshot == nil { PageReadStatus(isReading: true, text: "Reading " + title + "…") }
                 if let snapshot {
-                    FaceView(snapshot: snapshot, title: title, header: !asTab, door: door, session: session).id(page)
+                    FaceView(snapshot: snapshot, title: title, header: false, door: door, session: session, leaf: { Self.leaf($0) }).id(page)
                         .onAppear { session.notice = { [weak appModel] words in appModel?.systemToasts.push(success: words) } }
                 } else if let pageIssue {
                     Text(pageIssue).foregroundStyle(.secondary).textSelection(.enabled)
@@ -186,7 +201,6 @@ struct FacePageView: View {
                 }
                 if let feedback { Text(feedback).font(.callout).foregroundStyle(.secondary).textSelection(.enabled) }
             }
-            .padding(.top, asTab ? 0 : TodayMetrics.topPadding)
             .padding(.bottom, 32)
             .frame(maxWidth: .infinity, alignment: .leading)
             .id("face-top")
@@ -196,6 +210,8 @@ struct FacePageView: View {
         .onChange(of: topRequest) { withAnimation(.snappy) { reader.scrollTo("face-top", anchor: .top) } }
         }
         .pageScrollColumn()
+        }
+        .padding(.top, asTab ? 0 : TodayMetrics.topPadding)
         .padding(.horizontal, 20)
         .frame(maxWidth: TodayMetrics.contentWidth, maxHeight: .infinity, alignment: .top)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -209,6 +225,21 @@ struct FacePageView: View {
 
     private var door: ClosureFaceDoor {
         appModel.pageDoor(page: page, open: open)
+    }
+
+    /// A piece a page lays out (key `piece:…`, ref its Make ref, revision its version) is drawn through the Make pane's granted preview;
+    /// any other leaf reads as its words.
+    static func leaf(_ block: PartFace.Block) -> AnyView {
+        guard let piece = piece(block) else {
+            return AnyView(Text(block.alt ?? PartFace.Block.updateNote).foregroundStyle(.secondary))
+        }
+        return AnyView(PageMakePreview(reference: piece.reference, version: piece.version))
+    }
+
+    /// The Make version a leaf block lays on a page, read the same way by the window and by a picture of the page.
+    static func piece(_ block: PartFace.Block) -> (reference: String, version: String)? {
+        guard block.kind == "leaf", block.key.hasPrefix("piece:"), let reference = block.ref, let version = block.revision else { return nil }
+        return (reference, version)
     }
 
     private func open(_ link: String) {

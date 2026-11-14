@@ -288,11 +288,9 @@ extension NativeCognitionRuntime {
 
     /// Use canonical Desk deferUntil for timing and the work title for identity, independently of the deferred day.
     private func deskDeferralSources(at now: Date) async -> (rows: [(token: String, dueAt: Date)], complete: Bool) {
+        // The Desk's own read decides: its op-log and base reads treat only "no such file" as never written (complete and empty);
+        // any other failure (permission, I/O, damage) throws, and an unreadable Desk is incomplete.
         guard let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() else {
-            return ([], false)
-        }
-        // A missing feed is unavailable, distinct from an empty Desk; neither establishes a horizon outcome.
-        guard deskFeedIsPresent else {
             return ([], false)
         }
         var seen: Set<String> = []
@@ -312,15 +310,6 @@ extension NativeCognitionRuntime {
             out.append(token)
         }
         return (out, true)
-    }
-
-    /// Either the canonical op-log or its compaction snapshot establishes a written Desk; neither present leaves source evidence unavailable.
-    /// This filesystem read uses immutable dataRoot and touches no actor state.
-    nonisolated var deskFeedIsPresent: Bool {
-        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        let manager = FileManager.default
-        return manager.fileExists(atPath: store.opsPath.path)
-            || manager.fileExists(atPath: store.basePath.path)
     }
 
     /// Use the approval action as its label; title and reason are content and cannot cross here.

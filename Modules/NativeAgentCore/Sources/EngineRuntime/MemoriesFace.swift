@@ -12,7 +12,8 @@ extension NativeAgentEngine {
     /// Forget on every memory read here and Keep / Don't keep on every waiting proposal — which no face can omit. Every read that fails is a
     /// named unavailable fact; only cancellation throws, so the levers never depend on the part.
     @concurrent func memoriesPacket(surface: String? = nil) async throws -> PartFaces.Packet {
-        let epoch = UInt64(Date().timeIntervalSince1970 * 1000)
+        let now = Date()
+        let epoch = UInt64(now.timeIntervalSince1970 * 1000)
         var facts: [String: JSONValue] = [:]
         var keys: [String: JSONValue] = [:]
         var memoryLevers: [String: PartFace.Row] = [:]
@@ -54,7 +55,7 @@ extension NativeAgentEngine {
                     memoryLevers[record.id] = .init(id: "memory:" + record.id, title: excerpt.isEmpty ? "An empty note" : excerpt,
                         actions: [.init(id: "forget", label: "Forget this…", role: .destructive, call: PartFace.Call("memory.forget", ["id": id]))])
                 }
-                return memoriesFact(record, trust: trust)
+                return memoriesFact(record, trust: trust, now: now)
             })
         }
         func unavailable(_ reason: String) -> JSONValue { .object(["state": .string("unavailable"), "reason": .string(reason)]) }
@@ -151,17 +152,25 @@ extension NativeAgentEngine {
     }
 
     /// One kept memory as measured facts: its words, pin and lifecycle, the time its row shows (and whether that time reads), the time it is
-    /// ordered by, the run that wrote it, the provenance its owners derive (a later-wrong sense's warning, the named untrusted sources) and its roots.
-    private func memoriesFact(_ record: MemoryV2.MemoryRecord, trust: PeerDataTaint.TrustRead) -> JSONValue {
+    /// ordered by and the span of the calendar it falls in, the run that wrote it, the provenance its owners derive (a later-wrong sense's warning,
+    /// the named untrusted sources) and its roots.
+    private func memoriesFact(_ record: MemoryV2.MemoryRecord, trust: PeerDataTaint.TrustRead, now: Date) -> JSONValue {
         let updated = record.updatedAt?.trimmingCharacters(in: .whitespacesAndNewlines)
         let stamp = updated.flatMap { $0.isEmpty ? nil : $0 } ?? record.createdAt
         let ordered = record.updatedAt.flatMap { UserDisplayFormatters.parseISOTimestamp($0) } ?? UserDisplayFormatters.parseISOTimestamp(record.createdAt)
+        // Weeks are ISO weeks, as Misses counts them, so "this week" means one span on the page.
+        let calendar = Calendar(identifier: .iso8601)
         return .object([
             "id": .string(record.id), "text": .string(record.text), "pinned": .bool(record.pinned == true),
             "lifecycle": .string(MemoryLifecycle.normalized(record.lifecycle)),
             "at": faceText(stamp.isEmpty ? nil : stamp), "atReadable": .bool(UserDisplayFormatters.parseISOTimestamp(stamp) != nil),
             // Seconds since 1970 at full precision, so the face orders exactly as the store's times compare.
             "orderSeconds": ordered.map { JSONValue.double($0.timeIntervalSince1970) } ?? .null,
+            // The span the face groups it under, from that same time; it changes only when the day turns. Null when the time can't be read.
+            "when": ordered.map { date in
+                JSONValue.string(calendar.isDate(date, inSameDayAs: now) ? "today"
+                    : calendar.isDate(date, equalTo: now, toGranularity: .weekOfYear) ? "week" : "earlier")
+            } ?? .null,
             "source": faceText(record.sourceRunId),
             "warning": faceText(MemorySenseProvenance.warning(in: record.extras)),
             "from": .array(MemoryDataProvenance.sources(in: record.extras, trust: trust).map(JSONValue.string)),
