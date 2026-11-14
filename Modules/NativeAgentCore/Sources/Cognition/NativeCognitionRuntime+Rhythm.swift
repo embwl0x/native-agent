@@ -131,6 +131,7 @@ extension NativeCognitionRuntime {
         guard !isFlushedForTermination, rhythm.refresh == nil else {
             reply?(.init("held", "The person's day is already refreshing or the runtime is stopping.")); return
         }
+        guard mindStarted else { reply?(.init("held", "The mind starts when setup finishes.")); return }
         guard runNow || rhythm.dirty || rhythm.due.map({ $0 <= now() }) == true || rhythm.nightDue.map({ $0 <= now() }) == true else { return }
         rhythm.dirty = false
         rhythm.refresh = Task { [weak self] in
@@ -162,12 +163,22 @@ extension NativeCognitionRuntime {
         ])
     }
 
-    /// The next reading is a sense boundary, never a promised bedtime.
+    /// The next reading is a sense boundary, never a promised bedtime. With none due it says why: the person is here (and since when), or whether
+    /// they are here is unknown. Today and the agent's own state read (`mind.inner_state`) both read this.
     public func nextNight() async throws -> JSONValue {
-        let rest = try await restReading(at: now())
-        return .object(["state": .string("available"), "rest": rest,
-            "at": rhythm.nightDue.map { .double($0.timeIntervalSince1970) } ?? .null,
-            "reason": .string(rhythm.nightDue == nil ? "Waiting for the person to be away." : "The next reading of the night; sleep is my judgment.")])
+        let at = now()
+        let rest = try await restReading(at: at)
+        var fields: [String: JSONValue] = ["state": .string("available"), "rest": rest,
+            "at": rhythm.nightDue.map { .double($0.timeIntervalSince1970) } ?? .null]
+        if rhythm.nightDue != nil {
+            fields["reason"] = .string("The next reading of the night; sleep is my judgment.")
+        } else if let presence = PersonPresence.read(dataRoot: dataRoot, now: at).transition {
+            fields["reason"] = .string("Waiting for the person to be away.")
+            if presence.here { fields["hereSince"] = .double(presence.since.timeIntervalSince1970) }
+        } else {
+            fields["reason"] = .string("Whether the person is here is unknown (no Mac input reading yet), so no night is due.")
+        }
+        return .object(fields)
     }
 
     func personTurnAt() throws -> Date? {

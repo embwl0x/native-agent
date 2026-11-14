@@ -10,8 +10,11 @@ public let XAIOAuthDirectExhaustedMarker = "xai_oauth_direct_exhausted: re-sign-
 /// App-owned xAI credentials authenticate the first-party model route.
 public final class XAIOAuthTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
-    /// This transport sends no output-cap field.
-    public func requestOutputTokens(model: String, call: LLMCall) throws -> Int { 0 }
+    /// While a run's budget is bound, one request's allowance (`budgetedOutputTokens`) goes in xAI's `max_completion_tokens`; else no cap.
+    public func requestOutputTokens(model: String, call: LLMCall) throws -> Int {
+        FirstPartyExecutionControls.budgetedOutputTokens(model: try Self.normalizeModel(model), providerID: providerId, call: call,
+            dataRoot: tokenPath.deletingLastPathComponent().deletingLastPathComponent()) ?? 0
+    }
 
     public let providerId: String = "xai_oauth_direct"
 
@@ -149,6 +152,9 @@ public final class XAIOAuthTransport: LLMTransport {
         if stream { body["stream_options"] = ["include_usage": true] }
         try OpenAITransport.applyTools(to: &body, tools: tools)
         try FirstPartyExecutionControls.applyXAIControls(to: &body, model: model, call: call, dataRoot: dataRoot)
+        if let allowance = FirstPartyExecutionControls.budgetedOutputTokens(model: model, providerID: "xai_oauth_direct", call: call, dataRoot: dataRoot) {
+            body["max_completion_tokens"] = allowance
+        }
         return body
     }
 

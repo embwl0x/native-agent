@@ -57,6 +57,9 @@ extension AppConnectorStatusPlatform {
         }, showGrokSecureSetup: { peer in
             guard let model = ApplicationLifetime.shared.appModel else { throw FaceWireError.disconnected }
             try await BodyFacePresentation.current(model: model).present(.showGrokSetup(contact: peer, operation: UUID()))
+        }, closeGrokSecureSetup: { peer in
+            guard let model = ApplicationLifetime.shared.appModel else { throw FaceWireError.disconnected }
+            try await BodyFacePresentation.current(model: model).present(.closeGrokSetup(contact: peer))
         }, showProviderSetup: { provider, root in
             guard let model = ApplicationLifetime.shared.appModel,
                   model.engine.dataRoot.standardizedFileURL == root.standardizedFileURL else { throw FaceWireError.disconnected }

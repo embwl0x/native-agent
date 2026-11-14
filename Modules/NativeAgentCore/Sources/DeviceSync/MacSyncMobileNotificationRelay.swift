@@ -323,7 +323,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                                    eventID: String, timestamp: Date) async throws -> NotificationPublication {
         let path = sync.dataRoot.appendingPathComponent("notifications/publications/\(eventID).json")
         do {
-            return try await SwiftNativePersistenceCore.withFileLock(path, waitingAtMost: 5) {
+            return try await SwiftNativePersistenceCore.withFileLock(path) {
                 let data: Data
                 do { data = try Data(contentsOf: path) }
                 catch let error as CocoaError where error.code == .fileReadNoSuchFile {
@@ -358,7 +358,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
 
     public func beginDeliveryPrediction(eventID: String, source: String) async {
         guard NativeAgentDeviceEventIdentity.isCanonical(eventID) else { return }
-        await sync.cognition.ingestOrganismSignal(
+        await sync.cognition?.ingestOrganismSignal(
             kind: .phoneDeliveryStarted,
             sourceOrgan: "phone.\(eventID)",
             intensity: 0.30,
@@ -373,7 +373,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
 
     func receiveDeliveryPrediction(eventID: String, channel: String) async {
         guard NativeAgentDeviceEventIdentity.isCanonical(eventID) else { return }
-        await sync.cognition.ingestOrganismSignal(
+        await sync.cognition?.ingestOrganismSignal(
             kind: .phoneDeliveryReceived,
             sourceOrgan: "phone.\(eventID)",
             intensity: 0.60,
@@ -389,7 +389,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
 
     public func failDeliveryPrediction(eventID: String, source: String) async {
         guard NativeAgentDeviceEventIdentity.isCanonical(eventID) else { return }
-        await sync.cognition.ingestOrganismSignal(
+        await sync.cognition?.ingestOrganismSignal(
             kind: .phoneDeliveryFailed,
             sourceOrgan: "phone.\(eventID)",
             intensity: 0.65,

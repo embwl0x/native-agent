@@ -386,35 +386,56 @@ struct FaceRowView: View {
         set(String(value), control)
     }
 
-    private var actionStrip: some View {
-        ViewThatFits(in: .horizontal) {
-            stripButtons.fixedSize()
-            Menu { ForEach(actions) { action in actionButton(action) } } label: { Image(systemName: "ellipsis") }
-                .fixedSize().accessibilityLabel(Text("More"))
-                .focused(focus, equals: .actionMenu(item))
-        }
-        .font(.callout)
+    /// What the strip draws as buttons: the answer first, then the other answers as they came. Housekeeping (`aside`) stands behind the
+    /// "…" menu, unless the row has nothing else to answer with.
+    private var answers: [PartFace.Action] {
+        let drawn = actions.contains { $0.aside != true } ? actions.filter { $0.aside != true } : actions
+        guard let lead = primary, drawn.contains(where: { $0.id == lead.id }) else { return drawn }
+        return [lead] + drawn.filter { $0.id != lead.id }
     }
 
-    private var stripButtons: some View {
+    /// A row's actions are buttons with a shape. The one answer leads, filled; it wears the door's accent only when the row waits on the
+    /// person, because the accent means only that. The rest are quiet. No action is coloured by its role: a destructive one asks before it
+    /// runs, and its confirmation names it.
+    private var actionStrip: some View {
+        ViewThatFits(in: .horizontal) {
+            stripButtons(compact ? Array(answers.prefix(2)) : answers).fixedSize()
+            stripButtons(Array(answers.prefix(1))).fixedSize()
+            moreMenu(actions)
+        }
+        .controlSize(.small)
+    }
+
+    private func stripButtons(_ shown: [PartFace.Action]) -> some View {
         HStack(spacing: 8) {
-            ForEach(compact ? Array(actions.prefix(2)) : actions) { action in
-                actionButton(action).focused(focus, equals: .action(item, action.id))
+            ForEach(shown) { action in
+                stripButton(action).focused(focus, equals: .action(item, action.id))
             }
-            if compact && actions.count > 2 {
-                Menu { ForEach(Array(actions.dropFirst(2))) { action in actionButton(action) } } label: {
-                    Image(systemName: "ellipsis")
-                }.fixedSize().accessibilityLabel(Text("More"))
-                    .focused(focus, equals: .actionMenu(item))
-            }
+            let rest = actions.filter { action in !shown.contains { $0.id == action.id } }
+            if !rest.isEmpty { moreMenu(rest) }
         }
         .lineLimit(1)
     }
 
+    /// Quiet buttons are in the primary ink, so no door's own tint colours them.
+    private func stripButton(_ action: PartFace.Action) -> some View {
+        let leads = action.id == primary?.id && action.aside != true && row.tone == .attention
+        return actionButton(action).buttonStyle(FaceActionButtonStyle(fill: leads ? style.answer ?? .accentColor : nil))
+    }
+
+    /// The row's other actions behind one quiet "…" button, read aloud as "More actions".
+    private func moreMenu(_ rest: [PartFace.Action]) -> some View {
+        Menu { ForEach(rest) { action in actionButton(action) } } label: { Image(systemName: "ellipsis") }
+            .menuStyle(.button).buttonStyle(FaceActionButtonStyle(fill: nil)).menuIndicator(.hidden).fixedSize()
+            .accessibilityLabel(Text("More actions"))
+            .focused(focus, equals: .actionMenu(item))
+            #if os(macOS)
+            .help(rest.map(\.label).joined(separator: ", "))
+            #endif
+    }
+
     private func actionButton(_ action: PartFace.Action) -> some View {
         Button(action.label + (action.unavailable.map { " (unavailable: " + $0 + ")" } ?? "")) { perform(action) }
-            .buttonStyle(.plain)
-            .foregroundStyle(action.role == .destructive ? Color.red : .primary)
             .disabled(session.held(item) || action.unavailable != nil)
     }
 
@@ -566,6 +587,35 @@ struct FaceMeterBar: View {
         }
         .frame(width: 72, height: 6)
         .accessibilityHidden(true)
+    }
+}
+
+/// A row action's shape, drawn by SwiftUI itself: the filled answer, or a quiet button on the row's ground. The press stays a SwiftUI
+/// press, as the plain buttons' was; the AppKit-backed `.bordered` and `.borderedProminent` buttons inside a row never ran their action.
+struct FaceActionButtonStyle: ButtonStyle {
+    let fill: Color?
+
+    func makeBody(configuration: Configuration) -> some View {
+        FaceActionButtonBody(configuration: configuration, fill: fill)
+    }
+}
+
+private struct FaceActionButtonBody: View {
+    let configuration: ButtonStyleConfiguration
+    let fill: Color?
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 6, style: .continuous)
+        configuration.label
+            .font(.callout)
+            .lineLimit(1)
+            .foregroundStyle(fill == nil ? AnyShapeStyle(.primary) : AnyShapeStyle(Color.white))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background { if let fill { shape.fill(fill) } else { shape.fill(.quaternary) } }
+            .contentShape(shape)
+            .opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.45)
     }
 }
 

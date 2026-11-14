@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
@@ -27,6 +28,30 @@ extension Turn {
     }
 }
 
+/// The apps one Mac operation's Accessibility messages go to. While Accessibility holds the operation, they are what it waits on: alive
+/// while any of those processes runs, however hung (shown as waiting; Stop ends it); dead only when every one of them has quit.
+final class MacAXTargets: @unchecked Sendable {
+    private let lock = NSLock()
+    private var apps: [pid_t: String] = [:]
+
+    func note(_ pid: pid_t) {
+        guard pid > 0, lock.withLock({ apps[pid] == nil }) else { return }
+        var buffer = [CChar](repeating: 0, count: 256)
+        let named = proc_name(pid, &buffer, UInt32(buffer.count)) > 0
+            ? buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) } : "process \(pid)"
+        lock.withLock { apps[pid] = named }
+    }
+
+    var life: CallLife {
+        CallLife(what: "the app Accessibility is reaching") { [self] in
+            let noted = lock.withLock { apps }
+            guard !noted.isEmpty else { return .unknown }
+            if noted.keys.contains(where: { kill($0, 0) == 0 || errno == EPERM }) { return .alive }
+            return .dead("\(noted.values.sorted().joined(separator: ", ")) has quit")
+        }
+    }
+}
+
 /// One native operation's call-stack state. Copies refine a nested operation;
 /// reference owners retain the exact driver, AX evidence and captured sight.
 /// Nothing here is shared implicitly between concurrent calls.
@@ -35,12 +60,16 @@ public struct MacOperationContext: Sendable {
     public var appCapture: SenseAppReadCapture?
     public var readContent: OwnedProgramRunner.ReadContent?
     public var deadline: ContinuousClock.Instant?
+    /// The watch of the call this operation serves: what the operation waits on is attached to it.
+    public var life: TurnDeadline?
     public var observationMode: MacObservationMode = .interactive
     public var driver: MacDriverBinding?
     public var background = false
     var inputStartCount = 0
     var holdsAcrossCalls = false
     var axSession: SwiftNativeMacControl.AXSession?
+    /// The apps this operation's Accessibility messages go to, noted as each message is prepared.
+    var axTargets: MacAXTargets?
     var capture: MacSightCaptureBinding?
     public var frameSource = "direct"
     public var batchFrames: [String: MacLookFrame]?

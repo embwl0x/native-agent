@@ -48,7 +48,9 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     public var settingsSupported: Bool = true
     public var declaredRoute: Route? = nil
     public var outboundRoute: String { route == .dotIPC ? "chatgpt-dot-ipc" : route == .desktopChat ? "desktop-chat" : route == .grokBot
-        ? "grok-webhook" : acp == nil ? (commandLine == nil ? "none" : "command") : "acp" }
+        ? "grok-webhook" : route == .localChat ? "local-chat" : acp == nil ? (commandLine == nil ? "none" : "command") : "acp" }
+    /// A settings host whose messages go out live (its command line, or its local chat server) rather than waiting for its next check-in.
+    public var reachedLive: Bool { commandLine != nil || localChat != nil }
     /// Launch Services finds applications outside the usual Applications folders too.
     public var bundleIDs: [String] = []
     /// Only documented listening ports belong in seeds; contacts retain their card’s own port.
@@ -59,6 +61,7 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     public var commandLine: AgentHostCommandLine? = nil
     public var acp: AgentHostACP? = nil
     public var a2a: A2A? = nil
+    public var localChat: LocalChat? = nil
     public var searchPaths: [String] = []
     /// Additional program names used as installation evidence, never launched.
     public var executables: [String]? = nil
@@ -80,8 +83,10 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     public var desktopChat: DesktopChat? = nil
     public var grokRoutine: GrokRoutine? = nil
     public enum Route: String, Sendable, Codable, CaseIterable { case acp, a2a, dotIPC = "chatgpt-dot-ipc", grokBot = "grok-bot",
-        desktopChat = "desktop-chat", commandLine = "command-line", mcpSettingsOnly = "mcp-settings-only" }
-    public var route: Route { declaredRoute ?? (acp != nil ? .acp : commandLine != nil ? .commandLine : .mcpSettingsOnly) }
+        desktopChat = "desktop-chat", commandLine = "command-line", localChat = "local-chat", mcpSettingsOnly = "mcp-settings-only" }
+    public var route: Route {
+        declaredRoute ?? (acp != nil ? .acp : commandLine != nil ? .commandLine : localChat != nil ? .localChat : .mcpSettingsOnly)
+    }
 
     public struct Installation: Sendable {
         public let applicationURL: URL?
@@ -273,6 +278,19 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
         }
 
 
+    }
+
+    /// A chat server the host runs on this Mac (OpenAI's chat completions wire). It keeps no conversation, so each message carries the
+    /// conversation's history, and it answers with a model the host already has loaded: it is never started, nor a model loaded, from here.
+    public struct LocalChat: Codable, Sendable, Equatable {
+        /// The server's loopback root, e.g. http://localhost:1234.
+        public var server: String
+        /// Lists the models, each with its loaded instances (`models[].loaded_instances[].id`).
+        public var models: String
+        /// The chat completions path under `server`.
+        public var chat: String
+        /// The person's words for turning the server on.
+        public var start: String
     }
 
     /// Credentials stay references; sends enforce saved card evidence and only dry runs learn changes.

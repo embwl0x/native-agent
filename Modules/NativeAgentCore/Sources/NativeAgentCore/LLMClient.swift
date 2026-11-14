@@ -97,6 +97,11 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
     public let effectInputPolicy: ToolEffectInputPolicy
     /// Local app/axis declaration; absent for tools without a Mac integration and never sent to providers.
     public let macIntegration: MacIntegrationAccess?
+    /// A create: the field of its own receipt that carries the id of the thing its call brought into being.
+    public let makes: String?
+    /// A removal of one thing: the field of its input that names the thing it removes. Removing what the agent's own create made
+    /// (`makes`) is the agent undoing its own act.
+    public let removes: String?
 
     public init(
         name: String,
@@ -105,6 +110,8 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
         capabilities: Set<String>? = nil,
         effectInputPolicy: ToolEffectInputPolicy = .fixed,
         macIntegration: MacIntegrationAccess? = nil,
+        makes: String? = nil,
+        removes: String? = nil,
         description: String,
         parametersJSON: Data
     ) {
@@ -116,6 +123,8 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
         self.capabilities = capabilities ?? toolClass?.baseCapabilities ?? []
         self.effectInputPolicy = effectInputPolicy
         self.macIntegration = macIntegration
+        self.makes = makes
+        self.removes = removes
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -138,6 +147,8 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
         self.capabilities = []
         self.effectInputPolicy = .fixed
         self.macIntegration = nil
+        self.makes = nil
+        self.removes = nil
     }
 
     public func encode(to encoder: Encoder) throws {

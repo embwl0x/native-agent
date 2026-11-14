@@ -6,7 +6,9 @@ import PersistenceCore
 extension AppActions {
     /// What a row of the stem's Providers, Connectors and Capabilities pages does where no other verb does it, declared once: the person's
     /// tap and the agent's call are the same `connections` host call. A lever names why it is the person's, and `asks: false` where no card
-    /// can carry the agent's ask (a sign-in, a key, a pairing, a window or panel on the Mac, a macOS grant in the foreground).
+    /// and no word of theirs can stand in for the person: a secret read off their screen, a pairing code they match, a place they choose in a
+    /// system panel, a macOS grant they answer in the foreground, or words sent as theirs. Raising the card or window where they sign in or
+    /// enter a key is no such act: the agent does it when they ask, and asks first when it is its own idea.
     static var providersConnectorsCapabilitiesVerbs: [AppAction] {
         get throws {
             // An irreversible change writes app data through its tool, as every irreversible row verb declares.
@@ -17,12 +19,12 @@ extension AppActions {
                           owner: .person("models are the person's picks, on Providers",
                               name: "Choosing my models"), tool: "connections", input: verb("provider_choose")),
                 AppAction("provider.codex_session", "providers", "Use, ignore or back up and reset the Codex CLI sign-in found on this Mac",
-                          ["answer:use|ignore|repair"], owner: .person("adopting a sign-in is the person's consent, on Providers", asks: false,
+                          ["answer:use|ignore|repair"], owner: .person("adopting a sign-in is the person's consent, on Providers",
                               name: "Using the Codex sign-in found on this Mac"),
                           tool: "connections", input: verb("provider_codex_session")),
 
                 AppAction("connector.connect", "connectors", "Connect or reconnect an account on its setup card in chat", ["id"], subject: ["id"],
-                          owner: .person("signing in is the person's, on the connector's setup card", asks: false, name: "Signing in to an account"),
+                          owner: .person("signing in is the person's, on the connector's setup card this raises", name: "Signing in to an account"),
                           tool: "connections", input: verb("connector_connect")),
                 AppAction("connector.forget_secret", "connectors", "Forget a kept secret", ["name"], subject: ["name"],
                           owner: .person("only the person can grant it again", name: "Forgetting a kept secret"), irreversible: true, capabilities: writes,
@@ -34,7 +36,7 @@ extension AppActions {
                 AppAction("telegram.refresh", "telegram", "Read Telegram's records again", tool: "connections", input: verb("telegram_refresh"),
                           read: true),
                 AppAction("telegram.token", "telegram", "Enter or replace the bot token on its key-entry card in chat",
-                          owner: .person("the bot token is the person's to enter, on its key-entry card", asks: false, name: "Entering the Telegram bot token"),
+                          owner: .person("the bot token is the person's to enter, on the key-entry card this raises", name: "Entering the Telegram bot token"),
                           tool: "connections", input: verb("telegram_token")),
                 AppAction("telegram.allowlist", "telegram", "Replace the allowed chat or user IDs (numeric IDs separated by commas)",
                           ["list:chats|users", "value"], subject: ["list"], owner: .person("who may reach the agent on Telegram is the person's",
@@ -61,11 +63,11 @@ extension AppActions {
                           owner: .person("the person matches the phone's code and pairs it on the Mac", asks: false, name: "Pairing an iPhone"),
                           tool: "connections", input: verb("pairing_pair")),
                 AppAction("pairing.rotate", "pairing", "Regenerate the pairing key; the old key stops working at once",
-                          owner: .person("the person regenerates the pairing key on the Mac", asks: false,
+                          owner: .person("a new pairing key replaces the one every paired phone holds",
                               name: "Regenerating the pairing key"), irreversible: true,
                           capabilities: writes, tool: "connections", input: verb("pairing_rotate")),
                 AppAction("pairing.use_here", "pairing", "Use the iPhone with this Mac, disconnecting it from the other one",
-                          owner: .person("moving the iPhone between Macs is the person's, on the Mac", asks: false, name: "Moving the iPhone to this Mac"),
+                          owner: .person("moving the iPhone between Macs is the person's", name: "Moving the iPhone to this Mac"),
                           tool: "connections", input: verb("pairing_use_here")),
 
                 AppAction("agent.refresh", "agents", "Read the agent address book again", tool: "connections", input: verb("agent_refresh"),
@@ -84,14 +86,11 @@ extension AppActions {
                           owner: .person("it sends the person's own words", instead: "agent.message sends yours", asks: false,
                               name: "Sending your own message to an agent"), toolClass: .send,
                           tool: "connections", input: verb("agent_send")),
-                AppAction("agent.grok_import", "agents", "Read a Grok Bot routine's credentials securely on this Mac", ["agent"], subject: ["agent"],
-                          owner: .person("routine credentials are the person's, read on the Mac", asks: false,
-                              name: "Reading a Grok Bot routine's credentials"),
-                          tool: "connections", input: verb("agent_grok_import")),
-                AppAction("agent.grok_paste", "agents", "Paste a Grok Bot routine's credentials in the Mac's secure window", ["agent"],
-                          subject: ["agent"], owner: .person("routine credentials go from the Mac's secure field to the keychain", asks: false,
-                              name: "Pasting a Grok Bot routine's credentials"),
-                          tool: "connections", input: verb("agent_grok_paste")),
+                // Not a lever: it only moves what Grok Bot's own Copy put on the clipboard into this contact's Keychain entry while its setup is
+                // owed, and no value reaches a result, so it runs at once and never sits on a card.
+                AppAction("agent.grok_paste", "agents",
+                          "Paste a Grok Bot routine's webhook address or key from the clipboard into its secure field (the key never shows)",
+                          ["agent"], subject: ["agent"], tool: "connections", input: verb("agent_grok_paste")),
                 AppAction("agent.grok_bot", "agents", "Grok Bot's exact sidebar name for a contact's routine", ["agent", "value"], subject: ["agent"],
                           owner: .person("setting up a contact's connection is the person's, on Connectors", name: "Naming a contact's Grok Bot routine"),
                           tool: "connections", input: verb("agent_grok_bot")),

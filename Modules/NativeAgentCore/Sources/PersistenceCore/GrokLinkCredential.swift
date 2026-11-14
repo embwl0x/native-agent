@@ -20,7 +20,7 @@ public struct GrokLinkCredential: Codable, Sendable {
             case .unavailable:
                 return "Grok Bot's saved connection credentials are unavailable. Connect Grok Bot again to finish secure setup."
             case .invalid:
-                return "Grok Bot connection data failed validation. Finish setup at Agents → Grok Bot → Routine credentials; never put credentials in chat."
+                return "Grok Bot connection data failed validation. Connect Grok Bot again to finish setup."
             }
         }
     }
@@ -70,13 +70,46 @@ public struct GrokLinkCredential: Codable, Sendable {
         guard status == errSecSuccess || status == errSecItemNotFound else { throw Failure.unavailable }
     }
     public mutating func importWebhook(url: String, key: String) throws {
-        guard url.utf8.count <= 4096, let parts = URLComponents(string: url),
-              parts.scheme == "https", parts.host?.isEmpty == false,
-              parts.user == nil, parts.password == nil, parts.fragment == nil,
-              !key.isEmpty, key.utf8.count <= 8192,
-              key.utf8.allSatisfy({ $0 >= 33 && $0 <= 126 }) else { throw Failure.invalid }
+        guard Self.usableURL(url), Self.usableKey(key) else { throw Failure.invalid }
         webhookURL = url; webhookKey = key
     }
+    private static func usableURL(_ url: String) -> Bool {
+        guard url.utf8.count <= 4096, let parts = URLComponents(string: url) else { return false }
+        return parts.scheme == "https" && parts.host?.isEmpty == false && parts.user == nil && parts.password == nil && parts.fragment == nil
+    }
+    private static func usableKey(_ key: String) -> Bool {
+        !key.isEmpty && key.utf8.count <= 8192 && key.utf8.allSatisfy({ $0 >= 33 && $0 <= 126 })
+    }
+    /// What one paste names. Accepted forms: `{"url":"…","key":"…"}`; the webhook address and the key one after the other, separated by a space or a new
+    /// line (in either order); or either one alone. Nil: none of these.
+    public static func pasted(_ text: String) -> (url: String?, key: String?)? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.utf8.count <= 16_384 else { return nil }
+        if trimmed.hasPrefix("{") {
+            guard let object = try? JSONSerialization.jsonObject(with: Data(trimmed.utf8)) as? [String: String],
+                  Set(object.keys) == ["url", "key"] else { return nil }
+            return (object["url"], object["key"])
+        }
+        var url: String?, key: String?
+        for part in trimmed.split(whereSeparator: \.isWhitespace).map(String.init) {
+            if part.lowercased().hasPrefix("https://") {
+                guard url == nil else { return nil }
+                url = part
+            } else {
+                guard key == nil else { return nil }
+                key = part
+            }
+        }
+        return (url, key)
+    }
+    /// Take a pasted address and/or key; the other part already saved stays.
+    public mutating func takePasted(url: String?, key: String?) throws {
+        if let url { guard Self.usableURL(url) else { throw Failure.invalid } }
+        if let key { guard Self.usableKey(key) else { throw Failure.invalid } }
+        if let url { webhookURL = url }
+        if let key { webhookKey = key }
+    }
+    public var webhookComplete: Bool { webhookURL != nil && webhookKey != nil }
 }
 
 public struct GrokReplyInput: Codable, Sendable {

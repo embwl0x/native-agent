@@ -287,6 +287,8 @@ private struct TodaySource: Sendable, Equatable {
     var keys: [String: JSONValue] = [:]
     /// The person's decisions waiting, drawn by the stem beside the face.
     var levers: [PartFace.Row] = []
+    /// The answers riding the face's own rows by key (`keyLevers`): a waiting request's Inbox row's own buttons on its Waiting for you row.
+    var keyed: [PartFace.Row] = []
     /// The night's trials, the same section Home draws (`TrialLevers`): the person's Set aside wherever the person is.
     var trials: PartFace.Section?
     var owed = false
@@ -305,10 +307,12 @@ private struct TodaySource: Sendable, Equatable {
             let rows = try await SwiftNativeApprovalInbox(root: engine.dataRoot).list(filter: .all)
             let approvals = WorkOverviewRead.waitingApprovals(rows)
             source.approvalCount = approvals.count
+            // Each decision carries its Inbox row's own answers (same ids, door calls and confirmation); an unreadable Inbox leaves its open link.
+            let answers = (try? await engine.inboxAnswers()) ?? [:]
             source.levers = approvals.map { approval in
                 let matter = approval.matter
                 return PartFace.Row(id: "approval:" + approval.id, title: matter.title,
-                    detail: TodayWords.line(matter.summary), tone: .attention, open: "approval:" + approval.id)
+                    detail: TodayWords.line(matter.summary), tone: .attention, open: "approval:" + approval.id, actions: answers[approval.id])
             }
             source.owed = !approvals.isEmpty
         } catch {
@@ -334,8 +338,11 @@ private struct TodaySource: Sendable, Equatable {
             }
             source.input["sourceStates"] = .object(["notes": .string(items.isEmpty ? "empty" : "available")])
             let asks = items.filter { $0.requiresOwnerInput && !$0.hasLinkedApproval }.sorted { $0.created_at > $1.created_at }
+            // Each request carries its Inbox row's own answers (same ids, door calls and confirmation); an unreadable Inbox leaves its open link.
+            let answers = (try? await engine.inboxAnswers()) ?? [:]
             let waiting = asks.map { item -> JSONValue in
                 source.keys["card:" + item.id] = .object(["open": .string("card:" + item.id)])
+                if let actions = answers[item.id] { source.keyed.append(PartFace.Row(id: "card:" + item.id, title: item.title, actions: actions)) }
                 return .object(["id": .string("card:" + item.id), "title": .string(item.title), "detail": .string(TodayWords.line(item.summary))])
             }
             let notes = items.filter { $0.isActivityPending && !$0.isSystemLane }.compactMap { item -> JSONValue? in
@@ -884,26 +891,29 @@ public actor TodayReadout {
                 let packet = packet(epoch: epoch)
                 let began = ContinuousClock.now
                 await engine.pages.sourceChanged(id: "today-readout", page: "today", epoch: packet.epoch, input: packet.facts,
-                    owed: packet.owed, levers: packet.levers.isEmpty ? nil : packet.levers, bound: true)
+                    owed: packet.owed, levers: packet.levers.isEmpty ? nil : packet.levers,
+                    keyLevers: packet.keyLevers.isEmpty ? nil : packet.keyLevers, bound: true)
                 ModuleLog.app("[today-source] feed=projection duration=\(began.duration(to: .now)) pending=\(pending.count)", level: .debug)
             } catch is CancellationError { return }
             catch {
                 let current = await engine.pages.snapshots["today"]
                 await engine.pages.sourceChanged(id: "today-readout", page: "today", epoch: current?.sourceEpoch ?? 0, input: .object([:]),
-                    unavailable: error.localizedDescription, owed: current?.owed ?? false, levers: current?.levers, bound: true)
+                    unavailable: error.localizedDescription, owed: current?.owed ?? false, levers: current?.levers,
+                    keyLevers: current?.keyLevers, bound: true)
             }
         }
     }
 
     private func packet(epoch: UInt64) -> PartFaces.Packet {
         var input: [String: JSONValue] = [:], keys: [String: JSONValue] = [:], states: [String: JSONValue] = [:]
-        var levers: [PartFace.Row] = [], trials: PartFace.Section?, owed = false, gaps: [String] = []
+        var levers: [PartFace.Row] = [], keyed: [PartFace.Row] = [], trials: PartFace.Section?, owed = false, gaps: [String] = []
         for feed in TodayFeed.allCases {
             guard let source = sources[feed] else { continue }
             for (field, value) in source.input where field != "sourceStates" { input[field] = value }
             if let values = source.input["sourceStates"]?.objectValue { states.merge(values) { _, new in new } }
             keys.merge(source.keys) { _, new in new }
             levers += source.levers
+            keyed += source.keyed
             if let section = source.trials { trials = section }
             owed = owed || source.owed
             gaps += source.unavailable
@@ -960,6 +970,7 @@ public actor TodayReadout {
         }
         input["keys"] = .object(keys)
         let decisions = levers.isEmpty ? [] : [PartFace.Section(id: "decisions", title: "Your decisions", style: .list, rows: levers)]
-        return PartFaces.Packet(facts: .object(input), epoch: epoch, levers: decisions + [trials].compactMap { $0 }, owed: owed)
+        let answers = keyed.isEmpty ? [] : [PartFace.Section(id: "waiting", title: "Waiting for you", style: .list, rows: keyed)]
+        return PartFaces.Packet(facts: .object(input), epoch: epoch, levers: decisions + [trials].compactMap { $0 }, keyLevers: answers, owed: owed)
     }
 }

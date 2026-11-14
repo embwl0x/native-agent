@@ -179,7 +179,7 @@ freezing their remaining time into an absolute Mac, sense or program wait budget
 Bridge tool ingress hands its newly bounded chain to dispatch; ability management
 takes the caller's whole `Parts.Invocation`.
 The [deadline contract](TURN_RESILIENCE.md#3-tool-dispatch-deadline) distinguishes
-active-work, wall-clock and response-only ceilings.
+active-work and wall-clock ceilings, and gives every call a turn makes its watch.
 Each boundary still sets the values it owns on what it passes down. Stream
 admission sets a supplied Mac takeover on the turn read by native actions;
 without a supplied reply row and session it clears the mounted reply row.
@@ -199,10 +199,14 @@ in that session can receive the hand-back, and the open-turn owner checks the
 same act. Every replay, including a waiting host's, uses the card's recorded
 envelope and its verified signature witness. Missing identity or origin leaves
 the continuation unresolved with a visible repair instruction. A standalone
-card continuation that arrives while another request is answering is a hidden
-arrival: their turn reads it at its next step and writes no row for it, as a hidden
-bubble writes none; if its own place comes first it runs as its own hidden turn
-with the card's origin. Domain approvals without a
+card continuation in the person's own Mac conversation that arrives while another
+request is answering is a hidden arrival: their turn reads it at its next step and
+writes no row for it, as a hidden bubble writes none; if its own place comes first
+it runs as its own hidden turn with the card's origin. A card raised from any other
+door (a contact's conversation, the phone, a chat service) continues the same
+way through that door, with the card's turn as its authority (origin envelope,
+file-access ceiling, request-only model binding, steering); in a contact's
+conversation its answer is held for the contact's next call. Domain approvals without a
 request envelope execute their bounded approved effect as a local approval
 act; the resolving door records who decided, never the effect's authority.
 Chat approval replay likewise installs the verified card's exact origin on
@@ -973,7 +977,14 @@ states, the same in Simple and Advanced:
   dash for an unconfirmed one) and its finished words, set off from the current
   step by a hairline. Older steps are not shown; rows are fixed single lines, so
   the card's cost never grows with their work.
-- **Waiting on you**: a pending approval or a block keeps its own words.
+- **Waiting on you**: a pending approval or a block keeps its own words. A turn
+  that ended waiting on the person (its reply's `terminalState` is `waiting`)
+  is an ending of its own, phase `waiting_on_person`: never interrupted, never
+  unknown. Its card reads `<name> is waiting on you` with the ask's words (after
+  a restart, "The next move is yours."), in the quiet tone with no dot; an
+  approval still undecided owns the card's words. It waits only while the
+  approval it raised is undecided: once that approval is decided or ends, the
+  turn reads as done, and an approval that keeps its card owns the words.
 - **Done**: the card goes away; the transcript folds the reply's tools into one row.
 
 The session owns live delivery through `SessionTurnDelivery`, attached at the
@@ -1096,9 +1107,12 @@ a read joins as many as that holds and an explicit raw read takes one; a long
 line takes a page of its own, a longer string is read as ordered pieces that
 join back to it exactly, and `page` in the answer is where it started), and
 `next_page` or `continue:true` advances without running the action again.
-A `query` returns where its terms are, not everything around them: from
-each section that holds every term (a term cut by the seam between two
-pieces still counts), one row per line holding a term (its first match),
+A `query` returns where it is, not everything around it. It is first the
+phrase as written (trimmed, case aside); only when that phrase is nowhere in
+the result is a query of several words read again as its separate words, and
+`query_read_as` (`phrase` or `words`) and the detail say which it did. From
+each section that holds the phrase, or every word (a term cut by the seam
+between two pieces still counts), one row per line holding a term (its first match),
 with its `path`, its `line` (where the value has no lines, an `offset`), the
 line itself or a bounded window of a long line around the match, the
 adjacent line on each side, and `section_page`, the page of a reading without
@@ -1121,7 +1135,15 @@ its own failure, never an unretained prefix or a verdict about the original
 action's effects. A retention failure keeps the complete result
 in its caller's dispatch record; model delivery marks the projection error.
 
-The loop handles cancellation, bounded dispatch response waits and malformed-call feedback. The original tool owns its actual receipt and checkpoint settlement after a wait expires. Native routes execute only structured calls, text-marker routes only their offered markers, and text-only routes execute none. Malformed text is refused without salvage, and helpers share the offered-descriptor admission before the gate chain. No schema-loading round is needed between iterations. [Turn resilience](TURN_RESILIENCE.md#3-tool-dispatch-deadline) owns this contract.
+The loop handles cancellation, each call's watch and malformed-call feedback.
+A call whose wait is found dead, or that passes its own declared time, is
+ended as Stop ends it and the agent reads why; the original tool owns its
+actual receipt and checkpoint settlement. Native routes execute only structured calls,
+text-marker routes only their offered markers, and text-only routes execute
+none. Malformed text is refused without salvage, and helpers share the
+offered-descriptor admission before the gate chain. No schema-loading round is
+needed between iterations.
+[Turn resilience](TURN_RESILIENCE.md#3-tool-dispatch-deadline) owns this contract.
 Fenced and inline code examples remain answer text; markers inside them never
 execute or trigger protocol repair. On the text-marker wire a call is an
 offered tool name around one JSON object: the model's trained
@@ -1200,8 +1222,13 @@ The row's existing `completionState` distinguishes a saved completed answer
 from a saved incomplete reply; where the row also carries the turn's
 `terminalState`, that settled state is what restart reads, the same one the
 live lifecycle projects, so a reply that ended on a pending card is waiting in
-both. Incomplete replies retain their receipt and
-text, but settle as an unconfirmed outcome, including on Regenerate and restart.
+both. Waiting on the person is a known ending: it settles as
+`waiting_on_person` live, on Regenerate and on restart. The lifecycle file
+stores it in the pair every build reads (`outcome_unknown`,
+`interrupted_outcome_unknown`); restart reads an outcome-unknown record's saved
+reply and restores `waiting_on_person` when that reply ended `waiting`. Other
+incomplete replies retain their receipt and text, but
+settle as an unconfirmed outcome, including on Regenerate and restart.
 
 Chrome form batches retain each structured action receipt beside the compact
 field summary and page. Their verification stays pending while any subaction's

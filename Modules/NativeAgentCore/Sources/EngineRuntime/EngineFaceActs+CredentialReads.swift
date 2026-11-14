@@ -52,10 +52,9 @@ extension EngineFaceActs {
                     .init(id: "require_mention", value: .bool(policy.requireMention))]
             }
         case .grok(let write):
-            let submitted = try JSONDecoder().decode([String: String].self, from: write.secret)
+            guard let text = String(data: write.secret, encoding: .utf8), let submitted = GrokLinkCredential.pasted(text) else { return nil }
             let saved = try GrokLinkCredential.read(peer: write.contact)
-            guard Set(submitted.keys) == ["url", "key"], let url = submitted["url"], let key = submitted["key"],
-                  saved.webhookURL == url, saved.webhookKey == key,
+            guard let url = submitted.url, let key = submitted.key, saved.webhookURL == url, saved.webhookKey == key,
                   let contact = try AgentPeerStore(dataRoot: root).list().first(where: { $0.id == write.contact }),
                   contact.transport == .grokBot, contact.grokSetup == "set up", contact.grokBootstrapConfirmed == true else { return nil }
             return [.init(id: "credentials")]

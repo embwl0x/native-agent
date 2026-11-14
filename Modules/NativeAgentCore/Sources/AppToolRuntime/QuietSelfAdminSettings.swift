@@ -18,10 +18,10 @@ import AVFoundation
 
 public enum QuietSettings {
     public static let trustVoicePreferenceDidChange = Notification.Name("NativeAgent.trustVoicePreferenceDidChange")
-    /// The agent lowers its own fence at any posture; turning Full Mac on is the person's alone.
+    /// The agent lowers its own fence at any posture; turning Full Mac on is the person's, as every raise is.
     public static let fullMacRefusal =
-        "Turning Full Mac on is the person's alone, in Trust. The agent's own preset choices are Safe, Work mode and Builder, and a "
-        + "choice that widens what the agent may do asks the person."
+        "Turning Full Mac on is the person's: it is made on their own words asking for it, quoted in because, or on their card. The agent's "
+        + "own preset choices are Safe, Work mode and Builder, and a choice that widens what the agent may do asks the person."
 
     /// The choices the Trust page's activity and Mac access controls offer, as their settings take them.
     public static let activityTitleChoices = ["apps", "windows", "browsers"]
@@ -29,8 +29,8 @@ public enum QuietSettings {
     public static let macPresetChoices = ["off", "watch", "assistant", "full"]
 
     public static let ownerOnlyRefusal =
-        "This one is the person's to set. It decides what the agent is allowed to do, "
-        + "so the agent can read it and report it but never change it. Ask them to set it in the app."
+        "This one is the person's to decide: it decides what the agent is allowed to do. When they ask for a change in their own words, "
+        + "quote them in because and it is made on their word; a change that is the agent's own idea asks them on a card."
 
     // MARK: - Who decides
 
@@ -41,9 +41,10 @@ public enum QuietSettings {
         PermissionLaw.personDecided(tool: "app", input: ["action": .string("setting.set"), "args": .object(args)], turn: turn)
     }
 
-    /// The same law read inside a setting's own check or write, which hold the setting and the value the door passed.
+    /// The same law read inside a setting's own check or write, which hold the setting and the value the door passed: the person decided
+    /// this change, whatever reason (`because`) the call they approved carried beside it, alone or with others on one card.
     public static func personDecided(setting id: String, value: JSONValue, turn: Turn) -> Bool {
-        personDecided(["setting": .string(id), "value": value], turn: turn)
+        PermissionLaw.personDecided(setting: id, value: value, turn: turn)
     }
 
     /// The agent's Trust posture change rechecks its direction under the merge lock: one that widens the agent's reach against the policy as
@@ -525,10 +526,10 @@ public enum QuietSettings {
         }
         rows.append(postureEdit(
             id: "trust.preset", label: "Trust preset", kind: .choice,
-            choices: MobileTrustAction.Preset.quietWritable.map(\.rawValue),
-            note: "Safe, Work mode and Builder — the same three buttons the Trust page shows, "
-                + "applied through the page's own preset action. Full Mac is not one of them: "
-                + "turning Full Mac ON is the person's alone, whatever mode this Mac is in.",
+            choices: MobileTrustAction.Preset.allCases.map(\.rawValue),
+            note: "Safe, Work mode, Builder and full_mac (Full Mac), applied through the page's own preset action. A choice that "
+                + "widens what you may do, Full Mac among them, is the person's at any mode: it is made when because quotes their own "
+                + "request, and otherwise asks them on a card.",
             // A preset writes its whole Mac control block, so one at the same rank still raises any switch it turns back on.
             raises: { host, current, wanted in
                 guard let preset = MobileTrustAction.Preset(rawValue: wanted.stringValue ?? "") else { return true }
@@ -908,10 +909,10 @@ public enum QuietSettings {
         ).ownedByMind())
 
         rows.append(QuietSetting(
-            id: "research.search_url", page: "desk", label: "Search service",
+            id: "research.search_url", page: "settings", label: "Search service",
             kind: .text,
             note: "The SearXNG address I search through, as http://host:port; auto finds one running on this Mac and saves it.",
-            read: { appModel in .string(appModel.searchServiceURL) },
+            read: { appModel in .string(try await appModel.searchServiceURL) },
             write: { appModel, value, context in
                 let raw = try stringValue(value, "Search service").trimmingCharacters(in: .whitespaces)
                 if raw.caseInsensitiveCompare("auto") == .orderedSame {
@@ -938,15 +939,15 @@ public enum QuietSettings {
             id: "notifications.raise_unasked", page: "notifications",
             label: "Raise things unasked", kind: .boolean,
             note: "The master over the triggers below. The agent may turn it off; turning it on is "
-                + "the person's.",
+                + "the person's (your call asks them).",
             read: { appModel in (await notificationsMasterOn(appModel)).map { .bool($0) } ?? .null },
             write: { appModel, value, context in
                 let on = try boolValue(value, "Raise things unasked")
-                // Turning it on is the person's own decided call and nothing else's.
-                guard !on || personDecided(setting: "notifications.raise_unasked", value: value, turn: context.turn) else {
-                    throw QuietSettingError.unavailable(
-                        "Turning this on is the person's call: it lets the agent reach out unasked. "
-                        + "Ask them to switch it on in Settings.")
+                // Turning it on is the person's, as every raise is: their decided call (a tap, a card, their word) makes it.
+                if on, await notificationsMasterOn(appModel) != true,
+                   let refused = usersCall("Turning Raise things unasked on", "Settings → Notifications",
+                                           setting: "notifications.raise_unasked", value: value, turn: context.turn) {
+                    throw refused
                 }
                 let saved: TrustPolicy
                 do {
@@ -960,6 +961,11 @@ public enum QuietSettings {
                         + "Try again in a moment.")
                 }
                 appModel.applySavedTrustPolicy(saved, status: "Notification policy saved")
+            },
+            check: { appModel, value, turn in
+                guard (try? boolValue(value, "Raise things unasked")) == true, await notificationsMasterOn(appModel) != true else { return nil }
+                return usersCall("Turning Raise things unasked on", "Settings → Notifications", setting: "notifications.raise_unasked",
+                                 value: value, turn: turn)
             }
         ))
         rows.append(QuietSetting(
@@ -992,9 +998,8 @@ public enum QuietSettings {
                 let turningOn = triggers.contains { wanted.contains($0.name) && !$0.enabled }
                 if turningOn, await notificationsMasterOn(appModel) != true {
                     throw QuietSettingError.unavailable(
-                        "Raising things unasked is off, and turning it on is the person's call, so no "
-                        + "trigger can be switched on. Ask them to switch it on in Settings; "
-                        + "switching triggers off still works.")
+                        "Raising things unasked is off, so no trigger can be switched on yet. Turn notifications.raise_unasked "
+                        + "on first (the person's: on their words quoted in because, or on their card); switching triggers off still works.")
                 }
                 if let unknown = wanted.sorted().first(where: { !names.contains($0) }) {
                     throw QuietSettingError.badValue(

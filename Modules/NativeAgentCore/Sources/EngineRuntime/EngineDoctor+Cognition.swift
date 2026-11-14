@@ -31,7 +31,7 @@ extension EngineDoctorRuntime {
         } else {
             rows.append(CheckResult(source: "Cognition registration",
                 id: "live.cognition.runtime", title: "Cognition runtime", status: "unmeasured",
-                detail: "The mounted cognition runtime has no ready state to read."
+                detail: "The mind has not started: it starts when setup finishes, so there is no state to read yet."
             ))
         }
         rows.append(await doctorContextFlowCheck())

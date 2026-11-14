@@ -84,13 +84,114 @@ No result retrieval re-executes the action; a body that never returns remains
 owned and uncertain while the reporting caller stays bounded. The payload-free
 lifecycle and startup recovery remain the durable evidence owner.
 
-`ChatTurnRuntime/ChatOrchestration+ToolDispatch.swift` applies
-`ToolDispatchDeadline` from `ToolLoopSupport.swift`. Folded `app` actions
-use the underlying tool's name and arguments to select their deadline.
-Defaults are 900 seconds for interactive work and 3,900 for unattended work;
-an integer `timeout_seconds` is clamped to 30–3,600 seconds plus a 30-second
-cleanup margin. Tool-specific defaults can differ. The deadline bounds time without
-progress: a part that carries itself (`{again: input}`) renews it with every run.
+**No agent is ever stuck, and no call is ended by a number while it is alive.
+A call is ended when the thing it waits on is seen to be dead or not
+answering, exactly as Stop ends it, and the agent reads what was found dead.**
+The turn goes on: the agent reads the receipt and decides what to do.
+`PersistenceCore/CallBound.swift` holds the law.
+
+Each call has a watch (`TurnDeadline` on its active-work clock), and the
+watches of one outermost call and every call running inside it form one tree.
+Life anywhere in the tree renews every watch in it: a call in it completing, a
+part that carries itself (`{again: input}`), any event (a keep-alive included)
+from a turn running under it, and each sign of life an owner reports. A
+person's wait anywhere in the tree pauses it; waiting on the person is never
+silence. A call running inside another holds the other's watch until it
+returns or is ended, so only the innermost running call listens. Because the
+tree is reached from any watch in it, work that holds an older copy of the
+chain (an ability body admitted after its execution was made) still renews and
+pauses the call it runs in.
+
+What a call waits on is a `CallLife`: its owner attaches it to the call's
+watch (`TurnDeadline.watching` or `attach`/`detach`), reports life with
+`moved()`, and answers "is it alive?". When the innermost call has been quiet
+for `quietSeconds` (60), each attached owner is asked, with `pingSeconds` (10)
+to answer, and the turn's status starts saying what the call is waiting on.
+Any answer of life keeps the call waiting, however long. A death or
+a failure to answer, with no life, ends the call. A wait on the person keeps
+it waiting and shows the turn the owner's words. When nothing attached can
+answer, the call is not ended: the turn shows, as a `call.stalled` notice,
+which call has been waiting and for how long with nothing able to say whether
+it lives, so the person can press Stop; the question is asked again after
+each quiet window. Owners that report life today:
+
+- a child process (`OwnedProcessGroup.callLife`, attached by `ManagedProcess`
+  when its `life` is set: builder commands through `runShellLikeProcess`, a
+  part's `program.receive`, Codex image generation, the screenshot save, and
+  `ProcessExecution.run` given the call's `life`, as Dot's helper is): alive
+  while any member of its group runs,
+  however quiet (`sleep 600`, a slow download); its output, read by the
+  capture owner, is life as it comes; dead only when the whole group has
+  exited;
+- an app under automation (`AppleScriptExecution.appLife`, attached for the
+  call's Apple Event or script): alive while it answers an accessibility ping,
+  gone when it has quit, not answering when the ping cannot complete;
+- the apps a Mac operation's Accessibility messages go to (`MacAXTargets`,
+  attached in `MacControl`'s dispatch and kept until the call's watch ends, so
+  a wait's observers after the dispatch returns have it too; each app is noted
+  as a message to it is prepared): alive while any of those processes runs,
+  however hung, so a hung app is shown as waiting and Stop ends it; dead only
+  when every one has quit; with none noted yet, it cannot say;
+- the holder of a file lock (`CredentialFileLock.holderLife`, attached by
+  `CredentialFileLock.withLock` and `SwiftNativePersistenceCore.withFileLock`
+  given the waiting call's `life`): every holder names its process in the
+  lock's sidecar; alive while that other process runs; held in this process or
+  unnamed, it cannot say. The async wait blocks in `flock` on a thread of its
+  own, so Stop releases the caller at once and a lock it gets after the caller
+  left is released;
+- Chrome's extension, for every Chrome request (`ChromeControlChannel.life`):
+  alive while the connection to it is open, however slow, so a hung extension
+  is shown as waiting and Stop ends it; dead once the connection has closed;
+- the person's keyboard hold before a key is posted (`MacInputEvents`): a wait
+  on the person, shown as such;
+- another agent's ACP program (`AgentACPClient.turn`, attached for the turn
+  from the program's process group): alive while it runs, however quiet; each
+  line it writes is life; dead once it has exited;
+- a desktop contact's app under observation (`DesktopRouteObservation`): its
+  `appLife` is attached while the observation lasts, and each accessibility
+  event from the app is life;
+- an ACP permission or connect card (`AgentACPApproval`): a wait on the person,
+  shown as such;
+- the agent's turn answering a helper's `agent_message`: each word and step it
+  reports is life of the helper's call;
+- Location Services, for a location read waiting on a fix
+  (`MacLocationReader`): switched off or refused is dead, allowed is alive
+  (CoreLocation answers every request with a fix or an error);
+- a turn running under a call (helper runs and `bot_ask`, a part's
+  `model.call` and thoughts, a desktop contact's operator turn), which carries
+  the call's watch as `Turn.enclosingCall`: every provider event and every
+  byte its request receives is life, and each call it makes joins the tree.
+  Its open provider request answers as a request does (below), so a silent
+  one is shown as still running, never ended;
+- a request (`CallLife.request`; `URLSession.data(for:life:)` attaches it,
+  as the image API does, and the provider transfer attaches it for a turn
+  under a call): alive while its task runs, however quiet, as a running
+  process is; dead once the task has completed or is being cancelled; bytes
+  sent or received are life;
+- a helper's run (`BotRunner.perform`): every run, scheduled or asked for, has
+  its own watch, inside the asking call's when there is one, and its turn
+  carries that watch. A call waiting for a busy helper
+  (`BotRunQueue.claimWhenAvailable`) asks the run the helper is already doing:
+  alive while that run has shown life within a quiet window or anything it
+  waits on answers alive, the person's words when it waits on the person, and
+  never dead (the run's own watch ends it).
+
+A call that itself declares a time (`timeout_seconds`, or `timeout` on Mac
+acts and watch frames, clamped to 30-3,600 seconds; `wait_seconds` on reply
+observations) ends at that time plus a 30-second settlement allowance, on a
+wall clock: the caller's own word, not the app's number. A tool's own default
+inside its code (a shell's 120 seconds, a build's 600) is that tool's, and it
+ends its own work; the call does not.
+
+Four boundaries give each call its watch, and every call a turn makes crosses
+one: `runSingleDispatch` for each call of a turn on the shared tool loop; a
+helper's turn's own dispatch (`runStandingBot`), which does not use that loop;
+the app door's re-entry (`CanonicalToolNameDispatcher`'s
+`AppDoorReentry.perform`) for every nested call, which is how batch steps,
+script and part actions, reads and finds, folded calls, part thoughts' calls
+and every admitted primitive run; and `ToolHost.primitive` for the watch-frame
+and `program.receive`/`program.close` primitives that reach their broker
+without crossing the door.
 The chain is stored only on `ChatToolInvocation`; `ChatTurnWork.deadlines`
 and `AppActionExecution.deadlines` read and refine it, and the app execution's
 invocation is a view of its held work. Receiving a nested invocation therefore
@@ -98,31 +199,29 @@ replaces the chain seen by every wait and progress callback in that operation;
 the work's invocation projection never overwrites it from a second copy.
 The projection also leaves `waitDeadline` unchanged: that independently supplied
 absolute wait budget is never synthesized from a pausable, renewable ceiling.
-The live `TurnDeadline` owns enclosing expiry and cancellation; Mac and fetch
-owners retain their own operation and transport limits.
+Mac and fetch owners retain their own operation and transport limits.
 Ability management receives the caller's whole `Parts.Invocation`, including
 its ceilings, progress callback and preview state, through both action and
-preflight paths. Missing ceilings mean no enclosing bound, never a new timeout
-or a verdict about completion. Human waits pause active-work ceilings until
+preflight paths. Human waits pause active-work ceilings until
 the person answers or the wait ends; Stop and enclosing wall-clock limits
 still apply. Missing answers cannot count as approval or completion.
 Expansion's speculative delivery instead uses a wall-clock ceiling: progress
 and a person's wait cannot renew or pause the bound on the original result.
 
-`NATIVE_AGENT_TOOL_DISPATCH_TIMEOUT_SECONDS` overrides this policy;
-nonpositive or nonfinite values disable the dispatch backstop. Expiry returns
-model-visible error feedback stating that effects may already have occurred.
-The deadline helper delegates to `NativeAgentCore/TurnDeadline.swift`, whose
-resume-once race bounds the wait without cancelling or joining the original
-tool at expiry. The feedback is `status:timeout`, `effects:unknown`,
-`reason:tool_dispatch_wait_expired`, with the invocation and call IDs. The
-original body retains its checkpoint and records its actual receipt through
-`settle`; `tool.dispatch.settled` carries that receipt with the same IDs after
-actual exit, including a late return or journal-settlement failure. If it never
-returns, no settled trace is invented and the checkpoint remains unresolved.
-The response-only ceiling does not constrain downstream work through
-`secondsLeft`. Stop requests cancellation while the original body still owns
-its settlement, as required by [Stop's dispatch lifetime law](STOP.md).
+An ended call takes Stop's path: its body is cancelled and the caller released
+at once, even when the body ignores cancellation. A call found dead reads
+`status:failed`, `reason:found_dead`, naming what was found dead; one past its
+own declared time reads `status:timed_out`, `reason:ran_out_of_time`. Both
+carry `execution:attempted`, `effects:unknown`, one sentence saying whether it
+took effect is unknown, and a reconcile remedy; a model-facing call's receipt
+also carries its invocation and call IDs and names this turn's dispatch
+receipts. A nested call's receipt reaches its batch or program as that step's
+failed result. The original body retains its checkpoint and records its actual
+receipt through `settle`; `tool.dispatch.settled` carries that receipt with the
+same IDs after actual exit. If it never returns, no settled trace is invented
+and the checkpoint remains unresolved. A wait that does not answer
+cancellation (a blocked `flock`, a semaphore) still holds its own body after
+the caller is released.
 Its resolved state carries the value directly, including cancellation before
 the waiter arrives; nested human waits keep tokens rather than an integer
 counter. The helper refuses nonfinite, negative or unrepresentable seconds

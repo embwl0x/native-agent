@@ -111,14 +111,18 @@ public struct AppActionBinding: Sendable {
     public let subject: [String]
     /// The argument names the action declares, as the door spells them; the door's one reading of a call takes a declared name for the action.
     public let declaredArguments: Set<String>
+    /// The agent's own words to its own person (`chat.post`): no act on anyone's world and no send to a third party, so no posture and no
+    /// steering of the turn holds it on a card.
+    public let voice: Bool
 
     public init(lever: Lever?, irreversible: Bool, read: Bool, secretArgs: [String],
                 boundArguments: @escaping @Sendable ([String: JSONValue]) throws -> [String: JSONValue], readWhen: [String: JSONValue] = [:],
                 lifecycle: CapabilityLifecycle.Action? = nil, subject: [String] = [],
                 tool: String = "", fixedInput: [String: JSONValue] = [:], rename: [String: String] = [:],
                 folded: Bool = false, descriptor: ToolDescriptor? = nil, toolClass: ToolClass = .write,
-                reach: ToolReach = .agent, capabilities: Set<String>? = nil, declaredArguments: Set<String> = []) {
+                reach: ToolReach = .agent, capabilities: Set<String>? = nil, declaredArguments: Set<String> = [], voice: Bool = false) {
         self.tool = tool; self.fixedInput = fixedInput; self.rename = rename; self.folded = folded; self.descriptor = descriptor
+        self.voice = voice
         self.lever = lever; self.irreversible = irreversible; self.read = read
         self.secretArgs = secretArgs; self.readWhen = readWhen
         self.boundArguments = boundArguments

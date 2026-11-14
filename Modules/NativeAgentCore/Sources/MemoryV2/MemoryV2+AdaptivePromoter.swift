@@ -42,6 +42,8 @@ public actor AdaptiveMemoryPromoter {
     var observationID: UUID?
     var stopped = false
     var owedDrain: Task<AdaptiveMemoryObservation, Never>?
+    /// A drain was asked for while one ran; that drain looks again before it ends.
+    var owedDrainAsked = false
     var heldDrainIsIdle: (@Sendable () async -> Bool)?
     /// Injected fact-promotion policy; no configured owner means enabled.
     var adaptivePromotionEnabled: (@Sendable () throws -> Bool)?

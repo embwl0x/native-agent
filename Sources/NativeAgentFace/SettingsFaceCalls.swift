@@ -19,6 +19,9 @@ enum SettingsFaceCalls {
             case .showGrokSetup(let contact, let operation):
                 _ = try await GrokSecureSetupWindow.show(contact: contact, operation: operation, appModel: appModel)
                 return .acknowledged
+            case .closeGrokSetup(let contact):
+                GrokSecureSetupWindow.close(contact: contact)
+                return .acknowledged
             case .showMacControlWorkbench:
                 TrustPresentation.showWorkbench(appModel: appModel)
                 return .acknowledged

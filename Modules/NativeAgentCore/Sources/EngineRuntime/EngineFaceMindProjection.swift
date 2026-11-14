@@ -58,7 +58,7 @@ public enum EngineFaceMindProjection {
                 else {
                     face = CognitionFace(sections: [], proposals: [], receipts: [], organism: [], capsule: [],
                         state: engine.cognition == nil
-                            ? .unavailable(EngineFaceActs.failure("body_unavailable", "This root has no resident mind."))
+                            ? .unavailable(EngineFaceActs.failure("body_unavailable", "There is no running mind: it starts when setup finishes."))
                             : .waiting(on: "cognition"))
                 }
                 await engine.face.post(face, at: .cognition)

@@ -87,7 +87,7 @@ extension NativeCognitionRuntime {
         reason: String
     ) {
         // After terminal snapshot, late replay or organism arrivals cannot arm new microcycles.
-        guard !isFlushedForTermination else { return }
+        guard !isFlushedForTermination, mindStarted else { return }
         microcycleTelemetry.scheduledSignalCount &+= 1
         if microcycleTask != nil {
             microcycleTelemetry.coalescedReplacementCount &+= 1
@@ -197,8 +197,8 @@ extension NativeCognitionRuntime {
     private static let cognitionMaintenanceSleepClampSeconds: TimeInterval = 30 * 24 * 60 * 60
 
     func rescheduleResidualRepairDeadline() async {
-        // Termination prevents every path from rearming this deadline.
-        guard !isFlushedForTermination else { return }
+        // Termination prevents every path from rearming this deadline; a mind not started arms none.
+        guard !isFlushedForTermination, mindStarted else { return }
         let generation = residualDeadline.invalidate()
         let opportunity = await organismKernel.residualRepairOpportunity()
         guard generation == residualDeadline.generation else { return }
@@ -262,7 +262,7 @@ extension NativeCognitionRuntime {
         force: Bool = false
     ) async {
         // Termination prevents every path from rearming this deadline.
-        guard !isFlushedForTermination, maintenanceFailure == nil else { return }
+        guard !isFlushedForTermination, mindStarted, maintenanceFailure == nil else { return }
         let currentGeneration = cognitionDeadline.generation
         let opportunity = await substrate.maintenanceOpportunity()
         guard !isFlushedForTermination, cognitionDeadline.generation == currentGeneration else { return }

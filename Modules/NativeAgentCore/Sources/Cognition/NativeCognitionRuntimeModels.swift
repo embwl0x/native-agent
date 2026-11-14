@@ -61,6 +61,12 @@ public struct NativeCognitionRuntimeChange: Sendable, Equatable {
     public let revision: UInt64
     public let occurredAt: Date
     public let reason: String
+
+    public init(revision: UInt64, occurredAt: Date, reason: String) {
+        self.revision = revision
+        self.occurredAt = occurredAt
+        self.reason = reason
+    }
 }
 
 public struct NativeSubconsciousRuntimeState: Sendable, Equatable {

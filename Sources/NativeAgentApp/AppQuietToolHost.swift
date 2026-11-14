@@ -70,6 +70,9 @@ import TrustPersistence
             try await tools.pageRead(call, envelope: envelope, turn: turn)
         })
     }
+    func pageItem(page: String, named: String) async -> (id: String, open: String?)? {
+        await appModel.engine.pages.shownItem(page: page, named: named)
+    }
     func composerState(sessionId: String, turn: Turn) async -> [String: JSONValue] {
         if let face {
             do { return try await BodyQuietChatCommands(face: face).composerState(sessionID: sessionId, turn: turn) }

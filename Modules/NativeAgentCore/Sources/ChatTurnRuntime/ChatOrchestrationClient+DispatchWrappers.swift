@@ -21,7 +21,7 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import StandingBots
-// Blueprint: | `ChatOrchestrationClient+DispatchWrappers.swift` | File-access gates; exact-call consent carried to dispatch; audit failures owe repairs |
+// Blueprint: | `ChatOrchestrationClient+DispatchWrappers.swift` | File-access gates; exact-call consent carried to dispatch, the person's word deciding what is theirs; audit failures owe repairs |
 
 /// Carry request ceilings to Trust's canonical refusal before any inner work.
 final class FileAccessGatedDispatcher: ExpansionToolDispatchClient, PreApprovalToolValidating, Sendable {
@@ -150,6 +150,95 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         return said.count > 240 ? String(said.prefix(240)) + "…" : said
     }
 
+    /// The person's requests a call quotes (`because`): beside the call or in its args, and on each step of a list, each once, in order.
+    static func becauseQuotes(_ input: [String: JSONValue]) -> [String] {
+        func said(_ call: [String: JSONValue]) -> [String] {
+            [call["because"], call["args"]?.objectValue?["because"]]
+                .compactMap { $0?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        }
+        let all = said(input) + (input["actions"]?.arrayValue ?? []).flatMap { said($0.objectValue ?? [:]) }
+        return all.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+    }
+
+    /// The act as the person would name it, for `RequestWords`: each call's action id, the lever's declared name, the call's own values
+    /// (its target: an agent's, an app's, a setting's name), and what the owner's ask names (the setting, its label and page, the words of
+    /// each ask of a list).
+    static func actWords(tool: String, input: [String: JSONValue], ask: JSONValue?, turn: Turn) -> [String] {
+        func values(_ value: JSONValue?) -> [String] {
+            switch value {
+            case .string(let text)?: [text]
+            case .int?, .double?: [value?.scalarText ?? ""]
+            case .array(let items)?: items.flatMap { values($0) }
+            case .object(let fields)?: fields.filter { $0.key != "because" && !$0.key.hasPrefix("__") }.values.flatMap { values($0) }
+            default: []
+            }
+        }
+        let calls = input["actions"]?.arrayValue?.compactMap(\.objectValue) ?? [input]
+        var words = calls.flatMap { call -> [String] in
+            let lever = (try? PermissionLaw.lever(tool: tool, input: call, turn: turn))?.name
+            return [call["action"]?.stringValue, lever].compactMap { $0 } + values(call["args"])
+        }
+        // The ask's own fields, beside the door's receipt or inside its result.
+        for case .object(let answer)? in [ask, ask?.objectValue?["result"]] {
+            words += ["setting", "label", "page"].compactMap { answer[$0]?.stringValue }
+            words += (answer["asks"]?.arrayValue ?? []).compactMap { $0.objectValue?["words"]?.stringValue }
+        }
+        return words
+    }
+
+    /// The person's own words asking for this exact call, when it quotes them: every quote it carries (`becauseQuotes`), of three words or
+    /// more, names the act (`RequestWords.relates` with `actWords`) and is found by the turn's request evidence (`Turn.personWord`) in the
+    /// person's own message of the ask this turn is acting on, at a door of theirs. A helper's turn or one an agent the person has not trusted
+    /// steers has no word of theirs to quote. Any miss leaves the call on the person's card.
+    private func personsWord(tool: String, input: [String: JSONValue], ask: JSONValue?, turn: Turn) async -> String? {
+        guard tool == "app", input["preview"] != .bool(true), let heard = turn.personWord, !StandingBotContinuity.isHelperTurn(turn: turn),
+              CapabilityLifecycle.turnWriteCheck(turn)() == nil else { return nil }
+        let quotes = Self.becauseQuotes(input)
+        guard !quotes.isEmpty else { return nil }
+        let act = Self.actWords(tool: tool, input: input, ask: ask, turn: turn)
+        for quote in quotes {
+            guard quote.split(whereSeparator: \.isWhitespace).count >= 3, RequestWords.relates(quote, to: act), await heard(quote) else { return nil }
+        }
+        return quotes.joined(separator: " … ")
+    }
+
+    /// The call as a card names it, without the quoted request (`because`) beside it, in its args or on its steps: a card filed before the
+    /// person's words were quoted is for the same call.
+    static func withoutBecause(_ call: [String: JSONValue]) -> [String: JSONValue] {
+        var call = call
+        call["because"] = nil
+        if case .object(var args)? = call["args"] { args["because"] = nil; call["args"] = .object(args) }
+        if case .array(let steps)? = call["actions"] { call["actions"] = .array(steps.map { .object(withoutBecause($0.objectValue ?? [:])) }) }
+        return call
+    }
+
+    /// A card still waiting for the call the person's word now decides is settled now, through the inbox's own decision write, as decided
+    /// by their word, with their words: it cannot sit in their inbox and replay a change already made. Its reconciliation then reports it as
+    /// not run, as every withdrawn card is. Returns the cards settled and any that could not be.
+    private func settleCards(decidedBy words: String, tool: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
+        guard let session = turn.verifiedSessionID ?? verifiedSessionId else { return .null }
+        let call = Self.withoutBecause(MacInjectionArgRedaction.redacted(tool: tool, input: input, turn: turn))
+        let inbox = SwiftNativeApprovalInbox(root: peerDirectoryDataRoot ?? defaultDataRoot())
+        let waiting: [ApprovalRecord]
+        do { waiting = try await inbox.list(filter: ApprovalFilter(status: "pending", action: tool)) }
+        catch { return .object(["unreadable": .string(error.localizedDescription)]) }
+        var settled: [JSONValue] = [], failed: [JSONValue] = []
+        for record in waiting {
+            guard case .object(let payload) = record.payload, payload["kind"] == .string("chat_tool_approval"),
+                  payload["toolName"] == .string(tool), payload["origin"]?.objectValue?["sessionId"] == .string(session),
+                  case .object(let filed)? = payload["input"], Self.withoutBecause(filed) == call else { continue }
+            do {
+                _ = try await inbox.resolve(record.id, decision: .canceled,
+                    provenance: .local(decidedBy: ApprovalRecord.personsWordDecider + "“\(words.prefix(240))”"))
+                settled.append(.string(record.id))
+            } catch {
+                failed.append(.object(["id": .string(record.id), "error": .string(error.localizedDescription)]))
+            }
+        }
+        guard !settled.isEmpty || !failed.isEmpty else { return .null }
+        return .object(["settled": .array(settled), "not_settled": .array(failed)])
+    }
+
     private func peerDisplayName(peerID: String?) -> String? {
         guard let peerID, !peerID.isEmpty, let root = peerDirectoryDataRoot,
               let peer = try? AgentPeerStore(dataRoot: root).list()
@@ -210,10 +299,36 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
     func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
         try Task.checkCancellation()
         if StandingBotContinuity.isHelperTurn(turn: turn), let pending = turn.execution?.pendingApproval { return pending }
-        return try await inner.withToolArguments(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface) { input, invocation in
+        var result = try await dispatchHeld(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
+        // What the agent's own create made, by the id its receipt declares, is kept so a later removal of it, in this turn or any other, is
+        // known as undoing its own act; a removal that ran takes it away. Recorded once, by the declared create or removal itself: a folded
+        // `app` call re-enters here under its tool's own name, and its outer `app` call (no declaration of its own) records nothing.
+        if ToolResult(result).outcome == .succeeded, let schema = AppActionBinding.declaredSchema(tool) {
+            do {
+                if let key = schema.makes, let id = ChatTranscriptEvidenceRendering.receiptField(key, in: result)?.stringValue {
+                    try AgentMade.note(id, madeBy: tool, root: securityCenter.dataRoot)
+                }
+                if let key = schema.removes, let id = input[key]?.stringValue { try AgentMade.forget(id, root: securityCenter.dataRoot) }
+            } catch {
+                if case .object(var fields) = result {
+                    fields["made_record_unavailable"] = .string("trust/made.json was not updated (\(error.localizedDescription)), so removing "
+                        + "what this made asks the person as removing the person's things does.")
+                    result = .object(fields)
+                }
+            }
+        }
+        return result
+    }
+
+    private func dispatchHeld(tool: String, input: [String: JSONValue], surface: String, turn: Turn,
+                              invocation: ChatToolInvocation) async throws -> JSONValue {
+        try await inner.withToolArguments(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface) { input, invocation in
             var work = self.work.with(\.toolInvocation, invocation)
             work.handsBack = work.handsBack || invocation.handsBack
-            guard turn.partID != nil, !work.handsBack else {
+            // A card never holds a running call: a call from a script or a part returns pending at once with its card, as a top-level call
+            // does, and the program sees pending and goes on or ends; the person's Approve replays the call from the card. Only an ability's
+            // own authored body waits on its card, since that body runs nowhere but inside its live run.
+            guard turn.partID != nil, work.authoredCall != nil, !work.handsBack else {
                 let result = try await dispatchNormalized(tool: tool, input: input, surface: surface, turn: turn, work: work)
                 guard input["preview"] != .bool(true), let need = InlineInteractionNeed.interaction(in: result),
                       let session = verifiedSessionId else { return result }
@@ -503,6 +618,30 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 }
             }
         }
+        // Removing what the agent's own create made is the agent undoing its own act, not deleting the person's things: it runs without a
+        // card in this turn or a later one, as long as the create would run without a card for this same asker now. Another agent's
+        // steering and a security ask keep their card; Safe's refusal is a deny and stands.
+        var ownUndo: String?
+        if case .requireApproval = decision, !securityAsked,
+           let words = await AgentMade.undoing(tool: tool, input: input, surface: surface,
+               origin: .currentTurn(turn: turn.with(\.verifiedSessionID, verifiedSessionId ?? turn.verifiedSessionID), surface: surface),
+               security: envelope, turn: turn, securityCenter: securityCenter) {
+            admission = Self.securityEnvelope(envelope, decision: .allow, reason: words)
+            decision = .allow
+            ownUndo = words
+        }
+        // A change that is the person's to decide and that a card can carry (a lever's ask here, a setting raise's from its owner below) is
+        // decided by their card or by their own words asking for it (`personsWord`). Only that ask is theirs to answer by word: a security
+        // ask, another agent's steering or a peer's request keeps its card.
+        var theirs = false
+        if case .requireApproval = autonomyDecision, !securityAsked, requester == nil,
+           try PermissionLaw.lever(tool: tool, input: input, turn: turn)?.asks == true { theirs = true }
+        // The person's word, once it decides this call: their act for this exact call, as their card's Approve would be; and the cards it
+        // settled that were waiting for this call.
+        var wordTurn: Turn?
+        var cardsSettled: JSONValue = .null
+        // What the owner's ask named (`needs_person`), for the act's own words.
+        var ownerAsk: JSONValue?
         // The user's own contact send needs no card. Broader execution and Trust refusals must be stated plainly.
         if turn.personInitiatedSend?.claim(tool: tool, input: input, surface: surface) == true {
             let name: String = {
@@ -527,6 +666,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         try Task.checkCancellation()
         // An owner that needs the person's yes for this exact call says so in its reply (`needs_person`, with its words): the call then asks
         // as a gate's ask does, and the person's Approve replays it as their own act. The person's own act, or its replay, never asks again.
+        var ownerAsked = false
         while true {
         switch decision {
         case .allow:
@@ -539,7 +679,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             }
             // Bind the approved session so downstream dispatch reconstructs the same origin instead of falsely blocking it.
             // Injection still requires exact approved replay; `runInner` refuses any allow without its approval ID.
-            let result = try await runInner(
+            var result = try await runInner(
                 admission: admission,
                 tool: tool,
                 input: input,
@@ -547,19 +687,45 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 injectionApprovalID: injectionReplayApprovalID ?? (approvedReplayAuthorizes ? approvedReplay?.approvalID : nil),
                 // Reaching .allow IS the person's go-ahead: their approval, or Full Mac.
                 personApprovedHost: namedConnect,
-                // A verified replay of the person's approved card runs as their decision of this exact call, levers included.
+                // A verified replay of the person's approved card runs as their decision of this exact call, levers included; so does a call
+                // the person asked for in their own words.
                 turn: approvedReplay.flatMap { replay in approvedReplayAuthorizes
                     ? turn.with(\.personAct, PersonAct(by: .card(id: replay.approvalID), tool: tool, input: input, spent: [.call])) : nil }
-                    ?? turn,
+                    ?? wordTurn ?? turn,
                 work: work)
             let reply = ToolResult(result)
-            // Only the stem's own verbs ask this way (an app action that is no part's, connector's or folded tool's), so no reply a part,
-            // a peer or a remote tool writes can word the person's card.
+            // Only the stem's own verbs ask this way (an app action that is no part's, connector's or folded tool's, or the door's own list
+            // of calls that are all the person's to decide), so no reply a part, a peer or a remote tool writes can word the person's card.
+            let stemAsks: Bool = if let asking = input["action"]?.stringValue { AppActionBinding.declaredBinding(asking)?.folded == false }
+                else { input["action"] == nil && input["actions"]?.arrayValue != nil }
             if reply.said("needs_person"), !approvedReplayAuthorizes, turn.personAct == nil, input["preview"] != .bool(true), tool == "app",
-               let asking = input["action"]?.stringValue, AppActionBinding.declaredBinding(asking)?.folded == false,
-               let words = result.objectValue?["detail"]?.stringValue, !words.isEmpty {
+               stemAsks, let words = result.objectValue?["detail"]?.stringValue, !words.isEmpty {
                 decision = .requireApproval(reason: words)
+                ownerAsk = result
+                ownerAsked = true
+                // The owner's ask is the person's, as a lever's is, unless another agent is behind this turn; one their word already
+                // answered and that still asks goes on their card.
+                theirs = requester == nil && wordTurn == nil
+                wordTurn = nil
                 continue
+            }
+            // What the agent reads says it undid its own act, and what it made.
+            if let ownUndo, case .object(var fields) = result {
+                fields["undoing_own_act"] = .string(ownUndo)
+                result = .object(fields)
+            }
+            // What the agent reads says the call ran on the person's word, in their words.
+            if let words = wordTurn?.personAct?.words, case .object(var fields) = result {
+                fields["decided_by"] = .string("person")
+                fields["persons_word"] = .string(words)
+                if cardsSettled != .null { fields["cards_settled_by_persons_word"] = cardsSettled }
+                result = .object(fields)
+            }
+            // A call the person's card decided says which card and that the person decided it, so the agent's own log ties it to them.
+            if approvedReplayAuthorizes, let replay = approvedReplay, case .object(var fields) = result {
+                fields["decided_by"] = .string("person")
+                fields["card"] = .string("\(ApprovalWords.call(tool: tool, input: .object(input)).act) (\(replay.approvalID)), approved by the person")
+                result = .object(fields)
             }
             if let decidedRequester, !trustedBridge, tool != "app",
                reply.outcome == .succeeded {
@@ -626,6 +792,17 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                     injectionApprovalID: nil,
                  turn: turn, work: work)
             }
+            // The person's word in this conversation is their act: when they asked for this exact call, it runs as theirs, admitted the way
+            // their card's Approve is (this call, once), and the consent record carries their words. No card is filed.
+            if theirs, let words = await personsWord(tool: tool, input: input, ask: ownerAsk, turn: turn) {
+                wordTurn = turn.with(\.personAct, PersonAct(by: .word(quote: words), tool: tool, input: input, spent: [.call]))
+                if !work.admissionOnly { cardsSettled = await settleCards(decidedBy: words, tool: tool, input: input, turn: turn) }
+                admission = Self.securityEnvelope(envelope, decision: .allow,
+                    reason: "The person asked for this in their own words in this conversation: “\(words)”.")
+                theirs = false
+                decision = .allow
+                continue
+            }
             // File approval and await gate resolution; without a usable filer,
             // deny explicitly so the loop records the rejection.
             guard approvalFiler != nil, !work.admissionOnly || approvalFiler is any NonBlockingApprovalFiler else {
@@ -673,6 +850,21 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 }
                 if let remedy = envelope.remedy, case .object(var fields) = pending {
                     fields["remedy"] = remedy
+                    pending = .object(fields)
+                }
+                // The owner's ask, or a lever's, is now the person's card: what the agent reads says so, and what to do next. Where their word
+                // could have decided it, one more sentence says how.
+                if ownerAsked || theirs, case .object(var fields) = pending {
+                    let card = ApprovalWords.call(tool: tool, input: .object(approvalPayloadInput)).act
+                    let word = !theirs ? "do not call it again."
+                        : Self.becauseQuotes(input).isEmpty
+                        ? "if the person asked for this in their own words, call it again with because quoting them and it runs on their word; "
+                            + "otherwise do not call it again."
+                        : "the words in because were not found in the person's own message of what you are doing now (this turn's, one "
+                            + "they sent while you worked, or the one a card's answer continues), so the card decides it; call it again only "
+                            + "with their exact words."
+                    fields["card"] = .string("The person's card \"\(card)\" (\(approvalId)) is up in Mac chat and on their phone, and they decide: "
+                        + "their Approve runs this exact call as theirs, their Decline leaves everything as it is; " + word)
                     pending = .object(fields)
                 }
                 if StandingBotContinuity.isHelperTurn(turn: turn) { turn.execution?.keepApproval(id: approvalId, pending) }

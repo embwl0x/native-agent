@@ -131,12 +131,18 @@ extension CloudKitDeviceTransport {
 
     // Reading the peer secret must not change this Mac's publication claim.
     public func peekPairingSecret(recovery: DeviceSyncRecovery = .init()) async throws -> Data {
+        try await peekPairing(recovery: recovery).secret
+    }
+
+    /// The peer's published key and when the peer published it, by the peer's own clock (nil when the record does not say).
+    public func peekPairing(recovery: DeviceSyncRecovery = .init()) async throws -> (secret: Data, publishedAt: Date?) {
         guard recovery.isActive else { throw CancellationError() }
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
         let recordName = "pairing.\(peerRole.rawValue)"
         return try await withDeviceCKOperation("CloudKitDeviceTransport.peekPairingSecret", onFailure: accountFailureReporter) {
             let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
-            return try Self.pairingSecret(in: record)
+            let publishedAt = (record["publishedAt"] as? String).flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
+            return (try Self.pairingSecret(in: record), publishedAt)
         }
     }
 

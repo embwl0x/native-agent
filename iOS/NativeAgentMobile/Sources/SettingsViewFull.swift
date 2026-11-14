@@ -178,6 +178,8 @@ struct SettingsViewFull: View {
                     showRePairSheet = true
                 case "phone.connection.refresh":
                     let changed = await pairingStore.refreshFromCloudKit()
+                    // What the Mac has sent is read now, from iCloud; a refresh never waits for a push.
+                    _ = await iCloudBridge.shared.pollIncomingNow()
                     let result = await store.refresh()
                     let words = SettingsICloudRefreshPresentation.statusText(pairingMaterialChanged: changed, snapshotError: result.feedbackMessage)
                     if let error = result.feedbackMessage { throw SyncError.unsupported(error) }

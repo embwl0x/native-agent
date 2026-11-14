@@ -788,7 +788,7 @@ public actor MemoryStorage {
 
     /// Check disclosure over small ordered projections; decode full rows only for this page, within the same SQLite read transaction.
     public func curationPage(
-        archived: Bool, kind: String?, surface: String, persona: String?, newestFirst: Bool,
+        archived: Bool, kind: String?, pinned: Bool? = nil, surface: String, persona: String?, newestFirst: Bool,
         afterKey: (String, String)?, offset: Int, limit: Int
     ) async throws -> (records: [MemoryRecord], total: Int, nextOffset: Int) {
         try await dbPool.read { db in
@@ -818,6 +818,7 @@ public actor MemoryStorage {
                         && !Self.metadataFlag(record.extras, Self.pendingAdmissionKey)
                         && MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: record.validTo, at: Date()),
                     kind == nil || record.memoryKind == kind,
+                    pinned == nil || (record.pinned == true) == pinned,
                     MemoryRecordDisclosurePolicy.classify(
                         personaID: record.personaId, status: archived ? "active" : record.status,
                         lifecycle: archived ? nil : record.lifecycle, tags: record.tags, metadata: record.extras

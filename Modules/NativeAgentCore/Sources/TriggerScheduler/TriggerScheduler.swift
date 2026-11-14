@@ -34,7 +34,7 @@ public actor SwiftNativeTriggerScheduler: Sendable {
         self.morningBriefPart = morningBriefPart
     }
 
-    /// Canonical trigger configuration; an absent file receives fresh defaults.
+    /// Canonical trigger configuration; an absent file is seeded once with the part's inactive defaults.
     public nonisolated var inboxPath: URL {
         root
             .appendingPathComponent("triggers", isDirectory: true)
@@ -51,7 +51,42 @@ public actor SwiftNativeTriggerScheduler: Sendable {
     // MARK: list
 
     public func listInboxTriggers() async throws -> [TriggerConfig] {
+        try await seedIfMissing()
         return try await Self._readList(path: inboxPath, defaultValue: try await defaults().inbox)
+    }
+
+    /// The one seeding in flight per trigger file in this process: concurrent first readers await the same part run, never a second one.
+    private static let seeding = OSAllocatedUnfairLock(initialState: [String: Task<Void, Error>]())
+
+    /// A missing file is written once with the part's inactive defaults, so the saved file is the record that the part ran: every later read
+    /// (Settings redraws on each memory write) reads the file and never runs the part again. The write only creates the file, so saved rows a
+    /// mutation wrote meanwhile are never replaced.
+    private func seedIfMissing() async throws {
+        guard case .missing = Self.readConfigsRaw(inboxPath) else { return }
+        let path = inboxPath
+        let seeding = Self.seeding.withLock { running in
+            if let task = running[path.path] { return task }
+            let task = Task<Void, Error> {
+                defer { Self.seeding.withLock { _ = $0.removeValue(forKey: path.path) } }
+                guard case .missing = Self.readConfigsRaw(path) else { return }
+                try Self.create(.array(try await self.defaults().inbox), at: path)
+            }
+            running[path.path] = task
+            return task
+        }
+        try await seeding.value
+    }
+
+    /// Write `value` at `path` only if nothing is there: an exclusive rename, so whichever writer is first keeps its bytes.
+    private nonisolated static func create(_ value: JSONValue, at path: URL) throws {
+        let folder = path.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let staged = folder.appendingPathComponent("." + path.lastPathComponent + "." + UUID().uuidString)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(try value.serializedData(pretty: true), to: staged)
+        defer { try? FileManager.default.removeItem(at: staged) }
+        guard renameatx_np(AT_FDCWD, staged.path, AT_FDCWD, path.path, UInt32(RENAME_EXCL)) == 0 || errno == EEXIST else {
+            throw TriggerSchedulerError.persistenceFailure("\(path.path) could not be created: \(String(cString: strerror(errno)))")
+        }
     }
 
     internal static func _readList(

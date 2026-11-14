@@ -22,7 +22,7 @@ import ToolRegistry
 import StandingBots
 import ChatToolParsing
 import NativeAgentShared
-// Blueprint: | `ChatOrchestrationClient+StructuredChat.swift` | Session-owned delivery, accepted input and canonical settlement |
+// Blueprint: | `ChatOrchestrationClient+StructuredChat.swift` | Session-owned delivery, accepted input, the turn's one request evidence and canonical settlement |
 
 extension SwiftNativeChatOrchestrationClient {
 
@@ -128,6 +128,8 @@ extension SwiftNativeChatOrchestrationClient {
                 try await store.append([.evidence(.init(source: "correlation", id: correlation))], to: heardID)
             }
         }
+        // The ask this turn acts on: its heard experience and the runs of its messages, for the person's word (`requestHeard`).
+        let ask = TurnAsk(heard: heardID, continuing: heardID != boundTurnId, run: runId)
         // The arrival's own turn writes its row and appraisal: its sender, door and taint, never the working turn's.
         let steeringPersister: ChatTurnSteering.Persister = { [weak self] sid, offer in
             guard let self else { return false }
@@ -153,6 +155,8 @@ extension SwiftNativeChatOrchestrationClient {
                         }
                     }
                 }
+                // A message this turn reads while it runs joins its ask.
+                ask.joined(enqueueRunID)
                 return true
             } catch {
                 await Self.reportTranscriptWriteFailure(
@@ -302,49 +306,16 @@ extension SwiftNativeChatOrchestrationClient {
             try await TurnTraceContext.$turnId.withValue(boundTurnId) {
             try await holding(turn.with(\.offeredTools, Set(providerCtx.toolSchemas.map(\.name)))) { turn in
             try await holding(turn.with(\.settingRequestEvidence, { [self] setting, value, currentValue, quote in
-                func normalized(_ text: String) -> String {
-                    text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
-                }
-                // Match quoted request text even when a transport wraps it with attribution.
-                let marks = CharacterSet(charactersIn: "\"“”'‘’")
-                let segments = quote.components(separatedBy: marks).map { normalized($0).trimmingCharacters(in: .punctuationCharacters.union(.whitespaces)) }
-                    .filter { $0.split(separator: " ").count >= 3 }
-                let candidates = [normalized(quote)] + segments
-                func quotes(_ text: String) -> Bool { let t = normalized(text); return candidates.contains { t.contains($0) } }
-                let envelope = TurnEnvelope.current(turn: turn, surface: surface)
-                let origin = turn.origin
-                let lane = (origin?.agent ?? envelope.agent) == "agent" ? envelope.verifiedUserId.map { "peer:" + $0 } : origin?.agent ?? envelope.agent
-                let currentRequest = (origin?.authored == .human || lane.map(PeerDataTaint.ownerTrusts) == true
-                    || (origin == nil && envelope.agent == nil && MyQueue.Door(rawValue: surface) != nil))
-                    && quotes(message)
-                var found = currentRequest
-                guard let history = try? await SessionHistoryReader(dataRoot: dataRoot).messagesWithStats(
-                    forSessionId: resolvedSession, strictEvidence: true),
-                    !["read_failed", "invalid_encoding", "invalid_session_id"].contains(history.stats.mode),
-                    history.stats.malformedRowCount == 0, history.stats.invalidShapeRowCount == 0 else { return found ? false : nil }
-                var lastChange: [String: JSONValue]?
-                for row in history.messages {
-                    guard case .object(let fields)? = row.extras else { continue }
-                    let author = SwiftToolDispatcher.persistedHistoryAuthor(role: row.role, row: fields)
-                    let peer = row.role == "user" ? SwiftToolDispatcher.persistedHistoryPeer(role: row.role, row: fields) : nil
-                    if author == SwiftToolDispatcher.ownerAuthor || author == "human via bridge"
-                        || peer.map({ $0.split(separator: "\n").allSatisfy { PeerDataTaint.ownerTrusts(String($0)) } }) == true
-                        || (peer == nil && envelope.verifiedUserId != nil && author == envelope.verifiedUserId) {
-                        found = found || quotes(row.content)
-                    }
-                    guard case .object(let metadata)? = fields["metadata"], metadata["kind"] == .string(ChatTranscriptToolMessageKind.toolUse),
-                          case .string(let result)? = metadata["resultSummary"],
-                          let receipt = try? JSONValue.parse(Data(result.utf8)),
-                          ChatTranscriptEvidenceRendering.receiptField("setting", in: receipt) == .string(setting),
-                          ChatTranscriptEvidenceRendering.receiptField("changed", in: receipt) == .bool(true) else { continue }
-                    lastChange = ["decided_by", "old_value", "new_value"].reduce(into: [:]) {
-                        $0[$1] = ChatTranscriptEvidenceRendering.receiptField($1, in: receipt)
-                    }
-                }
-                guard found else { return nil }
+                let heard = await Self.requestHeard(quote, setting: setting, message: message, surface: surface, session: resolvedSession,
+                                                    dataRoot: dataRoot, ask: ask, turn: turn)
+                guard heard.readable else { return heard.current ? false : nil }
+                guard heard.found else { return nil }
                 guard case .bool = value else { return false }
-                return currentRequest && value != currentValue && lastChange?["decided_by"] == .string("agent")
-                    && lastChange?["old_value"] == value && lastChange?["new_value"] == currentValue
+                return heard.current && value != currentValue && heard.lastChange?["decided_by"] == .string("agent")
+                    && heard.lastChange?["old_value"] == value && heard.lastChange?["new_value"] == currentValue
+            }).with(\.personWord, { [self] quote in
+                await Self.requestHeard(quote, setting: nil, message: message, surface: surface, session: resolvedSession,
+                                        dataRoot: dataRoot, ask: ask, turn: turn).person
             })) { turn in
                 return try await engine.executeTurnWithStreamingToolLoop(
                         surface: surface,
@@ -501,6 +472,108 @@ extension SwiftNativeChatOrchestrationClient {
         default:
             return false
         }
+    }
+
+    /// The ask a turn is acting on now: the heard experience it answers (its own for a fresh turn; for a continuation after a card, the
+    /// earlier turn's, named by the envelope's `answerExperienceID`), whose `run` evidence names every run that worked on that ask, and the
+    /// runs of messages that joined the turn while it ran (`ChatTurnSteering` arrivals this turn read). The person's messages of this ask
+    /// are their rows with one of those runs.
+    final class TurnAsk: @unchecked Sendable {
+        let heard: String
+        /// True when this turn carries on an earlier turn's ask (a card's continuation), whose message is not this turn's own.
+        let continuing: Bool
+        private let lock = NSLock()
+        private var runs: Set<String>
+        init(heard: String, continuing: Bool, run: String) { self.heard = heard; self.continuing = continuing; runs = [run] }
+        /// A message that joined this turn while it ran is part of its ask.
+        func joined(_ run: String) { lock.withLock { _ = runs.insert(run) } }
+        /// The runs of this ask: this turn's, those that joined it, and every run the heard experience records.
+        func allRuns(dataRoot: URL) async -> Set<String> {
+            let own = lock.withLock { runs }
+            let recorded = (try? await ExperienceStore.at(dataRoot).experience(heard))?.evidence.filter { $0.source == "run" }.map(\.id) ?? []
+            return own.union(recorded)
+        }
+    }
+
+    /// What one reading of request evidence found for a quote (`requestHeard`).
+    struct RequestHeard: Sendable {
+        /// The message that started this turn says it, and its author's words count for the agent's own dials.
+        var current = false
+        /// Someone whose words count for the agent's own dials said it: in this turn's message or earlier in this conversation.
+        var found = false
+        /// The person said it in their own message of the ask this turn is acting on (`TurnAsk`), at a door that is theirs.
+        var person = false
+        /// The conversation's history was read whole.
+        var readable = false
+        /// The receipt fields (decided_by, old_value, new_value) of the last change of the asked setting in this conversation.
+        var lastChange: [String: JSONValue]?
+    }
+
+    /// One reading of request evidence, for both questions a turn answers with it (`Turn.settingRequestEvidence`, `Turn.personWord`): were the
+    /// quote's words said in this conversation, and by whom. A message says a quote when it contains the quote whole, or one of the quote's
+    /// quoted runs of three words or more (a transport may wrap the request with attribution); nothing else relates the words to the call.
+    /// The person counts only on a turn that is theirs (`isUsersTurn`: their Mac chat, their signed phone, Telegram's one owner; or a card's
+    /// continuation at such a door) and only for their own messages of the ask the turn is acting on now (`TurnAsk`), never an earlier one in
+    /// the conversation. For the agent's own dials below Full Mac (`found`), any message here of the person's, a trusted agent's or a human
+    /// relayed through a bridge counts, as before. A tool result, a page, a file, a helper and the agent's own words are no message here.
+    static func requestHeard(_ quote: String, setting: String?, message: String, surface: String, session: String, dataRoot: URL,
+                             ask: TurnAsk, turn: Turn) async -> RequestHeard {
+        func normalized(_ text: String) -> String {
+            text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+        // Match quoted request text even when a transport wraps it with attribution.
+        let marks = CharacterSet(charactersIn: "\"“”'‘’")
+        let segments = quote.components(separatedBy: marks).map { normalized($0).trimmingCharacters(in: .punctuationCharacters.union(.whitespaces)) }
+            .filter { $0.split(separator: " ").count >= 3 }
+        let candidates = [normalized(quote)] + segments
+        func quotes(_ text: String) -> Bool { let t = normalized(text); return candidates.contains { t.contains($0) } }
+        let envelope = TurnEnvelope.current(turn: turn, surface: surface)
+        let origin = turn.origin
+        let lane = (origin?.agent ?? envelope.agent) == "agent" ? envelope.verifiedUserId.map { "peer:" + $0 } : origin?.agent ?? envelope.agent
+        // A card's continuation is the person's turn when it continues at one of their doors: the Mac, the phone, Telegram's one owner.
+        let door = surface.lowercased()
+        let personTurn = isUsersTurn(surface: surface, sessionId: session, dataRoot: dataRoot, turn: turn)
+            || (ask.continuing && origin == nil && envelope.agent == nil
+                && SessionConversation.kind(session, dataRoot: dataRoot)?.isPersonConversation == true
+                && (door == "telegram" ? envelope.verifiedUserId.map { $0 == telegramOwnerId(dataRoot: dataRoot) } == true
+                    : ["chat", "ios"].contains(door)))
+        var heard = RequestHeard()
+        let said = quotes(message)
+        heard.current = (origin?.authored == .human || lane.map(PeerDataTaint.ownerTrusts) == true
+            || (origin == nil && envelope.agent == nil && MyQueue.Door(rawValue: surface) != nil)) && said
+        heard.found = heard.current
+        // A continuation's message is the card's outcome, not the person's words.
+        heard.person = personTurn && !ask.continuing && said
+        var askRuns: Set<String> = []
+        if personTurn { askRuns = await ask.allRuns(dataRoot: dataRoot) }
+        guard let history = try? await SessionHistoryReader(dataRoot: dataRoot).messagesWithStats(
+            forSessionId: session, strictEvidence: true),
+            !["read_failed", "invalid_encoding", "invalid_session_id"].contains(history.stats.mode),
+            history.stats.malformedRowCount == 0, history.stats.invalidShapeRowCount == 0 else { return heard }
+        heard.readable = true
+        for row in history.messages {
+            guard case .object(let fields)? = row.extras else { continue }
+            let author = SwiftToolDispatcher.persistedHistoryAuthor(role: row.role, row: fields)
+            let peer = row.role == "user" ? SwiftToolDispatcher.persistedHistoryPeer(role: row.role, row: fields) : nil
+            let persons = author == SwiftToolDispatcher.ownerAuthor
+                || (peer == nil && envelope.verifiedUserId != nil && author == envelope.verifiedUserId)
+            if persons || author == "human via bridge"
+                || peer.map({ $0.split(separator: "\n").allSatisfy { PeerDataTaint.ownerTrusts(String($0)) } }) == true {
+                let here = quotes(row.content)
+                heard.found = heard.found || here
+                if persons, personTurn, let run = fields["runId"]?.stringValue, askRuns.contains(run) { heard.person = heard.person || here }
+            }
+            guard let setting, case .object(let metadata)? = fields["metadata"],
+                  metadata["kind"] == .string(ChatTranscriptToolMessageKind.toolUse),
+                  case .string(let result)? = metadata["resultSummary"],
+                  let receipt = try? JSONValue.parse(Data(result.utf8)),
+                  ChatTranscriptEvidenceRendering.receiptField("setting", in: receipt) == .string(setting),
+                  ChatTranscriptEvidenceRendering.receiptField("changed", in: receipt) == .bool(true) else { continue }
+            heard.lastChange = ["decided_by", "old_value", "new_value"].reduce(into: [:]) {
+                $0[$1] = ChatTranscriptEvidenceRendering.receiptField($1, in: receipt)
+            }
+        }
+        return heard
     }
 
     /// Only a single allowlisted user identifies the bot's owner.

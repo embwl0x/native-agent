@@ -7,8 +7,10 @@ import Synchronization
 /// work. BackgroundLoops writes beat details into the experience record and reads the newest 32 per organ. Every organ reaches it through this one hook —
 /// TurnTrace sits below BackgroundLoops and cannot import it — which the app installs before anything can beat.
 public struct OrganPulse: Sendable, Equatable {
-    /// `held`: judged and held back (off, not due, waiting). `stopped`: the pass was cut short before it could judge (cancelled or shut down).
-    public enum Outcome: String, Sendable { case worked, nothing, held, failed, stopped }
+    /// `held`: judged and held back (off, not due, waiting). `busy`: due, but a shared slot was held by other work, so it did not run; the note names
+    /// the holder and when the slot opens. Neither a hold nor a failure, so it never counts toward a stuck or failed organ. `stopped`: the pass was cut
+    /// short before it could judge (cancelled or shut down).
+    public enum Outcome: String, Sendable { case worked, nothing, held, busy, failed, stopped }
 
     public let organ: String
     public let at: Date
@@ -124,6 +126,7 @@ public struct OrganRecord: Sendable, Equatable {
             return Deviation(kind: .failed, why: "failed \(Self.times(run, since: now)): \(latest.note)", since: run[run.startIndex].at, size: run.count)
         }
         guard beats.count >= Self.precisionFloor else { return nil }
+        // Only the organ's own holds make it stuck; a busy beat waited on a slot other work held, and its note says when that slot opens.
         let held = trailingRun { $0.outcome == .held && !$0.isOff && $0.note == latest.note }
         if latest.outcome == .held, held.count >= 3 {
             return Deviation(kind: .stuck, why: "held \(Self.times(held, since: now)): \(latest.note)", since: held[held.startIndex].at, size: held.count)

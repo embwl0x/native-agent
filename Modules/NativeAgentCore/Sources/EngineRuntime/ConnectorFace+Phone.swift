@@ -86,6 +86,7 @@ extension NativeAgentEngine {
             if state.pairingError != nil { ("Needs attention", .failed) }
             else if state.phonePairedElsewhere { ("Paired with another Mac", .attention) }
             else if let waiting = state.standing?.waiting, waiting > 0 { ("Waiting for Pair", .attention) }
+            else if let confirming = state.standing?.confirming, confirming > 0 { ("Waiting for iPhone", .attention) }
             else {
                 switch state.connection?.headline.state {
                 case .holds?: ("Connected", .live)
@@ -103,16 +104,17 @@ extension NativeAgentEngine {
         var rows = phones.map { phone in
             let id: [String: PartFace.Value] = ["id": .string(phone.id)]
             let pair = PartFace.Action(id: "pair", label: "Pair", role: .primary, doors: ["mac"], call: .init("pairing.pair", id))
+            let canApprove = phone.status == .paired && !phone.confirmationOwed
             return PartFace.Row(id: "phone:" + phone.id, title: phone.status == .paired ? "iPhone or iPad" : "Phone waiting to pair",
-                detail: phone.id, value: phone.status == .paired ? "Can approve" : "Waiting", symbol: "iphone",
-                tone: phone.status == .paired ? .live : .attention,
+                detail: phone.id, value: canApprove ? "Can approve" : phone.status == .paired ? "Waiting for it to confirm" : "Waiting",
+                symbol: "iphone", tone: canApprove ? .live : .attention,
                 actions: (phone.status == .pending ? [pair] : [])
                     + [PartFace.Action(id: "remove", label: "Remove", role: .destructive, doors: ["mac"], call: .init("pairing.remove", id))])
         }
         // A phone that chats over the shared key is connected before it can approve, so an empty list never reads as "no phone".
         if phones.isEmpty {
             rows.append(.init(id: "iphone.none", title: connected
-                ? "Your iPhone is connected over iCloud, but it hasn't asked to pair. Open the companion app and tap Connect; it appears here to Pair."
+                ? "Your iPhone chats here through this Apple Account but isn't paired. Open the companion app and tap Connect; it appears here to Pair."
                 : "No phone can approve yet. Open the companion app and tap Connect to request pairing.", tone: .quiet))
         }
         if let message { rows.append(.init(id: "iphone.devices-error", title: message, tone: .failed)) }
@@ -176,7 +178,7 @@ extension NativeAgentEngine {
         guard await owner.pairedPhones.setStatus(.paired, id: phone.id) else {
             throw PartCallError(code: "pairing_failed", message: (owner.pairedPhones.message ?? "The change did not save.") + " The phone is as it was.")
         }
-        return "The phone is paired and can approve."
+        return "Paired on this Mac. The phone confirms as soon as it hears from this Mac, then it can approve."
     }
 
     @MainActor private func pairingOwner() throws -> DeviceSync {

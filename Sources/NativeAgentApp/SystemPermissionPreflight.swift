@@ -37,7 +37,8 @@ extension SystemPermissionPreflight {
         for id in frictionOrder(ids) {
             guard let gate = cardSettingsCapability(id),
                   await cardBlockReason([id], mode: mode) != nil else { continue }
-            if let problem = await activationProblem() {
+            // Once this walk has sent the person to a Settings pane, they are there because it asked: the rest still register.
+            if openedPanes.isEmpty, let problem = await activationProblem() {
                 problems.append(problem)
                 break
             }
@@ -116,23 +117,21 @@ extension SystemPermissionPreflight {
         return problems
     }
 
-    /// Activation may be declined; verify AppKit state on every exit before asking for a grant.
+    /// The person is present when this app is in front. The agent's window is its face, a process of its own inside this bundle; this
+    /// process has no window and macOS never makes it the active app, so waiting to become active waited forever and no request was made.
+    /// macOS shows its own permission requests whichever process asks.
     @MainActor
     private static func activationProblem() async -> String? {
         guard !Task.isCancelled else { return "The macOS permission request was interrupted." }
         guard !NSApp.isActive else { return nil }
-        let activated = ScopedWaiter()
-        let observer = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification, object: NSApp, queue: .main
-        ) { _ in activated.resume() }
-        defer { NotificationCenter.default.removeObserver(observer) }
-        NSApp.activate()
-        if !NSApp.isActive { await activated.park() }
-        guard !Task.isCancelled else { return "The macOS permission request was interrupted." }
-        guard NSApp.isActive else {
-            return "NativeAgent could not become active to request macOS permission. Bring NativeAgent to the front and try again."
+        let own = Bundle.main.bundleURL.standardizedFileURL.path
+        if let front = NSWorkspace.shared.frontmostApplication,
+           front.processIdentifier == ProcessInfo.processInfo.processIdentifier
+            || front.bundleURL.map({ ($0.standardizedFileURL.path + "/").hasPrefix(own + "/") }) == true {
+            return nil
         }
-        return nil
+        return "NativeAgent is not in front, so macOS would show its permission request behind your work. "
+            + "Bring NativeAgent to the front and allow again."
     }
 
     /// The Accessibility list shows only apps that asked, so asking first gives the person NativeAgent's switch in the pane.

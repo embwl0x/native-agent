@@ -115,7 +115,7 @@ enum ConversationPrefixSeeding {
             ? try TextMarkerCodec.volatileCatalogAppendix(for: context) : nil)
         let layout = codec == .textMarkers
             ? try TextMarkerCodec.systemLayout(baseSystem: seed.context.systemPrompt,
-                segments: seed.context.systemSegments, context: seed.context, turn: turn)
+                segments: seed.context.systemSegments, context: seed.context)
             : (system: seed.context.systemPrompt ?? "", segments: seed.context.systemSegments)
         let names = ProviderToolNameMap(seed.context.toolSchemas)
         return Request(seed: seed, system: layout.system, segments: layout.segments,

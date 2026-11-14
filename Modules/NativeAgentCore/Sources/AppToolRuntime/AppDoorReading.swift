@@ -231,8 +231,23 @@ extension AppToolExecutor {
     /// Unknown names return status not_found. Versions hash visible content, settings and items, excluding accessibility-tree churn.
     /// `surface` is the turn surface the door call arrived on; the ability census checks dependencies under it.
     @MainActor
-    func doorRead(page: QuietToolPage, item: String, offset: Int = 0, surface: String, turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+    func doorRead(page: QuietToolPage, item: String, offset: Int = 0, surface: String, turn: Turn, execution: AppActionExecution,
+                  following: Bool = false) async throws -> JSONValue {
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        // An item is reachable by the words the page shows: a row or section named by its title reads as its id, before any reader of this
+        // page claims the words.
+        var item = item
+        if !following, !item.isEmpty, let shown = await quietHost()?.pageItem(page: page.id, named: item) { item = shown.id }
+        // A fixed row that opens a place the app names (`AppDoorNames.aliases`: memories/graph is the knowledge page) reads that place, as the
+        // person's tap on it does. It needs nothing of the page's own, so it is resolved before any reader of the page, drawn or not.
+        let named = page.id + "/" + item.lowercased()
+        if !following, !item.isEmpty, AppDoorNames.aliases[named] != nil {
+            let place = AppDoorNames.place(page: named, item: "")
+            if place.page != page.id, let next = await doorPage(place.page) {
+                return Self.doorOpened(try await doorRead(page: next, item: place.item, offset: offset, surface: surface, turn: turn,
+                                                          execution: execution, following: true), at: place)
+            }
+        }
         do {
             if page.id == "pairing", item == "phone-senses" {
                 return try PhoneSensesGuide.read(dataRoot: root)
@@ -332,7 +347,17 @@ extension AppToolExecutor {
                 // An item of a page is a row of the list the page read gives; a setting row is read by the producer that lists it.
                 guard let host = quietHost() else { return Self.unattachedFailure() }
                 let rows = try await pageSettingRows(page: page, host: host, only: item)
-                guard !rows.isEmpty else { return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("not_found")])) }
+                guard !rows.isEmpty else {
+                    // A row with no reader of its own that opens a place reads that place, as the person's tap on it opens it (a link to
+                    // its own page names a place of the app, `AppDoorNames`). A link is followed once.
+                    let notFound = ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("not_found")]))
+                    guard !following, let shown = await host.pageItem(page: page.id, named: item), let open = shown.open,
+                          case .page(let to, item: let toItem)? = FaceLink(open) else { return notFound }
+                    let place = AppDoorNames.place(page: to + (toItem.map { "/" + $0 } ?? ""), item: "")
+                    guard place.page != page.id || place.item != shown.id, let next = await doorPage(place.page) else { return notFound }
+                    return Self.doorOpened(try await doorRead(page: next, item: place.item, offset: offset, surface: surface, turn: turn,
+                                                              execution: execution, following: true), at: place)
+                }
                 return .object(["status": .string("ok"), "page": .string(page.id), "item": .string(item), "settings": .array(rows)])
             default:
                 let result = await runAppPageRead(input: ["page": .string(page.id)], turn: turn)
@@ -356,6 +381,56 @@ extension AppToolExecutor {
         } catch {
             return ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none)
         }
+    }
+    /// The page items that show these words: a fixed row the app names (`AppDoorNames.aliases`: memories/graph), drawn or not, and every page's
+    /// drawn row or section by its id or title. Each place once.
+    @MainActor
+    func doorShownPlaces(_ name: String) async throws -> [(page: String, item: String)] {
+        let words = name.split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased()
+        guard !words.isEmpty, !words.contains("/") else { return [] }
+        var places: [(page: String, item: String)] = AppDoorNames.aliases.keys.sorted().compactMap { key in
+            let parts = key.split(separator: "/", maxSplits: 1).map(String.init)
+            return parts.count == 2 && parts[1] == words ? (page: parts[0], item: parts[1]) : nil
+        }
+        guard let host = quietHost() else { return places }
+        for page in try await doorPages {
+            guard let shown = await host.pageItem(page: page.id, named: words),
+                  !places.contains(where: { $0.page == page.id && $0.item.lowercased() == shown.id.lowercased() }) else { continue }
+            places.append((page: page.id, item: shown.id))
+        }
+        return places
+    }
+    /// A name the door knows as no page and no home name opens the one page item that shows it, from anywhere; when several pages show it, the
+    /// answer names each page and item. Nil when no page shows it.
+    @MainActor
+    func doorShownName(_ name: String, input: [String: JSONValue], surface: String, inProcess: Bool, turn: Turn,
+                       execution: AppActionExecution) async throws -> JSONValue? {
+        let places = try await doorShownPlaces(name)
+        guard let place = places.first else { return nil }
+        guard places.count == 1 else {
+            return Self.doorRefusal("ambiguous_item", "More than one page shows \(name). Nothing was read.",
+                remedy: "choose_page", "Read one of the listed places: app {page:\"<page>\", item:\"<item>\"}.",
+                extra: ["places": .array(places.map { .object(["page": .string($0.page), "item": .string($0.item)]) })])
+        }
+        var call = input
+        call["page"] = .string(place.page)
+        call["item"] = .string(place.item)
+        return AgentWorkspace.resolvedRead(try await runAppDoor(input: call, surface: surface, inProcess: inProcess, turn: turn,
+                                                                execution: execution), as: place.page + "." + place.item)
+    }
+    /// A read of the place a row opens names that place as `resolved` (page, or page/item): the read and its version are that place's, never
+    /// the row's, so the graph reads as the knowledge page its entities open under.
+    static func doorOpened(_ read: JSONValue, at place: (page: String, item: String)) -> JSONValue {
+        guard case .object(var fields) = read else { return read }
+        fields["resolved"] = .string(place.item.isEmpty ? place.page : place.page + "/" + place.item)
+        return .object(fields)
+    }
+    /// The version of a door read: of the place it opened when it followed a row there (`doorOpened`), else of the page and item asked.
+    static func doorVersion(asked page: String, item: String, _ read: [String: JSONValue]) throws -> String {
+        // The opened place versions as its own reads do (a chat/<id> composer keeps only what edits the draft).
+        let place = (read["resolved"]?.stringValue ?? "").split(separator: "/", maxSplits: 1).map(String.init)
+        guard let opened = place.first else { return try doorVersion(page: page, item: item, read) }
+        return try doorVersion(page: opened, item: place.count > 1 ? place[1] : "", read)
     }
     static func doorVersion(page: String, item: String, _ read: [String: JSONValue]) throws -> String {
         var fields = read.filter { ["content", "settings", "items", "item", "count", "entries", "complete", "blocked"].contains($0.key) }
@@ -381,7 +456,7 @@ extension AppToolExecutor {
         let item = parts.count > 1 ? parts[1] : ""
         guard case .object(let read) = try await doorRead(page: page, item: item, surface: surface, turn: turn, execution: execution),
               read["status"] == .string("ok") else { return nil }
-        return try read["version"]?.scalarText ?? Self.doorVersion(page: page.id, item: item, read)
+        return try read["version"]?.scalarText ?? Self.doorVersion(asked: page.id, item: item, read)
     }
     @MainActor
     func doorFind(_ query: String, turn: Turn, execution: AppActionExecution) async throws -> JSONValue {

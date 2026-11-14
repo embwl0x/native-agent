@@ -6,7 +6,7 @@ import NativeAgentShared
 
 extension EngineFaceActs {
     func cognition(_ command: CognitionAct) async throws -> FaceActReply {
-        guard let runtime = engine.cognition else { throw Self.failure("body_unavailable", "This root has no resident mind.") }
+        guard let runtime = engine.cognition else { throw Self.failure("body_unavailable", "There is no running mind: it starts when setup finishes.") }
         let state = await runtime.subconsciousRuntimeState()
         let status: String
         let message: String

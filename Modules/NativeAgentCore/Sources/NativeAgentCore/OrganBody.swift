@@ -13,6 +13,8 @@ public struct OrganBody: Sendable, Equatable {
         public let deviation: OrganRecord.Deviation?
         /// When the next beat is due; nil for an organ run on events or switched off.
         public let next: Date?
+        /// Whether the organ's kept beats hold a failure. Without one, a repair owed for this organ was owed for its being stuck.
+        public let failedInRecord: Bool
 
         /// The line both faces read, in plain words.
         public func words(now: Date) -> String {
@@ -38,7 +40,8 @@ public struct OrganBody: Sendable, Equatable {
         lines = records.map { record in
             let latest = record.latest
             let next = latest.isOff ? nil : latest.cadence.map { max(latest.at, launchedAt).addingTimeInterval($0) }
-            return Line(organ: record.organ, latest: latest, deviation: record.deviation(now: now, launchedAt: launchedAt), next: next)
+            return Line(organ: record.organ, latest: latest, deviation: record.deviation(now: now, launchedAt: launchedAt), next: next,
+                        failedInRecord: record.beats.contains { $0.outcome == .failed })
         }.sorted { ($0.deviation == nil ? 1 : 0, $0.organ) < ($1.deviation == nil ? 1 : 0, $1.organ) }
     }
 

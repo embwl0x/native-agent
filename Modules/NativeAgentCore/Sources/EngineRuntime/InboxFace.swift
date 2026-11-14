@@ -81,6 +81,17 @@ extension NativeAgentEngine {
         return (.init(title: "Inbox", line: "Requests, things that went wrong, and news.", sections: sections), epoch)
     }
 
+    /// The answers each waiting matter's Inbox row carries, by matter id (an ask, or something that went wrong): the row's own actions and door
+    /// calls as the Inbox draws them (housekeeping left behind), so another page that shows the matter offers the same press, never one it re-derives.
+    @concurrent func inboxAnswers() async throws -> [String: [PartFace.Action]] {
+        let waiting = try await ForPerson.at(dataRoot).matters().filter(ForPerson.isRow)
+            .filter { [.unread, .read].contains(ForPerson.reading($0)) && ($0.owes["decide"] != nil || $0.face?.row?.tone == .failed) }
+        return waiting.reduce(into: [:]) { answers, matter in
+            let actions = (inboxFaceRow(matter).actions ?? []).filter { $0.aside != true }
+            if !actions.isEmpty { answers[matter.id] = actions }
+        }
+    }
+
     /// The agent's own decisions of one kind (`BodyDecidedRow.kind`) fold under one row: the first of them this section draws and how many more, with
     /// the unread count as its value. Each decision stays its own nested row, newest first, with its id and actions; a kind with one decision
     /// stays a plain row. Folding only draws: no decision is read, put away or left out.
@@ -190,8 +201,10 @@ extension NativeAgentEngine {
             let composed = row.actions?.first { $0.id == answer.id }
             guard let call = composed?.call ?? Self.inboxCall(answer.id, matter: matter.id, approval: approval) else { return nil }
             let role: PartFace.Action.Role? = ["archive", "dismiss", "reject"].contains(answer.id) ? .destructive : composed?.role
+            // The inbox's own verbs are housekeeping on every row, drawn behind the row's menu; so is what its owner marked aside.
+            let aside = InboxActionVocabulary.inboxVerbs.contains { $0.id == answer.id } || composed?.aside == true
             return .init(id: answer.id, label: approval && answer.id == "reject" ? "Deny" : answer.label, role: role, doors: composed?.doors,
-                         call: call)
+                         call: call, aside: aside ? true : nil)
         }
         var detail = [row.detail, face.words].compactMap { $0 }.filter { !$0.isEmpty }
         if detail.count == 2, detail[0] == detail[1] { detail.removeLast() }

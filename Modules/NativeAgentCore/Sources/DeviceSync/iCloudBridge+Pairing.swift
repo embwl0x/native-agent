@@ -120,6 +120,8 @@ extension iCloudBridge {
         let wasElsewhere = phonePairedElsewhere
         phonePairingSettled = true
         phonePairedElsewhere = false
+        deliverOwedPairingConfirmations()
+        deleteRecordsFromOtherKeys()
         guard !wasSpeaking else { return }
         lastPublishedProviderCatalogStatus = nil
         lastPublishedMobileSnapshotStatus.removeAll()
@@ -134,6 +136,33 @@ extension iCloudBridge {
         }
     }
 
+    private static var otherKeyDeletionRunning = false
+    private static let otherKeyDeletionDoneKey = "NativeAgent.pairing.otherKeyRecordsDeletedFor"
+
+    /// Once for each key this Mac holds: the transport records in iCloud signed with any other key (earlier keys, earlier installs) are
+    /// deleted, so a phone never reads them again. The key's digest is kept only after the pass completes, so a failed pass runs again.
+    func deleteRecordsFromOtherKeys() {
+        guard let transport = deviceTransport, !Self.otherKeyDeletionRunning else { return }
+        Self.otherKeyDeletionRunning = true
+        Task {
+            defer { Self.otherKeyDeletionRunning = false }
+            let secret: Data
+            do { secret = try await sync.storage.perform { try PairingSecret.requireExistingSecret() } }
+            catch { return }
+            let digest = SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
+            guard UserDefaults.standard.string(forKey: Self.otherKeyDeletionDoneKey) != digest else { return }
+            do {
+                let deleted = try await transport.deleteRecordsSignedWithOtherKeys(current: secret)
+                UserDefaults.standard.set(digest, forKey: Self.otherKeyDeletionDoneKey)
+                nativeLog("[PairingBootstrap] Deleted %d iCloud transport record(s) signed with other pairing keys", deleted)
+                if deleted > 0 { syncStatus = "Deleted \(deleted) iCloud message record(s) left from earlier pairing keys." }
+            } catch {
+                nativeLog("[PairingBootstrap] Records from other pairing keys were not deleted; the next pairing check tries again: %@",
+                          error.localizedDescription)
+            }
+        }
+    }
+
     private func notePairedElsewhere() {
         phonePairingSettled = true
         phonePairedElsewhere = true
@@ -141,6 +170,49 @@ extension iCloudBridge {
         doctorTransportHealth = .pairedElsewhere
         doctorSendFailures.removeAll()
         recordTransportOrgansOff("the iPhone is paired with another Mac")
+    }
+
+    /// Each acceptance this Mac owes a phone goes out again: when this Mac starts speaking to the phone, when the person pairs one, and whenever a
+    /// phone is heard from. The paired-phone store holds what is owed; only the phone's acknowledgement clears it. The phone takes a repeat as a no-op.
+    func deliverOwedPairingConfirmations() {
+        // The published rows gate the fresh read; their own publication brings this back when they load or change.
+        guard speaksToPhone, sync.pairedPhones.phones.contains(where: \.confirmationOwed) else { return }
+        let generation = setupGeneration
+        Task {
+            guard let rows = await sync.pairedPhones.checkedPhones() else { return }
+            for phone in rows where phone.confirmationOwed {
+                guard isSetUp, generation == setupGeneration, speaksToPhone else { return }
+                do {
+                    _ = try await sendChatMessage(text: "This Mac accepted the pairing.", metadata: [
+                        "kind": NAPairingConfirmation.messageKind, NAPairingConfirmation.deviceField: phone.id,
+                        NAPairingConfirmation.acceptanceField: phone.acceptance ?? "",
+                    ])
+                    pairingConfirmationNote = """
+                        This Mac sent its acceptance at \(Date().formatted(date: .omitted, time: .shortened)); the iPhone confirms when its app \
+                        next reads iCloud.
+                        """
+                } catch {
+                    pairingConfirmationNote = """
+                        This Mac's acceptance could not be sent to the iPhone: \(error.localizedDescription) It goes again when the iPhone is \
+                        next heard from.
+                        """
+                    nativeLog("[PairingBootstrap] Pairing confirmation for %@ stays owed until the phone is next heard from: %@",
+                              phone.id, error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// A phone message this Mac cannot verify still gets an answer the phone can act on: the unsigned pairing wake-up, after which the phone
+    /// re-reads the pairing key from iCloud and sends again. It carries no command and nothing the phone could mistake for one.
+    func answerUnverifiablePhoneMessage(_ rejectedID: String) async {
+        guard let deviceTransport, !phonePairedElsewhere, let sourceKey = try? NativeAgentICloudBridgeConstants.mobileSourceKey else { return }
+        let hint = BridgeMessage.make(sender: "mac", text: "signature_invalid_resync", correlationID: rejectedID, metadata: [
+            "kind": "signature_invalid_resync", "rejectedMessageId": rejectedID, "publishedAt": "",
+            "pairing_secret_version": String(PairingSecret.currentSecretVersion()), "targetSourceKey": sourceKey,
+        ])
+        do { try await deviceTransport.send(hint) }
+        catch { nativeLog("[PairingBootstrap] Pairing wake-up for %@ not sent: %@", rejectedID, error.localizedDescription) }
     }
 
     // MARK: - The phone connection
@@ -151,6 +223,7 @@ extension iCloudBridge {
             phoneContactReadFailure = nil
             if contact > (lastPhoneContactAt ?? .distantPast) { lastPhoneContactAt = contact }
         }
+        deliverOwedPairingConfirmations()
     }
 
     /// Contact is the saved signed evidence; the shared key carries no device identity, so it says that a phone spoke, never which one.
@@ -159,7 +232,8 @@ extension iCloudBridge {
         let live = rows.filter { $0.status != .removed }
         let connected: Bool? = phoneContactReadFailure != nil ? nil : lastPhoneContactAt != nil ? true : nil
         return NAPhoneStanding(connected: connected, waiting: live.filter { $0.status == .pending }.count,
-                               approvers: live.filter { $0.status == .paired }.count)
+                               approvers: live.filter { $0.status == .paired && !$0.confirmationOwed }.count,
+                               confirming: live.filter(\.confirmationOwed).count)
     }
 
     /// The same standing from a checked read of paired_phones.json, for a verdict that must not rest on the published copy. Nil when it can't be read.
@@ -193,6 +267,10 @@ extension iCloudBridge {
             return .init(.waiting, phoneStanding.line, owner: .personOnMac,
                          lever: "Open Connectors → iPhone, match the code the iPhone shows, then choose Pair.")
         }
+        if phoneStanding.confirming > 0 {
+            return .init(.waiting, pairingConfirmationNote.map { phoneStanding.line + " " + $0 } ?? phoneStanding.line, owner: .personOnPhone,
+                         lever: "Open NativeAgent on your iPhone; it confirms on its own as soon as it hears from this Mac.")
+        }
         guard phoneStanding.canApprove else {
             return .init(.waiting, phoneStanding.line, owner: .personOnPhone,
                          lever: "Open NativeAgent on your iPhone, signed in to this Apple Account, and tap Connect.")
@@ -224,7 +302,9 @@ extension iCloudBridge {
                 return .init(.waiting, "\(carrier) is up; some deliveries to the iPhone are waiting to resend.", owner: .network,
                              lever: "Keep this Mac online with NativeAgent open; it resends on its own.")
             }
-            return .init(.holds, "\(carrier) carries their messages.")
+            // A build without the key-value store has one way to wake the phone; the phone also reads iCloud whenever its app opens.
+            return .init(.holds, "\(carrier) carries their messages." + (deviceTransport != nil && !DeviceCloudKitPreflight.hasKeyValueStoreEntitlement()
+                ? " This build wakes the iPhone by CloudKit push only; the iPhone also reads iCloud whenever its app opens." : ""))
         case .unmeasured:
             return .init(.waiting, "\(carrier) is starting; not measured yet.")
         case .signedOut:

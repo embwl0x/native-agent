@@ -18,10 +18,11 @@ extension NativeAgentEngine {
             await pages?.refresh(page: "home")
         }
         HomeFace.bind(dataRoot: dataRoot) { [weak pages] in await pages?.refresh(page: "home") }
-        return { [layout, owner, cognition] in
+        // The mind is read at each draw: Home drawn before setup finished sees the mind once it runs.
+        return { [layout, owner, mind] in
             let availability = await MainActor.run { layout.availability }
             let attention: String
-            if let cognition { attention = await cognition.isAsleep ? "asleep" : "awake" } else { attention = "unavailable" }
+            if let cognition = mind?.runtime { attention = await cognition.isAsleep ? "asleep" : "awake" } else { attention = "unavailable" }
             return await owner.read(layout: availability, attention: attention)
         }
     }

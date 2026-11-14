@@ -219,6 +219,9 @@ actor ChromeControlChannel {
         let data = try envelope.serializedData(pretty: false)
         let dispatch = ChromeRequestDispatch()
         let response = Response()
+        // While the call waits on Chrome, the extension is what it waits on.
+        let watched = context.life.map { ($0, $0.attach(life)) }
+        defer { if case let (watch, id)? = watched { watch.detach(id) } }
         return try await withTaskCancellationHandler {
             let timeout: Task<Void, Never>?
             if action == .navigate || action == .snapshot || action == .look {
@@ -250,6 +253,15 @@ actor ChromeControlChannel {
             // Invalidate synchronously before the socket queue can outrun actor cancellation.
             dispatch.cancel()
             Task { await self.cancelRequest(id, context: context) }
+        }
+    }
+
+    /// What a call waiting on Chrome waits on: the extension at the other end of this connection. Alive while the connection is open,
+    /// however slow the extension is (shown as waiting; Stop ends it); dead once the connection has closed.
+    nonisolated var life: CallLife {
+        CallLife(what: "Chrome's NativeAgent extension") { [weak self] in
+            guard let self, await !self.closed, self.socket.isOpen else { return .dead("Chrome's extension connection has closed") }
+            return .alive
         }
     }
 

@@ -32,6 +32,8 @@ extension OwnedProgramRunner {
         var notebookChanged = false
         var notebookChangeKnown = true
         var stopped: [String: JSONValue]?
+        /// An ordinary script's refused calls by number: each throws to the code, and becomes the stop only if the script ends on it uncaught.
+        var refusals: [Int: [String: JSONValue]] = [:]
         var refusedAfterStop = 0
         /// In-flight unjournaled calls must not create ledger rows.
         var unjournaled = false
@@ -92,6 +94,11 @@ extension OwnedProgramRunner {
             seen.insert(version)
         }
         func complete(_ fields: [String: JSONValue]) {
+            // A refusal the code caught is handled; one the script ended on uncaught is where it stopped.
+            if stopped == nil, case .object(let report)? = fields["exception"], case .int(let n)? = report["n"],
+               let refused = refusals[Int(n)] {
+                stopped = refused
+            }
             if case .object(var report)? = fields["exception"], stopped == nil {
                 report["origin"] = .string("javascript")
                 let message = report["message"]?.scalarText ?? "error"
@@ -709,13 +716,21 @@ extension OwnedProgramRunner {
                 row["reason"] = .string(reason)
                 if !detail.isEmpty { row["detail"] = .string(detail) }
                 append(.object(row))
-                stopped = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
-                           "reason": .string(reason), "detail": .string(detail)]
+                var stop: [String: JSONValue] = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
+                                                 "reason": .string(reason), "detail": .string(detail)]
                 if case .object(let fields) = receipt {
-                    for key in ["approvalId", "not_run_status", "remedy"] { stopped?[key] = fields[key] }
+                    for key in ["approvalId", "not_run_status", "remedy"] { stop[key] = fields[key] }
                 }
+                // An ordinary script's refused call, whatever refused it, throws to its code like any failure: caught, the script goes on and
+                // ends with its own outcome; uncaught, it ends the script here (`complete`). A call a card or the screen still holds for the
+                // person, a preview, Stop and strict runs stop the run at once.
+                let said = receipt.objectValue ?? [:]
+                let held = host.evidence(receipt).waiting || host.evidence(said["result"] ?? .null).waiting
+                    || said["status"] == .string("needs_glass")
+                let catchable = !strict && !preview && !previewed && !held && stopped == nil && reason != "cancelled"
+                if catchable { refusals[n] = stop } else { stopped = stop }
                 return answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail.isEmpty ? reason : detail),
-                               "stopped": .bool(true), "receipt": receipt, "call": .string(name), "effects": row["effects"] ?? .string("none")])
+                               "stopped": .bool(!catchable), "receipt": receipt, "call": .string(name), "effects": row["effects"] ?? .string("none")])
             }
         }
         /// A nested call's row keeps its identity and outcome; its answer stays in the private journal entry, never in the row.
@@ -799,7 +814,11 @@ extension OwnedProgramRunner {
                 if fields["status"] == .string("outcome_unknown"), fields["effects"] == nil { unknown.append(label) }
                 if fields["effects"] == .string("unknown") { unsure.append(label) }
             }
-            let status = stopped != nil ? "stopped" : timedOut ? "timed_out" : error != nil ? "error" : "ok"
+            // A previewed write hands the program nothing back. A program that then fails for want of it has reached the end of what a
+            // preview can show; that is not a fault of the program or a verdict on the live run.
+            let withheld = preview && stopped == nil && !timedOut && error?["origin"] == .string("javascript")
+                && ledger.contains { $0.objectValue?["status"] == .string("preview") }
+            let status = stopped != nil ? "stopped" : timedOut ? "timed_out" : error != nil && !withheld ? "error" : "ok"
             var out: [String: JSONValue] = [
                 "status": .string(status),
                 // A nested call's not_run verdict cannot erase work already performed by its containing program.
@@ -820,11 +839,16 @@ extension OwnedProgramRunner {
             if var stopped {
                 if refusedAfterStop > 0 { stopped["refused_after"] = .int(Int64(refusedAfterStop)) }
                 out["stopped"] = .object(stopped)
+                // The call it stopped on explains the stop, at the top where every reader looks first.
+                if let why = stopped["detail"]?.scalarText, !why.isEmpty { out["detail"] = .string(why) }
             }
             if timedOut, let detail = error?["message"]?.scalarText {
                 out["detail"] = .string(detail + " Calls already recorded retain their reported effects.")
             }
-            if let error {
+            if withheld {
+                out["preview_scope"] = .string("ended_at_first_write")
+                out["detail"] = .string("The preview ends at its first write: the program needs that call's result to go on. Nothing was done.")
+            } else if let error {
                 out["error"] = .object(error)
                 if part, error["origin"] == .string("javascript") { out["detail"] = error["message"] }
             }

@@ -159,6 +159,7 @@ extension iCloudBridge {
             if rejectedAt > (lastPhoneRejectedAt ?? .distantPast) { lastPhoneRejectedAt = rejectedAt }
             if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
             syncStatus = "Rejected iPhone message (CloudKit): signature_invalid"
+            await answerUnverifiablePhoneMessage(msg.id)
             return true
         }
         // Authentication suspended; a concurrent cancellation may have completed.

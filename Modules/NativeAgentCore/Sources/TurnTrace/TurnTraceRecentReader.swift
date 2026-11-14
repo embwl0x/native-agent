@@ -3,7 +3,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import Experiences
-// Blueprint: | `TurnTraceRecentReader.swift` | Checked record windows, model-call evidence and measured coverage |
+// Blueprint: | `TurnTraceRecentReader.swift` | Checked record windows, model-call evidence and coverage; `BodyReport` lives: launch to quit, crash or kill |
 
 /// Reads turn evidence and standalone receipts from the one record.
 public struct TurnTraceRecentReader: Sendable {
@@ -287,5 +287,56 @@ public struct TurnTraceRecentReader: Sendable {
                 return .object(row)
             }),
         ])
+    }
+}
+
+/// The record of the app's lives. A crash cannot write the trace, so each process writes its own boundaries to one append-only file: a launch
+/// line opens a life, and it ends in an exit line (it quit), a fatal signal line, or nothing at all (killed outright, force quit, power loss).
+public enum BodyReport {
+    public static func crashBreadcrumbs(_ dataRoot: URL) -> URL { dataRoot.appendingPathComponent("logs/crash-breadcrumbs.log") }
+    public static let launchMark = "NativeAgent launched "
+    public static let signalMark = "NativeAgent fatal signal "
+    public static let exitMark = "NativeAgent exited"
+
+    /// A launch line names its process, so the running life is known, never assumed.
+    public static func launchLine(at: Date = Date(), pid: Int32 = ProcessInfo.processInfo.processIdentifier) -> String {
+        launchMark + at.ISO8601Format() + " pid \(pid)"
+    }
+
+    /// The newest lives in the file's last 256 KiB, newest first.
+    public static func lives(_ dataRoot: URL, count: Int = 5) throws -> [JSONValue] {
+        let handle = try FileHandle(forReadingFrom: crashBreadcrumbs(dataRoot))
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        let start = size > 262_144 ? size - 262_144 : 0
+        try handle.seek(toOffset: start)
+        var lines = String(decoding: try handle.readToEnd() ?? Data(), as: UTF8.self).split(separator: "\n")
+        if start > 0, !lines.isEmpty { lines.removeFirst() }
+        let running = " pid \(ProcessInfo.processInfo.processIdentifier)"
+        var lives: [(started: String, ended: String?, endedAt: String?)] = []
+        var runningIndex: Int?
+        for line in lines {
+            if line.hasPrefix(launchMark) {
+                let stamp = line.dropFirst(launchMark.count)
+                lives.append((started: String(stamp.split(separator: " ").first ?? stamp), ended: nil, endedAt: nil))
+                runningIndex = line.hasSuffix(running) ? lives.count - 1 : nil
+            } else if line.hasPrefix(signalMark), !lives.isEmpty, lives[lives.count - 1].ended == nil {
+                let signal = Int(line.dropFirst(signalMark.count).prefix(2)) ?? 0
+                let names = [1: "SIGHUP", 4: "SIGILL", 5: "SIGTRAP", 6: "SIGABRT", 8: "SIGFPE", 10: "SIGBUS", 11: "SIGSEGV", 15: "SIGTERM"]
+                let name = names[signal] ?? "signal \(signal)"
+                lives[lives.count - 1].ended = [1, 15].contains(signal) ? "stopped from outside (\(name))" : "crashed (\(name))"
+            } else if line.hasPrefix(exitMark), !lives.isEmpty, lives[lives.count - 1].ended == nil {
+                lives[lives.count - 1].ended = "quit"
+                let at = line.dropFirst(exitMark.count).trimmingCharacters(in: .whitespaces)
+                lives[lives.count - 1].endedAt = at.isEmpty ? nil : at
+            }
+        }
+        // Only the newest launch can be this process; an older line naming the same pid is an earlier process given a reused pid.
+        if let runningIndex, runningIndex == lives.count - 1, lives[runningIndex].ended == nil { lives[runningIndex].ended = "running now" }
+        return lives.suffix(count).reversed().map { life -> JSONValue in
+            .object(["started_at": .string(life.started),
+                     "ended": .string(life.ended ?? "ended with no record: killed outright, force quit or power loss"),
+                     "ended_at": life.endedAt.map(JSONValue.string) ?? .null])
+        }
     }
 }

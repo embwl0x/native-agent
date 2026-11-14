@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-// Blueprint: | `ShellWindowChrome.swift` | `ShellWindowChrome`, `ShellFrame`: native chrome, split layout and keyboard order |
+// Blueprint: | `ShellWindowChrome.swift` | `ShellWindowChrome`, `ShellFrame`, `WindowFrame`: chrome, kept frames, split layout, keyboard order |
 
 @MainActor
 private protocol ShellWindowSizing: AnyObject {
@@ -50,6 +50,132 @@ struct ShellWindowChrome: NSViewRepresentable {
         window.toolbar?.isVisible = false
         // The glass sheet handles window dragging so text selection and controls win.
         window.isMovableByWindowBackground = false
+    }
+}
+
+
+/// A window opens where the person left it. AppKit keeps its frame under one stable autosave name in this process's defaults; beside it are
+/// kept what a frame cannot say: whether the window was zoomed, its unzoomed frame for the zoom button to return to, and full screen.
+/// A frame that no longer fits any connected screen (a display since detached) comes back onto the nearest screen at the same size,
+/// smaller only where that screen cannot hold it.
+@MainActor
+final class WindowFrame {
+    private(set) weak var window: NSWindow?
+    /// False when nothing was saved under the name: the window keeps its first placement.
+    let restored: Bool
+    private let name: String
+    private var observers: [NSObjectProtocol] = []
+
+    private var zoomedKey: String { name + ".zoomed" }
+    private var unzoomedKey: String { name + ".unzoomed" }
+    private var fullScreenKey: String { name + ".fullScreen" }
+
+    /// `formerName` is read once, when nothing is saved under `name` yet, so a frame saved under an earlier name still opens.
+    init(_ window: NSWindow, name: String, formerName: String? = nil) {
+        self.window = window
+        self.name = name
+        let defaults = UserDefaults.standard
+        if let formerName, defaults.string(forKey: "NSWindow Frame " + name) == nil,
+           let former = defaults.string(forKey: "NSWindow Frame " + formerName) {
+            defaults.set(former, forKey: "NSWindow Frame " + name)
+        }
+        // AppKit gives a name to one window at a time, and a closed window of the same scene can still hold it.
+        for other in NSApp.windows where other !== window && other.frameAutosaveName == name { other.setFrameAutosaveName("") }
+        restored = window.setFrameUsingName(name)
+        // Taking the name applies the saved frame again, so every correction below comes after it and is saved over it.
+        window.setFrameAutosaveName(name)
+        if restored {
+            let zoomed = defaults.bool(forKey: zoomedKey)
+            let unzoomed = zoomed ? defaults.string(forKey: unzoomedKey) : nil
+            // Zooming from the unzoomed frame lets AppKit remember it again, so the zoom button returns to the person's size.
+            if let unzoomed { window.setFrame(from: unzoomed) }
+            let fitted = Self.onScreen(window.frame, screens: NSScreen.screens.map { (frame: $0.frame, visible: $0.visibleFrame) })
+            if fitted != window.frame { window.setFrame(fitted, display: true) }
+            if unzoomed != nil, !window.isZoomed { window.zoom(nil) }
+            window.saveFrame(usingName: name)
+        }
+        let fullScreenKey = fullScreenKey
+        observers = [
+            NotificationCenter.default.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main) { _ in
+                UserDefaults.standard.set(true, forKey: fullScreenKey)
+            },
+            NotificationCenter.default.addObserver(forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main) { _ in
+                UserDefaults.standard.set(false, forKey: fullScreenKey)
+            },
+        ] + [NSWindow.didResizeNotification, NSWindow.didMoveNotification].map { change in
+            NotificationCenter.default.addObserver(forName: change, object: window, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.recordZoom() }
+            }
+        }
+        // A quit in full screen opens in full screen.
+        if defaults.bool(forKey: fullScreenKey), !window.styleMask.contains(.fullScreen) { window.toggleFullScreen(nil) }
+    }
+
+    /// Full screen is not zoom: its frame is the screen's, and leaving it returns to the frame already kept.
+    private func recordZoom() {
+        guard let window, !window.styleMask.contains(.fullScreen) else { return }
+        let zoomed = window.isZoomed
+        UserDefaults.standard.set(zoomed, forKey: zoomedKey)
+        if !zoomed { UserDefaults.standard.set(window.frameDescriptor, forKey: unzoomedKey) }
+    }
+
+    func end() {
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        observers.removeAll()
+    }
+
+    /// The frame where it is when a screen holds it whole; otherwise moved onto the screen it overlaps most, or the nearest one.
+    static func onScreen(_ frame: NSRect, screens: [(frame: NSRect, visible: NSRect)]) -> NSRect {
+        let usable = screens.filter { $0.visible.width > 1 && $0.visible.height > 1 }
+        guard !usable.contains(where: { $0.frame.contains(frame) }) else { return frame }
+        func overlap(_ screen: NSRect) -> CGFloat {
+            let shared = frame.intersection(screen)
+            return shared.isNull ? 0 : shared.width * shared.height
+        }
+        func distance(_ screen: NSRect) -> CGFloat {
+            let dx = max(screen.minX - frame.midX, 0, frame.midX - screen.maxX)
+            let dy = max(screen.minY - frame.midY, 0, frame.midY - screen.maxY)
+            return (dx * dx + dy * dy).squareRoot()
+        }
+        guard let target = usable.map(\.visible).min(by: { a, b in
+            overlap(a) != overlap(b) ? overlap(a) > overlap(b) : distance(a) < distance(b)
+        }) else { return frame }
+        let size = NSSize(width: min(frame.width, target.width), height: min(frame.height, target.height))
+        // Keep the top-left corner where it can stay, as the person placed it, then pull the whole frame inside the screen.
+        let moved = NSRect(x: frame.minX, y: frame.maxY - size.height, width: size.width, height: size.height)
+        return DetachedChatFramePlacement.clamp(moved, within: target)
+    }
+}
+
+/// The main window's frame, zoom and full screen are the person's, kept across quits, restarts and installs of a new build.
+struct MainWindowFrame: NSViewRepresentable {
+    static let autosaveName = "NativeAgent.MainWindow"
+    /// The name SwiftUI saved the frame under before the window kept its own: the scene id.
+    private static let formerName = ApplicationLifetime.mainSceneID
+
+    func makeNSView(context: Context) -> Keeper { Keeper() }
+    func updateNSView(_ view: Keeper, context: Context) {}
+    static func dismantleNSView(_ view: Keeper, coordinator: ()) { view.detach() }
+
+    final class Keeper: NSView {
+        private var kept: WindowFrame?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            // The scene places a new window at its default size; the person's frame replaces it once the window exists.
+            DispatchQueue.main.async { [weak self] in self?.keep() }
+        }
+
+        private func keep() {
+            guard let window, window !== kept?.window else { return }
+            detach()
+            kept = WindowFrame(window, name: MainWindowFrame.autosaveName, formerName: MainWindowFrame.formerName)
+        }
+
+        func detach() {
+            kept?.end()
+            kept = nil
+        }
     }
 }
 

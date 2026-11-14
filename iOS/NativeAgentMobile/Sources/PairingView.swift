@@ -47,6 +47,10 @@ struct PairingView: View {
     @State private var isCheckingForMac = false
     @State private var isConnecting = false
     @State private var connectionTask: Task<Void, Never>?
+    /// The connect this screen is waiting on; a cancelled one may still be unwinding and must not touch the screen.
+    @State private var connectionID: UUID?
+    /// The pairing key the waiting connect was sent under; nil until it is sent.
+    @State private var connectingWith: Data?
     @State private var phoneCode = ""
 
     var body: some View {
@@ -70,7 +74,10 @@ struct PairingView: View {
                                 Text("This phone’s code").font(.headline).foregroundStyle(AlivePalette.text)
                                 Text(phoneCode).font(.callout.monospaced()).textSelection(.enabled)
                                     .foregroundStyle(AlivePalette.text)
-                                Text("Open \(IOSPairingPresentation.macPairingRoute), match this code and choose Pair. Then tap Connect again.")
+                                Text("""
+                                    Open \(IOSPairingPresentation.macPairingRoute), match this code and choose Pair. This phone goes on by \
+                                    itself once the Mac accepts it.
+                                    """)
                                     .font(.subheadline).foregroundStyle(AlivePalette.secondary)
                             }
                             .aliveRow()
@@ -111,6 +118,8 @@ struct PairingView: View {
                         Button("Cancel waiting") {
                             connectionTask?.cancel()
                             connectionTask = nil
+                            connectionID = nil
+                            isConnecting = false
                         }
                         .frame(maxWidth: .infinity)
                     }
@@ -140,7 +149,23 @@ struct PairingView: View {
             }
             .onAppear { bridge.setup() }
             .onDisappear { connectionTask?.cancel() }
+            .onChange(of: pairingStore.macAcceptances) { _, _ in
+                // The Mac's acceptance, by its answer or its own confirmation, ends any wait here and closes the screen.
+                connectionTask?.cancel()
+                connectionTask = nil
+                connectionID = nil
+                isConnecting = false
+                onPaired?()
+            }
             .task(id: pairingStore.iCloudPairingSecret) {
+                // A connect sent under a key the Mac has since replaced cannot be answered; it goes again under the new one.
+                if isConnecting, let sentWith = connectingWith, sentWith != pairingStore.iCloudPairingSecret, pairingStore.isICloudSigned {
+                    connectionTask?.cancel()
+                    connectionID = nil
+                    isConnecting = false
+                    connectionTask = Task { await connectViaICloud() }
+                    return
+                }
                 guard pairingStore.connectionRepairPending else { return }
                 if pairingStore.isICloudSigned {
                     connectionTask = Task { await connectViaICloud() }
@@ -178,14 +203,15 @@ struct PairingView: View {
                 if isCheckingForMac {
                     ProgressView().controlSize(.small)
                 } else {
-                    Image(systemName: pairingStore.isICloudSigned ? "checkmark.circle.fill" : bridge.available ? "clock" : "icloud.slash")
-                        .foregroundStyle(pairingStore.isICloudSigned
+                    Image(systemName: keyIsCurrent ? "checkmark.circle.fill" : bridge.available ? "clock" : "icloud.slash")
+                        .foregroundStyle(keyIsCurrent
                                          ? AnyShapeStyle(HazeColor(stored: hazeColorRaw).swatch)
                                          : AnyShapeStyle(AlivePalette.secondary))
                         .frame(width: 28)
                 }
-                Text(isCheckingForMac ? "Checking for Mac…" : pairingStore.isICloudSigned ? "Pairing key is here" : !bridge.available
-                    ? "iCloud is unavailable on this phone." : "Waiting for the Mac’s pairing key")
+                Text(isCheckingForMac ? "Checking for Mac…" : keyIsCurrent ? "Pairing key is here"
+                    : pairingStore.isICloudSigned ? bridge.macPairingKey?.failure ?? "Checking this key against your Mac’s current one"
+                    : !bridge.available ? "iCloud is unavailable on this phone." : "Waiting for the Mac’s pairing key")
                     .font(.subheadline)
                     .foregroundStyle(AlivePalette.secondary)
             }
@@ -193,11 +219,16 @@ struct PairingView: View {
         }
     }
 
+    /// "Here" means the key the Mac publishes now, read from iCloud, not any key this phone kept.
+    private var keyIsCurrent: Bool { bridge.macPairingKey?.isCurrent(pairingStore.iCloudPairingSecret) == true }
+
     private func checkForMac() {
         Task {
             isCheckingForMac = true
             iCloudSecretError = nil
             await pairingStore.refreshFromCloudKit()
+            // The Mac's acceptance may already be waiting in iCloud; reading it here needs no push.
+            if pairingStore.isICloudSigned { _ = await bridge.pollIncomingNow() }
             isCheckingForMac = false
             if !pairingStore.isICloudSigned {
                 iCloudSecretError = bridge.available
@@ -209,13 +240,28 @@ struct PairingView: View {
 
     private func connectViaICloud() async {
         guard !isConnecting, !pairingStore.isRepairingConnection else { return }
+        let id = UUID()
+        connectionID = id
+        connectingWith = nil
+        isConnecting = true
+        defer {
+            if connectionID == id {
+                connectionID = nil
+                connectingWith = nil
+                isConnecting = false
+            }
+        }
+        errorMessage = nil
+        // Every Connect reads the Mac's current pairing key first: one sent under a replaced key would be turned away.
+        await pairingStore.refreshFromCloudKit()
+        guard connectionID == id else { return }
+        // An acceptance already in iCloud closes this screen without another round trip.
+        if pairingStore.isICloudSigned { _ = await bridge.pollIncomingNow() }
+        guard connectionID == id, !Task.isCancelled else { return }
         guard pairingStore.isICloudSigned else {
             errorMessage = IOSPairingPresentation.missingKeyMessage
             return
         }
-        isConnecting = true
-        defer { isConnecting = false }
-        errorMessage = nil
         let repairing = pairingStore.connectionRepairPending
         do {
             let key = try await PhoneSigningIdentity.shared.key()
@@ -223,7 +269,6 @@ struct PairingView: View {
             let sync = iCloudSyncEngine.shared
             sync.pairingStore = pairingStore
             if repairing, let secret = pairingStore.iCloudPairingSecret {
-                try sync.requireIdleActionForConnectionRepair()
                 pairingStore.isRepairingConnection = true
                 defer { pairingStore.isRepairingConnection = false }
                 let mailboxes = sync.connectionRepairMailboxes()
@@ -233,6 +278,7 @@ struct PairingView: View {
                 )
             }
             try Task.checkCancellation()
+            connectingWith = pairingStore.iCloudPairingSecret
             let result = try await iCloudSyncEngine.shared.sendActionAndWait(
                 .make(action: "pairDevice", payload: [:]), intentionalNewRequest: true)
             try Task.checkCancellation()
@@ -242,9 +288,8 @@ struct PairingView: View {
                 return
             }
             pairingStore.finishConnectionRepair()
-            pairingStore.applyICloudPairing()
-            onPaired?()
+            pairingStore.applyICloudPairing(acceptance: response[NAPairingConfirmation.acceptanceField])
         } catch is CancellationError {
-        } catch { errorMessage = error.localizedDescription }
+        } catch where connectionID == id { errorMessage = error.localizedDescription } catch {}
     }
 }

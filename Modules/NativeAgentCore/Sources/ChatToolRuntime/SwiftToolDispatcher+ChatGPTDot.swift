@@ -37,7 +37,7 @@ extension SwiftToolDispatcher {
             // Replies arrive through the listener as ordinary session messages, without a command or approval.
             input["text"] = .string(text + dotReplyFooter)
             // Wait at most 2 minutes for confirmation changes; busy responses retain the follower without spawning another helper.
-            let receipt = await dotHelper(input, peer: peer)
+            let receipt = await dotHelper(input, peer: peer, life: turn.enclosingCall)
             return await settle { [self] in
                 let reply = ToolResult(receipt)
                 var result = receipt
@@ -102,7 +102,8 @@ extension SwiftToolDispatcher {
         return integer
     }
 
-    private func dotHelper(_ input: [String: JSONValue], peer: AgentPeerContact) async -> JSONValue {
+    /// `life` is the watch of the call waiting on the helper process.
+    private func dotHelper(_ input: [String: JSONValue], peer: AgentPeerContact, life: TurnDeadline?) async -> JSONValue {
         let environment = AgentBridgeRuntime.processEnvironment()
         func unavailable(_ reason: String, _ detail: String, remedy: JSONValue) -> JSONValue {
             return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
@@ -142,7 +143,7 @@ extension SwiftToolDispatcher {
         do {
             let result = try await ProcessExecution().run(executable: node.path, arguments: [helper.path],
                 currentDirectory: dataRoot, environment: environment, standardInput: bytes,
-                timeoutSeconds: 166, outputByteLimit: nil)
+                timeoutSeconds: 166, outputByteLimit: nil, life: life)
             let receipt = result.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }
             guard result.exitCode == 0, let receipt else {
                 return unconfirmed(result.timedOut ? "dot_helper_timeout" : result.exitCode != 0 ? "dot_helper_exit_failed"

@@ -48,8 +48,8 @@ public extension SwiftNativeApprovalInbox {
 }
 /// PersistenceCore supplies atomic private storage; every inbox instance shares its file lock.
 public actor SwiftNativeApprovalInbox {
-    // Module visibility lets injection spends use the same root and persistence owner.
-    let root: URL
+    /// The data root this inbox owns: injection spends and a card's effect owners settle under the same root and persistence owner.
+    public nonisolated let root: URL
     /// These actions retain local-only flags regardless of caller input. Paired iPhone and bound owner-DM decisions follow `validateResolutionAuthority`;
     /// executable review still requires Mac/phone.
     nonisolated static let hardLocalOnlyActions: Set<String> = [

@@ -147,9 +147,18 @@ struct KnowledgeGraphView: View {
         return AnyView(KGGraphCanvas(entities: visible, edges: edges, selectedId: $selectedId).frame(minHeight: 360))
     }
 
+    /// The graph's own rows (an entity, the upkeep review) open here; every other link goes to the window's general follower.
     private func open(_ link: String) {
-        guard case .page("knowledge", let item?)? = FaceLink(link) else { return }
-        if item == "upkeep" { review = true }
-        else if item.hasPrefix("entity:") { selectedId = String(item.dropFirst("entity:".count)) }
+        if case .page("knowledge", let item?)? = FaceLink(link) {
+            if item == "upkeep" { review = true; return }
+            if item.hasPrefix("entity:") { selectedId = String(item.dropFirst("entity:".count)); return }
+        }
+        Task {
+            do {
+                _ = try await MacFaceLinks.follow(link, appModel: appModel) { card in
+                    ApplicationLifetime.shared.request(.activity(card.kind == .approval ? .approvals : .inbox))
+                }
+            } catch { appModel.systemToasts.push(error: error.localizedDescription) }
+        }
     }
 }

@@ -40,12 +40,13 @@ extension AgentRecipeStore {
         let acp = object(["executable": text, "arguments": strings, "documentation": text, "permissionMode": text,
             "referenceVersion": text, "environment": map(text)], optional: ["protocolVersion": integer,
             "modes": strings, "supportsLoad": flag, "supportsResume": flag])
+        let localChat = object(["server": text, "models": text, "chat": text, "start": text])
         let host = object(["id": text, "displayName": text, "description": text, "aliases": strings,
             "installMarkers": strings, "configPath": text, "format": enumeration(AgentHostRow.Format.self),
             "restartRequired": flag, "restartNote": text, "documentation": text, "requiresWorkspace": flag,
             "settingsSupported": flag, "bundleIDs": strings, "a2aPorts": list(integer), "searchPaths": strings], optional: [
             "declaredRoute": enumeration(AgentHostRow.Route.self), "configPaths": strings, "commandLine": command,
-            "acp": acp, "a2a": a2a, "executables": strings, "discoveryWords": strings,
+            "acp": acp, "a2a": a2a, "localChat": localChat, "executables": strings, "discoveryWords": strings,
             "messagingPermissionsPath": text, "messagingPermissionSyntax": enumeration(AgentHostRow.MessagingPermissionSyntax.self),
             "desktopChat": desktop, "grokRoutine": routine])
         return object(["recipeVersion": ToolSchema.intSchema(minimum: 1, maximum: Int.max - 1),

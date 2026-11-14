@@ -21,7 +21,7 @@ import TrustCenter
 /// Factories bind at launch; ingress and retained delivery remain with the runtime owner.
 public protocol ClaudeBridgeRuntimePort: ClaudeBridgeMessagePort {
     var dataRoot: URL { get }
-    var cognition: NativeCognitionRuntime { get }
+    var cognition: NativeCognitionRuntime? { get }
     var contextFlow: NativeContextFlowRuntime { get }
     var tasks: AgentContactTasks { get }
     var grpcPort: UInt16? { get }
@@ -681,7 +681,7 @@ extension ClaudeBridgeRuntime {
 
     public var preferredPersona: String? { host.preferredPersona }
     public var preferredSessionID: String? { host.preferredSessionID }
-    public var cognition: NativeCognitionRuntime { host.cognition }
+    public var cognition: NativeCognitionRuntime? { host.cognition }
     public var contextFlow: NativeContextFlowRuntime { host.contextFlow }
 
     public func toolClient(verifiedSessionID: String?) -> any ToolDispatchClient {

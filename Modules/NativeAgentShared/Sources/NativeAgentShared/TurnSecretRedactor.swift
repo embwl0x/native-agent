@@ -15,7 +15,12 @@ public enum TurnSecretRedactor {
         let specs: [(String, String, NSRegularExpression.Options)] = [
             ("NAMED_SECRET", #"\\+""# + credentialName + #"\\+"\s*:\s*\\+".*?(?:\\+"(?=\s*[,}\]]|$)|$)"#, [.caseInsensitive, .dotMatchesLineSeparators]),
             ("NAMED_SECRET", #"["']"# + credentialName + #"["']\s*[:=]\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,}\]]+)"#, [.caseInsensitive]),
-            ("TELEGRAM_TOKEN", #"(?:bot\d+|\b\d{6,})(?::|%3[Aa])[A-Za-z0-9_-]+"#, [.caseInsensitive]),
+            // A bot token is a whole-number bot id (bare, or after `bot` in a Bot API URL), a colon, and a secret of 30 or more URL-safe characters (34 or
+            // 35 as issued). Record ids join words, epoch seconds and UUIDs with colons, so the shape stops there: digits after a digit and a `.` are a
+            // decimal's fraction, never a bot id (a token after a sentence's full stop still is one); a run shorter than 30 is no secret; a UUID (36,
+            // dashed hex) is the record's own identifier, never a token's secret.
+            ("TELEGRAM_TOKEN", #"(?:bot\d+|(?<!\d\.)\b\d{6,})(?::|%3[Aa])"#
+                + #"(?![0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![A-Za-z0-9_-]))[A-Za-z0-9_-]{30,}"#, [.caseInsensitive]),
             // Assignments and credential fields are secrets; provider-label prose needs a shaped value.
             (
                 "NAMED_SECRET",

@@ -377,7 +377,7 @@ public extension NativeAgentEngine {
         _ = await providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
         await providers.refreshSessionsAfterRoutingWrite()
         if group.surfaces.contains("cognition_reflection") {
-            await Self.liveCognition.refreshConfiguration()
+            await Self.liveCognition?.refreshConfiguration()
         }
         Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
         return result

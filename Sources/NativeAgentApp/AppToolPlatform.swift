@@ -66,7 +66,7 @@ extension AppToolExecutor {
                     dataRoot: securityCenter.dataRoot, turn: turn, execution: execution)
             },
             chrome: { NativeAgentEngine.live.chrome },
-            motorActionObserver: { await NativeAgentEngine.liveCognition.observeMotorActionState($0) },
+            motorActionObserver: { await NativeAgentEngine.liveCognition?.observeMotorActionState($0) },
             mobileNotificationSender: mobileNotificationSender,
             macNotificationSender: macNotificationSender,
             macIntegrationPermissionStore: macIntegrationPermissionStore,
@@ -105,7 +105,7 @@ extension AppToolExecutor {
         return try await defaultBrowserActionRunner(
             actionId: actionId, dryRun: dryRun, input: input,
             chrome: { NativeAgentEngine.forRoot(dataRoot).chrome },
-            motorActionObserver: { await NativeAgentEngine.liveCognition.observeMotorActionState($0) },
+            motorActionObserver: { await NativeAgentEngine.liveCognition?.observeMotorActionState($0) },
             platform: BrowserToolPlatformPort(
                 setUpChrome: {
                     (try await ChromeExtensionFolder.setUp(turn: turn,

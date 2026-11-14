@@ -219,15 +219,22 @@ extension AppToolExecutor {
 
     /// The page's setting rows, one producer for the page read's `settings` list and for an item read of one row (`only`, matched like
     /// setting.get matches an id): types, choices and notes make setting.set's contract complete, and a row that cannot be read stays listed,
-    /// unavailable, so one row's failure never removes its siblings.
+    /// unavailable, so one row's failure never removes its siblings. A list of choices is said once per read: a later row offering the same
+    /// list (several groups on one account, and that account's default) carries `choices_same_as`, the id of the row that gave it.
     @MainActor
     func pageSettingRows(page: QuietToolPage, host: any QuietToolHost, only item: String? = nil) async throws -> [JSONValue] {
         var rows: [JSONValue] = []
+        var given: [(choices: JSONValue, id: String)] = []
         let wanted = item?.lowercased()
         for setting in try QuietSettings.settings(forPage: page.id, host: host) where wanted == nil || setting.id.lowercased() == wanted {
             do {
                 if case .object(let listed) = try await setting.catalogRow(host: { self.quietHost() }) {
                     var row = listed.filter { ["id", "label", "type", "choices", "note", "writable", "owner_only"].contains($0.key) }
+                    let choices = row["choices"]
+                    if let choices, let first = given.first(where: { $0.choices == choices }) {
+                        row["choices"] = nil
+                        row["choices_same_as"] = .string(first.id)
+                    }
                     if setting.readsAnotherDevice {
                         row["read_with"] = .object(["action": .string("setting.get"),
                             "args": .object(["setting": .string(setting.id)])])
@@ -235,6 +242,7 @@ extension AppToolExecutor {
                         row["value"] = try await setting.read(host)
                     }
                     rows.append(.object(row))
+                    if let choices, row["choices"] != nil { given.append((choices, setting.id)) }
                 }
             } catch {
                 // A row in the list is that setting, unavailable: it keeps its id like its siblings.
@@ -336,24 +344,10 @@ extension AppToolExecutor {
         do { currentValue = try await setting.read(appModel) }
         catch { return refuse(Self.settingReadFailure(error, setting: setting)) }
 
-        // Who decides: the person's own decided call of exactly these arguments (their tap, the phone's signed change, a card they approved)
-        // passes every person-only check below; nothing else does. Posture is what the agent may do, never what the person may.
+        // Who decides: the person's own decided call of exactly these arguments (their tap, the phone's signed change, a card they approved,
+        // their own words asking for it) passes every person-only check below; nothing else does. Posture is what the agent may do, never
+        // what the person may.
         let decided = QuietSettings.personDecided(input.filter { !$0.key.hasPrefix("__") }, turn: turn)
-
-        // The person's controls stay the person's at every posture, Full Mac included.
-        if setting.ownerOnly, !decided {
-            return refuse(Self.failure(
-                "owner_only",
-                QuietSettings.ownerOnlyRefusal,
-                extra: [
-                    "setting": .string(setting.id),
-                    "page": .string(setting.page),
-                    "label": .string(setting.label),
-                    "requested_value": input["value"] ?? .null,
-                    "current_value": currentValue,
-                ]
-            ))
-        }
 
         var request: String?
         var restoresPrevious = false
@@ -366,16 +360,28 @@ extension AppToolExecutor {
             restoresPrevious = true
         } else if !setting.mindOwned, !decided,
                   await Self.freshQuietPosture()?.name != Self.fullMacModeName {
-            // Under Full Mac the agent's own dials are its own (owner-only rows refused above); below it the agent's change, from any of its
-            // turns or parts, needs the person's words.
-            request = Self.text(input["because"])
-            guard let request, request.split(whereSeparator: \.isWhitespace).count >= 3,
-                  let restores = await turn.settingRequestEvidence?(setting.id, input["value"] ?? .null, currentValue, request) else {
-                return refuse(Self.failure("setting_not_requested",
-                    "No one asked to change \(setting.id); quote the request in because. Nothing changed.",
-                    extra: ["setting": .string(setting.id), "effects": .string("none"), "changed": .bool(false)]))
+            // Under Full Mac the agent's own dials are its own; below it the agent's change, from any of its turns or parts, needs words asking
+            // for it, said in this conversation and about this setting (`RequestWords`).
+            let quoted = Self.text(input["because"] ?? input["__because"])
+            let value = input["value"] ?? .null
+            let act = [setting.label, setting.page, setting.id, value.scalarText ?? ""]
+            if quoted.split(whereSeparator: \.isWhitespace).count >= 3, RequestWords.relates(quoted, to: act),
+               let restores = await turn.settingRequestEvidence?(setting.id, value, currentValue, quoted) {
+                request = quoted
+                restoresPrevious = restores
+            } else {
+                // A change that is the person's to decide (an owner-only row, a raise) asks them on a card at every posture, as without this
+                // check; only a change of the agent's own that no one asked for is refused here.
+                let theirs: Bool
+                if setting.ownerOnly { theirs = true }
+                else if case .users? = await setting.check?(appModel, value, turn) { theirs = true }
+                else { theirs = false }
+                guard theirs else {
+                    return refuse(Self.failure("setting_not_requested",
+                        "No one asked to change \(setting.id); quote the request about it in because. Nothing changed.",
+                        extra: ["setting": .string(setting.id), "effects": .string("none"), "changed": .bool(false)]))
+                }
             }
-            restoresPrevious = restores
         }
 
         var posture: QuietPosture?
@@ -417,6 +423,17 @@ extension AppToolExecutor {
                 "missing_value", "Pass the new value.",
                 extra: ["setting": .string(setting.id), "type": .string(setting.kind.rawValue)]
             ))
+        }
+        // The person's controls are the person's at every posture, Full Mac included, as a raise is: the agent's change asks them on a card
+        // for this exact call (`needs_person`), and their word, tap or Approve makes it. Safe and an unwritable row refused above, first.
+        if setting.ownerOnly, !decided {
+            return refuse(.object([
+                "status": .string("needs_person"), "reason": .string("owners_call"), "effects": .string("none"),
+                "detail": .string("Changing \(setting.label) to \(requestedValue.scalarText ?? "that") is the person's to decide at every "
+                    + "posture: this exact change asks them on a card, and their Approve makes it."),
+                "setting": .string(setting.id), "page": .string(setting.page), "label": .string(setting.label),
+                "requested_value": requestedValue, "current_value": currentValue,
+            ]))
         }
         if setting.id.hasPrefix("providers."), setting.id != "providers.routing_repair" {
             do {
@@ -465,6 +482,7 @@ extension AppToolExecutor {
         var extra: [String: JSONValue] = [
             "setting": .string(setting.id),
             "page": .string(setting.page),
+            "label": .string(setting.label),
             "requested_value": requestedValue,
         ]
         do { extra["current_value"] = try await setting.read(host) }
@@ -584,10 +602,11 @@ extension AppToolExecutor {
             receipt["user_request"] = .string(request)
             receipt["decided_by"] = .string("agent")
         }
-        // The person's own change is theirs to change back, on its row; the agent's undo never restores what the person decided.
+        // The person's own change is theirs to change back (their tap, their card, or their word); the agent's undo never restores what the
+        // person decided.
         if gated.decided {
             receipt["decided_by"] = .string("person")
-            receipt["undo_unavailable"] = .string("The person decided this change; changing it back is theirs, on its row.")
+            receipt["undo_unavailable"] = .string("The person decided this change; changing it back is theirs to decide.")
         }
         return .object(receipt)
     }

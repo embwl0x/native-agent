@@ -581,7 +581,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             [fields[key], inner[key]].lazy.compactMap { $0?.scalarText }
                 .first { !$0.isEmpty } ?? ""
         }
-        let detail = String(text("detail").prefix(400))
+        let detail = String([text("detail"), text("message")].first { !$0.isEmpty }?.prefix(400) ?? "")
         let waiting = text("not_run_status")
         let evidence = host.evidence(receipt)
         if !waiting.isEmpty || evidence.waiting

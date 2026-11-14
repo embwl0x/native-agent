@@ -2,6 +2,17 @@ import Foundation
 
 // Blueprint: | `PhoneConnection.swift` | `NAPhoneConnection`: pairing/transport/exchange assessment; `NAPhoneStanding`: connected and can-approve |
 
+/// The Mac's acceptance of a phone, owed to that phone until it answers. The Mac sends it as a signed message naming the device; the phone takes it
+/// whenever it arrives, waiting or not, and answers with the acknowledgement action. Both are idempotent.
+public enum NAPairingConfirmation {
+    public static let messageKind = "pairing_confirmed"
+    public static let deviceField = "deviceId"
+    /// One acceptance's identity: the confirmation carries it and the acknowledgement echoes it, so an answer to an earlier pairing never
+    /// settles a later one.
+    public static let acceptanceField = "acceptance"
+    public static let acknowledgement = "pairingConfirmed"
+}
+
 /// Pairing, transport and accepted exchange are independent facts. All surfaces use this assessment to name the first unmet fact and its repair owner.
 public struct NAPhoneConnection: Equatable, Sendable, Codable {
     public enum State: String, Sendable, Codable {
@@ -68,13 +79,26 @@ public struct NAPhoneStanding: Equatable, Sendable, Codable {
     public var connected: Bool?
     /// Phones that asked to pair and wait for the Pair button.
     public var waiting: Int
-    /// Phones whose device key is paired: the ones that can approve.
+    /// Phones whose device key is paired and that confirmed hearing it: the ones that can approve.
     public var approvers: Int
+    /// Phones paired here that have not yet confirmed hearing it; the Mac resends its acceptance until they do.
+    public var confirming: Int
 
-    public init(connected: Bool?, waiting: Int, approvers: Int) {
+    public init(connected: Bool?, waiting: Int, approvers: Int, confirming: Int = 0) {
         self.connected = connected
         self.waiting = waiting
         self.approvers = approvers
+        self.confirming = confirming
+    }
+
+    private enum CodingKeys: String, CodingKey { case connected, waiting, approvers, confirming }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        connected = try values.decodeIfPresent(Bool.self, forKey: .connected)
+        waiting = try values.decode(Int.self, forKey: .waiting)
+        approvers = try values.decode(Int.self, forKey: .approvers)
+        confirming = try values.decodeIfPresent(Int.self, forKey: .confirming) ?? 0
     }
 
     public var canApprove: Bool { approvers > 0 }
@@ -84,17 +108,25 @@ public struct NAPhoneStanding: Equatable, Sendable, Codable {
         waiting == 0 ? nil : waiting == 1 ? "An iPhone is waiting for you to choose Pair." : "\(waiting) iPhones are waiting for you to choose Pair."
     }
 
+    /// What waits on a paired phone confirming it heard this Mac; nil when nothing does.
+    public var confirmingLine: String? {
+        confirming == 0 ? nil : confirming == 1 ? "An iPhone is paired on this Mac; waiting for the iPhone to confirm."
+            : "\(confirming) iPhones are paired on this Mac; waiting for them to confirm."
+    }
+
+    /// One true sentence; the step that follows is the pairing fact's lever. Chatting over the shared iCloud key is not pairing.
     public var line: String {
-        let contact: String
-        switch connected {
-        case true?: contact = "Your iPhone is connected over iCloud."
-        case false?: contact = "No iPhone has connected over iCloud yet."
-        case nil: contact = "No verified iPhone contact is available."
+        let pending = [confirmingLine, waitingLine].compactMap { $0 }
+        if approvers > 0 {
+            let paired = approvers == 1 ? "Your iPhone is paired: it can chat and approve actions."
+                : "\(approvers) iPhones are paired: they can chat and approve actions."
+            return ([paired] + pending).joined(separator: " ")
         }
-        var approval: [String] = []
-        if approvers > 0 { approval.append(approvers == 1 ? "1 phone can approve actions." : "\(approvers) phones can approve actions.") }
-        if let waitingLine { approval.append(waitingLine) }
-        if approval.isEmpty { approval.append("No phone can approve actions until you pair it.") }
-        return ([contact] + approval).joined(separator: " ")
+        if !pending.isEmpty { return pending.joined(separator: " ") }
+        switch connected {
+        case true?: return "Your iPhone chats here through this Apple Account, but it isn't paired, so it can't approve actions."
+        case false?: return "No iPhone is paired with this Mac."
+        case nil: return "No iPhone is paired with this Mac; whether one chats here is not known."
+        }
     }
 }

@@ -41,37 +41,44 @@ public struct DesktopChatRoute: Sendable {
     var live: AgentConversationLiveTarget?
     var appName: String { recipe.host.displayName }
     var untitled: String { ui.newChat }
-    private struct State: Sendable {
-        var busy = false
-        var lastChat: String?
-        var lastReply = ""
-        var pressedReturn = false
-    }
-    // Only send bookkeeping is locked. AX, input, waits and settlement run without holding it.
-    private static let state = Mutex(State())
-    private static func claim() -> Bool {
-        state.withLock {
-            guard !$0.busy else { return false }
-            $0.busy = true
-            return true
+    /// One send's own bookkeeping. The desktop itself is the one desktop lane's (`DesktopLane`): typing takes it, observing a reply holds nothing, so
+    /// sends no longer exclude each other here. AX, input, waits and settlement run without holding this lock.
+    private final class Progress: Sendable {
+        private struct State: Sendable {
+            var lastChat: String?
+            var lastReply = ""
+            var pressedReturn = false
+        }
+        private let state = Mutex(State())
+        var lastChat: String? {
+            get { state.withLock { $0.lastChat } }
+            set { state.withLock { $0.lastChat = newValue } }
+        }
+        var lastReply: String {
+            get { state.withLock { $0.lastReply } }
+            set { state.withLock { $0.lastReply = newValue } }
+        }
+        var pressedReturn: Bool {
+            get { state.withLock { $0.pressedReturn } }
+            set { state.withLock { $0.pressedReturn = newValue } }
         }
     }
-    private static func release() { state.withLock { $0.busy = false } }
+    private let progress = Progress()
     /// Uncertain results must retain the destination chat for later reconciliation.
-    private static var lastChat: String? {
-        get { state.withLock { $0.lastChat } }
-        set { state.withLock { $0.lastChat = newValue } }
+    private var lastChat: String? {
+        get { progress.lastChat }
+        nonmutating set { progress.lastChat = newValue }
     }
-    private static var lastReply: String {
-        get { state.withLock { $0.lastReply } }
-        set { state.withLock { $0.lastReply = newValue } }
+    private var lastReply: String {
+        get { progress.lastReply }
+        nonmutating set { progress.lastReply = newValue }
     }
     /// After Return, errors leave delivery uncertain.
-    private static var pressedReturn: Bool {
-        get { state.withLock { $0.pressedReturn } }
-        set { state.withLock { $0.pressedReturn = newValue } }
+    private var pressedReturn: Bool {
+        get { progress.pressedReturn }
+        nonmutating set { progress.pressedReturn = newValue }
     }
-    private typealias AX = GrokRoutineAccessibility
+    private typealias AX = DesktopComposer
 
     @concurrent public static func perform(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, plan: [String: JSONValue],
         dataRoot: URL) async -> JSONValue {
@@ -127,17 +134,23 @@ public struct DesktopChatRoute: Sendable {
 
     /// Explicit verification reads only the authored controls, without input or selector guessing. A mismatch belongs to agent.recipe_write.
     private func dryRun(turn: NativeAgentCore.Turn, mac: MacOperationContext, peerID: String, dataRoot: URL) async -> JSONValue {
-        guard Self.claim() else {
-            return .object(["status": .string("busy"), "dry_run": .bool(true), "sent": .bool(false),
-                "detail": .string("The previous desktop send is still running. Nothing was checked.")])
-        }
-        defer { Self.release() }
         var name = ""
         do {
             name = try await Task.detached { try AgentBridgeRuntime.configuredNames(dataRoot: dataRoot).agent }.value
             guard !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty else { throw Blocker.offline }
             guard SystemMacAXElementSource().isTrusted() else { throw Blocker.permission }
-            try await controls(turn: turn, mac: mac)
+            // Showing the window and its side chats drives the desktop, so the check takes the one lane under its rule; admission is released by operate.
+            let person = DesktopLane.askedByPerson(turn)
+            var admitted: DesktopLane.Admission = .busy
+            if person || !DesktopLane.personHere { admitted = await DesktopLane.shared.admit(person: person) }
+            guard case .admitted(let ticket) = admitted else {
+                return .object(["status": .string("not_started"), "dry_run": .bool(true), "sent": .bool(false), "detail": .string(person
+                    ? "The check did not start: it was stopped, or the person's newer desktop request took the desktop first. Nothing was checked."
+                    : "The person is at the Mac or another operation is driving the desktop now, so nothing was checked. Check again later.")])
+            }
+            try await DesktopLane.shared.operate(ticket) { () -> Result<Void, Error> in
+                do { try await self.controls(turn: turn, mac: mac); return .success(()) } catch { return .failure(error) }
+            }.get()
             return .object(["status": .string("passed"), "dry_run": .bool(true), "sent": .bool(false),
                 "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
                 "recipe_version": .int(Int64(recipe.recipeVersion)),
@@ -243,15 +256,10 @@ public struct DesktopChatRoute: Sendable {
         do { name = try await Task.detached { try AgentBridgeRuntime.configuredNames(dataRoot: dataRoot).agent }.value }
         catch { return .object(["status": .string("unavailable"), "reason": .string("persona_profile_unavailable"), "sent": .bool(false),
             "detail": .string(error.localizedDescription)]) }
-        guard Self.claim() else {
-            return .object(["status": .string("busy"), "sent": .bool(false), "completed": .bool(false),
-                            "detail": .string("\(appName) is still answering the previous message. Nothing was sent.")])
-        }
         let thread: String?
         if case .string(let saved)? = plan["conversation_id"] { thread = saved }
         else { thread = nil }
         let store = AgentPeerStore(dataRoot: dataRoot)
-        Self.lastChat = nil; Self.lastReply = ""; Self.pressedReturn = false
         // Name the configured agent in its opening message so the chat is recognizable.
         let message = thread == nil && !text.hasPrefix(name) ? name + " here — " + text : text
         // The exact first message of each of the agent's chats, by title: a renamed chat is the agent's only if it opens with exactly that (never just its
@@ -262,7 +270,6 @@ public struct DesktopChatRoute: Sendable {
             else { first = message }
         }
         catch {
-            Self.release()
             return .object(["status": .string("unavailable"), "sent": .bool(false), "reason": .string("desktop_identity_unavailable"),
                 "detail": .string("""
                     Saved desktop conversation identity could not be read: \(error.localizedDescription). Repair the saved identity file before \
@@ -272,8 +279,9 @@ public struct DesktopChatRoute: Sendable {
         // Settlement is detached: carry the exact operation and authority, never look up task-local context after crossing that boundary.
         let sendTarget = conversation.liveTarget
         let sendDriver = mac.driver
-        // Person-requested sends go now or report a blocker; only autonomous sends wait for absence.
-        let byPerson = turn.personInitiatedSend?.text == text
+        // Person-requested sends (the person's own send, or any send in a turn that is the person's own message) go now or report a blocker; only
+        // autonomous sends wait for absence.
+        let byPerson = turn.personInitiatedSend?.text == text || DesktopLane.askedByPerson(turn)
         @Sendable func heldForMac(_ detail: String) async -> JSONValue {
             guard !byPerson, !Task.isCancelled, sendDriver?.handedBack != true,
                   let live = sendTarget, let row = live.recordID, let operation = live.operationID else {
@@ -299,11 +307,40 @@ public struct DesktopChatRoute: Sendable {
         do {
             try Task.checkCancellation()
             guard byPerson || MacPersonInput.presence()?.here == false else {
-                Self.release()
                 return await heldForMac(MacPersonInput.presence()?.here == true ? MacAttentionSessionStore.personUsingMac
                     : "I held off because the Mac's input is not yet known to be free. Nothing was sent.")
             }
-            result = .success(try await send(turn: turn, mac: mac, message, thread: thread, first: first) { submissionConfirmed = true })
+            // Opening the chat, typing and confirming the outgoing row take the one desktop lane; the reply is observed after it, holding nothing.
+            let ticket: DesktopLane.Ticket
+            switch await DesktopLane.shared.admit(person: byPerson) {
+            case .admitted(let admitted): ticket = admitted
+            case .cancelled: throw CancellationError()
+            case .busy:
+                return .object(["status": .string("busy"), "sent": .bool(false), "completed": .bool(false), "detail": .string("""
+                    Another operation is driving the desktop right now, so \(appName) was not touched. Nothing was sent; send again when it finishes.
+                    """)])
+            case .superseded:
+                return .object(["status": .string("not_sent"), "sent": .bool(false), "completed": .bool(false), "detail": .string("""
+                    Superseded by the person's newer desktop request before \(appName) was touched; nothing was sent and nothing of it waits. Send it \
+                    again if it is still wanted.
+                    """)])
+            }
+            let driven = await DesktopLane.shared.operate(ticket) { () -> Result<Driven, Error> in
+                do { return .success(try await self.drive(turn: turn, mac: mac, message, thread: thread, first: first, lane: ticket)) }
+                catch { return .failure(error) }
+            }
+            if ticket.yieldedUntyped {
+                guard byPerson else {
+                    return await heldForMac("The person asked for the desktop, so this message stepped aside before anything was typed.")
+                }
+                return .object(["status": .string("not_sent"), "sent": .bool(false), "completed": .bool(false), "detail": .string("""
+                    Set aside for the person's newer desktop request before anything was typed; nothing was sent and nothing of it waits. Send it \
+                    again if it is still wanted.
+                    """)])
+            }
+            let sent = try driven.get()
+            submissionConfirmed = true
+            result = .success(try await observe(mac: mac, message, first: first, driven: sent))
         }
         catch { result = .failure(error) }
         let stopped = Task.isCancelled
@@ -312,9 +349,9 @@ public struct DesktopChatRoute: Sendable {
         @Sendable func uncertain(_ detail: String, _ fields: [String: JSONValue] = [:]) async -> JSONValue {
             var result = fields.merging(["status": .string("outcome_unknown"), "completed": .bool(false),
                 "terminal": .bool(true), "reply_observation": .string("failed"), "detail": .string(detail)]) { $1 }
-            if !Self.lastReply.isEmpty { result["partial_reply"] = .string(Self.lastReply); result["untrusted_remote_data"] = .bool(true) }
+            if !lastReply.isEmpty { result["partial_reply"] = .string(lastReply); result["untrusted_remote_data"] = .bool(true) }
             if confirmed { result["sent"] = .bool(true) }
-            let chat = Self.lastChat
+            let chat = lastChat
             if let chat, chat != untitled {
                 result["conversation_id"] = .string(chat)
                 do { try await remember(chat) }
@@ -324,7 +361,6 @@ public struct DesktopChatRoute: Sendable {
             return .object(result)
         }
         return await settle {
-            defer { Self.release() }
             do {
                 let (reply, title, observation) = try result.get()
                 let identityError: String?
@@ -345,7 +381,7 @@ public struct DesktopChatRoute: Sendable {
                 return .object(answered)
             } catch {
                 if let failure = error as? MacAccessibilityReader.NativeReadFailure {
-                    if Self.pressedReturn || confirmed {
+                    if pressedReturn || confirmed {
                         return await uncertain(failure.detail + " " + (confirmed
                             ? "The message was sent; its answer remains unconfirmed. Nothing was resent."
                             : "Return was posted; message submission is unconfirmed. Nothing was resent."))
@@ -363,8 +399,8 @@ public struct DesktopChatRoute: Sendable {
                         """)
                 }
                 if let covered = error as? MacScreenLock.Covered {
-                    if Self.pressedReturn { return await uncertain(covered.detail + " Return was posted; submission is unconfirmed. Nothing was resent.") }
-                    if covered.code == "human_takeover", !Self.pressedReturn, !stopped { return await heldForMac(covered.detail) }
+                    if pressedReturn { return await uncertain(covered.detail + " Return was posted; submission is unconfirmed. Nothing was resent.") }
+                    if covered.code == "human_takeover", !pressedReturn, !stopped { return await heldForMac(covered.detail) }
                     return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(
                         covered.detail + " Nothing was sent.")])
                 }
@@ -379,13 +415,13 @@ public struct DesktopChatRoute: Sendable {
                     return await uncertain(report.detail, report.fields)
                 }
                 if let blocker = error as? Blocker {
-                    if blocker == .heldOff, Self.pressedReturn {
+                    if blocker == .heldOff, pressedReturn {
                         return await uncertain("""
                             You were typing or switched windows, so \(name) stopped using \(appName). Return had already been posted; message \
                             submission is unconfirmed. Check \(name)'s chat in \(appName) before trying again; nothing was resent.
                             """)
                     }
-                    if [.moved, .submission].contains(blocker) || Self.pressedReturn { return await uncertain(blocker.detail(mac: mac, name,
+                    if [.moved, .submission].contains(blocker) || pressedReturn { return await uncertain(blocker.detail(mac: mac, name,
                         app: appName)) }
                     if blocker == .heldOff, !stopped {
                         let detail = withAgentMacDriver(mac, driver: sendDriver) { mac in MacAttentionSessionStore.sendRefusal(context: mac) }
@@ -405,12 +441,12 @@ public struct DesktopChatRoute: Sendable {
                     return .object(result)
                 }
                 if let refusal = error as? MacNativeActionFailure, case .driver = refusal,
-                   !Self.pressedReturn, !stopped {
+                   !pressedReturn, !stopped {
                     let detail = withAgentMacDriver(mac, driver: sendDriver) { mac in MacAttentionSessionStore.sendRefusal(context: mac) }
                     return await heldForMac(detail)
                 }
                 // Before Return, report the specific failure without implying submission.
-                guard Self.pressedReturn else {
+                guard pressedReturn else {
                     return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
                                     "detail": .string("\(appName) couldn't be driven: \(error.localizedDescription). Nothing was sent.")])
                 }
@@ -427,15 +463,22 @@ public struct DesktopChatRoute: Sendable {
         return fields
     }
 
-    @concurrent func send(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, thread: String?, first: String?,
-        didSubmit: () -> Void) async throws -> (String, String, JSONValue) {
+    /// What the lane part of a send hands to its reply observation.
+    struct Driven: Sendable {
+        let before: Int
+        let chat: String?
+    }
+
+    /// The send's desktop part, under the lane: open the chat, type, submit and see the outgoing row.
+    @concurrent func drive(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, thread: String?, first: String?,
+        lane: DesktopLane.Ticket) async throws -> Driven {
         try await unlocked(turn: turn, mac: mac)
         guard SystemMacAXElementSource().isTrusted() else { throw Blocker.permission }
         try await showWindow(turn: turn, mac: mac)
         let opened = try await openThread(turn: turn, mac: mac, thread, first: first)
         let reopen = opened.reopen
-        var chat = opened.chat
-        Self.lastChat = chat
+        let chat = opened.chat
+        lastChat = chat
         let key = flat(message)
         func sent() throws -> Int { try turns(mac: mac, walk(mac: mac, window(mac: mac))).filter { $0.user && flat($0.text) == key }.count }
         func ownsChat() throws -> Bool {
@@ -444,16 +487,23 @@ public struct DesktopChatRoute: Sendable {
         }
         var rows: Int?
         let before = try await typeAndSubmit(turn: turn, mac: mac, message, chat: chat ?? untitled, reopen: reopen, ownsChat: ownsChat,
-                                             count: { rows = try logRows(mac: mac, walk(mac: mac, window(mac: mac))).count; return try sent() })
+                                             count: { rows = try logRows(mac: mac, walk(mac: mac, window(mac: mac))).count; return try sent() }, lane: lane)
         // An additional exact outgoing row confirms submission, not answer delivery.
         do {
-            try await until(mac: mac) { try sent() > before }
+            try await until("the message to appear in \(appName)'s chat", mac: mac) { try sent() > before }
         } catch let failure as MacAccessibilityReader.NativeReadFailure { throw failure }
         catch { throw Unconfirmed(rows: rows) }
+        return Driven(before: before, chat: chat)
+    }
+
+    /// The send's reply observation, after the lane is released: passive reads only, so it holds nothing.
+    @concurrent func observe(mac: MacOperationContext, _ message: String, first: String?, driven: Driven) async throws -> (String, String, JSONValue) {
+        let key = flat(message)
+        let before = driven.before
+        var chat = driven.chat
         func mine(_ turns: [ChatRow]) -> Int? {
             turns.indices.filter { turns[$0].user && flat(turns[$0].text) == key }.dropFirst(before).first
         }
-        didSubmit()
         let events = try await DesktopRouteObservation(bundleID: bundleID, context: mac)
         defer { events.stop() }
         if let live { await AgentConversationLiveHub.shared.note(live, "Waiting on \(appName)'s reply; cancel to stop waiting.") }
@@ -468,10 +518,10 @@ public struct DesktopChatRoute: Sendable {
                 chat = title
             }
             if let index = mine(all) {
-                Self.lastChat = title ?? Self.lastChat
+                lastChat = title ?? lastChat
                 let after = all[(index + 1)...].prefix { !$0.user }
                 let reply = after.map(\.text).joined(separator: "\n\n")
-                Self.lastReply = reply
+                lastReply = reply
                 guard all[(index + 1)...].allSatisfy({ !$0.user }) else { throw Blocker.moved }
                 if !reply.isEmpty, !snapshot.generating {
                     return (reply, try await settledTitle(mac: mac, first: first),
@@ -529,7 +579,7 @@ public struct DesktopChatRoute: Sendable {
             if new.isEmpty { throw Mismatch(key: "newChat", wanted: ui.newChat) }
             guard new.count == 1, let newChat = new.first, try SystemMacAXActSource().performNative(newChat, action: kAXPressAction, turn: turn,
                 context: mac).get() == .success else { throw Blocker.thread }
-            try await until(mac: mac) { try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == untitled && turns(
+            try await until("a new chat to open in \(appName)", mac: mac) { try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == untitled && turns(
                 mac: mac, walk(mac: mac, window(mac: mac))).isEmpty }
             return (false, nil)
         }
@@ -539,7 +589,7 @@ public struct DesktopChatRoute: Sendable {
         if let back = try buttons(mac: mac, { MacAXAttributeRead.text($0, kAXTitleAttribute, context: mac) == ui.backToMain }).first {
             guard try SystemMacAXActSource().performNative(back, action: kAXPressAction, turn: turn,
                 context: mac).get() == .success else { throw Blocker.thread }
-            try await until(mac: mac) { try headerTitle(mac: mac, walk(mac: mac, window(mac: mac))) == nil }
+            try await until("\(appName) to leave the open chat", mac: mac) { try headerTitle(mac: mac, walk(mac: mac, window(mac: mac))) == nil }
         }
         if try sideChatsPanel(mac: mac, walk(mac: mac, window(mac: mac))) == nil {
             guard let open = try buttons(mac: mac, { MacAXAttributeRead.text($0, kAXTitleAttribute, context: mac).hasPrefix(ui.chatsButton) })
@@ -547,17 +597,16 @@ public struct DesktopChatRoute: Sendable {
                 key: "chatsButton", wanted: ui.chatsButton) }
             guard try SystemMacAXActSource().performNative(open, action: kAXPressAction, turn: turn,
                 context: mac).get() == .success else { throw Blocker.window }
-            try await until(mac: mac) { try sideChatsPanel(mac: mac, walk(mac: mac,
+            try await until("\(appName)'s side-chat list to open", mac: mac) { try sideChatsPanel(mac: mac, walk(mac: mac,
                 window(mac: mac))) != nil }
         }
     }
 
     /// Restore the prior front app after input only while foreground ownership remains ours.
     @concurrent func typeAndSubmit(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, chat: String, reopen: Bool,
-        ownsChat: () throws -> Bool, count: () throws -> Int) async throws -> Int {
+        ownsChat: () throws -> Bool, count: () throws -> Int, lane: DesktopLane.Ticket) async throws -> Int {
         _ = try composer(mac: mac, walk(mac: mac, window(mac: mac)))
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { throw Blocker.offline }
-        guard !PersonOnlyWindows.keyboardHeldByPerson else { throw Blocker.heldOff }
         try await unlocked(turn: turn, mac: mac)
         let previous = NSWorkspace.shared.frontmostApplication
         let source = SystemMacAXActSource()
@@ -568,11 +617,11 @@ public struct DesktopChatRoute: Sendable {
         }
         guard activation != .invalidTarget else { throw Blocker.offline }
         guard activation == .performed else {
-            throw GrokRoutineAccessibility.Failure(detail: source.raiseDiagnostic ?? "\(appName) could not be activated. Bring it forward before continuing.")
+            throw DesktopComposer.Failure(detail: source.raiseDiagnostic ?? "\(appName) could not be activated. Bring it forward before continuing.")
         }
         let driver = mac.driver?.settlementBinding()
         let before: Int
-        do { before = try await typeInFront(mac: mac, message, chat: chat, reopen: reopen, ownsChat: ownsChat, count: count, app: app) }
+        do { before = try await typeInFront(mac: mac, message, chat: chat, reopen: reopen, ownsChat: ownsChat, count: count, app: app, lane: lane) }
         catch {
             await settle {
                 await withAgentMacDriver(mac, driver: driver) { mac in await restore(mac: mac, previous, from: app) }
@@ -596,7 +645,7 @@ public struct DesktopChatRoute: Sendable {
     }
 
     @concurrent private func typeInFront(mac: MacOperationContext, _ message: String, chat: String, reopen: Bool, ownsChat: () throws -> Bool,
-        count: () throws -> Int, app: NSRunningApplication) async throws -> Int {
+        count: () throws -> Int, app: NSRunningApplication, lane: DesktopLane.Ticket) async throws -> Int {
         func front() -> Bool {
             mac.driver?.allowsEmission(context: mac) == true
                 && NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
@@ -607,18 +656,19 @@ public struct DesktopChatRoute: Sendable {
             let point = CGPoint(x: frame.minX + frame.width * 0.35, y: frame.midY)
             guard let events = sink.clickEvents(at: point) else { throw Blocker.typing }
             for event in events {
-                guard front(), !PersonOnlyWindows.keyboardHeldByPerson else { throw Blocker.heldOff }
+                guard front() else { throw Blocker.heldOff }
                 try await sink.postNative(event, context: mac)
             }
         }
-        try await until(mac: mac) { front() }
+        try await until("\(appName) to come to the front", mac: mac) { front() }
         if reopen {
             // Only ever the agent's own entry in the side-chat list; never the main chat.
             let entries = try sideChatEntries(mac: mac, named: chat)
             guard entries.count == 1, let entry = entries.first else { throw Blocker.thread }
             try await click(entry)
             // Wait for the selected log to load before measuring its baseline.
-            try await until(mac: mac) { try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == chat && !turns(mac: mac,
+            try await until("the chat \u{201C}\(chat)\u{201D} to load", mac: mac) {
+                try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == chat && !turns(mac: mac,
                 walk(mac: mac, window(mac: mac))).isEmpty }
         }
         // Activation may change the chat; recheck the opening message before input.
@@ -634,15 +684,16 @@ public struct DesktopChatRoute: Sendable {
         func keys(_ code: CGKeyCode, flags: CGEventFlags = []) async throws {
             guard let events = sink.keyEvents(code, flags: flags) else { throw Blocker.typing }
             for event in events {
-                // Never emit keys while the person is typing in another window.
-                guard front(), !PersonOnlyWindows.keyboardHeldByPerson else { throw Blocker.heldOff }
-                try await sink.postNative(event, context: mac)
+                guard front() else { throw Blocker.heldOff }
+                // Never emit keys into the person's window: the key-down asks every window process live and is refused at once if one is key.
+                do { try await sink.postNative(event, context: mac) }
+                catch let held as PersonOnlyWindows.MotorFailure where held.detail == PersonOnlyWindows.keyboardRefusal { throw Blocker.heldOff }
                 // Only an emitted Return can make submission uncertain. A safety refusal before key-down proves nothing was sent.
-                if code == 36 { Self.pressedReturn = true }
+                if code == 36 { pressedReturn = true }
             }
         }
         try await click(inputBox)
-        try await until(mac: mac) {
+        try await until("the message box to take focus", mac: mac) {
             guard front(), try ownsChat() else { throw Blocker.heldOff }
             return try MacAXAttributeRead.checkedBool(inputBox, kAXFocusedAttribute, context: mac) == true
         }
@@ -668,8 +719,10 @@ public struct DesktopChatRoute: Sendable {
         guard CFEqual(inputBox, currentInput), try AX.composerValue(mac: mac, currentInput).isEmpty else {
             throw AX.Failure(detail: "The selected composer changed or holds a draft, left untouched. Nothing was pasted.")
         }
+        // Paste through Return and its confirmation is the keystroke sequence a person's request waits for; it is bounded by each step's patience.
+        try lane.beginKeys()
         try await keys(9, flags: .maskCommand)
-        try await until(mac: mac) {
+        try await until("the message box to take the text", mac: mac) {
             guard front(), try ownsChat(), try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == chat else { throw Blocker.heldOff }
             guard CFEqual(currentInput, try composerInput(mac: mac, walk(mac: mac, window(mac: mac)))) else { throw Blocker.thread }
             return flat(try AX.composerValue(mac: mac, currentInput)) == flat(message)
@@ -786,10 +839,12 @@ public struct DesktopChatRoute: Sendable {
         }
         guard try !existing.contains(where: { try hasLog(mac: mac, $0) }) else { return }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { throw Blocker.offline }
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = false
-        _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
-        try await until(mac: mac) { try windows(mac: mac).contains(where: { try hasLog(mac: mac, $0) }) }
+        do { try await DesktopRouteObservation.openApplication(url, context: mac) }
+        catch is OperationWaitBudget.Exceeded {
+            throw AX.Failure(detail: "Waited \(Int(DesktopRouteObservation.stepPatience)) seconds for macOS to open \(appName), and it did not happen.",
+                step: "macOS to open \(appName)")
+        }
+        try await until("\(appName)'s chat window to open", mac: mac) { try windows(mac: mac).contains(where: { try hasLog(mac: mac, $0) }) }
     }
 
     /// Exclude message bodies from navigation walks so long logs cannot exhaust the bound; retain the log node.
@@ -932,9 +987,10 @@ public struct DesktopChatRoute: Sendable {
 
     func flat(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
 
-    /// Read the condition after registration, then after its source changes. Silence remains a cancellable wait.
-    @concurrent func until(mac: MacOperationContext, _ ready: () throws -> Bool) async throws {
-        let events = try await DesktopRouteObservation(bundleID: bundleID, context: mac)
+    /// Read the condition after registration, then after its source changes. Silence is cancellable and bounded by the step's patience; when it runs out
+    /// the failure says what the step waited for (`step`, in the person's words) and what the app showed instead.
+    @concurrent func until(_ step: String, mac: MacOperationContext, _ ready: () throws -> Bool) async throws {
+        let events = try await DesktopRouteObservation(bundleID: bundleID, context: mac, patience: DesktopRouteObservation.stepPatience)
         defer { events.stop() }
         var waitingPublished = false
         repeat {
@@ -944,7 +1000,18 @@ public struct DesktopChatRoute: Sendable {
                 await AgentConversationLiveHub.shared.note(live, "Waiting on \(appName)'s desktop controls; cancel to stop waiting.")
                 waitingPublished = true
             }
-            try await events.next()
+            do { try await events.next() }
+            catch is DesktopRouteObservation.Expired {
+                let front = NSWorkspace.shared.frontmostApplication
+                let saw: String
+                if front?.bundleIdentifier != bundleID {
+                    saw = "\(front?.localizedName ?? "Another app") was in front, not \(appName)."
+                } else if let chat = try? openTitle(mac: mac, walk(mac: mac, window(mac: mac))) {
+                    saw = "\(appName) showed the chat \u{201C}\(chat)\u{201D}."
+                } else { saw = "\(appName) showed no open chat title." }
+                throw DesktopComposer.Failure(detail: "Waited \(Int(DesktopRouteObservation.stepPatience)) seconds for \(step), and it did not "
+                    + "happen. " + saw, step: step)
+            }
         } while true
     }
 

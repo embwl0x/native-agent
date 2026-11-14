@@ -97,7 +97,7 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
 
     /// The one answer to "does this card still need the person": delivery, the Inbox, Today and the phone all read it from the live card.
     public var needsAttention: Bool {
-        !state.isTerminal || (state == .failed && canRetry)
+        !state.isTerminal || ([.failed, .stopped].contains(state) && canRetry)
     }
 
     public init(

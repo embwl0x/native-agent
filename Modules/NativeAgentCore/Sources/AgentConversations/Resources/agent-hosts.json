@@ -2,15 +2,18 @@
   {
     "id": "omp",
     "displayName": "OMP",
-    "description": "The local OMP bridge lane.",
+    "description": "A coding agent in the terminal (oh-my-pi), driven live over ACP.",
     "aliases": [
       "oh-my-pi"
     ],
-    "installMarkers": [],
+    "installMarkers": [
+      "/opt/homebrew/bin/omp",
+      "/usr/local/bin/omp"
+    ],
     "configPath": "",
     "format": "sessionMCP",
     "restartRequired": false,
-    "restartNote": "The running bridge binds this lane to its contact; no restart is needed.",
+    "restartNote": "No restart needed; connection starts an ACP session with reply tools.",
     "documentation": "",
     "requiresWorkspace": false,
     "settingsSupported": true,
@@ -19,7 +22,21 @@
     "searchPaths": [],
     "executables": [
       "omp"
-    ]
+    ],
+    "acp": {
+      "executable": "omp",
+      "arguments": [
+        "acp"
+      ],
+      "documentation": "omp acp --help",
+      "permissionMode": "default",
+      "referenceVersion": "18.18.8",
+      "environment": {},
+      "protocolVersion": 1,
+      "modes": [],
+      "supportsLoad": true,
+      "supportsResume": true
+    }
   },
   {
     "id": "chatgpt-dot",
@@ -348,7 +365,7 @@
   {
     "id": "lm-studio",
     "displayName": "LM Studio",
-    "description": "An app for running and chatting with local models.",
+    "description": "An app for running and chatting with local models; a message goes to the model it has loaded, through its local server.",
     "aliases": [
       "lmstudio"
     ],
@@ -370,7 +387,13 @@
     "discoveryWords": [
       "lmstudio",
       "ollama"
-    ]
+    ],
+    "localChat": {
+      "server": "http://localhost:1234",
+      "models": "/api/v1/models",
+      "chat": "/v1/chat/completions",
+      "start": "In LM Studio open Developer and turn on Start server, or run `lms server start` in Terminal."
+    }
   },
   {
     "id": "cursor",
@@ -525,6 +548,44 @@
     "searchPaths": [],
     "discoveryWords": [
       "goose"
+    ]
+  },
+  {
+    "id": "grok-cli",
+    "displayName": "Grok CLI",
+    "description": "xAI's coding agent in the terminal (Grok Build), driven live over ACP.",
+    "aliases": [
+      "grok build",
+      "grok command line"
+    ],
+    "installMarkers": [
+      "~/.grok/bin/grok"
+    ],
+    "configPath": "",
+    "format": "sessionMCP",
+    "restartRequired": false,
+    "restartNote": "No restart needed; connection starts an ACP session with reply tools.",
+    "documentation": "~/.grok/docs/user-guide/15-agent-mode.md",
+    "requiresWorkspace": false,
+    "settingsSupported": false,
+    "bundleIDs": [],
+    "a2aPorts": [],
+    "acp": {
+      "executable": "grok",
+      "arguments": [
+        "agent",
+        "stdio"
+      ],
+      "documentation": "~/.grok/docs/user-guide/15-agent-mode.md",
+      "permissionMode": "default",
+      "referenceVersion": "1.0.46",
+      "environment": {},
+      "protocolVersion": 1,
+      "supportsLoad": true,
+      "supportsResume": true
+    },
+    "searchPaths": [
+      "~/.grok/bin"
     ]
   },
   {

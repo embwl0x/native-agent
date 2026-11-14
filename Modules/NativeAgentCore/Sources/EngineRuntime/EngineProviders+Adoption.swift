@@ -24,7 +24,7 @@ extension ProvidersFacade {
             await publishCommittedRouting(result.snapshot)
             await refreshSessionsAfterRoutingWrite()
             if result.surfacesChanged.contains("cognition_reflection") {
-                await NativeAgentEngine.liveCognition.refreshConfiguration()
+                await NativeAgentEngine.liveCognition?.refreshConfiguration()
             }
         } catch {
             failure(error, "select the connected account")

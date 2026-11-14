@@ -66,7 +66,7 @@ public enum InlineInteractionResolver {
         } else if picks.isEmpty, model.fields.isEmpty, control.isActionable, card.state.isOpen {
             answers.append(.init(id: "answer", label: model.primaryLabel, role: .primary, doors: mac, call: .init("card.answer", id)))
         }
-        if continuationFailed || (!providerEntry && model.canRetry && model.fields.isEmpty && model.state == .failed) {
+        if continuationFailed || (!providerEntry && model.canRetry && model.fields.isEmpty && [.failed, .stopped].contains(model.state)) {
             answers.append(.init(id: "try_again", label: "Try again", role: .primary, doors: mac, call: .init("card.try_again", id)))
         }
         let summary: String
@@ -90,7 +90,9 @@ public enum InlineInteractionResolver {
                     + " This request waits until the saved connection is verified." : ""),
             symbol: "hand.raised.fill", badge: "REQUEST", open: "card:" + card.id,
             choices: !model.needsAttention ? [] : continuationFailed ? answers : answers + (providerEntry ? [] : [
-                .init(id: "act", label: "Open request", doors: mac, call: .init("inbox.open_on_mac", ["id": .string("interaction:" + card.id)])),
+                // Beside an answer drawn here, opening the request elsewhere is housekeeping.
+                .init(id: "act", label: "Open request", doors: mac, call: .init("inbox.open_on_mac", ["id": .string("interaction:" + card.id)]),
+                      aside: answers.isEmpty ? nil : true),
             ]) + [
                 .init(id: "reject", label: "Not now", role: .destructive, call: .init("card.not_now", id)),
             ],
@@ -100,11 +102,12 @@ public enum InlineInteractionResolver {
         }
         return try await owner.tell(matter, doors: doors)
     }
-    /// Inject the scene-owned turn starter so every surface shares continuation policy. Only the first real question shows a user bubble; internal continuation
-    /// markers stay hidden. Report actual admission so a refused turn cannot strand a durable claim as resumed.
+    /// Starts a card's continuation in its own conversation, with the card's turn as its authority: the person's Mac conversation in the window, any
+    /// other door's through that door. Only the first real question shows a user bubble; internal continuation markers stay hidden. Report actual
+    /// admission, or throw why it could not run, so a refused turn cannot strand a durable claim as resumed.
     public typealias TurnStarter = @MainActor (
         _ prompt: String, _ sessionID: String, _ hideUserBubble: Bool, _ turn: Turn
-    ) async -> Bool
+    ) async throws -> Bool
     public static var startTurn: TurnStarter?
     /// Replay retained arguments through ordinary gates; reconstructing them would make a different call. Distinguish a dispatched call with no result from a
     /// call that never ran so only real work is checkpointed.
@@ -126,6 +129,8 @@ public enum InlineInteractionResolver {
     /// Fence the call-to-checkpoint window within this process; the durable row owns cross-launch authority.
     static var replayedResumeRunIds: Set<String> = []
     static var reclaimedSessions: Set<String> = []
+    /// Cards this process began running: their owner is alive here, so the launch settlement never takes them for interrupted.
+    static var begunHere: Set<String> = []
     /// Retain continuation results until the running turn takes them; that turn owns continuation, without starting another.
     static var handBacks: [String: String] = [:]
     public static func takeContinuationHandBack(id: String) -> String? {
@@ -396,6 +401,7 @@ public enum InlineInteractionResolver {
         }
         // Same-life retries keep admission and landed replay; a new life starts fresh.
         let running = current.running()
+        begunHere.insert(running.id)
         try await persist(
             running, sessionID: sessionID, ifRevision: current.revision, dataRoot: dataRoot
         )

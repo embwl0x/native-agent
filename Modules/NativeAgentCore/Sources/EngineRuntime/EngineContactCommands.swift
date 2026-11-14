@@ -96,7 +96,7 @@ private struct EngineClaudeBridgePort: ClaudeBridgeRuntimePort {
     let engine: @Sendable () -> NativeAgentEngine
     let readGRPCPort: @Sendable () -> UInt16?
     var dataRoot: URL { engine().dataRoot }
-    var cognition: NativeCognitionRuntime { engine().cognition! }
+    var cognition: NativeCognitionRuntime? { engine().cognition }
     var contextFlow: NativeContextFlowRuntime { engine().contextFlow }
     var tasks: AgentContactTasks { engine().agents.tasks }
     var grpcPort: UInt16? { readGRPCPort() }

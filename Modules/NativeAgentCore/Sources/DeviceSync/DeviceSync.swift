@@ -18,7 +18,8 @@ public final class DeviceSync {
     nonisolated let storage = DeviceSyncStorage()
     public nonisolated let dataRoot: URL
     nonisolated let host: any DeviceSyncHost
-    nonisolated let cognition: NativeCognitionRuntime
+    private nonisolated let mind: @Sendable () -> NativeCognitionRuntime?
+    nonisolated let mindChanges: @Sendable () -> AsyncStream<NativeCognitionRuntimeChange>
     public nonisolated let apns = SwiftNativeAPNSSender()
     nonisolated let needsUser: DeskNeedsUser
 
@@ -27,13 +28,19 @@ public final class DeviceSync {
     public lazy var relay = MacSyncMobileNotificationRelay(sync: self)
     public lazy var pairedPhones = PairedPhoneStore(url: dataRoot.appendingPathComponent("paired_phones.json"), storage: storage)
 
-    public nonisolated init(host: any DeviceSyncHost, cognition: NativeCognitionRuntime) {
+    /// The body's mind is read when it is needed: there is none until setup has finished, and its changes run across absence and presence.
+    public nonisolated init(host: any DeviceSyncHost, mind: @escaping @Sendable () -> NativeCognitionRuntime?,
+                            mindChanges: @escaping @Sendable () -> AsyncStream<NativeCognitionRuntimeChange>) {
         let dataRoot = PersistenceCore.defaultDataRoot()
         self.dataRoot = dataRoot
         self.host = host
-        self.cognition = cognition
+        self.mind = mind
+        self.mindChanges = mindChanges
         self.needsUser = DeskNeedsUser(dataRoot: dataRoot)
     }
+
+    /// The running mind, or nil before setup has finished and after a reset closed it.
+    nonisolated var cognition: NativeCognitionRuntime? { mind() }
 
     /// Attention follows the app's overview, so phone-sync shutdown cannot suppress it.
     public nonisolated func evaluateNeedsUser(items: [DeskItem]) async {

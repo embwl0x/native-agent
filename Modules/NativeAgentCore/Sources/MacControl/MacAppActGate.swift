@@ -119,19 +119,21 @@ public enum MacAppActGate {
             catch { throw CancellationError() } // The discovery owner throws only Failure or cancellation.
         }
         if ["apps.call", "applescript"].contains(operation) {
-            guard let bundle = input["bundle_id"]?.stringValue, !bundle.isEmpty else { return unavailable() }
+            guard let bundle = input["bundle_id"]?.stringValue, !bundle.isEmpty else {
+                return unavailable("this call names no bundle_id", next: "Give the bundle_id of the app it drives")
+            }
             guard !AuthoredToolEffects.appReadOnly(input) else { return nil }
             return refusal(bundleID: bundle, throughAppleEvents: true, dataRoot: dataRoot, context: context)
         }
         // A part's hand targets its held watch, checked by that owner before approval. Its arguments do not name a frontmost-app operation.
         guard ["act", "menu_press", "hand", "click", "keystroke", "ax_act", "quit_app"].contains(operation) else { return nil }
         if case .array(let steps)? = input["steps"] {
-            for raw in steps {
+            for (index, raw) in steps.enumerated() {
                 var step: [String: JSONValue]
                 switch raw {
                 case .object(let fields): step = fields
                 case .string: step = ["verb": .string("click")]
-                default: return unavailable()
+                default: return unavailable("step \(index + 1) is neither an object nor a handle", next: "Give each step as an object or a handle string")
                 }
                 if step["app"] == nil { step["app"] = input["app"] }
                 for key in ["frame_id", "image"] where step[key] == nil { step[key] = input[key] }
@@ -160,17 +162,28 @@ public enum MacAppActGate {
             }
             return refusal(pid: NSWorkspace.shared.frontmostApplication?.processIdentifier, dataRoot: dataRoot, context: context)
             #else
-            return unavailable()
+            return noAppKit()
             #endif
         }
         // Frame/mark ownership is resolved by its owner at execution, not guessed from whichever app happens to be in front during preflight.
         if let id = input["frame_id"]?.stringValue, input["handle"] != nil {
-            let frame = await MacLookFrameStore.shared.frame(frameId: id, context: context)
-            return refusal(pid: frame?.pid, dataRoot: dataRoot, context: context)
+            guard let frame = await MacLookFrameStore.shared.frame(frameId: id, context: context) else {
+                return unavailable("frame \(id) is no longer the latest look",
+                    next: "Use the latest frame_id and handles the previous action returned, or mac.look if none were returned")
+            }
+            guard let pid = frame.pid else {
+                return unavailable("frame \(id) did not record which app it read", next: "Take a fresh mac.look of the app and use its handles")
+            }
+            return refusal(pid: pid, dataRoot: dataRoot, context: context)
         }
         if let id = input["view"]?.stringValue {
-            let view = await MacScreenViewStore.shared.snapshot(viewId: id)
-            return refusal(pid: view?.windowIdentity?.pid, dataRoot: dataRoot, context: context)
+            guard let view = await MacScreenViewStore.shared.snapshot(viewId: id) else {
+                return unavailable("view \(id) is no longer held", next: "Take a fresh look and use the view it returns")
+            }
+            guard let pid = view.windowIdentity?.pid else {
+                return unavailable("view \(id) did not record which app's window it shows", next: "Take a fresh look of that app's window")
+            }
+            return refusal(pid: pid, dataRoot: dataRoot, context: context)
         }
         #if canImport(AppKit)
         func coordinates(_ value: JSONValue?) -> (Double, Double)? {
@@ -184,8 +197,14 @@ public enum MacAppActGate {
             for (x, y) in endpoints {
                 let screenX: Double, screenY: Double
                 if operation == "act" {
-                    guard let frame = MacImageFrames.frame(input["frame_id"]?.stringValue ?? input["image"]?.stringValue, turn: turn),
-                          let point = frame.geometry.screenPoint(imageX: x, imageY: y) else { return unavailable() }
+                    let named = input["frame_id"]?.stringValue ?? input["image"]?.stringValue
+                    guard let frame = MacImageFrames.frame(named, turn: turn) else {
+                        return unavailable(named.map { "image \($0) is not one this conversation still holds" } ?? "this conversation holds no image",
+                            next: "Take a fresh look and use the id of the image it returns")
+                    }
+                    guard let point = frame.geometry.screenPoint(imageX: x, imageY: y) else {
+                        return unavailable("point (\(x), \(y)) lies outside image \(frame.id)", next: "Use pixel coordinates inside that image")
+                    }
                     screenX = point.x; screenY = point.y
                 } else { screenX = x; screenY = y }
                 if let refusal = context.holding(\.dataRoot, dataRoot, { context in pointRefusal(x: screenX, y: screenY, context: context) }) { return refusal }
@@ -203,7 +222,7 @@ public enum MacAppActGate {
         }
         return refusal(pid: NSWorkspace.shared.frontmostApplication?.processIdentifier, dataRoot: dataRoot, context: context)
         #else
-        return unavailable()
+        return noAppKit()
         #endif
     }
 
@@ -211,7 +230,7 @@ public enum MacAppActGate {
     public static func refusal(bundleID: String, looking: Bool = false, throughAppleEvents: Bool = false, dataRoot: URL? = nil,
         context: MacOperationContext) -> MacAppActRefusal? {
         guard !looking else { return nil }
-        guard !bundleID.isEmpty else { return unavailable() }
+        guard !bundleID.isEmpty else { return unavailable("the bundle_id is empty", next: "Give the bundle_id of the app it drives") }
         #if canImport(AppKit)
         if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first(where: {
             PersonOnlyWindows.isOwnProcess($0.processIdentifier)
@@ -220,7 +239,10 @@ public enum MacAppActGate {
         }
         #endif
         // System Events can relay GUI mutations to another process. Its own bundle is not evidence of the affected app; native hands resolve it.
-        if throughAppleEvents, bundleID == "com.apple.systemevents" { return unavailable() }
+        if throughAppleEvents, bundleID == "com.apple.systemevents" {
+            return unavailable("System Events relays input to another app, so its bundle id does not say which",
+                next: "Use native hands on the observed app instead")
+        }
         guard let integration = MacIntegrationID.owning(appBundleID: bundleID) else { return nil }
         do {
             let snapshot = try MacIntegrationPermissionStore(dataRoot: dataRoot ?? context.dataRoot).snapshotNowChecked()
@@ -252,20 +274,29 @@ public enum MacAppActGate {
         }
         guard !looking else { return nil }
         #if canImport(AppKit)
-        guard let pid, pid > 0, let app = NSRunningApplication(processIdentifier: pid),
-              !app.isTerminated, let bundle = app.bundleIdentifier else { return unavailable() }
+        guard let pid, pid > 0 else {
+            return unavailable("no app process owns this target", next: "Look again and act on an app the look shows")
+        }
+        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
+            return unavailable("the app with process \(pid) is no longer running", next: "Look again at the apps running now")
+        }
+        guard let bundle = app.bundleIdentifier else {
+            return unavailable("process \(pid) has no bundle identifier", next: "Use native hands on an observed app or a named player's action")
+        }
         return refusal(bundleID: bundle, throughAppleEvents: throughAppleEvents, dataRoot: dataRoot, context: context)
         #else
-        return unavailable()
+        return noAppKit()
         #endif
     }
 
-    static func unavailable() -> MacAppActRefusal {
+    /// Every refusal of this kind names the fact that failed and the next step, so the caller fixes that fact instead of guessing.
+    static func unavailable(_ fact: String, next: String) -> MacAppActRefusal {
         MacAppActRefusal(code: "app_action_target_unavailable",
-            message: """
-                I can't establish which app this input would reach. Use native hands on an observed app or a named player's action; this input was not \
-                admitted.
-                """, integration: nil)
+            message: "I can't establish which app this input would reach: \(fact). \(next); this input was not admitted.", integration: nil)
+    }
+
+    static func noAppKit() -> MacAppActRefusal {
+        unavailable("this build has no AppKit to resolve apps", next: "Use a named player's action")
     }
 
     /// Retain a refusal as the act's outcome, never as a permission cache.
@@ -299,7 +330,12 @@ public enum MacAppActGate {
                 remedy: Repair.remedy(owner: "macOS Spotlight app index", nextCall: nil, tap: "System Settings > Spotlight",
                     instruction: "Repair the app inventory before naming this target again."))
         }
-        return unavailable()
+        if matches.count > 1 {
+            return unavailable("\(matches.count) running apps answer to \"\(name)\"",
+                next: "Name one by bundle id: \(matches.compactMap(\.bundleIdentifier).joined(separator: ", "))")
+        }
+        let seen = Set(NSWorkspace.shared.runningApplications.filter { !$0.isTerminated && $0.activationPolicy == .regular }.compactMap(\.localizedName))
+        return unavailable("no running or installed app is named \"\(name)\"", next: "Name one of the running apps: \(seen.sorted().joined(separator: ", "))")
     }
 
     static func frontRefusal(context: MacOperationContext) -> MacAppActRefusal? {
@@ -315,7 +351,9 @@ public enum MacAppActGate {
     }
     static func elementRefusal(_ element: AXUIElement, context: MacOperationContext) -> MacAppActRefusal? {
         var pid: pid_t = 0
-        guard AXUIElementGetPid(element, &pid) == .success else { return unavailable() }
+        guard AXUIElementGetPid(element, &pid) == .success else {
+            return unavailable("the element no longer reports its process", next: "Look again and act on a fresh handle")
+        }
         return refusal(pid: pid, looking: context.looking, context: context)
     }
     #endif

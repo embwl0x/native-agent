@@ -59,7 +59,7 @@ Call an action with `app {"action":"agent.message","args":{...}}`.
 | `agent.connect` | Connect a known host by name, a peer by endpoint, or an explicit desktop route. Disconnect with `disconnect: true` and `agent: "peer:<id>"` from contacts. `ability: "<id>"` with a saved contact moves it to one of their abilities; `ability: false` moves it back to its built-in route. |
 | `agent.message` | Send `agent` and `text`, optionally `files: [{path}]` on A2A; continue this chat's current conversation with that contact. `wait_seconds` defaults to 20, accepts 0–120, and returns a live lane's answer inline. A known host can be connected in the same call through its setup gates. |
 | `agent.read` | Read the conversation and retained reply: a successful read says `execution: executed`, `effect: none`, independently of the send it shows. Reply owners publish `retrieval_result_class`, `execution_result_class` and `execution_terminal`; terminal task snapshots remain readable when execution failed or was cancelled. An unknown name is `unknown_contact` with nearest contacts; a known contact never messaged is `no_history`. `details: true` exposes receipts. `wait_seconds` waits 1–300 seconds on a conversation by name or its retained exact reply IDs; it cannot be combined with history or listing filters. |
-| `agent.cancel` | Request a stop through the route's cancellation mechanism. A thread's Stop retains its exact record and original chat scope; an absent or moved record cannot select another conversation by label. The result distinguishes stopping, stopped, released and unsupported stops. `clear_queue: true` withdraws queued follow-ups. |
+| `agent.cancel` | Request a stop through the route's cancellation mechanism. A thread's Stop retains its exact record and original chat scope; an absent or moved record cannot select another conversation by label. The result distinguishes stopping, stopped, released and unsupported stops. Its own `status` leads: `ok` (with `effects: occurred`) when something was stopped, released or withdrawn, `no_change` when nothing was there; the conversation's send keeps its words under `last_send_`, so a stop that worked never reads as a failed call. A send held for the Mac is withdrawn by the stop itself; `clear_queue: true` also withdraws queued follow-ups. |
 | `agent.reply` | From the ability a contact is reached through, and only there: its answer lands in that contact's conversation and settles the exchange (the one named, else their newest message to it still unanswered); `done: false` shows progress. |
 | `agent.jobs` | List their jobs, their own lines (`agent: "self"`) among them, newest first, and read retained reply deliveries (owed, delivered, let go) for the chats and contacts that asked. Missing evidence does not prove no execution. |
 
@@ -357,8 +357,45 @@ throwing permission service is `permission_decision_unavailable`, with its
 original `permission_failure`; it attempts session cancellation and a `cancelled`
 outcome for every open permission request. Cancellation-write errors remain visible.
 This terminal local failure leaves completion unconfirmed and never claims the
-person denied permission. The existing turn deadline also bounds a permission
-decision that never arrives; no second transport runs.
+person denied permission. A permission card the agent's call waits on is a wait
+on the person: the call keeps waiting and its turn says so; Stop ends it, and no
+clock does.
+
+An ACP turn has no clock of its own. The agent's running program is attached to
+the call as what it waits on, and every line the program writes is life of the
+call, so a quiet agent is shown waiting and only its exit, Stop or a protocol
+fault ends the turn. A turn that ends in an error still returns what the agent
+said in it as `reply`, whatever ended it. ACP's "authentication required"
+(-32000), at any step (opening, restoring or answering), is classified once where
+the error is read, as `reason: sign_in_required`: the person signs the agent in
+to its own service once and the conversation continues; it is never a reason to
+abandon the conversation. A check-in contact (`mcpHost`) whose recipe now has
+`host.acp` answers a send with `reconnect_required` and `agent.connect` as its
+next call; that reconnect keeps the contact's identity, mints a new key for the
+new route, leaves the old route's grants behind and carries the contact's
+conversations to the new route, each opening a fresh session there.
+
+A check-in contact whose recipe has `host.localChat` (LM Studio) is reached live
+through that host's own chat server on this Mac (`route: local-chat`), with no
+reconnect: its existing contact and conversations take the route at their next
+send. The server keeps no conversation, so each message carries the
+conversation's answered exchanges (its bounded history in
+`AgentConversationStore`) before the new one, and the answer streams into the
+conversation as it is written (`OpenAITransport` on the server's chat completions
+wire, recorded under the host's own id). It answers with the first model the
+host reports loaded (`localChat.models`), read as the last thing before the send;
+the server is never started, nor a model loaded, from here. Its chat completions
+take no "only if loaded" option and report no load, so only a model unloaded in
+the gap between those two local requests could be loaded again by the send. Every
+receipt names the conversation (`conversation_id`: the id it was sent under, else
+its record's), so the next message continues it. An answer cut by the model's
+output limit is `status: incomplete` with `reply_truncated` and what it said, and
+proves no round trip; a completed one is stamped with the recipe it was sent under. A server that is off is `reason: local_chat_server_off`
+with the recipe's words for turning it on, and one with nothing loaded is
+`reason: no_model_loaded`; nothing was sent in either. Only a conversation one of
+its callers opened by calling in stays with that caller. A dry run (`agent.verify`)
+reads the server and its loaded model and sends no prompt. A loopback request
+waits on no network path.
 
 For hosts configured through MCP settings, `AgentHostConfigWriter` edits the
 owned entry and `AgentHostConnection` binds a per-contact credential. Other
@@ -432,7 +469,8 @@ Other seed routes keep their current setup:
 | Hermes | Supplies tools through ACP with its own permission bridge; no documented per-server/per-tool auto-approval for these session-injected tools was established. Its global modes are not a scoped allowance. |
 | Claude Desktop | Has user-facing tool approval controls; no documented writable scoped allowance in its MCP JSON entry was established. |
 | LM Studio | Documents `mcp.json` server registration; no writable scoped auto-approval contract was established. |
-| OMP / ChatGPT Dot / Grok Bot / Muse | These recipes use the running bridge, local environment, webhook, or desktop route; they do not write a persistent MCP server whose tool approval can be set here. |
+| OMP / Grok CLI | Seed uses ACP `sessionMCP` (`omp acp`, `grok agent stdio`), not a persistent server entry. |
+| ChatGPT Dot / Grok Bot / Muse | These recipes use the local environment, webhook, or desktop route; they do not write a persistent MCP server whose tool approval can be set here. |
 
 Host contracts: [Claude Code permissions](https://code.claude.com/docs/en/permissions#mcp),
 [Claude Code MCP](https://code.claude.com/docs/en/mcp),
@@ -477,6 +515,13 @@ failed: the deadline proves only that no answer came, never that the send was
 lost. Its owed accept and answer let go as `expired`; only `sent: false` makes it
 not delivered.
 
+A desktop contact's courier send gets its answer back only through an MCP entry
+for this app in the contact's app (`nativeagent-link mcp`, its `agent_message`).
+An app with its own route here (Grok Bot's routine, a desktop chat such as
+Muse) has no such entry, so a send to an older desktop contact for that app
+answers `reconnect_required` with `next_call` (`agent.connect` by the app's
+name), sends nothing, and asks for the desktop contact to be disconnected after.
+
 Desktop contact health reads today's Accessibility grant and app installation
 without opening a window, prompting for permission or sending anything. A
 structured Accessibility blocker whose grant is now present says the cause is
@@ -488,6 +533,32 @@ so old unsent failures lose their broken-path mark and stale repair guidance
 without a migration file or a resend.
 
 Desktop permission refusals carry the Accessibility permission-card remedy.
+
+**What the person asks for goes now; the desktop is never busy to the person.**
+Desktop operations (desktop contact and desktop-chat sends, their recipe checks)
+share one desktop lane; Grok Bot setup and disconnect drive nothing and read
+nothing of Grok's chat (the agent types their message with the agent's own hands, in
+the words of its `grok-bot-setup` ability), so they take no lane. An operation
+is the person's when its turn is the person's own message or the person's own
+contact send. The newest of the person's asks takes the lane from whatever holds
+it, the agent's own or an earlier ask of the person's: a holder posting a
+keystroke sequence (a paste or type, a Return and its confirmation) ends that
+sequence first; any other holder is cancelled and left to finish on its own,
+never waited for, never a whole model turn. An older ask still waiting is told
+it was superseded. A send of the agent's own set aside before any key goes back
+to being held; one set aside after typing says where it stopped and is never
+resent. An unfinished Grok Bot setup stays owed on its contact (`setup_owed`,
+`next_call`); nothing resumes it by itself. The agent's own operation drives the desktop only on positive
+away evidence; otherwise a send is held in its conversation's queue (`held`,
+`mac_busy`), and a hold never claims the lane. The person's own send to that
+conversation does not queue behind the held one: it goes now, and the held one
+stays held, behind it. Observing a reply is passive reading and holds
+nothing. So "another operation is driving the desktop" is said only to the
+agent's own work, and means exactly that, now. Keys never wait for the person:
+each key-down asks every window process live, after the target app was
+activated, and is refused at once when a NativeAgent window is the key window.
+Every observed desktop step carries its own bound.
+
 If the person types, holds the keyboard or takes the foreground before Return,
 the desktop-chat send says they held off because the person is using the Mac,
 nothing was sent, and it is waiting for the Mac to be free and will go then.
@@ -503,7 +574,8 @@ queued send is terminal not sent after a restart because their original send
 act does not carry over.
 Explicit handback is distinguished from physical input and says to return
 control; it does not enter automatic retry. A live hold has no expiry and
-retains its text; `agent.cancel {clear_queue: true}` withdraws it. Missing or
+retains its text; `agent.cancel` withdraws it (with `clear_queue: true`, its follow-ups too). A held
+send never holds the desktop, so after the withdrawal nothing of it waits anywhere. Missing or
 unreadable presence or authority never means free. The receipt is `held`, not failed; when released,
 the ordinary reply and delayed-answer path continues. An emitted Return always
 keeps submission uncertain until the outgoing row confirms it and never enters
@@ -625,7 +697,7 @@ Peer turns retain agent authorship and use the shared turn engine in Core
 identity do not grant owner authority.
 
 Full Mac admits the agent's autonomous actions. macOS privacy permission resets
-still ask the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
+still ask the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. A note from your agent to you (`chat.post`) is never held, whoever steered the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
 Agents enabled in Trust → Connected agents carry the owner's authority on
 authenticated turns; ordinary Trust and domain checks still apply. A contact at
 the table reads the Desk without a turn and gains no authority by it
@@ -765,10 +837,7 @@ Completion is `completed` / `held_for_contact` once the held owner takes it;
 the exchange remains held until the contact's door writes it. Failed response
 writes keep it held, and a contact that never calls leaves it held. Recovery
 uses the same handoff and cannot replay the work or route it through a send.
-An asynchronous Grok desktop reply that cannot be saved owes repair under its
-original operation ID, retaining the terminal answer or partial reply and its
-observation evidence. A later successful settlement of that exact exchange
-settles the debt. Explicit protocol sends preserve the caller's `message_id`
+Explicit protocol sends preserve the caller's `message_id`
 as the protocol's string and bind it once in the exchange journal to a separate
 internal operation UUID. A2A IDs need a non-empty string; their shape is never
 validated as an internal UUID. Grok's request owner retains its UUID message-ID
@@ -803,7 +872,8 @@ contact to the table is the person's lever, per contact, off until set:
 `AgentPeerStore.setReadsDesk` through the lower-only setting
 `agent.reads_desk_<contact id>`. Their call may take a contact away from the table;
 their call to bring one asks the person on a card, and the person's tap on
-Connectors → the contact → **Reads my Desk** makes it. Only an MCP host or ACP
+Connectors → the contact → **Reads my Desk**, or their own words asking for it,
+quoted in `because`, makes it. Only an MCP host or ACP
 contact, which calls the MCP tools with its own key (`canReadTable`), has the
 lever.
 
@@ -858,7 +928,11 @@ Retain the generated connection entry, including its environment fields:
 These fields keep the helper bound to the contact and the correct install.
 HTTP clients must send the contact credential as `Authorization: Bearer <contact-secret>`.
 The machine bridge bearer alone is insufficient: contact routes return HTTP 401
-without a valid contact credential. Keep secrets out of command arguments and chat.
+without a valid contact credential. The builder-bridge lane's `/<lane>/message`
+carries a message only with the contact's identity beside that bearer
+(`x-nativeagent-peer-id` and `x-nativeagent-peer-secret`); the bearer alone is
+refused with HTTP 403 `contact_identity_required`, and carries only the install
+script's receipt into the selected chat. Keep secrets out of command arguments and chat.
 
 HTTP MCP clients must send `Accept: application/json, text/event-stream` and
 `Content-Type: application/json`. Supported protocol versions are `2025-11-25`,

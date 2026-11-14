@@ -12,6 +12,10 @@ import NativeAgentShared
 // Journal each settled turn as owed before interpretation so quit, crash or provider failure cannot lose it.
 
 extension NativeCognitionRuntime {
+    /// Whether the mind has started; its own clocks (rhythm and the night, microcycles, maintenance, the hour) arm only once it has. The body's mind
+    /// owner (`MindLifetime`) makes and opens the mind only once setup has finished.
+    var mindStarted: Bool { bootstrapTask != nil }
+
     public func bootstrap() async {
         if bootstrapTask == nil {
             guard !isFlushedForTermination else { return }
@@ -388,10 +392,19 @@ extension NativeCognitionRuntime {
     /// Assign each fold one sequence and apply it to substrate and body under the door; refolds skip pieces already stamped.
     /// Only fully landed or owner-refused shares settle the row; incomplete shares remain meant for another fold.
     /// Unrecorded turns cannot fold.
+    /// The mind's own work after a reply and at night reads cares through the warm embedder, so it warms the one it needs and awaits that load
+    /// by its own completion: a cold model is loaded, never a reason that work stays owed. A live turn's preparation never loads it.
+    public func warmEmbedderForOwnWork() async throws {
+        guard await substrate.configurationSnapshot().enabled else { return }
+        try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).warmUpEmbedder()
+    }
+
     func foldTurnMoment(_ context: AfterTurnContext, interpretation: AfterTurnInterpretation?,
                         momentID: String?) async -> Bool {
         // Nothing mutates the agent before wake completes.
         await bootstrap()
+        // A model that cannot load is named by the embedding owner, and the fold's care read then fails with its own cause and stays owed.
+        try? await warmEmbedderForOwnWork()
         // Serialize folds with Clear, Reset and restore so another sequence cannot overtake a partially applied fold.
         await enterDoor()
         defer { leaveDoor() }
@@ -616,6 +629,10 @@ public struct NativeCognitionSleepOutcome: Sendable, Equatable {
     public let substrate: String
     public let body: String
     public let unlivedMoments: Int?
+
+    /// No mind was running: setup had not finished, so nothing of the agent's was open to save.
+    public static let noMind = NativeCognitionSleepOutcome(substrate: "no mind: setup had not finished",
+                                                           body: "no mind: setup had not finished", unlivedMoments: 0)
 
     public var summary: String {
         "substrate \(substrate); body \(body); unlived moments \(unlivedMoments.map(String.init) ?? "unknown")"

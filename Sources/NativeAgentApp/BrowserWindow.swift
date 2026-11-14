@@ -445,7 +445,7 @@ private struct AppBrowserRouteEffects: BrowserIPCWindowEffects {
     }
 
     func observeMotorAction(_ model: MotorActionReadModel) async {
-        await NativeAgentEngine.liveCognition.observeMotorActionState(model)
+        await NativeAgentEngine.liveCognition?.observeMotorActionState(model)
     }
 
     func showProducedImage(at path: URL, name: String, sink: LocalToolImage.Sink?) -> (shown: Bool, note: String) {

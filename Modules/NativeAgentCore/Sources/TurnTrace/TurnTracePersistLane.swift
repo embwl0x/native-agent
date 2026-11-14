@@ -249,7 +249,7 @@ extension TurnTraceEvent {
 
     init?(detail: ExperienceStore.Detail) {
         guard let row = try? JSONValue.parse(detail.row) else { return nil }
-        self.init(persistedJSONRow: row, physicalByteCount: detail.row.count + 1)
+        self.init(persistedJSONRow: row, physicalByteCount: detail.row.count + 1, at: detail.at)
     }
 }
 

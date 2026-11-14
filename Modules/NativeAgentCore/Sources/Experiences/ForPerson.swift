@@ -431,7 +431,7 @@ public actor ForPerson {
         }.first
         var card = InboxItemRecord(
             id: matter.id, created_at: matter.at, source: from,
-            severity: ask ? "actionable" : row.tone == .failed ? "critical" : "info",
+            severity: ask ? InboxItemRecord.waitingSeverity : row.tone == .failed ? "critical" : "info",
             title: row.title, summary: row.detail ?? "", detail: face.words == row.detail ? nil : face.words,
             relatedWorkshopExecutionId: nil,
             related_approval_id: matter.evidence.first { $0.source == Matter.approvals }?.id,

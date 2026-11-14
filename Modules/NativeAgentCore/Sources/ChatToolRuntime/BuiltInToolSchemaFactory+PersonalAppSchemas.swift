@@ -238,7 +238,7 @@ extension BuiltInToolSchemaFactory {
             // Sensitive writes default off; scheduler.write defaults on with no read axis.
             requestedSchema(name: "mac_calendar_create_event",
                 toolClass: .write, reach: .person, capabilities: ["filesystem_write", "outside_app_data_write", "tool_call"],
-                macIntegration: .init(MacIntegrationID.calendar, .write),
+                macIntegration: .init(MacIntegrationID.calendar, .write), makes: "eventId",
                 description: """
                     Create a local Calendar entry via EventKit; this does not send invitations. With full access, choose an explicit destination; \
                     with write-only access, omit calendar_id and calendar_name to use the system default. Requires Calendar Write permission. \
@@ -282,7 +282,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(name: "mac_calendar_delete_event",
                 toolClass: .destructive, reach: .person, capabilities: ["destructive", "filesystem_delete", "outside_app_data_write", "tool_call"],
-                macIntegration: .init(MacIntegrationID.calendar, .write),
+                macIntegration: .init(MacIntegrationID.calendar, .write), removes: "id",
                 description: """
                     Delete exactly one calendar event occurrence by id from calendar.upcoming. Requires the observed title and start as \
                     preconditions; a changed event is not deleted. Never deletes a recurring series. Requires Calendar → Write and EventKit full \
@@ -299,7 +299,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(name: "mac_reminders_create",
                 toolClass: .write, reach: .person, capabilities: ["filesystem_write", "outside_app_data_write", "tool_call"],
-                macIntegration: .init(MacIntegrationID.reminders, .write),
+                macIntegration: .init(MacIntegrationID.reminders, .write), makes: "reminderId",
                 description: "Create a new reminder in the user's Mac Reminders via EventKit. Requires Reminders -> Write permission (off by default).",
                 parametersJSON: ToolSchema.params(
                     properties: [
@@ -372,7 +372,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(name: "mac_reminders_delete",
                 toolClass: .destructive, reach: .person, capabilities: ["destructive", "filesystem_delete", "outside_app_data_write", "tool_call"],
-                macIntegration: .init(MacIntegrationID.reminders, .write),
+                macIntegration: .init(MacIntegrationID.reminders, .write), removes: "id",
                 description: """
                     Delete exactly one Mac Reminder by id from reminders.create or reminders.due_today. Requires its observed title as a \
                     precondition; a changed reminder is not deleted. Requires Reminders → Write permission. Use only for an explicitly requested \

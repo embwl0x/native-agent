@@ -25,7 +25,7 @@ extension NativeAgentEngine {
             return NativeCognitionRuntime.recordClockRun("dream", .init("preview_refused",
                 "The provider completion wall bound is disabled. Preview refuses an unbounded generation.", fields: fields))
         }
-        let cognition = cognitionRuntime(for: root)
+        let cognition = try requiredMind(for: root)
         let result: MindClockResult
         if let why = await cognition.mindPreviewRefusal() {
             result = .init("unavailable", why, fields: fields)
@@ -65,7 +65,7 @@ extension NativeAgentEngine {
     }
 
     private static func dreamCycle(dataRoot root: URL, preview: Bool = false) async throws -> SwiftNativeDreamREMCycle {
-        let cognition = cognitionRuntime(for: root)
+        let cognition = try requiredMind(for: root)
         return try await SwiftNativeDreamREMCycle(
             dataRoot: root,
             gate: CognitionViewFacade(dataRoot: root).dreamGate(),
@@ -107,7 +107,7 @@ extension NativeAgentEngine {
     ) async throws -> [String: Any] {
         let cause: Turn
         if let parent { cause = parent } else { cause = Turn(session: "dream") }
-        let cognition = cognitionRuntime(for: root)
+        let cognition = try requiredMind(for: root)
         let impl = try await dreamCycle(dataRoot: root)
         let report = try await DreamBackgroundWork.runDream(
             dataRoot: root, cycle: impl, cognitionRuntime: cognition,
@@ -139,7 +139,7 @@ extension NativeAgentEngine {
 
     /// Manual and weekly REM share approval staging; the weekly clock time passes `force: false` so an earlier manual run cannot distil the same dreams twice.
     public static func runRem(dataRoot root: URL, force: Bool = true, repair: Bool = false) async throws -> [String: Any] {
-        let cognition = cognitionRuntime(for: root)
+        let cognition = try requiredMind(for: root)
         let impl = try makeDreamREMCycle(
             root: root,
             gate: try await CognitionViewFacade(dataRoot: root).dreamGateChecked(),

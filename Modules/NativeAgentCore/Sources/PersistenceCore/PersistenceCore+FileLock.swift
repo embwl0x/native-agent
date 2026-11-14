@@ -1,8 +1,9 @@
 import CryptoKit
 import Foundation
 import Darwin
+import NativeAgentCore
 
-// Blueprint: | `PersistenceCore+FileLock.swift` | `FileLockScope`, `CredentialFileLock`; inode-checked kernel locks and async acquisition. |
+// Blueprint: | `PersistenceCore+FileLock.swift` | `FileLockScope`, `CredentialFileLock`; inode-checked kernel locks, async acquisition, the holder's life |
 
 /// Task-local held paths let nested acquisitions reuse the same nonrecursive flock.
 public enum FileLockScope {
@@ -30,8 +31,25 @@ private func sidecarIsCurrent(_ fd: Int32, at path: String) throws -> Bool {
     return held.st_dev == atPath.st_dev && held.st_ino == atPath.st_ino
 }
 
+/// The holder names itself in the sidecar, so a waiter can ask whether the process holding the lock still runs.
+private func markHolder(_ fd: Int32) {
+    let pid = Array("\(getpid())\n".utf8)
+    if ftruncate(fd, 0) == 0 { _ = pid.withUnsafeBytes { pwrite(fd, $0.baseAddress, $0.count, 0) } }
+}
+
 /// Serialize synchronous file transactions on the same sidecar as async acquisition.
 public enum CredentialFileLock {
+    /// What a call waiting for this lock waits on: the process holding it, as the holder named itself in the sidecar. Alive while that other
+    /// process runs; held in this process, or by a holder that named nothing, it cannot say.
+    public static func holderLife(_ targetPath: URL) -> CallLife {
+        let lockPath = targetPath.path + ".lock"
+        return CallLife(what: "the process holding the lock on \(targetPath.lastPathComponent)") {
+            guard let named = try? String(contentsOfFile: lockPath, encoding: .utf8),
+                  let pid = pid_t(named.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0, pid != getpid() else { return .unknown }
+            return kill(pid, 0) == 0 || errno == EPERM ? .alive : .unknown
+        }
+    }
+
     /// One attempt; contention defers the transaction, while unreadable or replaced lock identity throws.
     public static func tryWithLock<T>(_ targetPath: URL, _ body: () throws -> T) throws -> T? {
         let lockPath = targetPath.path + ".lock"
@@ -50,12 +68,14 @@ public enum CredentialFileLock {
             throw NSError(domain: "FileLock", code: Int(EAGAIN), userInfo: [NSLocalizedDescriptionKey:
                 "Lock file at \(lockPath) changed during acquisition; repair its replacing owner."])
         }
+        markHolder(fd)
         return try FileLockScope.$heldLockPaths.withValue(FileLockScope.heldLockPaths.union([lockPath])) {
             try body()
         }
     }
 
-    public static func withLock<T>(_ targetPath: URL, _ body: () throws -> T) throws -> T {
+    /// `life` is the watch of the call waiting for the lock: while it waits, the holder is what it waits on.
+    public static func withLock<T>(_ targetPath: URL, life: TurnDeadline? = nil, _ body: () throws -> T) throws -> T {
         let lockPath = targetPath.path + ".lock"
         if FileLockScope.heldLockPaths.contains(lockPath) {
             return try body()
@@ -67,8 +87,11 @@ public enum CredentialFileLock {
             throw NSError(domain: "FileLock", code: Int(errno),
                 userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"])
         }
-        guard flock(fd, LOCK_EX) == 0 else {
-            let code = errno
+        let watched = life.map { ($0, $0.attach(holderLife(targetPath))) }
+        let locked = flock(fd, LOCK_EX)
+        let code = errno
+        if case let (watch, id)? = watched { watch.detach(id) }
+        guard locked == 0 else {
             Darwin.close(fd)
             throw NSError(domain: "FileLock", code: Int(code), userInfo: [NSLocalizedDescriptionKey:
                 "flock LOCK_EX failed at \(lockPath): \(String(cString: strerror(code)))"])
@@ -90,6 +113,7 @@ public enum CredentialFileLock {
             throw NSError(domain: "FileLock", code: Int(errno),
                 userInfo: [NSLocalizedDescriptionKey: "secure lock permissions failed: \(String(cString: strerror(errno)))"])
         }
+        markHolder(fd)
         return try FileLockScope.$heldLockPaths.withValue(FileLockScope.heldLockPaths.union([lockPath])) {
             try body()
         }
@@ -114,24 +138,82 @@ public enum CredentialFileLock {
     }
 }
 
-public enum PersistenceFileLockWait {
-    /// Bound acquisition so a stalled holder cannot hang the caller.
-    public static let defaultSeconds: TimeInterval = 60
+private func releaseSidecar(_ fd: Int32) {
+    _ = flock(fd, LOCK_UN)
+    Darwin.close(fd)
+}
+
+/// One wait for a busy sidecar: a thread of its own blocks in `flock` while the caller awaits. Whichever side leaves first decides who
+/// releases: a caller resumed with the lock owns the descriptor; a caller that left (Stop) hands it to the thread, which releases the lock
+/// the moment it gets it.
+private final class SidecarWait: @unchecked Sendable {
+    private let fd: Int32
+    private let lock = NSLock()
+    private var waiter: CheckedContinuation<Void, Error>?
+    private var left = false
+
+    init(_ fd: Int32) { self.fd = fd }
+
+    func start(_ continuation: CheckedContinuation<Void, Error>) {
+        let leftAlready = lock.withLock { () -> Bool in
+            if !left { waiter = continuation }
+            return left
+        }
+        guard !leftAlready else {
+            Darwin.close(fd)
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        let thread = Thread { [self] in block() }
+        thread.name = "file lock wait"
+        thread.start()
+    }
+
+    /// The caller stops waiting at once; the descriptor is the thread's from here.
+    func leave() {
+        let waiting = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            left = true
+            defer { waiter = nil }
+            return waiter
+        }
+        waiting?.resume(throwing: CancellationError())
+    }
+
+    private func block() {
+        var locked = flock(fd, LOCK_EX)
+        while locked != 0, errno == EINTR { locked = flock(fd, LOCK_EX) }
+        let code = errno
+        let waiting = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            defer { waiter = nil }
+            return waiter
+        }
+        guard let waiting, locked == 0 else {
+            // The caller left, or the wait failed: nothing here keeps the lock or the descriptor.
+            if locked == 0 { _ = flock(fd, LOCK_UN) }
+            Darwin.close(fd)
+            waiting?.resume(throwing: NSError(domain: "FileLock", code: Int(code), userInfo: [NSLocalizedDescriptionKey:
+                "flock LOCK_EX failed: \(String(cString: strerror(code)))"]))
+            return
+        }
+        waiting.resume()
+    }
 }
 
 public extension SwiftNativePersistenceCore {
-    /// Contended acquisition yields cooperatively; release completes synchronously with the body.
-    /// - Parameter waitSeconds: maximum contention wait; `0` tries once and throws if busy.
+    /// Hold the target's sidecar lock for `body`; release completes with the body. A busy lock is waited for in a blocking `flock` on a
+    /// thread of its own, never the cooperative pool: the kernel releases a dead holder's lock, so the wait lasts only while its holder
+    /// lives, and the caller's Stop ends it at once. `life`, the watch of the call waiting, is shown the holder while it waits.
+    /// - Parameter tryingOnce: take the lock only if it is free; busy throws `ETIMEDOUT` in the `FileLock` domain.
     static func withFileLock<T: Sendable>(
         _ targetPath: URL,
-        waitingAtMost waitSeconds: TimeInterval = PersistenceFileLockWait.defaultSeconds,
+        tryingOnce: Bool = false,
+        life: TurnDeadline? = nil,
         _ body: @Sendable () async throws -> T
     ) async throws -> T {
         let lockPath = targetPath.path + ".lock"
         if FileLockScope.heldLockPaths.contains(lockPath) {
             return try await body()
         }
-        let waitDeadline = ProcessInfo.processInfo.systemUptime + max(0, waitSeconds)
         let parent = (lockPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
         var attempts = 0
@@ -140,55 +222,42 @@ public extension SwiftNativePersistenceCore {
             var fd = Darwin.open(lockPath, O_CREAT | O_WRONLY, 0o600)
             if fd < 0, errno == ENOENT {
                 // Recreate a parent removed during acquisition; a second failure throws.
-                try? FileManager.default.createDirectory(
-                    atPath: parent,
-                    withIntermediateDirectories: true
-                )
+                try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
                 fd = Darwin.open(lockPath, O_CREAT | O_WRONLY, 0o600)
             }
             if fd < 0 {
                 throw NSError(domain: "FileLock", code: Int(errno),
                     userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"])
             }
-            var acquired = false
-            var keep = false
-            defer {
-                if !keep {
-                    if acquired { _ = flock(fd, LOCK_UN) }
+            let busy: Bool
+            do { busy = try tryAcquireSidecar(fd) != 0 } catch { Darwin.close(fd); throw error }
+            if busy {
+                guard !tryingOnce else {
                     Darwin.close(fd)
+                    throw NSError(domain: "FileLock", code: Int(ETIMEDOUT), userInfo: [NSLocalizedDescriptionKey: "lock at \(lockPath) is busy"])
                 }
+                let wait = SidecarWait(fd)
+                let watched = life.map { ($0, $0.attach(CredentialFileLock.holderLife(targetPath))) }
+                defer { if case let (watch, id)? = watched { watch.detach(id) } }
+                // A wait that throws has already given up the descriptor.
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { wait.start($0) }
+                } onCancel: { wait.leave() }
             }
-            while true {
-                if try tryAcquireSidecar(fd) == 0 {
-                    acquired = true
-                    break
-                }
-                // Cancellation releases the descriptor through the iteration's defer.
-                guard ProcessInfo.processInfo.systemUptime < waitDeadline else {
-                    throw NSError(
-                        domain: "FileLock", code: Int(ETIMEDOUT),
-                        userInfo: [NSLocalizedDescriptionKey:
-                            "lock at \(lockPath) stayed busy for \(Int(max(0, waitSeconds)))s; gave up rather than wait forever"])
-                }
-                try await Task.sleep(nanoseconds: 20_000_000)
-            }
-            if try !sidecarIsCurrent(fd, at: lockPath) {
-                // Bound retries when a sidecar is repeatedly replaced.
+            let current: Bool
+            do { current = try sidecarIsCurrent(fd, at: lockPath) } catch { releaseSidecar(fd); throw error }
+            guard current else {
+                // The sidecar was replaced while held: lock the one now at the path.
+                releaseSidecar(fd)
                 if attempts >= 8 {
                     throw NSError(domain: "FileLock", code: Int(EAGAIN),
                         userInfo: [NSLocalizedDescriptionKey: "lock file at \(lockPath) replaced repeatedly; giving up after \(attempts) attempts"])
                 }
-                try await Task.sleep(nanoseconds: 5_000_000)
                 continue
             }
-            keep = true
-            defer {
-                _ = flock(fd, LOCK_UN)
-                Darwin.close(fd)
-            }
-            return try await FileLockScope.$heldLockPaths.withValue(
-                FileLockScope.heldLockPaths.union([lockPath])
-            ) {
+            defer { releaseSidecar(fd) }
+            markHolder(fd)
+            return try await FileLockScope.$heldLockPaths.withValue(FileLockScope.heldLockPaths.union([lockPath])) {
                 try await body()
             }
         }

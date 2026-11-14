@@ -351,14 +351,17 @@ extension SchedulerJobNormalizer {
 extension SchedulerJobNormalizer {
     /// A once input is an at moment, not a recurring rhythm.
     public static let rhythmKinds: Set<String> = ["every", "hourly", "daily", "weekly", "monthly", "cron"]
+    /// A when that names one moment is that moment, whether its kind says once, repeats at, or is left out.
+    public static let momentKinds: Set<String> = ["once", "at"]
 
     /// Keep the public timing schema beside the rhythm parser so they cannot drift.
     public static let intentionWhenSchema: JSONValue = {
         let number: JSONValue = .object(["type": .array([.string("number"), .string("string")])])
         let text = ToolSchema.strSchema()
-        let kinds = rhythmKinds.union(["once"]).sorted().joined(separator: "|")
+        let kinds = rhythmKinds.union(momentKinds).sorted().joined(separator: "|")
         let kind: JSONValue = .object(["type": .string("string"), "pattern": .string("(?i)^\\s*(" + kinds + ")\\s*$"),
-            "description": .string("Rhythm type: " + kinds + "; kind is an alias for type.")])
+            "description": .string("Rhythm type: " + rhythmKinds.sorted().joined(separator: "|") + ", or "
+                + momentKinds.sorted().joined(separator: "|") + " for one moment; kind is an alias for type.")])
         let weekdays: JSONValue = .object(["oneOf": .array([text, .object(["type": .string("integer")]),
             .object(["type": .string("array"), "items": number])]),
             "description": .string("Weekday names (mon…sun, weekdays, weekends) or numbers 1=Monday…7=Sunday; list, comma-separated or space-separated.")])
@@ -373,8 +376,9 @@ extension SchedulerJobNormalizer {
         return .object(["description": .string("""
             Omit for next_turn. Strings: own_turn, when_user_messages [door: \(MyQueue.Door.listed)], when_user_here, when_user_away, \
             on_news <words>, on <signal>, after_card <id>, at \
-            <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), in N minutes|hours|days, every <cron>, every N minutes|hours|days. \
-            Objects name a rhythm type/kind, or cron/expression; {at:<ISO/local time>} and {type:once,at:<ISO/local time>} name one moment. Local words use \
+            <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), in N seconds|minutes|hours|days, every <cron>, every N \
+            minutes|hours|days. Objects name a rhythm type/kind, or cron/expression; {at:<ISO/local time>} names one moment, with or without type once or \
+            at; an amount (seconds, minutes, hours, days, intervalSeconds) without a rhythm type is one moment that far from now. Local words use \
             the system date reader in the Mac's zone; ambiguous readings refuse with their interpretation. Rhythm defaults and cross-field timing are checked \
             by the clock.
             """),

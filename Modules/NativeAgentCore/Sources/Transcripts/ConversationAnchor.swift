@@ -31,6 +31,8 @@ public enum ConversationAnchor {
         case emptySource
         /// A delayed publication cannot replace newer accepted activity.
         case supersededByNewerAnchor
+        /// An opening publication found the person already in a conversation; that choice stands.
+        case alreadyAnchored
     }
 
     public enum PublishOutcome: Sendable, Equatable {
@@ -50,7 +52,8 @@ public enum ConversationAnchor {
         source: String,
         conversationKind: ChatThreadKind,
         dataRoot: URL = defaultDataRoot(),
-        now: Date = Date()
+        now: Date = Date(),
+        onlyWhenNone: Bool = false
     ) async throws -> PublishOutcome {
         let cleanSession = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanSession.isEmpty else { return .refused(.emptySessionID) }
@@ -70,6 +73,8 @@ public enum ConversationAnchor {
             let parent = anchorPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
             let existing = try readUnlocked(at: anchorPath)
+            // Opening the person's conversation for them never replaces one they chose meanwhile.
+            if onlyWhenNone, existing != nil { return .refused(.alreadyAnchored) }
             // Preserve activity order even if an older publication was delayed. The numeric stamp retains precision lost by ISO display formatting.
             let committedStamp = NativeTimestampFormat.fractionalZulu(now)
             if let existing,

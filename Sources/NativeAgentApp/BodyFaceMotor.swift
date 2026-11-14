@@ -24,7 +24,10 @@ enum BodyFaceMotor {
             }, pointer: { point, pressed in
                 writer.yield(.init(x: point.x, y: point.y, pressed: pressed, name: nil, driver: nil))
             }, keyboard: {
-                try await acknowledge(.waitForKeyboard, connection: connection, acts: acts)
+                do { try await acknowledge(.checkKeyboard, connection: connection, acts: acts) }
+                catch let held as WireFailure where held.code == "person_keyboard_held" {
+                    throw PersonOnlyWindows.MotorFailure(detail: PersonOnlyWindows.keyboardRefusal)
+                }
             }, disconnected: { writer.finish() }))
     }
 

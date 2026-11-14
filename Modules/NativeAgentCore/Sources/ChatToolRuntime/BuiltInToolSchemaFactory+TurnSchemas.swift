@@ -46,9 +46,9 @@ extension BuiltInToolSchemaFactory {
                             raw read takes one). The answer says pages_read and where to go on; follow next_call for the rest.
                             """))),
                         ("query", ToolSchema.nullable(ToolSchema.strSchema("""
-                            Return the lines holding a term, from sections containing every whitespace-separated term, case-insensitively; a \
-                            long line gives a window around the match. Keep query while paging; start at page 0 when changing it. Empty reads \
-                            all sections whole.
+                            Return the lines holding the phrase as written, case-insensitively; only when it is nowhere, the lines holding \
+                            a word, from sections containing every whitespace-separated word (query_read_as says which). A long line gives a \
+                            window around the match. Keep query while paging; start at page 0 when changing it. Empty reads all sections whole.
                             """))),
                         ("raw", ToolSchema.nullable(ToolSchema.boolSchema("""
                             Exact original bytes instead of sections, only for reconstruction or oversized values. Separate 8000-byte pages may \
@@ -247,14 +247,16 @@ extension BuiltInToolSchemaFactory {
                     Read traces and receipts from the life record. view:receipts returns compact tool-end evidence with action, target, effect \
                     and time; effects_only filters successful non-read receipts, and since accepts today or an ISO-8601 timestamp. completed_turns selects \
                     the last N finished turns, excluding unfinished turns; scan limits are reported. name and turn_id select exact evidence. \
-                    Results are bounded to 32 KiB including metadata; follow next_call for continuation. turn_id or completed_turns plus fields \
-                    reads bounded, secret-redacted values.
+                    Results are bounded to 32 KiB including metadata; follow next_call for continuation. fields reads bounded, secret-redacted \
+                    values. Every read carries lives: the app's starts and how each ended (quit, crash, kill), so a restart is never missed.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("limit", ToolSchema.intSchema("Maximum events per page, default 10, capped at 50.")),
                         ("offset", ToolSchema.intSchema("Continuation event offset; copy from next_call.")),
-                        ("before", ToolSchema.strSchema("Continuation anchor timestamp; copy from next_call to keep the same window.")),
+                        ("before", ToolSchema.strSchema("""
+                            Continuation anchor timestamp; copy from next_call. Reading continues from the newest retained event at or before it.
+                            """)),
                         ("view", ToolSchema.enumStringSchema(["receipts", "usage", "model_calls"], """
                             Use receipts for compact tool.dispatch end receipts across all conversations unless session_id is explicit; non-read \
                             actions precede reads. usage sums recorded model calls across all conversations, defaults since to today, and reports \
@@ -275,12 +277,17 @@ extension BuiltInToolSchemaFactory {
                             """)),
                         ("kind", ToolSchema.strSchema("Optional event kind substring, e.g. tool.dispatch or turn.terminal; action names belong in name.")),
                         ("name", ToolSchema.strSchema("""
-                            Optional exact action filter, e.g. mac.clipboard_read. For returned values use \
-                            turn_id or completed_turns with fields:[name,args,result,receipt].
+                            Optional exact action filter, e.g. mac.clipboard_read. For returned values add fields:[name,args,result,receipt].
                             """)),
                         ("status", ToolSchema.strSchema("Optional exact status filter.")),
+                        ("scope", ToolSchema.enumStringSchema(["conversation", "all"], """
+                            Which life the read covers. Omitted or conversation: an event read stays in the calling conversation (receipts and usage \
+                            already span all). all: every conversation and the agent's background life (the mind, attention, abilities; their rows \
+                            have session_id null). Takes no session_id.
+                            """)),
                         ("session_id", ToolSchema.strSchema("""
-                            Optional exact conversation filter. Includes sibling events from turns belonging to that conversation.
+                            Optional exact conversation id filter. Includes sibling events from turns belonging to that conversation. For every \
+                            conversation and the background life, use scope:all.
                             """)),
                         ("turn_id", ToolSchema.strSchema("Optional exact turn id filter.")),
                         ("receipt_id", ToolSchema.strSchema("""
@@ -288,8 +295,7 @@ extension BuiltInToolSchemaFactory {
                             operation.
                             """)),
                         ("fields", stringArraySchema("""
-                            Optional payload keys; requires turn_id or completed_turns. Up to 16 keys, 80 characters each; values share an 8 KiB \
-                            cap.
+                            Optional payload keys, with or without a turn window. Up to 16 keys, 80 characters each; values share an 8 KiB cap.
                             """, minItems: 1, maxItems: 16, maxItemLength: 80)),
                     ],
                     required: []

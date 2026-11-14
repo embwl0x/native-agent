@@ -47,7 +47,7 @@ public struct AgentContactRow: Identifiable, Sendable {
                     """
             }
             return host.description + " I add myself to its settings so it can message me. "
-                + (host.commandLine == nil ? "It can message me; I cannot start a conversation with it yet."
+                + (!host.reachedLive ? "It can message me; I cannot start a conversation with it yet."
                     : "I can start a conversation with it.")
         }
         if let candidate { return candidate.detail + ((candidate.endpoint ?? candidate.cardURL).map { "\nA2A address: " + $0.absoluteString } ?? "") }
@@ -194,7 +194,7 @@ public struct AgentContactRow: Identifiable, Sendable {
         if contact.provenInboundAt != nil { return "It can reach me · No proven outbound round trip" }
         if contact.transport == .mcpHost,
            let host = AgentPeerStore.hostRowID(contact.endpoint),
-           AgentHostDirectory.rows.first(where: { $0.id == host })?.commandLine == nil {
+           AgentHostDirectory.rows.first(where: { $0.id == host })?.reachedLive != true {
             return "It can message me; I cannot start a conversation with it yet."
         }
         switch contact.state {

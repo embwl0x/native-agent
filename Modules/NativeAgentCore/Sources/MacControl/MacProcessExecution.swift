@@ -316,6 +316,7 @@ public final class ProcessExecution: Sendable {
         standardInput: Data?,
         timeoutSeconds: TimeInterval?,
         outputByteLimit: Int? = nil,
+        life: TurnDeadline? = nil,
         launchFailure: @Sendable (Error) -> Error = { MacControlError.ioFailure("Process.run() failed: \($0)") }
     ) async throws -> ProcessRunResult {
         // Validate before launch so invalid timeouts cannot overflow Dispatch’s nanosecond conversion.
@@ -333,6 +334,8 @@ public final class ProcessExecution: Sendable {
             timeoutDeadline = DispatchTime(uptimeNanoseconds: epoch + UInt64(milliseconds) * 1_000_000)
         } else { timeoutDeadline = nil }
         let proc = ManagedProcess()
+        // `life` is the watch of the call waiting on this process: the running process is what it waits on, its output is life.
+        proc.life = life
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = arguments
         proc.currentDirectoryURL = currentDirectory
@@ -352,14 +355,14 @@ public final class ProcessExecution: Sendable {
         let errBuf = _Buffer(byteLimit: outputByteLimit)
         let outDrain: ProcessPipeDrain
         do {
-            outDrain = try ProcessPipeDrain(handle: outPipe.fileHandleForReading) { outBuf.append($0) }
+            outDrain = try ProcessPipeDrain(handle: outPipe.fileHandleForReading) { outBuf.append($0); life?.moved() }
         } catch {
             inputDelivery?.stop()
             throw MacControlError.ioFailure(error.localizedDescription)
         }
         let errDrain: ProcessPipeDrain
         do {
-            errDrain = try ProcessPipeDrain(handle: errPipe.fileHandleForReading) { errBuf.append($0) }
+            errDrain = try ProcessPipeDrain(handle: errPipe.fileHandleForReading) { errBuf.append($0); life?.moved() }
         } catch {
             inputDelivery?.stop()
             outDrain.stop()

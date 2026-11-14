@@ -75,10 +75,16 @@ public extension NativeAgentEngine {
         return response
     }
 
+    /// The reset runs through the mind's one serial owner: the running mind closes (everything its start attached is stopped and joined) before the
+    /// identity it was made from is removed, and the owner's decision after it rechecks setup. A completed reset leaves no mind; one that did not
+    /// complete leaves setup finished, and a new mind starts. Nothing else decides between the close and the removal.
     @MainActor
     func resetOnboarding(confirm: Bool, resident: NativeAgentEngine) async throws -> OnboardingResetResult {
-        let result = try await onboarding.resetOnboarding(confirm: confirm)
-        if result.ok { await resident.refreshResidentMindAfterOnboardingTransition() }
+        let onboarding = self.onboarding
+        guard confirm else { return try await onboarding.resetOnboarding(confirm: false) }
+        guard let mind = resident.mind else { return try await onboarding.resetOnboarding(confirm: true) }
+        let result = try await mind.reset { try await onboarding.resetOnboarding(confirm: true) }
+        await resident.contextFlow.reloadConfiguration()
         return result
     }
 
@@ -94,10 +100,11 @@ public extension NativeAgentEngine {
         }
     }
 
+    /// The one hook every setup transition reaches: ContextFlow reloads, and the mind's owner decides whether a mind runs (`MindLifetime.reconcile`).
     @MainActor
     func refreshResidentMindAfterOnboardingTransition() async {
         async let contextFlow: Void = self.contextFlow.reloadConfiguration()
-        async let cognition = self.cognition?.refreshAfterOnboardingTransition()
-        _ = await (contextFlow, cognition)
+        async let mind: Void? = self.mind?.reconcile()
+        _ = await (contextFlow, mind)
     }
 }

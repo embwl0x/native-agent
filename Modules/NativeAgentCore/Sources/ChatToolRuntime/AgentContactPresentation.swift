@@ -52,10 +52,10 @@ extension SwiftToolDispatcher {
         if case .string(let detail)? = value["detail"] { return detail + check }
         return "The probe ran and nothing arrived through the entry." + check
     }
-    /// Connection entry ownership is per install; disclose an overwrite before the remaining setup evidence.
+    /// Connection entry ownership is per contact; disclose an overwrite before the remaining setup evidence.
     static func sayReplaced(_ outcome: AgentHostConfigWriter.Outcome, in value: inout [String: JSONValue]) {
         guard let helper = outcome.replacedInstall else { return }
-        let note = "Replaced an entry from another install of this app at \(helper); backup at \(outcome.backupPath ?? "none")."
+        let note = "Replaced an entry this contact did not write (its command: \(helper)); backup at \(outcome.backupPath ?? "none")."
         value["replaced_entry"] = .string(note)
         value["detail"] = .string(note + (value["detail"].flatMap { if case .string(let text) = $0 { " " + text } else { nil } } ?? ""))
     }
@@ -200,6 +200,12 @@ extension SwiftToolDispatcher {
                     Webhook acceptance starts a run. Only a correlated local reply is an answer. Grok Bot may ask for local execution approval each \
                     time.
                     """)]
+            // Setup has no durable hold: until it finishes it stays owed here, with the one call that continues it.
+            if !["set up", "disconnected"].contains(peer.grokSetup ?? "set up") {
+                value["setup_owed"] = .bool(true)
+                value["next_call"] = .object(["tool": .string("app"), "input": .object(["action": .string("agent.connect"),
+                    "args": .object(["agent": .string(peer.name)])])])
+            }
             if let proof = peer.roundTripProof {
                 value["round_trip_proof"] = .object([
                     "route": .string("grokBot"), "at": .string(proof.at),
@@ -268,13 +274,17 @@ extension SwiftToolDispatcher {
             value["readiness"] = .string("not_checked")
             value["capabilities"] = .array([.string("message")])
             value["read_inputs"] = .array(line?.continuesConversations == true ? [.string("conversation_id")] : [])
-            value["setup"] = .string(line == nil
+            value["setup"] = .string(row?.localChat.map { chat in """
+                A message to this contact goes to the model \(row?.displayName ?? peer.name) has loaded, through its local server at \
+                \(chat.server), with this conversation's earlier exchanges, and its answer streams back into the conversation. When the server \
+                is off the message is not sent: \(chat.start) It also reaches this app any time through its own entry.
+                """ } ?? (line == nil
                 ? hostInboundOnlyDetail
                 : "A message to this contact runs its command line once and brings its reply back in the same call."
                     + (line?.continuesConversations == true
                        ? " The app remembers the conversation within your current chat; use conversation to select a named discussion."
                        : " This connection starts a separate conversation for each message.")
-                    + " It also reaches this app any time through its own entry.")
+                    + " It also reaches this app any time through its own entry."))
             if row?.format == .shellEnvironment {
                 value["state_detail"] = .string(ChatGPTDotIPCTransport.detail)
                 value["outbound_route"] = .string("chatgpt-dot-ipc")

@@ -244,6 +244,96 @@ extension SwiftToolDispatcher {
         Self.sayReplaced(result.outcome, in: &value)
         return .object(value)
     }
+    /// On the person's ask (`reopen: true`), a host that loads its entry only at launch is quit gracefully, its process is waited on until it is
+    /// seen gone, and it is opened again, so the connection is live without the person quitting it. Stop ends the wait; a host that stays open
+    /// (a question on its screen) keeps the call waiting, shown, never ended by a clock.
+    static func reopenHost(_ row: AgentHostRow, after result: JSONValue) async -> JSONValue {
+        guard case .object(var value) = result else { return result }
+        let settled = ["configured", "connected", "already_configured", "repaired"].contains(value["status"]?.stringValue ?? "")
+        guard settled, row.restartRequired else { return result }
+        #if canImport(AppKit)
+        let running = row.bundleIDs.flatMap { NSRunningApplication.runningApplications(withBundleIdentifier: $0) }.filter { !$0.isTerminated }
+        guard let first = running.first, let bundle = first.bundleURL else {
+            value["reopened"] = .string("not_running")
+            value["detail"] = .string((value["detail"]?.stringValue ?? "") + " \(row.displayName) is not running; it loads the entry when it opens.")
+            return .object(value)
+        }
+        // Stop ends the quitting before any further quit; what was asked to quit is reopened however the call ended (its settlement).
+        var asked: [pid_t] = []
+        for app in running where !Task.isCancelled {
+            asked.append(app.processIdentifier)
+            app.terminate()
+            await gone(app)
+        }
+        if Task.isCancelled {
+            let quit = asked
+            Task.detached { await Self.reopenAfter(quit, bundle: bundle) }
+            value["reopened"] = .string("stopped")
+            value["detail"] = .string((value["detail"]?.stringValue ?? "")
+                + " Stopped while \(row.displayName) was quitting: nothing more was quit, and what was quit opens again once it is gone.")
+            return .object(value)
+        }
+        do {
+            try await open(bundle)
+            value["reopened"] = .string("reopened")
+            value["detail"] = .string((value["detail"]?.stringValue ?? "") + " Quit \(row.displayName) and opened it again; it loads the entry now.")
+        } catch {
+            value["reopened"] = .string("quit_not_reopened")
+            value["detail"] = .string((value["detail"]?.stringValue ?? "")
+                + " Quit \(row.displayName), but opening it again failed: \(error.localizedDescription). Opening it loads the entry.")
+        }
+        return .object(value)
+        #else
+        return result
+        #endif
+    }
+
+    #if canImport(AppKit)
+    /// The reopen a Stop owes: once every instance asked to quit is seen gone, the app opens again. Not cancelled by the Stop that owes it.
+    private static func reopenAfter(_ asked: [pid_t], bundle: URL) async {
+        for pid in asked { if let app = NSRunningApplication(processIdentifier: pid) { await gone(app) } }
+        try? await open(bundle)
+    }
+
+    @MainActor private static func open(_ bundle: URL) async throws {
+        _ = try await NSWorkspace.shared.openApplication(at: bundle, configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    /// Returns when the process is seen gone, or when the call is stopped.
+    private static func gone(_ app: NSRunningApplication) async {
+        final class Watch: @unchecked Sendable {
+            private let lock = NSLock()
+            private var continuation: CheckedContinuation<Void, Never>?
+            private var observation: NSKeyValueObservation?
+            private var done = false
+            func park(_ continuation: CheckedContinuation<Void, Never>) -> Bool {
+                lock.withLock { if done { return false }; self.continuation = continuation; return true }
+            }
+            func hold(_ observation: NSKeyValueObservation) {
+                let late = lock.withLock { () -> Bool in if done { return true }; self.observation = observation; return false }
+                if late { observation.invalidate() }
+            }
+            func finish() {
+                let (waiting, watching) = lock.withLock { () -> (CheckedContinuation<Void, Never>?, NSKeyValueObservation?) in
+                    defer { done = true; continuation = nil; observation = nil }
+                    return done ? (nil, nil) : (continuation, observation)
+                }
+                watching?.invalidate()
+                waiting?.resume()
+            }
+        }
+        let watch = Watch()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard watch.park(continuation) else { continuation.resume(); return }
+                watch.hold(app.observe(\.isTerminated, options: [.initial, .new]) { app, _ in
+                    if app.isTerminated { watch.finish() }
+                })
+            }
+        } onCancel: { watch.finish() }
+    }
+    #endif
+
     private static let directCommandSetupDetail = """
         Contact saved with permission for its two MCP messaging tools only. agent.message returns the command's answer; conversation_id continues \
         it. No callback was attempted. The separate MCP reply path stays unverified until an inbound message arrives.

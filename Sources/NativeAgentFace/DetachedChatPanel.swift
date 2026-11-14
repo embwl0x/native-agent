@@ -50,15 +50,10 @@ final class DetachedChatPanel: NSPanel {
         self.animationBehavior = .documentWindow
         // A resize floor prevents the window collapsing into a sliver.
         self.contentMinSize = NSSize(width: 420, height: 320)
-        let autosaveKey = "DetachedChatPanel.\(sessionId)"
-        self.setFrameAutosaveName(autosaveKey)
-        self.setFrameUsingName(autosaveKey)
     }
 
-    static func hasSavedFrame(sessionId: String) -> Bool {
-        let key = "NSWindow Frame DetachedChatPanel.\(sessionId)"
-        return UserDefaults.standard.string(forKey: key) != nil
-    }
+    /// The conversation's own frame name; its frame is applied once the content is in place, since setting the content sizes the panel.
+    var autosaveKey: String { "DetachedChatPanel.\(sessionId)" }
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -72,6 +67,8 @@ final class DetachedChatWindowController: NSObject, NSWindowDelegate {
     static let shared = DetachedChatWindowController()
 
     private var panels: [String: DetachedChatPanel] = [:]
+    /// Each open panel's kept frame, ended with the panel.
+    private var frames: [String: WindowFrame] = [:]
     private weak var appModel: AppModel?
     private let defaults = UserDefaults.standard
 
@@ -165,7 +162,9 @@ final class DetachedChatWindowController: NSObject, NSWindowDelegate {
         panel.delegate = self
 
         // Center only unsaved windows so relaunch preserves the person's chosen placement.
-        if origin == nil, !DetachedChatPanel.hasSavedFrame(sessionId: sessionId) {
+        let frame = WindowFrame(panel, name: panel.autosaveKey)
+        frames[sessionId] = frame
+        if !frame.restored, origin == nil {
             panel.center()
         }
 
@@ -233,6 +232,7 @@ final class DetachedChatWindowController: NSObject, NSWindowDelegate {
         guard let panel = notification.object as? DetachedChatPanel else { return }
         let sessionId = panel.sessionId
         panels.removeValue(forKey: sessionId)
+        frames.removeValue(forKey: sessionId)?.end()
         removeFromPersist(sessionId)
         // Keep the pin after closing so the session remains reachable from the strip.
     }

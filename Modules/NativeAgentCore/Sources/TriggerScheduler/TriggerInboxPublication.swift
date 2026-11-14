@@ -36,14 +36,8 @@ extension SwiftNativeTriggerScheduler {
         }
 
         let configs: [TriggerConfig]
-        let seed: MorningBriefDefaults
-        do {
-            seed = try await defaults()
-            configs = try await Self._readList(
-                path: inboxPath,
-                defaultValue: seed.inbox
-            )
-        } catch {
+        do { configs = try await listInboxTriggers() }
+        catch {
             return .refused(TriggerFireResult(status: "error", name: name, stub: true,
                                      error: String(describing: error)))
         }
@@ -57,7 +51,10 @@ extension SwiftNativeTriggerScheduler {
 
         do {
             try Task.checkCancellation()
-            return .ready(row: row, notify: seed.notify, item: try await _buildMorningBriefItem())
+            // One occasion runs the part once, for its brief; its defaults are asked only for a notify the saved row does not say.
+            let notify: [String: Bool]
+            if case .object(let fields)? = row.config, case .bool? = fields["notify"] { notify = [:] } else { notify = try await defaults().notify }
+            return .ready(row: row, notify: notify, item: try await _buildMorningBriefItem())
         }
         catch { return .refused(TriggerFireResult(status: "error", name: name, stub: true, error: String(describing: error))) }
     }

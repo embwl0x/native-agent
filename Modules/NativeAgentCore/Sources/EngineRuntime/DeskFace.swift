@@ -9,7 +9,7 @@ import PersistenceCore
 import StandingBots
 import Studio
 import TriggerScheduler
-// Blueprint: | `DeskFace.swift` | The Desk packet `native-desk` draws: the Desk revision's facts, its rows' keys, the Reminders levers and Veto key levers |
+// Blueprint: | `DeskFace.swift` | The Desk packet `native-desk` draws: its facts, its rows' keys, Reminders levers, Veto key levers, Needs you's answers |
 
 extension NativeAgentEngine {
     static let deskPart = "native-desk"
@@ -45,7 +45,9 @@ extension NativeAgentEngine {
         let names = ((try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []).reduce(into: [String: String]()) { $0["peer:" + $1.id] = $1.name }
         if !names.isEmpty { facts = facts.mapValues { Self.named($0, names) } }
         // The board revision orders reads; a selection or a clock edge changes the facts at one revision, and the face is drawn again.
-        let levers = deskLevers(snapshot, selected: state.selected)
+        // A row that needs the person carries its Inbox row's own answers; an unreadable Inbox leaves the row its open link only.
+        let answers = (try? await inboxAnswers()) ?? [:]
+        let levers = deskLevers(snapshot, selected: state.selected, answers: answers)
         return PartFaces.Packet(facts: .object(facts), epoch: board.revision, levers: levers.page, keyLevers: levers.keyed)
     }
 
@@ -116,7 +118,8 @@ extension NativeAgentEngine {
 
     /// The person's say over the agent on the Desk: the Reminders section (page levers, drawn first) and Veto on each pursuit the
     /// Desk offers it on (key levers on the pursuit's row and on the selected item's Veto row).
-    func deskLevers(_ snapshot: DeskPageSnapshot, selected: String?) -> (page: [PartFace.Section], keyed: [PartFace.Section]) {
+    func deskLevers(_ snapshot: DeskPageSnapshot, selected: String?,
+                    answers: [String: [PartFace.Action]] = [:]) -> (page: [PartFace.Section], keyed: [PartFace.Section]) {
         func veto(_ item: DeskItem) -> PartFace.Action? {
             Self.deskItemActions(item).first { $0.id == "veto" }.map { PartFace.Action(id: "veto", label: "Veto", role: .destructive, call: $0.call) }
         }
@@ -126,7 +129,14 @@ extension NativeAgentEngine {
         if let handle = selected, let item = snapshot.boardItems.first(where: { $0.handle == handle }), let action = veto(item) {
             rows.append(.init(id: "item-action:veto", title: "Veto", actions: [action]))
         }
-        return ([deskReminders(snapshot, selected: selected)], rows.isEmpty ? [] : [.init(id: "veto", title: "Pursuits", rows: rows)])
+        // Needs you: each approval or request rides its Inbox row's answers (same ids, door calls and confirmation), the person's own press.
+        let needs: [PartFace.Row] = (snapshot.overview?.needsYou ?? []).compactMap { row in
+            guard [WorkOverviewReference.Kind.approval, .inbox].contains(row.reference.kind), let actions = answers[row.reference.id] else { return nil }
+            return PartFace.Row(id: row.id, title: row.title, actions: actions)
+        }
+        var keyed: [PartFace.Section] = rows.isEmpty ? [] : [.init(id: "veto", title: "Pursuits", rows: rows)]
+        if !needs.isEmpty { keyed.append(.init(id: "needs-you", title: "Needs you", rows: needs)) }
+        return ([deskReminders(snapshot, selected: selected)], keyed)
     }
 
     private func deskReminders(_ snapshot: DeskPageSnapshot, selected: String?) -> PartFace.Section {

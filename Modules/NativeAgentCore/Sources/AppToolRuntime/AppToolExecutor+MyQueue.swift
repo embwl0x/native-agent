@@ -57,12 +57,29 @@ extension AppToolExecutor {
             next: ["page": .string("desk")], effects: .unknown) }
     }
 
+    /// A relative amount of time is one moment from now, in words ("in 2 minutes") or as amount fields ({seconds:120}).
     static func relativeMoment(_ text: String) -> TimeInterval? {
         let words = text.lowercased().split(separator: " ").map(String.init)
         guard words.count == 3, words[0] == "in", let count = Double(words[1]), count > 0,
-              let unit = ["minute": 60.0, "minutes": 60, "min": 60, "mins": 60, "hour": 3_600, "hours": 3_600,
-                          "day": 86_400, "days": 86_400][words[2]] else { return nil }
+              let unit = ["second": 1.0, "seconds": 1, "sec": 1, "secs": 1, "minute": 60, "minutes": 60, "min": 60, "mins": 60,
+                          "hour": 3_600, "hours": 3_600, "day": 86_400, "days": 86_400][words[2]] else { return nil }
         return count * unit
+    }
+
+    /// Amount fields the timing schema names, with no repeat kind (none, once or at), are one moment that far from now; any other field is not.
+    static func relativeMoment(_ fields: [String: JSONValue]) -> TimeInterval? {
+        let units: [String: TimeInterval] = ["seconds": 1, "interval_seconds": 1, "intervalSeconds": 1, "minutes": 60, "hours": 3_600,
+                                             "days": 86_400]
+        let kind = (fields["type"] ?? fields["kind"]).map { ($0.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        guard kind.map(SchedulerJobNormalizer.momentKinds.contains) ?? true else { return nil }
+        let amounts = fields.filter { $0.key != "type" && $0.key != "kind" }
+        guard !amounts.isEmpty else { return nil }
+        var total: TimeInterval = 0
+        for (name, value) in amounts {
+            guard let unit = units[name], let count = value.scalarText.flatMap(Double.init), count.isFinite, count >= 0 else { return nil }
+            total += count * unit
+        }
+        return total > 0 ? total : nil
     }
 
     /// Queued steps retain peer steering so later execution cannot outrank the originating turn.
@@ -185,11 +202,14 @@ extension AppToolExecutor {
                 if rhythm == nil, case .object(let fields)? = input["when"],
                    let at = (fields["at"] ?? fields["run_at"] ?? fields["runAt"])?.scalarText {
                     whenText = "at " + at
+                } else if rhythm == nil, case .object(let fields)? = input["when"], let relative = Self.relativeMoment(fields) {
+                    whenText = "at " + ISO8601DateFormatter().string(from: Date().addingTimeInterval(relative))
                 } else if rhythm == nil, case .object? = input["when"] {
                     return Self.doorRefusal("invalid_input", "Nothing was queued.", remedy: "fix_args",
                         """
                             A when object is a rhythm in the scheduler's grammar: {type: hourly|daily|weekly|monthly|cron|every, …}, e.g. {type:\"cron\", \
-                            expression:\"0 9,16 * * *\"}. A single time is at <ISO time>.
+                            expression:\"0 9,16 * * *\"}. A single time is at <ISO time> or {at:\"<ISO time>\"}; an amount with no rhythm type, e.g. \
+                            {seconds:120}, is one moment that far from now.
                             """)
                 }
                 guard let when = rhythm == nil ? MyQueue.When(whenText) : .every else {
@@ -205,8 +225,8 @@ extension AppToolExecutor {
                             Read when \"\(supplied)\": \(MyQueue.When.timeReading(moment).interpretation). Use a complete local date/time (e.g. Sun Nov 1 at \
                             06:00) or at <ISO time with offset>. Other moments: next_turn, own_turn, when_user_messages [\(MyQueue.Door.listed)], \
                             when_user_here, when_user_away, \
-                            on_news <words>, on <signal>, after_card <id>, in N minutes|hours|days, or a rhythm (every N hours, every <cron>, or a schedule \
-                            object).
+                            on_news <words>, on <signal>, after_card <id>, in N seconds|minutes|hours|days, an amount such as {seconds:120}, or a rhythm \
+                            (every N hours, every <cron>, or a schedule object).
                             """)
                 }
                 var untilText = text("until")
@@ -217,9 +237,14 @@ extension AppToolExecutor {
                    let at = (fields["at"] ?? fields["run_at"] ?? fields["runAt"])?.stringValue,
                    let moment = MyQueue.When("at " + at), case .at = moment {
                     untilText = "at " + at
+                } else if case .object(let fields)? = input["until"], let relative = Self.relativeMoment(fields) {
+                    untilText = "at " + ISO8601DateFormatter().string(from: Date().addingTimeInterval(relative))
                 } else if let value = input["until"], value != .null, value.stringValue == nil {
                     return Self.doorRefusal("invalid_input", "Nothing was queued.", remedy: "fix_args",
-                        "until is a moment {at:\"<ISO time>\"}, at <ISO time>, in N minutes|hours|days, words for when it is done, or standing.")
+                        """
+                            until is a moment {at:\"<ISO time>\"}, at <ISO time>, in N seconds|minutes|hours|days, an amount such as {seconds:120}, words \
+                            for when it is done, or standing.
+                            """)
                 }
                 let until = untilText.map { MyQueue.Until($0) } ?? (rhythm == nil ? .once : .standing)
                 if case .time(let ends) = until, ends <= Date(), editing == nil || named.contains("until") {

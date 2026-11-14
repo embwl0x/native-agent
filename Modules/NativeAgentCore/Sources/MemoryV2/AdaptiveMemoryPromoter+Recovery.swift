@@ -198,9 +198,14 @@ extension AdaptiveMemoryPromoter {
     /// Recovery shares the live tail and yields between passes as soon as live work arrives. A pass folds one meaning or judges one moment.
     private func drainOwedRows(door: LivedMomentDoor, isIdle: (@Sendable () async -> Bool)?,
                                joining: Bool = false) async {
+        // Every ask is answered. What made it (a moment left owed, a window that closed) can come after a running drain's last look, so an ask
+        // while one runs is kept and that drain looks again before it ends; the asker does not wait on it.
+        if !joining, owedDrain != nil {
+            owedDrainAsked = true
+            return
+        }
         // Night is a barrier before the dream reads the agent's day. Join a shared flight without taking its ownership, then continue through this owner.
         while let running = owedDrain {
-            guard joining else { return }
             _ = await running.value
             guard !Task.isCancelled else { return }
         }
@@ -218,10 +223,17 @@ extension AdaptiveMemoryPromoter {
             // Failed work remains due for the next drain; successful writes may advance into the fold in this drain.
             var attempted = Set<String>()
             while true {
-                guard !stopped, !Task.isCancelled, let memory else { break }
-                let idle = await isIdle?() ?? true
-                guard idle, pendingLiveObservations == 0 else { break }
-                if !(await askOwedMoments(memory: memory, door: door, attempted: &attempted)) { break }
+                // An ask that came during the last pass is the next drain: this pass looks again with nothing yet tried, so a row
+                // that failed while the ask came is retried here, not left for another trigger.
+                if owedDrainAsked {
+                    owedDrainAsked = false
+                    attempted = []
+                }
+                var more = false
+                if !stopped, !Task.isCancelled, let memory, await isIdle?() ?? true, pendingLiveObservations == 0 {
+                    more = await askOwedMoments(memory: memory, door: door, attempted: &attempted)
+                }
+                guard more || owedDrainAsked, !stopped, !Task.isCancelled else { break }
             }
             return AdaptiveMemoryObservation(proposals: [], extraction: .init(candidates: [], semanticStatus: .skipped))
         }

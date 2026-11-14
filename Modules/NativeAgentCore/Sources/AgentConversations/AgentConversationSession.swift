@@ -4,6 +4,7 @@ import AgentWorkspace
 import ApprovalInbox
 import Foundation
 import Experiences
+import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Privacy
@@ -122,6 +123,7 @@ package enum AgentConversationSession {
             }
             fields["execution"] = .string("executed")
             fields["effect"] = .string("none")
+            try await graphEntity(of: string(fields["agent_id"]) ?? string(input["agent"]), dataRoot: dataRoot, into: &fields)
             return .object(fields)
         }
         guard tool == "agent_message" else { return result }
@@ -130,6 +132,26 @@ package enum AgentConversationSession {
             "peer:" + $0.id == agent || ($0.handles ?? []).contains(agent)
         }
         return messageReceipt(result, live: AgentConversationDelivery.answersLive(peer: peer))
+    }
+
+    /// The contact's own graph entity, when the graph holds one: `graph_entity` opens it (`page:knowledge/contact:<id>`), the way back
+    /// from the contact to what the graph knows of it. A route associated with another contact (`who`) is that contact. No graph yet is no
+    /// entity; a graph that cannot be read says so in `graph_entity_unavailable` and the contact's read still stands.
+    private static func graphEntity(of agent: String?, dataRoot: URL, into fields: inout [String: JSONValue]) async throws {
+        guard let agent, agent.hasPrefix("peer:") else { return }
+        let peers = try AgentPeerStore(dataRoot: dataRoot).list()
+        let route = peers.first { "peer:" + $0.id == agent }
+        let owner = route?.who.flatMap { who in peers.contains { $0.id == who } ? who : nil }
+        let contact = owner.map { "peer:" + $0 } ?? agent
+        do {
+            guard try await KnowledgeGraphStore.contactEntityFromMemoryV2(
+                memoryDir: dataRoot.appendingPathComponent("memory", isDirectory: true), contactID: contact) != nil else { return }
+            fields["graph_entity"] = .string("page:knowledge/contact:" + contact)
+        } catch KnowledgeGraphSQLiteLoadError.databaseMissing {
+            return
+        } catch {
+            fields["graph_entity_unavailable"] = .string("The graph could not be read for this contact: " + String(describing: error))
+        }
     }
 
     private static func dispatchConversation(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, workspace: WorkspaceOperation,
@@ -313,7 +335,10 @@ package enum AgentConversationSession {
             // Queued sends wait in order for evidence-based settlement or an explicit stop/release. A reservation admits its queued message; every other
             // message waits behind the queue.
             let reserved = reservation != nil && row.queueReservation == reservation
-            if !reserved, try inFlight(row, peer?.transport, dataRoot: dataRoot) {
+            // The person's own send never queues behind a send held for the Mac: it goes now, and the held one stays held, behind it.
+            let personNow = turn.personInitiatedSend?.matches(args) == true || turn.askedByPerson
+            if !reserved, try personNow ? inFlightAheadOfPerson(row, peer?.transport, dataRoot: dataRoot) : inFlight(row, peer?.transport,
+                dataRoot: dataRoot) {
                 if let queued = try queue(turn: turn, mac: mac, conversation: conversation, workspace: workspace, behind: row, name: name, peer: peer,
                     args: args, expectsReply: expectsValue, scope: scope, surface: surface, dataRoot: dataRoot, perform: perform) {
                     return queued

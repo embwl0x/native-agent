@@ -400,7 +400,7 @@ struct NativeAgentMobileApp: App {
         }
         Task { @MainActor in
             guard pairingStore.applyCloudKitPairingSecret(data) else { return }
-            pairingStore.applyICloudPairing()
+            pairingStore.applyICloudPairing(acceptance: nil)
             NSLog("[NativeAgentMobile] -pairingSecretBase64: installed through PairingStore; isICloudPaired=true")
         }
         #endif

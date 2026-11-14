@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
+import PersistenceCore
 // Blueprint: | `BotRunner.swift` | `BotRunner` actor; `run`, `ask`: shared admission, accounting and typed notification verdicts |
 
 /// Inject the helper's turn runner so scheduling and accounting do not own its model/tool loop.
@@ -120,7 +121,7 @@ public actor BotRunner {
     public func run(bot id: UUID, requestID: UUID? = nil, parent: Turn?, scope: BotRunScope,
                     holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { _ in false }) async throws -> ShelfEntry? {
         let claimed: BotRunQueue.ClaimedRun
-        do { claimed = try await queue.claimWhenAvailable(bot: id, requestID: requestID, scope: scope) }
+        do { claimed = try await queue.claimWhenAvailable(bot: id, requestID: requestID, scope: scope, waiting: parent?.enclosingCall) }
         catch BotRunAdmissionError.paused { return nil }
         defer { queue.finish(bot: id) }
         let bot = claimed.bot
@@ -167,7 +168,7 @@ public actor BotRunner {
         guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw StandingBotsError.invalidValue("question is empty")
         }
-        let claimed = try await queue.claimWhenAvailable(bot: id, requestID: nil, manual: true, scope: scope)
+        let claimed = try await queue.claimWhenAvailable(bot: id, requestID: nil, manual: true, scope: scope, waiting: parent?.enclosingCall)
         let bot = claimed.bot
         defer { queue.finish(bot: id) }
         do { try await prepare(bot, requestID: claimed.runID) }
@@ -179,7 +180,7 @@ public actor BotRunner {
 
     public func resume(bot saved: BotDefinition, message: String, parent: Turn?, scope: BotRunScope,
                        holdUnattended: @Sendable (BotDefinition) async -> Bool) async throws -> ShelfEntry {
-        let claimed = try await queue.claimWhenAvailable(bot: saved.id, requestID: nil, scope: scope)
+        let claimed = try await queue.claimWhenAvailable(bot: saved.id, requestID: nil, scope: scope, waiting: parent?.enclosingCall)
         let bot = claimed.bot
         defer { queue.finish(bot: saved.id) }
         do {
@@ -217,19 +218,38 @@ public actor BotRunner {
         try queue.admitExecution(bot: bot.id, requestID: requestID)
     }
 
+    private static func ended(_ error: Error) -> BotTurnReply {
+        BotTurnReply(reply: "", status: error is CancellationError ? .stopped : error is BotRunnerError ? .interrupted : .failed,
+            detail: String(describing: error))
+    }
+
     private func perform(_ bot: BotDefinition, message: String, requestID: UUID,
                          turn: Turn, scope: BotRunScope, asked: Bool = false,
                          judgesCondition: Bool = false) async throws -> ShelfEntry {
         let start = Date()
         let clock = ContinuousClock.now
         var outcome: BotTurnReply
+        let session = self.session, queue = self.queue
+        let options = BotRunOptions(conditionSessionID: judgesCondition ? bot.sessionID : nil)
+        let body = TurnBodyLifetime<BotTurnReply>()
         do {
-            // The claim is released only after the session has settled.
-            outcome = try await session(bot, message, turn, scope,
-                BotRunOptions(conditionSessionID: judgesCondition ? bot.sessionID : nil))
-        } catch {
-            outcome = BotTurnReply(reply: "", status: error is CancellationError ? .stopped : error is BotRunnerError ? .interrupted : .failed,
-                detail: String(describing: error))
+            // Every run has its own watch, inside the call that asked for it if any: the run's output and calls are its life, and a call
+            // waiting for this busy helper asks it.
+            outcome = try await CallBound.run(name: "\(bot.name)'s run", declared: nil, deadlines: OperationDeadlines(),
+                enclosing: turn.enclosingCall) { _, watch in
+                try await body.run {
+                    queue.running(bot: bot.id, on: watch)
+                    return try await session(bot, message, turn.with(\.enclosingCall, watch), scope, options)
+                }
+            }
+        } catch { outcome = Self.ended(error) }
+        // The watch releases this caller at once on Stop; the claim is released only after the session has settled, and on Stop what the
+        // session settled with is the run's outcome.
+        if case let settled? = await body.finish(), outcome.status == .stopped {
+            switch settled {
+            case .success(let reply): outcome = reply
+            case .failure(let error): outcome = Self.ended(error)
+            }
         }
         if judgesCondition, outcome.status != .completed { outcome.conditionMet = nil }
         if judgesCondition, outcome.conditionMet == nil {

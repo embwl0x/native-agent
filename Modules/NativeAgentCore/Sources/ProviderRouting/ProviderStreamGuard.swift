@@ -126,12 +126,16 @@ private final class ProviderHTTPTransfer: NSObject, URLSessionDataDelegate, Send
     private let body: AsyncThrowingStream<Data, Error>.Continuation
     private let call: LLMCall
     private let requestID: String
+    /// A turn running under a call (a helper, a part's thought): while the request is open it is what that call waits on, and its bytes are
+    /// the call's life.
+    private let life: (watch: TurnDeadline, id: UUID)?
 
-    init(task: URLSessionDataTask, body: AsyncThrowingStream<Data, Error>.Continuation, call: LLMCall, requestID: String) {
+    init(task: URLSessionDataTask, body: AsyncThrowingStream<Data, Error>.Continuation, call: LLMCall, requestID: String, what: String) {
         state = Mutex(State(task: task))
         self.body = body
         self.call = call
         self.requestID = requestID
+        life = call.turn?.enclosingCall.map { ($0, $0.attach(.request(task, what: what))) }
     }
 
     func open() async throws -> URLResponse {
@@ -183,6 +187,7 @@ private final class ProviderHTTPTransfer: NSObject, URLSessionDataDelegate, Send
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        life?.watch.moved()
         state.withLock {
             guard !$0.finished else { return }
             if !$0.observedFirstBodyBytes, !data.isEmpty {
@@ -229,6 +234,7 @@ private final class ProviderHTTPTransfer: NSObject, URLSessionDataDelegate, Send
             return owned
         }
         guard let owned else { return }
+        if let life { life.watch.detach(life.id) }
         owned.1?.cancel()
         if cancel { owned.0?.cancel() }
         if let error = owned.2 { body.finish(throwing: error) }
@@ -244,15 +250,19 @@ private final class ProviderHTTPTransfer: NSObject, URLSessionDataDelegate, Send
 public enum ProviderWire {
     public static func open(_ session: URLSession, _ request: URLRequest, call: LLMCall) async throws
         -> (ProviderHTTPBytes, URLResponse) {
-        await waiting(on: "network path", detail: "Waiting for this Mac's network", call: call)
-        try await NetworkSense.returns()
+        // A loopback server is on this Mac: no network path stands between it and the app.
+        if !["localhost", "127.0.0.1", "::1", "[::1]"].contains(request.url?.host?.lowercased() ?? "") {
+            await waiting(on: "network path", detail: "Waiting for this Mac's network", call: call)
+            try await NetworkSense.returns()
+        }
         try Task.checkCancellation()
         var request = request
         request.timeoutInterval = .infinity
         let requestID = UUID().uuidString.lowercased()
         let pair = AsyncThrowingStream<Data, Error>.makeStream()
         let task = session.dataTask(with: request)
-        let transfer = ProviderHTTPTransfer(task: task, body: pair.continuation, call: call, requestID: requestID)
+        let label = call.admission.map { SwiftNativeProviderRouting.displayName(for: $0.provider) } ?? request.url?.host ?? "provider"
+        let transfer = ProviderHTTPTransfer(task: task, body: pair.continuation, call: call, requestID: requestID, what: "\(label)'s answer")
         task.delegate = transfer
         pair.continuation.onTermination = { [weak transfer] ending in
             if case .cancelled = ending { transfer?.finish(error: CancellationError(), cancel: true) }
@@ -261,7 +271,6 @@ public enum ProviderWire {
         TurnTraceBus.fireFromContext(kind: "provider.httpRequestStarted", surface: call.surface,
             payload: .object(["request": .string(requestID), "requestBodyBytes": .int(Int64(request.httpBody?.count ?? 0))]), turn: call.turn)
         call.sentCredential?.sending(request)
-        let label = call.admission.map { SwiftNativeProviderRouting.displayName(for: $0.provider) } ?? request.url?.host ?? "provider"
         await waiting(on: "provider response", detail: "Waiting on \(label)", call: call)
         let response = try await transfer.open()
         call.lifetime.response?(response)

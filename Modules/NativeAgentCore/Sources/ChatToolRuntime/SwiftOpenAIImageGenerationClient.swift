@@ -81,7 +81,7 @@ final class SwiftOpenAIImageGenerationClient: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await URLSession.shared.data(for: urlRequest)
+            (data, response) = try await URLSession.shared.data(for: urlRequest, life: turn?.enclosingCall)
         } catch {
             if error is CancellationError { throw CancellationError() }
             let nsError = error as NSError

@@ -423,9 +423,8 @@ extension MacSyncEngine {
 
     private func startCognitionSnapshotObservation() {
         cognitionSnapshotObservationTask?.cancel()
-        let cognition = sync.cognition
+        let changes = sync.mindChanges()
         cognitionSnapshotObservationTask = Task { [weak self] in
-            let changes = await cognition.changes()
             for await change in changes {
                 guard !Task.isCancelled, let self, self.isActive else { return }
                 guard Self.shouldWriteSnapshot(for: change) else { continue }
@@ -536,6 +535,7 @@ extension MacSyncEngine {
         for change: NativeCognitionRuntimeChange
     ) -> Bool {
         change.reason.hasPrefix("configuration:")
+            || change.reason.hasPrefix("mind:")
             || change.reason.hasPrefix("organism:")
             || change.reason.hasPrefix("transient_clear:")
             || change.reason == "microcycle_settlement:finished"

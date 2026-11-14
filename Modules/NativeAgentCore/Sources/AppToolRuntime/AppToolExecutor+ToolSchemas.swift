@@ -203,6 +203,11 @@ extension AppToolExecutor {
                             With action: the version a read returned. Refused, with nothing done, if that page changed since. It hashes what the page shows, \
                             so a page changed and changed back has its old version again.
                             """)),
+                        ("because", ToolSchema.strSchema("""
+                            With action or actions: the person's own words asking for it, quoted from their message asking for what you are doing now \
+                            (three words or more). A change that is theirs to decide (a lever, a setting that widens what you may do, an owner_only \
+                            setting) then runs on their word, with no card; without it, or if the words are not theirs, it asks them on a card.
+                            """)),
                         ("find", ToolSchema.strSchema("""
                             What you want done, in words. Discovers actions on every page, including home, one line each as id(args) label, with the best \
                             match's example. Name an action's id in the words for its args_schema and example. Search history explicitly with work.context or \

@@ -14,6 +14,8 @@ public struct KnowledgeGraphEntity: Sendable, Identifiable, Hashable {
     public var mentionCount: Int?
     public var aliases: [String]?
     public var summary: String?
+    /// The agent's contact this entity names (`peer:<id>`), derived by the indexer from the agent's contacts.
+    public var contactID: String?
 }
 
 public struct KnowledgeGraphEdge: Sendable, Identifiable, Hashable {
@@ -47,6 +49,7 @@ extension KnowledgeGraphEntity {
             aliases = strings.count == raw.count ? strings : nil
         }
         summary = o["summary"]?.stringValue
+        contactID = o["contact_id"]?.stringValue
     }
 }
 

@@ -145,9 +145,10 @@ extension AppActions {
                   Deny this exact waiting card on the person's own authenticated message, under the same authority as inbox.approve
                   """),
 
-        // Version-exempt: chat appends through Reach without overwriting page state.
+        // Version-exempt: chat appends through Reach without overwriting page state. The agent's own words to its own person: a write to its
+        // own conversation, never a send to a third party, so no posture and no steering of the turn holds it on a card.
         AppAction("chat.post", "chat", "Tell the person directly", ["message"], irreversible: true,
-                  toolClass: .send, reach: .person, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_post", versionExempt: true),
+                  toolClass: .write, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_post", versionExempt: true, voice: true),
         AppAction("chat.list", "chat", """
             Conversations, newest first; query filters by title; pinned:true only pinned, pinned:false only unpinned; filters apply before offset
             """, ["archived?:bool", "pinned?:bool", "query?", "offset?:int"],
@@ -275,7 +276,8 @@ extension AppActions {
                   warn: """
                       Your own mind settings need no request. For other settings below Full Mac, because must quote at least 3 words from a person \
                       or trusted agent in this conversation (a run with no conversation has none to quote); you may restore a switch whose last \
-                      change was yours. An owner_only setting is the person's alone.
+                      change was yours. A change that widens what you may do, and any change to an owner_only setting (Full Mac included), runs \
+                      when because quotes the person's own request, at any posture but Safe; without it, it asks them on a card.
                       """,
                   tool: "app_setting_set", schema: arguments("app_setting_set", ["setting": ToolSchema.strSchema(), "because": ToolSchema.strSchema(),
                       "value": .object([
@@ -373,9 +375,9 @@ extension AppActions {
                   input: verb("embeddings_resume")),
         AppAction("memory.reindex", "memories", "Spotlight reindex", tool: "upkeep", input: verb("spotlight_reindex")),
         AppAction("memory.list", "memories", "List memories with exact total and remaining counts; follow next_after_id only for more entries. "
-                  + "sort newest_first or oldest_first; status active or archived. "
+                  + "sort newest_first or oldest_first; status active or archived; pinned true for only the pinned ones, false for the rest. "
                   + "Archived entries include what replaced them",
-                  ["status?", "sort?", "offset?:int", "after_id?", "limit?:int", "kind?"],tool: "list_memories",
+                  ["status?", "sort?", "offset?:int", "after_id?", "limit?:int", "kind?", "pinned?:bool"],tool: "list_memories",
                   read: true),
         AppAction("memory.rewrite", "memories", "Rewrite, pin, unpin or restore a memory, or restate its roots: how, from whom and since when you know it",
                   ["id", "text?", "pinned?:bool", "restore?:bool", "reason?", "roots?:[{how,by?,since?}]"], subject: ["id"],
@@ -682,13 +684,13 @@ extension AppActions {
                           use rhythms for schedule:),\u{20}
                           """
                       + """
-                          after_card <approval id>, at <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), \"in 20 minutes\", or a \
-                          rhythm that brings it back each time:\u{20}
+                          after_card <approval id>, at <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), \"in 20 minutes\" or \
+                          {seconds:120}, or a rhythm that brings it back each time:\u{20}
                           """
                       + "\"every 0 9,16 * * *\" (cron, Mac clock), \"every 2 hours\", or a schedule object {type: daily|weekly|cron|…}. "
                       + """
-                          until takes a moment as when does: at <ISO time>, in N minutes|hours|days, or {at:\"<ISO time>\"} (it ends itself then); also words \
-                          you check when it comes up, or standing (a rhythm's default).\u{20}
+                          until takes a moment as when does: at <ISO time>, in N minutes|hours|days, {at:\"<ISO time>\"} or {seconds:N} (it ends itself \
+                          then); also words you check when it comes up, or standing (a rhythm's default).\u{20}
                           """
                       + """
                           say is fixed words for the person, said as they are. action:{action:\"authored.<id>\",args:{…}} binds a habit: it runs through \
@@ -761,11 +763,11 @@ extension AppActions {
         .fold("agent_introspect", "diagnostics", "Your live runtime, provider and conversation identity",
               ["detail?:compact|full"], read: true),
         .fold("recent_trace_summary", "diagnostics", """
-            Read traces from the life record; receipts span all conversations unless session_id is explicit, with non-read actions first and complete \
-            retained since windows
+            Read traces from the life record; events stay in this conversation unless scope:all, which reads every conversation and the background \
+            life; receipts span all conversations unless session_id is explicit, with non-read actions first and complete retained since windows
             """,
               ["view?:receipts", "effects_only?:bool", "since?", "limit?:int", "before?", "offset?:int", "completed_turns?:int", "kind?", "name?",
-                  "status?", "session_id?", "turn_id?", "receipt_id?", "fields?:[str]"], read: true),
+                  "status?", "scope?:conversation|all", "session_id?", "turn_id?", "receipt_id?", "fields?:[str]"], read: true),
         .fold("recent_trace_summary", "diagnostics", id: "trace.model_calls", """
             Model calls: per-turn counts by purpose and rounds per turn (p50, p90) for the last 24 hours and 7 days, the top five purposes by total \
             milliseconds, and the week's five heaviest asks with their first six calls; reads retained traces without a model call

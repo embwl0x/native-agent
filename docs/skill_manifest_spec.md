@@ -181,7 +181,7 @@ While on and Autonomy allows unattended work, an ability runs as `authored.<id>`
   This reports a usable Mac network path, not provider health. Transport waits read the immediate state; abilities and `on network.up` intentions receive the
   settled signal.
 
-`agent` identifies non-owner words (untrusted steering or a non-allowlisted sender). The run uses current Trust and its own gate chain. A tainted signal skips write-capable parts with a trace and no card; trusted-agent signals carry owner authority. Required approvals wait; requests for their use `home.arrive {line}`, deduplicated per ability/day/line on its hop-limited thread (an explicit `event_key` uses durable occurrence deduplication instead).
+`agent` identifies non-owner words (untrusted steering or a non-allowlisted sender). The run uses current Trust and its own gate chain. A tainted signal skips write-capable parts with a trace and no card; trusted-agent signals carry owner authority. A required approval answers pending at once with its card; requests for their use `home.arrive {line}`, deduplicated per ability/day/line on its hop-limited thread (an explicit `event_key` uses durable occurrence deduplication instead).
 
 ### Calling a part and projecting its face
 
@@ -369,12 +369,29 @@ decision of that exact call (`PersonAct`), admitted once per run; a row the agen
 of its own is the agent's call, so the tap only asks. A lever's verb (`owner: .person(why, asks:)`)
 is never the agent's at any posture: its call raises the person's card, or is refused where no
 card can carry it; a change that widens the agent's own reach is a lever the same way, and
-lowering it stays the agent's. A lever can name the arguments under which its call only lowers
+lowering it stays the agent's. The person's own words in the conversation are their act too:
+when the call quotes their request in `because`, the quote names the act (`RequestWords.relates`: it
+shares a content word with the act's own words), and the turn's request evidence finds those words
+in their own message of the ask the turn is acting on now (`Turn.personWord`: the turn's own
+message, one that joined it while it ran, or the one a card's continuation carries on; their door;
+never an earlier message, a tool result, a page, a helper, another agent or the agent's own words),
+a lever a card can carry, a raise, or an owner-only setting (Full Mac among them), runs as their
+decision of that exact call (`PersonAct.By.word`), admitted once like a card's Approve, with no card;
+a card still waiting for that call is settled as decided by their word, and the consent record and
+the call's receipt carry their words.
+Safe allows no ask, so no word either; a lever no card can carry stays the person's own act. A lever can name the arguments under which its call only lowers
 (`freely:`): with exactly those arguments the call is the agent's own, and with any other, or with
 them missing, it stays the person's. `sense.switch` is the first: `value: false` turns a sense off
 as the agent's own act; turning one on is the person's consent. An owner of the stem's that needs the person's yes for an exact
 call replies `needs_person`, and the gate puts that call on the person's card; Approve replays it
-as the person's act.
+as the person's act. The door answers the agent's call of a lever a card can carry the same way, so
+that call is the person's card, unless their word decides it, and never a bare refusal; a lever no card can carry is
+refused with where the person does it. A list (`app {actions:[…]}`) whose every change is such an
+ask, two or more of them, is one ask: nothing runs, the door replies `needs_person` for the list,
+and the gate puts the list on one card; Approve replays it as the person's decision of each of its
+calls, each admitted once (`PermissionLaw.decidedCalls`), and Decline leaves everything as it was.
+A setting's own check reads the decided change itself (`PermissionLaw.personDecided(setting:)`),
+whatever `because` rode beside it.
 
 Approval answers (`inbox.approve`, `inbox.deny`, and declining a pending approval
 when putting it away) also accept one exact card on the person's own authenticated
@@ -1249,7 +1266,7 @@ beside `args`; replay compares these outer operational choices exactly.
 Versions returned from a prior taped read remain exact and flow into later
 options. Old action tape rows with no recorded options cannot replay. In
 hand-written fixtures an omitted `options` means `{}`.
-Cards wait; only `app.decide` hands back a bounded checkpoint. Resume returns landed-write receipts without repeating effects. Any prior primitive call (network, program, screen, hands, model, fetch, apps) prevents resume. A fresh-run call is offered only when the runner reports no effects; otherwise its reconciliation remedy stands. An aborted replay still accounts for every effect in the original journal. Changed code, admission, host revision or reads, or a dependency call that no longer fits, visibly refuse/close the saved run, preserving journal and held work. The same world stop at the same place in 2 of the last 3 runs leaves one MY QUEUE upgrade line.
+A card never holds a running call: an app call that needs the person's card answers pending at once with its card and the run sees it (the person's Approve replays that call from the card); only the ability's own authored body, which runs nowhere but in its live run, waits on its card. Only `app.decide` hands back a bounded checkpoint. Resume returns landed-write receipts without repeating effects. Any prior primitive call (network, program, screen, hands, model, fetch, apps) prevents resume. A fresh-run call is offered only when the runner reports no effects; otherwise its reconciliation remedy stands. An aborted replay still accounts for every effect in the original journal. Changed code, admission, host revision or reads, or a dependency call that no longer fits, visibly refuse/close the saved run, preserving journal and held work. The same world stop at the same place in 2 of the last 3 runs leaves one MY QUEUE upgrade line.
 
 The checkpoint owner reports save, inventory, read, seal, claim and cleanup
 failures through the typed failure/remedy shape. A claim verifies one byte

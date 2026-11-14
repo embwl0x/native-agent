@@ -208,6 +208,10 @@ final class PairingStore: ObservableObject {
         material = .unavailable
         NSLog("[PairingStore] %@", message)
     }
+    /// Counts the Mac's acceptances taken here; an open pairing screen closes on the next one.
+    @Published private(set) var macAcceptances = 0
+    /// Where this phone's answer to the Mac's acceptance stands while it is not settled; nil once the Mac has it.
+    @Published private(set) var confirmationStep: String?
     @Published private(set) var connectionRepairPending = UserDefaults.standard.bool(forKey: "mobile.pairing.connectionRepairPending")
     @Published var isRepairingConnection = false
     @Published private(set) var secretStorageError: String?
@@ -393,8 +397,35 @@ final class PairingStore: ObservableObject {
         return iCloudPairingSecret != previousSecret
     }
 
-    // Only a successful pairDevice response completes pairing.
-    func applyICloudPairing() {
+    /// The Mac's acceptance completes pairing: its pairDevice answer or its confirmation message, however often either arrives. Each one is
+    /// acknowledged, so the Mac stops owing it; an acknowledgement that does not reach the Mac is asked for again by the Mac's next confirmation.
+    /// The acknowledgement echoes the acceptance it answers, so it settles that pairing and no later one.
+    /// The Mac's answer to the acknowledgement is awaited and kept in `confirmationStep`, so the phone says which step failed.
+    func applyICloudPairing(acceptance: String?) {
         isICloudPaired = true
+        macAcceptances &+= 1
+        confirmationStep = "Telling your Mac this phone has its acceptance\u{2026}"
+        Task {
+            do {
+                let answer = try await iCloudSyncEngine.shared.sendActionAndWait(.make(action: NAPairingConfirmation.acknowledgement,
+                    payload: [NAPairingConfirmation.acceptanceField: acceptance ?? ""]), intentionalNewRequest: true)
+                // A Mac from before acknowledgements (0.6.17 and earlier) answers "Unknown action": it never owed one, so nothing is left.
+                let predatesAcknowledgement = answer["message"] == "Unknown action: \(NAPairingConfirmation.acknowledgement)"
+                if answer["ok"] == "true" || predatesAcknowledgement {
+                    confirmationStep = nil
+                } else {
+                    let reason = answer["message"] ?? answer["error"] ?? "it gave no reason"
+                    confirmationStep = "Your Mac did not take this phone\u{2019}s confirmation: \(reason)"
+                    NSLog("[PairingStore] pairing acknowledgement refused by the Mac: %@", reason)
+                }
+            } catch is CancellationError {
+            } catch {
+                confirmationStep = """
+                    This phone\u{2019}s confirmation did not reach your Mac: \(error.localizedDescription) Your Mac sends its acceptance again \
+                    when it next hears from this phone.
+                    """
+                NSLog("[PairingStore] pairing acknowledgement not sent; the Mac asks again: %@", error.localizedDescription)
+            }
+        }
     }
 }

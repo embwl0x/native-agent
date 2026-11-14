@@ -397,12 +397,10 @@ public final class AppToolExecutor: ChatToolExecuting {
             return try await doorFind(query, turn: turn, execution: execution)
         case "chat_post":
             let root = securityCenter.dataRoot
-            guard let destination = ConversationAnchor.currentSessionId(dataRoot: root) else {
-                throw ChatOrchestrationError.underlying("The person has no current conversation. Nothing was posted.")
-            }
             guard !turn.id.isEmpty else {
                 throw ChatOrchestrationError.underlying("chat.post requires a current turn. Nothing was posted.")
             }
+            let destination = try await Self.personConversation(dataRoot: root)
             let message = input["message"]?.scalarText ?? ""
             // Post into the user's thread with that thread's route so delivery reaches the user's Mac, phone and Telegram.
             let route = try await HumanConversationReader.read(sessionID: destination, dataRoot: root).route
@@ -665,6 +663,32 @@ public final class AppToolExecutor: ChatToolExecuting {
         default:
             return Self.failure("not_folded", "\(action.id) is not run in process.", extra: ["tool": .string(action.tool)])
         }
+    }
+
+    /// The person's conversation: the one they were last in. A brand-new person has none yet, so the agent's first note opens it: the main
+    /// conversation the window already made, else a new one, anchored as theirs.
+    static func personConversation(dataRoot root: URL) async throws -> String {
+        if let current = ConversationAnchor.currentSessionId(dataRoot: root) { return current }
+        let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: root.appendingPathComponent("chat/sessions.json"))
+        let kinds = SessionConversation(rows: rows)
+        let open = rows.compactMap { row -> (id: String, app: Bool)? in
+            guard case .string(let id)? = row["id"], row["archived"] != .bool(true), kinds.kind(id)?.isPersonConversation == true,
+                  !kinds.isHelper(id) else { return nil }
+            return (id, row["sourceKey"]?.stringValue == "app")
+        }
+        let session: String
+        if let main = open.first(where: \.app) ?? open.first {
+            session = main.id
+        } else {
+            session = UUID().uuidString
+            try await ChatSessionIndexFile.ensureSession(id: session, title: "New Chat", source: "app", sourceKey: "app", kind: .direct,
+                                                        dataRoot: root, context: "chat.post")
+        }
+        // The person may have chosen a conversation while this one was opened: theirs stands, and the note goes there.
+        let opened = try await ConversationAnchor.publish(sessionId: session, source: "app", conversationKind: .direct, dataRoot: root,
+                                                         onlyWhenNone: true)
+        if case .refused(.alreadyAnchored) = opened, let chosen = ConversationAnchor.currentSessionId(dataRoot: root) { return chosen }
+        return session
     }
 
     static func skillSteer(surface: String, turn: Turn) -> [String] {

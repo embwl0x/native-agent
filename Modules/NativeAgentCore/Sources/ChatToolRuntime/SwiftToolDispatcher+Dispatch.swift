@@ -433,8 +433,8 @@ extension SwiftToolDispatcher {
         case let name where Self.macIntegrationAccess(forTool: name) != nil:
             return try await dispatchMacIntegrationTool(turn: turn, invocation: invocation, tool: name, surface: surface, input: input)
         case "mac_location":
-            // The fix the Mac holds answers first, whatever the permission now. Not yet asked: macOS's own prompt is the ask (the reader raises it); the
-            // Settings-row card is for a denial with nothing held.
+            // The fix the Mac holds answers first, whatever the permission now. Not yet asked: the reader's refusal carries the permission card's
+            // remedy; this Settings-row card is for a denial with nothing held.
             let held = try await MacLocationReader.read(context: invocation.macContext(dataRoot: dataRoot))
             let reply = ToolResult(held)
             guard !Task.isCancelled, !invocation.expired else { throw invocation.cancellationError }

@@ -160,6 +160,11 @@ extension AgentConversationSession {
         try replyInFlight(row, transport, dataRoot: dataRoot) || AgentConversationRunning.shared.watched(row.id) || row.queueReservation != nil
             || row.queued?.contains(where: { $0.held == nil || $0.waitingForMac == true }) == true
     }
+    /// What a person's own send waits behind: a reply in flight, a watch, a reservation or an ordinary queued send, never a send held for the Mac.
+    static func inFlightAheadOfPerson(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?, dataRoot: URL) throws -> Bool {
+        try replyInFlight(row, transport, dataRoot: dataRoot) || AgentConversationRunning.shared.watched(row.id) || row.queueReservation != nil
+            || row.queued?.contains(where: { $0.held == nil }) == true
+    }
     /// Admission owns a send before its task registers; only process-exit evidence can abandon that interval.
     static func replyInFlight(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?, dataRoot: URL) throws -> Bool {
         if row.phase == "sending" { return !ownerless(row) }
@@ -226,10 +231,12 @@ extension AgentConversationSession {
         row.operationStartedAt.map { $0 < AbandonedTurnReconciler.processEpoch } == true
             && !AgentConversationRunning.shared.live(row: row.id, operation: row.operationID)
     }
-    /// Process exit ends the local turn without proving a reply or authorizing a resend.
+    /// Process exit ends the local turn without proving a reply or authorizing a resend. Only an owner seen dead may say the work ended; the
+    /// restart sees none, and the other agent may still be working on it (a separate gateway can carry accepted work on), so a resend could
+    /// run it twice.
     package static func restartDetail(_ name: String) -> String {
-        "The app restarted while this was in flight to \(name). It may have reached \(name); if \(name) answers, the answer arrives in this "
-            + "conversation. Nothing was resent; send it again only if no answer comes and you still want it."
+        "The app restarted while this was in flight to \(name). It may have reached \(name), and \(name) may still be working on it; if \(name) "
+            + "answers, the answer arrives in this conversation. Nothing was resent."
     }
     /// A sending row still holds its previous receipt and needs a fresh interruption receipt. Preserve other sends’ locators: remote work may finish after
     /// the local wait ends.
@@ -243,8 +250,8 @@ extension AgentConversationSession {
         }
         let detail = row.phase == "attention"
             ? """
-                An app restart ended this app's wait for \(row.name)'s reply. Nothing was resent; if the reply comes, it still arrives here when \
-                this conversation is read, so send again only if it is still wanted.
+                An app restart ended this app's wait for \(row.name)'s reply; \(row.name) may still be working on it. Nothing was resent; if the \
+                reply comes, it still arrives here when this conversation is read.
                 """
             : restartDetail(row.name)
         func settle(_ fields: inout [String: JSONValue]) {

@@ -226,7 +226,15 @@ extension ApprovalRequest {
 extension NativeAgentEngine {
     @MainActor
     public static func configureInlineInteractionsAtLaunch(startTurn: @escaping InlineInteractionResolver.TurnStarter) {
-        InlineInteractionResolver.startTurn = startTurn
+        // The person's own Mac conversation continues in the window; a card from any other door continues there through that door.
+        InlineInteractionResolver.startTurn = { prompt, sessionID, hideUserBubble, turn in
+            guard let route = turn.envelope?.replyRoute, AgentBridgeCompletionRoute.Kind(surface: route.surface) != .local else {
+                return try await startTurn(prompt, sessionID, hideUserBubble, turn)
+            }
+            try await makeTurnContinuationRuntime(dataRoot: PersistenceCore.defaultDataRoot())
+                .continueInteractionCard(sessionID: sessionID, turn: turn, prompt: prompt)
+            return true
+        }
         // Replay original arguments through the shared dispatcher and ordinary gate; card resolution grants no sibling authority. Keep the filer so
         // confirmations reach the person.
         InlineInteractionResolver.replayBlockedTool = { toolName, argumentsJSON, sessionID, turn in

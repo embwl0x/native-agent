@@ -83,13 +83,18 @@ final class EngineFrontSense {
     func stop() -> Task<Void, Never> {
         if let drain { return drain }
         stopped = true
+        let task = detach()
+        drain = task
+        return task
+    }
+
+    /// A mind closing: observation ends and admitted work is cancelled and joined; the next mind's start observes again.
+    func detach() -> Task<Void, Never> {
         if let observer { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
         observer = nil
         pending = nil
         let admitted = Array(work.values)
         for task in admitted { task.cancel() }
-        let task = Task { await settle { for task in admitted { await task.value } } }
-        drain = task
-        return task
+        return Task { await settle { for task in admitted { await task.value } } }
     }
 }

@@ -150,7 +150,7 @@ struct MacSyncActionRouter {
         let cognition = sync.cognition
         defer {
             Task {
-                await cognition.ingestOrganismSignal(
+                await cognition?.ingestOrganismSignal(
                     kind: .iPhoneReachable,
                     sourceOrgan: "ios",
                     intensity: 0.25,
@@ -163,7 +163,7 @@ struct MacSyncActionRouter {
             }
             if let response = cognitiveResponse {
                 Task {
-                    await cognition.observeRemoteAction(
+                    await cognition?.observeRemoteAction(
                         surface: "ios",
                         action: actionName,
                         payload: payload,
@@ -199,7 +199,20 @@ struct MacSyncActionRouter {
                 }
                 return response
             case "pairDevice":
-                return ["status": "ok", "ok": "true", "message": "This phone is paired."]
+                // The answer names the acceptance it reports, so the phone's acknowledgement settles this pairing and no later one.
+                let acceptance = await sync.pairedPhones.checkedPhones()?.first { $0.id == action.clientId }?.acceptance ?? ""
+                return ["status": "ok", "ok": "true", "message": "This phone is paired.", NAPairingConfirmation.acceptanceField: acceptance]
+            case NAPairingConfirmation.acknowledgement:
+                guard await sync.pairedPhones.confirm(id: action.clientId,
+                                                      acceptance: payload[NAPairingConfirmation.acceptanceField] ?? "") else {
+                    let reason = sync.pairedPhones.message ?? "The confirmation could not be saved."
+                    sync.bridge.pairingConfirmationNote = "The iPhone's confirmation was not taken: \(reason)"
+                    // An answer to an earlier acceptance is met with the current one, now.
+                    sync.bridge.deliverOwedPairingConfirmations()
+                    return ["status": "error", "ok": "false", "message": reason]
+                }
+                sync.bridge.pairingConfirmationNote = nil
+                return ["status": "ok", "ok": "true", "message": "This Mac has the phone's confirmation."]
 
             case "approveApproval", "rejectApproval", "cancelApproval":
                 guard let id = payload["approvalId"], !id.isEmpty else {

@@ -28,7 +28,8 @@ import Browser
 import NotificationInbox
 // Blueprint: | `InlineInteractionContinuation.swift` | Claim before replay; settle after Stop. |
 extension InlineInteractionResolver {
-    /// Claim durably before starting so racing taps resume once; invalidated or resumed claims start nothing.
+    /// Claim durably before starting so racing taps resume once; invalidated or resumed claims start nothing. Settling a card never waits on its
+    /// continuation: the answer may come from a turn in the card's own conversation, which holds the place the continuation needs.
     static func resumeOnce(
         _ interaction: InlineInteraction,
         sessionID: String,
@@ -40,7 +41,9 @@ extension InlineInteractionResolver {
               interaction.continuation?.state == .waiting,
               interaction.continuation?.resumedByTurnId == nil,
               resumesInFlight[interaction.id] == nil else { return }
-        _ = await resumeUnderPeerProvenance(interaction, sessionID: sessionID, dataRoot: dataRoot, turn: turn)
+        Task { @MainActor in
+            _ = await resumeUnderPeerProvenance(interaction, sessionID: sessionID, dataRoot: dataRoot, turn: turn)
+        }
     }
     /// This owner holds the continuation until its effect ends, then writes its one terminal record and releases the slot, even after Stop.
     static func resumeUnderPeerProvenance(
@@ -265,12 +268,32 @@ extension InlineInteractionResolver {
             .with(\.session, sessionID)
             .with(\.modelOverride, binding)
             .with(\.rows.questionRunID, synthetic ? record.continuation?.originRunId : nil)
-        let admitted = await startTurn(prompt, sessionID, synthetic, resumedTurn)
+        let admitted = try await startTurn(prompt, sessionID, synthetic, resumedTurn)
         guard admitted else {
             try Task.checkCancellation()
             throw failure("That couldn't be continued just now. Try again.")
         }
         return (nil, nil)
+    }
+    /// What was underway when the app died is settled once at launch, honestly, as an approval left underway is: a card the departed process left
+    /// running is stopped, interrupted, whether it took effect unknown, and never run again (the person may try it again). A card begun in this
+    /// process is its live owner's; a card waiting on macOS held nothing there, and this launch's GrantWatch resumes its walk. Opening a
+    /// conversation settles the same way what launch could not read or write; false while any of it is unsettled.
+    @discardableResult
+    static func settleInterrupted(sessionID: String, dataRoot: URL) async -> Bool {
+        guard case .success(let pairs) = await checkedInteractionsByRow(sessionID: sessionID, dataRoot: dataRoot) else { return false }
+        var settled = true
+        for (_, interaction) in pairs where interaction.state == .running && interaction.waitingOn == nil && !begunHere.contains(interaction.id) {
+            let stopped = interaction.stopped(reason: "The app closed while this was underway; whether it took effect is unknown. It was not run again.")
+            do {
+                try await persist(stopped, sessionID: sessionID, ifRevision: interaction.revision, dataRoot: dataRoot,
+                                  expecting: { $0.state == .running })
+            } catch {
+                nativeLog("[interaction] interrupted card not settled for \(interaction.id): \(error)")
+                settled = false
+            }
+        }
+        return settled
     }
     /// Reclaim only same-life work stranded by process exit. Cross-life reads are stopped, so conversation open cannot replay a restored card.
     public static func reclaimStrandedContinuations(
@@ -278,6 +301,8 @@ extension InlineInteractionResolver {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async {
         guard !reclaimedSessions.contains(sessionID) else { return }
+        // What launch could not read or settle is settled here, the same way; a card it settled is already stopped.
+        var reconciled = await settleInterrupted(sessionID: sessionID, dataRoot: dataRoot)
         let read: (rows: [JSONValue], lifeID: String)
         do {
             read = try await checkedRows(sessionID, dataRoot)
@@ -285,26 +310,11 @@ extension InlineInteractionResolver {
             return
         }
         // Mark the session only after its checked read and mutations succeed.
-        var reconciled = true
         let pairs = await Task.detached { interactionsByRow(in: read.rows, lifeID: read.lifeID) }.value
         for (_, interaction) in pairs {
-            // A same-life control held by the departed process needs a new tap. A card waiting on macOS held nothing there: this launch's GrantWatch
-            // resumes its walk at the item it recorded.
-            if case .running = interaction.state, interaction.waitingOn == nil {
-                let orphaned = interaction.failed(
-                    reason: "The app closed before this finished."
-                )
-                do {
-                    try await persist(
-                        orphaned, sessionID: sessionID, ifRevision: interaction.revision,
-                        dataRoot: dataRoot,
-                        expecting: { $0.continuation?.state == interaction.continuation?.state }
-                    )
-                } catch {
-                    reconciled = false
-                }
-                continue
-            }
+            // A running control is its live owner's, or one the departed process left that `settleInterrupted` could not settle (retried on the
+            // next open). A card waiting on macOS held nothing there: this launch's GrantWatch resumes its walk at the item it recorded.
+            if case .running = interaction.state, interaction.waitingOn == nil { continue }
             // Mid-dispatch/admission has an unknown outcome; only the person retries.
             if interaction.continuation?.state == .replaying,
                resumesInFlight[interaction.id] == nil {

@@ -6,14 +6,15 @@ import ToolRegistry
 
 /// Peer sessions keep ordinary agent context, but untrusted peer-steered effects require the person's decision.
 public enum PeerTurnEffectPolicy {
-    /// The declared contract, not a name or argument reading: a peer-steered call that is not a read needs the person.
+    /// The declared contract, not a name or argument reading: a peer-steered call that is not a read needs the person, except the agent's own
+    /// words to its own person (`voice`), which no one's steering turns into the person's approval.
     public static func requiresPeerApproval(
         _ tool: String,
         input: [String: JSONValue] = [:],
         turn: Turn?
     ) throws -> Bool {
         // A folded door action is a read here: it re-enters under its own tool and is judged there.
-        try PermissionLaw.toolClass(tool, input: input, turn: turn) != .read
+        try PermissionLaw.toolClass(tool, input: input, turn: turn) != .read && !PermissionLaw.voice(tool: tool, input: input, turn: turn)
     }
 
     public static func normalized(_ tool: String) -> String {

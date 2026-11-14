@@ -107,7 +107,8 @@ public actor LivingStatusOwner {
         guard coalescer.requestRefresh() else { return }
         repeat {
             _ = await latest.read({ await read(view: view, desk: desk, agentDisplayName: agentDisplayName) }, publish: { outcome in
-                if let snapshot = outcome.snapshot { reading.livingSnapshot = snapshot }
+                // A failed read keeps the last snapshot; with no mind running there is none, never the last mind's shown as current.
+                if outcome.snapshot != nil || outcome.failed.isEmpty { reading.livingSnapshot = outcome.snapshot }
                 let now = Date()
                 reading.livingRefreshStatus = PanelRefreshStatus(lastAttemptAt: now,
                     lastSuccessAt: outcome.failed.isEmpty ? now : reading.livingRefreshStatus?.lastSuccessAt, failedEndpoints: outcome.failed)
@@ -119,7 +120,7 @@ public actor LivingStatusOwner {
 
     private func read(view: CognitionViewFacade, desk: DeskFacade, agentDisplayName: @Sendable () async -> String) async
         -> (snapshot: LivingStatusSnapshot?, failed: [String]) {
-        guard let organism = await view.organismSnapshot() else { return (nil, ["Cognition"]) }
+        guard let organism = await view.organismSnapshot() else { return (nil, view.runtime == nil ? [] : ["Cognition"]) }
         let board = await desk.loadBoard()
         guard let overview = board.overview else { return (nil, ["Desk"]) }
         var failed = overview.unavailable.isEmpty ? [] : ["Desk"]

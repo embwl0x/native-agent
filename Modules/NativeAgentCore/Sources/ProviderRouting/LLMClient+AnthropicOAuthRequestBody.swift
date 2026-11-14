@@ -198,10 +198,11 @@ extension AnthropicOAuthTransport {
         return true
     }
 
-    /// The server stops text-tool replies at the declared protocol boundary.
+    /// The server stops a text-tool reply where the model starts writing results itself. Where a call block ends is read by the app
+    /// (`endingCallBlock`): a stop mark on the block's closing letters would also fire inside a call's own content.
     static func applyTextLaneStops(to body: inout [String: Any], system: String?, call: LLMCall) {
         if system?.contains(textToolProtocolHeader) == true {
-            body["stop_sequences"] = ["</function_calls>", "<function_results>", "\n<tool_result", "\nNativeAgent tool result #"]
+            body["stop_sequences"] = ["<function_results>", "\n<tool_result", "\nNativeAgent tool result #"]
             TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L01"), "site": .string(
                 "LLMClient+AnthropicOAuthRequestBody.swift:applyTextLaneStops")]), turn: call.turn)
         }

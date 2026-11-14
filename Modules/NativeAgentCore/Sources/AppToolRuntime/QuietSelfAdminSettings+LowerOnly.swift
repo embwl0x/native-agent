@@ -322,7 +322,8 @@ extension QuietLowerOnlySettingsHost {
                 let label = "\(name) \(mode == "read" ? "Read" : "Write")"
                 rows.append(QuietSetting(
                     id: axisID, page: "trust", label: label, kind: .boolean,
-                    note: "One axis of \(name) access. You may turn it off; turning it on is the person's at every posture. Off fences Full Mac too.",
+                    note: "One axis of \(name) access. You may turn it off; turning it on is the person's at every posture (your call asks them "
+                        + "on a card). Off fences Full Mac too.",
                     read: { _ in .bool(try await current().contains(mode)) },
                     write: { _, value, context in
                         let on = try QuietSettings.boolValue(value, label)

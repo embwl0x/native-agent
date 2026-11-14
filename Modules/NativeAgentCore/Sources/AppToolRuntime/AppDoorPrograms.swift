@@ -22,7 +22,7 @@ import TrustCenter
 import Senses
 import PersonaEngine
 import Desk
-// Blueprint: | `AppDoorPrograms.swift` | Ordered gated calls; a failed, waiting or unexpected step bars later changes, not reads or cleanups; their `then_say` stands only when the deed came back wholly as said |
+// Blueprint: | `AppDoorPrograms.swift` | Ordered gated calls; a failed, waiting or unexpected step bars later changes, not reads or cleanups; changes that are all the person's to decide are one card; their `then_say` stands only when the deed came back wholly as said |
 extension AppToolExecutor {
     /// Every preview says who would receive a card, including refusals that stop before card filing and script previews of the calls reached.
     static func previewApproval(_ value: JSONValue, preview: Bool) -> JSONValue {
@@ -106,6 +106,8 @@ extension AppToolExecutor {
                     remedy: "correct_arguments", "Give then_say with it, and each slot as {found: \"<step>.<path>\"}, then call again.")
             }
         }
+        // Several changes that are all the person's to decide, asked together, are one ask: one card for the list, never a card each.
+        if let together = await doorAsksTogether(entries, base: base, turn: turn, execution: execution) { return together }
         let named = Dictionary(uniqueKeysWithValues: names.map { ($0.value, $0.key) })
         let snapshot = execution.notesSnapshot ?? DoorNotesSnapshot()
         var batchExecution = execution
@@ -376,6 +378,96 @@ extension AppToolExecutor {
             return .object(result)
         }
     }
+    /// A list whose every change is the person's to decide (a lever a card can carry, or a setting change that widens what the agent may do),
+    /// two or more of them, is one ask: nothing runs, and the answer (`needs_person`, as one such call gives) has the gate file one card for
+    /// the exact list. The person's Approve replays the list as their decision of each of its calls, each by its own place
+    /// (`PermissionLaw.decidedCalls`); their Decline leaves everything as it was. Reads may sit among them, and a change already as asked is
+    /// no ask: it stays in the list, is left off the card's asks and is reported as already so. A list the person already decided, a preview
+    /// (read as the door reads it, after the call's own reading), a step that takes a found value or any other change runs as a list always
+    /// has: each ask then stops it on its own card.
+    @MainActor
+    func doorAsksTogether(_ entries: [JSONValue], base: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue? {
+        guard entries.count >= 2, base["action"] == nil,
+              !PermissionLaw.personDecided(tool: "app", input: ["actions": .array(entries)], turn: turn) else { return nil }
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        var asks: [(step: Int, words: String)] = []
+        var already: [(step: Int, words: String)] = []
+        for (index, entry) in entries.enumerated() {
+            guard case .object(let fields) = entry, fields["cleanup"] != .bool(true) else { return nil }
+            // The step as the list runs it: its own reading first, then the list's preview over it, so a preview written anywhere is one.
+            var call = base.filter { $0.key != "expected_version" && !ToolNameAliases.appDeedKeys.contains($0.key) }
+            call.merge(fields.filter { !["expect", "as", "cleanup"].contains($0.key) }) { $1 }
+            call = ToolNameAliases.doorCall("app", call)
+            if base["preview"] == .bool(true) { call["preview"] = .bool(true) }
+            // A preview never files a card.
+            guard call["preview"] != .bool(true) else { return nil }
+            guard let action = (try? await AppActions.resolvedAction(Self.doorText(call["action"]), dataRoot: root, turn: turn))?.action else {
+                if Self.doorCertainRead(call) { continue }
+                return nil
+            }
+            let args = call["args"]?.objectValue ?? [:]
+            if action.readOnly(args: args) { continue }
+            guard !Self.doorCarriesFound(.object(args)),
+                  let ask = await doorAsk(action, args: args, root: root, turn: turn, execution: execution) else { return nil }
+            switch ask {
+            case .ask(let words): asks.append((step: index + 1, words: words))
+            case .already(let words): already.append((step: index + 1, words: words))
+            }
+        }
+        guard asks.count >= 2 else { return nil }
+        let said = asks.dropLast().map { $0.words }.joined(separator: ", ") + " and " + (asks.last?.words ?? "")
+        let asIs = already.isEmpty ? "" : " Already so, and left as it is: " + already.map { $0.words }.joined(separator: ", ") + "."
+        return .object([
+            "status": .string("needs_person"), "reason": .string("owners_call"), "effects": .string("none"), "execution": .string("not_run"),
+            "detail": .string("\(said.prefix(1).uppercased() + said.dropFirst()) are the person's to decide. Only their yes on one card for these "
+                + "\(asks.count) changes together runs them; nothing was done.\(asIs)"),
+            "asks": .array(asks.map { .object(["step": .int(Int64($0.step)), "words": .string($0.words)]) }),
+            "already": .array(already.map { .object(["step": .int(Int64($0.step)), "words": .string($0.words)]) }),
+            "steps_total": .int(Int64(entries.count)),
+        ])
+    }
+
+    /// One change of a list, for the person's card: theirs to decide in these words, or already as asked.
+    enum DoorAsk { case ask(String), already(String) }
+
+    /// The person's words for one change that is theirs to decide and that a card can carry, `already` when the change is already as
+    /// asked, or nil when the change is neither (an ordinary change the list runs as its own).
+    @MainActor
+    private func doorAsk(_ action: AppAction, args: [String: JSONValue], root: URL, turn: Turn, execution: AppActionExecution) async -> DoorAsk? {
+        if action.id == "setting.set" {
+            let id = Self.doorText(args["setting"])
+            let value = args["value"] ?? .null
+            let setting = try? await QuietSettings.setting(id: id, host: quietHost())
+            let label = setting?.label ?? id
+            let wanted = value == .bool(true) ? "on" : value == .bool(false) ? "off" : value.scalarText ?? "that"
+            // A change already as asked is no ask; it runs as nothing on approval.
+            if let setting, let host = quietHost(), let current = try? await setting.read(host) {
+                let asked: JSONValue? = setting.kind == .boolean ? (try? QuietSettings.boolValue(value, label)).map(JSONValue.bool) : value
+                if asked == current { return .already("\(label) is already \(wanted)") }
+            }
+            // The setting's own check says whether this change widens what the agent may do: its raise is the person's ask.
+            guard case .object(let refused)? = await settingRefusal(input: action.binding.arguments(args), turn: turn, execution: execution),
+                  refused["status"] == .string("needs_person") else { return nil }
+            return .ask("changing \(label) to \(wanted)")
+        }
+        // A lever a card can carry, which the gate asks for at every posture that allows an ask.
+        guard let lever = action.lever, lever.asks, lever.holds(args),
+              !PermissionLaw.personDecided(tool: "app", input: ["action": .string(action.id), "args": .object(args)], turn: turn),
+              let posture = await Self.freshQuietPosture(dataRoot: root), posture.changesAllowed else { return nil }
+        return .ask((lever.name.isEmpty ? action.id : lever.name.prefix(1).lowercased() + lever.name.dropFirst()) + " (" + lever.why + ")")
+    }
+
+    /// Whether a step's arguments take a value from an earlier step, which is only there once that step has run.
+    static func doorCarriesFound(_ value: JSONValue) -> Bool {
+        switch value {
+        case .object(let fields):
+            if fields.count == 1, fields["found"]?.stringValue != nil { return true }
+            return fields.values.contains { doorCarriesFound($0) }
+        case .array(let items): return items.contains { doorCarriesFound($0) }
+        default: return false
+        }
+    }
+
     /// A place that did not come back as said: where, the shape said there, and what was there (nil when nothing was).
     typealias DoorMiss = (place: String, expected: JSONValue, found: JSONValue?)
     /// A found reference with nothing behind it, and what was at the deepest place reached.

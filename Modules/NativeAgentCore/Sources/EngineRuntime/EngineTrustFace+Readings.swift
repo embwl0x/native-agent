@@ -83,8 +83,8 @@ extension NativeAgentEngine {
     }
 
     /// The reach on this Mac: each macOS grant read live and without prompting, as the permission card reads it and in the order a card asks;
-    /// never a saved copy. Automation is per app, read by the Mac-access owner's last non-prompting probe, and asked in context the first time
-    /// that app is needed. Asking and opening System Settings are the person's levers, in the foreground on this Mac (`trust.ask_grant`,
+    /// never a saved copy. Automation is per app, read by the Mac-access owner's last non-prompting probe, and asked on the same first card as
+    /// the rest of the reach. Asking and opening System Settings are the person's levers, in the foreground on this Mac (`trust.ask_grant`,
     /// `trust.grant_settings`); the agent asks with its own permission card.
     func trustSystemFace() async -> PartFace.Section {
         let systemStatuses = await macIntegration.systemStatuses
@@ -99,7 +99,7 @@ extension NativeAgentEngine {
         }
         var rows: [PartFace.Row] = []
         var off = 0
-        for target in SystemPermissionPreflight.frictionOrder(trustReachGrants.map { "privacy:" + $0.rawValue }) {
+        for target in SystemPermissionPreflight.frictionOrder(SystemPermissionPreflight.reach.map { "privacy:" + $0.rawValue }) {
             guard let gate = SystemPermissionPreflight.cardSettingsCapability(target) else { continue }
             let path = "Turned on in " + SystemPermissionPreflight.settingsPath(gate) + "."
             if await SystemPermissionPreflight.cardBlockReason([target], mode: nil) != nil {
@@ -116,7 +116,7 @@ extension NativeAgentEngine {
         for app in AppleScriptExecution.automationTargetApps {
             guard let bundle = AppleScriptExecution.automationTargetBundleIDs[app] else { continue }
             let id = "grant.automation." + app.lowercased(), title = "Automation for " + app, target = "applescript:" + bundle
-            let detail = "Asked in context, the first time \(app) is needed."
+            let detail = "macOS asks this in place, on the permission card with the other grants."
             guard let state = systemStatuses[AppleScriptExecution.automationStatusKey(app: app)] else {
                 off += 1
                 rows.append(.init(id: id, title: title, detail: detail, value: "Not read yet", tone: .attention, actions: [open(target)]))
@@ -201,8 +201,3 @@ extension NativeAgentEngine {
                 + "My own windows and the lock screen are always excluded.", rows: rows)
     }
 }
-
-/// The macOS grants that make up the reach on this Mac, as the permission card names them. Automation is per app and asked in context, so it is
-/// not part of the reach.
-private let trustReachGrants: [SystemPermissionCapability] = [.notifications, .calendars, .reminders, .contacts, .microphone, .speechRecognition,
-    .accessibility, .screenRecording, .inputMonitoring, .fullDiskAccess]

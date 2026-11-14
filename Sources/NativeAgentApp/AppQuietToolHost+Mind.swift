@@ -63,8 +63,9 @@ extension AppQuietToolHost {
                 return (true, "The night's reading of your parts, as numbers and ids.", reading)
             } catch { return (false, error.localizedDescription, ["argument_path": .string("since")]) }
         }
+        guard let runtime = NativeAgentEngine.liveCognition else { return (false, "There is no running mind: it starts when setup finishes.", [:]) }
         return await AppToolExecutor.runQuietMind(
-            verb: verb, input: input, runtime: NativeAgentEngine.liveCognition,
+            verb: verb, input: input, runtime: runtime,
             dataRoot: appModel.engine.dataRoot, remPolicy: trustPolicy, turn: turn,
             dreamEnabled: { try await dreamEnabled() },
             runDream: {

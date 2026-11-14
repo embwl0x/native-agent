@@ -108,6 +108,24 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             response(400, ["error": "missing_text"])
             return
         }
+        // Only allowlisted script senders may override the route's sender name.
+        let sender: String = {
+            if let named = (json["sender"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+               Self.scriptSenders.contains(named) {
+                return named
+            }
+            return defaultSender
+        }()
+        // The shared bearer cannot say who is calling, so a contact's message arrives only with the contact's own identity; the bearer alone
+        // carries nothing but a script's receipt into the selected chat.
+        if principal.peerID == nil, sender == defaultSender {
+            response(403, ["error": "contact_identity_required", "detail": """
+                The bridge bearer cannot say who is calling, so it carries no message. Send the contact's identity with it \
+                (x-nativeagent-peer-id and x-nativeagent-peer-secret, from the contact's connection entry), or message through the nativeagent \
+                link or /agent/message with the contact's own bearer.
+                """])
+            return
+        }
         let dataRoot = PersistenceCore.defaultDataRoot()
         let owner: String
         do { owner = try AgentContactIdentity(dataRoot: dataRoot).canonical("peer:" + principal.id) }
@@ -118,14 +136,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         let preparedImages = Self.prepareBridgeImages(json["image_paths"] as? [String] ?? [])
         let attachments = preparedImages.attachments
         let imageSkips = preparedImages.skips
-        // Only allowlisted script senders may override the route's sender name.
-        let sender: String = {
-            if let named = (json["sender"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-               Self.scriptSenders.contains(named) {
-                return named
-            }
-            return defaultSender
-        }()
         // Peers default to their own conversation; scripts use the active chat.
         let selectedSession: String?
         do {

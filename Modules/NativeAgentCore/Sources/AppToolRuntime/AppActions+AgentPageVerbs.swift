@@ -18,7 +18,7 @@ extension AppActions {
                           tool: "upkeep", input: verb("desk_remind")),
                 AppAction("desk.veto", "desk", "Veto a pursuit: close it as the person's no", ["handle"], subject: ["handle"],
                           owner: .person("a veto is the person's no to the agent's own pursuit",
-                                         instead: "desk.close {handle, reason} closes a pursuit of your own", asks: false, name: "Vetoing one of my pursuits"),
+                                         instead: "desk.close {handle, reason} closes a pursuit of your own", name: "Vetoing one of my pursuits"),
                           irreversible: true, tool: "upkeep", input: verb("desk_veto")),
                 AppAction("memories.search", "memories", "Search the Memories page (three letters or more; empty shows every memory)",
                           ["value"], tool: "upkeep", input: verb("memories_search"), read: true),

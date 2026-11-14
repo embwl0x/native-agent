@@ -371,13 +371,7 @@ extension SystemPermissionPreflight {
             }
             let current: SystemPermissionStatus
             if gate == .notifications {
-                let settings = await UNUserNotificationCenter.current().notificationSettings()
-                switch settings.authorizationStatus {
-                case .authorized, .provisional: current = .granted
-                case .notDetermined: current = .notDetermined
-                case .denied: current = .denied
-                default: current = .unknown
-                }
+                current = await notificationStatus()
             } else if gate == .fullDiskAccess {
                 let snapshot = Self.snapshot(gate)
                 if snapshot.status == .unknown { return snapshot.detail }
@@ -429,6 +423,74 @@ extension SystemPermissionPreflight {
         case .some(.restart): return true
         case .some(.target(let id)): return cardSettingsCapability(id).map { appliesAtLaunch.contains($0) } ?? false
         case nil: return false
+        }
+    }
+
+    /// The macOS grants that make up the reach on this Mac, as the permission card names them; each app's Automation joins them from
+    /// `AppleScriptExecution.automationTargetApps`.
+    public static let reach: [SystemPermissionCapability] = [.notifications, .calendars, .reminders, .contacts, .microphone, .speechRecognition,
+        .accessibility, .screenRecording, .inputMonitoring, .fullDiskAccess]
+
+    /// The whole reach as it reads now, from the app's own grant reading and never the screen, never prompting: what a walk through System
+    /// Settings reports after each pane, so it says what is granted rather than what it hoped landed.
+    public static func reachNow() async -> (text: String, detail: JSONValue) {
+        var granted: [String] = [], off: [String] = [], restart: [String] = [], unknown: [String] = []
+        var fields: [String: JSONValue] = [:]
+        for target in frictionOrder(reach.map { "privacy:" + $0.rawValue }) {
+            guard let gate = cardSettingsCapability(target) else { continue }
+            // An unreadable grant stays unknown with its cause; it is never reported as off.
+            let reading: SystemPermissionSnapshot
+            switch gate {
+            case .notifications: reading = SystemPermissionSnapshot(capability: gate, status: await notificationStatus())
+            case .fullDiskAccess: reading = snapshot(gate)
+            default: reading = SystemPermissionSnapshot(capability: gate, status: cardStatus(gate, mode: nil))
+            }
+            switch reading.status {
+            case .unknown:
+                let cause = reading.detail.isEmpty ? "macOS gave no reading" : reading.detail
+                unknown.append(gate.displayName + " (" + cause + ")")
+                fields[gate.rawValue] = .object(["status": .string("unknown"), "cause": .string(cause)])
+            case .granted where !launchPending([target]).isEmpty:
+                restart.append(gate.displayName)
+                fields[gate.rawValue] = .string("granted_after_restart")
+            case .granted:
+                granted.append(gate.displayName)
+                fields[gate.rawValue] = .string("granted")
+            case .denied, .notDetermined, .restricted:
+                // A launch-applied grant switched on after this launch may still read off until the one restart.
+                off.append(gate.displayName + (appliesAtLaunch.contains(gate) ? " (counts from the next launch once it is on)" : ""))
+                fields[gate.rawValue] = .string(reading.status.rawValue)
+            }
+        }
+        var automation: [String] = []
+        for app in AppleScriptExecution.automationTargetApps {
+            guard let bundleID = AppleScriptExecution.automationTargetBundleIDs[app] else { continue }
+            guard case .object(let probe) = await AppleScriptExecution.automationPermission(bundleID: bundleID) else { continue }
+            let (words, state): (String, String) = switch probe["code"] {
+            case .int(0)?: ("granted", "granted")
+            case .int(-1743)?: ("denied", "denied")
+            case .int(-1744)?: ("not asked yet", "not_determined")
+            case .int(-600)?: ("unread while \(app) is not running", "app_not_running")
+            default: ("unknown (" + (probe["detail"]?.stringValue ?? "macOS gave no reading") + ")", "unknown")
+            }
+            automation.append(app + " " + words)
+            fields["automation." + app.lowercased()] = .string(state)
+        }
+        func list(_ names: [String]) -> String { names.isEmpty ? "none" : names.joined(separator: ", ") }
+        var text = "macOS grants now, read by the app itself: granted: \(list(granted)); not granted: \(list(off))"
+        if !restart.isEmpty { text += "; granted, takes effect after one restart: \(list(restart))" }
+        if !unknown.isEmpty { text += "; unknown: \(list(unknown))" }
+        text += "; Automation: \(list(automation))."
+        return (text, .object(fields))
+    }
+
+    /// The notification grant as macOS reports it for this app, never prompting.
+    static func notificationStatus() async -> SystemPermissionStatus {
+        switch await UNUserNotificationCenter.current().notificationSettings().authorizationStatus {
+        case .authorized, .provisional: return .granted
+        case .notDetermined: return .notDetermined
+        case .denied: return .denied
+        default: return .unknown
         }
     }
 

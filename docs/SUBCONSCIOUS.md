@@ -418,6 +418,10 @@ alongside the previous position's "changed my mind" note.
 Evidence older than a care's newest moment joins its story, including stance
 pressure, without changing its gap or held stance. A new care first meets the whole live
 and faded inventory through the same warm memory embedder and care-vector cache.
+A moment's fold runs after the reply, so it first warms that embedder and awaits
+the load (`NativeCognitionRuntime.warmEmbedderForOwnWork`, shared with the
+night); a cold model never leaves a care birth owed. A model that cannot load
+leaves the fold owed with its own cause.
 `VectorMath.standout` uses recall's
 `ContextSelectionConfiguration.memoryStandoutDeviations` (2σ); the nearest
 standing care with the same `with` receives the movement, with the new phrasing
@@ -458,7 +462,10 @@ newest first, one plain line each ("<date>: <about> became part of my
 most 24. `traits` and `story` now carry their dream-authored self-reading,
 with `shown_by` evidence; `self_night` names the committed diary. `people`
 contains one line per retained person (two in compact detail, all in full).
-`self_unavailable` reports an unreadable self file. The Personality page shows
+`self_unavailable` reports an unreadable self file. `next_night` is the rhythm's
+own reading (`NativeCognitionRuntime.nextNight`, the one Today shows): its time
+`at`, or why none is due (the person is here, with `hereSince`; or whether the
+person is here is unknown), or `unavailable` with the reason. The Personality page shows
 the same resident traits and story read-only; it does not edit their persona.
 
 **The night.** After the nightly dream commits its diary
@@ -497,10 +504,12 @@ tally rather than admitting damaged care history.
   offered, saved (including duplicate reassertions) and failed saves. The
   reading, bounds and memory kinds are defined once in
   [They learns from surprise](SURPRISE.md#they-learns-from-surprise).
-- A care-night evidence failure leaves the dream uncommitted. Cold or failed
-  embeddings and unreadable self/people evidence throw through the shared dream
-  provider; `nil` is reserved for an explicitly disabled inner life. A later
-  admitted pass attempts the reading again.
+- A care-night evidence failure leaves the dream uncommitted. The shared dream
+  provider first warms the embedder the night reads through, awaiting the load
+  itself (`warmEmbedderForOwnWork`), so a cold model is loaded rather than a failure; a model that cannot
+  load, failed embeddings and unreadable self/people evidence throw through it;
+  `nil` is reserved for an explicitly disabled inner life. A later admitted pass
+  attempts the reading again.
 - One care per thing. The same dream block includes at most six clusters of
   six live cares: same `with`, each pair standing at least 2σ in both directions
   against the live inventory excluding self, using the shared cached vectors.
@@ -1126,9 +1135,9 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
   A malformed row or missing field node refuses that node's claim and owes repair while sibling crossings proceed; a failure of the
   shared record channel, or a row whose node cannot be read, holds the unfinished batch.
   Already admitted batches finish even if sleep begins while their record is being written; subsequent world batches wait.
-- **Before setup (known gap).** The mind starts at launch, before onboarding has completed, so attention, the night and
-  microcycles can run before the agent exists (a fresh installation's first night ran REM against a persona not yet written).
-  The design to close it is to start the mind only once setup finishes ([Automated Systems §2](AUTOMATED_SYSTEMS.md)).
+- **Before setup.** The mind starts when the agent exists: until setup has finished there is no runtime, no attention and no
+  night, so nothing arms; happenings stay owed and attention opens on them when the mind starts. A reset closes the mind before
+  the identity is removed ([Automated Systems §2](AUTOMATED_SYSTEMS.md)).
 - **Sleep.** From the admitted night until it settles the agent is asleep: owed happenings still open thoughts and the world
   waits unweighed. Waking (the night settled, something owed arrived, a message arrived, the person arrived) records
   `attention.wake` and weighs what waited, once, in mode `waking`.

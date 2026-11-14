@@ -185,9 +185,14 @@ extension AppToolExecutor {
                     fields["happening"] = try JSONValue.fromEncodable(experience.happening)
                     return .object(fields)
                 }
-                return .object(["status": .string("ok"), "of": .string(grain), "matched_total": .int(Int64(page.total)),
-                    "returned": .int(Int64(items.count)), "has_more": .bool(page.total > items.count),
-                    "items": .array(items), "effects": .string("none")])
+                // A record that will not fold is named with its cause beside the ones that do.
+                let unreadable: [JSONValue] = page.unreadable.map { record in
+                    .object(["id": .string(record.id), "event": .int(record.seq), "error": .string(record.words)])
+                }
+                return .object(["status": .string(unreadable.isEmpty ? "ok" : "partial"), "of": .string(grain),
+                    "matched_total": .int(Int64(page.total)), "returned": .int(Int64(items.count)),
+                    "has_more": .bool(page.total > items.count + unreadable.count), "items": .array(items), "unreadable": .array(unreadable),
+                    "effects": .string("none")])
             }
             let since: Date?
             if let text = input["since"]?.stringValue {
@@ -579,6 +584,12 @@ extension AppToolExecutor {
                 return AgentWorkspace.resolvedRead(try await runAppDoor(input: input, surface: surface, inProcess: inProcess, turn: turn,
                     execution: execution), as: page.id)
             }
+            // A reference Home issued is claimed by Home first; a name no owner, page or home name claims opens the one page item that shows it.
+            if !(await AgentWorkspaceNavigation.shared.issued(named, dataRoot: root, scope: scope)),
+               await AgentScreen.classify(workspace: workspace, named, dataRoot: root, scope: scope) == .unknown,
+               let shown = try await doorShownName(named, input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution) {
+                return shown
+            }
         }
         // Other keys app does not take still fail loudly; a deed key sent as null was omitted.
         for key in ToolNameAliases.appDeedKeys where input[key] == .null { input.removeValue(forKey: key) }
@@ -592,7 +603,7 @@ extension AppToolExecutor {
             }
             return Self.doorRefusal("unknown_key",
                 "app takes no \(stray.joined(separator: ", ")). Its keys are page, item, action, args, actions, preview, "
-                + "expected_version, find and script, and then_say and with beside actions. An action's own arguments go inside args, "
+                + "expected_version, because, find and script, and then_say and with beside actions. An action's own arguments go inside args, "
                 + "or beside action when the call has no args. Nothing was read or done.",
                 remedy: "correct_arguments", "Call app again with only those keys; {} lists the pages.",
                 next: [:], extra: ["unrecognised": .array(stray.map(JSONValue.string)), "valid": .array(valid.sorted().map(JSONValue.string))])
@@ -601,12 +612,12 @@ extension AppToolExecutor {
         if let entries = input["actions"], entries != .null {
             let beside = input.filter { $0.key != "actions" && $0.value != .null }
             guard case .array(let list) = entries,
-                  beside.keys.allSatisfy({ $0.hasPrefix("__") || ["preview", "expected_version"].contains($0)
+                  beside.keys.allSatisfy({ $0.hasPrefix("__") || ["preview", "expected_version", "because"].contains($0)
                       || ToolNameAliases.appDeedKeys.contains($0) }) else {
                 let advice = try Self.doorBatchAdvice(entries, input: input)
                 return Self.doorRefusal("invalid_actions",
                     "actions is a list of app calls ({action, args}, {page[, item]} or {item}, each may add expect, as and cleanup) "
-                    + "and takes only preview, expected_version, then_say and with beside it. Nothing was run.",
+                    + "and takes only preview, expected_version, because, then_say and with beside it. Nothing was run.",
                     remedy: "correct_arguments", "Use try_instead's actions call, or its declared shape with your supplied values.",
                     next: advice.objectValue, extra: ["try_instead": advice])
             }
@@ -755,8 +766,12 @@ extension AppToolExecutor {
                 return Self.doorRefusal("item_action", "That home name acts; a page only reads.", remedy: "open_item",
                     "Use item to invoke it explicitly.", next: ["item": .string(name)])
             }
-            return Self.doorRefusal("unknown_page", "No page is called that.", remedy: "read_index",
-                "Read {} for the pages; nothing was done.", next: [:],
+            if item.isEmpty,
+               let shown = try await doorShownName(page, input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution) {
+                return shown
+            }
+            return Self.doorRefusal("unknown_page", "No page is called that, and no page shows a row by that name.", remedy: "read_index",
+                "Read {} for the pages; a page's own row opens with app {page:\"<page>\", item:\"<row>\"}. Nothing was done.", next: [:],
                 extra: ["requested": .string(page), "pages": .array(try await doorPages.map { .string($0.id) })])
         }
         switch input["args"] {
@@ -813,8 +828,9 @@ extension AppToolExecutor {
             try await AgentWorkspaceNavigation.shared.rememberDoorPage(
                 workspace: workspace, resolved.id, dataRoot: root, scope: scope)
         }
-        if page != resolved.id { read["resolved"] = .string(resolved.id) }
-        read["version"] = try read["version"] ?? .string(Self.doorVersion(page: resolved.id, item: catalog ? "" : item, read))
+        // A row that opens another place read that place (`doorOpened`): its version and `resolved` already name it.
+        read["version"] = try read["version"] ?? .string(Self.doorVersion(asked: resolved.id, item: catalog ? "" : item, read))
+        if page != resolved.id, read["resolved"] == nil { read["resolved"] = .string(resolved.id) }
         if item.isEmpty, let items = Self.doorItemReads[resolved.id] {
             read["item_reads"] = .array(items.sorted { $0.key < $1.key }.map { .string("\($0.key): \($0.value)") })
         }

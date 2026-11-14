@@ -29,17 +29,55 @@ extension iCloudBridge {
             guard setupGeneration == generation else { return }
             syncStatus = "Mac presence could not be read: \(error.localizedDescription)"
         }
+        guard setupGeneration == generation else { return }
+        await readMacPairingKey()
+    }
+
+    /// Reads the key the Mac publishes in iCloud and holds it, whatever this phone held before (a wipe, a reinstall, Regenerate, another
+    /// install on the same Apple Account): the published key is the pairing. Returns whether a different key was installed.
+    @discardableResult
+    func readMacPairingKey(rechecked: Bool = false) async -> Bool {
+        guard pairingStore?.isRepairingConnection != true, let transport = deviceTransport else { return false }
+        let generation = setupGeneration
         do {
-            let published = try await transport.peekPairingSecret()
-            guard setupGeneration == generation, pairingStore?.iCloudPairingSecret == secret else { return }
-            macPairingKey = MacPairingKeyReading(recordKey: published, phoneKey: secret, failure: nil)
+            let published = try await transport.peekPairing()
+            guard setupGeneration == generation else { return false }
+            return takeMacPairingKey(published.secret, publishedAt: published.publishedAt, rechecked: rechecked)
         } catch {
-            guard setupGeneration == generation, pairingStore?.iCloudPairingSecret == secret else { return }
-            let previousKey = macPairingKey.flatMap { $0.phoneKey == secret ? $0.recordKey : nil }
+            guard setupGeneration == generation, let held = pairingStore?.iCloudPairingSecret else { return false }
+            let previous = macPairingKey.flatMap { $0.phoneKey == held ? $0 : nil }
             let cause = "The Mac pairing key could not be read: \(error.localizedDescription)"
-            macPairingKey = MacPairingKeyReading(recordKey: previousKey, phoneKey: secret, failure: cause)
+            macPairingKey = MacPairingKeyReading(recordKey: previous?.recordKey, phoneKey: held, failure: cause, publishedAt: previous?.publishedAt)
             syncStatus = cause
+            return false
         }
+    }
+
+    /// Installs the Mac's published key when it differs, then records what was read against the key this phone now holds.
+    private func takeMacPairingKey(_ secret: Data, publishedAt: Date?, rechecked: Bool = false) -> Bool {
+        guard secret.count == 32 else {
+            NSLog("[iCloudBridge] Rejected malformed CloudKit pairing material (%d bytes)", secret.count)
+            return false
+        }
+        guard let pairingStore else {
+            NSLog("[iCloudBridge] Holding CloudKit pairing material until PairingStore is attached")
+            return false
+        }
+        let installed = pairingStore.applyCloudKitPairingSecret(secret)
+        if let held = pairingStore.iCloudPairingSecret {
+            let when = publishedAt ?? macPairingKey.flatMap { $0.recordKey == secret ? $0.publishedAt : nil }
+            macPairingKey = MacPairingKeyReading(recordKey: secret, phoneKey: held, failure: nil, publishedAt: when, rechecked: rechecked)
+            // Under the current key, records refused for their signature are judged again (one signed with another key is dropped), and
+            // the verification failures kept under any key are let go.
+            if secret == held {
+                if let when { deviceTransport?.raisePullCursor(toAtLeast: when) }
+                Task { await self.settleUnverifiedRecords(currentKey: held) }
+                if failingMacRecords.values.contains(where: { $0.reason == Self.signatureRefusal }) {
+                    Task { await self.reconsiderRefusedMacRecords(repairedReasons: [Self.signatureRefusal]) }
+                }
+            }
+        }
+        return installed
     }
 
     /// CloudKit construction is checked; PairingStore alone commits pairing material.
@@ -92,14 +130,21 @@ extension iCloudBridge {
         deviceIncomingSetupTask = Task {
             await iCloudSyncEngine.shared.enableCloudKitSnapshotCache()
             guard setupGeneration == generation else { return }
-            _ = await transport.observeIncoming { [weak self = self] msg in
+            let subscribed = await transport.observeIncoming { [weak self = self] msg in
                 guard await self?.setupGeneration == generation else { return false }
                 return await self?.handleIncomingFromTransport(msg) ?? false
             }
             guard setupGeneration == generation else { return }
+            pushSubscriptionsReady = subscribed
+            guard setupGeneration == generation else { return }
+            // The Mac's current key is read before the first drain: it decides which records can verify, and the cursor starts at its
+            // publication instead of reading days of records signed with earlier keys.
+            await readMacPairingKey()
+            guard setupGeneration == generation else { return }
             let drainStartedAt = Date()
             _ = await transport.drainIncoming()
             guard setupGeneration == generation else { return }
+            _ = await saveSeenMacRecords()
             NSLog("[phone-pipe] incoming setup drain returned elapsedMs=%.0f", Date().timeIntervalSince(drainStartedAt) * 1000)
             // Claim the catalog only after successful application.
             transport.observeStatus(
@@ -137,6 +182,8 @@ extension iCloudBridge {
                 try await transport.subscribeToStatusChanges()
             } catch {
                 NSLog("[iCloudBridge] status subscription registration FAILED (no live push): \(error)")
+                guard setupGeneration == generation else { return }
+                pushSubscriptionsReady = false
             }
         }
         startForegroundReceiving()
@@ -181,6 +228,7 @@ extension iCloudBridge {
                     let pairing = self.pairingStore?.iCloudPairingSecret
                     let result = await transport.drainIncoming(queueIfBusy: false)
                     guard !Task.isCancelled, self.setupGeneration == generation else { return }
+                    _ = await self.saveSeenMacRecords()
                     guard pairing == self.pairingStore?.iCloudPairingSecret else { continue }
                     if case .failure(.account(let failure), _) = result { self.recordAccountFailure(failure) }
                     self.clearAccountFailureAfterSuccessfulDrain(result, accountGeneration: accountGeneration, source: "foreground")
@@ -230,36 +278,24 @@ extension iCloudBridge {
         deliveryPairingDidChange()
         await deviceIncomingSetupTask?.value
         guard generation == setupGeneration, !Task.isCancelled else { return }
-        _ = await transport.ensurePushSubscriptions()
-        guard generation == setupGeneration else { return }
+        // The read comes first: whatever the phone waits on (the key, an answer, a reply) is in iCloud, and no push is needed to find it.
         _ = await drainDeviceTransportResult(refreshCachedSnapshots: true)
         guard generation == setupGeneration, !Task.isCancelled else { return }
+        // A missing subscription is made again here, and the connection says when it could not be.
+        let subscribed = await transport.ensurePushSubscriptions()
+        guard generation == setupGeneration, !Task.isCancelled else { return }
+        pushSubscriptionsReady = subscribed
         await readMacPresence()
     }
 
     private func applyPairingMaterialFromTransport(_ secret: Data) -> Bool {
-        guard secret.count == 32 else {
-            NSLog("[iCloudBridge] Rejected malformed CloudKit pairing material (%d bytes)", secret.count)
-            return false
-        }
-        guard let pairingStore else {
-            NSLog("[iCloudBridge] Holding CloudKit pairing material until PairingStore is attached")
-            return false
-        }
-        return pairingStore.applyCloudKitPairingSecret(secret)
+        takeMacPairingKey(secret, publishedAt: nil)
     }
 
     /// Pairing refresh may run inside initial message delivery; awaiting that setup drain would deadlock its caller.
     @discardableResult
     func refreshPairingFromCloudKit() async -> Bool {
-        guard pairingStore?.isRepairingConnection != true,
-              let transport = deviceTransport else { return false }
-        let generation = setupGeneration
-        let changed: Bool
-        do { changed = try await transport.drainPairing() }
-        catch { syncStatus = "Pairing could not be read: \(error.localizedDescription)"; return false }
-        guard generation == setupGeneration else { return false }
-        return changed
+        await readMacPairingKey()
     }
 
     /// Coalesce overlapping drains into at most one rerun; transport owns atomic message delivery.
@@ -316,7 +352,10 @@ extension iCloudBridge {
             guard generation == setupGeneration, recovery.isActive else { return .skipped(0) }
             let pairing = pairingStore?.iCloudPairingSecret
             let result = await ck.drainIncoming(queueIfBusy: !onlyIfCatchUpOwed, recovery: recovery)
-            guard generation == setupGeneration, pairing == pairingStore?.iCloudPairingSecret else { return .skipped(0) }
+            guard generation == setupGeneration else { return .skipped(0) }
+            // Records settled during the drain are written once, here.
+            _ = await saveSeenMacRecords()
+            guard pairing == pairingStore?.iCloudPairingSecret else { return .skipped(0) }
             if case .failure(.account(let failure), _) = result {
                 recordAccountFailure(failure)
             }

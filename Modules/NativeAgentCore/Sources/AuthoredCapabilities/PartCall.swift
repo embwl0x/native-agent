@@ -465,7 +465,7 @@ extension PartFace {
                 let actions = row.actions?.map { action -> Action in
                     let declared = key.actions[action.id]
                     return Action(id: action.id, label: action.label, role: action.role, doors: declared?.doors, call: declared?.call,
-                        open: declared?.open, unavailable: declared?.unavailable ?? action.unavailable)
+                        open: declared?.open, unavailable: declared?.unavailable ?? action.unavailable, aside: action.aside)
                 }
                 let control = row.control.map { control in
                     var bound = control

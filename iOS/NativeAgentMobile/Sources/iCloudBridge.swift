@@ -59,8 +59,18 @@ final class iCloudBridge: ObservableObject {
         let recordKey: Data?
         let phoneKey: Data
         let failure: String?
+        /// When the Mac published `recordKey`, by the Mac's clock: a record the Mac wrote before it was signed under an earlier key.
+        var publishedAt: Date? = nil
+
+        /// Read again for a failing record newer than the key's publication, so such a record is judged against the newest key.
+        var rechecked = false
+
+        /// This phone holds the key the Mac publishes now.
+        func isCurrent(_ held: Data?) -> Bool { failure == nil && recordKey != nil && recordKey == phoneKey && phoneKey == held }
     }
     @Published var macPairingKey: MacPairingKeyReading?
+    /// Whether iCloud holds this phone's wake subscriptions, as last registered; nil until registration ran.
+    @Published var pushSubscriptionsReady: Bool?
 
     func clearMacConfirmationForConnectionRepair() {
         lastMacConfirmationAt = nil
@@ -83,7 +93,6 @@ final class iCloudBridge: ObservableObject {
     }
 
     let kvs = NSUbiquitousKeyValueStore.default
-    private var activeSendCount = 0
     // CloudKit requires checked selection and entitlement; nil means unavailable.
     var deviceTransport: CloudKitDeviceTransport?
     var usesCloudKitDeviceTransport: Bool { deviceTransport != nil }
@@ -96,9 +105,10 @@ final class iCloudBridge: ObservableObject {
     private var unacceptedDeliveries: [String: String] = [:]
     private var deliveryPairingKey: String?
     private static let missingPairingRefusal = "this phone has no pairing key"
-    private static let signatureRefusal = "its signature does not match this phone's pairing"
+    static let signatureRefusal = "its signature does not match this phone's pairing"
     private static let consumerRefusal = "nothing on this phone is listening for it yet"
     private static let chatConsumerRefusal = "the chat is not listening yet"
+    private static let refusedRecordsKept = 200
 
     func deliveryPairingMatches(_ secret: Data) -> Bool {
         deliveryPairingKey == "mobile.icloud.unaccepted.\(keyDigest(secret))"
@@ -168,10 +178,24 @@ final class iCloudBridge: ObservableObject {
         unverifiedRecords.append(.init(id: msg.id, kind: msg.metadata?["kind"] ?? "chat",
             sender: msg.sender, timestamp: msg.timestamp, reason: reason,
             pairingVersion: version, keyDigest: keyDigest(secret)))
+        if unverifiedRecords.count > Self.refusedRecordsKept { unverifiedRecords.removeFirst(unverifiedRecords.count - Self.refusedRecordsKept) }
         if unverifiedRecords != prior { await persistUnverifiedRecords() }
         NSLog("[iCloudBridge] verification_deferred id=%@ kind=%@ sender=%@ timestamp=%@ pairing_version=%lld reason=%@",
               msg.id, msg.metadata?["kind"] ?? "chat", msg.sender,
               ISO8601DateFormatter().string(from: msg.timestamp), version, reason)
+    }
+
+    /// Once this phone holds the Mac's current key, a record that failed verification was signed with another key, whichever key this phone
+    /// held then: the list is let go, and so are deliveries owed under earlier keys.
+    func settleUnverifiedRecords(currentKey: Data) async {
+        let current = "mobile.icloud.unaccepted.\(keyDigest(currentKey))"
+        for key in userDefaults.dictionaryRepresentation().keys where key.hasPrefix("mobile.icloud.unaccepted.") && key != current {
+            userDefaults.removeObject(forKey: key)
+        }
+        guard !unverifiedRecords.isEmpty else { return }
+        NSLog("[iCloudBridge] let go of %d unverified records signed with other keys", unverifiedRecords.count)
+        unverifiedRecords = []
+        await persistUnverifiedRecords()
     }
 
     private func persistUnverifiedRecords() async {
@@ -319,12 +343,6 @@ final class iCloudBridge: ObservableObject {
         syncStatus = "CloudKit unavailable: no transport was constructed. Install the current signed iPhone app with its iCloud entitlement."
     }
 
-    func requireIdleSendForConnectionRepair() throws {
-        guard activeSendCount == 0 else {
-            throw SyncError.busy("A message is still sending. Wait for it to finish, then repair the connection.")
-        }
-    }
-
     func sendChatMessage(
         id: String = UUID().uuidString,
         text: String,
@@ -354,8 +372,6 @@ final class iCloudBridge: ObservableObject {
         guard pairingStore?.isRepairingConnection != true else {
             throw SyncError.busy("Connection repair is in progress.")
         }
-        activeSendCount += 1
-        defer { activeSendCount -= 1 }
         let generation = setupGeneration
         let msg = try await Task.detached(priority: .userInitiated) {
         if let preparedMessage {
@@ -504,7 +520,8 @@ final class iCloudBridge: ObservableObject {
         do { mobileSourceKey = try NativeAgentICloudBridgeConstants.mobileSourceKey }
         catch { syncStatus = error.localizedDescription; return refuse("this phone's source key is unavailable") }
         let kind = msg.metadata?["kind"]
-        if seenMacRecords[msg.id] != nil { return await persistSeenMacRecords() }
+        // A record already handled is written again only if its receipt is still unsaved; a re-read of many handled records writes nothing.
+        if seenMacRecords[msg.id] != nil { return await saveSeenMacRecords() }
         // Foreign records cannot stall CloudKit cursors.
         if let tsk = msg.metadata?["targetSourceKey"], !tsk.isEmpty,
            tsk != ChatRuntimeControls.deviceSourceKey,
@@ -535,7 +552,7 @@ final class iCloudBridge: ObservableObject {
 
         // Handle foreign targets/resync before waiting for signed consumers so nonlocal records cannot wedge delivery.
         guard kind == "notification" || kind == "icloud_action_response" || kind == PhoneRequest.messageKind
-                || !messageHandlers.isEmpty
+                || kind == NAPairingConfirmation.messageKind || !messageHandlers.isEmpty
                 || !rejectionHandlers.isEmpty else { return refuse(Self.consumerRefusal) }
         guard let secret = pairingStore?.iCloudPairingSecret else { return refuse(Self.missingPairingRefusal) }
 
@@ -544,6 +561,25 @@ final class iCloudBridge: ObservableObject {
         guard generation == setupGeneration, pairingStore?.iCloudPairingSecret == secret,
               pairingStore?.isRepairingConnection != true else { return false }
         if !verified {
+            // The key the Mac publishes decides. It is read once for each key held here, and once more when a record newer than that key's
+            // publication fails (the Mac may have a newer key); a record that fails under a newly installed key is judged again under it.
+            let reading = macPairingKey
+            let newerThanKey = reading?.publishedAt.map { msg.timestamp >= $0 } ?? true
+            if reading?.isCurrent(secret) != true || (newerThanKey && reading?.rechecked != true) {
+                let installed = await readMacPairingKey(rechecked: reading?.isCurrent(secret) == true)
+                guard generation == setupGeneration else { return false }
+                if installed { return await admitIncoming(msg) }
+            }
+            // Under the key the Mac publishes now, a record that does not verify was signed with another key (an earlier pairing, an earlier
+            // install). It can never verify: it is dropped as handled, never kept, retried or left pinning the drain.
+            if macPairingKey?.isCurrent(pairingStore?.iCloudPairingSecret) == true {
+                NSLog("[iCloudBridge] dropped Mac record %@ signed with another key (written %@)", msg.id,
+                      NativeTimestampFormat.fractionalZulu(msg.timestamp))
+                // Settling is idempotent, so it is saved with the drain's end rather than one write per record.
+                seenMacRecords[msg.id] = seenMacRecords[msg.id] ?? Date()
+                seenMacRecordsDirty = true
+                return generation == setupGeneration
+            }
             // Defer only after notifying a rejection consumer; without one, retain eligibility for the next drain.
             if !rejectionHandlers.isEmpty {
                 await retainUnverified(msg, secret: secret,
@@ -595,12 +631,24 @@ final class iCloudBridge: ObservableObject {
         } else if kind == "notification" {
             guard await NativeAgentBridgeNotificationScheduler.schedule(msg) else { return refuse("its notification could not be scheduled") }
             status = "Received notification from Mac"
+        } else if kind == NAPairingConfirmation.messageKind {
+            // The Mac's acceptance is taken whenever it lands, waiting or not, repairing or not; one naming another device is that device's.
+            // It counts only under the key this phone still holds after the identity read: a key replaced meanwhile belongs to another pairing.
+            let held = pairingStore?.iCloudPairingSecret
+            let key = try? await PhoneSigningIdentity.shared.key()
+            guard generation == setupGeneration else { return false }
+            if let pairingStore, let held, let key, pairingStore.iCloudPairingSecret == held, msg.verifySignature(secret: held),
+               msg.metadata?[NAPairingConfirmation.deviceField] == DeviceApprovalSignature.deviceID(publicKey: key.publicKey.rawRepresentation) {
+                pairingStore.finishConnectionRepair()
+                pairingStore.applyICloudPairing(acceptance: msg.metadata?[NAPairingConfirmation.acceptanceField])
+            }
+            status = nil
         } else {
             guard !messageHandlers.isEmpty else { return refuse(Self.chatConsumerRefusal) }
             status = "Received from Mac"
         }
         guard generation == setupGeneration else { return false }
-        if kind != PhoneRequest.messageKind, kind != "icloud_action_response", kind != "notification" {
+        if kind != PhoneRequest.messageKind, kind != "icloud_action_response", kind != "notification", kind != NAPairingConfirmation.messageKind {
             if kind == "text_delta" || [nil, "reply", "final", "error", "cancelled"].contains(kind) {
                 NSLog("[phone-pipe] received kind=%@ correlation=%@ seq=%@ writtenAt=%@ receivedAt=%@",
                     kind ?? "reply", msg.correlationID ?? "-", msg.metadata?["seq"] ?? "-",
@@ -731,21 +779,29 @@ final class iCloudBridge: ObservableObject {
     private func retainRefusedMacRecord(_ message: BridgeMessage, reason: String) async {
         let firstRefusedAt = failingMacRecords[message.id]?.firstRefusedAt ?? Date()
         failingMacRecords[message.id] = FailingMacRecord(message: message, reason: reason, firstRefusedAt: firstRefusedAt)
+        // The ledger names what is refused; it keeps the newest refusals, and a record let go here is refused again if it is read again.
+        if failingMacRecords.count > Self.refusedRecordsKept {
+            for (id, _) in failingMacRecords.sorted(by: { $0.value.firstRefusedAt < $1.value.firstRefusedAt })
+                .prefix(failingMacRecords.count - Self.refusedRecordsKept) { failingMacRecords.removeValue(forKey: id) }
+        }
         _ = await saveReceiveLedgers()
     }
 
     /// A repaired owner re-evaluates only the records that waited for it.
-    private func reconsiderRefusedMacRecords(repairedReasons: Set<String>) async {
+    func reconsiderRefusedMacRecords(repairedReasons: Set<String>) async {
         guard await restoreReceiveLedgers() else { return }
         let generation = setupGeneration
         let repaired = failingMacRecords.filter { repairedReasons.contains($0.value.reason) }.map(\.key)
         for id in repaired {
             guard generation == setupGeneration else { return }
-            await reconsiderRefusedMacRecord(id)
+            await reconsiderRefusedMacRecord(id, saving: false)
         }
+        // One write for the whole pass: per record, a pass over thousands of refusals rewrote both ledgers thousands of times.
+        guard generation == setupGeneration, !repaired.isEmpty else { return }
+        _ = await saveReceiveLedgers()
     }
 
-    func reconsiderRefusedMacRecord(_ id: String) async {
+    func reconsiderRefusedMacRecord(_ id: String, saving: Bool = true) async {
         guard await restoreReceiveLedgers(), let entry = failingMacRecords[id] else { return }
         let generation = setupGeneration
         refusal = nil
@@ -753,7 +809,7 @@ final class iCloudBridge: ObservableObject {
         guard generation == setupGeneration else { return }
         if admitted { failingMacRecords.removeValue(forKey: id) }
         else if let refusal { failingMacRecords[id]?.reason = refusal }
-        _ = await saveReceiveLedgers()
+        if saving { _ = await saveReceiveLedgers() }
     }
 
     /// Transport acceptance waits for the durable receipt, including during a drain. Failure leaves its claim and cursor retryable.

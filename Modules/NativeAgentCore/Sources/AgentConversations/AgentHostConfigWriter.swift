@@ -20,15 +20,15 @@ public enum AgentHostConfigWriter {
         case publicationUnconfirmed(String)
         case changedUnderneath
         case entryExists(String)
-        /// Connect may replace this product’s entry from another install.
+        /// An entry under this app's name that this contact did not write; connect replaces it.
         case staleEntry(at: String, helper: String, gone: Bool)
 
         public var errorDescription: String? {
             switch self {
             case .staleEntry(let at, let helper, let gone):
                 return """
-                    The entry at \(at) was written by another install of this app (its helper is \
-                    \(helper)\(gone ? ", which no longer exists" : "")). agent.connect replaces it with this app's entry and keeps a backup beside \
+                    The entry at \(at) was not written for this contact (its command is \
+                    \(helper)\(gone ? ", which does not exist" : "")). agent.connect replaces it with this app's entry and keeps a backup beside \
                     the file; nothing was changed.
                     """
             case .entryExists(let at):
@@ -99,18 +99,17 @@ public enum AgentHostConfigWriter {
             return try TOMLEntrySplice.fields(Data(text.utf8), name: AgentHostDirectory.entryName)
         }
         let old = try identity(existing, value: a), new = try identity(expected, value: b)
-        // Connect may replace another install's helper, never a foreign helper.
-        if let helper = old.command, let ours = new.command,
-           URL(fileURLWithPath: helper).lastPathComponent == URL(fileURLWithPath: ours).lastPathComponent,
-           URL(fileURLWithPath: helper).resolvingSymlinksInPath() != URL(fileURLWithPath: ours).resolvingSymlinksInPath() {
+        // The entry under this app's name that this contact did not write (another install, an earlier agent, any other writer) is
+        // replaced; the edit keeps the old file as a backup beside it.
+        guard let peer = new.peerID, !peer.isEmpty, old.peerID == peer,
+              configuration.repairingPeer == nil || configuration.repairingPeer == peer else {
+            let helper = old.command ?? "no command"
             guard configuration.checking == nil else {
                 throw Failure.staleEntry(at: at, helper: helper, gone: !FileManager.default.isExecutableFile(atPath: helper))
             }
             configuration.replaced.helper = helper
             return false
         }
-        guard let peer = new.peerID, !peer.isEmpty, old.peerID == peer,
-              configuration.repairingPeer == nil || configuration.repairingPeer == peer else { throw Failure.entryExists(at) }
         if configuration.checking != nil {
             throw ToolFailureError("This contact's connector at \(at) needs reconciliation. Connect it again to update its owned entry.",
                 effects: .none, owner: at, nextCall: ToolFailureError.call("app", ["action": .string("agent.connect"),

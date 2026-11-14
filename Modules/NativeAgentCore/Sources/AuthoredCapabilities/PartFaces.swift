@@ -602,6 +602,20 @@ public actor PartFaces {
         return try PartFace.Keys(packet: source.input).rows[item]?.read != nil
     }
 
+    /// The row or section a page shows under these words: its id, else its title as the page draws it, with where the row opens.
+    public func shownItem(page id: String, named words: String) -> (id: String, open: String?)? {
+        let snapshot = currentSnapshot(id)
+        let sections = (snapshot?.drawnFace?.sections ?? []) + (snapshot?.levers ?? [])
+        let rows = sections.flatMap(\.allRows)
+        func same(_ shown: String?) -> Bool {
+            shown.map { $0.split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased() }
+                == words.split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased()
+        }
+        if let row = rows.first(where: { same($0.id) }) ?? rows.first(where: { same($0.title) }) { return (row.id, row.open) }
+        guard let section = sections.first(where: { same($0.id) }) ?? sections.first(where: { same($0.title) }) else { return nil }
+        return (section.id, nil)
+    }
+
     public func releaseItem(page id: String, item: String, request: UUID) {
         let namespace = id + "/" + item
         guard itemDemands[namespace]?.request.id == request else { return }

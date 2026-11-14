@@ -46,6 +46,14 @@ private struct TranscriptResolvedAttachmentView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.transcriptOpenSettings) private var openSettings
     @State private var feedback: String?
+    /// The Inbox row drawn here keeps its pending, failure and undo as the Inbox page keeps them.
+    @State private var session = FacePageSession()
+    @State private var activityTarget: ActivityTarget?
+
+    private struct ActivityTarget: Identifiable {
+        let reference: WorkOverviewReference
+        var id: String { reference.kind.rawValue + ":" + reference.id }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
@@ -57,6 +65,9 @@ private struct TranscriptResolvedAttachmentView: View {
         }
         .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
         .accessibilityLabel(attachment.title)
+        .sheet(item: $activityTarget) { target in
+            MacWorkOverviewDetail(reference: target.reference) { activityTarget = nil }
+        }
     }
 
     @ViewBuilder private var content: some View {
@@ -71,7 +82,9 @@ private struct TranscriptResolvedAttachmentView: View {
         case .file: MessageAttachmentChipView(attachment: attachment)
         case .card, .approval, .trouble:
             if let face = attachment.card {
-                FaceView(face: face, open: open, act: act)
+                // The Inbox row, pressed through the Inbox page's own door: the same drawn call, confirmation and answer.
+                FaceView(face: face, door: appModel.pageDoor(page: "inbox", open: open), session: session)
+                    .onAppear { session.notice = { words in feedback = words } }
             } else {
                 Text(attachment.text ?? "Waiting on the request's presentation. Its absence does not settle it.")
                     .textSelection(.enabled)
@@ -91,23 +104,10 @@ private struct TranscriptResolvedAttachmentView: View {
         }
     }
 
-    private func act(_ row: String, _ action: String, _ value: String?) {
-        let expected = attachment.card?.sections.flatMap(\.rows).first { $0.id == row }?.actions?.first { $0.id == action }?.call
-        feedback = nil
-        Task {
-            do {
-                let reply = try await appModel.client.act(.pageAct(PageActRequest(page: "inbox", row: row, action: action,
-                    value: value.map { .string($0) }, expectedRevision: nil, expectedCall: expected)))
-                try TranscriptFaceReply.success(reply)
-                if case .result(.string(let text)) = reply { feedback = text }
-            } catch { feedback = error.localizedDescription }
-        }
-    }
-
     private func open(_ link: String) {
         feedback = nil
         Task {
-            do { _ = try await MacFaceLinks.follow(link, appModel: appModel) { _ in } }
+            do { _ = try await MacFaceLinks.follow(link, appModel: appModel) { activityTarget = ActivityTarget(reference: $0) } }
             catch { feedback = error.localizedDescription }
         }
     }

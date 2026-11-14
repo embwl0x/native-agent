@@ -44,6 +44,8 @@ import CoreGraphics
 public enum MacChatTurnTranscriptTerminalProof: Sendable, Equatable {
     case completed
     case incomplete
+    /// The saved reply ended `waiting`: a known ending whose next move is the person's.
+    case waitingOnPerson
     case failed
     case canceled
     case absent
@@ -189,6 +191,7 @@ public actor MacChatTurnTranscriptProofReader {
                 // turn's settled terminal state is read by it, as the live lifecycle is: a reply that ended on a pending card is waiting.
                 switch (metadata["terminalState"], metadata["completionState"]) {
                 case (.string("completed")?, .string("completed")?), (nil, .string("completed")?): return .completed
+                case (.string("waiting")?, .string?): return .waitingOnPerson
                 case (_, .string?): return .incomplete
                 default: return .absent
                 }
@@ -225,12 +228,16 @@ public enum MacChatTurnLifecycleRestartRepair {
         at instant: Date
     ) -> MacChatTurnLifecycleState? {
         guard let restored = record.restoredState() else { return nil }
-        guard !restored.presentation.isTerminal else { return restored }
+        guard !restored.presentation.isTerminal else {
+            // The file keeps a waiting ending as outcome unknown, the pair builds that exist read; the saved reply's own terminal state tells them apart.
+            return record.phase == .outcomeUnknown && transcriptProof == .waitingOnPerson ? record.restoredState(waitingOnPerson: true) : restored
+        }
         let kind: MacChatTurnLifecycleInput.Kind
         switch transcriptProof {
         case .completed: kind = .completed
         case .incomplete:
             kind = .outcomeUnknown(reason: "This reply was saved, but the turn did not finish.")
+        case .waitingOnPerson: kind = .waitingOnPerson(action: nil)
         case .failed: kind = .failed(reason: nil)
         case .canceled: kind = .cancellationConfirmed(reason: nil)
         case .absent, .unavailable:

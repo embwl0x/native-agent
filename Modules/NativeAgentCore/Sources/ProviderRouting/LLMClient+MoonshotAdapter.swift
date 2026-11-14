@@ -7,8 +7,10 @@ import PersistenceCore
 /// Kimi tool loops require retained reasoning state alongside structured calls, images and SSE output.
 public final class MoonshotTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
-    /// The transport declares no output-cap field.
-    public func requestOutputTokens(model: String, call: LLMCall) throws -> Int { 0 }
+    /// While a run's budget is bound, one request's allowance (`budgetedOutputTokens`) goes in Moonshot's `max_completion_tokens`; else no cap.
+    public func requestOutputTokens(model: String, call: LLMCall) throws -> Int {
+        FirstPartyExecutionControls.budgetedOutputTokens(model: model, providerID: providerId, call: call, dataRoot: credentialRoot) ?? 0
+    }
 
     public let providerId = "moonshot"
 
@@ -135,6 +137,10 @@ public final class MoonshotTransport: LLMTransport {
         if stream { body["stream_options"] = ["include_usage": true] }
         try OpenAITransport.applyTools(to: &body, tools: tools)
         try applyReasoningControls(to: &body, model: model, call: call)
+        // No allowance, no field: a cap of zero would refuse the request.
+        if let allowance = FirstPartyExecutionControls.budgetedOutputTokens(model: model, providerID: providerId, call: call, dataRoot: credentialRoot) {
+            body["max_completion_tokens"] = allowance
+        }
         return body
     }
 

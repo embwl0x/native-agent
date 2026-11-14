@@ -16,10 +16,12 @@ public enum TurnPresentationPhase: String, CaseIterable, Sendable, Codable, Equa
     case failed
     case canceled
     case outcomeUnknown = "outcome_unknown"
+    /// An ending of its own: the turn did its part and the next move is the person's. `waiting` is a wait inside a running turn.
+    case waitingOnPerson = "waiting_on_person"
 
     public var isTerminal: Bool {
         switch self {
-        case .completed, .failed, .canceled, .outcomeUnknown:
+        case .completed, .failed, .canceled, .outcomeUnknown, .waitingOnPerson:
             return true
         default:
             return false

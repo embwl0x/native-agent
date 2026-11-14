@@ -75,18 +75,19 @@ private struct EngineContactToolDispatcher: ToolDispatchClient, PreApprovalToolV
 /// Compose every chat client and tool chain from one root and native ports. Roots without bodies cannot borrow process-global tools, live organism or
 /// Context projections; authority remains in SecurityCenter, TrustCenter and the per-turn gate.
 public final class NativeAgentEngine: Sendable {
-    /// Keep paired body owners typed together, including the live root.
+    /// Keep paired body owners typed together, including the live root. The body owns its mind's lifetime, not a mind: there is none until setup
+    /// has finished (`MindLifetime`).
     private struct Body: Sendable {
         let contextFlow: NativeContextFlowRuntime
-        let cognition: NativeCognitionRuntime
+        let mind: MindLifetime
         let deviceSync: DeviceSync
 
         init(dataRoot: URL, ports: NativeAgentEnginePorts) {
             let contextFlow = NativeContextFlowRuntime(dataRoot: dataRoot)
-            let cognition = NativeCognitionRuntime(dataRoot: dataRoot, host: ports.cognitionHost, contextFlow: contextFlow)
+            let mind = MindLifetime(dataRoot: dataRoot, host: ports.cognitionHost, contextFlow: contextFlow)
             self.contextFlow = contextFlow
-            self.cognition = cognition
-            self.deviceSync = DeviceSync(host: ports.deviceSyncHost, cognition: cognition)
+            self.mind = mind
+            self.deviceSync = DeviceSync(host: ports.deviceSyncHost, mind: { mind.runtime }, mindChanges: { mind.changes() })
         }
     }
     public let dataRoot: URL
@@ -102,8 +103,10 @@ public final class NativeAgentEngine: Sendable {
     public let ports: NativeAgentEnginePorts
     private let clients: EngineAgentContactClients
     public let hasBody: Bool
-    /// Only body-backed roots may own the resident mind.
-    public let cognition: NativeCognitionRuntime?
+    /// Only body-backed roots own the resident mind's lifetime.
+    public let mind: MindLifetime?
+    /// The running mind, read when asked: nil before setup has finished, after a reset closed it, and on roots without a body.
+    public var cognition: NativeCognitionRuntime? { mind?.runtime }
     public let cognitionView: CognitionViewFacade
     public let doctor: DoctorFacade
     /// Share persisted turn evidence between Mac Inspector and phone summaries.
@@ -171,14 +174,19 @@ public final class NativeAgentEngine: Sendable {
         self.panelFreshness = PanelFreshnessOwner(counts: counts)
         self.countsStatus = CountsStatusProjection(countsFeed: counts)
         let contextFlow = body?.contextFlow ?? NativeContextFlowRuntime(dataRoot: dataRoot)
+        let mind = body?.mind
         let clients = EngineAgentContactClients(dataRoot: dataRoot, ports: ports, hasBody: hasBody,
-            cognition: body?.cognition, contextFlow: contextFlow)
+            mind: mind, contextFlow: contextFlow)
         self.clients = clients
         self.bots = BotRunnerScheduler(dataRoot: dataRoot,
             session: { bot, message, turn, scope, options in
                 try await clients.standingBotSession()(bot, message, turn, scope, options)
             },
-            isAutonomyEnabled: { await UnattendedWork.allowed(dataRoot: dataRoot) })
+            isAutonomyEnabled: {
+                // A body's helpers run unattended only while its mind runs: none before setup has finished or after a reset.
+                if let mind, mind.runtime == nil { return false }
+                return await UnattendedWork.allowed(dataRoot: dataRoot)
+            })
         PeerTrust.install(dataRoot: dataRoot)
         // Full Mac keeps are the agent’s act even on trusted-agent turns; only the user’s surfaces establish their own acts.
         CapabilityLifecycle.keepAuthority = { root in
@@ -234,9 +242,8 @@ public final class NativeAgentEngine: Sendable {
         // first drawn here: the agent's hand is whole before anything can ask for it, and a later deed is noted as it is written, never read again.
         if hasBody { _ = AppToolExecutor.appToolSchemas() }
         self.contextFlow = contextFlow
-        let cognition = body?.cognition
-        self.cognition = cognition
-        self.cognitionView = CognitionViewFacade(dataRoot: dataRoot, runtime: cognition)
+        self.mind = mind
+        self.cognitionView = CognitionViewFacade(dataRoot: dataRoot, mind: mind)
         let deviceSync = body?.deviceSync
         self.deviceSync = deviceSync
         self.sync = SyncFacade(owner: deviceSync)
@@ -246,6 +253,7 @@ public final class NativeAgentEngine: Sendable {
         self.agents = AgentContacts(dataRoot: dataRoot, clients: clients,
                                     completionSender: ports.completionSender(dataRoot))
         clients.attach(self.agents)
+        mind?.attach(stream: { MindStream(dataRoot: dataRoot, clients: clients, completionSender: ports.completionSender(dataRoot)) })
         installSessionDelivery()
         Task { @MainActor [turns, face, approvals, persona, transcripts] in
             turns.bindTurnFaces(source: face, approvals: approvals, persona: persona, transcripts: transcripts)
@@ -305,15 +313,15 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
     let dataRoot: URL
     let ports: NativeAgentEnginePorts
     let hasBody: Bool
-    let cognition: NativeCognitionRuntime?
+    let mind: MindLifetime?
     let contextFlow: NativeContextFlowRuntime
     private let lock = NSLock()
     private weak var contacts: AgentContacts?
 
     init(dataRoot: URL, ports: NativeAgentEnginePorts, hasBody: Bool,
-         cognition: NativeCognitionRuntime?, contextFlow: NativeContextFlowRuntime) {
+         mind: MindLifetime?, contextFlow: NativeContextFlowRuntime) {
         self.dataRoot = dataRoot; self.ports = ports; self.hasBody = hasBody
-        self.cognition = cognition; self.contextFlow = contextFlow
+        self.mind = mind; self.contextFlow = contextFlow
     }
 
     func attach(_ contacts: AgentContacts) { lock.withLock { self.contacts = contacts } }
@@ -359,9 +367,10 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
         let inner: @Sendable (AppActionExecution) -> any ToolDispatchClient = { [self] execution in SwiftToolDispatcher(
             dataRoot: dataRoot,
             allowProcessGlobalTools: hasBody,
-            providerLifecycleObserver: cognition,
-            // Studio entries reach the mind through its own journal bus.
-            studioJournalBus: cognition?.studioJournalBus,
+            // The owner, never a runtime: a client made before setup, or kept across a reset, reaches whichever mind runs when it acts.
+            providerLifecycleObserver: mind,
+            // Studio entries reach the running mind through the body's one journal bus.
+            studioJournalBus: mind?.journal,
             macIntegrationBridge: hasBody ? ports.macIntegration : nil,
             appTools: appToolExecutor?.withExecution(execution),
             agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
@@ -373,7 +382,8 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
             standingBotSession: standingBotSession()
         ) }
         let appTools: AppChatToolDispatcher
-        if let cognition {
+        if hasBody {
+            let mind = self.mind
             appTools = AppChatToolDispatcher(
                 securityCenter: securityCenter,
                 enforceAutonomySecurity: enforceAppAutonomy,
@@ -389,7 +399,7 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
                         model = nil
                     }
                     guard let model else { return }
-                    await cognition.observeMotorActionState(model)
+                    await mind?.runtime?.observeMotorActionState(model)
                 },
                 platform: ports.chatPlatform,
                 scopedInner: inner, actionExecution: actionExecution
@@ -460,8 +470,8 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
             dataRoot: dataRoot,
             continuationCapabilityProfile: continuationCapabilityProfile?.rawValue,
             approvalFiler: approvalFiler,
-            cognitiveRuntime: cognition,
-            providerLifecycleObserver: cognition,
+            cognitiveRuntime: mind,
+            providerLifecycleObserver: mind,
             contextFlow: contextFlow,
             memoryAtomTranslator: contextFlow.map { runtime in { @Sendable recordID in
                 runtime.memoryRecordAtomID(forRecordID: recordID)
@@ -526,7 +536,8 @@ extension NativeAgentEngine {
         return (NativeAgentEngine(dataRoot: dataRoot, ports: ports, body: body), body)
     }()
     public static var live: NativeAgentEngine { liveRoot.engine }
-    public static var liveCognition: NativeCognitionRuntime { liveRoot.body.cognition }
+    /// The running mind: nil before setup has finished and after a reset closed it. Reading it never makes one.
+    public static var liveCognition: NativeCognitionRuntime? { liveRoot.body.mind.runtime }
     public static var liveDeviceSync: DeviceSync { liveRoot.body.deviceSync }
 
     public static func forRoot(_ dataRoot: URL) -> NativeAgentEngine {

@@ -89,6 +89,8 @@ public struct AppAction: Sendable {
     public let reach: ToolReach
     public let capabilities: Set<String>
     public let resultSchema: JSONValue
+    /// The agent's own words to its own person (`AppActionBinding.voice`).
+    public let voice: Bool
 
     init(_ id: String, _ page: String, _ label: String, _ args: [String] = [], subject: [String] = [], owner: Owner = .agent,
          irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .agent, capabilities: Set<String>? = nil,
@@ -99,7 +101,7 @@ public struct AppAction: Sendable {
          versionExempt: Bool = false, revision: Int = 1, readWhen: [String: JSONValue] = [:], scope: String = "",
          advisory: Bool = false, resultSchema: JSONValue = AppActions.resultEnvelope,
          lifecycle: CapabilityLifecycle.Action? = nil, schema: LLMToolSchema? = nil, partAction: Bool = false,
-         part: String? = nil, folded: Bool = false) {
+         part: String? = nil, folded: Bool = false, voice: Bool = false) {
         // Without an explicit class, read declares a read; other actions write app-owned data by default.
         let toolClass = toolClass ?? (read ? .read : .write)
         // A folded action runs its host tool, so it answers to that tool's schema and door names unless it declares its own.
@@ -125,6 +127,7 @@ public struct AppAction: Sendable {
         self.resultSchema = resultSchema
         self.lifecycle = lifecycle
         self.reach = reach
+        self.voice = voice
         self.capabilities = capabilities ?? (toolClass == .read ? toolClass.baseCapabilities : toolClass.baseCapabilities.union(["app_data_write"]))
     }
 
@@ -192,7 +195,8 @@ public struct AppAction: Sendable {
                          tool: tool, fixedInput: input, rename: rename, folded: isFold,
                          descriptor: schema.map { ToolDescriptor(schema: $0, bucket:
                              SwiftToolDispatcher.catalogBucket(forRegisteredToolNamed: tool) ?? AppToolExecutor.buckets[tool] ?? .unclassified) },
-                         toolClass: toolClass, reach: reach, capabilities: capabilities, declaredArguments: Set(argSpecs.flatMap(\.names)))
+                         toolClass: toolClass, reach: reach, capabilities: capabilities, declaredArguments: Set(argSpecs.flatMap(\.names)),
+                         voice: voice)
     }
 
     func readOnly(args: [String: JSONValue]) -> Bool {
@@ -229,8 +233,10 @@ public struct AppAction: Sendable {
         if irreversible { text += " · irreversible" }
         if !warn.isEmpty { text += " · \(warn)" }
         if case .person(let why, let instead, let asks, let freely, _) = owner {
-            // A lever is the person's at every posture: the agent's call raises their card, or is refused when no card can carry it.
-            text += (asks ? " · the person's (your call asks them): " : " · the person's: ") + why + (instead.map { ". Instead: \($0)" } ?? "")
+            // A lever is the person's at every posture: the agent's call runs on their word quoted in because, or raises their card, or is
+            // refused when no card can carry it.
+            text += (asks ? " · the person's (runs on their words quoted in because, else asks them): " : " · the person's: ") + why
+                + (instead.map { ". Instead: \($0)" } ?? "")
             if !freely.isEmpty {
                 text += ". Yours with " + freely.sorted { $0.key < $1.key }.map { $0.key + " " + ($0.value.scalarText ?? "") }
                     .joined(separator: ", ")

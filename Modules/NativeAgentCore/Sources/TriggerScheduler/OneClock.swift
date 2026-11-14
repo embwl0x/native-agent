@@ -88,6 +88,11 @@ public actor OneClock {
         await fire()
     }
 
+    /// An owner stops taking delivery: its times stay declared and pending, and are delivered once when it handles them again.
+    public func release(_ owner: String) {
+        handlers[owner] = nil
+    }
+
     /// Declare (or replace) one time.
     public func declare(_ time: Time) async throws {
         var time = time

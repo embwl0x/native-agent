@@ -181,7 +181,8 @@ extension SwiftToolDispatcher {
                 directory: directory, environment: childEnvironment,
                 message: dryRun ? nil : message, peerCredential: secret, mcpServers: [server], line: line,
                 conversationID: dryRun ? nil : conversationID,
-                approvedExecutable: approved, requireVerifiedRestore: row.id == "hermes", permission: { [turn] request in
+                approvedExecutable: approved, requireVerifiedRestore: row.id == "hermes",
+                life: turn.enclosingCall ?? invocation.deadlines.innermostCall, named: contact.name, permission: { [turn] request in
                     // Revocation wins even if an already-open card was approved.
                     guard try store.list().contains(where: { $0.id == contact.id }) else { return false }
                     // Under Full Mac the agent decides a driven agent's requests; irreversible deletion stays the person's.
@@ -256,11 +257,33 @@ extension SwiftToolDispatcher {
             let opened = await lease?.client.currentSessionID
             let delivered = await lease?.client.delivered == true
             let reported = await lease?.client.learned(line).protocolVersion
+            // A turn that ended in an error still shows what the agent said in it (often its own account of the failure).
+            let said = await lease?.client.said ?? ""
             let session = conversationID ?? opened
             if let lease { await AgentACPConnections.shared.finish(lease, peer: contact.id, conversation: nil) }
+            func withSaid(_ result: [String: JSONValue]) -> JSONValue {
+                var result = result
+                if !said.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    result["reply"] = .string(said)
+                    result["untrusted_remote_data"] = .bool(true)
+                }
+                return Self.peerRedact(.object(result), token: secret)
+            }
             if let failure = error as? AgentACPClient.Failure, failure == .sessionUnavailable || failure == .busy {
                 return .object(["status": .string(failure == .busy ? "busy" : "session_unavailable"), "sent": .bool(false), "completed": .bool(false),
                     "detail": .string(failure.localizedDescription)])
+            }
+            // The agent is not signed in to its own service (classified where its error is read). The conversation stays; signing in continues it.
+            if (error as? AgentACPClient.Failure) == .signInRequired {
+                store.recordUnavailable(peerID: contact.id)
+                var result: [String: JSONValue] = ["status": .string(dryRun ? "failed" : "unavailable"), "agent": .string("peer:" + contact.id),
+                    "transport": .string("acp"), "sent": delivered ? .null : .bool(false), "completed": .bool(false),
+                    "reason": .string("sign_in_required"),
+                    "detail": .string("\(shown): " + AgentACPClient.Failure.signInRequired.localizedDescription
+                        + (delivered ? " Whether it took the message is unknown; it was not resent." : " Nothing was sent."))]
+                if let session { result["conversation_id"] = .string(session) }
+                if dryRun { result["dry_run"] = .bool(true) }
+                return withSaid(result)
             }
             // Recipe disagreement or a failed dry run cannot claim a send.
             if let refused = error as? AgentACPClient.Mismatch {
@@ -301,21 +324,21 @@ extension SwiftToolDispatcher {
                     "completed": .bool(false), "terminal": .bool(true), "detail": .string(unavailable.localizedDescription),
                     "permission_failure": ChatToolOutcome.failure(error: unavailable.cause)]
                 if let session { result["conversation_id"] = .string(session) }
-                return Self.peerRedact(.object(result), token: secret)
+                return withSaid(result)
             }
             if let failure = ProviderFailure.report(error, work: .outcomeUnknown) {
                 var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("acp")]
                 Self.peerFailure(failure, into: &result)
                 if let session { result["conversation_id"] = .string(session) }
-                return Self.peerRedact(.object(result), token: secret)
+                return withSaid(result)
             }
-            // The client's timeout ends this call; the thread must not keep waiting after it.
+            // The turn ended (Stop, the app quitting, the agent's program exiting or breaking the protocol); the thread does not keep waiting.
             var result: [String: JSONValue] = ["status": .string(Task.isCancelled ? "cancelled" : quit ? "interrupted" : "outcome_unknown"),
                 "agent": .string("peer:" + contact.id), "transport": .string("acp"), "completed": .bool(false), "terminal": .bool(true),
                 "detail": .string(Task.isCancelled ? "The conversation was stopped." : quit ? AgentConversationSession.restartDetail(contact.name) :
                     (error as? AgentACPClient.Failure)?.localizedDescription ?? "The conversation did not finish. Do not resend automatically.")]
             if let session { result["conversation_id"] = .string(session) }
-            return .object(result)
+            return withSaid(result)
         }
     }
     /// Scrub reply snapshots before exposing ACP progress.

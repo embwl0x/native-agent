@@ -20,8 +20,8 @@ public enum OrganJudge {
         beat(organ, .held, note: OrganPulse.offPrefix + reason)
     }
 
-    /// A loop-shaped pass: completed work, a skip the organ chose (off, not needed, held back) or a failure. A health-neutral skip joined another tick or
-    /// backed off and decides nothing of its own, so it writes no beat.
+    /// A loop-shaped pass: completed work, a skip the organ chose (off, not needed, held back), a slot held by other work (busy) or a failure. A
+    /// health-neutral skip joined another tick or backed off and decides nothing of its own, so it writes no beat.
     public static func beat(_ organ: String, tick: LoopTickOutcome, yield: Int? = nil, cadence: TimeInterval?) {
         switch tick {
         case .completed(let result):
@@ -32,6 +32,8 @@ public enum OrganJudge {
                 beatOff(organ, because: String(reason.dropFirst(LoopTickOutcome.offPrefix.count)))
             } else if reason.hasPrefix(LoopTickOutcome.notNeededPrefix) {
                 beat(organ, .nothing, note: String(reason.dropFirst(LoopTickOutcome.notNeededPrefix.count)), yield: yield, cadence: cadence)
+            } else if reason.hasPrefix(LoopTickOutcome.busyPrefix) {
+                beat(organ, .busy, note: String(reason.dropFirst(LoopTickOutcome.busyPrefix.count)), cadence: cadence)
             } else {
                 beat(organ, .held, note: reason, cadence: cadence)
             }

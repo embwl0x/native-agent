@@ -60,8 +60,9 @@ public struct KnowledgeGraphContextRelation: Sendable, Equatable {
 
 extension SwiftNativeKnowledgeGraphIndexer {
 
-    /// Structural mentions edges are plumbing rather than claims and must not be projected.
-    static let structuralRelationType = "mentions"
+    /// Structural edges are plumbing rather than claims and must not be projected: a memory naming a thing, and the person's edge to each
+    /// thing a memory names (`personRelation`).
+    static let structuralRelationTypes = ["mentions", "in_memory_about", "in_memory_from"]
 
     /// Evidence-first ordering keeps best-attested edges under caps; per-subject limits stop a hub consuming the whole budget. Missing storage means nothing
     /// indexed; unreadable storage throws.
@@ -102,7 +103,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 FROM kg_relationships r
                 JOIN kg_entities ef ON ef.id = r.from_id
                 JOIN kg_entities et ON et.id = r.to_id
-                WHERE r.type <> ?
+                WHERE r.type NOT IN (\(Self.structuralRelationTypes.map { _ in "?" }.joined(separator: ", ")))
                   AND SUBSTR(r.from_id, 1, ?) <> ?
                   AND SUBSTR(r.to_id, 1, ?) <> ?
                   AND TRIM(COALESCE(r.type, '')) <> ''
@@ -112,8 +113,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 ORDER BY mention_count DESC, weight DESC,
                          from_name ASC, type ASC, to_name ASC
                 LIMIT ?
-                """, arguments: [
-                    Self.structuralRelationType,
+                """, arguments: StatementArguments(Self.structuralRelationTypes) + [
                     prefix.count, prefix,
                     prefix.count, prefix,
                     readLimit,

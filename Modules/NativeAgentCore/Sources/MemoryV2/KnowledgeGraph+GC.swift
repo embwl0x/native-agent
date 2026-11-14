@@ -44,10 +44,11 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let identity = try resolvedExtractionIdentity()
         let primaryUserName = identity.primaryUserName
         let knownPeople = identity.knownPeople
+        let knownAgents = identity.knownAgents
         if !apply {
             return try await dbPool.read { db in
                 let scan = try Self.scanForOrphans(
-                    db, knownPeople: knownPeople, primaryUserName: primaryUserName
+                    db, knownPeople: knownPeople, knownAgents: knownAgents, primaryUserName: primaryUserName
                 )
                 return KnowledgeGraphGCReport(
                     candidates: scan.candidates,
@@ -63,7 +64,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
 
         return try await dbPool.write { db in
             let scan = try Self.scanForOrphans(
-                db, knownPeople: knownPeople, primaryUserName: primaryUserName
+                db, knownPeople: knownPeople, knownAgents: knownAgents, primaryUserName: primaryUserName
             )
             if let expectedCandidateIDs,
                Set(scan.candidates.map(\.id)) != expectedCandidateIDs {
@@ -127,6 +128,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
     private static func scanForOrphans(
         _ db: Database,
         knownPeople: [String],
+        knownAgents: [String: String],
         primaryUserName: String
     ) throws -> OrphanScan {
         let rows = try Row.fetchAll(
@@ -144,8 +146,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let liveIDs = Set(active.map(\.id).filter { !$0.isEmpty })
         // Support uses the indexer's exact extractor and known-person vocabulary.
         var liveKeys = Set<String>()
-        for fact in active {
-            for entity in Self.extractEntities(from: fact.content, knownPeople: knownPeople) {
+        for entities in Self.extractCorpus(active.map { $0.content }, knownPeople: knownPeople, knownAgents: knownAgents) {
+            for entity in entities {
                 liveKeys.insert("\(entity.type.lowercased())|\(entity.name.lowercased())")
             }
         }

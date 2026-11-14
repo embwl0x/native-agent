@@ -81,7 +81,7 @@ struct InboxNotesCapsule: View {
                 return .init(id: id, title: "Waiting on this update's reading…", tone: .quiet)
             }
             return .init(id: id, title: item.title, detail: item.summary, at: item.created_at, symbol: item.sourceIcon,
-                         tone: item.severity == "actionable" ? .attention : nil, actions: [
+                         tone: item.waitsOnPerson ? .attention : nil, actions: [
                 .init(id: "open", label: "Open", open: "page:inbox/" + id,
                       unavailable: isMarkingAll ? "Waiting on the current read operation." : nil),
             ])

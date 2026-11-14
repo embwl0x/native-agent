@@ -21,6 +21,27 @@ import os
 public final class AppleScriptExecution: Sendable {
     public init() {}
 
+    /// What a call waits on when it waits on an app under automation: alive while the app answers an accessibility ping, gone when it has
+    /// quit, not answering when the ping cannot complete. Without accessibility the app cannot be asked, so it says nothing.
+    public static func appLife(pid: pid_t, name: String) -> CallLife {
+        CallLife(what: name) {
+            #if canImport(AppKit)
+            guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return .dead("\(name) has quit") }
+            let element = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(element, 3)
+            var role: CFTypeRef?
+            switch AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) {
+            case .success: return .alive
+            case .cannotComplete: return .dead("\(name) is not answering")
+            case .invalidUIElement: return .dead("\(name) has quit")
+            default: return .unknown
+            }
+            #else
+            return .unknown
+            #endif
+        }
+    }
+
     public static let appleScriptOutcomeUnknownCode = -1002
 
     public static func automationTarget(_ permission: String) -> String? {
@@ -239,6 +260,9 @@ public final class AppleScriptExecution: Sendable {
             pid = try await Self.appProcess(at: url)
         }
         let consentRoot = context.dataRoot
+        // While the call waits on this app, the app is what it waits on: a quiet call asks whether the app still answers.
+        let watched = context.life.map { ($0, $0.attach(Self.appLife(pid: pid, name: url.deletingPathExtension().lastPathComponent))) }
+        defer { if case let (watch, id)? = watched { watch.detach(id) } }
         if !read, holder == nil { Self.holders.withLock { if $0[pid] != nil { $0[pid] = UUID() } } }
         let response: JSONValue = try await Self.onAppleScriptQueue { cancelled in
             if let holder, Self.holders.withLock({ $0[pid] }) != holder {

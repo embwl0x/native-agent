@@ -600,8 +600,28 @@ old pairing's cache. Acknowledgements and publication deduplication distinguish
 the pairing and scoped record, so a previous pairing cannot suppress delivery.
 
 CloudKit launch and foreground activation share one catch-up: wait for message
-and status consumers, renew subscriptions, pull pairing before incoming
-messages, re-read observed status records, then read Mac presence. The setup
+and status consumers, pull pairing before incoming messages, re-read observed
+status records, then renew subscriptions and read Mac presence. The read comes
+first: what the phone waits on is in iCloud, and no push is needed to find it.
+The phone holds the key the Mac publishes in `pairing.mac`, whatever it held
+before (wipe, reinstall, Regenerate, another install on the same Apple Account):
+every read of that record installs it when it differs, with no button. The key is read
+before the first drain, and the phone's pull cursor is raised to the current
+key's publication (less the 30 s overlap): older records were signed with an
+earlier key. A Mac record that fails its signature causes one read of the
+published key per key held (and one more for a failing record newer than the
+key's publication); under a newly installed key it is judged again. Under the
+Mac's current key, a record that does not verify was signed with another key: it
+is dropped as handled, never kept, retried or left pinning the drain. Once the
+key is current, the unverified list and deliveries owed under other keys are let
+go, and refused records are judged again. `failing-mac-records.json` and the
+unverified list keep at most 200 entries. A drain writes its handled-record
+memory once, at its end. Once for each key it holds, the Mac deletes the
+`NAChatMessage` and `NANotification` records whose signed inline envelope does
+not verify under that key; pairing, status and snapshot records, unsigned records
+and asset payloads are left alone.
+Connect, Check for Mac and Connection refresh read incoming records too, and a
+chat send reads once after it lands. The setup
 pairing-key read retains a verified mismatch across a failed read. Without a
 current successful key read, connection assessment carries the read cause or
 waits for evidence; it cannot call the pairing healthy.
@@ -743,8 +763,10 @@ polling or dropping it. The foreground/talk phone's 30-second contact loop reads
 Mac presence independently of message reads. The Mac's separate metadata drain follows
 receive/status events and completion, without a 30-second throttle.
 A missing or unreadable peer message establishes no disconnection and completes
-no delivery. KVS wake hints are sent once after transport acceptance or a durable
-Drive commit; the one worker awaits each real synchronize return, with no delayed
+no delivery. A build signed with the key-value store entitlement sends KVS wake
+hints once after transport acceptance or a durable Drive commit; a build without
+it sends none, and its iPhone transport fact says the phone is woken by CloudKit
+push only; the one worker awaits each real synchronize return, with no delayed
 1/3-second nudges. Local synchronization never proves recipient acceptance.
 
 The Mac records payload-free `phone.pickup` (signed-envelope send time, Mac

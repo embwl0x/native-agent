@@ -13,11 +13,12 @@ import DreamREMCycle
 public struct PersonaBackedBackgroundLLMClient: LLMClient {
     let inner: any LLMClient
     let dataRoot: URL
-    let cognitionRuntime: NativeCognitionRuntime
+    /// The running mind, read when the call is made: its posture joins the persona; with no mind running the work runs without it.
+    let cognitionRuntime: @Sendable () -> NativeCognitionRuntime?
     /// The caller chooses the assembly for this operation's client explicitly.
     let assembly: PrivateWorkContextAssembly
 
-    public init(inner: any LLMClient, dataRoot: URL, cognitionRuntime: NativeCognitionRuntime,
+    public init(inner: any LLMClient, dataRoot: URL, cognitionRuntime: @escaping @Sendable () -> NativeCognitionRuntime?,
                 assembly: PrivateWorkContextAssembly) {
         self.inner = inner
         self.dataRoot = dataRoot
@@ -96,7 +97,7 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
         guard !compiled.isEmpty else {
             throw BackgroundPersonaContextError.emptyCompiledPrompt(surface: surface)
         }
-        let organismPosture = await cognitionRuntime.organismBehaviorPosture()?
+        let organismPosture = await cognitionRuntime()?.organismBehaviorPosture()?
             .privateRuntimeContext()
         let boundary = """
         # Private background work

@@ -18,7 +18,8 @@ public protocol ClaudeBridgeStatePort: Sendable {
     var startedAt: Date { get }
     var preferredPersona: String? { get }
     var preferredSessionID: String? { get }
-    var cognition: NativeCognitionRuntime { get }
+    /// The running mind; nil before setup has finished and after a reset closed it.
+    var cognition: NativeCognitionRuntime? { get }
     var contextFlow: NativeContextFlowRuntime { get }
     func recentEventPayloads() -> [[String: Any]]
 }
@@ -347,8 +348,12 @@ extension ClaudeBridgeReadout {
             "buildIdentity": buildIdentity.bridgePayload,
             "uptimeSeconds": uptime,
         ]
-        let organism = await port.cognition.organismSnapshot()
-        payload["organism"] = Self.organismSnapshotJSON(organism)
+        let cognition = port.cognition
+        if let organism = await cognition?.organismSnapshot() {
+            payload["organism"] = Self.organismSnapshotJSON(organism)
+        } else {
+            payload["organism"] = ["state": "no_mind", "why": "The mind starts when setup finishes."]
+        }
         let contextFlowStatus = await port.contextFlow.modeStatus()
         let contextFlowHealth = await port.contextFlow.health()
         payload["contextFlow"] = Self.contextFlowHealthJSON(
@@ -356,12 +361,16 @@ extension ClaudeBridgeReadout {
             health: contextFlowHealth,
             unavailableReason: contextFlowStatus.unavailableReason
         )
-        let capsule = await port.cognition.lastInjectedCapsuleBridgeSummary()
-        let microcycle = await port.cognition.microcycleTelemetrySnapshot()
-        payload["cognition"] = [
-            "lastInjectedCapsule": Self.capsuleSummaryJSON(capsule),
-            "microcycle": Self.microcycleTelemetryJSON(microcycle),
-        ]
+        if let cognition {
+            let capsule = await cognition.lastInjectedCapsuleBridgeSummary()
+            let microcycle = await cognition.microcycleTelemetrySnapshot()
+            payload["cognition"] = [
+                "lastInjectedCapsule": Self.capsuleSummaryJSON(capsule),
+                "microcycle": Self.microcycleTelemetryJSON(microcycle),
+            ]
+        } else {
+            payload["cognition"] = ["state": "no_mind"]
+        }
         return payload
     }
 

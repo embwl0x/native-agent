@@ -164,28 +164,28 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         }
         var fields: [String: JSONValue] = if case .object(let fields)? = executedAction { fields } else { [:] }
         if fields["detail"] == nil, let executionDetail { fields["detail"] = .string(executionDetail) }
+        // What changed: the call's own result once it ran, or that nothing ran.
         let words: String
         if case .object(let execution)? = executedAction,
            execution["op"] == .string("chat_tool_approval_replay") {
             let outcome = executionResultClass.receipt.label
             if let preview = execution["resultPreview"] { fields["detail"] = preview }
-            let preview = ChatToolOutcome.explanation(.object(fields)).map { " Result: \($0)" } ?? ""
-            // Execution attribution and approval authority are distinct.
-            let ranBy = preview.contains("decided_by") ? " Its decided_by names who carried it out, not who approved it." : ""
-            words = (decision == "approved" ? "\(action): \(outcome) after approval by \(approvedBy ?? "an unrecorded decider")."
-                : "\(action): \(decision ?? status). The tool did not run.") + preview + ranBy
+            // A replay refused before it executed did not run: say so, and why, never that it ran.
+            let notRun = executionResultClass == .refused || execution["not_run_status"] != nil
+            let preview = ChatToolOutcome.explanation(.object(fields)).map { (notRun ? " Why: " : " Result: ") + $0 } ?? ""
+            words = (decision != "approved" ? "Nothing ran." : notRun ? "It did not run." : "It ran: \(outcome).") + preview
         } else if executedAction != nil {
             let value = JSONValue.object(fields)
             words = [ChatToolOutcome.explanation(value), ChatToolOutcome.remedy(value)]
                 .compactMap { $0 }.joined(separator: " ")
         } else {
-            words = executionDetail ?? decision.map { "\(action): \($0)." } ?? payloadPreview
+            words = executionDetail ?? (decision == nil ? payloadPreview : decision == "approved" ? "" : "Nothing ran.")
         }
         // A saved decision is not proof of a successful effect. Lead its receipt with the execution owner's verdict.
         let outcomeLead: String?
         switch decision {
         case "denied": outcomeLead = "Declined"
-        case "canceled": outcomeLead = "Not now"
+        case "canceled": outcomeLead = decidedByPersonsWord ? "Decided by word" : "Not now"
         case "approved":
             switch executionResultClass {
             case .succeeded: outcomeLead = "Done"
@@ -195,14 +195,15 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
             case .timeout: outcomeLead = "Unknown: the approved action timed out; completion is unconfirmed"
             case .unknown: outcomeLead = "Unknown: the approved action's completion is unconfirmed"
             }
-        default: outcomeLead = status == "orphaned" ? "Expired: no decision was recorded" : nil
+        default: outcomeLead = status == "orphaned" ? "Expired" : nil
         }
+        // A settled card's record names the card, who decided it, and what changed, in that order, whoever reads it.
         var receipt: String
         if let outcomeLead {
             let detail = words.trimmingCharacters(in: .whitespacesAndNewlines)
-            receipt = outcomeLead + (detail.isEmpty ? ": no result detail was recorded." : ": " + detail)
+            let who = decider.map { "Decided by \($0)." } ?? "No one decided it."
+            receipt = "\(outcomeLead): \(title). \(who) " + (detail.isEmpty ? "No result detail was recorded." : detail)
         } else { receipt = words }
-        if let attribution = resolutionProvenance?.messageAttribution { receipt += " " + attribution + "." }
         // Approval is not adoption; only completed application writes this receipt.
         let applied: Bool
         let reply = ToolResult(.object(fields))
@@ -223,16 +224,30 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
                           claims: applied ? [.init(claim: "applied", evidence: [ref])] : [])
     }
     /// Receipts address the person as "you" and name other deciders by their own labels.
-    public var approvedBy: String? {
-        guard decision == "approved",
+    public var approvedBy: String? { decision == "approved" ? decider : nil }
+    /// The label a card settled by the person's own words carries: their word decided the call, which ran in its turn, not from the card.
+    public static let personsWordDecider = "the person's word in this conversation: "
+    /// Whether the person's own words, not a tap, decided this card.
+    public var decidedByPersonsWord: Bool {
+        if case .local(let label)? = resolutionProvenance { return label.hasPrefix(Self.personsWordDecider) }
+        return false
+    }
+    /// Who decided this card, whatever the decision: the person by a tap and where, the person by their word (their message the agent
+    /// carried out, or their words that decided the call itself), or the agent; with the time. Nil while no one has decided it.
+    public var decider: String? {
+        guard decision != nil,
               let provenance = resolutionProvenance ?? decidedBy.map(ApprovalResolutionProvenance.local) else { return nil }
         let who = switch provenance {
-        case .telegram: "you, in Telegram"
-        case .signedIOS: "you, on your iPhone"
+        case .telegram: "you, by a tap in Telegram"
+        case .signedIOS: "you, by a tap on your iPhone"
         case .personMessage(let sessionID, let messageID, let door):
-            "the agent on your message \(messageID) in conversation \(sessionID), through \(door.messageDoorName)"
-        case .local(decidedBy: "mac_ui"), .local(decidedBy: "local_desk_click"): "you, in the Mac app"
-        case .local(let label): label
+            "you, by your message \(messageID) in conversation \(sessionID) through \(door.messageDoorName), carried out by the agent"
+        case .local(decidedBy: "mac_ui"), .local(decidedBy: "local_desk_click"): "you, by a tap in the Mac app"
+        case .local(decidedBy: "agent_withdraw"): "the agent, withdrawing its own ask"
+        case .local(decidedBy: "full_mac_yolo"): "the agent, under Full Mac"
+        case .local(let label) where label.hasPrefix(Self.personsWordDecider):
+            "you, by your own words in the conversation: " + String(label.dropFirst(Self.personsWordDecider.count))
+        case .local(let label): isAgentsOwnDecision ? "the agent (\(label))" : label
         }
         guard let at = resolvedAt.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) else { return who }
         let clock = DateFormatter()

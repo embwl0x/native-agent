@@ -39,7 +39,7 @@ public actor AgentContactHealth {
     /// A pull host's last call is evidence of that call; its next call owns delivery.
     public nonisolated static func checkIn(_ peer: AgentPeerContact) -> AgentLocalHealth? {
         guard peer.transport == .mcpHost, !ChatGPTDotIPCTransport.owns(peer),
-              AgentPeerStore.hostRowID(peer.endpoint).flatMap(AgentHostDirectory.row(named:))?.commandLine == nil else { return nil }
+              AgentPeerStore.hostRowID(peer.endpoint).flatMap(AgentHostDirectory.row(named:))?.reachedLive != true else { return nil }
         let at = peer.provenInboundAt.flatMap(NativeTimestampFormat.parseISO8601)
         if peer.provenInboundAt != nil, at == nil {
             return AgentLocalHealth(status: "unknown",
@@ -74,7 +74,7 @@ public actor AgentContactHealth {
         if let row = peer.flatMap({ AgentPeerStore.hostRowID($0.endpoint) }).flatMap(AgentHostDirectory.row(named:)) ?? AgentHostDirectory.row(named: agent),
            row.acp == nil, row.settingsSupported || row.format == .shellEnvironment {
             let setup = AgentHostConnection.verifySetup(name: row.id, store: store, dataRoot: dataRoot, workspace: workspace ?? peer?.hostWorkspace)
-            if !passed(setup) || peer == nil || row.commandLine == nil { return setup }
+            if !passed(setup) || peer == nil || !row.reachedLive { return setup }
         }
         var verification = conversation
         verification.dryRun = true
@@ -408,7 +408,7 @@ public actor AgentContactHealth {
         do {
             if let peer, peer.transport == .grokBot, let verify = grokVerifiers[dataRoot.standardizedFileURL.path] {
                 try await verify(peer.id)
-                detail = "Reply routine re-imported; an actual reply is still unproven. Approve its reply command in Grok Bot if asked."
+                detail = "Its routine's webhook is saved; an actual reply is still unproven. Approve its reply command in Grok Bot if asked."
             } else if let peer, peer.transport == .a2a {
                 let found = try await Self.cardCheck(peer)
                 detail = (Self.text(found["detail"]) ?? "") + (Self.passed(.object(found))
@@ -430,7 +430,7 @@ public actor AgentContactHealth {
         } catch {
             detail = peer?.transport == .grokBot
                 ? String(error.localizedDescription.split(separator: "\n").first ?? "Routine verification failed.")
-                    + " Open Grok Bot's Routines and restore the NativeAgent reply routine, then run agent.verify for \(name)."
+                    + " Connect \(name) again for its setup steps, then run agent.verify for \(name)."
                 : "Restore \(name)'s reply endpoint or sign-in, then run agent.verify."
         }
         guard var health = try? AgentLocalHealth.checkedRead(dataRoot) else { return }

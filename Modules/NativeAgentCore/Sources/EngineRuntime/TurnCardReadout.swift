@@ -34,7 +34,7 @@ public enum TurnCardReadout {
             case .retrying: line = "Retrying"; moving = true
             case .blocked: line = "Blocked"; moving = false
             case .stalled: line = "No movement"; moving = false
-            case .completed, .failed, .canceled, .outcomeUnknown: return nil
+            case .completed, .failed, .canceled, .outcomeUnknown, .waitingOnPerson: return nil
             }
         }
         return .init(identity: state.identity, runID: runID, line: line, isMoving: moving)
@@ -49,7 +49,7 @@ public enum TurnCardReadout {
         case .completed, .failed, .canceled:
             return false
         case .acknowledged, .working, .tool, .delegation, .retrying,
-             .waiting, .blocked, .stalled, .outcomeUnknown:
+             .waiting, .blocked, .stalled, .outcomeUnknown, .waitingOnPerson:
             return true
         }
     }
@@ -81,6 +81,23 @@ public enum TurnCardReadout {
         )
     }
 
+    /// The turn's ending as it stands now. A turn that ended waiting on the person waits only while the approval it raised is undecided: once the
+    /// approval is decided (or ends undecided) the turn has done its part, and it reads as done; an approval that keeps its card owns the words.
+    /// Its follow-up runs as its own work and never rewrites this turn's lifecycle, so the decision is read here, where the card reads it.
+    public static func phase(of state: MacChatTurnLifecycleState, approval: MacChatTurnCardApproval?) -> TurnPresentationPhase {
+        let phase = state.presentation.phase
+        guard phase == .waitingOnPerson, let approval, approval.outcome != .pending else { return phase }
+        return .completed
+    }
+
+    public static func phase(
+        of state: MacChatTurnLifecycleState,
+        approvals: [ApprovalRecord],
+        parseTimestamp: (String) -> Date?
+    ) -> TurnPresentationPhase {
+        phase(of: state, approval: approval(for: state, approvals: approvals, parseTimestamp: parseTimestamp))
+    }
+
     public static func card(
         for state: MacChatTurnLifecycleState?,
         sessionId: String,
@@ -95,7 +112,7 @@ public enum TurnCardReadout {
         let approval = approval(for: state, approvals: approvals, parseTimestamp: parseTimestamp)
         let presentation = state.presentation
         let isTerminal = presentation.isTerminal
-        let phase = presentation.phase
+        let phase = Self.phase(of: state, approval: approval)
         // After completion, only unproven approval outcomes retain the card, and the approval owns its words.
         let approvalOwnsCard = approval?.outcome == .pending
             || (phase == .completed && approval?.keepsCardVisible == true)
@@ -206,7 +223,7 @@ public enum TurnCardReadout {
         case .acknowledged, .working, .tool, .delegation, .retrying:
             return true
         // Waiting is not movement; a live pulse would claim motion forever because the kernel does not stall waiting turns.
-        case .waiting, .blocked, .stalled, .completed, .failed, .canceled, .outcomeUnknown:
+        case .waiting, .blocked, .stalled, .completed, .failed, .canceled, .outcomeUnknown, .waitingOnPerson:
             return false
         }
     }
@@ -250,6 +267,8 @@ public enum TurnCardReadout {
             return "This turn was stopped"
         case .outcomeUnknown:
             return "Not sure that finished."
+        case .waitingOnPerson:
+            return "\(who) is waiting on you"
         }
     }
 
@@ -266,6 +285,8 @@ public enum TurnCardReadout {
             return "Nothing has moved for a while. This is an observation, not a verdict \u{2014} it clears on the next sign of work."
         case .outcomeUnknown:
             return "This reply did not finish before the app restarted."
+        case .waitingOnPerson:
+            return "The next move is yours."
         default:
             return nil
         }
@@ -273,7 +294,8 @@ public enum TurnCardReadout {
 
     public static func tone(for phase: TurnPresentationPhase) -> MacChatTurnCardModel.Tone {
         switch phase {
-        case .acknowledged, .working, .tool, .delegation, .retrying, .waiting, .completed:
+        // Waiting on the person is a known ending, never an error or an unknown: it keeps the quiet register.
+        case .acknowledged, .working, .tool, .delegation, .retrying, .waiting, .completed, .waitingOnPerson:
             return .working
         case .blocked, .stalled:
             return .attention
@@ -300,6 +322,7 @@ public enum TurnCardReadout {
         case .failed: return "exclamationmark.triangle"
         case .canceled: return "stop.circle"
         case .outcomeUnknown: return "questionmark.circle"
+        case .waitingOnPerson: return "hourglass"
         }
     }
 }

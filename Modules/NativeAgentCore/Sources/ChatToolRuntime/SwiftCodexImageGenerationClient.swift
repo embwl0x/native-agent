@@ -133,7 +133,7 @@ final class SwiftCodexImageGenerationClient: Sendable {
 
         let processResult: CodexImageGenerationProcessResult
         do {
-            processResult = try await Self.defaultRunner(invocation)
+            processResult = try await Self.defaultRunner(invocation, life: turn?.enclosingCall)
         } catch {
             if error is CancellationError { throw CancellationError() }
             throw ImageGenerationToolError.transport(message: String(describing: error))
@@ -330,8 +330,10 @@ final class SwiftCodexImageGenerationClient: Sendable {
         return lines.joined(separator: "\n")
     }
 
-    static func defaultRunner(_ invocation: CodexImageGenerationInvocation) async throws -> CodexImageGenerationProcessResult {
+    /// `life` is the watch of the call waiting on the image: the running process is what it waits on.
+    static func defaultRunner(_ invocation: CodexImageGenerationInvocation, life: TurnDeadline?) async throws -> CodexImageGenerationProcessResult {
         let process = ManagedProcess()
+        process.life = life
         process.executableURL = URL(fileURLWithPath: invocation.executable)
         process.arguments = invocation.arguments
         process.currentDirectoryURL = invocation.cwd

@@ -53,15 +53,24 @@ import Studio
 
 extension NativeAgentEngine {
 
-    /// Alternate roots must never observe or mutate the process-global personal cognition runtime.
+    /// Alternate roots must never observe or mutate the process-global personal cognition runtime. The live root's mind is nil until setup has
+    /// finished and after a reset closed it; asking never makes one.
     public static func cognitionRuntime(
         for dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> NativeCognitionRuntime {
+    ) -> NativeCognitionRuntime? {
         let standardized = dataRoot.standardizedFileURL
         return standardized == PersistenceCore.defaultDataRoot().standardizedFileURL
             ? NativeAgentEngine.liveCognition
             : NativeCognitionRuntime(dataRoot: standardized, host: NativeAgentEngine.live.ports.cognitionHost,
                                      contextFlow: NativeContextFlowRuntime(dataRoot: standardized))
+    }
+
+    /// The mind a dream, REM or night reading needs, or the reason there is none yet.
+    static func requiredMind(for dataRoot: URL) throws -> NativeCognitionRuntime {
+        guard let runtime = cognitionRuntime(for: dataRoot) else {
+            throw PersistenceCoreError.ioFailure("The mind starts when setup finishes; there is no mind yet.")
+        }
+        return runtime
     }
 
     /// Share resident routing, credentials and call limits so a stalled background call cannot hold memory promotion forever.
@@ -70,19 +79,33 @@ extension NativeAgentEngine {
         cognitionRuntime: NativeCognitionRuntime? = nil,
         assembly: PrivateWorkContextAssembly
     ) -> any LLMClient {
-        let runtime = cognitionRuntime ?? self.cognitionRuntime(for: dataRoot)
-        let inner = makeResidentProviderLLMClient(dataRoot: dataRoot, lifecycleObserver: runtime)
+        // A supplied runtime is that mind's own call. The live root's mind is read through its owner when the call runs, so a client made before
+        // setup or kept across a reset reaches whichever mind runs; an alternate root's runtime is made once here.
+        let mind: @Sendable () -> NativeCognitionRuntime?
+        let observer: (any LLMCallLifecycleObserving)?
+        if let cognitionRuntime {
+            mind = { cognitionRuntime }; observer = cognitionRuntime
+        } else if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
+            let owner = NativeAgentEngine.live.mind
+            mind = { owner?.runtime }; observer = owner
+        } else {
+            let alternate = self.cognitionRuntime(for: dataRoot)
+            mind = { alternate }; observer = alternate
+        }
+        let inner = makeResidentProviderLLMClient(dataRoot: dataRoot, lifecycleObserver: observer)
         return PersonaBackedBackgroundLLMClient(
             inner: inner,
             dataRoot: dataRoot,
-            cognitionRuntime: runtime, assembly: assembly
+            cognitionRuntime: mind, assembly: assembly
         )
     }
     /// The night owns dreams and REM; registered loops serve their own evidence.
     public static func assembleAllLoops(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [LoopRegistration] {
-        let cognition = cognitionRuntime(for: dataRoot)
+        // The live mind is read at each tick (none until setup has finished); an alternate root's runtime is made once here.
+        let alternate = dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL ? nil : cognitionRuntime(for: dataRoot)
+        let cognition: @Sendable () -> NativeCognitionRuntime? = { alternate ?? cognitionRuntime(for: dataRoot) }
         let runners: [any LoopRunner] = [
             makeAutoDoctorLoop(dataRoot: dataRoot),
             makeOffDiskBackupLoop(dataRoot: dataRoot),
@@ -156,7 +179,7 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
     var agentSubject: String { NativeAgentEngine.live.ports.backgroundWork.agentSubject }
 
     func observeMotorActionState(_ model: MotorActionReadModel) async {
-        await NativeAgentEngine.liveCognition.observeMotorActionState(model)
+        await NativeAgentEngine.liveCognition?.observeMotorActionState(model)
     }
 
     /// The contact doors' transports (their start, queued sends, reply reads) and the Desk waits that settled. Neither decides that the agent thinks:

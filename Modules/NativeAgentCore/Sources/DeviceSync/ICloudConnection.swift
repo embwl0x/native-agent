@@ -17,8 +17,12 @@ extension iCloudBridge {
         guard !isSetUp else { return }
         isSetUp = true
         if pairedPhonesSubscription == nil {
-            pairedPhonesSubscription = sync.pairedPhones.$phones.sink { [weak self] _ in
-                Task { @MainActor in self?.refreshPhoneConnection() }
+            pairedPhonesSubscription = sync.pairedPhones.$phones.sink { [weak self] phones in
+                Task { @MainActor in
+                    self?.refreshPhoneConnection()
+                    // The person's Pair writes the owed acceptance; it leaves for the phone from here, whichever door pressed Pair.
+                    if phones.contains(where: \.confirmationOwed) { self?.deliverOwedPairingConfirmations() }
+                }
             }
         }
         doctorTransportHealth = .unmeasured

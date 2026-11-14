@@ -65,13 +65,31 @@ setup it is due by its ordinary rhythm. This replaces the per-pass setup checks:
 the off-disk backup's own "setup is not complete" skip and the launch Doctor
 tick's separate onboarding guard.
 
-**Known gap: the mind still starts before setup finishes.** The mind's own
-attention, night and microcycles start at launch, before setup, because nothing
-holds the mind until the agent exists. Example: on a wiped Mac first launched at
-16:58, the night opened 30 minutes after the person left, REM failed at 17:31
-reading a `persona/GROWTH.md` that setup wrote at 18:48, and Doctor's Body row
-kept that failure afterwards. The design to close it is to start the mind only
-once setup finishes, in one place, not to gate its paths one by one.
+**The mind starts when the agent exists.** The body owns its mind's lifetime
+(`MindLifetime`, `EngineRuntime/EngineMind.swift`), not a mind: before the same
+setup predicate holds there is no cognition runtime, no attention intake, no
+`BodyNerve` feeling beats, no mind stream, and none of the mind's sources or
+clock deliveries (part wake, front-app sense, the one clock's part, watch, scan
+and brief owners). One serial owner decides, always rechecking setup: launch
+asks once the body is up, and every setup transition asks through the shared
+hook (`refreshResidentMindAfterOnboardingTransition`), after the pending
+completion is removed. With setup finished and no mind it makes the runtime
+once, opens it, then attaches the nerve, installs attention, opens the stream on
+what was owed meanwhile and attaches the sources; with setup not finished it
+closes a running mind. Happenings posted with no mind stay recorded and owed;
+organ beats are recorded but not felt; clock times stay pending and are
+delivered once to the next mind; helpers run unattended only while a mind runs.
+A confirmed reset runs through the same owner: the mind closes first (attention
+and the nerve detach, the stream's thoughts, returns and night with its dream
+are stopped and joined, the sources and clock deliveries detach, the runtime
+sleeps and is removed), then the identity is removed, then the owner decides
+again, so a reset that did not complete starts a new mind. Every holder keeps
+the owner, never a runtime: chat and tool clients made before setup or kept
+across a reset reach whichever mind runs when they act, and its changes run
+across absence and presence (`mind:opened`, `mind:closed`). Readers with no mind
+report none (Doctor `unmeasured`, Cognition and mood faces unavailable, the
+phone's body status `unavailable`, `mind.sleep` and dream or REM runs refused
+with the reason). Quit closes a running mind and starts none after it.
 
 A tick returns `LoopTickOutcome.completed`, `skipped` or `failed`.
 A skip preserves an existing failure streak and updates live status only. Durable clocks
@@ -99,7 +117,7 @@ Inspect these together:
   readers fold incidents without rewriting their original occurrence times.
 - `beat` details in that record: work that runs outside a loop (iCloud drain,
   launch reconcilers) records each pass as a beat with `OrganPulse.record`
-  (outcome `worked`, `nothing`, `held`, `failed` or `stopped`, a note, an
+  (outcome `worked`, `nothing`, `held`, `busy`, `failed` or `stopped`, a note, an
   optional yield and cadence). The record compares those facts with the organ's
   latest stored beat in the write transaction; an unchanged reading writes nothing,
   including across relaunch. Every beat still feeds the live ring for liveness and
@@ -114,17 +132,22 @@ Inspect these together:
   missed once it misses a whole beat since launch. A fresh timestamp alone does
   not prove successful work: read outcome, note and cadence together. An organ
   whose clock stopped on purpose records a `held` beat noted `off: <reason>`:
-  never overdue, never felt. No beats yet means nothing is known, not a quiet
+  never overdue, never felt. A pass that was due but found its shared slot held
+  by other work records a `busy` beat whose note names the holder and when the
+  slot opens: not a hold and not a failure, so it never makes the organ stuck
+  or failed and owes no repair. No beats yet means nothing is known, not a quiet
   body.
 - **Felt.** The agent feels only what its body did not predict. A deviation
   not yet told to its turns rides the next turn's facts as one line ("In my
   body: …"), in every turn kind; a quiet body adds nothing. It is said at its
   start and again when its kind, onset or size changes; the
   said-memory (`mind/body_said.json`) is stamped only when the provider accepts
-  a context carrying the line. `BodyNerve` re-reads the body on every beat: a
+  a context carrying the line. While a mind runs, `BodyNerve` re-reads the body on every beat: a
   deviation it has not felt becomes one `organDeviated` somatic signal, and a
   `failed` or `stuck` organ owes repair (operation `organ:<id>`) once, settled
-  by that organ's next completed pass (`worked` or `nothing`). Its memory is
+  by that organ's next completed pass (`worked` or `nothing`); a repair owed for
+  being stuck (no `failed` beat among the organ's kept beats) is also settled by
+  a `busy` beat, since busy is not a hold. Its memory is
   `mind/body_nerve.json`, so a relaunch neither signals an ongoing deviation
   again nor forgets its debt.
 
@@ -842,7 +865,7 @@ their launch and termination lifetimes.
 | Part file wakes | `EngineRuntime/EnginePartWake.swift` | Declared file watches deliver changes and suppress self-write echoes. | Reading status does not emit a file-change wake. [Wake contract](skill_manifest_spec.md#wake-signals), [watcher settlement](STOP.md). |
 | Part presence wakes | `EngineRuntime/EnginePartWake.swift`; `MacControl/PersonPresence.swift`, `MacPersonInput.swift`; `PersistenceCore/PhoneSenseHistory.swift` | Mac-input transitions and durable phone-motion observations reach the same person presence owner; fresh walking/driving can signal away, later physical Mac input signals here. | No presence probe from a status read; silence/unknown is no phone verdict. [Wake contract](skill_manifest_spec.md#wake-signals), [phone evidence](mobile_companion.md#where-the-person-is). |
 | Network sense and wakes | `NetworkSense.swift` | Path edges and return wakes. | [Request lifetime][provider-liveness]. |
-| Part resume wakes | `EngineRuntime/EnginePartWake.swift` | Launch delivers `resumed` after registering source observers. | Reading status does not resume a part. [Wake contract](skill_manifest_spec.md#wake-signals). |
+| Part resume wakes | `EngineRuntime/EnginePartWake.swift` | The mind's start (launch once setup has finished, or setup finishing) delivers `resumed` after registering source observers. | Reading status does not resume a part. [Wake contract](skill_manifest_spec.md#wake-signals). |
 | First-terminal Doctor refresh | `EngineRuntime/EngineDoctor+FirstTurnRefresh.swift` | Once per launch, the first persisted terminal triggers a fresh Doctor pass under its configured gate. | The terminal event measures afresh; reading the saved report does not. See [Doctor](#3-doctor--the-health-authority). |
 | Approval / Desk waits | `ApprovalTransactions/ApprovalReconciliation.swift` (`settleDeskWaitsOnEveryResolve`) | Manager-owned observation subscribes before launch reconciliation, then settles Desk waits on approval resolution. | Observation performs reconciliation; reading a card grants nothing. [Approval law](approval-schema.md#resolution-and-execution). |
 | Grant observation | `ApprovalTransactions/InlineInteractionResolver+ChatLifecycle.swift` (`GrantWatch`) | Manager-owned permission-change observation and card taps coalesce grant rechecks. On each wake a running permission card records what it waits on (`waitingOn`) and, once that item is on, asks macOS for the next one in friction order, opening its pane; launch-applied grants share one restart, performed only by the person's tap on the card. | Its observation reads grants; only a card the person tapped asks for the next one, and a saved health read requests none. [Authority](ONE_DOOR.md#authority-and-receipts). |

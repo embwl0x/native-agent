@@ -293,6 +293,28 @@ public enum AgentHostConnection {
                     ACP receipt at \(proposal.executable?.path ?? "missing") failed its file identity/digest check against host.acp.executable; \
                     connect again to approve the installed program. \(proposal.row.installationCheck)
                     """) }
+                if let previous = proposal.existing, var contact = proposal.existing, contact.transport != .acp {
+                    // A host whose recipe gained a live route keeps its contact's identity and conversations. A key belongs to the route it
+                    // was minted for, so the new route gets a new key, and grants made for the old route do not carry over.
+                    guard let endpoint = URL(string: "acp://" + proposal.row.id) else { throw Refusal.unknownHost(proposal.row.id) }
+                    contact.endpoint = endpoint
+                    contact.transport = .acp
+                    contact.hostWorkspace = nil
+                    contact.acpExecutable = proposal.executable
+                    contact.approvedExecutablePath = proposal.executable?.path
+                    contact.acpWorkingDirectory = proposal.workingDirectory.path
+                    contact.credentialKey = AgentPeerContact.credentialKey(for: contact.id)
+                    try AgentPeerStore.validate(contact)
+                    try FileManager.default.createDirectory(at: proposal.workingDirectory, withIntermediateDirectories: true,
+                                                            attributes: [.posixPermissions: 0o700])
+                    try AgentPeerCredentials.write(try mintKey(), peerID: contact.id)
+                    // Conversations move first, so a failed save that is reconnected again finds them already on the route it lands on.
+                    try AgentConversationStore(dataRoot: store.fileURL.deletingLastPathComponent().deletingLastPathComponent())
+                        .moveRoute(from: previous, to: contact)
+                    _ = try store.remove(contact.id)
+                    contact = try store.upsert(contact, resetProof: true)
+                    return (contact, AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: false), false)
+                }
                 if var contact = proposal.existing {
                     contact.acpExecutable = proposal.executable
                     contact.approvedExecutablePath = proposal.executable?.path

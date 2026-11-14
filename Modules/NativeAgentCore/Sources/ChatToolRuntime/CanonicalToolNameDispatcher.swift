@@ -21,7 +21,7 @@ import ChatToolParsing
 import ChatTurnContracts
 import ChatSessionWork
 import AgentConversations
-// Blueprint: | `CanonicalToolNameDispatcher.swift` | Canonical dispatch; records non-Inbox calls before execution for message decisions |
+// Blueprint: | `CanonicalToolNameDispatcher.swift` | Canonical dispatch; non-Inbox calls noted first for message decisions; each nested call watched |
 
 /// Every app call re-enters the complete gated chain with the consumer's current
 /// turn and operation, including the enclosing receipt and door dependencies.
@@ -164,10 +164,29 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         // Admit `app` by its action profile, then re-enter the complete chain for each folded tool or script call. The reached name is active for that call
         // only; the app door confers no authority on it.
         if Self.canonical(tool) == "app" {
-            let door = AppDoorReentry(perform: { name, arguments, turn, invocation in
-                try await self.dispatch(tool: name, input: arguments, surface: surface,
-                    turn: turn.with(\.offeredTools, (turn.offeredTools ?? []).union([name])), invocation: invocation)
-            }, validate: { name, arguments, turn, invocation in
+            let perform: AppDoorReentry.Perform = { name, arguments, turn, invocation in
+                let turn = turn.with(\.offeredTools, (turn.offeredTools ?? []).union([name]))
+                // Every nested call (a batch step, a program's action, read or admitted primitive, a folded call) crosses here: each has
+                // its own watch inside its enclosing call's, and ends as Stop ends it only when what it waits on is found dead, or at its own
+                // declared time.
+                let ran = ToolNameAliases.ranCall(name, input: arguments)
+                let action = name == "app" ? arguments["action"]?.stringValue : nil
+                let spoken = action.map { "app " + $0 } ?? name
+                var notice: (@Sendable (String) async -> Void)?
+                if let show = turn.notices { notice = { text in await show("call.stalled", text) } }
+                let heard = notice
+                do {
+                    return try await CallBound.run(name: spoken, declared: CallBound.declaredSeconds(input: ran.input),
+                        deadlines: invocation.deadlines, enclosing: turn.enclosingCall, notice: heard) { (deadlines: OperationDeadlines, call: TurnDeadline?) -> JSONValue in
+                        try await self.dispatch(tool: name, input: arguments, surface: surface, turn: turn.with(\.enclosingCall, call),
+                            invocation: invocation.with(\.deadlines, deadlines))
+                    }
+                } catch {
+                    guard let receipt = CallBound.ended(error, name: spoken) else { throw error }
+                    return receipt
+                }
+            }
+            let door = AppDoorReentry(perform: perform, validate: { name, arguments, turn, invocation in
                 if let validating = self.inner as? any PreApprovalToolValidating {
                     return await validating.preApprovalRefusal(turn: turn, invocation: invocation, tool: name, input: arguments, surface: surface)
                 }

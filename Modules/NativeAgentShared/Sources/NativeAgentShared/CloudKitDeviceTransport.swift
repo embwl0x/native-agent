@@ -331,10 +331,24 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
         return (incomingHandler, lastPullDate)
     }
 
+    /// Records the reader can never verify are not read at all: the phone raises its cursor to the publication of the Mac's current key (less
+    /// the clock-skew overlap), since anything older was signed with an earlier key.
+    public func raisePullCursor(toAtLeast date: Date) {
+        let floor = date.addingTimeInterval(-Self.pullOverlap)
+        lock.lock()
+        let behind = lastPullDate.map { $0 < floor } ?? true
+        lock.unlock()
+        guard behind else { return }
+        nativeLog("[ck-device] pull cursor raised to the current key's publication %@", "\(floor)")
+        setLastPullDate(floor, persistImmediately: true)
+    }
+
     func setLastPullDate(_ date: Date, persistImmediately: Bool) {
         let shouldPersist: Bool = {
             lock.lock()
             defer { lock.unlock() }
+            // The cursor only moves forward: a drain that began before a raise cannot pull it back.
+            guard lastPullDate.map({ date > $0 }) ?? true else { return false }
             lastPullDate = date
             let now = Date()
             let persist = Self.shouldPersistPullCursor(

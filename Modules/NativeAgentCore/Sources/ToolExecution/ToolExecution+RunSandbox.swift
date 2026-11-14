@@ -450,6 +450,11 @@ actor ToolPrimitiveBroker {
         // Recheck shell authority on every interaction so lost permission ends the program.
         do { _ = try await host.performReach("program.access", arguments: .object([:]), execution: execution) }
         catch { endProgram(id); throw error }
+        // A receive waits on the program: it is what the call waits on while the receive lasts.
+        let watched = operation == "program.receive" ? execution.turn?.enclosingCall.flatMap { watch in
+            program.process.callLife(what: "the program \(URL(fileURLWithPath: program.path).lastPathComponent)").map { (watch, watch.attach($0)) }
+        } : nil
+        defer { if case let (watch, id)? = watched { watch.detach(id) } }
         switch operation {
         case "program.send":
             let data = try Self.outgoing(try await inserting(args, ["text"], to: .program(path: program.path, identity: program.identity)))

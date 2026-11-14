@@ -18,7 +18,10 @@ import ContextFlow
 @Observable
 public final class CognitionViewFacade {
     public nonisolated let dataRoot: URL
-    public nonisolated let runtime: NativeCognitionRuntime?
+    /// The body's mind lifetime; nil on roots without a body.
+    public nonisolated let mind: MindLifetime?
+    /// The running mind, read when asked: nil before setup has finished and after a reset closed it.
+    public nonisolated var runtime: NativeCognitionRuntime? { mind?.runtime }
 
     public var detail: CognitiveObservatoryDetail?
     public var contextFlowHealth: ContextFlowObservatoryHealthState = .unavailable
@@ -42,19 +45,20 @@ public final class CognitionViewFacade {
     private var pendingObservatoryReads = 0
     public var isRefreshing: Bool { pendingObservatoryReads > 0 }
 
-    public nonisolated init(dataRoot: URL, runtime: NativeCognitionRuntime? = nil) {
+    public nonisolated init(dataRoot: URL, mind: MindLifetime? = nil) {
         self.dataRoot = dataRoot
-        self.runtime = runtime
+        self.mind = mind
     }
 
+    /// The mind's changes across its absence and presence; a root without a body has none.
     public nonisolated func changes() async -> AsyncStream<NativeCognitionRuntimeChange> {
-        guard let runtime else { return AsyncStream { $0.finish() } }
-        return await runtime.changes()
+        guard let mind else { return AsyncStream { $0.finish() } }
+        return mind.changes()
     }
 
+    /// With no mind running the detail is gone, never the last mind's detail shown as current.
     public func refreshDetail() async {
         _ = await detailRead.read({ await runtime?.observatoryDetail() }, publish: { read in
-            guard let read else { return }
             detail = read
             lastRefresh = Date()
         })

@@ -214,8 +214,23 @@ extension SwiftNativeChatOrchestrationClient {
                     } else {
                         do {
                             result = try await holding(work.with(\.imageSink, sink)) { work in
-                                return try await dispatcher.dispatch(tool: call.name, input: call.input, surface: "bot", turn: turn,
-                                    invocation: work.invocation)
+                                // A helper's call is a call its turn makes: it has a watch of its own, inside the call that started the helper.
+                                let (name, input) = (call.name, call.input)
+                                let ran = ToolNameAliases.ranCall(name, input: input)
+                                var notice: (@Sendable (String) async -> Void)?
+                                if let show = turn.notices { notice = { text in await show("call.stalled", text) } }
+                                let heard = notice
+                                do {
+                                    return try await CallBound.run(name: name, declared: CallBound.declaredSeconds(input: ran.input),
+                                        deadlines: work.deadlines, enclosing: turn.enclosingCall, notice: heard) {
+                                        (deadlines: OperationDeadlines, own: TurnDeadline?) -> JSONValue in
+                                        try await dispatcher.dispatch(tool: name, input: input, surface: "bot",
+                                            turn: turn.with(\.enclosingCall, own), invocation: work.with(\.deadlines, deadlines).invocation)
+                                    }
+                                } catch {
+                                    guard let receipt = CallBound.ended(error, name: name) else { throw error }
+                                    return receipt
+                                }
                             }
                         }
                         catch is CancellationError { throw CancellationError() }

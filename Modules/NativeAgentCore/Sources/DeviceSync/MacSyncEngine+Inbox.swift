@@ -757,6 +757,7 @@ extension MacSyncEngine {
         if let authenticationError {
             syncError = "Rejected CloudKit action: \(authenticationError)"
             if authenticationError.contains("pairing secret unavailable") { return false }
+            await sync.bridge.answerUnverifiablePhoneMessage(message.id)
             return true
         }
         guard isActive, generation == snapshotLifecycleGeneration, let responsesDir, let transactionDir,

@@ -88,11 +88,13 @@ struct InboxItemDetailSheet: View {
         var sections: [PartFace.Section] = [
             .init(id: "note", title: item.detailEyebrow, rows: [
                 .init(id: item.id, title: item.title, detail: item.summary, at: item.created_at, symbol: item.sourceIcon,
+                      tone: item.waitsOnPerson ? .attention : nil,
                       actions: visibleActions.map { action in
                     .init(id: action.id, label: action.label,
                           role: ["archive", "dismiss", "reject", "deny"].contains(action.id) ? .destructive
                             : InboxActionWords.isPrimary(action.id) ? .primary : nil,
-                          call: actionCall(action.id))
+                          call: actionCall(action.id),
+                          aside: InboxActionVocabulary.inboxVerbs.contains { $0.id == action.id } ? true : nil)
                 }),
             ]),
         ]

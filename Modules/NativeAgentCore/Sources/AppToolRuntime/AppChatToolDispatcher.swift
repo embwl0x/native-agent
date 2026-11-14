@@ -317,8 +317,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         if includeAppOwnedTools, ["agent_connect", "agent_message"].contains(tool),
            case .object(let plan) = result,
            [JSONValue.string("grok_setup"), .string("grok_disconnect"), .string("grok_send")].contains(plan["status"] ?? .null) {
-            return await platform.grok(plan, PersistenceCore.defaultDataRoot(), scopedInner(execution), surface, turn,
-                execution.macOperation(dataRoot: securityCenter.dataRoot))
+            return await platform.grok(plan, PersistenceCore.defaultDataRoot(), surface, turn, execution.partInvocation(turn: turn, surface: surface))
         }
         if includeAppOwnedTools, tool == "agent_message", case .object(let plan) = result,
            plan["status"] == .string("desktop_chat_send") {
@@ -337,10 +336,9 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         if includeAppOwnedTools, tool == "agent_message",
            case .object(let plan) = result, plan["transport"] == .string("desktop"),
            plan["status"] == .string("requires_interaction") {
-            let sent = await platform.desktop(plan, scopedInner(execution), surface, turn, execution.turnWork,
-                execution.macOperation(dataRoot: securityCenter.dataRoot))
-            return await GrokDesktopReply.follow(conversation: execution.invocation.conversation, sent,
-                dataRoot: PersistenceCore.defaultDataRoot())
+            return await platform.desktop(plan, scopedInner(execution), surface, turn, execution.turnWork,
+                execution.macOperation(dataRoot: securityCenter.dataRoot), execution.invocation.conversation,
+                execution.partInvocation(turn: turn, surface: surface))
         }
         return result
     }

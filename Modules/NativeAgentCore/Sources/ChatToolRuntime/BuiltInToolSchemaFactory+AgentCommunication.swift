@@ -31,7 +31,7 @@ extension BuiltInToolSchemaFactory {
                 directly: Trust supplies any required approval card with the exact change. Name alone finds a supported installed host and adds one \
                 MCP entry for nativeagent-link with a connection-specific key. Preserves other settings; keeps the newest NativeAgent backup for \
                 each owned section beside its file and removes those backups on disconnect. Unknown/uninstalled hosts leave settings unchanged; no \
-                app is restarted or interrupted. Setup may run one fixed CLI verification probe asking the participant to answer through the entry; \
+                app is restarted unless reopen:true. Setup may run one fixed CLI verification probe asking the participant to answer through the entry; \
                 this is a message, not task work or an authority grant. Connected requires an authenticated inbound request, not a successful CLI \
                 exit. Otherwise stays configured with the cause; without a probe route, the result names any restart needed and waits for first \
                 inbound proof without reading the window. Disconnect: disconnect:true, name:peer:<exact id from agent.contacts>; removes that entry \
@@ -51,6 +51,10 @@ extension BuiltInToolSchemaFactory {
                     """)),
                 ("transport", ToolSchema.enumStringSchema(["auto", "a2a", "nativeAgent", "desktop"])),
                 ("disconnect", ToolSchema.boolSchema()),
+                ("reopen", ToolSchema.boolSchema("""
+                    By name, on the person's ask: a host that loads its entry only at launch (Claude Desktop, Codex, Cursor) is quit, seen gone \
+                    and opened again after setup.
+                    """)),
                 ("working_directory", ToolSchema.strSchema("""
                     ACP agents only: explicit absolute project folder to show on the connect card. Omit for a new empty folder in this app's \
                     workspace.

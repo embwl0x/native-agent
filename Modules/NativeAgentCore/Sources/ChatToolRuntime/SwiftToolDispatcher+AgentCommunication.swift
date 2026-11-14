@@ -36,7 +36,8 @@ extension SwiftToolDispatcher {
             return true
         }
         let store = AgentPeerStore(dataRoot: dataRoot)
-        if tool == "agent_message", let reply = try await HelperContact.message(conversation: invocation.conversation, input) { return reply }
+        if tool == "agent_message", let reply = try await HelperContact.message(conversation: invocation.conversation, input,
+            call: turn.enclosingCall ?? invocation.deadlines.innermostCall) { return reply }
         try AgentRecipeStore.requireAvailable()
         if tool == "agent_contacts" {
             try Self.peerKeys(args, allowed: ["discover", "details"])
@@ -211,7 +212,7 @@ extension SwiftToolDispatcher {
         }
         if tool == "agent_connect" {
             try Self.peerKeys(args, allowed: ["name", "endpoint", "transport", "bearer_token", "app_bundle_id", "conversation_label", "disconnect",
-                "working_directory", "workspace", "executable_path", "ability"])
+                "working_directory", "workspace", "executable_path", "ability", "reopen"])
             _ = try store.list() // Never install a secret over unreadable configuration.
             let name = try Self.peerString(args, "name", max: 480)!
             if let ability = args["ability"] {
@@ -234,11 +235,12 @@ extension SwiftToolDispatcher {
                 return try await hostDisconnect(name: name, store: store)
             }
             if args["endpoint"] == nil, args["app_bundle_id"] == nil, transportName == "auto" {
-                return try await hostConnect(turn: turn, invocation: invocation, name: name, workspace: workspace, executablePath: try Self.peerString(args,
-                    "executable_path", max: 4096,
-                    required: false), store: store, surface: surface,
+                let connected = try await hostConnect(turn: turn, invocation: invocation, name: name, workspace: workspace,
+                    executablePath: try Self.peerString(args, "executable_path", max: 4096, required: false), store: store, surface: surface,
                     workingDirectory: Self.peerString(args, "working_directory", max: 4096, required: false),
                     conversationLabel: Self.peerString(args, "conversation_label", max: 480, required: false)?.trimmingCharacters(in: .whitespacesAndNewlines))
+                guard args["reopen"] == .bool(true), let row = AgentHostDirectory.row(named: name) else { return connected }
+                return await Self.reopenHost(row, after: connected)
             }
             if transportName == "desktop" {
                 guard args["bearer_token"] == nil, args["endpoint"] == nil else {
@@ -438,6 +440,32 @@ extension SwiftToolDispatcher {
             // A conversation lives on the door it was opened through. Command hosts run their declared CLI; pull-only hosts, and the threads the
             // contact opened by calling in (its own, or one caller's), retain the message until its next inbound call.
             let heldThread = ContactCaller.held(args["conversation_id"]?.stringValue, peer: peer.id)
+            // A host with a local chat server answers there, live. Only a conversation one of its callers opened by calling in stays with that caller;
+            // the contact's own conversation (the thread no caller owns) goes live like a new one.
+            if let row, row.localChat != nil, heldThread == nil || heldThread == ContactCaller.shared(peer: peer.id) {
+                guard sending else {
+                    return .object(["status": .string("nothing_to_read"), "completed": .bool(false),
+                        "detail": .string("The answer returns with the message; there is no saved answer to recover here.")])
+                }
+                guard args["message_id"] == nil, args["task_id"] == nil else {
+                    throw AgentCommunicationError.invalid("This contact takes text and conversation_id only.")
+                }
+                return try await hostLocalChatRun(invocation: invocation, row: row, contact: peer, message: Self.peerString(args, "text", max: 64000)!,
+                                                  conversationID: Self.peerString(args, "conversation_id", max: 1024, required: false),
+                                                  store: store, surface: surface)
+            }
+            // A host whose recipe opens live conversations (ACP) is reached that way, never left to its next check-in: its contact moves to
+            // that route by one reconnect.
+            if let row, row.acp != nil, heldThread == nil, sending {
+                return .object(["status": .string("reconnect_required"), "agent": .string(agent), "sent": .bool(false), "completed": .bool(false),
+                    "detail": .string("""
+                        \(row.displayName) opens live two-way conversations over ACP, and this contact is still on its old check-in route. \
+                        Reconnect it once, then send again. Nothing was sent.
+                        """),
+                    "remedy": Repair.remedy(owner: peer.name, nextCall: try? JSONValue.parse(Data(ToolFailureError.call("app", [
+                        "action": .string("agent.connect"), "args": .object(["name": .string("peer:" + peer.id)])]).utf8)),
+                        tap: nil, instruction: "Reconnect this contact with next_call, then send the message again.")])
+            }
             guard let row, row.commandLine != nil, heldThread == nil else {
                 let snapshot = try Self.checkedPeerSnapshot(peer.id, store: store)
                 // A held send that names no held thread waits in the contact's own.
@@ -496,6 +524,22 @@ extension SwiftToolDispatcher {
                     "operation": .string("read"), "target": .object(target),
                     "opened": .bool(false), "read": .bool(false), "sent": .bool(false), "completed": .bool(false),
                     "detail": .string(Self.desktopSendOnlyDetail)])
+            }
+            // The courier's answer comes back only through an MCP entry for this app in the contact's app. An app with its own route here (Grok
+            // Bot's routine, a desktop chat) has none and answers only through that route, so a courier send would never get its answer back:
+            // its contact moves to that route by one connect by name, as an ACP host's contact does.
+            if let row = AgentHostDirectory.rows.first(where: {
+                $0.bundleIDs.contains(bundle) && [AgentHostRow.Route.grokBot, .desktopChat].contains($0.route)
+            }) {
+                return .object(["status": .string("reconnect_required"), "agent": .string(agent), "sent": .bool(false), "completed": .bool(false),
+                    "detail": .string("""
+                        \(row.displayName) answers only through its own route here, and this is an older desktop contact for its app, whose courier \
+                        send would never get an answer back. Connect \(row.displayName) by name once (next_call) and follow its steps, then \
+                        disconnect this desktop contact (\(agent)). Nothing was sent.
+                        """),
+                    "remedy": Repair.remedy(owner: peer.name, nextCall: .object(["tool": .string("app"), "input": .object([
+                        "action": .string("agent.connect"), "args": .object(["agent": .string(row.displayName)])])]),
+                        tap: nil, instruction: "Connect this app by name with next_call, then send the message to that contact.")])
             }
             let text = try Self.peerString(args, "text", max: 64000)!
             return .object(["status": .string("requires_interaction"),

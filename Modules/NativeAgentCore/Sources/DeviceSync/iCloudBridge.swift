@@ -54,6 +54,8 @@ public final class iCloudBridge: ObservableObject {
     @Published public internal(set) var phoneStanding = NAPhoneStanding(connected: nil, waiting: 0, approvers: 0)
     var transportRefusal: NAPhoneConnection.Fact? { didSet { refreshPhoneConnection() } }
     var pairingKeyUnreadable = false { didSet { refreshPhoneConnection() } }
+    /// What last happened to this Mac's acceptance on its way to a phone that has not confirmed it; the pairing fact says it.
+    var pairingConfirmationNote: String? { didSet { refreshPhoneConnection() } }
     var lastPhoneContactAt: Date? { didSet { refreshPhoneConnection(); readWhilePhoneOpen() } }
     var phoneOpenReadTask: Task<Void, Never>?
     var deviceReceiveBeatTask: Task<Void, Never>?

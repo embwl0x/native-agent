@@ -392,7 +392,7 @@ public actor ChatSessionIndexReconciler {
     ) async throws -> T? {
         try Task.checkCancellation()
         do {
-            return try await SwiftNativePersistenceCore.withFileLock(transcript, waitingAtMost: 0, body)
+            return try await SwiftNativePersistenceCore.withFileLock(transcript, tryingOnce: true, body)
         } catch let error as NSError where error.domain == "FileLock" && error.code == Int(ETIMEDOUT) {
             return nil
         }

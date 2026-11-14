@@ -483,6 +483,8 @@ public extension NativeAgentEngine {
                 break
             case .outcomeUnknown:
                 port.presentMacChatTurn(.status("Regenerate outcome could not be confirmed"))
+            case .waitingOnPerson:
+                port.presentMacChatTurn(.status("Regenerated response · waiting on you"))
             default:
                 switch result {
                 case .success:

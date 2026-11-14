@@ -1,9 +1,10 @@
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import CoreLocation
 import PersistenceCore
 import MacControl
-// Blueprint: | `MacLocationReader.swift` | Held location fixes with age; fresh requests settle on CoreLocation callbacks or caller cancellation |
+// Blueprint: | `MacLocationReader.swift` | Held fixes; requests settle on CoreLocation callbacks or cancellation; Location Services answers a waiting call |
 
 /// The manager owns held fixes; reads without one await its request result.
 @MainActor
@@ -13,6 +14,11 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
     private var waiters: [UUID: ScopedWaiter] = [:]
     private var results: [UUID: JSONValue] = [:]
     private var requesting = false
+    /// What the kept manager last heard from macOS. A new manager reads notDetermined until its first authorization callback, so a read never judges
+    /// the grant before that; nil until then.
+    private var heard: CLAuthorizationStatus?
+    /// A read is waiting on the first authorization callback to carry its request on.
+    private var awaitingAuthorization = false
     public nonisolated static var authorizationStatus: CLAuthorizationStatus {
         return CLLocationManager().authorizationStatus
     }
@@ -49,14 +55,33 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
             results.removeValue(forKey: id)
         }
         if !requesting { request() }
+        // While the read waits, Location Services is what it waits on.
+        let watched = context.life.map { ($0, $0.attach(Self.life)) }
+        defer { if case let (watch, id)? = watched { watch.detach(id) } }
         await done.park(budget: context.waitBudget)
         guard !Task.isCancelled, !context.expired else { throw context.cancellationError }
         guard let result = results[id] else { throw CancellationError() }
         return result
     }
 
+    /// What a read waiting for a fix waits on: macOS's Location Services, read from its own state. Switched off or refused is dead; allowed is
+    /// alive, since CoreLocation answers every request with a fix or an error; before macOS's first word it cannot say.
+    private static let life = CallLife(what: "Location Services") {
+        guard CLLocationManager.locationServicesEnabled() else { return .dead("Location Services are switched off on this Mac") }
+        switch await MainActor.run(body: { shared.heard }) {
+        case .authorizedAlways?, .authorizedWhenInUse?: return .alive
+        case .denied?, .restricted?: return .dead("macOS refused Location Services access")
+        default: return .unknown
+        }
+    }
+
     private func request() {
-        switch manager.authorizationStatus {
+        guard let heard else {
+            requesting = true
+            awaitingAuthorization = true
+            return
+        }
+        switch heard {
         case .authorizedAlways, .authorizedWhenInUse:
             requesting = true
             manager.requestLocation()
@@ -65,11 +90,15 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
     }
 
     public func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        heard = manager.authorizationStatus
         NotificationCenter.default.post(name: SystemPermissionPreflight.permissionDidChange, object: nil)
         switch manager.authorizationStatus {
         case .denied, .restricted:
             finish(Self.failure("location_not_allowed", "Location Services access was refused by macOS. Allow it on the permission card."))
-        default: break
+        default:
+            guard awaitingAuthorization else { break }
+            awaitingAuthorization = false
+            request()
         }
     }
 
@@ -106,6 +135,7 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
 
     private func finish(_ result: JSONValue) {
         requesting = false
+        awaitingAuthorization = false
         let waiting = waiters
         waiters = [:]
         for (id, done) in waiting {

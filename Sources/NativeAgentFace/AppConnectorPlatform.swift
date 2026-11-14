@@ -52,11 +52,15 @@ import NativeAgentShared
         operations.removeAll()
         for controller in shown { controller.close(); controller.contentViewController = nil }
     }
+    static func close(contact: String) {
+        operations.removeValue(forKey: contact)
+        guard let controller = controllers.removeValue(forKey: contact) else { return }
+        controller.close()
+        controller.contentViewController = nil
+    }
+    /// A window already open for this contact is brought forward and reused, whichever press opened it: an open window is never a refusal.
     static func show(contact: String, operation: UUID, appModel: AppModel) async throws -> NSWindow {
         if let window = controllers[contact]?.window, window.isVisible {
-            guard operations[contact] == operation else {
-                throw PartCallError(code: "protected_entry_busy", message: "Finish or close the existing routine credential window first.")
-            }
             window.makeKeyAndOrderFront(nil)
             NSApp.activate()
             try await RendererProtection.shared.hold(window: window)

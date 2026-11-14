@@ -125,15 +125,21 @@ package enum ToolResultSections {
     /// the page asked for, and stops once that page is full; a line gives at most one row, its first match, and the rest of the line is
     /// passed by its location alone. So the work of one read follows the bytes it reads, never matches times pieces.
     ///
-    /// A section matches when it holds every term (the AND rule), where a term cut by the seam between two pieces of one long string
-    /// counts in both. Its row: `path`; `line`, 1-based within the string at that path, where the section is a line; `offset`, in Unicode
-    /// scalars from the start of the line (or of the value, where it has no lines) to where `text` starts, unless `text` is the whole
-    /// line; `text`, the line, or a window of it around the match cut between scalars; `before` and `after`, the adjacent lines, each cut
-    /// to the part nearest the match; and `section_page`, the page of a reading without query that shows the whole section.
+    /// A query is first the phrase as written, trimmed and with case aside: a section matches when it holds the phrase. Only when the
+    /// phrase is nowhere in the result is a query of several words read again from the start as its separate words, and then a section
+    /// matches when it holds every word (the AND rule); `reading` says which it did. A term cut by the seam between two pieces of one long
+    /// string counts in both. Its row: `path`; `line`, 1-based within the string at that path, where the section is a line; `offset`, in
+    /// Unicode scalars from the start of the line (or of the value, where it has no lines) to where `text` starts, unless `text` is the
+    /// whole line; `text`, the line, or a window of it around the match cut between scalars; `before` and `after`, the adjacent lines, each
+    /// cut to the part nearest the match; and `section_page`, the page of a reading without query that shows the whole section.
     package struct Search: Sendable {
         package typealias Section = (value: JSONValue, text: String, bytes: Int)
+        /// How the query was read: the phrase as written, or its separate words because the phrase is nowhere in the result.
+        package enum Reading: String, Sendable { case phrase, words }
         package let query: String
-        private let terms: [String]
+        package private(set) var reading = Reading.phrase
+        private let words: [String]
+        private var terms: [String]
         private let budget: Int
         /// Pages found so far; the last may still be filling.
         package private(set) var pages: [[JSONValue]] = [[]]
@@ -147,12 +153,20 @@ package enum ToolResultSections {
 
         package init(query: String, budget: Int) {
             self.query = query
-            self.terms = ToolResultSections.queryTerms(query)
+            self.words = ToolResultSections.queryTerms(query)
+            self.terms = [query.trimmingCharacters(in: .whitespacesAndNewlines)]
             self.budget = budget
         }
 
-        /// Read on until `page` is closed by a row on the page after it, or the sections end.
+        /// Read on until `page` is closed by a row on the page after it, or the sections end. A phrase found nowhere, once every section is
+        /// read, is searched again from the start as its separate words.
         package mutating func fill(through page: Int, _ projection: [Section]) {
+            while !complete, pages.count - 1 <= page { step(projection) }
+            guard complete, reading == .phrase, words.count > 1, pages[0].isEmpty else { return }
+            reading = .words
+            terms = words
+            pages = [[]]; searched = 0; complete = false; bytes = 2; lastRow = nil
+            wholePage = 0; wholeBytes = 2; wholeHeld = 0
             while !complete, pages.count - 1 <= page { step(projection) }
         }
 

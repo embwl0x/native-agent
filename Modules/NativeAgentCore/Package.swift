@@ -77,7 +77,7 @@ let products: [Product] =
 let extraDeps: [String: [String]] = [
     "AgentConversations": ["PersonaEngine", "Experiences", "AuthoredCapabilities", "AgentWorkspace", "MacControl", "Privacy", "PersistenceCore",
         "ApprovalInbox", "StandingBots", "AgentLinkTransport", "ProviderRouting", "TurnTrace", "ChatTurnContracts", "ChatToolParsing", "Desk", "TrustCenter",
-        "Transcripts"],
+        "Transcripts", "MemoryV2"],
     "ChatTurnContracts": ["PersistenceCore", "ProviderRouting", "TurnTrace", "ApprovalInbox", "ChatToolParsing", "CognitiveSubstrate", "MacControl"],
     "ChatToolRuntime": ["Experiences", "AuthoredCapabilities", "Senses", "ChatTurnContracts", "AgentConversations", "AgentWorkspace", "ChatSessionWork",
         "ChatToolParsing", "Research", "StandingBots", "PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle",

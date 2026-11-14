@@ -5,6 +5,7 @@ import AgentConversations
 import AppToolRuntime
 import AttentionRouting
 import Agents
+import AgentWorkspace
 import AuthoredCapabilities
 import BackgroundLoops
 import BackgroundWork
@@ -57,7 +58,8 @@ extension NativeAgentEngine {
         ClockWork(root: dataRoot, attentionRouter: { NativeAgentEngine.forRoot(dataRoot).ports.backgroundWork.attention })
     }
 
-    /// Asked times belong to their declaring owners. The night belongs to attention.
+    /// Asked times belong to their declaring owners. The night belongs to attention. Once per process: the night's old times are withdrawn, helpers
+    /// attach and part times are followed; the deliveries themselves are the mind's (`handleClockOwners`).
     static func registerClockOwners(dataRoot: URL) async {
         let root = dataRoot.standardizedFileURL
         let clock = OneClock.at(root)
@@ -70,6 +72,31 @@ extension NativeAgentEngine {
                 status: "fail", detail: error.localizedDescription)], dataRoot: root)
         }
         _ = await NativeAgentEngine.live.bots.attach(carryingOver: false)
+        await handleClockOwners(dataRoot: root)
+        await declarePartTimes(dataRoot: root)
+        Task.detached(priority: .utility) {
+            // A part header's schedule:<cron> is a part time; editing the part moves it, removing the wake withdraws it.
+            for await _ in NotificationCenter.default.notifications(named: AbilityStore.didChange) { await declarePartTimes(dataRoot: root) }
+        }
+        do { try await makeNativeTriggerScheduler(dataRoot: root).declareTimes() }
+        catch {
+            await DoctorReadout.recordReadings([CheckResult(source: "triggers/trigger_config.json", id: "clock.briefs", title: "Inbox brief times",
+                status: "fail", detail: "Inbox trigger times are not on the clock: \(error.localizedDescription)")], dataRoot: root)
+        }
+    }
+
+    /// The clock owners a running mind takes delivery for. While no mind runs their times stay pending, and are delivered once when the next mind
+    /// handles them; the mind's own queue moments (`MyQueueReady.owner`) are handled by the runtime when it opens.
+    static let mindClockOwners = ["part", "watch", "scan", SwiftNativeTriggerScheduler.clockOwner]
+
+    static func releaseClockOwners(dataRoot: URL) async {
+        let clock = OneClock.at(dataRoot.standardizedFileURL)
+        for owner in mindClockOwners + [MyQueueReady.owner] { await clock.release(owner) }
+    }
+
+    static func handleClockOwners(dataRoot: URL) async {
+        let root = dataRoot.standardizedFileURL
+        let clock = OneClock.at(root)
         await clock.handle("part") { time, _ in
             guard let part = time.payload?.objectValue?["part"]?.stringValue, let signal = time.payload?.objectValue?["signal"]?.stringValue else {
                 ModuleLog.app("[clock] %@ carries no part and signal; nothing was posted", time.id)
@@ -87,25 +114,17 @@ extension NativeAgentEngine {
             }
             await makeNativeTriggerScheduler(dataRoot: root).deliver(name: name, occurrence: occurrence)
         }
-        await declarePartTimes(dataRoot: root)
-        Task.detached(priority: .utility) {
-            // A part header's schedule:<cron> is a part time; editing the part moves it, removing the wake withdraws it.
-            for await _ in NotificationCenter.default.notifications(named: AbilityStore.didChange) { await declarePartTimes(dataRoot: root) }
-        }
-        do { try await makeNativeTriggerScheduler(dataRoot: root).declareTimes() }
-        catch {
-            await DoctorReadout.recordReadings([CheckResult(source: "triggers/trigger_config.json", id: "clock.briefs", title: "Inbox brief times",
-                status: "fail", detail: "Inbox trigger times are not on the clock: \(error.localizedDescription)")], dataRoot: root)
-        }
     }
 
     // MARK: - The night and REM
 
     /// The night, through attention or an explicit sleep request: the sleep thought runs the dream, then the night's reading of the agent's parts,
-    /// and a thought of the agent's when the reading holds something. Returns its admission outcome; the stream holds the running night.
+    /// and a thought of the agent's when the reading holds something. Returns its admission outcome; the stream holds the running night. With no mind
+    /// running (setup not finished, or a reset closed it) there is no night to begin.
     public static func sleep(dataRoot: URL, attended: Attended? = nil, parent: Turn? = nil) async -> MindStream.NightOutcome {
         let root = dataRoot.standardizedFileURL
-        return await live.agents.stream.night(attended: attended, request: parent, dream: { parent, beganAt in
+        guard let stream = live.mind?.stream else { return .failed(cause: "The mind starts when setup finishes; there is no mind to sleep yet.") }
+        return await stream.night(attended: attended, request: parent, dream: { parent, beganAt in
             await dreamTheNight(dataRoot: root, parent: parent, beganAt: beganAt)
             await nightREM(dataRoot: root)
         }, reading: { await EngineSleep.night(dataRoot: root) })
@@ -115,7 +134,7 @@ extension NativeAgentEngine {
     func nextNightReading() async -> [String: JSONValue] {
         var reading: [String: JSONValue]
         do {
-            let sense = try await Self.cognitionRuntime(for: dataRoot).nextNight()
+            let sense = try await Self.requiredMind(for: dataRoot).nextNight()
             guard let facts = sense.objectValue else { throw PersistenceCoreError.ioFailure("The night sense returned no fields.") }
             reading = facts
         } catch {

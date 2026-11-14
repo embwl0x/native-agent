@@ -652,9 +652,15 @@ use named actions for its items. Secret arguments still require a single action.
 Settings rows say they are theirs to set both ways; they need no quoted request
 or Trust posture. For other settings on model turns below Full Mac, `because`
 still quotes at least three words of the person's or trusted agent's request,
-unless restoring their previous change. Trust rows keep their owner-only check
-and their direction: a lowering is theirs at any posture, and a raise asks the
-person on a card.
+unless restoring their previous change. A lowering of a Trust row is theirs at any
+posture. A raise, a change to an owner-only row (Full Mac included) and a lever
+a card can carry are the person's: they run on the person's word when `because`
+quotes the person's own message of the ask being acted on and names the change,
+and otherwise ask the person on one card for the exact call (several asked in
+one list are one card). A card still waiting for a call the word decided is
+withdrawn as decided, with the quote. Only what needs the person's own hands (a
+secret, a sign-in, a code from another device) stays theirs alone. Safe allows
+none of these.
 
 `OwnedProgramRunner` owns source, read and action limits and the shared progress clock: a renewable 60-second no-progress window by default, excluding host waits.
 Its receipt retains completed effects if a later step fails; a script is not

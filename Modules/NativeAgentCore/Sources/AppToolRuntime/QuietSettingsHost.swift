@@ -19,7 +19,8 @@ public protocol QuietSettingsHost: AnyObject {
     var chatFastMode: Bool { get set }
     var chatFileAccess: String { get }
     var chatProvider: String { get }
-    var searchServiceURL: String { get }
+    /// The saved search address read from its file now, so a write's receipt reads what the write did, never a drawing that has not caught up.
+    var searchServiceURL: String { get async throws }
     /// Controls owned by the mounted app (for example its shortcut manager). Declared beside those owners, then used by every settings reader/writer.
     var platformSettings: [QuietSetting] { get }
     /// A phone owns its local controls. Resolve them through its signed request channel; no Mac defaults or cached phone state stand in for its answer.

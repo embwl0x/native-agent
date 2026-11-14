@@ -42,8 +42,9 @@ package enum ChatToolSessionInjection {
         if toolName == "scratchpad_read" {
             out["session_id"] = .string(sessionId)
         }
+        // An event read stays in the calling conversation unless it asks for the whole life (scope:all).
         if toolName == "recent_trace_summary",
-           out["view"] != .string("receipts"), out["effects_only"] != .bool(true),
+           out["view"] != .string("receipts"), out["effects_only"] != .bool(true), out["scope"] != .string("all"),
            out["session_id"] == nil {
             out["session_id"] = .string(sessionId)
         }

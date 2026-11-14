@@ -85,7 +85,7 @@ extension FaceStyle {
     static let mac = FaceStyle(
         insets: EdgeInsets(top: 6, leading: AliveMetrics.rowInsetH, bottom: 6, trailing: AliveMetrics.rowInsetH),
         minimumHeight: 30, title: .body.weight(.medium), detail: .callout, value: .callout.monospacedDigit(),
-        elevation: AlivePalette.highlight, actionSurface: TodayPalette.cardFill,
+        elevation: AlivePalette.highlight, actionSurface: TodayPalette.cardFill, answer: NativeAgentBrand.accentDeep,
         card: { AnyView($0.clipShape(RoundedRectangle(cornerRadius: AliveMetrics.cardRadius, style: .continuous)).aliveCard()) })
 }
 

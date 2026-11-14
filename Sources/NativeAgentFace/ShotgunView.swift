@@ -179,6 +179,8 @@ struct ShotgunView: View {
         case .canceled: "Stopped"
         case .failed: "Couldn't finish"
         case .outcomeUnknown: "Outcome unknown"
+        // The box speaks as the agent: a turn that ended waiting on the person says so.
+        case .waitingOnPerson: "I'm waiting on you"
         default: "Done"
         }
     }

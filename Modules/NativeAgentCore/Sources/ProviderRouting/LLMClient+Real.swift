@@ -570,6 +570,8 @@ public final class SwiftNativeLLMClient: LLMClient {
                         held.lifetime.dispatched?()
                             for try await event in stream {
                                 try Task.checkCancellation()
+                                // Any event from a turn that runs under a call (a helper, a part's thought), a keep-alive included, is life of that call.
+                                held.turn?.enclosingCall?.moved()
                                 if let budget = held.turn?.tokenBudget {
                                     switch event {
                                     case .textDelta(let delta):

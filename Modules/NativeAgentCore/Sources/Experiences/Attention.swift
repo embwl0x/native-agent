@@ -29,7 +29,8 @@ public enum Attention {
     private static let intake = OSAllocatedUnfairLock<(any AttentionIntake)?>(initialState: nil)
     private static let log = ModuleLog(category: "Attention")
 
-    public static func install(_ taker: any AttentionIntake) { intake.withLock { $0 = taker } }
+    /// The mind takes happenings while it runs; with none installed they stay recorded and owed for the next mind to open on.
+    public static func install(_ taker: (any AttentionIntake)?) { intake.withLock { $0 = taker } }
     static var installed: (any AttentionIntake)? { intake.withLock { $0 } }
 
     /// Hand attention only the committed happening. A repeat writes and hands nothing; a failed record owes repair.
@@ -296,8 +297,15 @@ public enum Attention {
         return Landed(happenings: found, earlierDrive: earlier)
     }
 
-    /// The agent's thoughts within the horizon, oldest first.
+    /// The agent's thoughts within the horizon, oldest first; a thought that will not fold is this read's failure.
     public static func thoughts(dataRoot: URL, now: Date = Date()) async throws -> [Experience] {
+        let read = try await thoughtsRead(dataRoot: dataRoot, now: now)
+        if let first = read.unreadable.first { throw first.cause }
+        return read.experiences
+    }
+
+    /// Every readable thought within the horizon, oldest first, and each one that will not fold, named.
+    public static func thoughtsRead(dataRoot: URL, now: Date = Date()) async throws -> ExperienceStore.Folded {
         try await ExperienceStore.at(dataRoot).born(kinds: [.thought], after: now.addingTimeInterval(-horizon), limit: 4_096)
     }
 

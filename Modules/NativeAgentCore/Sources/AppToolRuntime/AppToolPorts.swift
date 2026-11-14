@@ -158,6 +158,8 @@ public struct BrowserToolPlatformPort: Sendable {
     /// The document or structured item the page's owner answers; offset reads a current collection page.
     /// Nil means this owner has no such reader. A declared reader's refusal throws.
     func pageBody(page: String, item: String, offset: Int, turn: Turn) async throws -> String?
+    /// The row or section the page shows under these words (its id, else its title), with where the row opens; nil when the page shows none.
+    func pageItem(page: String, named: String) async -> (id: String, open: String?)?
     /// Empty sessionId targets the visible conversation.
     func composerState(sessionId: String, turn: Turn) async -> [String: JSONValue]
     /// Attachments are already resolved and fenced; turnSessionId retains the asking conversation's __session_id.
@@ -234,13 +236,16 @@ public struct AppToolPresentationBinding: Sendable {
 }
 
 /// Desktop effects require the app's platform adapters.
+/// The `Parts.Invocation` they take is the calling turn's own app door, so an authored ability (`grok-bot-setup`, `desktop-courier`) runs under it.
 public struct ChatToolPlatformPort: Sendable {
-    public let grok: @Sendable ([String: JSONValue], URL, any ToolDispatchClient, String, Turn, MacOperationContext) async -> JSONValue
+    public let grok: @Sendable ([String: JSONValue], URL, String, Turn, Parts.Invocation) async -> JSONValue
     public let desktopChat: @Sendable ([String: JSONValue], URL, Turn, MacOperationContext, AgentConversationContext) async -> JSONValue
-    public let desktop: @Sendable ([String: JSONValue], any ToolDispatchClient, String, Turn, ChatTurnWork, MacOperationContext) async -> JSONValue
+    public let desktop: @Sendable ([String: JSONValue], any ToolDispatchClient, String, Turn, ChatTurnWork, MacOperationContext,
+        AgentConversationContext, Parts.Invocation) async -> JSONValue
     public init(
-        grok: @escaping @Sendable ([String: JSONValue], URL, any ToolDispatchClient, String, Turn, MacOperationContext) async -> JSONValue,
+        grok: @escaping @Sendable ([String: JSONValue], URL, String, Turn, Parts.Invocation) async -> JSONValue,
         desktopChat: @escaping @Sendable ([String: JSONValue], URL, Turn, MacOperationContext, AgentConversationContext) async -> JSONValue,
-        desktop: @escaping @Sendable ([String: JSONValue], any ToolDispatchClient, String, Turn, ChatTurnWork, MacOperationContext) async -> JSONValue
+        desktop: @escaping @Sendable ([String: JSONValue], any ToolDispatchClient, String, Turn, ChatTurnWork, MacOperationContext,
+            AgentConversationContext, Parts.Invocation) async -> JSONValue
     ) { self.grok = grok; self.desktopChat = desktopChat; self.desktop = desktop }
 }

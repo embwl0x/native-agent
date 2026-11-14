@@ -228,7 +228,10 @@ extension AgentConversationSession {
         let state = string(fields["status"]) ?? "cannot_stop"
         guard ["stopped", "stopping", "cannot_stop", "not_here"].contains(state) else { return result } // refused by its gate
         // Withdraw before local cancellation can publish ready and wake queued sends. Keep its result so a failed withdrawal still lets accepted work settle.
-        let withdrawal = Result { clearQueue ? try store.clearQueued(id: row.id) : 0 }
+        // A send held for the Mac is the conversation's current operation: a stop withdraws it even without clear_queue, and it never held the desktop.
+        let heldNow = latest.queued?.contains(where: { $0.id == latest.operationID && $0.waitingForMac == true }) == true
+        let heldOperation = latest.operationID
+        let withdrawal = Result { clearQueue || heldNow ? try store.clearQueued(id: row.id, onlyHeld: clearQueue ? nil : heldOperation) : 0 }
         let settled: Result<JSONValue, Error> = await settle {
             let running = AgentConversationRunning.shared
             let stoppedSend = await running.stop(row: latest.id, operation: latest.operationID)
@@ -239,16 +242,26 @@ extension AgentConversationSession {
                     throw AgentConversationStore.Failure(
                         message: "Stop ran, but the current conversation could not be found for settlement. Inspect the contact before another action.")
                 }
-                func answer(_ record: AgentConversationRecord, _ extra: [String: JSONValue]) -> JSONValue {
+                /// The stop's own outcome leads the receipt; the conversation's send keeps its words under `last_send_`, so a stop or withdrawal that
+                /// worked never reads as that send's "cancelled". `ok` = something was stopped, released or withdrawn; `no_change` = nothing was there.
+                func answer(_ record: AgentConversationRecord, _ extra: [String: JSONValue], status: String) -> JSONValue {
+                    var own = extra
+                    own["status"] = .string(status)
+                    if status == "ok" { own["effects"] = .string("occurred") } else if status == "no_change" { own["effects"] = .string("none") }
+                    if let stop = record.stop, stop.operationID == record.operationID, ["stopped", "released"].contains(stop.state) {
+                        own["stop_state"] = .string(stop.state)
+                    }
+                    if cleared > 0 { own["queue_cleared"] = .int(Int64(cleared)) }
                     guard case .object(var fields) = AgentConversationView.compact(AgentConversationView.view(record, details: false,
-                        dataRoot: dataRoot, includeHistory: false), row: record) else { return .object(extra) }
-                    fields.merge(extra) { _, new in new }
-                    if cleared > 0 { fields["queue_cleared"] = .int(Int64(cleared)) }
+                        dataRoot: dataRoot, includeHistory: false, sendPrefix: "last_send_"), row: record) else { return .object(own) }
+                    fields.merge(own) { _, new in new }
                     return .object(fields)
                 }
+                let acted = cleared > 0 ? "ok" : "no_change"
                 if stoppedSend || retiredWatch || stoppedOrReleased(current) {
                     return answer(current, ["stopped": .bool(current.stop?.state == "stopped"),
-                        "detail": .string(current.stop?.detail ?? "The reply finished before the stop landed.")])
+                        "detail": .string(current.stop?.detail ?? "The reply finished before the stop landed.")],
+                        status: stoppedOrReleased(current) ? "ok" : acted)
                 }
                 if try awaitingCard || !orphan && !replyInFlight(current, peer?.transport, dataRoot: dataRoot) {
                     let standing = awaitingCard
@@ -257,10 +270,12 @@ extension AgentConversationSession {
                             still waits on it.
                             """
                         : "Nothing from \(name) is in flight on this conversation, so there was nothing to stop."
-                    return answer(current, ["stopped": .bool(false), "detail": .string(standing + (cleared > 0 ? " The queued messages were withdrawn." : ""))])
+                    return answer(current, ["stopped": .bool(false), "detail": .string(standing + (cleared > 0 ? " The queued messages were withdrawn." : ""))],
+                        status: acted)
                 }
                 if state == "stopping" {
-                    return answer(current, ["stopped": .bool(false), "detail": fields["detail"] ?? .string("The remote stop has not finished.")])
+                    return answer(current, ["stopped": .bool(false), "detail": fields["detail"] ?? .string("The remote stop has not finished.")],
+                        status: "stopping")
                 }
                 let detail: String
                 let terminal: String
@@ -308,7 +323,8 @@ extension AgentConversationSession {
                     }
                 }
                 return answer(saved, ["stopped": .bool(saved.stop?.state == "stopped"),
-                    "detail": .string(saved.stop?.detail ?? "The reply finished before the stop landed.")])
+                    "detail": .string(saved.stop?.detail ?? "The reply finished before the stop landed.")],
+                    status: stoppedOrReleased(saved) ? "ok" : saved.stop?.state == "cannot_stop" ? "cannot_stop" : acted)
             }
         }
         do { return try settled.get() }

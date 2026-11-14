@@ -45,7 +45,7 @@ public final class AgentContacts: Sendable {
 
     package func helperDoor(for bot: BotDefinition) -> HelperContact.Door {
         HelperContact.Door(name: PersonaCompiler.agentDisplayName(dataRoot: dataRoot), conversationID: ContactThread.session(
-            owner: bot.sessionID)) { [self] text in
+            owner: bot.sessionID)) { [self] text, call in
             let owner = bot.sessionID
             // One trust rule: a helper of this install carries the person's grant (PeerTrust).
             let principal = AgentBridgePrincipal(id: owner, peerID: owner,
@@ -56,7 +56,9 @@ public final class AgentContacts: Sendable {
                 requestID: request, principal: principal, parts: [.text(text)])
             // A contact starts the agent's own admitted turn, with none of the helper's identity or allowance.
             do {
-                let outcome = try await AgentContactRuntime.run(turn, client: clients.bridgeChatClient(), dataRoot: dataRoot, emit: { _ in })
+                // The agent's answering turn is life of the helper's call: each word it writes and each step it reports.
+                let outcome = try await AgentContactRuntime.run(turn, client: clients.bridgeChatClient(), dataRoot: dataRoot,
+                    emit: { _ in call?.moved() })
                 return .object(["status": .string(outcome.state.rawValue),
                     "reply": .string(outcome.parts.compactMap { if case .text(let text) = $0 { text } else { nil } }.joined(separator: "\n")),
                     "parts": try JSONValue.fromEncodable(outcome.parts),
@@ -70,8 +72,6 @@ public final class AgentContacts: Sendable {
     public let humanReplies: HumanConversationReplies
     public let grok: GrokInboundReply
     public let continuation: AgentConversationContinuation
-    /// The agent's mind stream: its own thoughts, and work coming back to the conversation that started it.
-    public let stream: MindStream
     private let dot: ChatGPTDotConversation
 
     public func refreshDotSession(_ sessionID: String) async -> Bool {
@@ -141,6 +141,5 @@ public final class AgentContacts: Sendable {
         grok = GrokInboundReply(clients: clients)
         continuation = AgentConversationContinuation(dataRoot: dataRoot, clients: clients, grok: grok, dot: dot,
                                                      completionSender: completionSender)
-        stream = MindStream(dataRoot: dataRoot, clients: clients, completionSender: completionSender)
     }
 }

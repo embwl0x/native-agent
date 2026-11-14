@@ -30,7 +30,7 @@ extension NativeCognitionRuntime {
             sourceWakes.hourReading = nil
             held.resume()
         }
-        guard !isFlushedForTermination, !Task.isCancelled,
+        guard !isFlushedForTermination, !Task.isCancelled, mindStarted,
               Self.studioWanderInstallationNow(dataRoot: dataRoot).isInstalled,
               let presence = PersonPresence.read(dataRoot: dataRoot, now: now()).transition, !presence.here else { return }
         do {

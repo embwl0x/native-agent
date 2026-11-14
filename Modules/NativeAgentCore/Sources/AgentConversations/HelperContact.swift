@@ -7,8 +7,9 @@ package enum HelperContact {
     package struct Door: Sendable {
         package let name: String
         package let conversationID: String
-        package let send: @Sendable (String) async throws -> JSONValue
-        package init(name: String, conversationID: String, send: @escaping @Sendable (String) async throws -> JSONValue) {
+        /// Sends the text; the second argument is the watch of the helper's call, which the agent's answering turn keeps alive while it works.
+        package let send: @Sendable (String, TurnDeadline?) async throws -> JSONValue
+        package init(name: String, conversationID: String, send: @escaping @Sendable (String, TurnDeadline?) async throws -> JSONValue) {
             self.name = name; self.conversationID = conversationID; self.send = send
         }
     }
@@ -17,13 +18,14 @@ package enum HelperContact {
         return name.caseInsensitiveCompare(door.name) == .orderedSame
     }
 
-    package static func message(conversation: AgentConversationContext, _ input: [String: JSONValue]) async throws -> JSONValue? {
+    package static func message(conversation: AgentConversationContext, _ input: [String: JSONValue],
+                                call: TurnDeadline? = nil) async throws -> JSONValue? {
         guard matches(conversation: conversation, input), let door = conversation.helperDoor else { return nil }
         guard Set(input.keys).isSubset(of: ["agent", "text", "conversation_id", "session_id", "__session_id"]),
               input["conversation_id"] == nil || input["conversation_id"] == .string(door.conversationID),
               case .string(let text)? = input["text"], !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AgentConversationStore.Failure(message: "Name the contact and the text to send.")
         }
-        return try await door.send(text)
+        return try await door.send(text, call)
     }
 }

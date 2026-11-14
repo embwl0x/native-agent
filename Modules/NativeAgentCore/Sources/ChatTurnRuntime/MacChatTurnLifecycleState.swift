@@ -47,6 +47,10 @@ public enum MacChatTurnTerminalEvidence: String, Codable, Sendable, Equatable {
     case explicitTypedFailure = "explicit_typed_failure"
     case cancellationAcknowledged = "cancellation_acknowledged"
     case interruptedOutcomeUnknown = "interrupted_outcome_unknown"
+    /// The saved reply ended `waiting`: the turn did its part and the next move is the person's. Held in memory only: the lifecycle file
+    /// stores this ending in the pair builds that exist read (`outcome_unknown`, `interrupted_outcome_unknown`), and the saved reply's own
+    /// `terminalState` tells the two apart again on load.
+    case replyWaitsOnPerson = "reply_waits_on_person"
 }
 
 /// One accepted turn's shared-kernel state; requesting cancellation does not prove it stopped.
@@ -97,6 +101,8 @@ public struct MacChatTurnLifecycleInput: Sendable, Equatable {
         case failed(reason: String?)
         case cancellationConfirmed(reason: String?)
         case outcomeUnknown(reason: String?)
+        /// A known ending: the turn waits on the person, never interrupted and never unknown.
+        case waitingOnPerson(action: String?)
     }
 
     public let identity: MacChatTurnIdentity
@@ -217,6 +223,13 @@ public enum MacChatTurnLifecycleReducer {
                 at: max(input.occurredAt, state.cancellationRequestedAt ?? input.occurredAt)
             )
             nextTerminalEvidence = .interruptedOutcomeUnknown
+        case .waitingOnPerson(let action):
+            nextPresentation = lifecycle(
+                state.presentation,
+                .waitingOnPerson(action: action),
+                at: max(input.occurredAt, state.cancellationRequestedAt ?? input.occurredAt)
+            )
+            nextTerminalEvidence = .replyWaitsOnPerson
         }
 
         guard nextPresentation != state.presentation
@@ -252,7 +265,8 @@ public enum MacChatTurnLifecycleReducer {
     }
 }
 
-/// Durable state without prompts, replies, raw tool/provider material or accumulated stream text.
+/// Durable state without prompts, replies, raw tool/provider material or accumulated stream text. It holds only phase and evidence values that
+/// builds that exist decode: a turn that ended waiting on the person is written as outcome unknown, and restart reads it back from its saved reply.
 public struct MacChatPersistedTurnLifecycle: Codable, Sendable, Equatable {
     public let sessionId: String
     public let turnId: String
@@ -269,14 +283,15 @@ public struct MacChatPersistedTurnLifecycle: Codable, Sendable, Equatable {
         let presentation = state.presentation
         sessionId = state.identity.sessionId
         turnId = state.identity.turnId
-        phase = presentation.phase
+        let waitingOnPerson = presentation.phase == .waitingOnPerson
+        phase = waitingOnPerson ? .outcomeUnknown : presentation.phase
         startedAt = presentation.startedAt
         lastMovementAt = presentation.lastMovementAt
         endedAt = presentation.endedAt
         currentAction = Self.safeText(presentation.currentAction)
         delegateName = Self.safeText(presentation.delegateName)
         cancellationRequestedAt = state.cancellationRequestedAt
-        terminalEvidence = state.terminalEvidence
+        terminalEvidence = waitingOnPerson ? .interruptedOutcomeUnknown : state.terminalEvidence
         guard isValidRecord else { return nil }
     }
 
@@ -290,18 +305,20 @@ public struct MacChatPersistedTurnLifecycle: Codable, Sendable, Equatable {
 
     public var isTerminal: Bool { phase.isTerminal }
 
-    public func restoredState() -> MacChatTurnLifecycleState? {
-        guard isValidRecord else { return nil }
+    /// `waitingOnPerson` restores an outcome-unknown record as the waiting ending its saved reply proves; no other record takes it.
+    public func restoredState(waitingOnPerson: Bool = false) -> MacChatTurnLifecycleState? {
+        guard isValidRecord, !waitingOnPerson || phase == .outcomeUnknown else { return nil }
+        let shown: TurnPresentationPhase = waitingOnPerson ? .waitingOnPerson : self.phase
 
         var presentation = TurnPresentationReducer.initialState(at: startedAt)
-        if phase != .acknowledged {
+        if shown != .acknowledged {
             presentation = TurnPresentationReducer.recordActivity(
                 presentation,
-                phase: phase,
+                phase: shown,
                 detail: Self.safeText(currentAction),
                 delegateName: Self.safeText(delegateName),
                 at: lastMovementAt,
-                resetStreamLength: phase == .retrying,
+                resetStreamLength: shown == .retrying,
                 additionalRedactor: { NativeAppSecretRedactor.redactText($0) }
             )
         }
@@ -309,7 +326,7 @@ public struct MacChatPersistedTurnLifecycle: Codable, Sendable, Equatable {
             identity: identity,
             presentation: presentation,
             cancellationRequestedAt: cancellationRequestedAt,
-            terminalEvidence: terminalEvidence
+            terminalEvidence: waitingOnPerson ? .replyWaitsOnPerson : terminalEvidence
         )
     }
 

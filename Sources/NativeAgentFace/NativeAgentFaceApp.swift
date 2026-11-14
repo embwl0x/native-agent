@@ -28,6 +28,8 @@ struct NativeAgentFaceApp: App {
                 }
             }
             .frame(minWidth: 820, minHeight: 560)
+            // The default size is only the first window's: every later one opens at the frame the person left.
+            .background { MainWindowFrame() }
             .onChange(of: session.model.facePreference(AppearanceController.preferenceKey, as: Bool.self), initial: true) { _, dark in
                 if let dark { appearance.setPreferDark(dark) }
             }
@@ -93,6 +95,8 @@ struct FaceWindowCommands: Commands {
 }
 
 @MainActor final class FaceAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    /// This process is already ending with the body.
+    private var endingWithBody = false
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Opened without the body (a kept Dock icon, Finder): start the body, which opens its own window, and leave.
         guard ProcessInfo.processInfo.environment["NATIVEAGENT_FACE_DATA_ROOT"] != nil else {
@@ -109,6 +113,19 @@ struct FaceWindowCommands: Commands {
     }
     /// Closing the window keeps NativeAgent in the Dock, as every Mac app does; Quit is what ends it.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Quit is the whole app, however it is asked for. A Quit that reaches only this process (the Dock's menu, a system quit, a logout)
+    /// asks the body to end before this process does; left running, the body would open the window again the next time it had something
+    /// to show. An answer and a failure both end the wait: the body is ending, or there is no body to ask.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard ProcessInfo.processInfo.environment["NATIVEAGENT_FACE_DATA_ROOT"] != nil, !endingWithBody else { return .terminateNow }
+        endingWithBody = true
+        Task { @MainActor in
+            _ = try? await FaceSession.shared.client.act(.quitBody)
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
 
     /// A Dock click with no window open brings the window back.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {

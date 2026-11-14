@@ -663,6 +663,7 @@ public struct FaceRect: Codable, Sendable, Equatable {
 public struct ProtectedWindow: Codable, Sendable, Equatable {
     public var number: Int
     public var frame: FaceRect
+    /// The window is the key window now, so a posted key would land in it.
     public var keyHeld: Bool
     public init(number: Int, frame: FaceRect, keyHeld: Bool) {
         self.number = number

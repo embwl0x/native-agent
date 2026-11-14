@@ -204,8 +204,11 @@ A failed call or meaning write likewise leaves its row owed.
 Recovery uses the live observation tail, admitting each pass only while no live
 observation is waiting (idle drains also require idle). A pass folds one
 recorded meaning or judges one moment, continuing through due work while idle
-until no pass progresses. A failed call, write or fold retries on the next drain;
-a successful interpretation write advances into folding in the same drain.
+until no pass progresses. Every ask for a drain is answered: one that comes
+while a drain runs is kept, and that drain's next pass looks again with nothing
+yet tried (a row that failed while the ask came is retried in it), so a moment left owed or a window that closed after its last
+look is never left for a later turn. A failed call, write or fold retries on the
+next drain; a successful interpretation write advances into folding in the same drain.
 A model wait retains its typed cause and dependency
 in `lived_moments.parts_json`.
 The ChatTurnRuntime memory manager forms the route key with MemoryV2's public,

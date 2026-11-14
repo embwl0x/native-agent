@@ -714,8 +714,10 @@ that accepts a model choice asks it and refuses with "No models to choose yet: "
 and the account's sentence: the selection check every save passes through,
 routing reconstruction, the Providers and minds pickers, the default-model
 setting and the account editor, the agent's `provider.set_default_model`,
-`providers.*_model` and `chat.model`, Telegram's model menu and the image-model
-card. Pickers and menus list offered rows only, plus the slot's current model
+`providers.*_model` and `chat.model`, Telegram's model menu, the image-model
+card, and a helper's pinned model (`bot.create`/`bot.update`, through
+`botModelRefusal` over the rows `bot.list include_models` lists; the slot is
+the helper's own saved model). Pickers and menus list offered rows only, plus the slot's current model
 shown selected with its note; a picker with nothing offered says the account's
 sentence; a picker over several accounts (the composer, the image-model card)
 has no entries from an account that offers nothing. The phone and the agent's
@@ -726,9 +728,11 @@ min(what is left of a run's budget, the model's effective ceiling and the
 transport's own cap), from `FirstPartyExecutionControls.budgetedOutputTokens`,
 which every adapter that writes an output-cap field reads (OpenAI's Chat
 Completions and Responses, Anthropic by key and by Claude sign-in, Kimi Code and
-Meta); xAI, Moonshot, OpenRouter, ChatGPT and Codex write no cap, so the
-provider's own ceiling stands while the routing stream holds the run's aggregate
-budget. An explicit Think level the model's row offers is sent as written (xAI's
+Meta; and, while a run's budget is bound, xAI and Moonshot in
+`max_completion_tokens`). xAI documents its field as visible output only, so
+reasoning there is held by the routing stream alone. OpenRouter, ChatGPT and
+Codex write no cap (OpenRouter's catalog states no output ceiling to bound one), so the provider's own ceiling stands
+while the routing stream holds the run's aggregate budget. An explicit Think level the model's row offers is sent as written (xAI's
 `none` included); "use the provider's default" and a model with one level send no
 field, and the word `default` is never sent. **Refresh** (`provider.refresh`)
 asks every connected route again, names each list it could not fetch, and never

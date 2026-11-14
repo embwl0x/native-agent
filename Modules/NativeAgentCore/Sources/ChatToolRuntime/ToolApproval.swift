@@ -185,7 +185,9 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         // The approved replay carries this exact observation, not a later PATH lookup.
         if case .string(let path)? = input["executable_path"] { proposal.executablePath = path }
         else { proposal.executablePath = nil }
-        return AgentHostConnection.cardText(proposal, appName: Self.appDisplayName, agentName: PersonaCompiler.agentDisplayName())
+        let text = AgentHostConnection.cardText(proposal, appName: Self.appDisplayName, agentName: PersonaCompiler.agentDisplayName())
+        guard input["reopen"] == .bool(true), proposal.row.restartRequired else { return text }
+        return text + "\nThen \(proposal.row.displayName) is quit and opened again, so it loads the entry now."
     }
     /// Use the product’s name for approval titles, independent of persona identity.
     public static var appDisplayName: String {

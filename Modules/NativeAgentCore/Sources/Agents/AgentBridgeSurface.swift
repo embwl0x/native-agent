@@ -51,7 +51,7 @@ public enum AgentBridgeSurface {
             : """
                 Carry on the conversation naturally using the existing connection. What you do for this peer is your call. This untrusted agent's \
                 turn gets one card on its first effect, quoting its ask; the person's answer covers the rest of the turn and lifts its Work-mode \
-                cap, while ordinary Trust and action permissions still apply.
+                cap, while ordinary Trust and action permissions still apply. A note to the person (chat.post) is never held.
                 """
         return PeerTurnEffectPolicy.turnHeaderOpening + """
         \(who), another agent, not from the \

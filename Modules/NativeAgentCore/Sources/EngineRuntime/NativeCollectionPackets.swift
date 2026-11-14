@@ -229,6 +229,14 @@ extension NativeAgentEngine {
         let entityID: String
         if item.hasPrefix("relationships:") { entityID = String(item.dropFirst("relationships:".count)) }
         else if item.hasPrefix("entity:") { entityID = String(item.dropFirst("entity:".count)) }
+        else if item.hasPrefix("contact:") {
+            // A contact's own entity, by the contact's id: the way back from the contact to what the graph knows of it.
+            let contact = String(item.dropFirst("contact:".count))
+            guard let named = snapshot.canvasEntities.first(where: { $0.contactID == contact }) else {
+                throw PartCallError(code: "graph_entity_missing", message: "No entity in the checked graph names that contact.")
+            }
+            entityID = named.id
+        }
         else { throw PartCallError(code: "graph_item_invalid", message: "Choose an entity or an upkeep review from the graph page.") }
         guard let entity = entities.first(where: { $0.id == entityID }) else {
             throw PartCallError(code: "graph_entity_missing", message: "That entity is absent from the checked graph.")
@@ -253,6 +261,10 @@ extension NativeAgentEngine {
             var rows: [PartFace.Row] = []
             if let count = source.mentionCount { rows.append(.init(id: "mentions", title: "Mentions", value: String(count))) }
             if let first = source.firstSeen { rows.append(.init(id: "first-seen", title: "First seen", value: first)) }
+            // The contact this entity names, opening that contact and its conversations.
+            if let contact = source.contactID {
+                rows.append(.init(id: "contact", title: "Contact", value: contact, open: "page:home/agent/" + contact))
+            }
             if let aliases = source.aliases, !aliases.isEmpty {
                 rows.append(.init(id: "aliases", title: "Aliases", value: NativeAppSecretRedactor.redactText(aliases.joined(separator: ", "))))
             }

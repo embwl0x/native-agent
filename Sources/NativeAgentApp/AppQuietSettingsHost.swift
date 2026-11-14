@@ -43,7 +43,9 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     }
     var chatFileAccess: String { appModel.chatFileAccess }
     var chatProvider: String { appModel.chatProvider }
-    var searchServiceURL: String { appModel.searxngBaseURL }
+    var searchServiceURL: String {
+        get async throws { try await appModel.engine.configuration.readSearXNG(dataRoot: appModel.engine.dataRoot) }
+    }
 
     var platformSettings: [QuietSetting] {
         let model = appModel
@@ -379,16 +381,16 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     }
 
     func setInnerLifeEnabled(_ enabled: Bool) async -> (enabled: Bool, problem: String?) {
-        let (state, problem) = await appModel.setInnerLifeEnabled(enabled)
-        return (state.enabled, problem)
+        await appModel.setInnerLifeEnabled(enabled)
     }
 
     /// Use the same runtime setters as Settings and Cognition.
     func setCognitionLane(_ lane: QuietCognitionLane, enabled: Bool) async {
-        await lane.setEnabled(enabled, runtime: NativeAgentEngine.liveCognition)
+        guard let runtime = NativeAgentEngine.liveCognition else { return }
+        await lane.setEnabled(enabled, runtime: runtime)
     }
     func setReflectionBudget(_ budget: Int) async {
-        await NativeAgentEngine.liveCognition.setReflectionBudget(budget)
+        await NativeAgentEngine.liveCognition?.setReflectionBudget(budget)
     }
     func setContextFlowMode(_ mode: ContextFlowMode) async throws -> ContextFlowMode {
         let status = await NativeAgentEngine.live.contextFlow.setMode(mode)
@@ -418,9 +420,15 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     func findSearchService(context: QuietSettingWrite) async throws -> String {
         switch await appModel.autodetectSearXNG() {
         case .found(let baseURL, let gaps):
+            // The receipt says a live server answered, and where, so an unchanged address still reads as found, not kept.
+            context.detail.record("answered", .string(baseURL))
+            context.detail.record("probe", .string("A search server answered at \(baseURL); that address is saved."))
             if !gaps.isEmpty { context.detail.record("discovery_gaps", .array(gaps.map { .string($0) })) }
             return baseURL
-        case .notFound(let detail), .failed(let detail): throw QuietSettingError.unavailable(detail)
+        case .notFound(let detail):
+            context.detail.record("probe", .string("No search server answered on this Mac; the saved address was kept."))
+            throw QuietSettingError.unavailable(detail)
+        case .failed(let detail): throw QuietSettingError.unavailable(detail)
         }
     }
 

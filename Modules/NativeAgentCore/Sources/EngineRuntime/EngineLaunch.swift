@@ -144,8 +144,8 @@ extension NativeAgentEngine {
         } catch {
             ModuleLog.app("[crash-breadcrumbs] unavailable: %@", error.localizedDescription)
         }
-        let nerve = BodyNerve(dataRoot: dataRoot)
-        BackgroundLoopLifetimes.shared.receiveOrganPulses(felt: { await nerve.feel($0) })
+        // Beats are recorded from the first one; the mind's nerve feels them only while a mind runs (`MindLifetime`).
+        BackgroundLoopLifetimes.shared.receiveOrganPulses()
         // Observe person input once per launch; retain one access-and-relaunch card until granted.
         if !MacPersonInput.listening,
            let card = InlineInteractionRegistry.permission(["privacy:inputMonitoring"],
@@ -453,17 +453,6 @@ extension NativeAgentEngine {
                     id: "launch.embeddings", title: "Memory model bring-up", status: "fail", detail: detail)], dataRoot: dataRoot)
             }
         }
-        // One intake: every happening posted from here on is taken by the agent's attention; the stream opens admission once the mind is up.
-        Attention.install(NativeAgentEngine.liveCognition)
-        retainLaunchWork {
-            await NativeAgentEngine.liveCognition.bootstrap()
-            guard !Task.isCancelled else { return }
-            await NativeAgentEngine.live.agents.stream.open(attention: NativeAgentEngine.liveCognition, night: { attended in
-                _ = await NativeAgentEngine.sleep(dataRoot: dataRoot, attended: attended)
-            })
-        }
-        EngineFrontSense.shared.start(dataRoot: dataRoot)
-        retainLaunchWork { await NativeAgentEngine.liveCognition.bootstrap() }
         // Deliver callbacks owed before relaunch without waiting for a task read.
         retainLaunchWork { await NativeAgentEngine.live.agents.tasks.redeliverOwedCallbacks() }
         // A job a relaunch left working resumes through its door or ends stopped, so none waits on a flight that is gone. Its doors are open first.
@@ -486,15 +475,13 @@ extension NativeAgentEngine {
                 makeLoops: {
                     _ = NativeAgentEngine.live
                     guard !Task.isCancelled else { return nil }
-                    // Register signals before sources fire; individual sense readiness must not hold loop launch.
-                    await EnginePartWake.shared.start(dataRoot: dataRoot)
-                    guard !Task.isCancelled else { return nil }
                     // The delegation runner owns contact observation lifecycle.
                     let loops = assembleAllLoops()
                     await installBotProviderCheck()
                     guard !Task.isCancelled else { return nil }
-                    // The one clock delivers every declared time to its owner from here on; helpers run once their provider check is installed.
-                    await registerClockOwners(dataRoot: dataRoot)
+                    // The body is up and helpers' provider check is installed: the mind starts now if setup has finished, else when it does.
+                    // Its start owns attention, the nerve, the stream, and its sources and clocks (part wake, front sense, the one clock's owners).
+                    await retainLaunchWork { await NativeAgentEngine.live.mind?.bodyIsUp() }
                     return loops
                 },
                 resume: { checkpoint in
@@ -729,7 +716,7 @@ extension NativeAgentEngine {
                 }
             }
             await AdaptiveMemoryPromoter.shared.sleep()
-            let slept = await NativeAgentEngine.liveCognition.sleep()
+            let slept = await NativeAgentEngine.live.mind?.end() ?? .noMind
             await retireBrowser()
             return slept
         }
@@ -817,7 +804,7 @@ extension NativeAgentEngine {
     public static func reconcileContextAfterWake() {
         retainLaunchWork {
             await NativeAgentEngine.live.contextFlow.reconcileAfterWake()
-            await NativeAgentEngine.liveCognition.reanchorDeadlinesAfterWake()
+            await NativeAgentEngine.liveCognition?.reanchorDeadlinesAfterWake()
         }
     }
 }

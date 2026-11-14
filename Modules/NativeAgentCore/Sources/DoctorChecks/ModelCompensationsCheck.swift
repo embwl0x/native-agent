@@ -14,7 +14,6 @@ public struct ModelCompensationsCheck: DoctorCheck {
 
     /// Count only in-build shim.fired sites; silence measures receipt count, never mechanism health.
     private static let censusIDs = [
-        "P10", "P11",
         "C02", "C04", "C09",
         "L01", "L10", "L12", "L13",
         "L22", "L23",

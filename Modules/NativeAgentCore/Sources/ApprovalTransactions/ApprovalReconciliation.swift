@@ -79,8 +79,39 @@ extension ApprovalExecution {
             kinds: approvalExecutors(turn: nil), records: records)
         let chatTools = await reconcileUnappliedChatToolApprovalExecutions(dataRoot: dataRoot, records: records)
         let connectors = await reconcileUnappliedConnectorActionApprovals(dataRoot: dataRoot, records: records)
+        let interrupted = await settleInterruptedApprovals(dataRoot: dataRoot, records: records)
         try await checkpointApprovalReconciliation(dataRoot: dataRoot, records: records, retry: chatTools.failures)
-        return executed + chatTools.executed + connectors
+        return executed + chatTools.executed + connectors + interrupted
+    }
+    /// What was underway when the app died is settled once at launch, honestly, as a turn's interrupted receipt is. Only a card answered to a live
+    /// asker has no other owner to settle it: an agent conversation's request (`agent_acp_live_approval`), which records its answer when the yes
+    /// is handed over, so one approved before this process began with no record was underway when its conversation died with the app. Every
+    /// other approved card's owner settles it in the passes above (a chat tool's spend says whether it started); a card no executor runs has
+    /// nothing underway and is left as decided.
+    func settleInterruptedApprovals(dataRoot: URL, records: [ApprovalRecord]) async -> Int {
+        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        var settled = 0
+        for rec in records where rec.decision == "approved" && rec.executedAction == nil
+            && rec.payload.objectValue?["kind"] == .string("agent_acp_live_approval") {
+            guard let decided = rec.resolvedAt.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst),
+                  decided < AbandonedTurnReconciler.processEpoch else { continue }
+            // The owner's slot, and a fresh read under it: an execution record written meanwhile wins and nothing is settled twice.
+            if await ApprovalExecutionOwners.perform(rec, dataRoot: dataRoot, operation: {
+                guard try await inbox.get(rec.id).executedAction == nil else { return nil }
+                return Self.interruptedSettlement(action: rec.action, detail: """
+                    No record shows the person's yes reached the agent conversation that asked, and that conversation ended with the app; \
+                    whether it acted on the answer is unknown. Nothing is sent again.
+                    """)
+            }) { settled += 1 }
+        }
+        return settled
+    }
+    /// The one interrupted record: stopped (a terminal outcome, never a running one), its effects unknown, not run again.
+    static func interruptedSettlement(action: String, op: String = "approval_interrupted", fields: [String: JSONValue] = [:],
+                                      detail: String? = nil) -> ApprovalExecutionOwners.Settlement {
+        .init(action: .object(fields.merging(["op": .string(op), "action": .string(action), "status": .string("stopped"),
+                  "reason": .string("interrupted"), "effects": .string("unknown")]) { _, fixed in fixed }),
+              detail: detail ?? "\(action) had started when the app closed after its approval; whether it took effect is unknown. It was not run again.")
     }
     struct ApprovalReconciliationCursor: Codable {
         var stamp = ""

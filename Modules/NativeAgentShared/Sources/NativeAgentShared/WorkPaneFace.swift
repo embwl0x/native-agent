@@ -46,6 +46,7 @@ public enum WorkPaneFace {
     public static func stepsLine(_ turn: TurnFace?) -> String {
         guard let turn else { return "Waiting for turn status…" }
         if turn.isRunning { return turn.liveLine ?? "Working" }
+        if turn.phase == .waitingOnPerson { return turn.steps.isEmpty ? "I'm waiting on you." : "I'm waiting on you. Here's what I did." }
         return turn.steps.isEmpty ? "When I'm working on something, my steps show up here." : "Here's what I did last time."
     }
 

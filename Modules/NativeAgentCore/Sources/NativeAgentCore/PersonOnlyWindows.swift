@@ -4,8 +4,8 @@ import Synchronization
 
 // Blueprint: | `PersonOnlyWindows.swift` | `PersonOnlyWindows`: capture exclusion and input coordination |
 
-/// Person-only windows are excluded from agent captures, pass agent pointer events through, and hold agent typing while their composer has the keyboard; person
-/// input there is not a takeover. The app registers windows and effects here without Core depending on it.
+/// Person-only windows are excluded from agent captures, pass agent pointer events through, and refuse agent typing at once while they hold the
+/// keyboard; person input there is not a takeover. The app registers windows and effects here without Core depending on it.
 public enum PersonOnlyWindows {
     private static let facePID = Atomic<Int32>(0)
 
@@ -63,12 +63,10 @@ public enum PersonOnlyWindows {
         var windows: [Window] = []
         var keyHeld = false
         var rendererWindows: [UUID: [Window]] = [:]
-        var rendererKeyHeld: Set<UUID> = []
         var rendererOverlays: [UUID: Int] = [:]
         var allWindows: [Window] { windows + rendererWindows.values.flatMap { $0 } }
         var localMotor: MotorHost?
         var rendererMotors: [UUID: MotorHost] = [:]
-        var keyboardReaders: [UUID: AsyncStream<Bool>.Continuation] = [:]
         var lastPersonInputUptime = -Double.infinity
         /// Decoration is excluded from captures, never a hand-back or click target.
         var overlays: Set<Int> = []
@@ -136,17 +134,12 @@ public enum PersonOnlyWindows {
     public static func update(_ current: [Window], keyHeld held: Bool) {
         state.withLock {
             $0.windows = current; $0.keyHeld = held && !current.isEmpty
-            publishKeyboard(&$0)
         }
     }
 
-    public static func updateRenderer(connection: UUID, windows: [Window], keyHeld: Bool) {
-        state.withLock {
-            $0.rendererWindows[connection] = windows
-            if keyHeld && !windows.isEmpty { $0.rendererKeyHeld.insert(connection) }
-            else { $0.rendererKeyHeld.remove(connection) }
-            publishKeyboard(&$0)
-        }
+    /// A report's geometry only: whether the keyboard is held is asked live at each key (`requireKeyboardFree`), never read from a report.
+    public static func updateRenderer(connection: UUID, windows: [Window]) {
+        state.withLock { $0.rendererWindows[connection] = windows }
     }
 
     public static func setRendererOverlay(connection: UUID, number: Int?) {
@@ -156,10 +149,8 @@ public enum PersonOnlyWindows {
     public static func removeRenderer(connection: UUID) {
         let motor = state.withLock {
             $0.rendererWindows.removeValue(forKey: connection)
-            $0.rendererKeyHeld.remove(connection)
             $0.rendererOverlays.removeValue(forKey: connection)
             let motor = $0.rendererMotors.removeValue(forKey: connection)
-            publishKeyboard(&$0)
             return motor
         }
         motor?.disconnected?()
@@ -172,10 +163,8 @@ public enum PersonOnlyWindows {
             $0.keyHeld = false
             $0.overlays = []
             $0.rendererWindows.removeAll()
-            $0.rendererKeyHeld.removeAll()
             $0.rendererOverlays.removeAll()
             $0.rendererMotors.removeAll()
-            publishKeyboard(&$0)
             return motors
         }
         for motor in motors { motor.disconnected?() }
@@ -237,36 +226,18 @@ public enum PersonOnlyWindows {
         public init(detail: String) { self.detail = detail }
     }
 
-    public static func keyboardChanges() -> AsyncStream<Bool> {
-        let id = UUID()
-        let (stream, reader) = AsyncStream<Bool>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        reader.onTermination = { _ in _ = state.withLock { $0.keyboardReaders.removeValue(forKey: id) } }
-        state.withLock {
-            $0.keyboardReaders[id] = reader
-            reader.yield($0.keyHeld || !$0.rendererKeyHeld.isEmpty)
-        }
-        return stream
-    }
+    /// The one sentence a refused key carries.
+    public static let keyboardRefusal = """
+        A NativeAgent window has the keyboard, so nothing was typed: a key now would land in the person's text. Bring the target app forward, then \
+        continue.
+        """
 
-    public static func waitForKeyboard() async throws {
+    /// Answers at once: every window process says, live at the moment of the key (after the target app was activated), that its keyboard is free, or the
+    /// key is refused. A protected-window report can lag an activation, so it never decides this. The agent never waits for the person to click away.
+    public static func requireKeyboardFree() async throws {
+        if state.withLock({ $0.keyHeld }) { throw MotorFailure(detail: keyboardRefusal) }
         let renderers = state.withLock { Array($0.rendererMotors.values) }
         for host in renderers { try await host.keyboard?() }
-        for await held in keyboardChanges() {
-            try Task.checkCancellation()
-            if !held { return }
-        }
-        try Task.checkCancellation()
-    }
-
-    private static func publishKeyboard(_ state: inout State) {
-        let held = state.keyHeld || !state.rendererKeyHeld.isEmpty
-        for reader in state.keyboardReaders.values { reader.yield(held) }
-    }
-
-    /// True while the person's window holds the keyboard (its composer is focused). A keystroke posted to whatever is key would land in their message, so the
-    /// agent's wait until they send or click away.
-    public static var keyboardHeldByPerson: Bool {
-        state.withLock { $0.keyHeld || !$0.rendererKeyHeld.isEmpty }
     }
 
     public static func notePersonInput() {

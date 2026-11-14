@@ -86,7 +86,8 @@ extension SwiftNativeTriggerScheduler {
         return .parsed(items)
     }
 
-    /// One config loader for reads and mutations. Only a missing file asks the part for defaults, before any lock; locked mutations supply prepared defaults.
+    /// One config loader for reads and mutations. Only a missing file asks the part for defaults, before any lock; reads seed the file once
+    /// (`seedIfMissing`), locked mutations supply prepared defaults.
     /// Parsed → the person's rows. Corrupt → the canonical bytes stay in place and the operation throws, never resurrecting defaults over saved data.
     nonisolated static func loadConfigs(
         path: URL,

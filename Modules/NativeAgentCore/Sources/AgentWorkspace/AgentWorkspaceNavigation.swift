@@ -80,6 +80,13 @@ package actor AgentWorkspaceNavigation {
         sessions[dataRoot.standardizedFileURL.path + "\u{0}" + scope]?.lastUndoReceipt
     }
 
+    /// Whether Home issued this id in this conversation's view (a control, live or spent, or an arrival pointer): a reference, never a name.
+    package func issued(_ id: String, dataRoot: URL, scope: String) -> Bool {
+        guard let session = sessions[dataRoot.standardizedFileURL.path + "\u{0}" + scope] else { return false }
+        return session.buttons[id] != nil || session.arrivals?.pending.contains(where: { $0.id == id }) == true
+            || (!session.buttonPrefix.isEmpty && id.hasPrefix(session.buttonPrefix + "."))
+    }
+
     package func lastDoorPage(dataRoot: URL, scope: String) -> String? {
         sessions[dataRoot.standardizedFileURL.path + "\u{0}" + scope]?.lastDoorPage
     }
@@ -118,6 +125,14 @@ package actor AgentWorkspaceNavigation {
         let session = sessions[key], button = session?.buttons[id]
         guard let session, Date().timeIntervalSince(session.issuedAt) <= 1800,
               let button, !button.consumed, !button.retired else {
+            // A name this view never offered is not an expired reference: say so, and name the forms that open a page's item.
+            guard session.map({ !$0.buttonPrefix.isEmpty && id.hasPrefix($0.buttonPrefix + ".") }) == true else {
+                throw ToolFailureError("""
+                    Nothing on home is named \(id): no room, contact, record or control this view offers. A page's own row opens with \
+                    app {page:"<page>", item:"<row>"}; app {find:"\(id)"} finds actions, pages and items. Nothing was done.
+                    """,
+                    argumentPath: "item", effects: .none, nextCall: ToolFailureError.call("app", ["find": .string(id)]))
+            }
             var next: [String: JSONValue] = [:]
             if let name = button?.viewName { next["item"] = .string(name) }
             throw ToolFailureError("""

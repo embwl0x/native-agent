@@ -198,7 +198,7 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
         if ChatGPTDotIPCTransport.owns(self) { return ChatGPTDotIPCTransport.available }
         if transport == .acp { return approvedACPExecutable?.isCurrent == true }
         if transport == .mcpHost {
-            return AgentPeerStore.hostRowID(endpoint).flatMap { AgentHostDirectory.row(named: $0)?.commandLine } != nil
+            return AgentPeerStore.hostRowID(endpoint).flatMap { AgentHostDirectory.row(named: $0)?.reachedLive } == true
         }
         return true
     }

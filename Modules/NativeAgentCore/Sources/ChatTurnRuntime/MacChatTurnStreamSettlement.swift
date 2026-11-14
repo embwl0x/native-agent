@@ -89,7 +89,11 @@ public extension MacChatTurnPresentationPort {
                     proof = .unavailable
                     kind = .outcomeUnknown(reason: "The conversation owner could not be read: \(error.localizedDescription)")
                 }
-            case .waiting, .interrupted, nil:
+            // Waiting on the person is a known ending; only an interrupted or unreported ending is unknown.
+            case .waiting:
+                proof = .waitingOnPerson
+                kind = .waitingOnPerson(action: response.statusDetail)
+            case .interrupted, nil:
                 proof = .incomplete
                 kind = .outcomeUnknown(reason: response.statusDetail ?? "This reply was saved, but the turn did not finish.")
             }
@@ -99,6 +103,7 @@ public extension MacChatTurnPresentationPort {
             switch proof {
             case .completed: kind = .completed
             case .incomplete: kind = .outcomeUnknown(reason: "This reply was saved, but the turn did not finish.")
+            case .waitingOnPerson: kind = .waitingOnPerson(action: nil)
             case .failed: kind = .failed(reason: nil)
             case .canceled: kind = .cancellationConfirmed(reason: nil)
             case .absent:

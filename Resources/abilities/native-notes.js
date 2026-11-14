@@ -4,10 +4,11 @@
  "face":{"page":"notes"},
  "answers":{
  "notes.search":{"description":"Find and read Apple Notes: blank query lists recent notes, query matches title or text, title (exact) or id returns a body page. Each note reports truncated; continue with its id and next_body_offset as body_offset until false. Read-only; requires Notes → Read permission.","class":"read","irreversible":false,"screen":false,"args":{"type":"object","properties":{"query":{"type":"string","description":"Words to find in titles or text; blank lists recent notes."},"title":{"type":"string","description":"Exact note title: returns a body page."},"id":{"type":"string","description":"A note's id from an earlier result: returns a body page of that exact note."},"body_offset":{"type":"integer","description":"UTF-16 offset from next_body_offset; requires the same note id. Omit to read from the start."},"limit":{"type":"integer","description":"Maximum notes to return (1-50, default 10)."}},"required":[],"additionalProperties":false}},
- "notes.create":{"description":"Create a new Apple Note with title + body, optionally in a named folder. Requires Notes → Write permission (off by default).","class":"write","irreversible":false,"screen":false,"args":{"type":"object","properties":{"title":{"type":"string","description":"Note title (required)."},"body":{"type":"string","description":"Note body content (required)."},"folder":{"type":"string","description":"Optional folder name; created in the default folder when omitted. A named folder that does not exist is an error listing the folders that do — it is never silently swapped for the default."}},"required":["title","body"],"additionalProperties":false}},
+ "notes.create":{"description":"Create a new Apple Note with title + body, optionally in a named folder. Requires Notes → Write permission (off by default).","class":"write","irreversible":false,"screen":false,"args":{"type":"object","properties":{"title":{"type":"string","description":"Note title (required)."},"body":{"type":"string","description":"Note body content (required)."},"folder":{"type":"string","description":"Optional folder name; omitted, the note goes where Notes puts new notes (the default account's default folder). A named folder that does not exist is an error listing the folders that do — it is never silently swapped for the default; make it with notes.folder_create."}},"required":["title","body"],"additionalProperties":false}},
  "notes.update":{"description":"Update one Apple Note by id from notes.search or a unique exact title. Supply body, append, new_title or clear_fields:[\"body\"]. Clearing empties the body and cannot be combined with body/append. Requires Notes → Write permission (off by default).","class":"write","irreversible":false,"screen":false,"args":{"type":"object","properties":{"id":{"type":"string","description":"The note's id from notes.search; use it when two notes share a title."},"title":{"type":"string","description":"Exact title of the note to update (as notes.search shows it)."},"body":{"type":"string","description":"Replace the note's text under its title; the title stays unless new_title is given."},"append":{"type":"string","description":"Add this as a new line at the end of the note."},"new_title":{"type":"string","description":"Rename the note to this title."},"clear_fields":{"type":"array","items":{"type":"string","enum":["body"]},"description":"[\"body\"] is a valid update by itself; empties the body. Cannot combine with body or append."}},"required":[],"additionalProperties":false}},
- "notes.delete":{"description":"Delete one Apple Note by id or an exact title only one note has. Moves it to Recently Deleted, where it can be restored; returns that reversible outcome. Requires Notes → Write permission (off by default).","class":"write","irreversible":false,"screen":false,"args":{"type":"object","properties":{"id":{"type":"string","description":"The note's id from notes.search; use it when two notes share a title."},"title":{"type":"string","description":"Exact title of the note to delete; duplicate titles refuse without changing anything."}},"required":[],"additionalProperties":false,"allOf":[{"anyOf":[{"required":["id"]},{"required":["title"]}]}]}}},
- "record":{"description":"Apple Notes: find, read, create, update and delete notes through the app's own scripting, with named read gaps and recovery wording for every refusal.","actions":[]}}
+ "notes.delete":{"description":"Delete one Apple Note by id or an exact title only one note has. Moves it to Recently Deleted, where it can be restored; returns that reversible outcome. Requires Notes → Write permission (off by default).","class":"write","irreversible":false,"screen":false,"args":{"type":"object","properties":{"id":{"type":"string","description":"The note's id from notes.search; use it when two notes share a title."},"title":{"type":"string","description":"Exact title of the note to delete; duplicate titles refuse without changing anything."}},"required":[],"additionalProperties":false,"allOf":[{"anyOf":[{"required":["id"]},{"required":["title"]}]}]}},
+ "notes.folder_create":{"description":"Make a Notes folder by name in the default Notes account; a folder already named that in that account is returned, not doubled. Requires Notes → Write permission (off by default).","class":"write","irreversible":false,"screen":false,"args":{"type":"object","properties":{"name":{"type":"string","description":"The new folder's name (required)."}},"required":["name"],"additionalProperties":false}}},
+ "record":{"description":"Apple Notes: find, read, create, update and delete notes, and make folders, through the app's own scripting, with named read gaps and recovery wording for every refusal.","actions":[]}}
 */
 const NOTES = "com.apple.Notes";
 // Setup and folder refusals travel as these markers because a script's reply is one value.
@@ -23,7 +24,6 @@ const WORDS = {
     "missing_body_append_or_new_title": "Say what to change: body (replace), append, or new_title.",
     "body_and_append_mutually_exclusive": "Use body to replace or append to add, not both."
 };
-const NO_DEFAULT_FOLDER = "The default Notes account has no default folder; make that destination available in Notes before creating a note.";
 // Foundation's whitespaceAndNewlineCharacterSet and newlines set.
 const SPACE = "\\t\\n\\u000b\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
 const TRIM = new RegExp("^[" + SPACE + "]+|[" + SPACE + "]+$", "g");
@@ -252,7 +252,8 @@ function search(input) {
     return read('notes whose (name contains "' + q + '") or (body contains "' + q + '")', limit, false, 0);
 }
 
-// An omitted or blank folder uses Notes' default; a named folder that cannot be resolved never does.
+// An omitted or blank folder leaves the place to Notes: a note made with no location goes where Notes puts every new note, the default
+// account's default folder, so no account or folder is resolved here. A named folder that cannot be resolved is never swapped for it.
 function create(input) {
     const title = text(input.title);
     if (!title) return failed("missing_title");
@@ -261,7 +262,8 @@ function create(input) {
     const given = text(input.folder);
     const requested = given === undefined ? undefined : trim(given);
     const named = requested !== undefined && requested !== "";
-    const destination = named ? `
+    const make = `make new note with properties {name:"${escape(title)}", body:"${escape(html(body))}"}`;
+    const value = script(named ? `
 set matchingFolders to folders whose name is "${escape(requested)}"
 if (count of matchingFolders) is 0 then
     set folderNames to ""
@@ -274,22 +276,16 @@ if (count of matchingFolders) is 0 then
     return "${FOLDER_MISSING}" & folderNames
 end if
 if (count of matchingFolders) is not 1 then error "Several Notes folders have that name; no note was created. Choose a unique folder name."
-set targetFolder to item 1 of matchingFolders` : `
-set targetAccount to default account
-if targetAccount is missing value then error "Notes has no default account; choose its default account in Notes before creating a note."
-set targetFolder to default folder of targetAccount
-if targetFolder is missing value then error "${NO_DEFAULT_FOLDER}"`;
-    const value = script(`${destination}
--- Resolve the destination before the single create command.
-set destinationID to (id of targetFolder) as text
-tell targetFolder
-    set newNote to make new note with properties {name:"${escape(title)}", body:"${escape(html(body))}"}
+tell item 1 of matchingFolders
+    set newNote to ${make}
 end tell
+return "created|" & (id of newNote as string)` : `
+set newNote to ${make}
 return "created|" & (id of newNote as string)`, false);
     if (named && typeof value === "string" && value.startsWith(FOLDER_MISSING)) {
         const names = value.slice(FOLDER_MISSING.length).split("###").map(trim).filter(name => name !== "");
         return {status:"failed", integration:"notes", effects:"none", reason:"folder_not_found",
-            detail:"No Notes folder is named that, so nothing changed; use one of available_folders.",
+            detail:"No Notes folder is named that, so nothing changed; use one of available_folders, or make it with notes.folder_create.",
             requested_folder:requested, available_folders:names};
     }
     // The new note's own id is returned so later reads and changes cannot select another note.
@@ -298,6 +294,26 @@ return "created|" & (id of newNote as string)`, false);
             message:"Notes returned an unrecognized creation result. Read the intended folder before trying again."};
     }
     return {status:"completed", action:"created", title, id:value.slice("created|".length)};
+}
+
+// The folder is made in the default account, and only that account is looked in first: a folder of that name already there is the
+// folder asked for and is returned, never doubled; one of that name in another account is another folder.
+function createFolder(input) {
+    const name = trim(text(input.name) || "");
+    if (name === "") return {status:"failed", integration:"notes", reason:"missing_name", effects:"none", message:"Give the folder's name."};
+    const value = script(`
+tell default account
+    set matchingFolders to folders whose name is "${escape(name)}"
+    if (count of matchingFolders) > 0 then return "exists|" & ((id of item 1 of matchingFolders) as string)
+    set newFolder to make new folder with properties {name:"${escape(name)}"}
+end tell
+return "created|" & ((id of newFolder) as string)`, false);
+    const done = typeof value === "string" ? /^(exists|created)\|(.+)$/.exec(value) : null;
+    if (!done) {
+        return {status:"outcome_unknown", integration:"notes", effects:"unknown", reason:"unexpected_folder_create_result",
+            message:"Notes returned an unrecognized folder result. Read the folders with notes.search before trying again."};
+    }
+    return {status:"completed", action:done[1] === "created" ? "created" : "already_exists", name, id:done[2]};
 }
 
 function mutationUnknown(input, deleting) {
@@ -410,6 +426,7 @@ function run(input) {
         if (input.verb === "notes.create") return create(input);
         if (input.verb === "notes.update") return modify(input, false);
         if (input.verb === "notes.delete") return modify(input, true);
+        if (input.verb === "notes.folder_create") return createFolder(input);
     } catch (error) { return appFailure(error); }
-    throw new Error("native-notes answers notes.search, notes.create, notes.update and notes.delete.");
+    throw new Error("native-notes answers notes.search, notes.create, notes.update, notes.delete and notes.folder_create.");
 }

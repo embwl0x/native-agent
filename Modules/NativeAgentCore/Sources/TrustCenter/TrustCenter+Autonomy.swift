@@ -17,7 +17,8 @@ public enum PermissionPosture: Sendable {
 }
 
 /// Every executor shares judgment from declared class, saved posture, integration switch and steering authority. The agent's data and workspace roots are its
-/// own; external paths, accounts, apps and shared remotes reach the person. Irreversible changes on the person's side always ask; Safe cannot change that side.
+/// own; external paths, accounts, apps and shared remotes reach the person. Irreversible changes on the person's side always ask (the gate lets the
+/// agent undo its own act: remove what its own create made, `AgentMade`); Safe cannot change that side.
 public enum PermissionLaw {
     /// Request ceilings precede coordination, consent and effects. A wider saved posture or nested chain cannot lift them.
     public static func requestFileAccessRefusal(tool: String, input: [String: JSONValue], turn: Turn?) throws -> ToolFailureError? {
@@ -38,7 +39,7 @@ public enum PermissionLaw {
                 instruction: "Ask the request issuer to grant Read only (fileAccess=read_only) or the intended broader access at \(control), "
                     + "then submit a new request. Every originating ceiling carried by the request must permit explicit-path reads.")
         }
-        if ceiling.readOnly, try toolClass(tool, input: input, turn: turn) != .read {
+        if ceiling.readOnly, try toolClass(tool, input: input, turn: turn) != .read, !voice(tool: tool, input: input, turn: turn) {
             return ToolFailureError("request.fileAccess=read_only blocks \(tool); nothing ran. The request issuer must resubmit with write access.",
                 effects: .none, owner: "request.fileAccess", tap: control, personDecides: true,
                 code: "request_read_only", status: .refused,
@@ -229,6 +230,14 @@ public enum PermissionLaw {
     private static func personForm(tool: String, input: [String: JSONValue], turn: Turn?) -> PersonAct.Form? {
         guard let act = turn?.personAct else { return nil }
         if act.covers(tool: tool, input: input) { return .call }
+        // A card the person approved for several calls together decides each of them by its own place in the list, as the door runs
+        // them in order: the first matching place not yet admitted, so two identical calls are two places, each admitted once. When every
+        // matching place is admitted, the first names the call (still the person's, but a further admission of it is refused).
+        if act.input["actions"] != nil, ToolNameAliases.canonical(tool) == "app" {
+            let calls = decidedCalls(act)
+            let places = calls.indices.filter { PersonAct.sameAppCall(calls[$0], input) }
+            if let step = places.first(where: { !act.isSpent(.step($0)) }) ?? places.first { return .step(step) }
+        }
         guard act.tool == "app", case .string(let action)? = act.input["action"],
               let binding = AppActionBinding.declaredBinding(action), binding.folded else { return nil }
         let ran = ToolNameAliases.ranCall("app", input: act.input)
@@ -238,6 +247,35 @@ public enum PermissionLaw {
               input.filter({ !$0.key.hasPrefix("__") }).allSatisfy({ ran.input[$0.key] != nil || binding.fixedInput[$0.key] == $0.value })
         else { return nil }
         return .folded
+    }
+
+    /// The `app` calls the person's act decides: its own call, or each call of a list they approved together, read as the door reads a
+    /// step of `app {actions:[…]}` (the step's own `expect`, `as` and `cleanup` are the list's, never the call's).
+    public static func decidedCalls(_ act: PersonAct) -> [[String: JSONValue]] {
+        guard act.tool == "app" else { return [] }
+        guard case .array(let entries)? = act.input["actions"] else { return [act.input] }
+        return entries.map { entry in
+            ToolNameAliases.doorCall("app", (entry.objectValue ?? [:]).filter { !["expect", "as", "cleanup"].contains($0.key) })
+        }
+    }
+
+    /// Whether the person decided setting `id` to `value`, alone or with others: the change itself, whatever reason the agent's call gave
+    /// beside it (`because`), since a setting's own check holds only the setting and the value.
+    public static func personDecided(setting id: String, value: JSONValue, turn: Turn?) -> Bool {
+        guard let act = turn?.personAct else { return false }
+        let wanted = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return decidedCalls(act).contains { call in
+            let args = call["args"]?.objectValue ?? [:]
+            return call["action"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "setting.set"
+                && args["setting"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == wanted
+                && args["value"] == value
+        }
+    }
+
+    /// The agent's own words to its own person (`AppActionBinding.voice`, `chat.post`): no act on anyone's world, so no gate holds it, not
+    /// a posture, a request's read-only ceiling, an unauthenticated remote origin, nor another agent's steering. Every gate reads this one.
+    public static func voice(tool: String, input: [String: JSONValue], turn: Turn?) -> Bool {
+        (try? AppActionBinding.action(tool: tool, input: input, turn: turn))?.voice == true
     }
 
     /// The lever this call is, if it is one (`AppActionBinding.lever`): an `app` action, or a tool an `app` lever folds into.

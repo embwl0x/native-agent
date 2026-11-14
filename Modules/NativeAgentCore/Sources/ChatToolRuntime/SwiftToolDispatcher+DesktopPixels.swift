@@ -101,6 +101,7 @@ extension SwiftToolDispatcher {
         }
         try Task.checkCancellation()
         let process = ManagedProcess()
+        process.life = turn.enclosingCall
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         process.arguments = args + paths.map(\.path)
         process.standardInput = FileHandle.nullDevice

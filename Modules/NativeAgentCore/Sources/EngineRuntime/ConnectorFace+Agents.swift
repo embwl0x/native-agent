@@ -84,22 +84,21 @@ extension NativeAgentEngine {
             actions.append(PartFace.Action(id: "disconnect", label: "Disconnect agent", doors: ["mac"], call: ask("disconnect")))
         }
         var setup: [PartFace.Row] = []
-        // A Grok Bot routine finishes setup by reading its credentials natively; the credentials themselves never enter a face.
+        // A Grok Bot routine finishes setup when its webhook address and key are pasted securely; the credentials themselves never enter a face.
         if let contact = row.contact, contact.transport == .grokBot, ["creating", "secure-paste"].contains(contact.grokSetup ?? "") {
             let peer: [String: PartFace.Value] = ["agent": .string(contact.id)]
             setup.append(.init(id: "agent-grok:" + contact.id, title: "Routine credentials", detail: contact.grokSetup == "creating"
                 ? """
-                    Routine setup is not confirmed. Connect again to continue this contact's setup. If a request was already submitted, it will not be \
-                    sent again; approve it in Grok Bot if asked.
+                    Routine setup is unfinished. Connect gives the steps: send its one message in the Grok Bot chat, then copy the routine's webhook \
+                    address and key with Grok Bot's own Copy and paste them securely.
                     """
-                : "Grok Bot setup is unfinished. Connect again to continue, or read the routine securely on this Mac.",
-                tone: .attention, actions: [.init(id: "import", label: "Read routine securely", doors: ["mac"], call: .init("agent.grok_import", peer)),
-                                            .init(id: "paste", label: "Paste credentials securely", doors: ["mac"],
+                : "Grok Bot setup is unfinished. Paste the routine's webhook address and key securely, together or one after the other.",
+                tone: .attention, actions: [.init(id: "paste", label: "Paste credentials securely", doors: ["mac"],
                                                   call: .init("agent.grok_paste", peer))]))
             if contact.grokConversation == nil {
                 setup.append(.init(id: "agent-grok-bot:" + contact.id, title: "Grok Bot name", detail: """
-                    Connect briefly brings Grok Bot forward to send the routine request. If the current Bot cannot be identified, enter its exact \
-                    sidebar name here, then Connect again.
+                    Connect's steps name the Grok Bot chat its setup message goes to. For another Bot's chat, enter that Bot's exact sidebar name \
+                    here, then Connect again.
                     """, control: .field("", placeholder: "Bot name", call: .init("agent.grok_bot", peer))))
             }
         }
@@ -210,42 +209,36 @@ extension NativeAgentEngine {
         return "Message accepted."
     }
 
-    /// `agent.grok_paste`: the Mac's secure window takes a Grok Bot routine's credentials, from its secure field to the keychain only.
-    @MainActor func grokPaste(peer: String, renderer: UUID?) async throws -> String? {
-        guard let contact = contacts.rows.first(where: { $0.contact?.id == peer })?.contact,
+    /// `agent.grok_paste`: a Grok Bot routine's webhook goes from a secure paste to the keychain only. One rule decides the path. The person's own press
+    /// of the Connectors row's button in the app opens the Mac's secure field for the person's paste. Every other call through the door (the agent's
+    /// own, one the person's word decided, an approved card's replay) is the one paste that field allows the agent: the clipboard, read natively at
+    /// once, never a window and never waiting on one. Each call is independent: address and key in either order, each saved as it arrives; the one
+    /// that completes the setup closes any secure window still open for the contact.
+    @MainActor func grokPaste(peer: String, turn: Turn) async throws -> String? {
+        guard let contact = contacts.rows.first(where: { $0.contact?.id == peer || $0.contact?.name.caseInsensitiveCompare(peer) == .orderedSame })?
+                .contact,
               contact.transport == .grokBot, ["creating", "secure-paste"].contains(contact.grokSetup ?? "") else {
             throw PartCallError(code: "stale_row", message: "This contact is not waiting for routine credentials. Refresh Connectors.")
         }
-        if let renderer {
-            switch try await faceActs.call(.showGrokSetup(contact: peer, operation: UUID()), renderer: renderer) {
+        if case .tap(let door, _, _, let page, _)? = turn.personAct?.by, door == "mac", page == "connectors",
+           let renderer = turn[FacePresentationPart.self] {
+            switch try await faceActs.call(.showGrokSetup(contact: contact.id, operation: UUID()), renderer: renderer) {
             case .acknowledged: return nil
             case .failed(let issue), .refused(let issue): throw issue
             case .cancelled: throw CancellationError()
             default: throw FaceWireError.invalidFeedOrder
             }
         }
-        guard let show = connectors.platform.showGrokSecureSetup else {
-            throw PartCallError(code: "mac_required", message: "Paste the Grok Bot credentials on your Mac.")
-        }
-        try await show(peer)
-        return nil
-    }
-
-    /// `agent.grok_import`: a Grok Bot routine's credentials are read securely on this Mac into the keychain.
-    @MainActor func grokImport(peer: String) async throws -> String? {
-        let turn = Turn().with(\.envelope, .personOnMac("mac_ui:grok.import"))
-        guard try await GrokBotConnection.importSecureCredentials(turn: turn, mac: .init(dataRoot: dataRoot), peer: peer, dataRoot: dataRoot,
-                                                                 desktop: agents.desktop) else {
-            throw PartCallError(code: "stale_row", message: "This contact is not waiting for routine credentials. Refresh Connectors.")
-        }
-        return "Set up. Credentials are in Keychain. Send a test message; approve the local reply command in Grok Bot if asked."
+        let pasted = try await GrokBotConnection.pasteClipboard(peer: contact.id, dataRoot: dataRoot)
+        if pasted.complete, let close = connectors.platform.closeGrokSecureSetup { try? await close(contact.id) }
+        return pasted.words
     }
 
     /// `agent.grok_bot`: the Grok Bot's exact sidebar name for a contact's routine request.
     @MainActor func grokBot(peer: String, name: String) throws -> String? {
         guard !name.isEmpty else { throw PartCallError(code: "bad_value", message: "Enter the Bot's exact sidebar name. Nothing was saved.") }
         try GrokBotConnection.selectBot(peer: peer, name: name, dataRoot: dataRoot)
-        return "Bot selected. Connect again to send the routine request."
+        return "Bot selected. Connect again for the setup steps in that Bot's chat."
     }
 
     @MainActor private func anchoredSession(for purpose: String) throws -> String {

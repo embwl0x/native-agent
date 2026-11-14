@@ -24,6 +24,14 @@ public final class ManagedProcess: @unchecked Sendable {
         get { state.withLock { $0.handler } }
         set { state.withLock { $0.handler = newValue } }
     }
+    /// The watch of the call that waits on this process: launch attaches the process as what the call waits on, its output is the call's
+    /// life (the capture owner reports it), and exit detaches it. A running process is alive however quiet it is.
+    public var life: TurnDeadline? {
+        get { state.withLock { $0.life } }
+        set { state.withLock { $0.life = newValue } }
+    }
+    /// What a call waits on when it waits on this running process; nil before launch.
+    public func callLife(what: String) -> CallLife? { state.withLock { $0.group }?.callLife(what: what) }
 
     private struct State {
         var group: OwnedProcessGroup?
@@ -33,6 +41,8 @@ public final class ManagedProcess: @unchecked Sendable {
         var deadline: DispatchSourceTimer?
         var timedOut = false
         var handler: (@Sendable (ManagedProcess) -> Void)?
+        var life: TurnDeadline?
+        var lifeID: UUID?
     }
     private let state = NSLockedState(State())
     private let finished = DispatchGroup()
@@ -63,6 +73,10 @@ public final class ManagedProcess: @unchecked Sendable {
             inheritedDescriptor: inheritedDescriptor)
         finished.enter()
         state.withLock { $0.group = group }
+        if let life = self.life {
+            let id = life.attach(group.callLife(what: "the process \(executableURL.lastPathComponent)"))
+            state.withLock { $0.lifeID = id }
+        }
         group.onFailure = { [weak self] in self?.announce() }
         if let timeout {
             let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
@@ -131,14 +145,18 @@ public final class ManagedProcess: @unchecked Sendable {
     }
 
     private func announce() {
-        let (first, handler): (Bool, (@Sendable (ManagedProcess) -> Void)?) = state.withLock {
-            guard !$0.announced else { return (false, nil) }
+        let (first, handler, watched): (Bool, (@Sendable (ManagedProcess) -> Void)?, (TurnDeadline, UUID)?) = state.withLock {
+            guard !$0.announced else { return (false, nil, nil) }
             $0.announced = true
             $0.deadline?.cancel()
             $0.deadline = nil
-            return (true, $0.handler)
+            var watched: (TurnDeadline, UUID)?
+            if let life = $0.life, let id = $0.lifeID { watched = (life, id) }
+            $0.lifeID = nil
+            return (true, $0.handler, watched)
         }
         guard first else { return }
+        if case let (life, id)? = watched { life.detach(id) }
         DispatchQueue.global(qos: .utility).async { [self] in
             finished.leave()
             handler?(self)
@@ -349,6 +367,16 @@ public final class OwnedProcessGroup: @unchecked Sendable {
         } catch {
             recordFailure("Process group \(pid) termination could not be verified: \(error.localizedDescription). The waitable leader remains owned.")
             return false
+        }
+    }
+
+    /// What a call waits on when it waits on this group: alive while any member runs, quiet or busy; dead only when the whole group has exited.
+    public func callLife(what: String) -> CallLife {
+        CallLife(what: what) { [self] in
+            let running: Bool
+            if let members = try? liveGroupMembers() { running = !members.isEmpty }
+            else { running = killpg(pid, 0) == 0 || errno == EPERM }
+            return running ? .alive : .dead("\(what) has exited")
         }
     }
 

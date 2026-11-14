@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import NativeAgentCore
+import PersistenceCore
 // Blueprint: | `BotRunQueue.swift` | `BotRunQueue`; `enqueue`, `presence`, `refusal`: commit claim/refusal before removal; daily reservations |
 
 public struct BotRunReceipt: Sendable, Equatable {
@@ -100,7 +101,8 @@ public struct BotRunQueue: Sendable {
     // Serialize disk transactions with process-wide claims to prevent double admission.
     private final class Admission: @unchecked Sendable {
         let lock = NSLock()
-        var active: [String: [UUID: (descriptor: Int32, done: ScopedWaiter)]] = [:]
+        /// `watch` is the running job's own call watch, set once its turn starts: what a waiter for the same helper asks.
+        var active: [String: [UUID: (descriptor: Int32, done: ScopedWaiter, watch: TurnDeadline?)]] = [:]
     }
 
     public init(dataRoot: URL) {
@@ -268,7 +270,10 @@ public struct BotRunQueue: Sendable {
         return run
     }
 
-    func claimWhenAvailable(bot id: UUID, requestID: UUID?, manual: Bool = false, scope: BotRunScope) async throws -> ClaimedRun {
+    /// `waiting` is the watch of the call that waits for the helper: while the helper is busy, the run it is already doing is what that call
+    /// waits on, and that run answers for it.
+    func claimWhenAvailable(bot id: UUID, requestID: UUID?, manual: Bool = false, scope: BotRunScope,
+                            waiting: TurnDeadline? = nil) async throws -> ClaimedRun {
         // Waiting on a run this task is already inside can only ever time out.
         guard !scope.ancestry.contains(id) else { throw BotRunAdmissionError.alreadyRunning }
         while true {
@@ -285,8 +290,33 @@ public struct BotRunQueue: Sendable {
                     try Task.checkCancellation()
                     return try claim(bot: id, requestID: requestID, manual: manual)
                 }
-                await waiter.park()
+                if let waiting { await waiting.watching(runLife(id)) { await waiter.park() } } else { await waiter.park() }
             }
+        }
+    }
+
+    /// The running job's turn starts: its watch is what a waiter for this helper asks.
+    func running(bot id: UUID, on watch: TurnDeadline?) {
+        Self.admission.lock.withLock { Self.admission.active[rootKey]?[id]?.watch = watch }
+    }
+
+    /// The run holding this helper, whichever it is now, answers for a call waiting to use the helper: alive while it shows life or what it
+    /// waits on is alive, never dead (its own watch ends it). When the helper is free the waiter is already claiming it.
+    private func runLife(_ id: UUID) -> CallLife {
+        let root = rootKey
+        return CallLife(what: "the run this helper is already doing") {
+            guard let entry = Self.admission.lock.withLock({ Self.admission.active[root]?[id] }) else { return .alive }
+            guard let run = entry.watch else { return .unknown }
+            if run.quietFor < CallBound.quietSeconds { return .alive }
+            let answers = await withTaskGroup(of: CallLife.Answer.self) { group in
+                for life in run.livesBelow() { group.addTask { await life.alive() } }
+                var all: [CallLife.Answer] = []
+                for await answer in group { all.append(answer) }
+                return all
+            }
+            if answers.contains(where: { if case .alive = $0 { true } else { false } }) { return .alive }
+            for case .waitingOnPerson(let words) in answers { return .waitingOnPerson(words) }
+            return .unknown
         }
     }
 
@@ -348,7 +378,7 @@ public struct BotRunQueue: Sendable {
                 requests.removeValue(forKey: id)
                 try disk.write(requests, at: path)
             }
-            Self.admission.active[rootKey, default: [:]][id] = (descriptor, ScopedWaiter())
+            Self.admission.active[rootKey, default: [:]][id] = (descriptor, ScopedWaiter(), nil)
             retained = true
             return ClaimedRun(runID: admittedID, bot: bot, context: context, provenance: provenance)
         }

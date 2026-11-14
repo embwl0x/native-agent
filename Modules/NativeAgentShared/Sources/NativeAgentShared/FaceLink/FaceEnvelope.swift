@@ -274,6 +274,8 @@ public enum FaceCall: Codable, Sendable {
     case prepareChatDraft(text: String)
     case showProviderSetup(provider: String, operation: UUID)
     case showGrokSetup(contact: String, operation: UUID)
+    /// Close the secure Grok window open for this contact, if any (the agent's paste finished its setup).
+    case closeGrokSetup(contact: String)
     case showMacControlWorkbench
     case chooseSharedFolder(operation: UUID)
     case chooseSenseDestination(operation: UUID, suggestedName: String)
@@ -288,7 +290,8 @@ public enum FaceCall: Codable, Sendable {
     case agentPointerMoved(PointerPresentation)
     case passPointerThrough(operation: UUID, x: Double, y: Double, driver: DriverIdentity?)
     case restorePointerInteraction(operation: UUID)
-    case waitForKeyboard
+    /// Answers at once whether the window process's keyboard is free; a held keyboard refuses the agent's key, never parks it.
+    case checkKeyboard
     case readInspectorHealth
     case rearmInspectorSubscription(view: UUID, subscription: UUID?)
     case presentFailure(title: String, detail: String)

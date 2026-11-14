@@ -11,6 +11,20 @@ Reverse-chronological. Each phase: 1–2 lines.
 - A clean Mac shows no false alarms: Doctor says off for what was never set up; a never-written Desk is empty; a window with no connection shows no Inspector
 - The text wire reads a call's body as JSON; the hand grows with what the agent has done; a long write shows what is being written; receipts show only what their call may
 - Telegram voice notes decode with the Mac's own reader; Stop runs when its marker cannot be read; pages are not offered as calls; a notification carries its subtitle
+- Setup: a grant walk reports the app's own reading after each pane and asks every app's Automation at once; the first note opens the person's conversation;
+  connecting other agents replaces a stale entry with a backup and reopens a host on request; Doctor's phone line is one true sentence; Quit is the whole app
+- Cards: the person's word in the conversation is their act and needs no card; a list of the person's asks is one card; every card's buttons work wherever it
+  is shown; a settled card names itself, who decided and what changed; a note to the person and undoing the agent's own act are never carded
+- Cards continue: an answered card carries on its work wherever it was answered; a card never holds a running call; a card left running by a restart
+  settles as interrupted
+- Other agents: command-line agents get live two-way sessions; their turns keep their words and no clock cuts them; a chat bot's setup is the agent's own
+  ability; a contact on this Mac arrives with its own identity or not at all; a helper takes only a model its account offers
+- iPhone: an accepted pairing is owed to the phone until it confirms; repair goes ahead over sends in flight; the phone holds the Mac's current key and earlier
+  records settle; each pairing step says where it stands; the phone accepts an older Mac's answer
+- Memory: a Notes note needs no folder and folders can be made; the night and every moment load the memory model first; the graph knows contacts by every name
+  and links them; one unreadable record no longer blinds the agent's history, which reads every conversation and the app's own starts and stops
+- Nothing gets stuck: a call ends when what it waits on is seen dead, never by the app's clock; each waiting owner answers whether it lives; the shared file
+  lock waits while its holder lives; one desktop lane, the person first; a relative time is one moment in every form
 
 ## 0.6.17 — never clueless (2026-11-10)
 

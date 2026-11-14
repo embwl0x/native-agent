@@ -39,7 +39,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             try db.execute(sql: """
                 UPDATE kg_entities SET summary = NULL,
                     metadata_json = json_remove(metadata_json,
-                        '$.last_memory_id', '$.last_memory_source', '$.embedding_text', '$.indexer')
+                        '$.last_memory_id', '$.last_memory_source', '$.embedding_text', '$.indexer', '$.contact_id')
                 WHERE json_extract(metadata_json, '$.indexer') IN (\(ownedIndexerPlaceholders))
                   AND json_extract(metadata_json, '$.\(Self.createdByKey)') IS NULL
                 """, arguments: StatementArguments(Self.ownedIndexerVersions))
@@ -96,9 +96,12 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 UPDATE kg_entities SET mention_count = 0
                 WHERE COALESCE(json_extract(metadata_json, '$.role'), '') = 'primary_user'
                 """)
-            for fact in facts {
+            // Every fact's stated aliases meet before any fact is indexed, so one entity is one node whichever name a fact uses.
+            let contents = facts.map { $0.content.trimmingCharacters(in: .whitespacesAndNewlines) }
+            let extracted = Self.extractCorpus(contents, knownPeople: identity.knownPeople, knownAgents: identity.knownAgents)
+            for (index, fact) in facts.enumerated() {
                 let memoryID = fact.id.trimmingCharacters(in: .whitespacesAndNewlines)
-                let content = fact.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                let content = contents[index]
                 let contentHash = Self.factFingerprint(fact, content: content, identity: identity)
                 try Self.indexActiveFact(
                     db,
@@ -107,8 +110,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     content: content,
                     contentHash: contentHash,
                     now: now,
-                    extracted: Self.extractEntities(from: content, knownPeople: identity.knownPeople),
-                    primaryUserName: identity.primaryUserName
+                    extracted: extracted[index],
+                    primaryUserName: identity.primaryUserName,
+                    contactIDs: identity.contactIDs
                 )
             }
             return KnowledgeGraphMemoryRebuildReport(

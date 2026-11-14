@@ -374,7 +374,7 @@ public actor EngineFaceActs: FaceActHandler {
             await engine.trust.publishPolicy(saved)
             return try Self.committed(saved)
         case .setInnerLifeEnabled(let enabled):
-            guard let runtime = engine.cognition else { throw Self.failure("body_unavailable", "This root has no resident mind.") }
+            guard let runtime = engine.cognition else { throw Self.failure("body_unavailable", "There is no running mind: it starts when setup finishes.") }
             let result = await engine.cognitionView.setInnerLifeEnabled(enabled, runtime: runtime, contextFlow: engine.contextFlow)
             return .result(.object(["enabled": .bool(result.state.enabled), "contextFlowReady": .bool(result.contextFlowReady)]))
         case .setContextFlowMode(let name):

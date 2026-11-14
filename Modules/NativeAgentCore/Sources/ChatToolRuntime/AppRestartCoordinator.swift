@@ -179,7 +179,7 @@ public actor AppRelaunch {
         // Lock cooldown-read through stamp-write so concurrent requests cannot both restart the app.
         let result: JSONValue
         do {
-            result = try await SwiftNativePersistenceCore.withFileLock(stampURL) {
+            result = try await SwiftNativePersistenceCore.withFileLock(stampURL, life: turn?.enclosingCall) {
                 guard !Task.isCancelled else { return await Self.stopped() }
                 // Read the clock under the lock so elapsed time includes any wait for a prior restart.
                 let requestedAt = Date()

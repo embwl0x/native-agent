@@ -149,6 +149,15 @@ public actor SwiftNativeMacControl: MacControlClient {
         capability: MacInjectionCapability?,
         turn: Turn, context: MacOperationContext
     ) async throws -> MacControlResult {
+        // The apps this operation's Accessibility messages go to are what it waits on while Accessibility holds it. They stay attached until
+        // the call's watch ends, so waits after this dispatch returns (a wait's observers) still have them as owner.
+        if context.axTargets == nil, let watch = context.life {
+            let targets = MacAXTargets()
+            _ = watch.attach(targets.life)
+            return try await context.holding(\.axTargets, targets) { context in
+                try await dispatchCore(action: action, body: rawBody, capability: capability, turn: turn, context: context)
+            }
+        }
         if axSession(context: context) == nil {
             #if canImport(ApplicationServices) && os(macOS)
             let read: any MacAXElementSource = suppliedAccessibilitySource is SystemMacAXElementSource

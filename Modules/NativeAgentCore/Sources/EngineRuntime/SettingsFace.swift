@@ -44,11 +44,13 @@ extension NativeAgentEngine {
             throw PartCallError(code: "settings_unavailable", message: "Settings are not mounted for this agent. Open the Mac app and read Settings again.")
         }
         var settings: [QuietSetting.ReadSnapshot] = []
+        var search: QuietSetting.Descriptor?
         for setting in try QuietSettings.settings(forPage: "settings", host: host) {
             try Task.checkCancellation()
+            // The search service draws its own field and Find under Advanced, read from the search owner.
+            if setting.id == Self.searchService { search = setting.descriptor; continue }
             settings.append(try await setting.snapshot(host: host))
         }
-        let search = try QuietSettings.settings(forPage: "desk", host: host).first { $0.id == Self.searchService }?.descriptor
         return SettingsSnapshot(settings: settings, search: search, extras: host.settingsFaceExtrasSnapshot())
     }
 

@@ -15,7 +15,7 @@ import Transcripts
 import TrustCenter
 import ProviderRouting
 import Context
-// Blueprint: | `ChatOrchestration+ToolDispatch.swift` | Offered-call admission; deadlines end only the wait |
+// Blueprint: | `ChatOrchestration+ToolDispatch.swift` | Offered-call admission; a call found dead ends as Stop ends it |
 
 extension SwiftNativeTurnEngine {
     // MARK: - Per-iteration dispatch shared by both loops
@@ -653,9 +653,7 @@ extension SwiftNativeTurnEngine {
         if Self.dispatchCancelSignalled(cancelFlagPath) {
             return (prepared, Self.cancelledToolResult(Self.spokenName(prepared)), true)
         }
-        let nanos = ToolDispatchDeadline.timeoutNanos(toolName: prepared.ranCall.tool,
-            input: prepared.ranCall.input, surface: surface)
-        let seconds = Double(nanos) / 1_000_000_000
+        let declared = CallBound.declaredSeconds(input: prepared.ranCall.input)
         let outcomes = ContinuationOnce<Result<(PreparedToolCall, JSONValue, Bool), Error>>()
         let body = TurnBodyLifetime<(PreparedToolCall, JSONValue, Bool)>()
         // This subscription belongs to the actual body, not its response.
@@ -668,16 +666,18 @@ extension SwiftNativeTurnEngine {
                 }
             }
         }
-        // The deadline owns only the response. Its child retains the actual
-        // tool and journal until they settle, even after this waiter returns.
+        // An ended call (found dead, or past its own declared time) ends as Stop does: the body is
+        // cancelled and keeps its tool and journal until they settle, even after this waiter returns.
         let dispatch = Task {
-            let operation: @Sendable (OperationDeadlines) async throws -> (PreparedToolCall, JSONValue, Bool) = { deadlines in
+            let operation: @Sendable (OperationDeadlines, TurnDeadline?) async throws -> (PreparedToolCall, JSONValue, Bool) = { deadlines, call in
+                // The call's own bound rides on the turn it hands down, so a turn it starts reports its movement here.
+                let callTurn = turn.with(\.enclosingCall, call)
                 do {
                     return try await body.run {
                         defer { watcher?.cancel() }
                         let actual = await Self.runSettlingDispatch(prepared: prepared, modelId: modelId, surface: surface,
                             personaID: personaID, fluidContextTurn: fluidContextTurn, tools: tools, progress: progress,
-                            imageSink: imageSink, cancelFlagPath: cancelFlagPath, turn: turn, work: work.with(\.deadlines, deadlines))
+                            imageSink: imageSink, cancelFlagPath: cancelFlagPath, turn: callTurn, work: work.with(\.deadlines, deadlines))
                         let safe = ChatSecretRedactor.redactValue(actual.1)
                         var payload: [String: JSONValue] = [
                             "invocationID": .string(prepared.invocationID), "callID": .string(prepared.pairedId),
@@ -704,14 +704,24 @@ extension SwiftNativeTurnEngine {
                 }
             }
             do {
-                let actual: (PreparedToolCall, JSONValue, Bool)
-                if nanos > 0 {
-                    actual = try await TurnDeadline.withThrowingDeadline(seconds: seconds, cancelWorkOnExpiry: false, deadlines: work.deadlines, operation)
-                } else { actual = try await operation(work.deadlines) }
+                // The turn shows a call that waits on something nothing can answer for, so the person can press Stop.
+                let actual = try await CallBound.run(name: Self.spokenName(prepared), declared: declared, deadlines: work.deadlines,
+                    enclosing: turn.enclosingCall, notice: { text in await progress?(.notice(kind: "call.stalled", text: text)) }, operation)
                 outcomes.resume(.success(actual))
-            } catch is TurnDeadline.DeadlineExceeded {
-                outcomes.resume(.failure(ToolDispatchDeadline.timeoutError(tool: Self.spokenName(prepared), seconds: seconds)))
-            } catch { outcomes.resume(.failure(error)) }
+            } catch {
+                guard var receipt = CallBound.ended(error, name: Self.spokenName(prepared), nextCall: Self.dispatchReceiptCall(turn: turn)) else {
+                    outcomes.resume(.failure(error))
+                    return
+                }
+                // Found dead or past its own declared time: ended as Stop ends it, the body keeping its own settlement.
+                body.cancel()
+                if case .object(var fields) = receipt {
+                    fields["invocationID"] = .string(prepared.invocationID)
+                    fields["callID"] = .string(prepared.pairedId)
+                    receipt = .object(fields)
+                }
+                outcomes.resume(.success((prepared, receipt, true)))
+            }
         }
         if Self.dispatchCancelSignalled(cancelFlagPath) {
             body.cancel()

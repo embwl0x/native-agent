@@ -114,6 +114,9 @@ public struct MemoryCuration: Sendable {
                 }
             }
         }
+        if let value = input["pinned"], value != .null, curationBool(input, "pinned") == nil {
+            return curationRefusal("pinned must be true or false; omit it to list pinned and unpinned memories together.")
+        }
         let offset = max(0, curationInt(input, "offset") ?? 0)
         let limit = min(100, max(1, curationInt(input, "limit") ?? 50))
         let sort = curationString(input, "sort") ?? "newest_first"
@@ -143,7 +146,8 @@ public struct MemoryCuration: Sendable {
         let listing: (records: [MemoryRecord], total: Int, nextOffset: Int)
         do {
             listing = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot).curationPage(
-                archived: status == "archived", kind: curationString(input, "kind"), surface: surface, persona: persona,
+                archived: status == "archived", kind: curationString(input, "kind"), pinned: curationBool(input, "pinned"),
+                surface: surface, persona: persona,
                 newestFirst: sort == "newest_first", afterKey: cursor?.key, offset: offset, limit: limit
             )
         } catch {

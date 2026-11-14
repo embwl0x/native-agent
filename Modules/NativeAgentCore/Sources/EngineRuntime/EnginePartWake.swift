@@ -168,27 +168,27 @@ actor EnginePartWake {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         let reading = PersonPresence.read(dataRoot: dataRoot)
         guard let transition = reading.transition else { return }
-        await NativeAgentEngine.cognitionRuntime(for: dataRoot).rhythmPresenceChanged(here: transition.here)
+        await NativeAgentEngine.cognitionRuntime(for: dataRoot)?.rhythmPresenceChanged(here: transition.here)
         guard lifecycle == epoch, !Task.isCancelled else { return }
         // A newer callback can run during suspension; never overwrite its receipt with an older reading.
         if let current = PersonPresence.read(dataRoot: dataRoot).transition {
             postPresence(current, payload: ["idle_seconds": .double(idle)], dataRoot: dataRoot)
         }
-        await NativeAgentEngine.cognitionRuntime(for: dataRoot).carriedPresenceChanged()
+        await NativeAgentEngine.cognitionRuntime(for: dataRoot)?.carriedPresenceChanged()
     }
 
     private func phonePresence(source: String?, at: Date?, dataRoot: URL, epoch: UUID) async {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         let reading = PersonPresence.read(dataRoot: dataRoot)
         if let transition = reading.transition {
-            await NativeAgentEngine.cognitionRuntime(for: dataRoot).rhythmPresenceChanged(here: transition.here)
+            await NativeAgentEngine.cognitionRuntime(for: dataRoot)?.rhythmPresenceChanged(here: transition.here)
         }
         guard lifecycle == epoch, !Task.isCancelled else { return }
         let current = PersonPresence.read(dataRoot: dataRoot)
         if source == "motion", let at, let transition = current.transition, transition.here == false, transition.since == at {
             postPresence(transition, payload: ["source": .string("phone motion")], dataRoot: dataRoot)
         }
-        await NativeAgentEngine.cognitionRuntime(for: dataRoot).carriedPresenceChanged()
+        await NativeAgentEngine.cognitionRuntime(for: dataRoot)?.carriedPresenceChanged()
     }
 
     /// Presence signals the parts with source evidence and posts a world happening. The transition alone owns the happening's words and
@@ -226,11 +226,12 @@ actor EnginePartWake {
     private func awake(_ awake: Bool, dataRoot: URL, epoch: UUID) async {
         guard lifecycle == epoch else { return }
         let here = awake ? PersonPresence.read(dataRoot: dataRoot).transition?.here : nil
-        await NativeAgentEngine.cognitionRuntime(for: dataRoot).rhythmAwakeChanged(awake: awake, here: here)
+        await NativeAgentEngine.cognitionRuntime(for: dataRoot)?.rhythmAwakeChanged(awake: awake, here: here)
     }
 
-    func stop() async {
-        stopped = true
+    /// Quit stops for good. A mind closing (`forGood: false`) stops and joins the same work, and the next mind's start registers again.
+    func stop(forGood: Bool = true) async {
+        if forGood { stopped = true }
         lifecycle = nil // Close admission before cancelling any resident work.
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         observers.removeAll()
@@ -269,7 +270,7 @@ actor EnginePartWake {
                 }
             }
         }
-        await NativeAgentEngine.cognitionRuntime(for: dataRoot).carriedSignal(signal, payload: payload, suppressing: echoes)
+        await NativeAgentEngine.cognitionRuntime(for: dataRoot)?.carriedSignal(signal, payload: payload, suppressing: echoes)
         await deliver(signal, only: only, except: except, payload, dataRoot: dataRoot, epoch: epoch)
     }
 

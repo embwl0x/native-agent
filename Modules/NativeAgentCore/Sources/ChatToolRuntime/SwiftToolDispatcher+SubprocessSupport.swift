@@ -26,9 +26,10 @@ extension SwiftToolDispatcher {
             self.stderrBuffer = stderrBuffer
             process.standardOutput = stdout
             process.standardError = stderr
-            let stdoutDrain = try ProcessPipeDrain(handle: stdout.fileHandleForReading) { stdoutBuffer.append($0) }
+            // Output is life of the call waiting on this process.
+            let stdoutDrain = try ProcessPipeDrain(handle: stdout.fileHandleForReading) { stdoutBuffer.append($0); process.life?.moved() }
             do {
-                stderrDrain = try ProcessPipeDrain(handle: stderr.fileHandleForReading) { stderrBuffer.append($0) }
+                stderrDrain = try ProcessPipeDrain(handle: stderr.fileHandleForReading) { stderrBuffer.append($0); process.life?.moved() }
             } catch {
                 stdoutDrain.stopAndWait()
                 throw error

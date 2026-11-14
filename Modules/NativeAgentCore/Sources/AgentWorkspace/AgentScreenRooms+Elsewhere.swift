@@ -19,9 +19,11 @@ package enum ThoughtWords: Sendable {
 
     package static func last(on kind: String, dataRoot: URL, now: Date) async -> ThoughtWords? {
         do {
-            let thoughts = try await Attention.thoughts(dataRoot: dataRoot, now: now)
-            var gap: String?
-            for thought in thoughts.reversed() {
+            let thoughts = try await Attention.thoughtsRead(dataRoot: dataRoot, now: now)
+            // A thought that will not fold may be a later one of this class: named, never silently passed over.
+            var gap: String? = thoughts.unreadable.isEmpty ? nil
+                : "Thought words unavailable: " + thoughts.unreadable.map(\.words).joined(separator: " ")
+            for thought in thoughts.experiences.reversed() {
                 guard let body = thought.thought, !body.kind.isEmpty else {
                     return .unavailable("Thought words unavailable: " + thought.id + " has no readable class.")
                 }
@@ -510,15 +512,21 @@ extension AgentScreen {
         }
         do {
             var window: [(at: Date, thought: Experience)] = []
-            for thought in try await Attention.thoughts(dataRoot: dataRoot, now: now) {
+            let read = try await Attention.thoughtsRead(dataRoot: dataRoot, now: now)
+            for thought in read.experiences {
                 guard let at = NativeTimestampFormat.parseISO8601FractionalFirst(thought.at) else {
                     return (nil, unavailable("thought " + thought.id + " has an unreadable birth time."))
                 }
                 if at > since, at <= now { window.append((at, thought)) }
             }
-            guard let newest = window.last else { return (nil, nil) }
+            // Each thought in the window that will not fold is named beside the ones that do.
+            let unreadable = read.unreadable.filter { record in
+                NativeTimestampFormat.parseISO8601FractionalFirst(record.at).map { $0 > since && $0 <= now } ?? true
+            }
+            let named = unreadable.isEmpty ? nil : unavailable(unreadable.map(\.words).joined(separator: " "))
+            guard let newest = window.last else { return (nil, named) }
             let words = await ThoughtWords.read(newest.thought, dataRoot: dataRoot)
-            return (ThoughtLine(at: newest.at, outcome: newest.thought.outcome?.status, words: words, count: window.count), nil)
+            return (ThoughtLine(at: newest.at, outcome: newest.thought.outcome?.status, words: words, count: window.count), named)
         } catch { return (nil, unavailable(error.localizedDescription)) }
     }
 
@@ -711,7 +719,8 @@ extension AgentScreen {
         }
         do {
             let store = ExperienceStore.at(dataRoot)
-            let born = try await store.born(kinds: [.act], after: since, limit: Int.max)
+            let read = try await store.born(kinds: [.act], after: since, limit: Int.max)
+            let born = read.experiences
             let subjects = Array(Set(born.filter { $0.outcome?.effects == .occurred }.flatMap(\.cause)))
             var dispatchUnreadable = 0
             var mindActs: Set<String> = []
@@ -736,6 +745,8 @@ extension AgentScreen {
                 if !failures.contains(named) { failures.append(named) }
             }
             if dispatchUnreadable > 0 { gap(unavailable("\(dispatchUnreadable) closing dispatch rows are unreadable.")) }
+            // An act that will not fold is named by id with why; the readable acts are still read.
+            for record in read.unreadable { gap(unavailable(record.words)) }
             for act in born {
                 guard let outcome = act.outcome, outcome.effects == .occurred else { continue }
                 do {

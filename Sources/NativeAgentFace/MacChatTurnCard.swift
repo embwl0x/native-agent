@@ -155,7 +155,7 @@ struct MacChatTurnCard: View {
                     MacChatTurnLongStepLine()
                         .padding(.leading, 12 + NativeAgentSpacing.sm)
                         .padding(.vertical, 2)
-                    Text("This step takes a while. Nothing is stuck.")
+                    Text("This step is taking a while. Stop ends it.")
                         .font(NativeAgentFont.tag)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .lineLimit(1)

@@ -31,7 +31,8 @@ Read the page for the current arguments and applicable action warnings.
 Successful memory reads report `count`, an exact `total` or `capped: true`,
 and `has_more` with `next_offset`. `memory.list` keeps its exact total and
 sort-stamped cursor (`next_after_id`); only emitted cursors and the current
-`newest_first|oldest_first`, `active|archived` vocabulary are accepted. A bare
+`newest_first|oldest_first`, `active|archived` vocabulary are accepted, and
+`pinned: true|false` keeps only the pinned or only the unpinned. A bare
 ID or old name is refused with a fresh-page remedy. Recall search follows `read_more` with the same
 query and k. Its offset walks ranked, disclosed candidates, including rows
 the relevance judgment rejected. A bounded page can therefore be empty and
@@ -833,7 +834,33 @@ prediction failure, or cold/incomplete index refuses discovery with its remedy.
 MemoryStorage owns `memory.sqlite`'s `kg_*` schema. Graph wakes carry only memory
 IDs; `SwiftNativeKnowledgeGraphIndexer` reads canonical facts in its write transaction.
 `SwiftNativeKnowledgeGraphIndexer+EntityExtraction.swift` extracts
-deterministically without approving memories. The graph also includes Studio's
+deterministically without approving memories. A name is typed only by what its
+text says of it: a known person (the person, the agent), one of the agent's
+contacts, the name tagger's reading of the sentence, or a file's own extension;
+familiar names are found even where the tagger misses them, but no fixed table
+assigns their kind, and a name with no stated kind is a concept. The contacts
+(`agents/peers.json`, read once per index pass beside the profile, plus the
+app-delegated builders Claude and Codex) are agents: a contact's name, handle,
+endpoint host as words and its name's distinctive first word ("Grok" of "Grok
+Bot": one contact's alone, not a known name or stopword) all resolve to that
+contact's one `agent` entity under its own name; a row associated with another
+contact is that contact. That entity carries the contact's id (`contact_id`,
+`peer:<id>`, derived again on every pass; a name two contacts share links
+neither): the graph page's entity shows it as a Contact row that opens the
+contact and its conversations (`page:home/agent/<id>`), and
+`page:knowledge/contact:<id>` opens the contact's entity; the contact's own read
+(`agent_read`) carries that link as `graph_entity` when the graph holds the
+entity. Names a fact explicitly states are one ("A, aka / also
+known as / known as / also called B", "A is B", "A is X's B", "A is X's name for
+B", "X's B is named / called / known as A", "B, named / called A", "B goes by A";
+never a parenthesis or a list) are one entity: indexing reads every fact's
+stated aliases before typing any, the group keeps a known person's name (else a
+contact's, else the name stated first) and one type decided once (a person if it
+holds a known person, an agent if it holds a contact, else the first stated kind
+of any of its names, else a concept), the entity stores the others in
+`aliases_json` (the person's hub keeps them among its own aliases), and a later
+fact naming only an alias meets it. A new fact that states a new alias rederives
+the graph, and the contacts are part of each fact's fingerprint. The graph also includes Studio's
 journal works, creators and relations (`studio-journal`, `studio_entry_ids` citations),
 DreamREMCycle's GROWTH-eviction summaries with source locators (`rem-growth-eviction`),
 and independently owned entities. Memory rebuilds rederive their own current

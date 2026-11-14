@@ -180,8 +180,10 @@ Action preview follows the [preview contract](ONE_DOOR.md#one-door-every-action)
 checks and adds a ledger row: the call's identity and outcome, never its
 answer, which the script receives and returns as it chooses (the
 [receipts law](ONE_DOOR.md#authority-and-receipts)). A call that raises a card waits for the answer
-and continues or receives the refusal; a blocked action stops the script
-without undoing earlier calls. The script has no direct network or
+and continues or receives the refusal. A blocked action throws to the
+script like any failure: caught, the script goes on and ends with its own
+outcome; uncaught, it stops the script there, with the blocked call's own
+explanation at the top, without undoing earlier calls. The script has no direct network or
 filesystem API; it cannot call every action merely because the action exists.
 
 ### Abilities
@@ -637,11 +639,13 @@ connectors and agent communication under the saved policy.
   and `next_body_offset` still count the stored UTF-16 text, including the title.
   Read `access` receipts confirm automation and the read, with no `write` key;
   write checks belong only to create, update and delete receipts.
-  Notes creation resolves one destination before writing: an omitted or blank
-  folder uses Notes' default account's default folder; a named folder must match
-  exactly one folder. An unavailable destination never selects another route.
-  A missing named folder returns `folder_not_found` and `available_folders` from
-  folders' own names, without reading their containers or creating a note.
+  Notes creation with an omitted or blank folder makes the note with no
+  location, so Notes puts it where it puts every new note (its default
+  account's default folder); a named folder must match exactly one folder and is
+  never swapped for the default. A missing named folder returns `folder_not_found`
+  and `available_folders` from folders' own names, without reading their
+  containers or creating a note. `notes.folder_create {name}` makes a folder in
+  the default account, or returns the folder already named that in that account.
   Notes reads exclude Recently Deleted by matching note ids to folders' own note
   lists and names. An unreadable folder or note is a named `gaps` entry while readable siblings
   return with `status: partial` and `total_is_complete: false`; an empty partial
@@ -974,7 +978,7 @@ approval and has no expiry timer. Explicit user blocks, origin authentication,
 macOS grants and hard domain refusals remain authoritative. **macOS privacy
 permission resets always ask the owner first.**
 
-A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
+A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. A note from your agent to you (`chat.post`) is never held, whoever steered the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
 Agents enabled in Trust → Connected agents carry the owner's authority on
 authenticated turns; ordinary Trust and domain checks still apply.
 

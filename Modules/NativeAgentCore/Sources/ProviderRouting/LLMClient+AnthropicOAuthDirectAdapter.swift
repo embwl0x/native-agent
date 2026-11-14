@@ -215,31 +215,42 @@ public final class AnthropicOAuthTransport: LLMTransport {
         return system?.contains(AnthropicOAuthTransport.textToolProtocolHeader) == true ? Self.endingCallBlock(stream, turn: call.turn) : stream
     }
 
-    /// The app ends a text-lane call block. The provider's stop mark ends a `<function_calls>` block; a call written outside one has no mark
-    /// coming, and a model that is never stopped writes it again until the output runs out. So the reply ends where that call does, and the
-    /// rest of the stream is let go.
+    /// The app ends a text-lane reply. It reads the reply as it arrives and stops passing text on where its call block closes, or where a
+    /// call written outside a block ends. A stop mark cannot do this: it is matched on bytes, so it also fires on the same letters inside
+    /// a call's own content. Past the end the model is let finish, so the provider's own ending and the usage it carries still arrive;
+    /// a model that keeps writing instead is let go.
     package static func endingCallBlock(
         _ source: AsyncThrowingStream<LLMMessageStreamEvent, Error>, turn: Turn?
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 var text = ""
+                // Units written past the end, once the reply has ended.
+                var past: Int?
                 do {
                     for try await event in source {
                         guard case .textDelta(let delta) = event else { continuation.yield(event); continue }
-                        text += delta
-                        if let end = ToolCallParser.bareCallEnd(in: text, appended: delta.count) {
-                            // Cut in the units the end is measured in: a combining mark after the call must not take its last character.
-                            let kept = delta.utf16.dropLast(max(0, text.utf16.count - end))
-                            if !kept.isEmpty { continuation.yield(.textDelta(String(decoding: Array(kept), as: UTF16.self))) }
-                            TurnTraceBus.fireFromContext(kind: "provider.callBlockEnded", payload: .object(["units": .int(Int64(end))]),
-                                turn: turn)
-                            break
+                        if let written = past {
+                            // A model that stops at its block's end says so within a few characters; one that goes on is writing again.
+                            past = written + delta.utf16.count
+                            if written + delta.utf16.count > 200 { break }
+                            continue
                         }
-                        continuation.yield(event)
+                        text += delta
+                        guard let end = ToolCallParser.replyEnd(in: text, appended: delta.count) else { continuation.yield(event); continue }
+                        // Cut in the units the end is measured in: a combining mark after the end must not take the character before it.
+                        let over = max(0, text.utf16.count - end)
+                        let kept = delta.utf16.dropLast(over)
+                        if !kept.isEmpty { continuation.yield(.textDelta(String(decoding: Array(kept), as: UTF16.self))) }
+                        TurnTraceBus.fireFromContext(kind: "provider.callBlockEnded", payload: .object(["units": .int(Int64(end))]), turn: turn)
+                        past = over
+                        if over > 200 { break }
                     }
                     continuation.finish()
-                } catch { continuation.finish(throwing: error) }
+                } catch {
+                    // The reply was whole before the stream failed.
+                    if past == nil { continuation.finish(throwing: error) } else { continuation.finish() }
+                }
             }
             continuation.onTermination = { _ in task.cancel() }
         }

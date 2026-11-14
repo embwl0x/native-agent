@@ -376,23 +376,32 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    @discardableResult public func clearQueued(id: String) throws -> Int {
+    /// `onlyHeld` names the one send held for the Mac to withdraw (the operation the caller read before it acted), leaving every other queued message,
+    /// including a newer operation's, untouched.
+    @discardableResult public func clearQueued(id: String, onlyHeld held: String? = nil) throws -> Int {
         try locked {
             var rows = try load()
             guard let i = rows.firstIndex(where: { $0.id == id }) else { return 0 }
-            let count = rows[i].queued?.count ?? 0
+            let operation = rows[i].operationID
+            let onlyHeld = held != nil
+            let withdrawn = Set((rows[i].queued ?? []).filter { held == nil || ($0.id == held && $0.waitingForMac == true) }.map(\.id))
+            let count = withdrawn.count
             // A reserved message is withdrawn too: its sender's begin then refuses.
-            let reserved = rows[i].queueReservation != nil
-            if rows[i].queued?.contains(where: { $0.id == rows[i].operationID }) == true,
-               rows[i].sendEvidence["reason"] == .string("mac_busy") {
+            let reserved = !onlyHeld && rows[i].queueReservation != nil
+            if withdrawn.contains(operation), rows[i].sendEvidence["reason"] == .string("mac_busy") {
                 rows[i].receipt = .object(["status": .string("cancelled"), "sent": .bool(false), "terminal": .bool(true),
                     "detail": .string("The waiting message was withdrawn. Nothing was sent.")])
                 rows[i].stop = .init(state: "stopped", operationID: rows[i].operationID, at: Date(),
                     detail: "The waiting message was withdrawn. Nothing was sent.")
                 try Self.absorbExchange(into: &rows[i], file: fileURL)
             }
-            rows[i].queued = nil
-            rows[i].queueReservation = nil
+            if onlyHeld {
+                rows[i].queued?.removeAll { withdrawn.contains($0.id) }
+                if rows[i].queued?.isEmpty == true { rows[i].queued = nil }
+            } else {
+                rows[i].queued = nil
+                rows[i].queueReservation = nil
+            }
             if count > 0 || reserved { rows[i].updatedAt = Date(); try save(rows) }
             return count
         }
@@ -426,6 +435,23 @@ public struct AgentConversationStore: Sendable {
             // Only the route owner can attest the reply.
             noteReplies(was: identity, now: rows[i], from: rows[i].agent)
             return rows[i]
+        }
+    }
+
+    /// A contact moved to a new route by its reconnect carries its conversations with it: each keeps its place, history and queue, and is now
+    /// on the new route. The old route's remote session means nothing to the new one, so the next send opens a fresh one there.
+    public func moveRoute(from old: AgentPeerContact, to new: AgentPeerContact) throws {
+        let was = Self.routeFingerprint(old), now = Self.routeFingerprint(new)
+        guard was != now else { return }
+        try locked {
+            var rows = try load()
+            var moved = false
+            for i in rows.indices where rows[i].agent == "peer:" + new.id && rows[i].peerRouteFingerprint == was {
+                rows[i].peerRouteFingerprint = now
+                rows[i].conversationID = nil
+                moved = true
+            }
+            if moved { try save(rows) }
         }
     }
 

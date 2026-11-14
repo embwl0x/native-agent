@@ -70,6 +70,14 @@ private struct HazeControlTint: ViewModifier {
     }
 }
 
+extension View {
+    /// A segmented switch on in the quiet neutral every switch on the Mac wears, never the system accent; AppKit's selected segment takes it
+    /// directly, since tint does not reach it.
+    func neutralSegments() -> some View {
+        tint(FaceSwitchTint.on).background { SegmentBezelTint(color: NSColor(FaceSwitchTint.on)) }
+    }
+}
+
 /// Touch only NSSegmentedControl so mounting behind another control remains inert.
 private struct SegmentBezelTint: NSViewRepresentable {
     var color: NSColor

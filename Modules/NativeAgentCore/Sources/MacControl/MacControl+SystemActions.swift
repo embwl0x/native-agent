@@ -359,7 +359,10 @@ extension SwiftNativeMacControl {
             pid = current
         } catch let failure as MacMediaTarget.Failure { return failure.refusal.result(action: "media") }
         guard let player = NSRunningApplication(processIdentifier: pid), !player.isTerminated,
-              let bundle = player.bundleIdentifier else { return MacAppActGate.unavailable().result(action: "media") }
+              let bundle = player.bundleIdentifier else {
+            return MacAppActGate.unavailable("the Now Playing app with process \(pid) has quit or has no bundle identifier",
+                next: "Ask again for the current player").result(action: "media")
+        }
         try Task.checkCancellation()
         if let refusal = MacAppActGate.refusal(pid: pid, context: context) { return refusal.result(action: "media") }
         for event in events { try await CGEventSink().postNative(event, context: context) }
@@ -383,7 +386,8 @@ extension SwiftNativeMacControl {
             throw MacControlError.missingField("script")
         }
         guard let bundle = body["bundle_id"]?.stringValue, !bundle.isEmpty else {
-            return MacAppActGate.unavailable().result(action: "applescript")
+            return MacAppActGate.unavailable("this call names no bundle_id", next: "Give the bundle_id of the app the script drives")
+                .result(action: "applescript")
         }
         let args: JSONValue = .object(["bundle_id": .string(bundle), "script": .string(script),
             "read_only": body["read_only"] ?? .bool(false), "launch": body["launch"] ?? .bool(true)])

@@ -102,6 +102,10 @@ package enum MacAXAttributeRead {
     }
     /// IPC budget only, also used by observer teardown, which must not wake a renderer.
     static func prepareMessage(_ element: AXUIElement, context: MacOperationContext) -> Bool {
+        if let targets = context.axTargets {
+            var pid: pid_t = 0
+            if AXUIElementGetPid(element, &pid) == .success { targets.note(pid) }
+        }
         guard !Task.isCancelled else { return false }
         do { try context.evidence?.check() } catch { return false }
         if let deadline = context.readDeadline {

@@ -154,7 +154,8 @@ enum TrustLockCard {
             var detail = written, tone: PartFace.Tone? = nil
             if act == .lever {
                 switch levers {
-                case .success(let levers): detail = list(levers.filter { $0.asks }.map { $0.name })
+                // Where the standing allows an ask, the person's word decides one as their card does; where it does not, neither does.
+                case .success(let levers): detail = (level == "confirm" ? leverTruth + " " : "") + list(levers.filter { $0.asks }.map { $0.name })
                 case .failure(let error):
                     detail = "What is yours to decide could not be read: " + error.localizedDescription
                     tone = .failed
@@ -179,10 +180,15 @@ enum TrustLockCard {
         return locked + [PartFace.Row(id: "lock.rest", title: fold, detail: caseByCase, rows: runs + out + only)]
     }
 
+    /// Who decides what is the person's: their word in our conversation does, as their tap and their card do (`PersonAct`), so the agent does
+    /// it when asked and asks first only when it is its own idea.
+    static let leverTruth = "When you ask me for one of these, I do it. When it's my own idea, I ask you first:"
+
     /// The deciders that answer from a call's own input (where it came from, which limit it widens, which ability it keeps), by kind. True
     /// at every setting; their owners are named in the Trust doc.
     static let caseByCase = "A few things can still ask case by case: a request from another device, chat or agent; a change that widens "
-        + "my own limits; and keeping an ability, my turn program included."
+        + "my own limits, such as turning an app's Read or Write switch on, unless you asked me for it; and keeping an ability, my turn "
+        + "program included."
 
     /// Names in one sentence, as they are declared.
     private static func list(_ names: [String]) -> String {

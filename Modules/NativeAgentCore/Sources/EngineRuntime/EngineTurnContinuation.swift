@@ -1,4 +1,5 @@
 import Agents
+import AgentConversations
 import Experiences
 import AttentionRouting
 import BackgroundWork
@@ -377,14 +378,74 @@ public struct TurnContinuationRuntime: Sendable {
                 effects: .none, code: "approval_origin_unavailable")
         }
         try await runApprovalAdmission(sessionID: sessionID, envelope: envelope, prompt: prompt, turn: turn) { turn in
-            try await runApprovalFollowUp(sessionID: sessionID, envelope: envelope, prompt: prompt,
+            let response = try await runApprovalFollowUp(sessionID: sessionID, envelope: envelope, prompt: prompt,
                 fileAccess: fileAccess, turn: turn)
+            guard let route = redeliveryRoute(envelope, sessionID: sessionID) else { return }
+            // Keep one claim over turn and delivery; failed or uncertain sends must never trigger another model turn.
+            _ = try await settleReply(response: response, route: route, envelope: envelope, turn: turn, settlement: .approvalClaim)
         }
+    }
+
+    /// An answered card's continuation outside the person's Mac conversation. The card's turn is its authority: origin envelope, file-access
+    /// ceiling, request-only model binding and peer steering, as the approval follow-up carries them. A turn open there reads it; otherwise it runs
+    /// as that conversation's own hidden turn, and in a contact's conversation its answer is held for the contact's next call.
+    public func continueInteractionCard(sessionID: String, turn: Turn, prompt: String) async throws {
+        guard let envelope = turn.envelope else {
+            throw ToolFailureError("The card's continuation has no recorded origin. Nothing ran.", effects: .none, code: "card_origin_unavailable")
+        }
+        let fileAccess = turn.fileAccess ?? "auto"
+        try await runApprovalAdmission(sessionID: sessionID, envelope: envelope, prompt: prompt, turn: turn) { turn in
+            // Admitted, the follow-up is the card's resumed work: a failure from here is owed, never a second run of the turn. Stop still stops it.
+            func owe(_ what: String, _ error: any Error, lever: String) {
+                RepairOwed.owe(dataRoot, id: "card-followup:" + turn.run, kind: .message, operation: "card.followup:" + turn.run,
+                    owner: sessionID, words: what + error.localizedDescription, lever: lever)
+            }
+            let response: ChatResponse
+            do {
+                response = try await runApprovalFollowUp(sessionID: sessionID, envelope: envelope, prompt: prompt, fileAccess: fileAccess, turn: turn)
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                owe("The card's follow-up turn started but did not finish: ", error,
+                    lever: "Read what the follow-up did in its conversation before asking for anything again; the card does not run it twice.")
+                return
+            }
+            do {
+                if AgentBridgeCompletionRoute.Kind(surface: envelope.replyRoute.surface) == .callerResult {
+                    // A contact's answer is held for the contact's next call.
+                    guard response.terminalState == .completed, !response.isSilentCompletion else { return }
+                    let contacts = try AgentPeerStore(dataRoot: dataRoot).list()
+                        .filter { sessionID.hasPrefix(ChatSessionRetention.contactSessionPrefix(owner: $0.id)) }
+                    guard contacts.count == 1, let contact = contacts.first else {
+                        throw ToolFailureError("No one saved contact owns this conversation.", effects: .none, code: "card_contact_unavailable")
+                    }
+                    try await AgentContactHeldAnswer.hold(dataRoot: dataRoot, peer: contact, session: sessionID,
+                        deliveryID: "card:" + response.runId, response: response, client: engine.chatClient(profile: .bridge), turn: turn)
+                } else if let route = redeliveryRoute(envelope, sessionID: sessionID) {
+                    // The saved answer is the delivery ledger's: an unconfirmed send is redelivered from it, never answered again.
+                    let digest = CodexCompletionTranscriptEvidence.responseDigest(sessionId: sessionID, runId: response.runId,
+                        content: response.output, attachments: response.attachments ?? [])
+                    _ = try await settleReply(response: response, route: route, envelope: envelope, turn: turn,
+                        settlement: .durable(deliveryID: "card:" + response.runId, requestDigest: digest, notifyRequestedResult: false))
+                }
+            } catch {
+                owe("The card's answer is saved in its conversation but did not reach whoever asked: ", error,
+                    lever: "Deliver the saved answer through its door; do not run the card again.")
+            }
+        }
+    }
+
+    /// The route of a door that redelivers a reply itself (Telegram, Slack, the phone); nil for a door on this Mac or a caller's result.
+    private func redeliveryRoute(_ envelope: TurnEnvelope, sessionID: String) -> AgentBridgeCompletionRoute? {
+        let saved = envelope.replyRoute
+        let route = AgentBridgeCompletionRoute(surface: saved.surface, sessionId: sessionID,
+            destinationId: saved.destinationId, threadId: saved.threadId, sourceKey: saved.sourceKey,
+            replyTo: saved.replyTo, correlationId: saved.correlationId, requesterUserId: saved.requesterUserId)
+        return route.kind?.hasRedeliveryOwner == true ? route : nil
     }
 
     /// Every replayed call retains the card’s door, Trust, peer floor and bound steering.
     private func runApprovalFollowUp(sessionID: String, envelope: TurnEnvelope, prompt: String,
-                                     fileAccess: String, turn: Turn) async throws {
+                                     fileAccess: String, turn: Turn) async throws -> ChatResponse {
         let door = ConversationSurfaceProfile(envelope.surface)
         let response: ChatResponse
         if door.id == "bot" {
@@ -417,13 +478,7 @@ public struct TurnContinuationRuntime: Sendable {
             response = try await followUpRequest(message: prompt, sessionID: sessionID, fileAccess: fileAccess,
                 surface: envelope.surface, envelope: envelope, replyRoute: envelope.replyRoute).chat(on: client, parent: turn)
         }
-        // Keep one claim over turn and delivery; failed or uncertain sends must never trigger another model turn.
-        let saved = envelope.replyRoute
-        let route = AgentBridgeCompletionRoute(surface: saved.surface, sessionId: sessionID,
-            destinationId: saved.destinationId, threadId: saved.threadId, sourceKey: saved.sourceKey,
-            replyTo: saved.replyTo, correlationId: saved.correlationId, requesterUserId: saved.requesterUserId)
-        guard route.kind?.hasRedeliveryOwner == true else { return }
-        _ = try await settleReply(response: response, route: route, envelope: envelope, turn: turn, settlement: .approvalClaim)
+        return response
     }
 
     private func followUpRequest(message: String, sessionID: String?, fileAccess: String, surface: String,

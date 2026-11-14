@@ -192,6 +192,18 @@ extension KnowledgeGraphStore {
         }
     }
 
+    /// The entity that names one of the agent's contacts (its `contact_id`, `peer:<id>`), or nil when the graph holds none.
+    public static func contactEntityFromMemoryV2(memoryDir: URL, contactID: String) async throws -> String? {
+        try await withPreparedPool(memoryDir: memoryDir) { pool in
+            try await pool.read { db in
+                try String.fetchOne(db, sql: """
+                    SELECT id FROM kg_entities WHERE json_extract(metadata_json, '$.contact_id') = ?
+                    ORDER BY mention_count DESC LIMIT 1
+                    """, arguments: [contactID])
+            }
+        }
+    }
+
     /// Only a successfully absent entity is omitted; source faults fail the batch.
     public static func entitiesFromMemoryV2(
         memoryDir: URL, ids: [String]

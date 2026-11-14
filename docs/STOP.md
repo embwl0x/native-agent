@@ -132,7 +132,7 @@ from running to exactly one terminal state, written at settlement:
 
 - **done**: the effect completed;
 - **stopped**: Stop ended it; the record keeps what it produced or sent
-  ("sent to Grok; any answer stays in that chat");
+  ("sent to the app's chat; any answer stays in that chat");
 - **failed**: it broke; the record says how.
 
 Native browser sign-in selects one outcome for callback, cancellation, launch
@@ -300,14 +300,19 @@ final saves. Closing admission prevents another recent-life provider call;
 judgments already returned finish their settlement.
 
 A tool dispatch owns its actual body across the deadline/Stop race. The first
-response stays selected. Its response deadline ends only the wait: it never
-cancels a write or joins a body that has not returned. The original body keeps
-its checkpoint until actual exit, records the real receipt through `settle`,
-and emits `tool.dispatch.settled` with the invocation/call IDs. A late receipt
-is evidence, not a replacement response or another dispatch. Missing completion
-stays unknown; Stop requests cancellation without asserting effects stopped.
-The active-work response clock still renews on progress and pauses for human
-waits, but supplies no downstream effect budget. Practice keep turns retain
+response stays selected. A call whose wait is found dead or not answering, or
+that passes its own declared time, is Stopped as one call: the body is
+cancelled, the caller released without joining a body that has not returned,
+and the agent reads `reason:found_dead` or `reason:ran_out_of_time` with
+`effects:unknown` while the turn goes on. No call is ended by the app's clock. The
+original body keeps its checkpoint until actual exit, records the real receipt
+through `settle`, and emits `tool.dispatch.settled` with the invocation/call
+IDs. A late receipt is evidence, not a replacement response or another
+dispatch. Missing completion stays unknown; neither Stop nor the bound asserts
+effects stopped. A quiet call asks what it waits on whether it is alive, and
+a person's wait is never silence;
+[turn resilience](TURN_RESILIENCE.md#3-tool-dispatch-deadline)
+owns where it comes from and where nested calls take theirs. Practice keep turns retain
 their `TurnBodyLifetime` cancellation/join behavior; `TurnDeadline` owns their
 response verdict separately.
 

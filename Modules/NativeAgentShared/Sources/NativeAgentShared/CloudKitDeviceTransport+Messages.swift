@@ -393,13 +393,16 @@ extension CloudKitDeviceTransport {
         return delivered
     }
 
+    /// Clock-skew overlap kept behind every cursor.
+    public static let pullOverlap: TimeInterval = 30
+
     static func nextPullCursor(
         previousCursor: Date?,
         queryStartedAt: Date,
         safeRecordDate: Date?,
         halted: Bool
     ) -> Date? {
-        let overlap: TimeInterval = 30
+        let overlap = pullOverlap
 
         if halted {
             guard let safeRecordDate else { return previousCursor }

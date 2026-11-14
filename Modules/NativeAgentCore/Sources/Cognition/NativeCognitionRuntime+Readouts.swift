@@ -51,8 +51,9 @@ extension NativeCognitionRuntime {
         return substrate
     }
 
+    /// A read joins the opening the mind's owner started; it never opens the mind itself.
     public func observatoryDetail() async -> CognitiveObservatoryDetail {
-        await bootstrap()
+        await bootstrapTask?.value
         let inspectFixedAt = now()
         let organism = await organismKernel.refreshBodySchemaAndFrozenRead(
             await organismBodySample(at: inspectFixedAt), integratesChemistry: false,

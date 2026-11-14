@@ -38,7 +38,10 @@ extension ClaudeBridgeRuntime {
                 guard workLatch.claim() else { return }
                 self.writeJSON(conn, status: status, obj: obj)
             }
-            let runtime = host.cognition
+            guard let runtime = host.cognition else {
+                respond(409, ["status": "no_mind", "error": "The mind starts when setup finishes; there is no organism to debug yet."])
+                return
+            }
             if action == "reset" || action == "reset_continuity" {
                 let outcome = await runtime.resetOrganismContinuityChecked()
                 guard !Task.isCancelled else { return }

@@ -41,7 +41,7 @@ public extension MacEventSink {
 
     func send(key: MacKeyEvent, toPid pid: Int32? = nil, turn: Turn, context: MacOperationContext) async throws -> Bool {
         if let pid { return post(key: key, toPid: pid, turn: turn, context: context) }
-        if key.down { try await waitForPersonKeyboard(context: context) }
+        if key.down { try await requirePersonKeyboardFree() }
         guard !key.down || context.driver?.allowsEmission(context: context) == true else { return false }
         post(key: key, turn: turn, context: context)
         return true
@@ -67,22 +67,10 @@ public extension MacEventSink {
     }
 }
 
-private func waitForPersonKeyboard(context: MacOperationContext) async throws {
-    try await withThrowingTaskGroup(of: Void.self) { group in
-        group.addTask {
-            try await PersonOnlyWindows.waitForKeyboard()
-        }
-        group.addTask {
-            for await _ in await MacAttentionSessionStore.shared.driverChanges() {
-                guard context.driver?.allowsEmission(context: context) == true else {
-                    throw PersonOnlyWindows.MotorFailure(detail: "Mac driver authority ended while waiting for the person's keyboard.")
-                }
-            }
-            throw PersonOnlyWindows.MotorFailure(detail: "The Mac driver owner shut down while waiting for the person's keyboard.")
-        }
-        defer { group.cancelAll() }
-        _ = try await group.next()
-    }
+/// A global key never waits for the person: while the person's own window holds the keyboard the key would land in their text, so it is refused at once
+/// and nothing is typed. The agent's keys reach their target by that app being in front, never by waiting for the person to click away.
+private func requirePersonKeyboardFree() async throws {
+    try await PersonOnlyWindows.requireKeyboardFree()
     try Task.checkCancellation()
 }
 
@@ -221,9 +209,9 @@ public struct CGEventSink: MacEventSink {
     package func postNative(_ event: CGEvent, context: MacOperationContext) async throws {
         switch event.type {
         case .keyDown:
-            try await waitForPersonKeyboard(context: context)
+            try await requirePersonKeyboardFree()
             guard emitTrackedNative(event, context: context) else {
-                throw PersonOnlyWindows.MotorFailure(detail: "Key emission was refused after the keyboard hold ended; no key was posted.")
+                throw PersonOnlyWindows.MotorFailure(detail: "Key emission was refused; no key was posted.")
             }
         case .mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown,
              .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .leftMouseUp, .rightMouseUp, .otherMouseUp, .scrollWheel:

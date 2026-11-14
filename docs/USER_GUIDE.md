@@ -108,7 +108,9 @@ detail is its tooltip. Up/Down
 moves between rows, Tab reaches controls, Return opens the row or runs its primary
 action, and Space changes a switch. A field submits on Return. Right-click holds
 actions and Copy; ⌘C copies the current row, and ⌘F opens its local filter. Narrow
-pages put values and controls below the text. Destructive actions ask once.
+pages put values and controls below the text. Destructive actions ask once. A request's
+answer is its one filled button; Not now sits beside it, and Mark read, Archive and
+Dismiss are in its ⋯ menu.
 On the phone these are native grouped list rows, with swipe and long press for actions.
 
 Providers is one shared face: **Chat**, **Work**, **Mind**, **Accounts**, and **Catalog**.
@@ -1143,8 +1145,8 @@ from the read.
 Scripts can use `app.read`, `app.find`, `app.log` and the registry's
 actions, such as `app.inbox.archive(args)`. They have no direct file or
 network access. Each call is checked separately. A call that raises a card
-waits for your answer; a blocked action stops the script; earlier completed
-calls stay done.
+waits for your answer. A blocked action stops the script unless the script
+catches it and goes on; earlier completed calls stay done.
 
 Page reads are available in Safe. Ordinary setting changes require Work mode,
 Builder or Full Mac. The returned page states which controls the agent may
@@ -1421,14 +1423,31 @@ never promises something the gate does not do:
 | Reading and looking things up | On | On | On | On |
 
 “Changing what is yours to decide” lists the person's levers a card can carry,
-each by the name its action declares; “Only you can do these” lists the levers
-no card can carry: the agent's call to one is refused, at every standing. A
-lever added to the app appears in one of them without touching the card.
+each by the name its action declares, after one sentence: “When you ask me for
+one of these, I do it. When it's my own idea, I ask you first.” Your own words
+in the conversation decide one of these as your tap and your card do: when the
+agent's call quotes your request (`because`), those words name the change (they
+share a word with it, such as “trusted” with Trusted or “restore” with Restoring a
+backup), and they are found in your own message of the request it is acting on now (the message that started its
+turn, one you sent while it worked, or the one a card's answer continues), at
+your Mac, your paired phone or your own Telegram, the change is made with no
+card, any card still waiting for that same change is withdrawn as decided by
+your word, its receipt quotes you, and the
+consent record keeps your words. Words from a tool result, a web page, a file,
+another agent, a helper or the agent itself never count. Under Safe nothing asks,
+so nothing runs on your word either. “Only you can do these” lists the levers
+no card can carry: typing or reading a secret, matching a pairing code, choosing
+in a system panel, answering macOS's own prompt, words sent as yours, an
+approval's own action opened on the Mac, recovering a damaged Trust policy, and
+resetting who the agent is; the agent's call to one is refused, at every
+standing, and your word cannot do it for you. A lever added to the app appears
+in one of them without touching the card.
 Some things ask case by case, decided from the request itself rather than the
 standing, so they carry no lock; the fold says so in one sentence: a request
 from another device, chat or agent (who sent it, whether it is signed and
 trusted, or an untrusted agent steering the turn); a change that widens the
-agent's own limits (a setting raise or an allow-list addition); and keeping an
+agent's own limits (a setting raise, such as turning an app's Read or Write
+switch on, or an allow-list addition), unless you asked for it; and keeping an
 ability, the turn program included (by where the ability came from, the
 standing, and whether the person had turned it off).
 

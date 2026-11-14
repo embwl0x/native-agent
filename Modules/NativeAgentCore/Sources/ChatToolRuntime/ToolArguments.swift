@@ -392,6 +392,7 @@ extension ChatToolInvocation {
     package func macContext(dataRoot: URL) -> MacOperationContext {
         var context = macOperation ?? MacOperationContext(dataRoot: dataRoot)
         context.deadline = waitDeadline
+        context.life = deadlines.innermostCall
         context.observationMode = observationMode
         context.frameSource = frameSource
         context.handsBack = handsBack

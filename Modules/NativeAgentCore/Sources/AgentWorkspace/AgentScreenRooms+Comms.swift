@@ -10,7 +10,7 @@ extension AgentScreen {
 
     static let commsDestinations: [AgentWorkspaceDestination] = [
         .init(id: "notes", title: "Notes", summary: "Apple Notes: recent notes, find, read, add.",
-              tool: "notes.search", input: ["limit": .int(12)], tools: ["notes.create"]),
+              tool: "notes.search", input: ["limit": .int(12)], tools: ["notes.create", "notes.folder_create"]),
         .init(id: "contacts", title: "Contacts", summary: "Mac Contacts: someone's number or email.",
               tool: "contacts_search", searchField: "query", tools: ["contacts_create_or_update"]),
     ]

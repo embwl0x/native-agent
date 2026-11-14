@@ -343,7 +343,7 @@ final class BodyFaceServices {
         PersonOnlyWindows.updateRenderer(connection: report.connection, windows: report.windows.map { window in
             .init(number: window.number, frame: .init(x: window.frame.x, y: window.frame.y,
                 width: window.frame.width, height: window.frame.height))
-        }, keyHeld: report.windows.contains(where: \.keyHeld))
+        })
     }
 
     @concurrent private static func overlay(_ number: Int?, connection: UUID) async {

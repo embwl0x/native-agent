@@ -285,10 +285,11 @@ public final class FirstRunWelcomeTransaction {
         Then your reach: what you can touch on this Mac. Before you write it, read \
         app {page:"trust"}. Its "macOS grants" rows (row grant.<name>) are your live reach, in \
         the order a card asks for them. Raise exactly ONE card in this opening, for every such \
-        row that reads Not granted: request_interaction kind=permission, target privacy:<name> \
-        of the first such row, also_needed privacy:<name> of the rest of them in row order. The \
-        Automation rows (row grant.automation.<app>) stay off this card; ask for one of those in \
-        context, the first time you need that app. If every reach row is granted, raise no card.
+        row that does not read Granted: request_interaction kind=permission, target privacy:<name> \
+        of the first such row, also_needed the rest of them in row order: privacy:<name> for a \
+        grant row, and for an Automation row (row grant.automation.<app>) the applescript:<bundle_id> \
+        target its own actions name. Every app you read or write rides this one card. If every \
+        reach row is granted, raise no card.
 
         Say it in one or two sentences in your own voice: what the card turns on and what that \
         lets you do, close to "Allow these and I can read your calendar and see your screen; \

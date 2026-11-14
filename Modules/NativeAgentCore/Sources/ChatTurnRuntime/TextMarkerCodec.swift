@@ -99,11 +99,10 @@ struct TextMarkerCodec: Sendable {
         """
     }
 
-    /// Emit continuation guidance once per round using only the protocol's marker form.
+    /// Close each round's results with continuation guidance in the protocol's marker form. This is the protocol's own wire, written every time
+    /// a request encodes its history, so it is no compensation and leaves no receipt.
     func closeRound(_ carrier: inout String) {
         carrier += "\n\nIf work remains, send the next <function_calls> block and end at </function_calls>.\n"
-        TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P11"), "site": .string("TextMarkerCodec.swift:closeRound")]),
-            turn: turn)
     }
 
     // MARK: - Bounces
@@ -119,12 +118,11 @@ struct TextMarkerCodec: Sendable {
     static func systemLayout(
         baseSystem: String?,
         segments: SystemPromptSegments?,
-        context: TurnContext,
-        turn: Turn?
+        context: TurnContext
     ) throws -> (system: String, segments: SystemPromptSegments?) {
         let floorBlock = renderFloor(rows: try catalogSections(
             schemas: context.toolSchemas, names: context.toolsAvailable
-        ).floor, appDoor: context.toolSchemas.contains { $0.name == "app" }, turn: turn)
+        ).floor, appDoor: context.toolSchemas.contains { $0.name == "app" })
         guard let segments,
               let baseSystem,
               segments.reassembles(into: baseSystem) else {
@@ -201,11 +199,11 @@ struct TextMarkerCodec: Sendable {
         )
     }
 
-    /// Render through the canonical catalog; folded tools use action identity at the app door.
+    /// Render through the canonical catalog; folded tools use action identity at the app door. The floor is the protocol itself, laid out
+    /// on every request, so it is no compensation and leaves no receipt.
     private static func renderFloor(
         rows renderedRows: String,
-        appDoor: Bool,
-        turn: Turn?
+        appDoor: Bool
     ) -> String {
         let findLine = appDoor
             ? "open its page with app {\"page\": \"<page>\"} or find its action with app {\"find\": \"<what you want done>\"}."
@@ -213,8 +211,6 @@ struct TextMarkerCodec: Sendable {
         let gitLine = appDoor
             ? ""
             : "Do not ask for raw shell/git commands unless a shell action is explicitly listed."
-        TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P10"), "site": .string("TextMarkerCodec.swift:renderFloor")]),
-            turn: turn)
         return """
         \(AnthropicOAuthTransport.textToolProtocolHeader)
         - This provider request intentionally does not include provider-native tools. Do not infer that nothing can be called.

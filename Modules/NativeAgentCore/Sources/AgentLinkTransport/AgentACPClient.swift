@@ -21,7 +21,7 @@ public actor AgentACPClient {
         package var completed: Bool { stopReason == "end_turn" }
     }
     public enum Failure: String, Error, LocalizedError {
-        case unavailable, executableChanged, interrupted, appQuit, invalidResponse, timedOut, tooLarge, busy, sessionUnavailable
+        case unavailable, executableChanged, interrupted, appQuit, invalidResponse, timedOut, tooLarge, busy, sessionUnavailable, signInRequired
         case initializationTimedOut, sessionStartupTimedOut, modeSetupTimedOut
         public var errorDescription: String? {
             switch self {
@@ -31,6 +31,10 @@ public actor AgentACPClient {
                 its context.
                 """
             case .unavailable: "The other agent could not start. Check its installation and sign-in."
+            case .signInRequired: """
+                The other agent is not signed in to its own service, so it would not go on. The person signs it in once in its own app or terminal \
+                (for a command-line agent, its login command); then the conversation continues where it was.
+                """
             case .executableChanged: "The approved program changed or is missing. Review a fresh connection approval. Nothing ran."
             case .interrupted: "The other agent stopped before finishing. Do not resend automatically."
             case .appQuit: "The app quit before the other agent finished, which ended its turn. Nothing was resent."
@@ -116,6 +120,9 @@ public actor AgentACPClient {
     private var pipeReader: AgentACPPipeReader?
     private var deadline: Task<Void, Never>?
     private var deadlineGeneration = 0
+    /// The watch of the call the current turn serves, and the running program attached to it.
+    private var life: TurnDeadline?
+    private var lifeID: UUID?
     private var started = false
     private var closing = false
     private var tree: ProcessTreeSnapshot?
@@ -126,6 +133,8 @@ public actor AgentACPClient {
     private var prompting = false
     /// A written prompt belongs to the peer's turn; callers must not treat its later failure as a failed send.
     package private(set) var delivered = false
+    /// What the agent said in the current turn so far: a turn that ends in an error still shows the agent's own words.
+    package var said: String { text }
     private var active = false
     private var restoredHistory = false
     private var initialized: JSONValue?
@@ -141,33 +150,44 @@ public actor AgentACPClient {
     }
 
     /// Without a message, learn the advertised handshake and mode without sending a prompt.
+    /// No clock ends a turn: `life` is the watch of the call the turn serves. The agent's running program is attached to it as what the call
+    /// waits on, and every line the agent writes is life of the call, so a quiet agent is shown waiting and only its exit, Stop or a protocol
+    /// fault ends the turn. `capped` limits what a turn reads; a job's turn runs to its own end.
     package func turn(executable: String, arguments: [String], directory: URL,
               environment: [String: String], message: String?, peerCredential: String, mcpServers: [JSONValue] = [],
               line: AgentHostACP,
               conversationID: String? = nil,
               approvedExecutable: AgentACPExecutable? = nil,
               requireVerifiedRestore: Bool = false,
-              timeout: Duration? = .seconds(300), permission: @escaping Permission,
+              capped: Bool = true, life: TurnDeadline? = nil, named: String = "the other agent",
+              permission: @escaping Permission,
               update: @escaping Update = { _ in },
               sessionOpened: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> Reply {
         guard !active else { throw Failure.busy }
         guard !closing, failure == nil else { throw Failure.interrupted }
         if started { guard conversationID == sessionID else { throw Failure.sessionUnavailable } }
         active = true
-        defer { active = false; prompting = false; self.permission = nil; self.update = nil; self.peerCredential = nil }
+        defer {
+            active = false; prompting = false; self.permission = nil; self.update = nil; self.peerCredential = nil
+            if let lifeID { self.life?.detach(lifeID) }
+            self.life = nil; lifeID = nil
+        }
         text = ""; receivedBytes = 0; deniedPermission = false; restoredHistory = false; requiredMode = nil; delivered = false
-        bounded = timeout != nil
+        bounded = capped
         startupTimeout = .initializationTimedOut
         self.permission = permission
         self.update = update
         self.peerCredential = peerCredential
+        self.life = life
         do {
         let reply = try await withTaskCancellationHandler {
             try Task.checkCancellation()
             let initialized = try await handshake(executable: executable, arguments: arguments, directory: directory,
-                environment: environment, approvedExecutable: approvedExecutable, timeout: timeout ?? .seconds(300))
-            // Opening the session is bounded either way; nil leaves only the prompt unbounded.
-            arm(timeout ?? .seconds(300))
+                environment: environment, approvedExecutable: approvedExecutable, timeout: nil)
+            // What the call waits on from here is this running program: alive while its process group runs, dead once it has exited.
+            if let life, lifeID == nil, let group = OwnedProcessGroup.owner(processID) {
+                lifeID = life.attach(group.callLife(what: named))
+            }
             startupTimeout = .sessionStartupTimedOut
             let params: [String: JSONValue] = ["cwd": .string(directory.path), "mcpServers": .array(mcpServers)]
             var restored: JSONValue? = sessionID != nil && conversationID == sessionID ? .object([:]) : nil
@@ -198,6 +218,8 @@ public actor AgentACPClient {
                     } catch {
                         try Task.checkCancellation()
                         if let failure { throw failure }
+                        // Signing in continues this conversation; it is never a reason to abandon it.
+                        if (error as? Failure) == .signInRequired { throw error }
                         // Only -32601/-32602 prove recipe mismatch; other errors mean restoration failed.
                         if let refused = error as? Mismatch, [-32601, -32602].contains(refused.code) { throw refused }
                         throw Failure.sessionUnavailable
@@ -255,7 +277,6 @@ public actor AgentACPClient {
             guard let message else {
                 return Reply(sessionID: id, text: "", stopReason: "dry_run", continued: continued)
             }
-            if timeout == nil { deadlineGeneration += 1; deadline?.cancel(); deadline = nil }
             // Conservative boundary: any attempted prompt write makes delivery uncertain.
             prompting = true; delivered = true
             let response = try await request("session/prompt", ["sessionId": .string(id),
@@ -292,7 +313,7 @@ public actor AgentACPClient {
 
     /// Fresh spawns and retained exchanges verify the program; initialize must prove JSON-RPC 2.0, request identity and ACP 1.
     private func handshake(executable: String, arguments: [String], directory: URL, environment: [String: String],
-                           approvedExecutable: AgentACPExecutable?, timeout: Duration) async throws -> JSONValue {
+                           approvedExecutable: AgentACPExecutable?, timeout: Duration?) async throws -> JSONValue {
         if started, let approvedExecutable {
             do { try approvedExecutable.verify() } catch { throw Failure.executableChanged }
         }
@@ -337,8 +358,8 @@ public actor AgentACPClient {
                 } catch { await self?.fail(error) }
             }
         }
-        // Initialization needs its own 30-second bound, independent of the reply window.
-        arm(min(timeout, .seconds(30)))
+        // Only discovery's probe of an unknown program bounds its handshake; a turn's handshake waits on the program's life.
+        if let timeout { arm(min(timeout, .seconds(30))) }
         if initialized == nil { initialized = try await request("initialize", [
             "protocolVersion": .int(1), "clientCapabilities": .object([:]),
             "clientInfo": .object(["name": .string("nativeagent"), "version": .string("1")])]) }
@@ -456,21 +477,25 @@ public actor AgentACPClient {
 
     private func receive(_ value: JSONValue) async {
         guard failure == nil else { return }
+        // Every line the agent writes is life of the call its turn serves.
+        life?.moved()
         do {
             guard let object = value.objectValue, object["jsonrpc"] == .string("2.0") else { throw Failure.invalidResponse }
             receivedBytes += (try value.serializedData(pretty: false)).count
             guard !bounded || receivedBytes <= 8 * 1_048_576 else { throw Failure.tooLarge }
             if case .string(let method)? = object["method"] {
-                guard let params = object["params"]?.objectValue else { throw Failure.invalidResponse }
+                let params = object["params"]?.objectValue ?? [:]
                 if method == "session/update" {
-                    guard object["id"] == nil, params["sessionId"] == sessionID.map(JSONValue.string),
-                          let event = params["update"] else { throw Failure.invalidResponse }
+                    guard object["id"] == nil, let event = params["update"] else { throw Failure.invalidResponse }
+                    let ours = sessionID != nil && params["sessionId"] == sessionID.map(JSONValue.string)
                     guard prompting else {
-                        if [
+                        // Before the prompt only the session being restored replays history; news of a session not yet answered is not a fault.
+                        if ours, [
                             JSONValue.string("agent_message_chunk"),
                             .string("user_message_chunk")].contains(event.objectValue?["sessionUpdate"] ?? .null) { restoredHistory = true }
                         return
                     }
+                    guard ours else { throw Failure.invalidResponse }
                     if let requiredMode, event.objectValue?["sessionUpdate"] == .string("current_mode_update"),
                        event.objectValue?["currentModeId"] != .string(requiredMode) {
                         cancel(error: Failure.invalidResponse)
@@ -490,6 +515,7 @@ public actor AgentACPClient {
                     }
                     try handleRequest(method, id: id, params: params)
                 }
+                // A notification this client does not read (an agent's own extension, such as `_x.ai/…`) is not a fault.
                 return
             }
             guard case .int(let id)? = object["id"], let request = pending.removeValue(forKey: id) else {
@@ -497,6 +523,11 @@ public actor AgentACPClient {
             }
             if let error = object["error"] {
                 let detail = (try? error.serialize(pretty: false)) ?? ""
+                // ACP's "authentication required" (-32000), at any step (opening, restoring or answering): the agent is not signed in.
+                if error.objectValue?["code"] == .int(-32000) {
+                    complete(request, .failure(Failure.signInRequired))
+                    return
+                }
                 if !prompting {
                     let code: Int64? = if case .int(let code)? = error.objectValue?["code"] { code } else { nil }
                     let said: String = if case .string(let said)? = error.objectValue?["message"] { said } else { detail }

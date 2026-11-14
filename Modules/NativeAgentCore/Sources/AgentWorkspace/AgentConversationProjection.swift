@@ -234,8 +234,9 @@ public struct AgentConversationStop: Codable, Sendable, Equatable {
 }
 
 
-/// Bounded display history inside the routing bookmark. Never provider context, replay input or a replacement for the reply's owner. Experience settlement
-/// reads its retained reply/status as evidence; eviction supplies no acceptance.
+/// Bounded history inside the routing bookmark: shown as the conversation, and sent as the conversation by the one route that keeps none of its own
+/// (a host's local chat server). Never replay input or a replacement for the reply's owner. Experience settlement reads its retained reply/status as
+/// evidence; eviction supplies no acceptance.
 public struct AgentConversationExchange: Codable, Sendable, Equatable {
     public var lifeID: String?
     public var id: String

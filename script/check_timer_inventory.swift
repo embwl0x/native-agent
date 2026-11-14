@@ -119,33 +119,33 @@ func loadRules(_ path: URL) throws -> [Rule] {
     }
 }
 
-let arguments = CommandLine.arguments.dropFirst()
-var repo = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-var printCandidates = false
-var iterator = arguments.makeIterator()
-while let argument = iterator.next() {
-    switch argument {
-    case "--repo":
-        guard let value = iterator.next() else {
-            throw TimerInventoryError.usage("--repo requires a path")
-        }
-        repo = URL(fileURLWithPath: value).standardizedFileURL
-    case "--print-candidates": printCandidates = true
-    default: throw TimerInventoryError.usage("unknown argument: \(argument)")
-    }
-}
-
-let found = try occurrences(repo: repo)
-if printCandidates {
-    for item in found {
-        print("\(item.path):\(item.line)\t\(item.source)")
-    }
-    exit(0)
-}
-
-let manifest = repo.appendingPathComponent("script/timer_inventory.tsv")
+// Every failure, including a bad argument or a missing blueprint, ends as one error line and exit 1: an error left to escape
+// top-level code makes the `swift` interpreter crash and print its own stack dump.
 do {
-    let rules = try loadRules(manifest)
+    var repo = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    var printCandidates = false
+    var iterator = CommandLine.arguments.dropFirst().makeIterator()
+    while let argument = iterator.next() {
+        switch argument {
+        case "--repo":
+            guard let value = iterator.next() else {
+                throw TimerInventoryError.usage("--repo requires a path")
+            }
+            repo = URL(fileURLWithPath: value).standardizedFileURL
+        case "--print-candidates": printCandidates = true
+        default: throw TimerInventoryError.usage("unknown argument: \(argument)")
+        }
+    }
+
+    let found = try occurrences(repo: repo)
+    if printCandidates {
+        for item in found {
+            print("\(item.path):\(item.line)\t\(item.source)")
+        }
+        exit(0)
+    }
+
+    let rules = try loadRules(repo.appendingPathComponent("script/timer_inventory.tsv"))
     var counts = Array(repeating: 0, count: rules.count)
     for item in found {
         let matches = rules.indices.filter {

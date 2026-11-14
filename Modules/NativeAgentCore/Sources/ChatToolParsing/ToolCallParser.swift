@@ -315,29 +315,57 @@ package enum ToolCallParser {
         return (String(held[name]), input)
     }
 
-    /// Where the reply ends when its call stands outside a block. On the text wire a `<function_calls>` block is ended by its closing mark;
-    /// a call written with no block around it has no mark coming, so it is a block of one and the reply ends where the call does. Nil while
-    /// no complete call opens its own line outside a block. `appended` is how many characters just arrived: a call can only have completed
-    /// inside them, so text read before is not read again. The end is a UTF-16 offset, as marker text is measured.
-    package static func bareCallEnd(in text: String, appended: Int) -> Int? {
-        let tail = text.suffix(appended + 12)
-        guard tail.contains("</tool_use>") || tail.contains("</invoke>") else { return nil }
-        guard let first = framedCalls(text).first else { return nil }
+    /// Where a text-wire reply ends, read by the app as it arrives; nil while it has not ended. A `<function_calls>` block ends with its
+    /// closing mark. A call that opens its own line with no
+    /// block around it is a block of one and ends the reply where it ends: no closing mark is coming for it, and a model that is never
+    /// stopped writes it again until the output runs out. Every call is read through its JSON, so a mark inside one of its strings is
+    /// content, and so is a mark in prose that no block opened. `appended` is how many characters just arrived: a reply can only have
+    /// ended inside them, so text read before is not read again. The end is a UTF-16 offset, as marker text is measured.
+    package static func replyEnd(in text: String, appended: Int) -> Int? {
+        let tail = text.suffix(appended + 20)
+        guard ["</tool_use>", "</invoke>", "</function_calls>"].contains(where: tail.contains) else { return nil }
         let ns = text as NSString
-        guard !(unquotedProtocolText(text) as NSString).substring(to: first.0).contains("<function_calls") else { return nil }
-        // A call opens its own line. One written after other words on a line may be an example whose closing backtick has not arrived.
-        let line = ns.range(of: "\n", options: .backwards, range: NSRange(location: 0, length: first.0))
-        let lineStart = line.location == NSNotFound ? 0 : NSMaxRange(line)
-        guard ns.substring(with: NSRange(location: lineStart, length: first.0 - lineStart)).allSatisfy(\.isWhitespace) else { return nil }
-        let opened = ns.range(of: ">", range: NSRange(location: first.0, length: first.3 - first.0))
+        let unquoted = unquotedProtocolText(text) as NSString
+        var cursor = 0
+        var inBlock = false
+        /// Where a block's closing mark ends between `cursor` and `limit`, noting a block that opens there.
+        func blockClose(upTo limit: Int) -> Int? {
+            let opener = unquoted.range(of: "<function_calls>", range: NSRange(location: cursor, length: limit - cursor))
+            if opener.location != NSNotFound { inBlock = true }
+            guard inBlock else { return nil }
+            let from = opener.location == NSNotFound ? cursor : NSMaxRange(opener)
+            let closer = unquoted.range(of: "</function_calls>", range: NSRange(location: from, length: limit - from))
+            return closer.location == NSNotFound ? nil : NSMaxRange(closer)
+        }
+        // A marker framed inside text an earlier call already read through is that call's content.
+        for call in framedCalls(text) where call.0 >= cursor {
+            if let close = blockClose(upTo: call.0) { return close }
+            // A call still being written owns what follows its opening: a closing marker read so far is inside one of its strings.
+            guard let end = writtenEnd(of: call.0..<call.3, in: ns) else { return nil }
+            if !inBlock {
+                // A call opens its own line. One written after other words on a line may be an example whose closing backtick has not arrived.
+                let line = ns.range(of: "\n", options: .backwards, range: NSRange(location: 0, length: call.0))
+                let lineStart = line.location == NSNotFound ? 0 : NSMaxRange(line)
+                if ns.substring(with: NSRange(location: lineStart, length: call.0 - lineStart)).allSatisfy(\.isWhitespace) { return end }
+            }
+            cursor = end
+        }
+        // Past the last complete call, a call whose opening is written owns everything after that opening.
+        guard cursor <= ns.length else { return nil }
+        let writing = openMarkerRegex.firstMatch(in: unquoted as String, range: NSRange(location: cursor, length: ns.length - cursor))
+        return blockClose(upTo: writing?.range.location ?? ns.length)
+    }
+
+    /// Where the call framed at `framed` ends, or nil while it is still being written. A body that is one JSON object ends at the closing
+    /// marker written right after the object; any other body ends where the pattern ended it.
+    private static func writtenEnd(of framed: Range<Int>, in ns: NSString) -> Int? {
+        let opened = ns.range(of: ">", range: NSRange(location: framed.lowerBound, length: framed.count))
         guard opened.location != NSNotFound else { return nil }
-        // A body that is one JSON object ends at the closing marker written right after the object. Until that marker is there the call
-        // is still being written, and a closing marker read so far is inside one of its strings.
-        let closers = ns.substring(from: first.0).hasPrefix("<tool_use") ? ["</tool_use>"] : ["</tool_use>", "</invoke>"]
+        let closers = ns.substring(from: framed.lowerBound).hasPrefix("<tool_use") ? ["</tool_use>"] : ["</tool_use>", "</invoke>"]
         switch JSONByteScanner.objectRead(ns.substring(from: NSMaxRange(opened)), closers: closers) {
         case .open?, .closed(_, nil)?: return nil
         case .closed(_, let closer?)?: return NSMaxRange(opened) + closer.upperBound
-        case nil: return first.3
+        case nil: return framed.upperBound
         }
     }
 

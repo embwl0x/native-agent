@@ -15,6 +15,8 @@ public protocol InnerStateProviding: Sendable {
         detail: CognitiveInnerStateReading.Detail,
         surface: String
     ) async -> CognitiveInnerStateReading
+    /// The rhythm's own reading of the next night: its time, or why none is due.
+    func nextNight() async throws -> JSONValue
 }
 
 extension SwiftToolDispatcher {
@@ -37,7 +39,12 @@ extension SwiftToolDispatcher {
         }
 
         let reading = await mind.innerStateReading(windowHours: requested, detail: detail, surface: surface)
-        return Self.innerStateJSON(reading, requestedWindowHours: Self.innerStateRawWindowHours(input))
+        let state = Self.innerStateJSON(reading, requestedWindowHours: Self.innerStateRawWindowHours(input))
+        guard case .object(var fields) = state else { return state }
+        // The next night as the rhythm reads it, never recomputed here.
+        do { fields["next_night"] = try await mind.nextNight() }
+        catch { fields["next_night"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)]) }
+        return .object(fields)
     }
 
     /// Return the finite requested window, or nil if absent or invalid, so results can disclose clamping.

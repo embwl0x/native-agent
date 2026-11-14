@@ -11,6 +11,7 @@ import ProviderRouting
 import TrustCenter
 import Dispatcher
 import MacControl
+import MacIntegration
 import Context
 import SwarmRuns
 import Senses
@@ -447,7 +448,16 @@ extension SwiftToolDispatcher {
                 return .object(["ok": .bool(false), "text": .string(continuation.modelContext(context: context)), "effects": .string("none"),
                     "detail": .object(["error": .string("continuation_target_mismatch")])])
             }
-            reply = await verbs.go(name, front: input["front"] == .bool(true), turn: turn, context: context)
+            let went = await verbs.go(name, front: input["front"] == .bool(true), turn: turn, context: context)
+            // A System Settings pane is where the person grants; the screen may be unreadable there, so the reply says what is granted now from
+            // the app's own grant reading.
+            if name.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("x-apple.systempreferences") {
+                let reach = await SystemPermissionPreflight.reachNow()
+                reply = MacFourVerbsReply(ok: went.ok, text: went.text + "\n" + reach.text,
+                                          detail: went.detail.merging(["grants": reach.detail]) { _, new in new })
+            } else {
+                reply = went
+            }
         case "wait":
             reply = await verbs.wait(until: str("until"), seconds: num("seconds"), turn: turn, context: context)
         default:

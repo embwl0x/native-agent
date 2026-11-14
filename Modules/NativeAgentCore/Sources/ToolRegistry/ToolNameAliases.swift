@@ -98,8 +98,10 @@ public enum ToolNameAliases {
         "agent_connect": ["name": "agent"],
     ]
 
-    /// The app tool's own keys. Keys beginning with __ belong to the gate chain.
-    public static let appDoorKeys: Set<String> = ["page", "item", "action", "args", "actions", "preview", "expected_version", "find", "script"]
+    /// The app tool's own keys. Keys beginning with __ belong to the gate chain. `because` quotes the person's own request for the call: the
+    /// gate reads it as their word (`Turn.personWord`); an action that declares `because` (setting.set) takes it as its own.
+    public static let appDoorKeys: Set<String> = ["page", "item", "action", "args", "actions", "preview", "expected_version", "find", "script",
+                                                  "because"]
     /// A batch step's own keys: what must come back, its name for found, and whether it puts back what the deed moved.
     public static let appStepKeys: Set<String> = ["expect", "as", "cleanup"]
     /// The deed's own keys beside actions, and on no other form: the agent's closing words and the slots they take from what came back.
@@ -112,19 +114,19 @@ public enum ToolNameAliases {
 
     /// One reading of an app call. A call that names an action and has no args object takes every key outside the app tool's own as that
     /// action's arguments, and a reading key the action declares too, or an item where the action declares one address word. A call that
-    /// has args keeps each key where it was sent, so a key beside args is refused, never merged into them; only the door's own preview
-    /// and expected_version, sent inside args, are read as the door's.
+    /// has args keeps each key where it was sent, so a key beside args is refused, never merged into them; only the door's own preview,
+    /// expected_version and because, sent inside args, are read as the door's.
     public static func doorCall(_ tool: String, _ input: [String: JSONValue]) -> [String: JSONValue] {
         guard canonical(tool) == "app", case .string(let action)? = input["action"],
               !action.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return input }
         let binding = AppActionBinding.declaredBinding(action)
         let declared = binding?.declaredArguments ?? []
-        // The door's own guards sent inside args are still the door's, unless the action takes an argument by that name: a preview stays
-        // a preview, and a version guard still guards. An action the agent authored declares its arguments in its own part, unread
-        // here, so its args stay as sent.
+        // The door's own keys sent inside args are still the door's, unless the action takes an argument by that name: a preview stays
+        // a preview, a version guard still guards, and the person's quoted request is still the gate's to read. An action the agent
+        // authored declares its arguments in its own part, unread here, so its args stay as sent.
         if case .object(var args)? = input["args"], binding != nil {
             var call = input
-            for key in ["preview", "expected_version"] where call[key] == nil && !declared.contains(key) {
+            for key in ["preview", "expected_version", "because"] where call[key] == nil && !declared.contains(key) {
                 if let value = args.removeValue(forKey: key) { call[key] = value }
             }
             guard args.count != input["args"]?.objectValue?.count else { return input }
@@ -133,6 +135,8 @@ public enum ToolNameAliases {
         }
         guard input["args"] == nil || input["args"] == .null else { return input }
         var taken = appReaderKeys.intersection(declared)
+        // An action that declares `because` (setting.set) takes the door's own as its argument.
+        if declared.contains("because") { taken.insert("because") }
         if declared.intersection(addressWords).count == 1 { taken.insert("item") }
         let own = appDoorKeys.union(appStepKeys).union(appDeedKeys).subtracting(taken)
         let args = input.filter { !own.contains($0.key) && !$0.key.hasPrefix("__") }

@@ -235,8 +235,8 @@ public enum GrokBotRoute {
     }
     public static func routineName(_ peer: String) -> String { "NativeAgent reply " + peer }
     public static let securePasteBlocker = """
-        Grok Bot setup is unfinished. Connect again to continue native import; a navigation blocker names the control and \
-        agents/recipes/grok-bot.json to update. This secure field also accepts the URL and key together; never put credentials in chat.
+        Grok Bot setup is unfinished. Connect gives the steps: send its one message in the Grok Bot chat, then copy the routine's webhook \
+        address and key with Grok Bot's own Copy and paste them here, together or one after the other.
         """
     public static func instruction(peer: String, command: String) -> String {
         // Only app-owned fixed arguments form the command. Reply data is stdin.
@@ -315,8 +315,9 @@ public enum GrokBotRoute {
     public static func postOnce(_ request: URLRequest) async throws -> Int {
         let config = URLSessionConfiguration.ephemeral
         config.urlCache = nil; config.httpShouldSetCookies = false
-        config.timeoutIntervalForRequest = .infinity
-        config.timeoutIntervalForResource = .infinity
+        // An HTTP send to a contact carries the family's 45-second bound (AgentPeerHTTP.send); past it acceptance is unknown, never awaited.
+        config.timeoutIntervalForRequest = 45
+        config.timeoutIntervalForResource = 45
         let session = URLSession(configuration: config, delegate: GrokNoRedirect(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         let (_, response) = try await session.bytes(for: request)

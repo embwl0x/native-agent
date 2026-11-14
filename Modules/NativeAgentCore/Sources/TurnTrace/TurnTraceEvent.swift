@@ -350,12 +350,14 @@ public struct TurnTraceEvent: Sendable, Equatable {
     }
 
     /// Reuse the writer's size proof only for physically bounded rows with canonical envelopes and unclipped leaves; otherwise reapply construction.
-    public init?(persistedJSONRow value: JSONValue, physicalByteCount: Int) {
+    /// `at` is the record's own time for the row: when given it is the event's time, exactly as the record orders and filters it (the row's
+    /// `ts` text keeps only milliseconds).
+    public init?(persistedJSONRow value: JSONValue, physicalByteCount: Int, at: Date? = nil) {
         guard case .object(let obj) = value,
               case .string(let turnId)? = obj["turnId"],
               case .string(let kind)? = obj["kind"],
               case .string(let tsString)? = obj["ts"],
-              let ts = Self.parseISO8601(tsString)
+              let ts = at ?? Self.parseISO8601(tsString)
         else { return nil }
         let sessionId: String? = if case .string(let value)? = obj["sessionId"] {
             value

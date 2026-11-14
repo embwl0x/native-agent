@@ -286,7 +286,7 @@ final class iCloudSyncEngine {
         didSet { invalidateSnapshots(pairing: pairingStore?.iCloudPairingSecret) }
     }
 
-    // Serialize transaction admission on MainActor; independent actions including Stop may overlap, while repair waits for active sends.
+    // Serialize transaction admission on MainActor; independent actions including Stop may overlap. Repair never waits on them.
     var sendingTransactions: Set<String> = []
 
     // Ledger persistence is part of send acceptance; bound synchronous coordinated-I/O waits before releasing send ownership.

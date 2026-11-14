@@ -1016,8 +1016,21 @@ extension MacSyncEngine {
     }
 
     func organismLivingStatusSnapshot() async -> OrganismLivingStatusFile {
-        let snapshot = await sync.cognition.organismSnapshot()
+        guard let snapshot = await sync.cognition?.organismSnapshot() else { return Self.noMindLivingStatus() }
         return await MobileSnapshotBuilder.shared.build { Self.organismLivingStatusSnapshot(from: snapshot) }
+    }
+
+    /// No mind runs before setup has finished or after a reset closed it: the phone is told so, never shown a calm or stale body. The file is the
+    /// same on every pass while no mind runs, so it publishes once.
+    nonisolated static func noMindLivingStatus() -> OrganismLivingStatusFile {
+        var status = OrganismLivingStatusFile(generatedAt: .distantPast, enabled: false, posture: "off", bodyLine: nil, behaviorLine: "off",
+            needsUser: false, needsAttention: nil, signalCount: 0, lastSignalAt: nil,
+            body: OrganismLivingBodyFile(macAwake: true, iPhoneReachable: false, providersHealthy: false, memoryHealthy: false, dreamHealthy: false,
+                toolHandsAvailable: false, approvalChannelsOpen: false, notificationPathHealthy: nil, resourcePressure: "unknown"),
+            counters: OrganismLivingCountersFile(fieldNodes: 0, pendingPredictions: 0, dreamRepairs: 0),
+            availability: .unavailable)
+        status.markUnavailable(reason: "mind_not_started")
+        return status
     }
 
     nonisolated static func organismLivingStatusSnapshot(

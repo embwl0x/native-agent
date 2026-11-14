@@ -41,8 +41,13 @@ public actor MindStream: AttentionStream {
     private var nightBegan: Date?
     private var nightAdmission: ScopedWaiter?
     private var nightWork: (@Sendable (Attended) async -> Void)?
+    /// The stream's running work (thoughts, returns, the night with its dream), held so closing the mind can stop and join it.
+    private var work: [UUID: Task<Void, Never>] = [:]
+    /// Set when the mind closes: nothing starts after it, and what was attended stays owed for the next mind.
+    private var closed = false
 
-    init(dataRoot: URL, clients: any AgentContactClients, completionSender: any AgentBridgeCompletionSending) {
+    /// One stream per mind: the body's mind owner makes it when the mind starts, and a later mind gets its own.
+    public init(dataRoot: URL, clients: any AgentContactClients, completionSender: any AgentBridgeCompletionSending) {
         self.dataRoot = dataRoot
         self.clients = clients
         self.completionSender = completionSender
@@ -60,7 +65,30 @@ public actor MindStream: AttentionStream {
         await attention.installStream(self)
     }
 
+    /// The mind is closing: no thought, return or night starts from here, and every running one is stopped (its own settlement still runs) and
+    /// joined before this returns.
+    public func close() async {
+        closed = true
+        while !work.isEmpty {
+            let running = Array(work.values)
+            for task in running { task.cancel() }
+            for task in running { await task.value }
+        }
+    }
+
+    /// Runs one piece of the stream's work as a task the stream holds; the caller's cancellation reaches it, and so does closing.
+    private func held(_ body: @escaping @Sendable () async -> Void) async {
+        let id = UUID()
+        let task = Task { await body() }
+        work[id] = task
+        await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        work[id] = nil
+    }
+
+    private func retire(_ id: UUID) { work[id] = nil }
+
     public func rest(_ attended: Attended) async {
+        guard !closed else { await settle { await self.giveBack(attended) }; return }
         guard let nightWork else {
             await RepairOwed.owe(dataRoot, id: "night-owner", kind: .run, operation: "night", owner: "attention",
                 words: "The night owner is not installed; the happening remains owed.", tap: "Restore the mind stream's night owner.").value
@@ -72,6 +100,11 @@ public actor MindStream: AttentionStream {
     // MARK: - A thought
 
     public func think(_ attended: Attended) async {
+        guard !closed else { await settle { await self.giveBack(attended) }; return }
+        await held { await self.thinkHeld(attended) }
+    }
+
+    private func thinkHeld(_ attended: Attended) async {
         thoughtOffered = true
         if thinking {
             if attended.node != nil || attended.night != nil {
@@ -358,7 +391,13 @@ public actor MindStream: AttentionStream {
 
     /// A return continues the conversation that started the work, through the same admitted chat, completion ledger and gated delivery as a contact
     /// continuation. An open turn there reads it; otherwise it runs as that conversation's own turn.
-    public func returnTo(_ session: String, _: [Experience]) async {
+    public func returnTo(_ session: String, _ happenings: [Experience]) async {
+        // Closed, what was returning stays owed on its route for the next mind.
+        guard !closed else { return }
+        await held { await self.returnHeld(session, happenings) }
+    }
+
+    private func returnHeld(_ session: String, _: [Experience]) async {
         if returning[session] != nil { returning[session] = true; return }
         returning[session] = false
         defer { returning[session] = nil }
@@ -799,6 +838,10 @@ public actor MindStream: AttentionStream {
     /// wakes and weighs what waited, once. Returns the admission outcome; the stream retains the accepted night until it settles.
     public func night(attended: Attended? = nil, request: Turn? = nil, dream: @escaping @Sendable (Turn, Date) async -> Void,
                       reading: @escaping @Sendable () async -> JSONValue) async -> NightOutcome {
+        guard !closed else {
+            if let attended { await settle { await self.giveBack(attended) } }
+            return .failed(cause: "The mind is closed; no night begins.")
+        }
         // A concurrent caller waits for the pending admission's actual outcome before calling it a running night.
         while let admission = nightAdmission, !Task.isCancelled {
             await admission.park()
@@ -841,8 +884,11 @@ public actor MindStream: AttentionStream {
         else { parent = Turn(id: attended?.happeningIDs.first ?? Turn.mintID(), session: Attention.stream) }
         nightBegan = beganAt
         await owner.fellAsleep()
-        Task.detached {
+        // The stream holds the night past this call; closing the mind stops it and joins its settlement.
+        let id = UUID()
+        work[id] = Task.detached {
             await self.finishNight(attended: attended, parent: parent, owner: owner, beganAt: beganAt, dream: dream, reading: reading)
+            await self.retire(id)
         }
         return .started(at: beganAt)
     }

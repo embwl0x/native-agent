@@ -9,6 +9,8 @@ import MacControl
 import PersistenceCore
 import ApplicationServices
 import ToolExecution
+import NativeAgentShared
+import Synchronization
 // Blueprint: | `DesktopAgentConversationRoute.swift` | `Resources/abilities/desktop-courier.js`, `Parts.call` |
 
 /// Desktop operators use ordinary gated Mac tools and own no transcript or agent. Send-only contacts answer through authenticated inbound messaging, never
@@ -16,42 +18,75 @@ import ToolExecution
 public actor DesktopAgentConversationRoute {
     let clients: any AgentContactClients
     private let dataRoot: URL
-    private var busy = false
 
     init(clients: any AgentContactClients, dataRoot: URL) { self.clients = clients; self.dataRoot = dataRoot }
-
-    public func grokBootstrap(turn: Turn, mac: MacOperationContext, _ text: String, bot: String, beforeSubmission: @Sendable () throws -> Void) async throws {
-        guard !busy else { throw GrokRoutineAccessibility.Blocker.busy }
-        busy = true
-        defer { busy = false }
-        try await GrokRoutineAccessibility.send(turn: turn, mac: mac, text, bot: bot, beforeSubmission: beforeSubmission)
-    }
-
-    @discardableResult public func importGrokRoutine(turn: Turn, mac: MacOperationContext, peer: String, dataRoot: URL,
-        waitForCreation: Bool) async throws -> String {
-        guard !busy else { throw GrokRoutineAccessibility.Blocker.busy }
-        busy = true
-        defer { busy = false }
-        return try await GrokRoutineAccessibility.importRoutine(turn: turn, mac: mac, peer: peer, dataRoot: dataRoot, waitForCreation: waitForCreation)
-    }
 
     private struct CourierInstructions: Codable, Sendable {
         let replyInstruction: String
         let procedure: String
     }
 
+    /// The person's send goes now; the agent's own runs only while the person is away, otherwise (or when the person takes the desktop before anything
+    /// was typed) it is held in its conversation's queue, holding nothing, and goes when the Mac is free.
     public func run(turn: Turn, work: ChatTurnWork, mac: MacOperationContext, plan: [String: JSONValue], inner: any ToolDispatchClient,
-        surface: String) async -> JSONValue {
+        surface: String, conversation: AgentConversationContext, parts: Parts.Invocation) async -> JSONValue {
         let agent = string(plan["agent"]) ?? "unknown"
-        guard !busy else { return result(agent, "busy", "The desktop is handling another conversation. Send again when it finishes.") }
-        busy = true
-        let output = await operate(turn: turn, work: work, mac: mac, plan: plan, inner: inner, surface: surface)
-        return await settle { await self.release(output) }
+        let text = string(plan["requested_text"]) ?? ""
+        let person = DesktopLane.askedByPerson(turn)
+        if !person, DesktopLane.personHere {
+            return await Self.held(agent, text: text, conversation: conversation, detail: MacAttentionSessionStore.personUsingMac)
+        }
+        let ticket: DesktopLane.Ticket
+        switch await DesktopLane.shared.admit(person: person) {
+        case .admitted(let admitted): ticket = admitted
+        case .cancelled: return Self.stopped(agent, app: "the app", stage: "waiting for the desktop", typed: false, submitted: false, why: "Stopped.")
+        case .busy:
+            return result(agent, "busy", "Another operation is driving the desktop right now; this message has not started. Send again when it finishes.")
+        case .superseded: return Self.supersededSend(agent)
+        }
+        let output = await DesktopLane.shared.operate(ticket) {
+            await self.operate(turn: turn, work: work, mac: mac, plan: plan, inner: inner, surface: surface, lane: ticket, parts: parts)
+        }
+        let yielded = ticket.yieldedUntyped
+        if person { return yielded ? Self.supersededSend(agent) : output }
+        let untouched: Bool = if case .object(let fields) = output { fields["safe_to_resend"] == .bool(true) } else { false }
+        if yielded || (untouched && DesktopLane.personHere) {
+            return await Self.held(agent, text: text, conversation: conversation, detail: yielded
+                ? "The person asked for the desktop, so this message stepped aside before anything was typed."
+                : MacAttentionSessionStore.personUsingMac)
+        }
+        return output
     }
-    private func release(_ output: JSONValue) -> JSONValue { busy = false; return output }
+
+    static func supersededSend(_ agent: String) -> JSONValue {
+        .object(["agent": .string(agent), "transport": .string("desktop"), "status": .string("not_sent"), "sent": .bool(false),
+            "completed": .bool(false), "safe_to_resend": .bool(true), "automatic_resend": .bool(false), "detail": .string("""
+                Superseded by the person's newer desktop request before anything was typed; nothing was sent and nothing of it waits. Send it again \
+                if it is still wanted.
+                """)])
+    }
+
+    /// The conversation's existing Mac hold (as DesktopChat's): the full text stays queued under its send id and the release drain sends it when the person
+    /// is away. A held send never holds the desktop.
+    private static func held(_ agent: String, text: String, conversation: AgentConversationContext, detail: String) async -> JSONValue {
+        guard !Task.isCancelled, !text.isEmpty, let live = conversation.liveTarget, let row = live.recordID, let operation = live.operationID else {
+            return .object(["agent": .string(agent), "status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                "safe_to_resend": .bool(true), "detail": .string(detail)])
+        }
+        do {
+            try await Task.detached {
+                try AgentConversationStore(dataRoot: live.dataRoot).holdForMac(id: row, operation: operation, text: text, conversation: nil, detail: detail)
+            }.value
+            return .object(["agent": .string(agent), "status": .string("held"), "reason": .string("mac_busy"), "sent": .bool(false),
+                "completed": .bool(false), "detail": .string(detail + " Waiting for the Mac to be free; it will go then. Do not send it again.")])
+        } catch {
+            return .object(["agent": .string(agent), "status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                "safe_to_resend": .bool(true), "detail": .string(detail + " Saving the waiting message failed: " + error.localizedDescription)])
+        }
+    }
 
     private func operate(turn: Turn, work: ChatTurnWork, mac: MacOperationContext, plan: [String: JSONValue], inner: any ToolDispatchClient,
-        surface: String) async -> JSONValue {
+        surface: String, lane: DesktopLane.Ticket, parts: Parts.Invocation) async -> JSONValue {
         let agent = string(plan["agent"]) ?? "unknown"
         guard case .object(let target)? = plan["target"], let bundle = string(target["app_bundle_id"]),
               let label = string(target["conversation_label"]), !label.isEmpty else {
@@ -60,42 +95,14 @@ public actor DesktopAgentConversationRoute {
         guard let requested = string(plan["requested_text"]), !requested.isEmpty else {
             return result(agent, "needs_setup", "A desktop contact is send-only; this route carries a message or nothing at all.")
         }
-        // Native chat readers already correlate the answer, so requesting a second inbound answer would duplicate it. Wake covered screens before activation.
+        // Wake covered screens before activation.
         do { try await MacScreenLock.wakeIfCovered(turn: turn, context: mac) } catch {
             return Self.stopped(agent, app: "the app", stage: "waking the screen", typed: false, submitted: false,
                                 why: (error as? MacScreenLock.Covered)?.detail ?? "\(error)")
         }
-        // Native submission and reply-watch evidence remain with their route owner.
-        if bundle == GrokBotRoute.bundleID {
-            do {
-                try await GrokRoutineAccessibility.send(turn: turn, mac: mac, requested, bot: label, watchReply: true)
-                // Release busy ownership before following replies so other desktop sends can proceed.
-                guard case .object(var fields) = Self.delivered(agent) else { return Self.delivered(agent) }
-                fields["submission_observation"] = GrokRoutineAccessibility.submissionObservation
-                guard let sent = GrokRoutineAccessibility.sentLayout else {
-                    fields["detail"] = .string("""
-                        Pasted into chat \u{201C}\(label)\u{201D} in the Grok Bot app and seen there, but that chat's transcript could not be read \
-                        to watch for the answer; it stays in that chat.
-                        """)
-                    fields.removeValue(forKey: "reply_with")
-                    return .object(fields)
-                }
-                fields["_grok_watch"] = .object(["chat": .string(label),
-                    "peer": .string(agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : agent),
-                    "watch_id": sent.watchID.map(JSONValue.string) ?? .null])
-                return .object(fields)
-            } catch {
-                let reached = GrokRoutineAccessibility.reached
-                let why = (error as? MacScreenLock.Covered)?.detail ?? error.localizedDescription
-                let stage = reached == .opening ? "opening Grok Bot" : "opening chat \u{201C}\(label)\u{201D} and checking its message box"
-                return Self.stopped(agent, app: "Grok Bot", stage: stage, typed: reached == .typing || reached == .submitted,
-                                    submitted: reached == .submitted, why: why)
-            }
-        }
         let instructions: CourierInstructions
         switch await Parts(root: dataRoot).call(id: "desktop-courier",
-            input: .object(["agentName": .string(PeerFacingIdentity.agentName)]), invocation: .init(host: nil, execution: .init(turn: turn,
-                surface: surface, deadlines: work.deadlines)), as: CourierInstructions.self) {
+            input: .object(["agentName": .string(PeerFacingIdentity.agentName)]), invocation: parts, as: CourierInstructions.self) {
         case .success(let value): instructions = value
         case .failure(let error):
             await ChatToolDispatchTracer.traceUndispatched(turn: turn, tool: "app", input: ["action": .string("authored.desktop-courier")],
@@ -108,7 +115,7 @@ public actor DesktopAgentConversationRoute {
                 typed: false, submitted: false, why: error.localizedDescription)
         }
         let message = requested + "\n\n" + instructions.replyInstruction
-        let operatorTools = DesktopConversationTools(mac: mac, inner: inner, bundle: bundle, label: label, message: message)
+        let operatorTools = DesktopConversationTools(mac: mac, inner: inner, bundle: bundle, label: label, message: message, lane: lane)
         let client = clients.chatClient(tools: operatorTools)
         let task: JSONValue = .object([
             "app_bundle_id": .string(bundle), "conversation_label": .string(label),
@@ -175,6 +182,7 @@ package actor DesktopConversationTools: ToolDispatchClient {
     let bundle: String
     let label: String
     let message: String
+    let lane: DesktopLane.Ticket?
     let frontmostBundle: @Sendable () async -> String?
     private var calls = 0
     private var typed = false
@@ -189,11 +197,11 @@ package actor DesktopConversationTools: ToolDispatchClient {
     private var problem = ""
 
     package init(mac: MacOperationContext, inner: any ToolDispatchClient, bundle: String, label: String, message: String,
-         frontmostBundle: @escaping @Sendable () async -> String? = {
+         lane: DesktopLane.Ticket? = nil, frontmostBundle: @escaping @Sendable () async -> String? = {
              await MainActor.run { NSWorkspace.shared.frontmostApplication?.bundleIdentifier }
          }) {
         self.mac = mac; self.inner = inner; self.bundle = bundle; self.label = label; self.message = message
-        self.frontmostBundle = frontmostBundle
+        self.lane = lane; self.frontmostBundle = frontmostBundle
     }
     package func listAvailableTools(turn: Turn?, surface: String) async throws -> [String] {
         try await listAvailableToolSchemas(turn: turn, surface: surface).map(\.name)
@@ -272,6 +280,8 @@ package actor DesktopConversationTools: ToolDispatchClient {
                         throw refusal("The exact conversation and an empty message box could not be verified. Nothing was typed.")
                     }
                     args["target"] = .string(composer)
+                    // These keys run to their end; a person's operation already taking the desktop stops the send here, untyped.
+                    try lane?.beginKeys()
                     typed = true // before dispatch: uncertain attempts are never replayed
                     stage = "typing the message"; typing = true
                 case "key":
@@ -280,6 +290,8 @@ package actor DesktopConversationTools: ToolDispatchClient {
                         throw refusal("The conversation or composed message changed. Submission stopped.")
                     }
                     baseline = try await DesktopChatRoute.outgoingOccurrences(mac: mac, message, bundle: bundle, label: label)
+                    // Between typing and Return the desktop may yield (the text stays in the box and the receipt says so); Return itself runs to its end.
+                    try lane?.beginKeys()
                     submitted = true; stage = "verifying the sent message"; submitting = true
                 case "click":
                     if typed {
@@ -289,6 +301,7 @@ package actor DesktopConversationTools: ToolDispatchClient {
                             throw refusal("The conversation or composed message changed. Submission stopped.")
                         }
                         baseline = try await DesktopChatRoute.outgoingOccurrences(mac: mac, message, bundle: bundle, label: label)
+                        try lane?.beginKeys()
                         submitted = true; stage = "verifying the sent message"; submitting = true
                     } else {
                         let decorated = target.hasPrefix(label + ", ") && observed.contains(target)
@@ -303,6 +316,8 @@ package actor DesktopConversationTools: ToolDispatchClient {
         // Only a read taken after the submission counts as evidence of it.
         if submitting { observed = "" }
         let response: JSONValue
+        // The atomic step a person's request may wait for is this keystroke dispatch, never the model turn around it.
+        defer { if typing || submitting { lane?.endKeys() } }
         do { response = try await inner.dispatch(tool: tool, input: args, surface: surface, turn: turn, invocation: invocation) }
         catch { problem = String(error.localizedDescription.prefix(240)); throw error }
         if ["screen", "read", "tool_result_page"].contains(tool) {
@@ -355,7 +370,7 @@ package actor DesktopConversationTools: ToolDispatchClient {
                 && MacAXAttributeRead.copyRaw($0, kAXEnabledAttribute, context: mac) as? Bool == true
         }
         guard boxes.count == 1 else { return nil }
-        let value = try GrokRoutineAccessibility.composerValue(mac: mac, boxes[0])
+        let value = try DesktopComposer.composerValue(mac: mac, boxes[0])
         guard
               value.trimmingCharacters(in: .whitespacesAndNewlines) == content.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
         return MacAXAttributeRead.text(boxes[0], kAXRoleAttribute, context: mac) == kAXTextAreaRole ? "text area" : "text"
@@ -392,5 +407,159 @@ package actor DesktopConversationTools: ToolDispatchClient {
     private func refusal(_ reason: String) -> NSError {
         problem = reason
         return NSError(domain: "DesktopConversation", code: 403, userInfo: [NSLocalizedDescriptionKey: reason])
+    }
+}
+
+/// The one desktop lane: one operation drives the desktop at a time, and what the person asks for goes now. The agent's own operation runs only while the
+/// person is away; otherwise a send is held by its conversation and does not claim the lane. The newest of the
+/// person's asks takes the lane from whatever holds it: a holder that is posting keys ends that bounded sequence first; any other holder is cancelled and
+/// left to finish dying on its own, never waited for. An older waiting ask is told it was superseded. So "busy" is only ever said to the agent's own work,
+/// and means an operation is driving the desktop now. Keys never wait and every observed step is bounded.
+package final class DesktopLane: Sendable {
+    static let shared = DesktopLane()
+
+    static func askedByPerson(_ turn: Turn) -> Bool { turn.askedByPerson }
+    /// The agent's own desktop work needs positive away evidence; unknown presence counts as here.
+    static var personHere: Bool { MacPersonInput.presence()?.here != false }
+
+    enum Admission {
+        case admitted(Ticket)
+        /// The agent's own operation found the desktop driven now.
+        case busy
+        /// A newer ask of the person's took the lane first.
+        case superseded
+        case cancelled
+    }
+
+    /// One admitted operation.
+    package final class Ticket: Sendable {
+        let person: Bool
+        fileprivate enum Yield { case released, typing(ScopedWaiter), cancelled }
+        private struct State {
+            var keys = false
+            var typed = false
+            var yieldAsked = false
+            var yielded = false
+            var released = false
+            var cancel: (@Sendable () -> Void)?
+            var waiters: [ScopedWaiter] = []
+        }
+        private let state = Mutex(State())
+        init(person: Bool) { self.person = person }
+
+        /// A keystroke sequence (paste or type, Return) is about to be posted: a takeover waits for its end, so no key is cut short. A takeover already
+        /// taken ends the operation here instead.
+        func beginKeys() throws {
+            let yielded = state.withLock { state -> Bool in
+                if !state.yielded { state.keys = true; state.typed = true }
+                return state.yielded
+            }
+            if yielded { throw CancellationError() }
+        }
+        /// The keystroke sequence ended; a takeover asked meanwhile cancels the operation now and wakes the person's operation.
+        func endKeys() {
+            let (cancel, waiters) = state.withLock { state -> ((@Sendable () -> Void)?, [ScopedWaiter]) in
+                state.keys = false
+                guard state.yieldAsked else { return (nil, []) }
+                let waiting = state.waiters
+                state.waiters = []
+                guard !state.yielded else { return (nil, waiting) }
+                state.yielded = true
+                return (state.cancel, waiting)
+            }
+            cancel?()
+            for waiter in waiters { waiter.resume() }
+        }
+        /// The operation yielded the desktop before any key was posted: nothing of it is anywhere but in its owner.
+        var yieldedUntyped: Bool { state.withLock { $0.yielded && !$0.typed } }
+
+        fileprivate func started(_ cancel: @escaping @Sendable () -> Void) {
+            let late = state.withLock { state -> Bool in
+                state.cancel = cancel
+                return state.yielded
+            }
+            if late { cancel() }
+        }
+        /// Keys in flight: the waiter wakes when they end. Otherwise the operation is cancelled now (once) and the lane is free to take.
+        fileprivate func yieldToPerson() -> Yield {
+            let (yield, cancel) = state.withLock { state -> (Yield, (@Sendable () -> Void)?) in
+                guard !state.released else { return (.released, nil) }
+                state.yieldAsked = true
+                if state.keys {
+                    let waiter = ScopedWaiter()
+                    state.waiters.append(waiter)
+                    return (.typing(waiter), nil)
+                }
+                guard !state.yielded else { return (.cancelled, nil) }
+                state.yielded = true
+                return (.cancelled, state.cancel)
+            }
+            cancel?()
+            return yield
+        }
+        fileprivate func release() {
+            let waiters = state.withLock { state -> [ScopedWaiter] in
+                state.released = true
+                let waiting = state.waiters
+                state.waiters = []
+                return waiting
+            }
+            for waiter in waiters { waiter.resume() }
+        }
+    }
+
+    private struct Lane {
+        var holder: Ticket?
+        /// Each person's ask takes the next number; only the newest may take the lane.
+        var newest = 0
+    }
+    private let lane = Mutex(Lane())
+
+    /// The newest person's ask takes the lane, waiting at most for keys in flight; the agent's own never queues.
+    func admit(person: Bool) async -> Admission {
+        let order = person ? lane.withLock { state -> Int in state.newest += 1; return state.newest } : 0
+        while !Task.isCancelled {
+            enum Next { case taken(Ticket), busy, superseded, yield(Ticket) }
+            let next = lane.withLock { state -> Next in
+                if person, state.newest != order { return .superseded }
+                guard let held = state.holder else {
+                    let ticket = Ticket(person: person)
+                    state.holder = ticket
+                    return .taken(ticket)
+                }
+                return person ? .yield(held) : .busy
+            }
+            switch next {
+            case .taken(let ticket): return .admitted(ticket)
+            case .busy: return .busy
+            case .superseded: return .superseded
+            case .yield(let held):
+                switch held.yieldToPerson() {
+                case .released: continue
+                case .typing(let keysEnded): await keysEnded.park()
+                case .cancelled:
+                    // The cancelled holder finishes dying on its own; the lane is this ask's now, unless a newer ask came meanwhile.
+                    let taken = lane.withLock { state -> Ticket? in
+                        guard state.newest == order, state.holder === held else { return nil }
+                        let ticket = Ticket(person: person)
+                        state.holder = ticket
+                        return ticket
+                    }
+                    if let taken { return .admitted(taken) }
+                }
+            }
+        }
+        return .cancelled
+    }
+
+    /// Run the admitted operation where the lane can cancel it to yield; Stop reaches it as well. Releasing the lane is its settlement; a holder that was
+    /// taken over releases nothing of the new holder's.
+    func operate<T: Sendable>(_ ticket: Ticket, _ body: @escaping @Sendable () async -> T) async -> T {
+        let work = Task { await body() }
+        ticket.started { work.cancel() }
+        let value = await withTaskCancellationHandler { await work.value } onCancel: { work.cancel() }
+        lane.withLock { state in if state.holder === ticket { state.holder = nil } }
+        ticket.release()
+        return value
     }
 }

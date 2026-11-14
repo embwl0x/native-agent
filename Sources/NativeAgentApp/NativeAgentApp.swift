@@ -427,13 +427,12 @@ extension NativeAgentEnginePorts {
     static func mounted(dataRoot: URL) -> Self {
         Task {
             await AgentContactHealth.shared.installGrokVerifier(dataRoot: dataRoot) { peer in
-                do {
-                    // Health verification is standalone work; its callback carries no chat turn.
-                    let turn = Turn().with(\.envelope, .native("native:grok.verify"))
-                    try await NativeAgentEngine.forRoot(dataRoot).agents.desktop.importGrokRoutine(
-                        turn: turn, mac: .init(dataRoot: dataRoot), peer: peer, dataRoot: dataRoot, waitForCreation: false)
+                // Verification reads nothing on the desktop: the routine's webhook must be saved, or setup is still owed.
+                let credential = try GrokLinkCredential.read(peer: peer)
+                guard credential.webhookComplete else {
+                    throw ToolFailureError("Grok Bot's webhook address and key are not saved. Connect Grok Bot again for its setup steps.",
+                        effects: .none)
                 }
-                catch let blocker as GrokRoutineAccessibility.Blocker { throw ToolFailureError(blocker.rawValue, effects: .unknown) }
             }
         }
         return Self(
@@ -464,17 +463,16 @@ extension NativeAgentEnginePorts {
             browserRoutes: .app,
             connectorActions: { AppConnectorActionPlatform(engine: $0) },
             chatPlatform: ChatToolPlatformPort(
-                grok: { plan, root, inner, surface, turn, mac in
-                    await GrokBotConnection.perform(turn: turn, mac: mac, plan: plan, dataRoot: root,
-                        inner: inner, surface: surface, port: NativeAgentEngine.live.agents.desktop)
+                grok: { plan, root, surface, turn, parts in
+                    await GrokBotConnection.perform(turn: turn, plan: plan, dataRoot: root, surface: surface, parts: parts)
                 },
                 desktopChat: { plan, root, turn, mac, conversation in
                     await DesktopChatRoute.perform(turn: turn, mac: mac, conversation: conversation,
                         plan: plan, dataRoot: root)
                 },
-                desktop: { plan, inner, surface, turn, work, mac in
+                desktop: { plan, inner, surface, turn, work, mac, conversation, parts in
                     await NativeAgentEngine.live.agents.desktop.run(
-                        turn: turn, work: work, mac: mac, plan: plan, inner: inner, surface: surface)
+                        turn: turn, work: work, mac: mac, plan: plan, inner: inner, surface: surface, conversation: conversation, parts: parts)
                 }
             )
         )

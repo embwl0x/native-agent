@@ -236,8 +236,8 @@ extension AppToolExecutor {
             }
             return Repair.why(owner: action.id, tap: tap)
         }()
-        // A lever runs only as the person's own decision of this exact call (their tap, or the card they approved); the gate asked them
-        // for the agent's call, and here nothing else passes, at any posture.
+        // A lever runs only as the person's own decision of this exact call (their tap, or the card they approved); here nothing else passes,
+        // at any posture, and the agent's call of it becomes their card or names where they do it.
         let decided = PermissionLaw.personDecided(tool: "app", input: ["action": .string(action.id), "args": input["args"] ?? .object([:])],
             turn: turn)
         // A preview of a lever a card can carry is the gate's own check before it asks the person: it reads on, and the card decides.
@@ -269,12 +269,33 @@ extension AppToolExecutor {
                 receipt["detail"] = .string("Would refuse: that's the owner's, \(why). Nothing was done.")
                 return .object(receipt)
             }
-            return Self.failure("owners_call", "\(action.id) (\(lever.name)) is the person's lever: \(why). "
-                + (lever.asks ? "Your call asks them on a card; " : "It needs the person themself; ") + "nothing was done.", extra: receipt)
+            let named = lever.name.isEmpty ? action.id : "\(lever.name) (\(action.id))"
+            if lever.asks {
+                // The agent's call of a lever a card can carry is the person's ask, never a bare refusal: this answer is the one a setting's
+                // raise gives (`needs_person`), and the gate that admitted the call files the person's card for this exact call from it.
+                // Their Approve replays it as their decision (`personDecided` above); their Decline leaves everything as it was.
+                var ask = receipt
+                ask["status"] = .string("needs_person")
+                ask["reason"] = .string("owners_call")
+                ask["effects"] = .string("none")
+                ask["execution"] = .string("not_run")
+                ask["detail"] = .string("\(named) is the person's to decide: \(why). Only their yes on a card for this exact call runs it; "
+                    + "nothing was done.")
+                return .object(ask)
+            }
+            // No card can carry it: the sentence says where the person does it themself, so the agent can tell them.
+            let place = ownerRemedy.objectValue?["tap"]?.stringValue.map { " (\($0))" } ?? ""
+            return Self.failure("owners_call", "\(named) is the person's own to do: \(why)\(place). No card can carry it, so nothing was "
+                + "done; tell the person where they do it, and do not call it again.", extra: receipt)
         }
         // Archive reasons must not use reason, which runners classify as the machine refusal code.
         if let reason = args["reason"]?.scalarText { receipt["reason_given"] = .string(String(reason.prefix(280))) }
         var call = action.binding.arguments(args)
+        // The person's quoted request beside the call reaches an action that reads one (setting.set) when its args carry none; as a door key it
+        // is no argument of the call, so the person's decision of the call still names it exactly.
+        if action.binding.declaredArguments.contains("because"), args["because"] == nil, let because = input["because"] {
+            call["__because"] = because
+        }
         // A program calling gets a reader's structured form, where it has one.
         if input[Self.doorScriptKey] == .bool(true), call["structured"] == nil,
            action.argSpecs.flatMap(\.names).contains("structured") { call["structured"] = .bool(true) }

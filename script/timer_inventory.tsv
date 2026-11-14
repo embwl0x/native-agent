@@ -5,6 +5,8 @@ Sources/NativeAgentFace/KnowledgeGraphView.swift	do { try await Task.sleep(for: 
 # deep-projections (2026-11-02): visible_ui QuietSelfAdminRender.settle retains its 4s ceiling and 20ms suspension, propagating cancellation before layout/capture; TranscriptLayoutProbe's existing 5s append-triggered diagnostic window flush now precedes its 400-row admission cap. No new timer primitive or duration.
 # Desktop contact replies follow correlated generation state through AX/workspace events; silence remains cancellable waiting.
 # Only stopped runs reserve Desk items through retained checkpoints until resumed or released; reservations have no clock.
+# call-watch (2026-11-14): no new timer primitive; supersedes call-bound's cut. A call's TurnDeadline is a watch: after 60s with no life its CallLife owners are asked whether what it waits on lives (each with a 10s ping); only a dead or unanswering owner ends it, and with no owner the turn shows a call.stalled notice. A declared timeout_seconds/timeout/wait_seconds ends the call at its own time plus 30s on a wall-clock TurnDeadline. The 180s default and NATIVE_AGENT_TOOL_DISPATCH_TIMEOUT_SECONDS are removed.
+# call-bound (2026-11-14): no new timer primitive. Every call a turn makes is bounded on the existing TurnDeadline active-work clock (PersistenceCore/CallBound.swift: declared timeout_seconds or wait_seconds plus 30s, a tool's own number in code, else 180s; one bound tree per outermost call, renewed by movement anywhere in it, including a turn's output under it, and paused by a person's wait anywhere in it; a running child call holds its parent's clock). Expiry now cancels the call's body as Stop does and returns ran_out_of_time; this supersedes deep-turn-loop's response-only expiry. Nested calls take their own bound at the app door's re-entry and ToolHost's direct-broker primitives, and a helper's calls at runStandingBot's dispatch.
 # deep-turn-loop (2026-11-02): timeout_retry_deadline dispatch backstop durations unchanged; TurnDeadline expiry ends only the response wait, without cancelling the original tool or joining its exit. Its active-work progress/person-wait behavior remains; a response-only ceiling is excluded from downstream secondsLeft work budgets. Stop requests cancellation. Actual receipt/checkpoint settlement uses the original body; a never-returning body remains unknown. No new timer primitive or polling.
 # path	needle	expected_count	classification	canonical_owner
 # Care cue settlement reads a lived response event; CognitiveSubstrate+CaresMind.swift has no elapsed-time careReleaseRest.
@@ -61,7 +63,7 @@ Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatchController.swift	Task
 # APNSNotificationDelivery.swift: removed the five-second observation sleeper and fan-out cancellation. The admitted task joins all sends and receipt settlement; URLSession owns the 5-second request-idle / 30-second resource transport limits. No observation timer or resend.
 # FileSystemProcessOwner: ProcessPipeDrain uses readiness events; the existing shared two-second EOF grace bounds capture after ManagedProcess settlement.
 Modules/NativeAgentCore/Sources/AgentConversations/JobDoorA2A.swift	Task.sleep(for:	1	external_protocol_poll	A2AJobDoor: a job's A2A task is read 5s after the send, the pause doubling to 60s, until the task is terminal or her stop cancels the read and sends the task's own cancel; a job outlives any one stream or push connection, so it reads; no deadline ends the job
-Modules/NativeAgentCore/Sources/AgentLinkTransport/AgentACPClient.swift	*	2	timeout_retry_deadline	ACP initialize and turn deadlines and retained connection idle expiry; no polling or retry
+Modules/NativeAgentCore/Sources/AgentLinkTransport/AgentACPClient.swift	*	2	timeout_retry_deadline	ACP discovery's initialize probe and retained connection idle expiry; a turn has no clock; no polling or retry
 Modules/NativeAgentCore/Sources/AgentLinkTransport/AgentACPProcess.swift	*	2	timeout_retry_deadline	ACP bounded EOF/terminate/kill shutdown through the core process owner; no polling or retry
 # 2026-09-09: speech-permission voice replay uses existing Telegram ticks; diagnostics fallback adds no timer sites.
 # 2026-09-09: Providers second-pass disclosures and offscreen fixture stores add no timer or sleep sites.
@@ -96,7 +98,7 @@ Modules/NativeAgentCore/Sources/MacControl/MacScreenWatch.swift	*	3	event_deadli
 Modules/NativeAgentCore/Sources/MacControl/MacScreenWatch+Capture.swift	*	1	event_deadline	MacScreenWatch: frames are ScreenCaptureKit events; secret inspection stays sampled on changing frames every 500ms with a 500ms walk budget to preserve redaction; the newest pending capture is inspected when due without another capture
 # NativeAgentCore/ManagedProcess.swift: kqueue NOTE_EXIT and checked waitid/waitpid own leader/member settlement and reaping; no polling or 500ms cutoff.
 # NativeAgentCore/NativeLoopbackListenerParameters.swift: Port diagnosis waits for lsof exit and EOF or owner cancellation.
-Modules/NativeAgentCore/Sources/PersistenceCore/PersistenceCore+FileLock.swift	*	2	timeout_retry_deadline	PersistenceFileLock
+# PersistenceCore/PersistenceCore+FileLock.swift: a busy lock waits in a blocking flock on its own thread while its holder lives. No poll or give-up.
 Modules/NativeAgentShared/Sources/NativeAgentShared/StoreReloadDebouncer.swift	*	1	event_deadline	Shared cancellable timer for store reloads, source invalidations, context directories and cognition microcycles
 # EngineRuntime/WorkOverviewRead+Today.swift: Today unions pending source changes and reads them after the held read finishes; no debounce timer.
 # ProviderRouting/LLMClient+CodexAdapter.swift: Stop ends every caller's wait; production retains codex.reply.produced at exit and EOF. No invocation timer.
@@ -138,7 +140,7 @@ Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift	Task.sleep(n
 Modules/NativeAgentCore/Sources/MacControl/MacAXEffectObservation.swift	*	1	event_deadline	MacAXEffectCollector signal deadline
 Modules/NativeAgentCore/Sources/MacControl/MacFourVerbsContracts.swift	*	1	event_deadline	MacFourVerbs.wait(seconds: caller-bounded settle wait)
 Modules/NativeAgentCore/Sources/MacControl/MacAppleEvents.swift	Task.sleep(nanoseconds: UInt64(seconds)	1	event_deadline	AppleScriptExecution Music-only bounded play (1-30 seconds); native per-call wait releases the script queue, cancellation ends the wait and exactly one settle stops only the original process/track/playback command; no polling or turn timer
-Modules/NativeAgentCore/Sources/NativeAgentCore/TurnDeadline.swift	*	1	timeout_retry_deadline	TurnDeadline.withThrowingDeadline (one sleeper; active-work pause/renew; wall-clock fixed; response-only expiry does not cancel work or supply its budget; Stop requests cancellation)
+Modules/NativeAgentCore/Sources/NativeAgentCore/TurnDeadline.swift	*	1	timeout_retry_deadline	TurnDeadline.withThrowingDeadline (one sleeper; active-work pause/renew; wall-clock fixed; a call's watch asks its CallLife owners on expiry and ends only on a dead answer; other expiry cancels the work as Stop does and releases the caller at once)
 # 2026-09-16: the mood-tint sampling clock, pre-existing and previously unclassified — it blocked every commit touching a timer file. One repeating sample behind the window tint; idempotent, stopped with the window.
 # 2026-09-17: the second_opinion tool's hard cap. The agent asked for this call, so the bound is its own wait, not one a turn absorbs; the losing side is cancelled and the outcome reads timeout.
 Modules/NativeAgentCore/Sources/EngineRuntime/ContactThreadReadouts.swift	Task.sleep(for: .milliseconds(150))	1	visible_ui	ContactThreadReadouts waits 150ms after a file tick so one message's several writes cause one read; only after a change, never polls
@@ -170,3 +172,13 @@ Modules/NativeAgentCore/Sources/DeviceSync/ICloudReceiving.swift	Task.sleep(for:
 
 # attn-l5: daily CognitiveReflectionLoop registration and six-hour same-material cooldown removed. Sleep/REM declarations and handlers withdrawn.
 # The night sense shares the existing residual event_deadline: away+30m, local hour boundaries and the body's 48h boundary; no timer primitive added.
+# desktop-lane-1114: timeout_retry_deadline through ScopedWaiter/TaskWaitDeadline, no timer primitive added. Each DesktopRouteObservation step of a desktop
+# operation (Grok Bot launch, activation, control, panel close, field read; DesktopChatRoute.until) waits at most 20s (routine creation 120s), capped by
+# the operation's own deadline; expiry ends that step and its operation, so a cancelled operation's cleanup cannot keep the desktop lane. Reply watches
+# keep no patience (Stop ends them). The person's keyboard is checked at once, never awaited.
+# desktop-lane-1114 (2): app launch for desktop routes (DesktopRouteObservation.openApplication) is bounded by the same 20s step patience through
+# OperationWaitBudget.withDeadline (TaskWaitDeadline); no timer primitive added. A desktop-lane takeover waits only for keys in flight, never on a dying holder.
+# desktop-lane-1114 (3): Grok Bot setup walks no panels; the routine-creation 120s row wait and panel/field/dismissal waits are deleted. The setup
+# answer read uses DesktopRouteObservation patience as 45s quiet spells (renewed while Grok writes) inside a 150s ceiling; no timer primitive added.
+# desktop-lane-1114 (4): Grok Bot setup has no wait at all: connect returns the message for the agent to send, and agent.grok_import reads the
+# chat once. The setup answer read's quiet spells and ceiling (note 3) are deleted.

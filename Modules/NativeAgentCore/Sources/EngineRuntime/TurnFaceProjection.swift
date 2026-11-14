@@ -71,7 +71,10 @@ actor TurnFaceProjection {
             let what = waiting && doing == nil ? turn?.currentAction
                 : preview?.imageError ?? (preview?.isShowable == true ? preview?.caption : doing ?? turn?.currentAction)
             let value = TurnFace(
-                sessionID: session, turnID: state?.identity.turnId, activeTurnID: input.active[session], phase: turn?.phase,
+                sessionID: session, turnID: state?.identity.turnId, activeTurnID: input.active[session],
+                // The ending as it stands now: a turn waiting on an approval stops waiting once the approval is decided.
+                phase: state.map { TurnCardReadout.phase(of: $0, approvals: approvalSnapshot.records,
+                    parseTimestamp: NativeTimestampFormat.parseISO8601FractionalFirst) },
                 isInFlight: inFlightSessions.contains(session),
                 card: TurnCardReadout.card(for: state, sessionId: session, personaName: input.name,
                     approvals: approvalSnapshot.records, parseTimestamp: NativeTimestampFormat.parseISO8601FractionalFirst),

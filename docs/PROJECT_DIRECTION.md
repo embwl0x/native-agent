@@ -62,7 +62,7 @@ Under Full Mac, the agent acts autonomously on admitted surfaces without routine
 approval cards. Explicit blocks and security checks still apply; macOS grants
 remain separate. **Resetting macOS privacy permissions always asks the owner.**
 
-A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. These boundaries live in
+A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. A note from your agent to you (`chat.post`) is never held, whoever steered the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. These boundaries live in
 `SecurityCenter.swift` and `PeerTurnEffectPolicy.swift`, not in prompt guesses.
 Agents enabled in Trust → Connected agents carry the owner's authority on
 authenticated turns; ordinary Trust and domain checks still apply.

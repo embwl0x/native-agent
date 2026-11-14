@@ -8,7 +8,8 @@ import PersistenceCore
 // Blueprint: | `EngineBodyNerve.swift` | `BodyNerve`: each beat re-reads the body; a newly felt deviation becomes a somatic signal and a fault owes repair |
 
 /// The body's integrator. Every beat re-reads the whole body, so an organ's silence is noticed as soon as any other organ beats. A deviation the nerve has
-/// not felt (new, changed, or doubled) becomes one `organDeviated` signal; a failed or stuck organ owes repair once, settled by its next completed pass.
+/// not felt (new, changed, or doubled) becomes one `organDeviated` signal; a failed or stuck organ owes repair once, settled by its next completed pass
+/// (a stuck organ's also by a busy beat, which says it is not stuck).
 /// What it has felt and what is owed live in `mind/body_nerve.json`, so a relaunch neither signals an ongoing deviation again nor forgets its debt.
 public actor BodyNerve {
     struct Memory: Codable, Equatable {
@@ -61,7 +62,10 @@ public actor BodyNerve {
         guard let body = read else { return }
         await RepairOwed.settle(dataRoot, operation: Self.recordOperation, evidence: .init(source: "mind.body", id: "read")).value
         guard var memory = load() else { return }
-        let settled = memory.owed.intersection(completed)
+        // A completed pass settles what the organ owes. So does a busy beat for a repair owed for being stuck (no failure in its kept beats):
+        // busy is a slot held by other work, not a hold, so the organ is not stuck and that repair is no longer owed. A failure stays owed.
+        let unstuck = body.lines.filter { $0.latest.outcome == .busy && !$0.failedInRecord }.map(\.organ)
+        let settled = memory.owed.intersection(completed.union(unstuck))
         completed = []
         let unfelt = body.unfelt(memory.felt)
         let owing = unfelt.filter { line in
@@ -96,8 +100,9 @@ public actor BodyNerve {
                            lever: "Read mind.body for its last beats and repair the cause its note names; its next completed pass settles this.")
         }
         guard !unfelt.isEmpty else { return }
+        // The nerve is attached only while a mind runs; one closed meanwhile feels nothing more.
         Task {
-            let cognition = NativeAgentEngine.liveCognition
+            guard let cognition = NativeAgentEngine.liveCognition else { return }
             for line in unfelt {
                 guard let deviation = line.deviation else { continue }
                 await cognition.ingestOrganismSignal(kind: .organDeviated, sourceOrgan: "organ." + line.organ,

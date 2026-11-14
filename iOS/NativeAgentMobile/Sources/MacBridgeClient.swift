@@ -50,8 +50,9 @@ final class MacBridgeClient: ObservableObject {
 
     init(bridge: iCloudBridge = .shared) {
         self.bridge = bridge
-        bridgeAvailabilityCancellable = bridge.$available.combineLatest(bridge.$accountFailure, bridge.$lastMacConfirmationAt)
-            .sink { [weak self] _, _, _ in
+        bridgeAvailabilityCancellable = bridge.$available.combineLatest(bridge.$accountFailure, bridge.$lastMacConfirmationAt,
+                                                                         bridge.$pushSubscriptionsReady)
+            .sink { [weak self] _, _, _, _ in
                 Task { @MainActor in
                     self?.objectWillChange.send()
                     if self?.bridge.lastMacConfirmationAt != nil { self?.isConnecting = false }
@@ -110,6 +111,7 @@ final class MacBridgeClient: ObservableObject {
             return .init(.waiting, "Waiting for you to pair on your Mac", owner: .personOnMac,
                          lever: "On your Mac, open Connectors \u{203A} iPhone, match the code and choose Pair.")
         }
+        if let step = pairingStore.confirmationStep { return .init(.waiting, step) }
         return .init(.holds, "Paired with your Mac")
     }
 
@@ -142,6 +144,11 @@ final class MacBridgeClient: ObservableObject {
         } else {
             transport = .init(.waiting, "Not connected yet; pairing starts it")
         }
+        // A wake subscription iCloud would not take is said, never skipped; the phone still reads whenever the app opens.
+        if bridge.pushSubscriptionsReady == false, transport.state == .holds {
+            transport = .init(.waiting, "iCloud can\u{2019}t wake this phone for your Mac\u{2019}s messages; I read them whenever the app opens",
+                         owner: .network, lever: "Nothing to do here: the app registers the wake again each time it opens.")
+        }
         return NAPhoneConnection(pairing: pairingFact, transport: transport, exchange: exchange)
     }
 
@@ -164,16 +171,12 @@ final class MacBridgeClient: ObservableObject {
             throw SyncError.busy("Connection repair is in progress.")
         }
         let sync = iCloudSyncEngine.shared
-        try bridge.requireIdleSendForConnectionRepair()
-        try sync.requireIdleActionForConnectionRepair()
         pairingStore.isRepairingConnection = true
         defer { pairingStore.isRepairingConnection = false }
         let mailboxes = sync.connectionRepairMailboxes()
         try await iCloudSyncEngine.reconcileActionsForConnectionRepair(
             transactions: mailboxes.transactions, responses: mailboxes.responses
         )
-        try bridge.requireIdleSendForConnectionRepair()
-        try sync.requireIdleActionForConnectionRepair()
         try pairingStore.clearPairingForConnectionRepair()
         connectionGeneration += 1
         isConnecting = false
@@ -231,6 +234,8 @@ final class MacBridgeClient: ObservableObject {
             expectedPairing: expectedPairing,
             onPrepared: onPrepared
         )
+        // One read once the send has landed; the reply's next words come with the next event (open, push, Talk), never a push alone.
+        Task { _ = await self.pollICloudRepliesNow() }
         return msg.id
     }
 

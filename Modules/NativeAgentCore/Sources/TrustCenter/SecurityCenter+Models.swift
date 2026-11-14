@@ -10,12 +10,21 @@ public enum PairedPhoneAuthority {
         public let id: String
         public let publicKey: Data
         public var status: Status
+        /// The phone acknowledged this Mac's acceptance. Until it does, that acceptance is owed to the phone and resent.
+        public var confirmed: Bool?
+        /// This acceptance's identity, new each time the phone becomes paired; only an acknowledgement echoing it settles what is owed.
+        public var acceptance: String?
 
-        public init(id: String, publicKey: Data, status: Status) {
+        public init(id: String, publicKey: Data, status: Status, confirmed: Bool? = nil, acceptance: String? = nil) {
             self.id = id
             self.publicKey = publicKey
             self.status = status
+            self.confirmed = confirmed
+            self.acceptance = acceptance
         }
+
+        /// Accepted here with the Pair button, and the phone has not yet said it heard.
+        public var confirmationOwed: Bool { status == .paired && confirmed != true }
     }
 
     public static func pairedCountChecked(at url: URL) throws -> Int {

@@ -113,18 +113,13 @@ extension ApprovalExecution {
             case .spent:
                 break
             case .alreadySpent:
+                // Its spend says it started before the app died: settled once as interrupted, effects unknown, never replayed.
                 if (try? await inbox.get(rec.id).executedAction) == nil {
+                    let interrupted = Self.interruptedSettlement(action: replay.toolName, op: "chat_tool_approval_replay",
+                        fields: ["tool": .string(replay.toolName), "surface": .string(replay.surface),
+                                 "error": .string("execution already started; automatic replay refused")])
                     try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                        rec.id,
-                        executedAction: .object([
-                            "op": .string("chat_tool_approval_replay"),
-                            "tool": .string(replay.toolName),
-                            "surface": .string(replay.surface),
-                            "status": .string("outcome_unknown"),
-                            "error": .string("execution already started; automatic replay refused"),
-                        ]),
-                        detail: "\(replay.toolName) may have started before interruption; it was not replayed automatically."
-                    )
+                        rec.id, executedAction: interrupted.action, detail: interrupted.detail)
                 }
                 await ensureChatToolApprovalOutcomeReceipt(approvalID: rec.id, dataRoot: dataRoot, continuation: continuation)
                 return
@@ -281,6 +276,9 @@ extension ApprovalExecution {
         let prose = rec.decisionExperience.face?.words ?? ""
         // Serialize the preserved result class and redacted evidence for transcript readers.
         var envelope: [String: JSONValue] = ["detail": .string(prose)]
+        // Which card it was and who decided it, beside what it did.
+        envelope["card"] = .string(TurnTraceRedactor.redactText(rec.title) + " (" + rec.id + ")")
+        if let decider = rec.decider { envelope["decided_by"] = .string(decider) }
         if let approvedBy = rec.approvedBy { envelope["approved_by"] = .string(approvedBy) }
         if case .object(let execution) = executedAction,
            let notRun = execution["not_run_status"] {

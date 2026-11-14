@@ -11,6 +11,7 @@ import MacControl
 extension OwnedProgramExecution {
     func macOperation(dataRoot: URL) -> MacOperationContext {
         var context = MacOperationContext(dataRoot: dataRoot, deadline: deadline)
+        context.life = turn?.enclosingCall ?? deadlines.innermostCall
         context.handsBack = options.handsBack
         context.readContent = readContent
         return context
@@ -282,18 +283,32 @@ struct ToolHost: OwnedProgramHostProfile {
         }
         if let refused = await checkPrimitive(operation, arguments: arguments, execution: execution) { return refused }
         if operation == "model.call" { return try await performPrimitive(operation, arguments: arguments, execution: execution) }
-        // Watch frames and program reads/close stay inside their admitted operation while the same enabled version owns them.
+        // Watch frames and program reads/close stay inside their admitted operation while the same enabled version owns them. They reach
+        // their broker without crossing the door, so each takes its call bound here; every other primitive takes it at the door.
         if ToolPrimitiveBroker.frameOperations.contains(operation) || ["program.receive", "program.close"].contains(operation) {
-            do {
+            let read = ToolPrimitiveBroker.readOnly(operation, arguments)
+            let run: @Sendable (OwnedProgramExecution) async throws -> JSONValue = { execution in
                 if operation.hasPrefix("program.") {
-                    do { try await admission() } catch { await broker.end(arguments); throw error }
+                    do { try await self.admission() } catch { await self.broker.end(arguments); throw error }
                 }
-                return Self.receipt(try await broker.perform(operation, arguments: arguments, host: base, execution: execution,
-                    openScreenWatch: openScreenWatch),
-                                    effects: ToolPrimitiveBroker.readOnly(operation, arguments) ? "none" : "occurred")
+                return Self.receipt(try await self.broker.perform(operation, arguments: arguments, host: self.base, execution: execution,
+                    openScreenWatch: self.openScreenWatch), effects: read ? "none" : "occurred")
             }
-            catch {
-                return Self.failure(error, effects: ToolPrimitiveBroker.readOnly(operation, arguments) ? "none" : "unknown", execution: "attempted")
+            do {
+                return try await CallBound.run(name: operation, declared: CallBound.declaredSeconds(input: Parts.fields(arguments)),
+                    deadlines: execution.deadlines, enclosing: execution.turn?.enclosingCall) { deadlines, call in
+                    var bounded = execution
+                    bounded.deadlines = deadlines
+                    bounded.turn = execution.turn?.with(\.enclosingCall, call)
+                    return try await run(bounded)
+                }
+            } catch let ended where CallBound.ended(ended, name: operation) != nil {
+                var receipt = CallBound.ended(ended, name: operation)?.objectValue ?? [:]
+                if read { receipt["effects"] = .string("none") }
+                receipt["result"] = .null
+                return .object(receipt)
+            } catch {
+                return Self.failure(error, effects: read ? "none" : "unknown", execution: "attempted")
             }
         }
         // Each new effect requires current ability admission and Trust; refused program input ends its program.

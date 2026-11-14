@@ -93,6 +93,45 @@ extension SwiftNativeProviderRouting {
         }
         return provider
     }
+    /// Why a helper may not hold a pinned model: the cause's own code and words, and the argument it belongs to (nil when no argument is wrong).
+    public struct BotModelRefusal: Sendable, Equatable {
+        public let field: String?
+        public let code: String
+        public let message: String
+    }
+    /// May a helper hold this model? Asked in the order the causes stand: the account is connected, its model list reads, then the model is
+    /// one the account offered (`ModelSlot.mayHold`, over the same rows `botModelChoices` lists) or the one this helper already holds (`held`),
+    /// so re-saving it with other settings is not a choice. Nil when it may; else the first cause, in its own words.
+    public func botModelRefusal(provider: String, model: String, held: String?) throws -> BotModelRefusal? {
+        let openRouterModels = OpenRouterModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
+        let moonshotModels = MoonshotModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
+        let route = Self.normalizeProviderId(provider)
+        let notConnected = "\(provider) is not connected. Connect it in Providers, or choose an account that is."
+        guard let account = try nativeListProviders(openRouterModels: openRouterModels, moonshotModels: moonshotModels).providers
+                .first(where: { $0.configured == true && Self.normalizeProviderId($0.id) == route }) else {
+            return .init(field: "provider", code: "provider_not_connected", message: notConnected)
+        }
+        let readiness = providerReadiness(id: account.id)
+        guard readiness.ready else {
+            return .init(field: "provider", code: "provider_not_connected",
+                         message: readiness.detail.isEmpty ? notConnected : "\(notConnected) \(readiness.detail)")
+        }
+        if let fault = catalogRows(account.id).fault {
+            return .init(field: nil, code: "model_catalog_unavailable", message: fault)
+        }
+        guard case .array(let rows)? = account.modelCatalog,
+              let row = FirstPartyModelCatalog.pickerRow(model, providerID: account.id, rows: rows, dataRoot: dataRoot) else {
+            return .init(field: "model", code: "model_not_offered",
+                         message: "\(provider) does not list \(model). Pick a model from bot.list include_models true.")
+        }
+        guard ModelSlot.mayHold(model, rowOffered: row["offered"] != .bool(false), savedInSlot: held) else {
+            var note: String?
+            if case .object(let extras)? = account.extras { note = extras["models_note"]?.stringValue }
+            return .init(field: "model", code: "model_not_offered",
+                         message: ModelSlot.refusal(note: note, accountName: Self.displayName(for: account.id)))
+        }
+        return nil
+    }
     /// Local choices for helper creation; no network probe or setting change. The normal creation gate still validates the explicitly chosen tuple.
     public func botModelChoices() throws -> JSONValue {
         let openRouterModels = OpenRouterModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }

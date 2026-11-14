@@ -446,7 +446,9 @@ public enum DreamBackgroundWork {
     ) -> DreamCareNightProvider {
         let runtime = cognitionRuntime
         return { @Sendable in
-            try await runtime.substrateForIntegration().careNightMaterial()
+            // A cold model is loaded for the night, never a failed night; a model that cannot load fails it with its own cause.
+            try await runtime.warmEmbedderForOwnWork()
+            return try await runtime.substrateForIntegration().careNightMaterial()
         }
     }
 

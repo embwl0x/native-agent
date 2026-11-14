@@ -18,7 +18,11 @@ optional `rhythm`, `until`, `say` and `action: {action, args?}`, with its origin
 and reply route. Older action strings read as `{action: string}`.
 `queue.add` and `queue.update` accept `at <ISO time>`, a plain local date/time
 with optional weekday (for example `Sun Nov 1 at 06:00`), `every <five-field cron>`, `every N
-minutes|hours|days`, or a recurring schedule object as `when`. The stored
+minutes|hours|days`, or a recurring schedule object as `when`. A relative
+amount of time is one moment that far from now, for `when` and `until` alike:
+`in N seconds|minutes|hours|days`, or an object naming `seconds`, `minutes`,
+`hours`, `days` or `intervalSeconds` with no rhythm kind (none, `once` or `at`),
+such as `{seconds: 120}`. The stored
 clock rhythm uses `IntentionClock`; it is not a new store or a `moments`
 array. An omitted rhythm end is `standing`; a single moment defaults to
 `once`. A condition in words closes when the after-turn judgment sees it met.

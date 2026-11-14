@@ -3,17 +3,46 @@ import NaturalLanguage
 // Blueprint: | `SwiftNativeKnowledgeGraphIndexer+EntityExtraction.swift` | `SwiftNativeKnowledgeGraphIndexer`: `extractEntities`, `taggedNameIsCredible` |
 
 extension SwiftNativeKnowledgeGraphIndexer {
+    /// Lowercased alias to the one entity it names: that entity's name and its one type, and the alias as the text wrote it.
+    typealias StatedAliases = [String: (name: String, type: String, alias: String)]
+
+    /// One text alone: an alias it states merges only within it. Indexing reads the aliases every fact states (`extractCorpus`).
     public nonisolated static func extractEntities(
         from content: String,
-        knownPeople: [String] = []
+        knownPeople: [String] = [],
+        knownAgents: [String: String] = [:]
     ) -> [KnowledgeGraphExtractedEntity] {
+        extractCorpus([content], knownPeople: knownPeople, knownAgents: knownAgents)[0]
+    }
+
+    /// Each text's entities, with every alias any of the texts states merged into one entity wherever either name is written.
+    nonisolated static func extractCorpus(_ contents: [String], knownPeople: [String],
+                                          knownAgents: [String: String]) -> [[KnowledgeGraphExtractedEntity]] {
+        let found = contents.map { namesIn($0, knownPeople: knownPeople, knownAgents: knownAgents) }
+        let aliases = statedAliases(zip(contents, found).map { (content: $0, entities: $1) }, knownPeople: knownPeople,
+                                    knownAgents: knownAgents)
+        return zip(contents, found).map {
+            resolvingAliases($1, in: $0, aliases: aliases, knownPeople: knownPeople, knownAgents: knownAgents)
+        }
+    }
+
+    /// The names one text yields, each typed only by what the text says of it: a known person, one of the agent's contacts (an agent,
+    /// whichever of its names is written), the tagger's reading of the sentence, or a file's own extension. A name with no stated kind stays
+    /// a concept; no fixed table of names assigns a kind.
+    nonisolated static func namesIn(_ content: String, knownPeople: [String],
+                                    knownAgents: [String: String] = [:]) -> [KnowledgeGraphExtractedEntity] {
         let summary = "Mentioned in memory: \(clip(content, limit: 220))"
         var ordered: [KnowledgeGraphExtractedEntity] = []
         var seen: Set<String> = []
 
         func add(_ rawName: String, forcedType: String? = nil) {
-            guard let name = cleanEntityName(canonicalFileEntityName(rawName)) else { return }
-            let type = forcedType ?? inferType(name)
+            guard var name = cleanEntityName(canonicalFileEntityName(rawName)) else { return }
+            var type = forcedType ?? inferType(name)
+            // A contact's name, handle, host or distinctive first word is that contact: one agent entity under its own name.
+            if let contact = knownAgents[name.lowercased()] {
+                name = contact
+                type = "agent"
+            }
             // One node per name: people are added first, and the first type to claim a name wins.
             let key = name.lowercased()
             guard !seen.contains(key) else { return }
@@ -24,10 +53,16 @@ extension SwiftNativeKnowledgeGraphIndexer {
         for person in knownPeople where !person.isEmpty && knownTermMentioned(person, in: content) {
             add(person, forcedType: "person")
         }
-        for term in knownTerms {
-            if content.range(of: term.pattern, options: [.regularExpression, .caseInsensitive]) != nil {
-                add(term.name, forcedType: term.type)
-            }
+        // Longest first, so "Grok Bot" is found as itself before its first word.
+        for term in knownAgents.keys.sorted(by: { $0.count != $1.count ? $0.count > $1.count : $0 < $1 })
+        where knownTermMentioned(term, in: content) {
+            add(term)
+        }
+        // Capitalization alone cannot establish an entity; known whole-name mentions override the tagger.
+        let tagged = taggedNames(in: content, knownPeople: knownPeople)
+        // A familiar name is found even where the tagger misses it, but its kind is still the sentence's.
+        for term in knownTerms where content.range(of: term.pattern, options: [.regularExpression, .caseInsensitive]) != nil {
+            add(term.name, forcedType: tagged.first { $0.0.lowercased() == term.name.lowercased() }?.1)
         }
 
         for match in regexCaptures(#"`([^`]{2,80})`"#, in: content) {
@@ -38,12 +73,162 @@ extension SwiftNativeKnowledgeGraphIndexer {
         for match in regexMatches(#"\b[A-Za-z0-9_./-]+\.(?:app|md|json|swift|sqlite|mlpackage|mlmodelc)\b"#, in: content) {
             add(match)
         }
-        // Capitalization alone cannot establish an entity; known whole-name mentions override the tagger.
-        for (name, type) in taggedNames(in: content, knownPeople: knownPeople) {
+        for (name, type) in tagged {
             add(name, forcedType: type)
         }
 
         return Array(ordered.prefix(24))
+    }
+
+    /// Pairs of names a text explicitly says are one, as people say a name: "A, aka / also known as / known as / also called B", "A is B",
+    /// "A is X's B", "A is X's name for B", "X's B is named / called / known as A", "B, named / called A", "B goes by A". Both must be names
+    /// the text yields, so a kind word ("Agent is User's agent") merges nothing, and a parenthesis or a list is never an alias.
+    nonisolated static func statedAliasPairs(in content: String, names: [String]) -> [(String, String)] {
+        let byKey = Dictionary(names.map { ($0.lowercased(), $0) }, uniquingKeysWith: { first, _ in first })
+        guard byKey.count > 1 else { return [] }
+        let alternation = byKey.values.sorted { $0.count > $1.count }.map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|")
+        let name = "(?<![\\p{L}\\p{N}])(\(alternation))(?![\\p{L}\\p{N}]|['’]s\\b)"
+        let owner = "(?:(?:my|your|our|his|her|their)\\s+|(?!(?:it|that|what|there|here|who|he|she|let)['’]s)[\\p{L}\\p{N}]+['’]s\\s+)"
+        let aka = "(?:aka|a\\.k\\.a\\.?|also known as|known as|also called)"
+        // The second name ends its clause, so "Swift is my Apple language" never makes Swift and Apple one.
+        let ends = "(?=\\s*(?:[.,;:!?)\"”'’\\-–—]|$)|\\s+(?:and|but|who|which|that|so|because)\\b)"
+        let quote = "[\"“'‘]?"
+        let forms = [
+            "\(name)\\s*,?\\s*\(aka)\\s+\(owner)?\(name)\(ends)",
+            "\(name)\\s+(?:is|was)\\s+(?:just\\s+|simply\\s+|really\\s+)?\(owner)?(?:name\\s+for\\s+\(owner)?)?\(name)\(ends)",
+            "\(name)\\s+(?:is|was)\\s+(?:also\\s+)?(?:named|called|nicknamed|known\\s+as)\\s+\(quote)\(name)\(ends)",
+            "\(name)\\s*,\\s*(?:named|called|nicknamed)\\s+\(quote)\(name)\(ends)",
+            "\(name)\\s+(?:goes|went)\\s+by\\s+\(quote)\(name)\(ends)",
+        ]
+        let whole = NSRange(content.startIndex..., in: content)
+        var pairs: [(String, String)] = []
+        for form in forms {
+            guard let regex = try? NSRegularExpression(pattern: form, options: [.caseInsensitive]) else { continue }
+            for match in regex.matches(in: content, range: whole) {
+                guard let first = Range(match.range(at: 1), in: content), let second = Range(match.range(at: 2), in: content),
+                      let a = byKey[content[first].lowercased()], let b = byKey[content[second].lowercased()],
+                      a.lowercased() != b.lowercased() else { continue }
+                pairs.append((a, b))
+            }
+        }
+        return pairs
+    }
+
+    /// Every alias the texts state, each mapped to the one name its group keeps (a known person if the group holds one, else a contact,
+    /// else the name stated first) and the one type it has, decided once: a person if the group holds a known person, an agent if it holds
+    /// a contact, else the first stated kind any of its names has in the texts, else a concept.
+    nonisolated static func statedAliases(_ texts: [(content: String, entities: [KnowledgeGraphExtractedEntity])],
+                                          knownPeople: [String], knownAgents: [String: String] = [:]) -> StatedAliases {
+        var parent: [String: String] = [:]
+        var written: [String: String] = [:]
+        var order: [String] = []
+        func root(_ key: String) -> String {
+            var key = key
+            while let next = parent[key], next != key { key = next }
+            return key
+        }
+        for text in texts {
+            for (a, b) in statedAliasPairs(in: text.content, names: text.entities.map(\.name)) {
+                for name in [a, b] where written[name.lowercased()] == nil {
+                    written[name.lowercased()] = name
+                    parent[name.lowercased()] = name.lowercased()
+                    order.append(name.lowercased())
+                }
+                let (left, right) = (root(a.lowercased()), root(b.lowercased()))
+                if left != right { parent[right] = left }
+            }
+        }
+        var groups: [String: [String]] = [:]
+        for key in order { groups[root(key), default: []].append(key) }
+        let people = knownPeople.map { $0.lowercased() }
+        let contacts = Set(knownAgents.values.map { $0.lowercased() })
+        var aliases: StatedAliases = [:]
+        for members in groups.values {
+            let kept = people.first { members.contains($0) } ?? members.first { contacts.contains($0) } ?? members[0]
+            let name = knownPeople.first { $0.lowercased() == kept } ?? knownAgents.values.first { $0.lowercased() == kept }
+                ?? written[kept] ?? kept
+            let stated = texts.lazy.flatMap { $0.entities }.first { members.contains($0.name.lowercased()) && $0.type != "concept" }?.type
+            let type = people.contains(kept) ? "person" : contacts.contains(kept) ? "agent" : stated ?? "concept"
+            for key in members where key != kept { aliases[key] = (name, type, written[key] ?? key) }
+        }
+        return aliases
+    }
+
+    /// Names stated as one become that one entity, under the name its group keeps and carrying every alias it is known by; an alias names
+    /// its entity wherever it is written, whether or not the tagger read it as a name. A group holding a known person is that person.
+    nonisolated static func resolvingAliases(
+        _ found: [KnowledgeGraphExtractedEntity], in content: String, aliases: StatedAliases, knownPeople: [String],
+        knownAgents: [String: String] = [:]
+    ) -> [KnowledgeGraphExtractedEntity] {
+        guard !aliases.isEmpty else { return found }
+        let people = Set(knownPeople.map { $0.lowercased() })
+        let contacts = Set(knownAgents.values.map { $0.lowercased() })
+        let summary = "Mentioned in memory: \(clip(content, limit: 220))"
+        var mentioned = found
+        for key in aliases.keys.sorted() where !found.contains(where: { $0.name.lowercased() == key }) {
+            guard let entry = aliases[key], knownTermMentioned(entry.alias, in: content) else { continue }
+            mentioned.append(KnowledgeGraphExtractedEntity(name: entry.alias, type: entry.type, summary: summary))
+        }
+        // The group's one type, by the name it keeps, so a mention of that name alone is the same entity too.
+        let types = Dictionary(aliases.values.map { ($0.name.lowercased(), $0.type) }, uniquingKeysWith: { first, _ in first })
+        var ordered: [KnowledgeGraphExtractedEntity] = []
+        for entity in mentioned {
+            let name = aliases[entity.name.lowercased()]?.name ?? entity.name
+            guard !ordered.contains(where: { $0.name.lowercased() == name.lowercased() }) else { continue }
+            let known = aliases.values.filter { $0.name.lowercased() == name.lowercased() }.map(\.alias).sorted()
+            let type = types[name.lowercased()] ?? (people.contains(name.lowercased()) ? "person"
+                : contacts.contains(name.lowercased()) ? "agent" : entity.type)
+            ordered.append(KnowledgeGraphExtractedEntity(name: name, type: type, summary: entity.summary, aliases: known))
+        }
+        return Array(ordered.prefix(24))
+    }
+
+    /// The agent's contacts by every name they are written as, each to the contact's own name: its name, its handles, its endpoint's host
+    /// as words ("grok-bot" is "grok bot"), and its name's first word when that word is distinctive (one contact's alone, not a known name in
+    /// `taken`, not a stopword: "Grok" of "Grok Bot"). A row associated with another contact (`who`) is that contact. `ids` is each
+    /// contact's own name (lowercased) to its id as the app names it (`peer:<id>`); a name two contacts share links neither. Read from
+    /// `agents/peers.json` once per index pass; no file is no contacts, and an unreadable one stops indexing with its repair.
+    nonisolated static func contactNames(peersURL: URL, taken: Set<String>) throws -> (names: [String: String], ids: [String: String]) {
+        let data: Data
+        do { data = try Data(contentsOf: peersURL) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return ([:], [:]) }
+        guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw MemoryStorageError.databaseUnavailable("""
+                \(peersURL.path) is not a contact list; repair the agent's contacts before graph indexing.
+                """)
+        }
+        let byID = Dictionary(rows.compactMap { row in (row["id"] as? String).map { ($0, row) } }, uniquingKeysWith: { first, _ in first })
+        var names: [String: String] = [:]
+        var ids: [String: String] = [:]
+        var shared: Set<String> = []
+        var firstWords: [String: Set<String>] = [:]
+        for row in rows {
+            let owner = (row["who"] as? String).flatMap { byID[$0] } ?? row
+            guard let contact = (owner["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !contact.isEmpty else { continue }
+            if let id = owner["id"] as? String, !id.isEmpty {
+                if let known = ids[contact.lowercased()], known != "peer:" + id { shared.insert(contact.lowercased()) }
+                ids[contact.lowercased()] = "peer:" + id
+            }
+            var written = [row["name"] as? String ?? ""] + ((row["handles"] as? [String]) ?? []).filter { !$0.contains(":") }
+            if let host = (row["endpoint"] as? String).flatMap(URL.init(string:))?.host?.replacingOccurrences(of: "-", with: " "),
+               host.allSatisfy({ $0.isLetter || $0 == " " }) {
+                written.append(host)
+            }
+            for raw in written {
+                guard let name = cleanEntityName(raw) else { continue }
+                if names[name.lowercased()] == nil { names[name.lowercased()] = contact }
+                let words = name.split(separator: " ").map(String.init)
+                if words.count > 1, let first = words.first, first.count >= 3, first.allSatisfy(\.isLetter),
+                   cleanEntityName(first) != nil {
+                    firstWords[first.lowercased(), default: []].insert(contact)
+                }
+            }
+        }
+        for (word, owners) in firstWords where owners.count == 1 && names[word] == nil && !taken.contains(word) {
+            names[word] = owners.first
+        }
+        for name in shared { ids[name] = nil }
+        return (names, ids)
     }
 
     private nonisolated static func taggedNames(
@@ -252,58 +437,29 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return regex.firstMatch(in: token, range: range) != nil
     }
 
+    /// A kind the name itself states: the words "user" or "assistant", a file's extension, an event word. Any other name is a concept.
     private static func inferType(_ name: String) -> String {
         let lower = name.lowercased()
         if ["user", "the user", "assistant", "the assistant"].contains(lower) {
             return "person"
         }
-        if ["nativeagent", "openclaw", "hermes", "clawdeck"].contains(lower) {
-            return "project"
-        }
         if lower.hasSuffix(".md") || lower.hasSuffix(".json") || lower.hasSuffix(".swift")
-            || lower.hasSuffix(".app") || lower.hasSuffix(".sqlite")
-            || ["swift", "coreml", "core ml", "macos", "telegram", "openai", "anthropic", "tradingview", "apns", "mcp"].contains(lower) {
+            || lower.hasSuffix(".app") || lower.hasSuffix(".sqlite") {
             return "tool"
         }
-        if lower == "apple" { return "organization" }
         if lower.contains("launch") || lower.contains("sunday") || lower.contains("rem cycle") {
             return "event"
         }
         return "concept"
     }
 
-    private static let knownTerms: [(name: String, type: String, pattern: String)] = [
-        ("NativeAgent", "project"),
-        ("Claude", "tool"),
-        ("GPT", "tool"),
-        ("Astra", "tool"),
-        ("Gemini", "tool"),
-        ("Kimi", "tool"),
-        ("Grok", "tool"),
-        ("Mistral", "tool"),
-        ("Llama", "tool"),
-        ("DeepSeek", "tool"),
-        ("Swift", "tool"),
-        ("CoreML", "tool"),
-        ("Core ML", "tool"),
-        ("Apple", "organization"),
-        ("macOS", "tool"),
-        ("Telegram", "tool"),
-        ("OpenAI", "tool"),
-        ("Anthropic", "tool"),
-        ("TradingView", "tool"),
-        ("APNS", "tool"),
-        ("MCP", "tool"),
-        ("Hermes", "project"),
-        ("OpenClaw", "project"),
-        ("ClawDeck", "project"),
-        ("SOUL.md", "tool"),
-        ("VOICE.md", "tool"),
-        ("USER.md", "tool"),
-        ("GROWTH.md", "tool"),
-        ("AGENTS.md", "tool"),
-    ].map { name, type in
-        (name, type, "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b")
+    /// Familiar names found even where the tagger misses them; each is typed by its sentence, never by this list.
+    private static let knownTerms: [(name: String, pattern: String)] = [
+        "NativeAgent", "Claude", "GPT", "Astra", "Gemini", "Kimi", "Grok", "Mistral", "Llama", "DeepSeek", "Swift", "CoreML", "Core ML",
+        "Apple", "macOS", "Telegram", "OpenAI", "Anthropic", "TradingView", "APNS", "MCP", "Hermes", "OpenClaw", "ClawDeck",
+        "SOUL.md", "VOICE.md", "USER.md", "GROWTH.md", "AGENTS.md",
+    ].map { name in
+        (name, "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b")
     }
 
     private static let canonicalPersonaDocuments: [String: String] = [

@@ -58,17 +58,21 @@ enum QuietSelfAdminRender {
                 instruction: "Read this page again after its owner publishes; preserve the owner's failure if it remains unavailable.",
                 next: ["page": .string(page.id)])]
         }
-        var sections: [JSONValue] = snapshot.text(title: page.title, door: true, page: page.id).components(separatedBy: "\n\n")
-            .filter { !$0.isEmpty }.map { block in
-                var lines = block.components(separatedBy: "\n")
-                var heading = page.title
-                if let first = lines.first, first == snapshot.face?.title || first.hasSuffix(":") {
-                    heading = first.hasSuffix(":") ? String(first.dropLast()) : first
-                    lines.removeFirst()
-                }
-                // The face's text already bounds each row's words and keeps its reference (id, link, calls) whole; it is not cut again.
-                return .object(["heading": .string(heading), "lines": .array(lines.map(JSONValue.string))])
+        // A block starting with the face's title or a section's title ("Entities:") is headed by it; an untitled block by the face's title, or
+        // the page's. The face's title alone is no section: it heads the untitled blocks after it, so the page never reads an empty heading.
+        var untitled = page.title
+        var sections: [JSONValue] = []
+        for block in snapshot.text(title: page.title, door: true, page: page.id).components(separatedBy: "\n\n") where !block.isEmpty {
+            var lines = block.components(separatedBy: "\n")
+            var heading = untitled
+            if let first = lines.first, first == snapshot.face?.title || first.hasSuffix(":") {
+                heading = first.hasSuffix(":") ? String(first.dropLast()) : first
+                lines.removeFirst()
             }
+            if lines.isEmpty, heading == snapshot.face?.title { untitled = heading; continue }
+            // The face's text already bounds each row's words and keeps its reference (id, link, calls) whole; it is not cut again.
+            sections.append(.object(["heading": .string(heading), "lines": .array(lines.map(JSONValue.string))]))
+        }
         // A page whose drawer is not known yet says nothing about it rather than guess.
         if let drawer = await appModel.engine.pages.drawer(page: page.id) {
             sections.append(.object(["heading": .string("How this page changes"), "lines": .array([.string(changeLine(drawer))])]))

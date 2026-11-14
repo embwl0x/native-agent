@@ -57,7 +57,7 @@ struct ACPJobDoor: JobRunner {
         do {
             let reply = try await client.turn(executable: approved.path, arguments: line.arguments, directory: folder, environment: environment,
                 message: resuming == nil ? job.brief : JobDoors.resumed(job.brief), peerCredential: "", mcpServers: [], line: line,
-                conversationID: resuming, approvedExecutable: approved, timeout: nil,
+                conversationID: resuming, approvedExecutable: approved, capped: false,
                 permission: { request in
                     await JobDoorBroker.answer(Self.ask(request), job: job, record: record, cwd: folder, out: out, dataRoot: dataRoot)
                 },

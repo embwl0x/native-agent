@@ -255,7 +255,10 @@ final class BodySettingsActHandler: FaceActHandler {
             let root = engine.dataRoot
             let saved = try await Self.saveGrok(contact: request.contact, secret: secret, root: root)
             guard saved else {
-                throw PartCallError(code: "grok_credentials_invalid", message: "Paste one JSON object with url and key. Nothing was saved.")
+                throw PartCallError(code: "grok_credentials_invalid", message: """
+                    Paste the webhook address and key: {"url":"…","key":"…"}, or the address and the key one after the other separated by a space or \
+                    a new line. Nothing was saved.
+                    """)
             }
             var issue: WireFailure?
             do { _ = try await engine.connectors.refresh().get() }

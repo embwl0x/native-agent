@@ -230,12 +230,13 @@ extension AppModel {
     }
 
     /// The inner-life master owns the hour's lifetime; enable Fluid Context's Active default only if no choice exists.
-    /// Return the runtime's state and cause when it cannot run as requested.
+    /// Return the runtime's state and cause when it cannot run as requested; with no running mind there is nothing to turn on or off.
     @MainActor
-    func setInnerLifeEnabled(_ enabled: Bool) async -> (state: NativeSubconsciousRuntimeState, problem: String?) {
+    func setInnerLifeEnabled(_ enabled: Bool) async -> (enabled: Bool, problem: String?) {
+        guard let runtime = NativeAgentEngine.liveCognition else { return (false, "There is no running mind: it starts when setup finishes.") }
         let (state, contextFlowReady) = await engine.cognitionView.setInnerLifeEnabled(
             enabled,
-            runtime: NativeAgentEngine.liveCognition,
+            runtime: runtime,
             contextFlow: NativeAgentEngine.live.contextFlow
         )
 
@@ -250,7 +251,7 @@ extension AppModel {
         statusText = state.enabled
             ? "I have an inner life again"
             : "My inner life is off"
-        return (state, problem)
+        return (state.enabled, problem)
     }
 
     /// Keep dream-run errors on the Dreams tab and reload only after success so failures remain visible. busy names effects kept owed

@@ -22,6 +22,8 @@ package struct BuiltInToolSchemaFactory {
         capabilities: Set<String>? = nil,
         effectInputPolicy: ToolEffectInputPolicy = .fixed,
         macIntegration: MacIntegrationAccess? = nil,
+        makes: String? = nil,
+        removes: String? = nil,
         description: @autoclosure () -> String,
         parametersJSON: @autoclosure () -> Data
     ) -> LLMToolSchema? {
@@ -33,6 +35,8 @@ package struct BuiltInToolSchemaFactory {
             capabilities: capabilities ?? toolClass.baseCapabilities,
             effectInputPolicy: effectInputPolicy,
             macIntegration: macIntegration,
+            makes: makes,
+            removes: removes,
             description: description(),
             parametersJSON: parametersJSON()
         )

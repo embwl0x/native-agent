@@ -189,6 +189,9 @@ public enum AppDoorNames {
         "bot": "bots", "helpers": "bots", "connector": "connectors",
         "skills & tools": "skills",
         "health": "status", "doctor": "diagnostics/doctor",
+        // A page's own rows that open page:<page>/<row> lead to these places, as the window draws them.
+        "today/approvals": "inbox", "today/inbox": "inbox", "today/cognitionproposals": "cognition",
+        "memories/graph": "knowledge", "memories/upkeep": "memory-upkeep",
     ]
 
     /// Places without a rail page keep their own room and all of its capabilities.

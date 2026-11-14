@@ -18,6 +18,8 @@ public enum TurnPresentationLifecycleEvent: Sendable, Equatable {
     case failed(reason: String?)
     case canceled(reason: String?)
     case outcomeUnknown(reason: String?)
+    /// The turn ended waiting on the person; the action is what it waits on.
+    case waitingOnPerson(action: String?)
 }
 
 /// One step of the turn, from its start to its end: one identity, its words now, and how it ended. It intentionally contains no tool arguments,
@@ -181,6 +183,9 @@ public enum TurnPresentationReducer {
         case .outcomeUnknown(let reason):
             phase = .outcomeUnknown
             action = reason
+        case .waitingOnPerson(let detail):
+            phase = .waitingOnPerson
+            action = detail
         }
         return transition(
             state,

@@ -493,6 +493,8 @@ extension iCloudBridge {
                 dataRoot: PersistenceCore.defaultDataRoot()
             ) else { throw CocoaError(.fileWriteUnknown) }
             try await Self.completePublication(signed.id, dataRoot: sync.dataRoot)
+            // A phone waiting on this answer wakes on the same nudge as a chat reply, not only on a silent push that may never come.
+            await scheduleDeliveryNudges(for: signed.id)
             lastSyncAt = Date()
             syncStatus = "Sent action response via CloudKit"
         } catch {
@@ -524,6 +526,9 @@ extension iCloudBridge {
     }
 
     private func scheduleDeliveryNudges(for messageID: String) async {
+        // Without the key-value store entitlement no nudge can synchronize; CloudKit's own push is this build's only wake, and the phone
+        // connection says so once instead of a failure per message.
+        guard DeviceCloudKitPreflight.hasKeyValueStoreEntitlement() else { return }
         let queue: ICloudDeliveryNudgeQueue
         if let deliveryNudgeQueue {
             queue = deliveryNudgeQueue

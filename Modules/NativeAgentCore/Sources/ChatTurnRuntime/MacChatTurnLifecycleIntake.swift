@@ -238,7 +238,8 @@ public extension MacChatTurnPresentationPort {
                 continue
             }
             if !isIndexed && record.isTerminal { continue }
-            let proof = record.isTerminal ? .absent : await loadProof(record.identity)
+            // An outcome-unknown record may hold a waiting ending (the file stores it in that pair); its saved reply says which.
+            let proof = record.isTerminal && record.phase != .outcomeUnknown ? .absent : await loadProof(record.identity)
             guard macChatTurns.activeTurnIDsBySession[record.sessionId] == nil else {
                 if !isIndexed { hasPendingRepairWork = true }
                 continue

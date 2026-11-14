@@ -99,6 +99,7 @@ public struct PartFace: Codable, Sendable, Equatable {
 
     /// Something the person can do to a row: a door call (`call`), or a place it opens (`open`, a link like a row's). Exactly one.
     public struct Action: Codable, Sendable, Equatable, Identifiable {
+        /// `primary` is the row's one answer: it leads. `destructive` asks once before it runs; neither colours the drawing.
         public enum Role: String, Codable, Sendable {
             case plain, primary, destructive
         }
@@ -111,10 +112,13 @@ public struct PartFace: Codable, Sendable, Equatable {
         public let call: Call?
         public let open: String?
         public let unavailable: String?
+        /// Housekeeping beside the row's answers (mark read, archive, dismiss, open it elsewhere): drawn behind the row's "…" menu, never
+        /// as a peer of an answer. A row whose actions are all housekeeping draws them as its answers. Every door still runs it.
+        public let aside: Bool?
         public init(id: String, label: String, role: Role? = nil, doors: [String]? = nil, call: Call? = nil, open: String? = nil,
-                    unavailable: String? = nil) {
+                    unavailable: String? = nil, aside: Bool? = nil) {
             self.id = id; self.label = label; self.role = role; self.doors = doors; self.call = call; self.open = open
-            self.unavailable = unavailable
+            self.unavailable = unavailable; self.aside = aside
         }
         public func runs(from door: String) -> Bool {
             guard let doors else { return true }
@@ -509,7 +513,7 @@ public struct PartFaceSnapshot: FaceValue {
             let named = subjects[row.id].flatMap { $0 == row.title ? nil : $0 }
             result.actions = (row.actions ?? []) + levers.map { lever in
                 named.map { PartFace.Action(id: lever.id, label: lever.label + " \u{201C}" + $0 + "\u{201D}", role: lever.role,
-                    doors: lever.doors, call: lever.call, open: lever.open, unavailable: lever.unavailable) } ?? lever
+                    doors: lever.doors, call: lever.call, open: lever.open, unavailable: lever.unavailable, aside: lever.aside) } ?? lever
             }
             return result
         }

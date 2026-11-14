@@ -316,8 +316,9 @@ public actor SwiftNativeSecurityCenter {
         let signatureMissing = !(originAssessment.trusted && Self.bool(security["trustedRemoteHighRiskAllowed"], default: true))
             && Self.bool(security["signedRemoteCommandsRequired"], default: true) && origin.commandSignatureVerified != true
         // The person's own verified act (the phone's signed tap) is theirs, not a remote request to authenticate.
+        // The agent's note to its own person is no remote request's effect (`PermissionLaw.voice`).
         if decision != .block, originAssessment.isRemote, !originAssessment.trusted || signatureMissing, toolClass != .read,
-           !PermissionLaw.personDecided(tool: tool, input: input, turn: turn) {
+           !PermissionLaw.personDecided(tool: tool, input: input, turn: turn), !PermissionLaw.voice(tool: tool, input: input, turn: turn) {
             decision = .ask
             reasons.append(.init(.cause, originAssessment.trusted
                 ? "This remote request has no verified signature, so it needs the person."

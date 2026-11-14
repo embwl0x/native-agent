@@ -44,8 +44,10 @@ extension SwiftToolDispatcher {
         } catch {
             var result = ChatToolOutcome.failure(error: error, tool: tool)
             if case .object(var fields) = result {
-                fields["reason"] = .string("invalid_arguments")
-                fields["failure_code"] = .string("invalid_arguments")
+                // An owner's own cause (model_not_offered) stands; an uncoded refusal is an argument refusal.
+                let code = (error as? ToolFailureError)?.code ?? "invalid_arguments"
+                fields["reason"] = .string(code)
+                fields["failure_code"] = .string(code)
                 fields["detail"] = .string(ChatToolOutcome.errorMessage(error))
                 fields["effects"] = .string("none")
                 result = ChatToolOutcome.normalizedFailure(.object(fields), tool: tool)
@@ -124,6 +126,7 @@ extension SwiftToolDispatcher {
         guard !edits.isEmpty else { throw botArgumentError("fields must contain at least one setting", field: "fields",
             accepted: "An object containing at least one setting to change.") }
         var bot = try definitions.get(botReference(args, definitions: definitions, dataRoot: dataRoot))
+        let saved = bot
         let notes: [String]
         do {
             if let value = edits["name"] { bot.name = try botString(value, field: "name") }
@@ -150,23 +153,28 @@ extension SwiftToolDispatcher {
             if let value = edits["budget"] { bot.budget = try botDecode(BotBudget.self, value, field: "budget") }
             notes = try await BotChatContract.followingSettings(for: bot, fields: edits, dataRoot: dataRoot)
             if bot.modelPinned != true { bot.followProviders() }
-            try await botRouteCheck(bot)
+            try await botRouteCheck(bot, held: saved.modelPinned == true && saved.provider == bot.provider ? saved.model : nil)
         } catch let error as ToolFailureError {
             throw botFieldsError(error)
         }
         return (bot, notes)
     }
 
-    /// Use the app’s BotRunGate route check so scheduled runs, chat and preview admit the same tuple.
-    private func botRouteCheck(_ bot: BotDefinition) async throws {
-        do { _ = try await BotChatContract.choice(for: bot, dataRoot: dataRoot) }
-        catch {
-            throw ToolFailureError(String(describing: error), argumentPath: "$",
-                accepted: """
-                    Follow Providers with model_pinned false, or pin a connected provider/model/reasoning_effort choice from bot_list \
-                    include_models true.
-                    """, effects: .none)
+    /// Use the app’s BotRunGate route check so scheduled runs, chat and preview admit the same tuple. A pinned model is one the account
+    /// offered, the same rows the picker lists, or the one this helper already holds (`held`).
+    private func botRouteCheck(_ bot: BotDefinition, held: String? = nil) async throws {
+        let accepted = """
+            Follow Providers with model_pinned false, or pin a connected provider/model/reasoning_effort choice from bot_list \
+            include_models true.
+            """
+        // A pinned model's own causes (account, model list, the model) come first, each named at its argument with its own code.
+        if bot.modelPinned == true, let provider = bot.provider, let model = bot.model,
+           let refusal = try await SwiftNativeProviderRouting(dataRoot: dataRoot).botModelRefusal(provider: provider, model: model, held: held) {
+            throw ToolFailureError(refusal.message, argumentPath: refusal.field.map { "$." + $0 }, accepted: accepted, effects: .none,
+                                   code: refusal.code)
         }
+        do { _ = try await BotChatContract.choice(for: bot, dataRoot: dataRoot) }
+        catch { throw ToolFailureError(String(describing: error), argumentPath: "$", accepted: accepted, effects: .none) }
     }
 
     /// Shelf exports never replace existing files and share write_file’s workspace and Full Mac gates.
@@ -551,8 +559,10 @@ extension SwiftToolDispatcher {
         } catch let error as ToolFailureError {
             var result = ChatToolOutcome.failure(error: error, tool: tool)
             if case .object(var fields) = result {
-                fields["reason"] = .string("bots_tool_failed")
-                fields["failure_code"] = .string("bots_tool_failed")
+                // The owner's own cause stands, as on the pre-approval path; only an uncoded failure is the tool's.
+                let code = error.code ?? "bots_tool_failed"
+                fields["reason"] = .string(code)
+                fields["failure_code"] = .string(code)
                 fields["detail"] = .string(ChatToolOutcome.errorMessage(error))
                 if !writeStarted { fields["effects"] = .string("none") }
                 result = .object(fields)
@@ -599,8 +609,10 @@ private func botFollowingRefusal(_ error: BotChatContract.FollowingSettingsRefus
 }
 
 private func botFieldsError(_ error: ToolFailureError) -> ToolFailureError {
+    // Only the path moves under fields; the owner's code, status and levers stay its own.
     ToolFailureError(error.message, argumentPath: error.argumentPath.map { "$.fields" + $0.dropFirst() },
-        accepted: error.accepted, effects: error.effects)
+        accepted: error.accepted, effects: error.effects, owner: error.owner, nextCall: error.nextCall, tap: error.tap,
+        personDecides: error.personDecides, code: error.code, status: error.status, instruction: error.instruction, recovery: error.recovery)
 }
 
 private func botTimingError(_ error: ToolFailureError, input: [String: JSONValue]) -> ToolFailureError {

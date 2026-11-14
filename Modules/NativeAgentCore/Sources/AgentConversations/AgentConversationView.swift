@@ -141,9 +141,10 @@ public enum AgentConversationView {
         return .object(fields)
     }
 
+    /// `sendPrefix` overrides where the retained send's own outcome goes (a read and a stop both keep it under "last_send_").
     package static func view(_ row: AgentConversationRecord, details: Bool, read: Bool = false, dataRoot: URL,
                      historyBefore: String? = nil, historyExchange: String? = nil, includeHistory: Bool = true,
-                     historyLimit: Int = 8) -> JSONValue {
+                     historyLimit: Int = 8, sendPrefix: String? = nil) -> JSONValue {
         let receipt = row.sendReceipt ?? .object(["status": .string("unknown")])
         guard case .object = receipt else { return receipt }
         let peers: [AgentPeerContact]
@@ -159,7 +160,7 @@ public enum AgentConversationView {
         let history = !details && includeHistory
         let lines: Result<[ContactThread.Line], Error>? = history ? Result { try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner,
             identity: identity) } : nil
-        var result = details ? receipt : conversationPresentation(row, transport: peer?.transport, prefix: read ? "last_send_" : "")
+        var result = details ? receipt : conversationPresentation(row, transport: peer?.transport, prefix: sendPrefix ?? (read ? "last_send_" : ""))
         if history {
             result = AgentConversationHistoryView.adding(to: result, agent: row.agent, name: row.name,
                 before: historyBefore, exchange: historyExchange, limit: historyLimit, dataRoot: dataRoot, peers: peers, lines: lines)

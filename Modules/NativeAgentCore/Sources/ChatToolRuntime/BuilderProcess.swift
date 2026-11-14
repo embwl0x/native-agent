@@ -298,6 +298,8 @@ extension SwiftToolDispatcher {
         let sandboxMode = launch.mode, resolvedCwd = launch.cwd
         let sandboxed = sandboxMode != .off
         let process = ManagedProcess()
+        // The call waiting on this command watches it: its output and processor time are the call's life.
+        process.life = turn.enclosingCall
         process.executableURL = URL(fileURLWithPath: launch.executable)
         process.arguments = launch.arguments
         // SwiftPM's manifest sandbox cannot nest. Put the --disable-sandbox shim first on PATH while the outer profile retains write confinement.

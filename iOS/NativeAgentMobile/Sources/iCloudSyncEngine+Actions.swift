@@ -14,12 +14,6 @@ extension iCloudSyncEngine {
         }
     }
 
-    func requireIdleActionForConnectionRepair() throws {
-        guard sendingTransactions.isEmpty else {
-            throw SyncError.busy("A Mac action is still sending. Wait for it to finish, then repair the connection.")
-        }
-    }
-
     /// Capture pairing before off-main signing/I/O; unsigned actions must never enter transport.
     @discardableResult
     func sendAction(_ action: InboxAction, intentionalNewRequest: Bool = false) async throws -> String {
@@ -78,6 +72,13 @@ extension iCloudSyncEngine {
                 actionID: action.msgId
             )
             accepted = true
+            // A repair goes ahead over a send in flight; this send's outcome is then unknown, its envelope kept and never resent blindly.
+            guard secret == pairingStore?.iCloudPairingSecret, pairingStore?.isRepairingConnection != true else {
+                throw SyncError.responseUnconfirmed("""
+                    The connection was repaired while this action was sending, so whether the Mac ran it is unknown. Check the Mac before \
+                    submitting it again.
+                    """)
+            }
             try await writeTransaction(
                 id: transactionId,
                 action: action.action,
@@ -87,6 +88,11 @@ extension iCloudSyncEngine {
             return action.msgId
         } catch {
             let sendError = error
+            // The repair owns the ledger now; nothing here waits on an answer under the previous pairing.
+            if accepted, secret != pairingStore?.iCloudPairingSecret || pairingStore?.isRepairingConnection == true {
+                syncError = sendError.localizedDescription
+                throw sendError
+            }
             if !wasRetained && !accepted && !(sendError is DeviceSyncSendOutcomeUnknown) {
                 try await persistTerminalSendFailure(
                     transactionID: transactionId,
@@ -285,6 +291,7 @@ extension iCloudSyncEngine {
         waiters.arm(msgId)
         defer { waiters.disarm(msgId) }
         await iCloudBridge.shared.pollIncomingNow()
+        try Task.checkCancellation()
         while true {
             if Task.isCancelled || generation != lifecycleGeneration { throw CancellationError() }
             waiters.consumeArrival(msgId)

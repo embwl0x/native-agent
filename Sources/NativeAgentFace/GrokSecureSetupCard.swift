@@ -12,9 +12,7 @@ struct GrokSecureSetupCard: View {
         PartFace(title: "Routine credentials", sections: [
             .init(id: "grok.bot", rows: [], block: .init(kind: "form", key: "grok.bot", fields: [
                 .init(id: "name", label: "Bot name", required: true)
-            ], submit: [.init(id: "bot", label: "Use this Bot", call: .init("agent.grok_bot"))])),
-            .init(id: "grok.import", rows: [.init(id: "grok.import", title: "Routine", actions: [
-                .init(id: "import", label: "Read routine securely", call: .init("agent.grok_import"))])])
+            ], submit: [.init(id: "bot", label: "Use this Bot", call: .init("agent.grok_bot"))]))
         ])
     }
     var body: some View {
@@ -24,7 +22,8 @@ struct GrokSecureSetupCard: View {
                 FaceProtectedForm(face: PartFace(sections: [
                     .init(id: "grok.credentials", rows: [], block: .init(kind: "form", key: "grok.credentials", fields: [
                         .init(id: "credentials", label: "Routine credentials", kind: "secret",
-                            placeholder: "Paste the JSON object with url and key", required: true)
+                            placeholder: "Paste the webhook address and key (one after the other, or {\"url\":…,\"key\":…})",
+                            required: true)
                     ], submit: [.init(id: "save", label: "Save to Keychain", role: .primary, call: .init("grok.credentials.save"))],
                         protected: true, receiver: FaceSecretReceiver.importGrokCredentials.name, doors: ["mac"]))
                 ]), receiver: .importGrokCredentials, session: session) { input in
@@ -47,11 +46,10 @@ struct GrokSecureSetupCard: View {
     private var door: ClosureFaceDoor {
         ClosureFaceDoor(open: { _ in }, waitingOn: "Grok setup") { submission in
             do {
-                let bot = submission.action == "bot"
-                let value = bot ? submission.values?["name"] : nil
-                let call = PartFace.Call(bot ? "agent.grok_bot" : "agent.grok_import", ["agent": .string(contact)])
+                let value = submission.values?["name"]
+                let call = PartFace.Call("agent.grok_bot", ["agent": .string(contact)])
                 let reply = try await appModel.protectedFormAct(.pageAct(.init(page: "connectors",
-                    row: (bot ? "agent-grok-bot:" : "agent-grok:") + contact, action: bot ? "set" : "import", value: value,
+                    row: "agent-grok-bot:" + contact, action: "set", value: value,
                     expectedRevision: nil, expectedCall: value.map { call.setting($0) } ?? call,
                     answers: true, operation: submission.id, checking: submission.checking)))
                 let outcome = try FaceActOutcome.reply(reply)

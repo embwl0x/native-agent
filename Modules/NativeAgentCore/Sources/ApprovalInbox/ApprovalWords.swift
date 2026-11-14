@@ -12,6 +12,12 @@ import Privacy
 public enum ApprovalWords {
     public static func call(tool: String, input: JSONValue?) -> (act: String, says: String) {
         let fields = input?.objectValue ?? [:]
+        // A list of calls asked together says each call in turn, in its own words.
+        if tool == "app", fields["action"] == nil, case .array(let entries)? = fields["actions"] {
+            let each = entries.map { call(tool: "app", input: $0).says }
+            let named = bounded("These \(entries.count) together", actLimit)
+            return (named, each.isEmpty ? named : named + ": " + each.joined(separator: "; "))
+        }
         let act: String
         let args: [String: JSONValue]
         if tool == "app", let action = fields["action"]?.stringValue {

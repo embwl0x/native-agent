@@ -66,6 +66,79 @@ extension CloudKitDeviceTransport {
         return deleted
     }
 
+    /// The Mac owns the shared container's transport records: once it holds a key, every chat/notification record whose signed envelope does not
+    /// verify under that key was written under another pairing (an earlier key, an earlier install) and can never be read, so it is deleted.
+    /// Only those two record types, only records carrying a signed inline envelope; pairing, status and snapshot records are never touched. A
+    /// record whose payload is an encrypted asset, or that carries no signature, is left to retention. Idempotent: a second pass finds nothing.
+    public func deleteRecordsSignedWithOtherKeys(current secret: Data) async throws -> Int {
+        guard role == .mac, holdsPairing, secret.count == 32 else { return 0 }
+        var deleted = 0
+        for recordType in [NADeviceSyncRecordType.chatMessage, NADeviceSyncRecordType.notification] {
+            deleted += try await withDeviceCKOperation("CloudKitDeviceTransport.foreignKeyDelete", onFailure: accountFailureReporter) {
+                var count = 0
+                var cursor: CKQueryOperation.Cursor?
+                repeat {
+                    let page = try await self.foreignKeyPage(recordType: recordType, cursor: cursor, secret: secret)
+                    cursor = page.cursor
+                    for start in stride(from: 0, to: page.names.count, by: 400) {
+                        let ids = page.names[start..<min(start + 400, page.names.count)].map { CKRecord.ID(recordName: $0) }
+                        let op = CKModifyRecordsOperation(recordsToSave: nil, recordIDsToDelete: ids)
+                        op.qualityOfService = .utility
+                        try await self.performModifyRecords(op)
+                        count += ids.count
+                    }
+                } while cursor != nil
+                return count
+            }
+        }
+        nativeLog("[ck-device] deleted %d transport record(s) signed with other pairing keys", deleted)
+        return deleted
+    }
+
+    private func foreignKeyPage(recordType: String, cursor: CKQueryOperation.Cursor?, secret: Data) async throws
+        -> (names: [String], cursor: CKQueryOperation.Cursor?) {
+        let op: CKQueryOperation
+        if let cursor {
+            op = CKQueryOperation(cursor: cursor)
+        } else {
+            op = CKQueryOperation(query: CKQuery(recordType: recordType, predicate: NSPredicate(
+                format: "direction IN %@", [NAChatDirection.mac2ios.rawValue, NAChatDirection.ios2mac.rawValue])))
+        }
+        op.qualityOfService = .utility
+        op.resultsLimit = 200
+        // The inline envelope only: an asset payload is never downloaded to be judged.
+        op.desiredKeys = ["payloadJSON"]
+        let holder = DeviceCKRecordNameHolder()
+        op.recordMatchedBlock = { id, result in
+            switch result {
+            case .success(let ck):
+                holder.noteFetched()
+                guard let json = ck["payloadJSON"] as? String, let data = json.data(using: .utf8) else { return }
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                guard let message = try? decoder.decode(BridgeMessage.self, from: data), message.signature != nil,
+                      !message.verifySignature(secret: secret) else { return }
+                holder.add(id.recordName)
+            case .failure(let error): holder.fail(error)
+            }
+        }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(names: [String], cursor: CKQueryOperation.Cursor?), Error>) in
+                op.queryResultBlock = { result in
+                    switch result {
+                    case .success(let next):
+                        do { cont.resume(returning: (try holder.snapshot().names, next)) }
+                        catch { cont.resume(throwing: Self.mapError(error)) }
+                    case .failure(let err):
+                        cont.resume(throwing: Self.mapError(err))
+                    }
+                }
+                self.database.add(op)
+                if Task.isCancelled { op.cancel() }
+            }
+        } onCancel: { op.cancel() }
+    }
+
     /// Claim the sweep slot under the lock. Doubles as the rate limiter and as the mutual exclusion between two concurrent drains.
     private func claimRetentionSweep(now: Date) -> Bool {
         lock.lock(); defer { lock.unlock() }

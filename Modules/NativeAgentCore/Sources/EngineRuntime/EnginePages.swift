@@ -81,7 +81,7 @@ extension NativeAgentEngine {
             var previous: SettingsInnerLifeStatus.State?
             for await change in await cognitionView.changes() {
                 guard !Task.isCancelled else { return }
-                guard change.reason == "bootstrap" || change.reason.hasPrefix("configuration:")
+                guard change.reason == "bootstrap" || change.reason.hasPrefix("mind:") || change.reason.hasPrefix("configuration:")
                     || change.reason.hasPrefix("provider_lifecycle:") || change.reason.hasPrefix("reflection:") else { continue }
                 await cognitionView.refreshVitals()
                 let current = SettingsInnerLifeStatus.state(runtime: cognitionView.subconsciousRuntime,

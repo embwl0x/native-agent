@@ -432,11 +432,17 @@ extension AppToolExecutor {
         // A folded action re-enters under its tool's own name; the rest are the app call's.
         let tool = action.isFold ? action.tool : "app"
         let args = action.isFold ? call : input.filter { $0.key != "preview" }
-        let envelope = await SwiftNativeSecurityCenter(dataRoot: root).evaluateTool(
-            tool: tool, input: MacInjectionArgRedaction.redacted(tool: tool, input: args, turn: turn),
-            origin: AppChatToolDispatcher.securityOrigin(turn: turn, surface: surface), turn: turn)
+        let center = SwiftNativeSecurityCenter(dataRoot: root)
+        let origin = AppChatToolDispatcher.securityOrigin(turn: turn, surface: surface)
+        let redacted = MacInjectionArgRedaction.redacted(tool: tool, input: args, turn: turn)
+        let envelope = await center.evaluateTool(tool: tool, input: redacted, origin: origin, turn: turn)
         guard envelope.decision != .block else { return false }
-        if envelope.requiresApproval { return true }
+        // The gate's own exemption, read from the one place it is judged: the agent undoing its own act runs with no card.
+        if envelope.requiresApproval {
+            let security = await center.evaluateTool(tool: tool, input: redacted, origin: origin, enforceAutonomy: false, turn: turn)
+            return await AgentMade.undoing(tool: tool, input: args, surface: surface, origin: origin, security: security, turn: turn,
+                securityCenter: center) == nil
+        }
         if action.tool == "request_interaction",
            InlineInteractionNeed.interaction(in: await SwiftToolDispatcher.requestedInteraction(invocation: execution.invocation, input: call,
                dataRoot: root)) != nil {

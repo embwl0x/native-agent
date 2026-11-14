@@ -14,7 +14,7 @@ import MacControl
 import Context
 import SwarmRuns
 import Transcripts
-// Blueprint: | `SwiftToolDispatcher+ContextTraceTools.swift` | `SwiftToolDispatcher`: `impl_context_lookup`, `impl_scratchpad_read`, bounded anchored `impl_recent_trace_summary` pages; receipts span conversations by default, rank non-read actions first and scan complete retained since windows; `trace.usage` and `trace.model_calls` share this route and `TurnTraceRecentReader` for recorded sums, purpose counts and retention coverage; explicit session filters and bound turn refs |
+// Blueprint: | `SwiftToolDispatcher+ContextTraceTools.swift` | `SwiftToolDispatcher`: `impl_context_lookup`, `impl_scratchpad_read`, bounded anchored `impl_recent_trace_summary` pages; receipts span conversations by default, rank non-read actions first and scan complete retained since windows; `trace.usage` and `trace.model_calls` share this route and `TurnTraceRecentReader` for recorded sums, purpose counts and retention coverage; event reads stay in the calling conversation unless scope:all, every conversation and the background life; explicit session filters and bound turn refs |
 
 // MARK: - Context, scratchpad, and trace tools
 
@@ -141,6 +141,15 @@ extension SwiftToolDispatcher {
             guard let text = input["session_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
             return text
         }()
+        // scope:all is the agent's whole life: every conversation and what ran outside any (no session filter is injected for it).
+        switch input["scope"] {
+        case nil, .null?, .string("conversation")?: break
+        case .string("all")? where normalizedSessionFilter == nil: break
+        case .string("all")?:
+            throw ToolFailureError("scope:all reads every conversation; session_id names one. Give one of them. Nothing was read.",
+                                   argumentPath: "session_id", effects: .none)
+        default: throw ToolFailureError("scope is conversation or all. Nothing was read.", argumentPath: "scope", effects: .none)
+        }
         let turnID = input["turn_id"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         var fields: [String] = []
@@ -152,21 +161,25 @@ extension SwiftToolDispatcher {
                   }) else {
                 throw ToolFailureError("fields takes 1–16 payload keys of at most 80 characters.", argumentPath: "fields", effects: .none)
             }
-            guard turnID?.isEmpty == false || completedTurns != nil else {
-                var next = input.filter { !$0.key.hasPrefix("__") }
-                next["completed_turns"] = .int(1)
-                throw ToolFailureError("fields requires turn_id or completed_turns. Nothing was read.", argumentPath: "fields", effects: .none,
-                    nextCall: ToolFailureError.call("app", ["action": .string("trace.recent"), "args": .object(next)]),
-                    instruction: "The proposed call reads the last completed turn; choose its count or supply the exact turn_id you need.")
-            }
             fields = values.compactMap { $0.stringValue }
+        }
+        // A continuation anchor is the record's own time for an event, in the record's own representation (seconds since 1970, every digit),
+        // so the read and the cutoff meet the anchor exactly. The page continues from the newest retained event at or before it, whether or not
+        // that exact event is still retained, and reads the anchor's own day. An ISO-8601 time is read as written.
+        var anchorDate: Date?
+        if let before = input["before"], before != .null {
+            guard let raw = before.stringValue,
+                  let date = Double(raw).map(Date.init(timeIntervalSince1970:)) ?? TurnTraceEvent.parseISO8601(raw) else {
+                throw ToolFailureError("before takes the timestamp a next_call carries. Nothing was read.", argumentPath: "before", effects: .none)
+            }
+            anchorDate = min(date, now)
         }
         // Shared across all returned events, in serialized UTF-8 bytes.
         var remainingPayloadBytes = 8 * 1024
 
         let snapshot: TurnTraceRecentReader.Snapshot
         do {
-            snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(
+            snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(now: anchorDate ?? now,
                 history: receiptID != nil || completedTurns != nil || turnID?.isEmpty == false,
                 since: since ?? (receiptID != nil ? Date.distantPast : nil),
                 holding: receiptID != nil ? ["tool.dispatch"] : [])
@@ -192,16 +205,7 @@ extension SwiftToolDispatcher {
         }
 
         var events = snapshot.events.sorted(by: { $0.ts > $1.ts })
-        if let before = input["before"] {
-            guard let index = events.firstIndex(where: { event in
-                guard case .object(let row) = event.jsonRow else { return false }
-                return row["ts"] == before
-            }) else {
-                return .object(["status": .string("no_match"), "effects": .string("none"),
-                    "detail": .string("The continuation anchor is no longer retained. Read trace.recent again without before and offset.")])
-            }
-            events = Array(events[index...])
-        }
+        if let anchorDate { events = events.filter { $0.ts <= anchorDate } }
         var completedIDs: [String] = []
         if let completedTurns {
             for event in events where TurnTraceEvent.isTerminalKind(event.kind) {
@@ -213,7 +217,8 @@ extension SwiftToolDispatcher {
             }
         }
 
-        let anchor: JSONValue = { if let event = events.first, case .object(let row) = event.jsonRow { return row["ts"] ?? .null }; return .null }()
+        // Every event has a time, standalone receipts included, so every page carries an anchor its continuation can find.
+        let anchor: JSONValue = events.first.map { JSONValue.string(String($0.ts.timeIntervalSince1970)) } ?? .null
         func nonReadReceipt(_ event: TurnTraceEvent) throws -> Bool {
             guard event.kind == "tool.dispatch", case .object(let payload) = event.payload,
                   payload["phase"] == .string("end") else { return false }
@@ -370,8 +375,19 @@ extension SwiftToolDispatcher {
             if refs[index] != .null { row["read_ref"] = row["turn_id"] == .string("unknown") ? .null : refs[index] }
             return .object(row)
         }
+        // Restarts are part of what happened: every read carries the app's lives, whatever its filters and page.
+        let lives: JSONValue, livesNote: String
+        do {
+            lives = .array(try BodyReport.lives(dataRoot))
+            livesNote = "The app's lives, newest first, with how each ended. A row older than lives[0].started_at happened before the latest start."
+        } catch {
+            lives = .null
+            livesNote = "The record of the app's starts and ends could not be read: \(error.localizedDescription)"
+        }
         var response: [String: JSONValue] = [
             "status": .string(missingTurn ? "no_match" : snapshot.completeSequences ? "ok" : "partial"),
+            "lives": lives,
+            "lives_note": .string(livesNote),
             "detail": missingTurn ? .string("No retained turn matches turn_id. Use an exact candidate_turn_id; no matching trace evidence was read.") : .null,
             "candidate_turn_ids": missingTurn ? .array(candidateIDs.map(JSONValue.string)) : .array([]),
             "candidate_turn_refs": missingTurn ? .array(refs.suffix(candidateIDs.count).filter { $0 != .null }) : .array([]),
@@ -389,7 +405,7 @@ extension SwiftToolDispatcher {
             "shown_note": .string("shown is an action label, not evidence that the screen moved."),
             "scanned_count": .int(Int64(snapshot.events.count)),
             "session_id": normalizedSessionFilter.map(JSONValue.string) ?? .null,
-            "scope": .string(normalizedSessionFilter == nil ? "all conversations" : "session"),
+            "scope": .string(normalizedSessionFilter != nil ? "session" : "all: every conversation and the background life (rows with session_id null)"),
         ]
         if receiptView {
             response["order_note"] = .string("""

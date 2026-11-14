@@ -73,6 +73,7 @@ public enum InlineInteractionDelivery {
             let sessions = await recovery.value
             for session in sessions {
                 guard !Task.isCancelled else { return }
+                await InlineInteractionResolver.settleInterrupted(sessionID: session, dataRoot: root)
                 await refresh(sessionID: session, dataRoot: root, notify: false)
             }
             await InlineInteractionResolver.settleProviderRequests(dataRoot: root)

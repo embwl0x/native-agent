@@ -21,8 +21,8 @@ extension ShotgunController {
                 try self.preparePointer(operation: operation, at: CGPoint(x: x, y: y), driver: driver)
             case .restorePointerInteraction(let operation):
                 try RendererProtection.shared.restorePointer(operation: operation)
-            case .waitForKeyboard:
-                try await RendererProtection.shared.waitForKeyboard()
+            case .checkKeyboard:
+                try RendererProtection.shared.requireKeyboardFree()
             default: return nil
             }
             return .acknowledged

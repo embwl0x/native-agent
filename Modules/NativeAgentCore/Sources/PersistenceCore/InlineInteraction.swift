@@ -538,6 +538,15 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         return copy
     }
 
+    public func stopped(reason: String, at date: Date = Date()) -> InlineInteraction {
+        var copy = self
+        copy.state = .stopped(reason: reason)
+        copy.settledAt = date
+        copy.revision += 1
+        copy.waitingOn = nil
+        return copy
+    }
+
     // MARK: Codable
     // `state` is a discriminated object. Missing core evidence never creates an executable pending card; optional content remains optional.
 

@@ -12,7 +12,9 @@ public final class OpenAITransport: LLMTransport {
         FirstPartyExecutionControls.budgetedOutputTokens(model: model, providerID: providerId, call: call, dataRoot: credentialRoot) ?? 0
     }
 
-    public let providerId: String = "openai"
+    /// "openai", or the local server this transport speaks to (its host's id), so its calls are recorded as that server's.
+    public let providerId: String
+    private let providerLabel: String
 
     private let session: URLSession
     private let endpoint: Result<URL, Error>
@@ -53,8 +55,12 @@ public final class OpenAITransport: LLMTransport {
         endpoint: URL? = nil,
         apiKeyOverride: String? = nil,
         dataRootOverride: URL? = nil,
-        telemetryDataRootOverride: URL? = nil
+        telemetryDataRootOverride: URL? = nil,
+        providerId: String = "openai",
+        providerLabel: String = "OpenAI"
     ) {
+        self.providerId = providerId
+        self.providerLabel = providerLabel
         self.session = session
         self.endpoint = Result { try endpoint ?? Self.defaultEndpoint }
         self.apiKeyOverride = apiKeyOverride
@@ -117,7 +123,8 @@ public final class OpenAITransport: LLMTransport {
         model: String,
         tools: [LLMToolSchema]?, call: LLMCall
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
-        if OpenAIExecutionControls.usesResponses(model: model, dataRoot: credentialRoot) {
+        // OpenAI's own model catalog decides its Responses models; a local server speaks chat completions only.
+        if providerId == "openai", OpenAIExecutionControls.usesResponses(model: model, dataRoot: credentialRoot) {
             return streamResponses(messages: messages, system: system, model: model, tools: tools, call: call)
         }
         let session = self.session
@@ -126,6 +133,7 @@ public final class OpenAITransport: LLMTransport {
         let credentialRoot = self.credentialRoot
         let telemetry = self.telemetry
         let providerId = self.providerId
+        let providerLabel = self.providerLabel
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -149,7 +157,9 @@ public final class OpenAITransport: LLMTransport {
                         "stream_options": ["include_usage": true],
                     ]
                     try Self.applyTools(to: &body, tools: tools)
-                    try OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model, call: call, dataRoot: credentialRoot)
+                    if providerId == "openai" {
+                        try OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model, call: call, dataRoot: credentialRoot)
+                    }
                     if call.turn?.tokenBudget != nil {
                         body["max_completion_tokens"] = try self.requestOutputTokens(model: model, call: call)
                     }
@@ -165,7 +175,7 @@ public final class OpenAITransport: LLMTransport {
                     }
                     defer { bytes.cancel() }
                     try await ProviderWire.validateChatCompletions(bytes, response)
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI")
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: providerLabel)
                     try await decoder.consume(
                         SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
                         request: req, providerID: providerId, model: model, idPrefix: "openai",

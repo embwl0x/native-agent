@@ -27,36 +27,18 @@ final class RendererProtection {
     var isConnected: Bool { connected }
     private var pointerPasses: Set<UUID> = []
     private var passing = false
-    private var keyboardWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
-
     private func keyboardHeld() throws -> Bool {
         guard connected else { throw FaceWireError.disconnected }
         if NSApp.keyWindow?.isKeyWindow == true { return true }
         return try snapshot().windows.contains(where: \.keyHeld)
     }
 
-    func waitForKeyboard() async throws {
-        let id = UUID()
-        try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            guard try keyboardHeld() else { return }
-            try await withCheckedThrowingContinuation { (waiter: CheckedContinuation<Void, Error>) in
-                if Task.isCancelled { waiter.resume(throwing: CancellationError()) }
-                else { keyboardWaiters[id] = waiter }
-            }
-        } onCancel: { Task { @MainActor in self.keyboardWaiters.removeValue(forKey: id)?.resume(throwing: CancellationError()) } }
-    }
-
-    private func settleKeyboard() {
-        guard !keyboardWaiters.isEmpty else { return }
-        let result: Result<Void, Error>
-        do {
-            guard try !keyboardHeld() else { return }
-            result = .success(())
-        } catch { result = .failure(error) }
-        let waiters = keyboardWaiters
-        keyboardWaiters.removeAll()
-        for waiter in waiters.values { waiter.resume(with: result) }
+    /// Answers at once: the keyboard is free, or the key is refused with its one sentence. The agent never waits for the person to send or click away.
+    func requireKeyboardFree() throws {
+        guard try !keyboardHeld() else {
+            throw WireFailure(code: "person_keyboard_held", message: "A NativeAgent window has the keyboard; nothing was typed.", cause: nil,
+                effects: .none)
+        }
     }
 
     /// Read live AppKit geometry, including hosts whose report is still crossing the pipe.
@@ -164,9 +146,6 @@ final class RendererProtection {
 
     func disconnect() {
         connected = false
-        let waiters = keyboardWaiters
-        keyboardWaiters.removeAll()
-        for waiter in waiters.values { waiter.resume(throwing: FaceWireError.disconnected) }
         shotgun?.ignoresMouseEvents = false
         pointerPasses.removeAll()
         passing = false
@@ -182,7 +161,6 @@ final class RendererProtection {
     }
 
     private func changed(_ id: ObjectIdentifier, closing: Bool) {
-        settleKeyboard()
         let isShotgun = shotgun.map { ObjectIdentifier($0) == id } == true
         guard held[id] != nil || isShotgun else { return }
         if closing {
@@ -193,7 +171,6 @@ final class RendererProtection {
     }
 
     private func publish() {
-        settleKeyboard()
         guard connected, client?.connectionID != nil else { return }
         do {
             _ = try enqueue(snapshot())
@@ -226,7 +203,9 @@ final class RendererProtection {
             }
             report.append(.init(number: number,
                 frame: .init(x: frame.minX, y: primary.frame.height - frame.maxY, width: frame.width, height: frame.height),
-                keyHeld: held[ObjectIdentifier(window)] != nil || window.isKeyWindow))
+                // A key reaches only the key window: a protected window that is not key (a transcript card's chat window while another app is in
+                // front) cannot receive the agent's key, so only actual key status holds the keyboard.
+                keyHeld: window.isKeyWindow))
         }
         return .init(connection: connection, windows: report.sorted { $0.number < $1.number })
     }

@@ -1,11 +1,7 @@
 import Darwin
 import Foundation
-// Blueprint: | `BodyReport.swift` | Crash breadcrumb paths and fatal-signal/process-exit logging |
-
-public enum BodyReport {
-    public static func crashBreadcrumbs(_ dataRoot: URL) -> URL { dataRoot.appendingPathComponent("logs/crash-breadcrumbs.log") }
-    public static let launchMark = "NativeAgent launched "
-}
+import TurnTrace
+// Blueprint: | `BodyReport.swift` | Fatal-signal/process-exit logging into the lives record `BodyReport` reads |
 
 /// Re-raise fatal signals after recording a launch-opened backtrace so macOS also files its report.
 /// Backtrace calls are not guaranteed async-signal-safe; this is best effort.
@@ -17,7 +13,7 @@ extension BodyReport {
         let opened = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0o600)
         guard opened >= 0 else { return }
         crashFD = opened
-        let launched = "\n" + BodyReport.launchMark + Date().ISO8601Format() + "\n"
+        let launched = "\n" + BodyReport.launchLine() + "\n"
         _ = launched.withCString { write(opened, $0, strlen($0)) }
         var action = sigaction()
         action.__sigaction_u.__sa_handler = { signum in
@@ -37,8 +33,8 @@ extension BodyReport {
         // TERM/HUP name an outside kill; a clean exit leaves its own line, so silence after the launch row means SIGKILL.
         for signum in [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGTERM, SIGHUP] { sigaction(signum, &action, nil) }
         atexit {
-            let line: StaticString = "\nNativeAgent exited\n"
-            _ = write(BodyReport.crashFD, line.utf8Start, line.utf8CodeUnitCount)
+            let line = "\n" + BodyReport.exitMark + " " + Date().ISO8601Format() + "\n"
+            _ = line.withCString { write(BodyReport.crashFD, $0, strlen($0)) }
         }
     }
 }

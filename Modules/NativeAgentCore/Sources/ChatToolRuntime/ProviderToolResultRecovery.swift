@@ -369,7 +369,8 @@ package actor ProviderToolResultRecoveryStore {
             }
             if body == "matches" {
                 answer["detail"] = .string(Self.matchesDetail(first: page, last: last, raw: int("raw_page_count"),
-                    displayed: int("displayed_matches"), searched: int("searched_sections"), sections: int("section_count")))
+                    displayed: int("displayed_matches"), searched: int("searched_sections"), sections: int("section_count"),
+                    readAs: answer["query_read_as"]?.stringValue.flatMap { ToolResultSections.Search.Reading(rawValue: $0) } ?? .phrase))
             }
             result = .object(answer)
         }
@@ -462,13 +463,21 @@ package actor ProviderToolResultRecoveryStore {
             """
     }
 
-    /// A search gives the lines that hold its terms, each with its place; the whole section around one is a page of a reading without query.
-    private static func matchesDetail(first: Int, last: Int, raw: Int, displayed: Int, searched: Int, sections: Int) -> String {
+    /// A search gives the lines that hold its phrase (or, when the phrase is nowhere, its words), each with its place; the whole section
+    /// around one is a page of a reading without query. `query_read_as` and the detail say which the search did.
+    private static func matchesDetail(first: Int, last: Int, raw: Int, displayed: Int, searched: Int, sections: Int,
+                                      readAs: ToolResultSections.Search.Reading) -> String {
         let shown = first == last ? "Page \(first) displays" : "Pages \(first) through \(last) display"
+        let rule = readAs == .phrase
+            ? "The query was read as the phrase as written, case aside: a match is the first place in a line that holds the phrase"
+            : """
+                The phrase as written is nowhere in this result, so its words were read separately: a match is the first place in a line \
+                that holds one of them, from a section that holds every word
+                """
         return """
             \(shown) \(displayed) matches; the search has read \(searched) of \(sections) sections, only as far as these pages, so later \
-            matches are found as reading goes on. A match is the first place in a line that holds a query term, from a section that holds \
-            every term; a line gives one match: path; line, numbered from 1 within the string at path; offset, in Unicode scalars from the \
+            matches are found as reading goes on. \(rule); a line gives one match: path; line, numbered from 1 within the string at path; \
+            offset, in Unicode scalars from the \
             start of the line or value to where text starts, when text is not the whole line; text, the line or a window of a long line \
             around the match; before and after, the adjacent lines. To read the whole section around a match, read tool_result_page with \
             page set to its section_page and no query. Paths, lines and offsets identify positions in this retained response only; unread \
@@ -516,6 +525,7 @@ package actor ProviderToolResultRecoveryStore {
                 "recovery_only": .bool(true),
                 "verification_scope": .string("retained_tool_response_not_external_outcome"),
                 "result_handle": .string(handle), "query": .string(query),
+                "query_read_as": .string(search.reading.rawValue),
                 "page": .int(Int64(page)),
                 "matches": .array(matches),
                 "displayed_matches": .int(Int64(matches.count)),
@@ -525,7 +535,7 @@ package actor ProviderToolResultRecoveryStore {
                 "next_page": page + 1 < search.pages.count ? .int(Int64(page + 1)) : .null,
                 "raw_page_count": .int(Int64(raw)),
                 "detail": .string(Self.matchesDetail(first: page, last: page, raw: raw, displayed: matches.count,
-                    searched: search.searched, sections: entry.sectionProjection.count)),
+                    searched: search.searched, sections: entry.sectionProjection.count, readAs: search.reading)),
             ]
             answer["source_continues"] = entry.source
             return .object(answer)

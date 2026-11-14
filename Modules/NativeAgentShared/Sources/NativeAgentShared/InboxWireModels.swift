@@ -147,6 +147,11 @@ public struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
         case interaction_session_id, interaction_id
     }
 
+    /// The wire's word for an item whose matter owes the person's decide (`ForPerson.card` writes it): the fact that puts its row under
+    /// the Inbox's "Waiting for you".
+    public static let waitingSeverity = "actionable"
+    /// The item waits on the person's answer, read from the one word the wire carries for it.
+    public var waitsOnPerson: Bool { severity == Self.waitingSeverity }
 }
 
 extension InboxItemRecord {

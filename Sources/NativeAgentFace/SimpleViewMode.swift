@@ -24,6 +24,8 @@ struct ViewModeSwitch: View {
         .labelsHidden()
         .controlSize(.small)
         .fixedSize()
+        // The switch sits over the window, outside the frame's own tint: it carries the neutral itself.
+        .neutralSegments()
     }
 }
 

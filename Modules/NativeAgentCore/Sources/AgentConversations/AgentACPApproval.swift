@@ -93,6 +93,13 @@ package enum AgentACPApproval {
 
     private static func resolve(_ content: JSONValue, turn: Turn?, inbox: SwiftNativeApprovalInbox) async throws -> Bool {
         try Task.checkCancellation()
+        // The card is a wait on the person: the call that raised it keeps waiting, however long, and its turn says what it waits for.
+        let title = content.objectValue?["title"]?.stringValue ?? "a request"
+        let watch = turn?.enclosingCall
+        let waiting = watch?.attach(CallLife(what: "the person's answer to \(title)") {
+            .waitingOnPerson("Waiting for your answer on the card: \(title)")
+        })
+        defer { if let waiting { watch?.detach(waiting) } }
         let events = await ApprovalLifecycleBus.shared.events()
         let record = try await inbox.create(content, turn: turn)
         do {
@@ -106,8 +113,15 @@ package enum AgentACPApproval {
                 }
             }
             try Task.checkCancellation()
-            return current.status == "resolved" && current.decision == "approved"
+            let approved = current.status == "resolved" && current.decision == "approved"
                 && current.payload == record.payload && current.resolutionProvenance != nil
+            // The person's yes is handed to the live agent conversation now: that is this card's whole effect, so its record says so.
+            if approved {
+                _ = await ApprovalExecutionOwners.settleExecution(record.id, dataRoot: inbox.root, settlement: .init(
+                    action: .object(["op": .string("agent_acp_answer"), "status": .string("completed"), "effects": .string("occurred")]),
+                    detail: "The person's yes was handed to the agent conversation that asked, for this one request."))
+            }
+            return approved
         } catch {
             _ = try? await inbox.resolve(record.id, decision: .canceled, decidedBy: "agent conversation ended")
             throw error

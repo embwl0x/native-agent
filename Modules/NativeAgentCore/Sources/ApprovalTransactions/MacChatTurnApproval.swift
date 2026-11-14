@@ -27,7 +27,9 @@ public enum TurnApprovalRead {
         guard !candidates.isEmpty else { return nil }
 
         let chosen = candidates
-            .map { (candidate: $0, outcome: ApprovalRequest.Outcome(status: $0.row.status, decision: $0.row.decision)) }
+            // A card the person's own words decided ran its call on their word: it reads as theirs, never as expired.
+            .map { (candidate: $0, outcome: $0.row.decidedByPersonsWord ? ApprovalRequest.Outcome.approved
+                : ApprovalRequest.Outcome(status: $0.row.status, decision: $0.row.decision)) }
             .sorted { lhs, rhs in
                 let lhsPending = lhs.outcome == .pending
                 let rhsPending = rhs.outcome == .pending

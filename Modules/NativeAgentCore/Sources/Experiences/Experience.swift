@@ -255,9 +255,10 @@ public actor ExperienceStore {
         return try reader.read(body)
     }
 
-    /// The count and newest births share one committed snapshot; each birth is folded through the owner's event law.
+    /// The count and newest births share one committed snapshot; each birth is folded through the owner's event law. A record that will not fold
+    /// is named in `unreadable` and the rest are returned.
     public func recordedExperiences(id: String? = nil, idPrefix: String? = nil, kind: Experience.Kind? = nil,
-                                    openOnly: Bool = false, limit: Int = 20) throws -> (total: Int, items: [Experience]) {
+                                    openOnly: Bool = false, limit: Int = 20) throws -> (total: Int, items: [Experience], unreadable: [Unreadable]) {
         var clauses: [String] = [], arguments = StatementArguments()
         if let id { clauses.append("experience.id = ?"); arguments += [id] }
         if let idPrefix {
@@ -273,23 +274,24 @@ public actor ExperienceStore {
             }
             var pageArguments = arguments
             pageArguments += [max(0, limit)]
-            let items = try Self.fold(db, matching: """
+            let page = try Self.foldReadable(db, matching: """
                 experience.id IN (SELECT experience.id FROM experience WHERE \(matching)
                                   ORDER BY experience.at DESC, experience.rowid DESC LIMIT ?)
                 """, arguments: pageArguments, order: "experience.at DESC, experience.rowid DESC")
-            return (total, items)
+            return (total, page.experiences, page.unreadable)
         }
     }
 
-    /// Experiences of these kinds born after `after`, oldest first: what happened since then.
-    public func born(kinds: [Experience.Kind], after: Date, limit: Int) throws -> [Experience] {
-        guard !kinds.isEmpty else { return [] }
+    /// Experiences of these kinds born after `after`, oldest first: what happened since then. A record that will not fold is named in
+    /// `unreadable`; it never hides the rest.
+    public func born(kinds: [Experience.Kind], after: Date, limit: Int) throws -> Folded {
+        guard !kinds.isEmpty else { return Folded() }
         let marks = Array(repeating: "?", count: kinds.count).joined(separator: ",")
         var arguments = StatementArguments(kinds.map(\.rawValue))
         arguments += [NativeTimestampFormat.fractionalZulu(after), max(0, limit)]
         return try database().read {
-            try Self.fold($0, matching: "experience.id IN (SELECT id FROM experience WHERE kind IN (\(marks)) AND at > ? ORDER BY at LIMIT ?)",
-                          arguments: arguments, order: "experience.at, experience.rowid")
+            try Self.foldReadable($0, matching: "experience.id IN (SELECT id FROM experience WHERE kind IN (\(marks)) AND at > ? ORDER BY at LIMIT ?)",
+                                  arguments: arguments, order: "experience.at, experience.rowid")
         }
     }
 
@@ -404,35 +406,102 @@ public actor ExperienceStore {
     }
 
     /// Replay through the admission law and report unreadable rows.
+    /// A record a read could not fold: its id, its birth time as the row holds it, the event that failed (0 for its birth) and why, with the
+    /// field that failed named.
+    public struct Unreadable: Sendable {
+        public let id: String
+        public let at: String
+        public let seq: Int64
+        public let cause: any Error
+        public var words: String { cause.localizedDescription }
+    }
+
+    /// What a read folded, and each record it could not, named.
+    public struct Folded: Sendable {
+        public var experiences: [Experience] = []
+        public var unreadable: [Unreadable] = []
+    }
+
+    /// A birth that will not decode; not a law refusal, so a write that meets it records a gap as before.
+    public struct UnreadableBirth: Error, LocalizedError, Sendable {
+        public let id: String
+        public let detail: String
+        public var errorDescription: String? { "Experience \(id)'s birth is unreadable: \(detail)." }
+    }
+
+    /// Strict readers and writes: the first record that will not fold is the read's failure.
     private static func fold(_ db: Database, matching: String, arguments: StatementArguments = [],
                              order: String = "experience.id") throws -> [Experience] {
+        let read = try foldReadable(db, matching: matching, arguments: arguments, order: order)
+        if let first = read.unreadable.first { throw first.cause }
+        return read.experiences
+    }
+
+    /// Every record that folds, and each one that does not, named by id with its cause; one bad record never hides the others.
+    private static func foldReadable(_ db: Database, matching: String, arguments: StatementArguments = [],
+                                     order: String = "experience.id") throws -> Folded {
         let decoder = JSONDecoder()
-        var experiences: [Experience] = []
+        var folded = Folded()
         var current: Experience?
+        var currentID: String?
         for row in try Row.fetchAll(db, sql: """
-            SELECT experience.id, born, updated_at, seq, event FROM experience
+            SELECT experience.id, experience.at AS born_at, born, updated_at, seq, event FROM experience
             LEFT JOIN event ON event.experience_id = experience.id
             WHERE \(matching) ORDER BY \(order), event.seq
             """, arguments: arguments) {
             let id: String = row["id"]
-            if current?.id != id {
-                if let current { experiences.append(current) }
-                current = try decoder.decode(Experience.self, from: Data((row["born"] as String).utf8))
-                current?.updatedAt = row["updated_at"]
-                current?.sequence = 0
+            if currentID != id {
+                if let current { folded.experiences.append(current) }
+                currentID = id
+                current = nil
+                do {
+                    var birth = try decoder.decode(Experience.self, from: Data((row["born"] as String).utf8))
+                    birth.updatedAt = row["updated_at"]
+                    birth.sequence = 0
+                    current = birth
+                } catch {
+                    folded.unreadable.append(.init(id: id, at: (row["born_at"] as String?) ?? "", seq: 0,
+                                                   cause: UnreadableBirth(id: id, detail: decodeFailure(error))))
+                    continue
+                }
             }
-            guard let event: String = row["event"] else { continue }
-            let change: Change
-            do { change = try decoder.decode(Change.self, from: Data(event.utf8)) } catch {
-                throw LawError.unreadable(id, row["seq"], error.localizedDescription)
+            guard var next = current, let event: String = row["event"] else { continue }
+            let seq: Int64 = row["seq"]
+            do {
+                let change: Change
+                do { change = try decoder.decode(Change.self, from: Data(event.utf8)) } catch {
+                    throw LawError.unreadable(id, seq, decodeFailure(error))
+                }
+                _ = try apply(change, to: &next)
+                next.sequence = seq
+                current = next
+            } catch {
+                // The record stops at its first event that will not fold; a partial record is never handed on as whole.
+                current = nil
+                folded.unreadable.append(.init(id: id, at: (row["born_at"] as String?) ?? "", seq: seq, cause: error))
             }
-            guard var folded = current else { throw LawError.unknown(id) }
-            _ = try apply(change, to: &folded)
-            folded.sequence = row["seq"]
-            current = folded
         }
-        if let current { experiences.append(current) }
-        return experiences
+        if let current { folded.experiences.append(current) }
+        return folded
+    }
+
+    /// A decode error with the field that failed, as a path from the record's top (`owes.repair.phase`, `evidence[0].id`).
+    static func decodeFailure(_ error: Error) -> String {
+        guard let failure = error as? DecodingError else { return error.localizedDescription }
+        func field(_ path: [any CodingKey]) -> String {
+            var named = ""
+            for key in path {
+                if let index = key.intValue { named += "[\(index)]" } else { named += (named.isEmpty ? "" : ".") + key.stringValue }
+            }
+            return named.isEmpty ? "the record itself" : "field " + named
+        }
+        switch failure {
+        case .keyNotFound(let key, let context): return field(context.codingPath + [key]) + " is missing"
+        case .valueNotFound(let type, let context): return field(context.codingPath) + " is null where \(type) is required"
+        case .typeMismatch(let type, let context): return field(context.codingPath) + " is not \(type): " + context.debugDescription
+        case .dataCorrupted(let context): return field(context.codingPath) + " is unreadable: " + context.debugDescription
+        @unknown default: return failure.localizedDescription
+        }
     }
 
     /// Keep change admission and replay under one law.

@@ -83,10 +83,10 @@ public actor BackgroundLoopLifetimes {
     }
 
     /// Install pulse recording and the body read before any organ can beat, so its first pulse reaches durable loop state. `felt` hears each beat once it
-    /// is in its ring.
-    public nonisolated func receiveOrganPulses(felt: @escaping @Sendable (OrganPulse) async -> Void) {
+    /// is in its ring: the mind's nerve, attached while a mind runs and detached (nil) when it closes.
+    public nonisolated func receiveOrganPulses(felt: (@Sendable (OrganPulse) async -> Void)? = nil) {
         let scheduler = scheduler
-        OrganPulse.install { pulse in Task { await scheduler.recordPulse(pulse); await felt(pulse) } }
+        OrganPulse.install { pulse in Task { await scheduler.recordPulse(pulse); await felt?(pulse) } }
         OrganBody.install { now in try await self.organBody(now: now) }
     }
 

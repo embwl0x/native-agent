@@ -14,10 +14,14 @@ public struct FaceStyle: Sendable {
     public let value: Font
     public let elevation: Color
     public let actionSurface: Color
+    /// The fill of a row's one answer when the row waits on the person: the door's one accent, deep enough to carry white words. Absent,
+    /// the answer takes the tint the door's window already gives its controls.
+    public let answer: Color?
     let card: @MainActor @Sendable (AnyView) -> AnyView
 
     public init(insets: EdgeInsets, minimumHeight: CGFloat, title: Font, detail: Font, value: Font,
-                elevation: Color, actionSurface: Color, card: @escaping @MainActor @Sendable (AnyView) -> AnyView) {
+                elevation: Color, actionSurface: Color, answer: Color? = nil,
+                card: @escaping @MainActor @Sendable (AnyView) -> AnyView) {
         self.insets = insets
         self.minimumHeight = minimumHeight
         self.title = title
@@ -25,6 +29,7 @@ public struct FaceStyle: Sendable {
         self.value = value
         self.elevation = elevation
         self.actionSurface = actionSurface
+        self.answer = answer
         self.card = card
     }
 

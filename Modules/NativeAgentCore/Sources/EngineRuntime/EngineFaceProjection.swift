@@ -123,16 +123,21 @@ enum EngineFaceProjection {
             await watchFiles([engine.dataRoot.appendingPathComponent("dream_diary")], refresh: { await entry(date, engine: engine) },
                 unavailable: { await unavailable(key, cause: $0, engine: engine) })
         case .mood:
-            guard let runtime = engine.cognition else {
-                let state = FaceReadState.unavailable(EngineFaceActs.failure("body_unavailable", "This root has no mind."))
-                await engine.face.post(MoodFace(warmth: nil, state: state), at: key)
-                return
+            // The mind's changes run across its absence and presence: the mood appears when the mind starts and goes when it closes.
+            let changes = await engine.cognitionView.changes()
+            func post() async {
+                guard let runtime = engine.cognition else {
+                    let state = FaceReadState.unavailable(
+                        EngineFaceActs.failure("body_unavailable", "There is no running mind: it starts when setup finishes."))
+                    await engine.face.post(MoodFace(warmth: nil, state: state), at: key)
+                    return
+                }
+                await engine.face.post(MoodFace(warmth: await runtime.moodWarmth(), state: .ready), at: key)
             }
-            let changes = await runtime.changes()
-            await engine.face.post(MoodFace(warmth: await runtime.moodWarmth(), state: .ready), at: key)
+            await post()
             for await _ in changes {
                 guard !Task.isCancelled else { return }
-                await engine.face.post(MoodFace(warmth: await runtime.moodWarmth(), state: .ready), at: key)
+                await post()
             }
         case .runs:
             await withTaskGroup(of: Void.self) { group in
