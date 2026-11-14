@@ -2,11 +2,11 @@ import AgentWorkspace
 import ChatToolRuntime
 import CognitiveSubstrate
 import Experiences
-import CoreGraphics
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import MacControl
+import MacIntegration
 import NativeAgentShared
 
 // Blueprint: | `NativeCognitionRuntime+Rhythm.swift` | `NativeCognitionRuntime`. |
@@ -187,7 +187,8 @@ extension NativeCognitionRuntime {
         if MacPersonInput.listening {
             return "I haven't felt your Mac input since NativeAgent started, so I can't tell yet when you're away; no night is due until I can."
         }
-        if CGPreflightListenEventAccess() {
+        // The grant as Trust reads it: on after this launch reads on, taking effect after one restart.
+        if SystemPermissionPreflight.status(.inputMonitoring) == .granted {
             return "Input Monitoring is on but counts from the next launch: I can't tell when you're away until NativeAgent restarts once."
         }
         return "I can't tell when you're away until Input Monitoring is on: System Settings → Privacy & Security → Input Monitoring, "

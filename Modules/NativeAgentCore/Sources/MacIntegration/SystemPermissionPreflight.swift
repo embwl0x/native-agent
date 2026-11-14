@@ -144,7 +144,53 @@ public enum SystemPermissionPreflight {
         [.fullDiskAccess, .screenRecording, .inputMonitoring]
 
     /// Capture launch-applied grants before later probes can observe settings this process has not acquired.
-    public static let grantedAtLaunch = Set(appliesAtLaunch.filter { status($0) == .granted })
+    public static let grantedAtLaunch = Set(appliesAtLaunch.filter(heldByThisProcess))
+
+    /// Whether this process itself holds a launch-applied grant. Screen Recording and Input Monitoring switched on after this launch read off
+    /// here until the one restart; `status` reads those as the next launch will.
+    static func heldByThisProcess(_ capability: SystemPermissionCapability) -> Bool {
+        switch capability {
+        case .screenRecording: CGPreflightScreenCaptureAccess()
+        case .inputMonitoring: CGPreflightListenEventAccess()
+        default: status(capability) == .granted
+        }
+    }
+
+    static let grantProbeArgument = "--nativeagent-grant-probe"
+    /// The app's own executable, set by its entry point: only the app answers the grant probe, so only the app runs one.
+    private nonisolated(unsafe) static var grantProbeExecutable: String?
+
+    /// Executable-only mode, before anything else starts. A fresh process of the app holds what the next launch will hold: it prints the
+    /// launch-applied grants it holds and exits. Any other launch records this executable as the one that answers the probe.
+    public static func runGrantProbeIfRequested() -> Bool {
+        guard CommandLine.arguments.dropFirst().first == grantProbeArgument else {
+            grantProbeExecutable = Bundle.main.executablePath
+            return false
+        }
+        let held = [SystemPermissionCapability.screenRecording, .inputMonitoring].filter(heldByThisProcess).map(\.rawValue)
+        FileHandle.standardOutput.write(Data(held.joined(separator: "\n").utf8))
+        return true
+    }
+
+    /// A launch-applied grant as the next launch of this app reads it, from a fresh process of the app; unknown when that read fails.
+    static func nextLaunchStatus(_ capability: SystemPermissionCapability) -> SystemPermissionStatus {
+        guard let executable = grantProbeExecutable else { return .unknown }
+        let process = Process(), output = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = [grantProbeArgument]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch {
+            logger.error("Grant probe did not start: \(error.localizedDescription, privacy: .public)")
+            return .unknown
+        }
+        // The probe ends itself once it has read; the end of its output is its exit.
+        let read = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else { return .unknown }
+        return String(decoding: read, as: UTF8.self).split(separator: "\n").contains { $0 == capability.rawValue } ? .granted : .denied
+    }
 
     /// A launch-applied grant enabled after startup still requires a restart, regardless of its current probe.
     public static func awaitingLaunch(_ ids: [String]) -> [SystemPermissionCapability] {
@@ -273,11 +319,12 @@ public enum SystemPermissionPreflight {
             }
         case .fullDiskAccess:
             return snapshot(capability).status
-        case .screenRecording:
-            // Preflight screen capture without invoking the prompting request API.
-            return CGPreflightScreenCaptureAccess() ? .granted : .denied
-        case .inputMonitoring:
-            return CGPreflightListenEventAccess() ? .granted : .denied
+        case .screenRecording, .inputMonitoring:
+            // Preflight without invoking the prompting request API. Switched on after this launch, the grant reads off in this process until
+            // it restarts: a fresh process of the app reads it as the next launch will, so every place shows it on, taking effect after one
+            // restart.
+            if heldByThisProcess(capability) { return .granted }
+            return grantedAtLaunch.contains(capability) ? .denied : nextLaunchStatus(capability)
         case .calendars:
             return mapEKStatus(EKEventStore.authorizationStatus(for: .event))
         case .reminders:
@@ -481,8 +528,7 @@ extension SystemPermissionPreflight {
                 granted.append(gate.displayName)
                 fields[gate.rawValue] = .string("granted")
             case .denied, .notDetermined, .restricted:
-                // A launch-applied grant switched on after this launch may still read off until the one restart.
-                off.append(gate.displayName + (appliesAtLaunch.contains(gate) ? " (counts from the next launch once it is on)" : ""))
+                off.append(gate.displayName)
                 fields[gate.rawValue] = .string(reading.status.rawValue)
             }
         }

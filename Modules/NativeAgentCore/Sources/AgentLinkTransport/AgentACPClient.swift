@@ -18,6 +18,8 @@ public actor AgentACPClient {
         package let continued: Bool
         /// The model the agent said its session uses, when it says.
         package var model: String? = nil
+        /// Said when the session runs in a mode other than the recipe's, because the recipe's is not offered.
+        package var modeNote: String? = nil
         package var completed: Bool { stopReason == "end_turn" }
     }
     public enum Failure: String, Error, LocalizedError {
@@ -139,6 +141,18 @@ public actor AgentACPClient {
     private var restoredHistory = false
     private var initialized: JSONValue?
     private var advertised: [String]?
+    /// The mode this session runs in, picked from the agent's own offer; nil when it offers none.
+    private var chosenMode: String?
+    private var modeNote: String?
+
+    /// How much a mode lets the agent do without asking, read from its name: 0 asks (ask, default, plan, chat), 1 edits on its own
+    /// (accept edits), 2 acts on its own (auto, yolo, bypass, don't ask).
+    static func latitude(_ mode: String) -> Int {
+        let name = mode.lowercased()
+        if ["yolo", "bypass", "dont_ask", "dontask", "don't", "never", "danger", "full", "auto"].contains(where: name.contains) { return 2 }
+        if ["accept", "edit", "write"].contains(where: name.contains) { return 1 }
+        return 0
+    }
 
     package nonisolated let dataRoot: URL
     package init(dataRoot: URL) { self.dataRoot = dataRoot.standardizedFileURL }
@@ -172,7 +186,7 @@ public actor AgentACPClient {
             if let lifeID { self.life?.detach(lifeID) }
             self.life = nil; lifeID = nil
         }
-        text = ""; receivedBytes = 0; deniedPermission = false; restoredHistory = false; requiredMode = nil; delivered = false
+        text = ""; receivedBytes = 0; deniedPermission = false; restoredHistory = false; requiredMode = nil; chosenMode = nil; modeNote = nil; delivered = false
         bounded = capped
         startupTimeout = .initializationTimedOut
         self.permission = permission
@@ -251,31 +265,30 @@ public actor AgentACPClient {
                 guard case .array(let modes)? = available else { return [] }
                 return modes.compactMap { if case .string(let mode)? = $0.objectValue?["id"] { mode } else { nil } }
             }()
+            // The mode is picked from what the agent offers: the recipe's when offered, else the offered mode that asks the most (the
+            // agent's current one among equals), never a more permissive one silently. An agent that offers none runs as it is; a mode it
+            // does not offer is never sent, and `learned` writes the pick to the recipe.
             if let now {
                 advertised = now
-                func named(_ modes: [String]) -> String { modes.isEmpty ? "none" : modes.joined(separator: ", ") }
-                if message != nil, let recipe = line.modes, Set(recipe) != Set(now) {
-                    throw Mismatch(method: opened, code: nil, detail: "it advertises modes \(named(now)); the recipe says \(named(recipe))")
+                let current = session.objectValue?["modes"]?.objectValue?["currentModeId"]?.stringValue
+                chosenMode = now.contains(line.permissionMode) ? line.permissionMode
+                    : now.min { (Self.latitude($0), $0 == current ? 0 : 1) < (Self.latitude($1), $1 == current ? 0 : 1) }
+                if let chosenMode, chosenMode != line.permissionMode {
+                    modeNote = "Ran in its \(chosenMode) mode: the recipe's \(line.permissionMode) is not one it offers ("
+                        + now.joined(separator: ", ") + ")."
+                        + (Self.latitude(chosenMode) > Self.latitude(line.permissionMode)
+                            ? " Every mode it offers lets it act on more without asking than \(line.permissionMode) would." : "")
                 }
-                if message != nil, line.modes == nil, now.isEmpty {
-                    throw Mismatch(
-                        method: "session/set_mode",
-                        code: nil,
-                        detail: "it advertises no modes, so permissionMode \(line.permissionMode) cannot be set")
-                }
-                guard now.isEmpty || now.contains(line.permissionMode) else {
-                    throw Mismatch(
-                        method: "session/set_mode",
-                        code: nil,
-                        detail: "the recipe's permissionMode \(line.permissionMode) is not one of its modes \(named(now))")
-                }
+            } else {
+                // A continued session need not restate its modes: the recipe's verified ones stand.
+                chosenMode = line.modes?.contains(line.permissionMode) == true ? line.permissionMode : nil
             }
-            if (now ?? line.modes)?.isEmpty != true {
-                requiredMode = line.permissionMode
-                _ = try await request("session/set_mode", ["sessionId": .string(id), "modeId": .string(line.permissionMode)])
+            if let chosenMode {
+                requiredMode = chosenMode
+                _ = try await request("session/set_mode", ["sessionId": .string(id), "modeId": .string(chosenMode)])
             }
             guard let message else {
-                return Reply(sessionID: id, text: "", stopReason: "dry_run", continued: continued)
+                return Reply(sessionID: id, text: "", stopReason: "dry_run", continued: continued, modeNote: modeNote)
             }
             // Conservative boundary: any attempted prompt write makes delivery uncertain.
             prompting = true; delivered = true
@@ -287,7 +300,7 @@ public actor AgentACPClient {
             withdrawOpenPermissions()
             try Task.checkCancellation()
             return Reply(sessionID: id, text: text, stopReason: deniedPermission ? "permission_denied" : reason,
-                continued: continued, model: model)
+                continued: continued, model: model, modeNote: modeNote)
         } onCancel: { Task { await self.cancel(error: CancellationError()) } }
         deadlineGeneration += 1
         deadline?.cancel(); deadline = nil
@@ -406,6 +419,7 @@ public actor AgentACPClient {
         let capabilities = initialized?.objectValue?["agentCapabilities"]?.objectValue
         if case .int(let version)? = initialized?.objectValue?["protocolVersion"] { line.protocolVersion = Int(version) }
         if let advertised, line.modes.map(Set.init) != Set(advertised) { line.modes = advertised }
+        if let chosenMode { line.permissionMode = chosenMode }
         if initialized != nil {
             line.supportsLoad = capabilities?["loadSession"] == .bool(true)
             line.supportsResume = capabilities?["sessionCapabilities"]?.objectValue?["resume"]?.objectValue != nil

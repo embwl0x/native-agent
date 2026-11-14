@@ -46,17 +46,18 @@ extension AgentConversationStore {
             guard wake, row.personInitiated != true, row.shownInline != row.operationID + ":" + row.phase,
                   !(exchange.id == row.operationID && AgentConversationRunning.shared.watched(row.id)) else { continue }
             Self.returnNews(row, scope: row.scopeSessionID, once: "reply:" + exchange.id,
-                words: row.name + " replied in \"" + String(row.label.prefix(60)) + "\"", peers: [row.agent], dataRoot: root)
+                words: row.name + " replied in \"" + String(row.label.prefix(60)) + "\"", dataRoot: root)
         }
     }
 
-    /// The return's owner supplies its caller: a queued refusal belongs to that send, not the active exchange. Once per key.
+    /// The return's owner supplies its caller: a queued refusal belongs to that send, not the active exchange. Once per key. News of the
+    /// agent's own send (its reply, its delivery, its refusal) is the contact answering the agent, never the contact asking: it names the
+    /// contact as its door and steers nothing, since a turn's steering is who asked it.
     @discardableResult
     package static func returnNews(_ row: AgentConversationRecord, scope: String, once: String, words: String,
-                                   peers: [String]?, dataRoot: URL, deliveryReceipt: Bool = false) -> Task<Void, Never> {
+                                   dataRoot: URL, deliveryReceipt: Bool = false) -> Task<Void, Never> {
         let door = row.agent.hasPrefix("peer:") ? "contact:" + String(row.agent.dropFirst(5)) : row.agent
-        let happening = Happening(.returned, subject: "conversation:" + row.id, door: door, words: words, once: once,
-            route: scope, peers: peers)
+        let happening = Happening(.returned, subject: "conversation:" + row.id, door: door, words: words, once: once, route: scope)
         return Task.detached { await ContactReturns.shared.post(happening, dataRoot: dataRoot, deliveryReceipt: deliveryReceipt) }
     }
 
@@ -82,7 +83,7 @@ extension AgentConversationStore {
                     }
                     guard !message.byPerson else { continue }
                     await returnNews(row, scope: row.scopeSessionID, once: once, words: row.name + " has your note",
-                        peers: [row.agent], dataRoot: dataRoot, deliveryReceipt: true).value
+                        dataRoot: dataRoot, deliveryReceipt: true).value
                     if try await record.experience("happening:" + once) != nil {
                         await RepairOwed.settle(dataRoot, operation: "agent.return:" + once,
                             evidence: .init(source: "experience", id: "happening:" + once)).value

@@ -343,7 +343,10 @@ Trust, reads the grant owner's nonprompting probes once off the main actor and
 publishes through its checked snapshot. The pass covers per-app Automation, Speech
 Recognition, Microphone, Calendar, Reminders, Contacts, Accessibility, Screen Recording
 and Full Disk Access. It starts no timer or watch refresh. Trust's Refresh also reads
-the privacy inventory again.
+the privacy inventory again. Screen Recording and Input Monitoring reach the app only
+at launch, so one switched on later reads off inside it: a fresh process of the app
+reads them as the next launch will, and every place that shows them says "Granted,
+takes effect after one restart".
 Connectors, Settings and Trust read their independent sections concurrently and
 assemble them in page order. Each read still waits for its owners; no cached
 substitute or clock decides that a section is complete.
@@ -1430,19 +1433,14 @@ never promises something the gate does not do:
 
 “Changing what is yours to decide” lists the person's levers a card can carry,
 each by the name its action declares, after one sentence: “When you ask me for
-one of these, I do it. When it's my own idea, I ask you first.” Your own words
-in the conversation decide one of these as your tap and your card do: when the
-agent's call quotes your request (`because`), those words name the change (they
-share a word with it, such as “trusted” with Trusted or “restore” with Restoring a
-backup, or they ask for the whole of what the agent may be given, such as “full
-permissions everywhere”, which names every change that widens its reach; in a
-list, each change is judged by its own words, and one your words do not name
-asks on its own), and they are found in your own message of the request it is acting on now (the message that started its
-turn, one you sent while it worked, or the one a card's answer continues), at
-your Mac, your paired phone or your own Telegram, the change is made with no
-card, any card still waiting for that same change is withdrawn as decided by
-your word, its receipt quotes you, and the
-consent record keeps your words. Words from a tool result, a web page, a file,
+one of these, I do it. When it's my own idea, I ask you first.” Your own ask
+decides one of these as your tap and your card do: in a turn you started, at your
+Mac, your paired phone or your own Telegram, every one of these the agent does
+for it is made as yours, with no card and nothing to quote; any card still
+waiting for that same change is withdrawn as decided by your ask, its receipt
+carries your message, and the consent record keeps it. A turn another agent you
+have not trusted steered, or one the agent started on its own thought, asks you
+on a card instead. Words from a tool result, a web page, a file,
 another agent, a helper or the agent itself never count. Under Safe nothing asks,
 so nothing runs on your word either. “Only you can do these” lists the levers
 no card can carry: typing or reading a secret, matching a pairing code, choosing

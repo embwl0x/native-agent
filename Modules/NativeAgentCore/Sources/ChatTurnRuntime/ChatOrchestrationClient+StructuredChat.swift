@@ -307,15 +307,14 @@ extension SwiftNativeChatOrchestrationClient {
             try await holding(turn.with(\.offeredTools, Set(providerCtx.toolSchemas.map(\.name)))) { turn in
             try await holding(turn.with(\.settingRequestEvidence, { [self] setting, value, currentValue, quote in
                 let heard = await Self.requestHeard(quote, setting: setting, message: message, surface: surface, session: resolvedSession,
-                                                    dataRoot: dataRoot, ask: ask, turn: turn)
+                                                    dataRoot: dataRoot, turn: turn)
                 guard heard.readable else { return heard.current ? false : nil }
                 guard heard.found else { return nil }
                 guard case .bool = value else { return false }
                 return heard.current && value != currentValue && heard.lastChange?["decided_by"] == .string("agent")
                     && heard.lastChange?["old_value"] == value && heard.lastChange?["new_value"] == currentValue
-            }).with(\.personWord, { [self] quote in
-                await Self.requestHeard(quote, setting: nil, message: message, surface: surface, session: resolvedSession,
-                                        dataRoot: dataRoot, ask: ask, turn: turn).person
+            }).with(\.personsAsk, { [self] in
+                await Self.personsAsk(message: message, surface: surface, session: resolvedSession, dataRoot: dataRoot, ask: ask, turn: turn)
             })) { turn in
                 return try await engine.executeTurnWithStreamingToolLoop(
                         surface: surface,
@@ -501,23 +500,18 @@ extension SwiftNativeChatOrchestrationClient {
         var current = false
         /// Someone whose words count for the agent's own dials said it: in this turn's message or earlier in this conversation.
         var found = false
-        /// The person said it in their own message of the ask this turn is acting on (`TurnAsk`), at a door that is theirs.
-        var person = false
         /// The conversation's history was read whole.
         var readable = false
         /// The receipt fields (decided_by, old_value, new_value) of the last change of the asked setting in this conversation.
         var lastChange: [String: JSONValue]?
     }
 
-    /// One reading of request evidence, for both questions a turn answers with it (`Turn.settingRequestEvidence`, `Turn.personWord`): were the
-    /// quote's words said in this conversation, and by whom. A message says a quote when it contains the quote whole, or one of the quote's
-    /// quoted runs of three words or more (a transport may wrap the request with attribution); nothing else relates the words to the call.
-    /// The person counts only on a turn that is theirs (`isUsersTurn`: their Mac chat, their signed phone, Telegram's one owner; or a card's
-    /// continuation at such a door) and only for their own messages of the ask the turn is acting on now (`TurnAsk`), never an earlier one in
-    /// the conversation. For the agent's own dials below Full Mac (`found`), any message here of the person's, a trusted agent's or a human
-    /// relayed through a bridge counts, as before. A tool result, a page, a file, a helper and the agent's own words are no message here.
+    /// Request evidence for the agent's own dials below Full Mac on a turn that is not the person's own ask (`Turn.settingRequestEvidence`):
+    /// were the quote's words said in this conversation by someone whose words count (the person, a trusted agent, a human relayed through a
+    /// bridge). A message says a quote when it contains the quote whole, or one of the quote's quoted runs of three words or more (a transport
+    /// may wrap the request with attribution). A tool result, a page, a file, a helper and the agent's own words are no message here.
     static func requestHeard(_ quote: String, setting: String?, message: String, surface: String, session: String, dataRoot: URL,
-                             ask: TurnAsk, turn: Turn) async -> RequestHeard {
+                             turn: Turn) async -> RequestHeard {
         func normalized(_ text: String) -> String {
             text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
         }
@@ -530,22 +524,10 @@ extension SwiftNativeChatOrchestrationClient {
         let envelope = TurnEnvelope.current(turn: turn, surface: surface)
         let origin = turn.origin
         let lane = (origin?.agent ?? envelope.agent) == "agent" ? envelope.verifiedUserId.map { "peer:" + $0 } : origin?.agent ?? envelope.agent
-        // A card's continuation is the person's turn when it continues at one of their doors: the Mac, the phone, Telegram's one owner.
-        let door = surface.lowercased()
-        let personTurn = isUsersTurn(surface: surface, sessionId: session, dataRoot: dataRoot, turn: turn)
-            || (ask.continuing && origin == nil && envelope.agent == nil
-                && SessionConversation.kind(session, dataRoot: dataRoot)?.isPersonConversation == true
-                && (door == "telegram" ? envelope.verifiedUserId.map { $0 == telegramOwnerId(dataRoot: dataRoot) } == true
-                    : ["chat", "ios"].contains(door)))
         var heard = RequestHeard()
-        let said = quotes(message)
         heard.current = (origin?.authored == .human || lane.map(PeerDataTaint.ownerTrusts) == true
-            || (origin == nil && envelope.agent == nil && MyQueue.Door(rawValue: surface) != nil)) && said
+            || (origin == nil && envelope.agent == nil && MyQueue.Door(rawValue: surface) != nil)) && quotes(message)
         heard.found = heard.current
-        // A continuation's message is the card's outcome, not the person's words.
-        heard.person = personTurn && !ask.continuing && said
-        var askRuns: Set<String> = []
-        if personTurn { askRuns = await ask.allRuns(dataRoot: dataRoot) }
         guard let history = try? await SessionHistoryReader(dataRoot: dataRoot).messagesWithStats(
             forSessionId: session, strictEvidence: true),
             !["read_failed", "invalid_encoding", "invalid_session_id"].contains(history.stats.mode),
@@ -559,9 +541,7 @@ extension SwiftNativeChatOrchestrationClient {
                 || (peer == nil && envelope.verifiedUserId != nil && author == envelope.verifiedUserId)
             if persons || author == "human via bridge"
                 || peer.map({ $0.split(separator: "\n").allSatisfy { PeerDataTaint.ownerTrusts(String($0)) } }) == true {
-                let here = quotes(row.content)
-                heard.found = heard.found || here
-                if persons, personTurn, let run = fields["runId"]?.stringValue, askRuns.contains(run) { heard.person = heard.person || here }
+                heard.found = heard.found || quotes(row.content)
             }
             guard let setting, case .object(let metadata)? = fields["metadata"],
                   metadata["kind"] == .string(ChatTranscriptToolMessageKind.toolUse),
@@ -574,6 +554,36 @@ extension SwiftNativeChatOrchestrationClient {
             }
         }
         return heard
+    }
+
+    /// The person's own ask this turn acts on (`Turn.personsAsk`), when the person started it: their Mac chat, their signed phone, Telegram's
+    /// one owner (`isUsersTurn`), or a card's continuation at such a door; and no untrusted agent steers it. The ask is the person's own
+    /// messages of it (`TurnAsk`): this turn's (never a continuation's, which is the card's outcome), those that joined it while it ran, and
+    /// the one a card's answer continues. Nil on any other turn, so its levers keep their card.
+    static func personsAsk(message: String, surface: String, session: String, dataRoot: URL, ask: TurnAsk, turn: Turn) async -> String? {
+        let envelope = TurnEnvelope.current(turn: turn, surface: surface)
+        let door = surface.lowercased()
+        let personTurn = isUsersTurn(surface: surface, sessionId: session, dataRoot: dataRoot, turn: turn)
+            || (ask.continuing && turn.origin == nil && envelope.agent == nil
+                && SessionConversation.kind(session, dataRoot: dataRoot)?.isPersonConversation == true
+                && (door == "telegram" ? envelope.verifiedUserId.map { $0 == telegramOwnerId(dataRoot: dataRoot) } == true
+                    : ["chat", "ios"].contains(door)))
+        guard personTurn, CapabilityLifecycle.turnWriteCheck(turn)() == nil else { return nil }
+        var said: [String] = ask.continuing ? [] : [message]
+        let runs = await ask.allRuns(dataRoot: dataRoot)
+        if let history = try? await SessionHistoryReader(dataRoot: dataRoot).messagesWithStats(forSessionId: session, strictEvidence: true) {
+            for row in history.messages where row.role == "user" {
+                guard case .object(let fields)? = row.extras, let run = fields["runId"]?.stringValue, runs.contains(run) else { continue }
+                let author = SwiftToolDispatcher.persistedHistoryAuthor(role: row.role, row: fields)
+                let peer = SwiftToolDispatcher.persistedHistoryPeer(role: row.role, row: fields)
+                guard author == SwiftToolDispatcher.ownerAuthor || (peer == nil && envelope.verifiedUserId != nil && author == envelope.verifiedUserId)
+                else { continue }
+                said.append(row.content)
+            }
+        }
+        let words = said.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            .reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+        return words.isEmpty ? nil : words.joined(separator: "\n")
     }
 
     /// Only a single allowlisted user identifies the bot's owner.

@@ -97,7 +97,13 @@ enum AgentConversationHistoryView {
                 "from": .string(line.speaker),
                 "text": .string(full ? line.text : String(line.text.prefix(800)))
             ]
-            if !full, line.text.count > 800 { value["text_truncated"] = .bool(true) }
+            // The page shows the start of a long message; the session keeps it whole, and the call here opens it whole.
+            if !full, line.text.count > 800 {
+                value["text_truncated"] = .bool(true)
+                value["whole_text_chars"] = .int(Int64(line.text.count))
+                value["read_whole"] = .object(["tool": .string("app"), "input": .object(["action": .string("agent.read"),
+                    "args": .object(["agent": .string(agent), "history_exchange": .string(line.id)])])])
+            }
             if let door = line.door { value["door"] = .string(door) }
             if let id = line.sendID {
                 value["send"] = .string(id)

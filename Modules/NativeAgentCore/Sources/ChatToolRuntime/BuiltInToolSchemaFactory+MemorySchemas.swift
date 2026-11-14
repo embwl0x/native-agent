@@ -95,7 +95,9 @@ extension BuiltInToolSchemaFactory {
                         ("importance", numSchema("How important this fact is to retain, 0..1. Default 0.5.")),
                         ("corrects", ToolSchema.strSchema("""
                             Optional id of an existing memory this new fact corrects (e.g. from memory.recall). The old memory is marked \
-                            lifecycle=corrected with a lineage link to this one and drops out of recall.
+                            lifecycle=corrected with a lineage link to this one and drops out of recall and context. A correction or \
+                            instruction saved without it returns still_surfacing: the nearest memories it leaves standing, each with the call \
+                            that retires it.
                             """)),
                         ("supersedes", stringArraySchema("Optional memory ids this replaces; kept in history, excluded from recall.")),
                         ("correction_reason", ToolSchema.strSchema("""

@@ -43,7 +43,7 @@ private enum RendersCardsPart: TurnPart { static let unset = false }
 private enum SettingEvidencePart: TurnPart {
     static let unset: (@Sendable (String, JSONValue, JSONValue, String) async -> Bool?)? = nil
 }
-private enum PersonWordPart: TurnPart { static let unset: (@Sendable (String) async -> Bool)? = nil }
+private enum PersonsAskPart: TurnPart { static let unset: (@Sendable () async -> String?)? = nil }
 private enum OriginPart: TurnPart { static let unset: ChatMessageOrigin? = nil }
 private enum RowsPart: TurnPart { static let unset = TurnRows() }
 private enum RuntimePart: TurnPart { static let unset: ChatTurnRuntimeContext.Active? = nil }
@@ -103,12 +103,12 @@ extension Turn {
         get { self[SettingEvidencePart.self] }
         set { self[SettingEvidencePart.self] = newValue }
     }
-    /// Whether a quote is the person's own words in their message of the ask this turn is acting on (this turn's message, a message that
-    /// joined it while it ran, or the message of the turn it continues after a card), said at a door that is theirs: the same request
-    /// evidence `settingRequestEvidence` reads, with only those messages counting. Nil off a conversation turn.
-    public var personWord: (@Sendable (String) async -> Bool)? {
-        get { self[PersonWordPart.self] }
-        set { self[PersonWordPart.self] = newValue }
+    /// The person's own ask this turn acts on, when the person started it at a door that is theirs and no untrusted agent steers it: the
+    /// person's own message (and any of theirs that joined it while it ran, or the one a card's answer continues). Every lever, raise and
+    /// owner-only change the agent calls in such a turn runs on it, as the person's act. Nil on any other turn.
+    public var personsAsk: (@Sendable () async -> String?)? {
+        get { self[PersonsAskPart.self] }
+        set { self[PersonsAskPart.self] = newValue }
     }
     /// Who authored the incoming row, stamped on user rows only.
     public var origin: ChatMessageOrigin? {
@@ -154,76 +154,5 @@ extension Turn {
         if let origin, origin.authored != .agent { return "person" }
         if let agent = origin?.agent ?? envelope?.agent { return agent == "self" ? "self" : "agent:" + agent }
         return origin?.authored == .agent ? "agent:unknown" : "person"
-    }
-}
-
-/// Whether quoted words are about the act they are offered for: one reading for a setting's request evidence and for the person's word.
-/// The quote and the act's own words (the act as the person would name it: a lever's name, a setting's label, page and id, the action's
-/// id, the call's target values) are split into words, lowercased, with common words and generic verbs left out; the quote relates to the
-/// act when one word of each meets: equal, or, both four letters or more, sharing their first four or more letters ("trusted" and "trust",
-/// "restoring" and "restore"). A miss means the quote does not name this act, so the change is not made on it.
-public enum RequestWords {
-    /// Words that name no act: articles, pronouns, auxiliaries, prepositions, politeness, and the verbs every act shares.
-    static let common: Set<String> = [
-        "a", "an", "the", "and", "or", "but", "if", "to", "of", "for", "in", "on", "off", "at", "by", "with", "from", "into", "up", "down",
-        "out", "over", "as", "it", "its", "it's", "this", "that", "these", "those", "them", "they", "their", "my", "me", "mine", "i", "i'm",
-        "you", "your", "yours", "we", "our", "us", "he", "she", "his", "her", "be", "is", "are", "was", "were", "am", "been", "do", "does",
-        "did", "done", "can", "could", "will", "would", "should", "shall", "may", "might", "must", "please", "just", "now", "all", "any",
-        "some", "every", "each", "yes", "no", "not", "ok", "okay", "so", "then", "too", "also", "what", "when", "where", "which", "who",
-        "how", "why", "there", "here", "have", "has", "had", "get", "got", "go", "let", "make", "want", "need", "like", "thing", "things",
-        "one", "ones", "again", "back", "new", "time", "turn", "turning", "change", "changing", "set", "setting", "settings", "switch",
-        "switches", "flip", "enable", "disable", "allow", "give", "use", "using", "open", "opening", "choose", "choosing", "person's",
-        "person", "agent", "agent's", "s", "true", "false",
-    ]
-
-    /// The words of a text that can name an act.
-    public static func words(_ text: String) -> [String] {
-        text.lowercased().split { !($0.isLetter || $0.isNumber || $0 == "'") }
-            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "'")) }
-            .filter { !$0.isEmpty && !common.contains($0) }
-    }
-
-    /// Whether the quote shares a word with the act's own words (see the type's rule).
-    public static func relates(_ quote: String, to act: [String]) -> Bool {
-        let said = words(quote), named = Set(act.flatMap(words))
-        return said.contains { word in
-            named.contains { name in
-                word == name || (word.count >= 4 && name.count >= 4 && word.prefix(4) == name.prefix(4))
-            }
-        }
-    }
-
-    /// Whether the quote is about this act: it shares a word with the act's own words, or the act widens what the agent may do and the
-    /// quote asks for the whole of that (`asksWhole`), which names every such act at once.
-    public static func relates(_ quote: String, to act: [String], widens: Bool) -> Bool {
-        relates(quote, to: act) || (widens && asksWhole(quote))
-    }
-
-    /// The words that name what a widening gives the agent.
-    static let kind = ["permission", "access", "grant"]
-    /// Words that, before a word of the kind, ask for all of it.
-    static let whole: Set<String> = ["all", "every", "full", "fully", "entire", "whole"]
-    /// Words that may stand between those and the kind: articles and owners.
-    static let between: Set<String> = ["the", "my", "your", "her", "his", "their", "its", "of", "these", "those", "this", "that"]
-
-    /// Whether a word is one of the kind (`permissions`, `accessing`, `granted`).
-    public static func namesKind(_ text: String) -> Bool {
-        text.lowercased().split { !($0.isLetter || $0 == "'") }.contains { word in kind.contains { word.hasPrefix($0) } }
-    }
-
-    /// Whether the quote asks for everything the agent may be given: a whole word before a word of the kind, with only articles and owners
-    /// between ("full permissions", "all your access", "every grant"); "everywhere" or "everything" in a quote that names the kind; or
-    /// "all of it" / "all of them". A whole word before anything else ("full disk access") asks for that thing alone.
-    public static func asksWhole(_ quote: String) -> Bool {
-        let said = quote.lowercased().split { !($0.isLetter || $0.isNumber || $0 == "'") }.map(String.init)
-        let named = said.contains { word in kind.contains { word.hasPrefix($0) } }
-        for (index, word) in said.enumerated() {
-            if named, word == "everywhere" || word == "everything" { return true }
-            guard whole.contains(word) else { continue }
-            let rest = said.dropFirst(index + 1)
-            if word == "all", rest.prefix(2).elementsEqual(["of", "it"]) || rest.prefix(2).elementsEqual(["of", "them"]) { return true }
-            if let next = rest.first(where: { !between.contains($0) }), kind.contains(where: { next.hasPrefix($0) }) { return true }
-        }
-        return false
     }
 }

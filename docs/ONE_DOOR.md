@@ -650,19 +650,19 @@ use named actions for its items. Secret arguments still require a single action.
 
 `setting.set` takes `setting`, `value` and optional `because`. Their mind's
 Settings rows say they are theirs to set both ways; they need no quoted request
-or Trust posture. For other settings on model turns below Full Mac, `because`
-still quotes at least three words of the person's or trusted agent's request,
-unless restoring their previous change. A lowering of a Trust row is theirs at any
-posture. A raise, a change to an owner-only row (Full Mac included) and a lever
-a card can carry are the person's: they run on the person's word when `because`
-quotes the person's own message of the ask being acted on and names the change
-(an ask for the whole, such as full permissions everywhere, names every change
-that widens what they may do), and otherwise ask the person on a card for the
-exact call; in a list, each step the word did not name gets its own card and
-the rest go on. A card still waiting for a call the word decided is
-withdrawn as decided, with the quote. Only what needs the person's own hands (a
-secret, a sign-in, a code from another device) stays theirs alone. Safe allows
-none of these.
+or Trust posture. For other settings below Full Mac, a turn the person started
+runs on its ask; any other model turn's `because` quotes at least three words
+of the person's or trusted agent's request, unless restoring their previous
+change. A lowering of a Trust row is theirs at any posture. A raise, a change to
+an owner-only row (Full Mac included) and a lever a card can carry are the
+person's: in a turn the person started, every one the
+agent calls runs on that turn's ask as the person's act (decided by the person,
+their message on the receipt and consent record, no quote and no card), and in
+a turn an untrusted agent steered or the agent's own thought started, it asks
+the person on one card for the exact call. A card still waiting for a call the
+person's ask decided is withdrawn as decided, with their message. Only what
+needs the person's own hands (a secret, a sign-in, a code from another device,
+a macOS prompt) stays theirs alone. Safe allows none of these.
 
 `OwnedProgramRunner` owns source, read and action limits and the shared progress clock: a renewable 60-second no-progress window by default, excluding host waits.
 Its receipt retains completed effects if a later step fails; a script is not

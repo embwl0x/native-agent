@@ -33,7 +33,6 @@
       "referenceVersion": "18.18.8",
       "environment": {},
       "protocolVersion": 1,
-      "modes": [],
       "supportsLoad": true,
       "supportsResume": true
     }
@@ -582,7 +581,8 @@
       "environment": {},
       "protocolVersion": 1,
       "supportsLoad": true,
-      "supportsResume": true
+      "supportsResume": true,
+      "signIn": "run `grok login` once in Terminal"
     },
     "searchPaths": [
       "~/.grok/bin"

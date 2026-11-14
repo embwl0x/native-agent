@@ -103,11 +103,17 @@ final class SettingsDock {
         try Task.checkCancellation()
         try await target.face.model.engine.settingsFeed.deliverFaces()
         guard self.target?.id == target.id else { return }
-        if grantedAtOpen == false, permissionSnapshot?.status == .granted { await closeCurrent() }
+        // A grant that takes effect after one restart keeps its guidance up to say so; the person closes it by leaving System Settings.
+        if grantedAtOpen == false, permissionSnapshot?.status == .granted, !Self.awaitsRestart(capability) { await closeCurrent() }
     }
 
     @concurrent private static func snapshot(_ capability: SystemPermissionCapability) async -> SystemPermissionSnapshot {
         SystemPermissionPreflight.snapshot(capability)
+    }
+
+    /// On now but not held by this launch: the grant reaches NativeAgent at its next launch.
+    private static func awaitsRestart(_ capability: SystemPermissionCapability) -> Bool {
+        SystemPermissionPreflight.appliesAtLaunch.contains(capability) && !SystemPermissionPreflight.grantedAtLaunch.contains(capability)
     }
 
     private static func line(_ snapshot: SystemPermissionSnapshot) -> PermissionSettingsFace.Dock {
@@ -117,6 +123,9 @@ final class SettingsDock {
         let capability = snapshot.capability
         let name = capability.displayName
         if snapshot.status == .granted {
+            if awaitsRestart(capability) {
+                return .init(line: "NativeAgent is on in \(name); it takes effect after one restart of NativeAgent.", highlight: nil)
+            }
             return .init(line: "NativeAgent is already on in \(name). If it is missing from the list, drag this icon in.", highlight: nil)
         }
         let words = capability == .fullDiskAccess

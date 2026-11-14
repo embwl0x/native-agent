@@ -171,11 +171,11 @@ public struct DesktopChatRoute: Sendable {
         }
     }
 
-    /// Resolve every required control before any input.
+    /// Resolve every required control before any input: the message box as a send finds and reads it, so a check and a send cannot disagree.
     func controls(turn: NativeAgentCore.Turn, mac: MacOperationContext) async throws {
         try await showWindow(turn: turn, mac: mac)
         try await showSideChats(turn: turn, mac: mac)
-        _ = try composer(mac: mac, walk(mac: mac, window(mac: mac)))
+        _ = try messageBox(mac: mac)
         guard try !buttons(mac: mac, { MacAXAttributeRead.text($0, kAXTitleAttribute, context: mac) == ui.newChat }).isEmpty else { throw Mismatch(
             key: "newChat", wanted: ui.newChat) }
     }
@@ -605,7 +605,7 @@ public struct DesktopChatRoute: Sendable {
     /// Restore the prior front app after input only while foreground ownership remains ours.
     @concurrent func typeAndSubmit(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, chat: String, reopen: Bool,
         ownsChat: () throws -> Bool, count: () throws -> Int, lane: DesktopLane.Ticket) async throws -> Int {
-        _ = try composer(mac: mac, walk(mac: mac, window(mac: mac)))
+        _ = try messageBox(mac: mac)
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { throw Blocker.offline }
         try await unlocked(turn: turn, mac: mac)
         let previous = NSWorkspace.shared.frontmostApplication
@@ -871,13 +871,36 @@ public struct DesktopChatRoute: Sendable {
         return (MacAXAttributeRead.text(box, kAXTitleAttribute, context: mac), box)
     }
 
+    /// The one message-box read: the check runs it, and every send runs it before input and again while typing.
+    nonisolated func messageBox(mac: MacOperationContext) throws -> AXUIElement {
+        let box = try composerInput(mac: mac, walk(mac: mac, window(mac: mac)))
+        _ = try AX.composerValue(mac: mac, box)
+        return box
+    }
+
+    /// The message box is whatever in the composer takes typed text, whatever role the app gives it: a text role, an element marked
+    /// editable, one holding a caret, or one whose value can be written (an app may expose its box as a button).
     nonisolated func composerInput(mac: MacOperationContext, _ tree: [AXUIElement]) throws -> AXUIElement {
         let group = try composer(mac: mac, tree).node
         let boxes = try MacAccessibilityReader.elements(in: group, searching: "the selected chat's composer", context: mac).filter {
-            [kAXTextAreaRole, kAXTextFieldRole].contains(MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac))
-                && MacAXAttributeRead.text($0, kAXSubroleAttribute, context: mac) != kAXSearchFieldSubrole
+            let role = MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac)
+            guard role != kAXStaticTextRole, !MacActClosedLoop.isSecureField(role: role),
+                  MacAXAttributeRead.text($0, kAXSubroleAttribute, context: mac) != kAXSearchFieldSubrole else { return false }
+            return MacActClosedLoop.canType(role: role) || MacAXAttributeRead.copyRaw($0, "AXEditable", context: mac) as? Bool == true
+                || MacAXAttributeRead.copyRaw($0, kAXSelectedTextRangeAttribute, context: mac) != nil
+                || MacAXAttributeRead.isSettable($0, kAXValueAttribute, context: mac)
         }
-        guard boxes.count == 1, let box = boxes.first else {
+        // Text inside an editable box can itself hold a caret: the box is the outermost one.
+        let outermost = boxes.filter { box in
+            // Walk up to the composer itself, included: it may be the box.
+            var node = CFEqual(box, group) ? nil : MacAXAttributeRead.copyElement(box, kAXParentAttribute, context: mac)
+            while let current = node {
+                if boxes.contains(where: { CFEqual($0, current) }) { return false }
+                node = CFEqual(current, group) ? nil : MacAXAttributeRead.copyElement(current, kAXParentAttribute, context: mac)
+            }
+            return true
+        }
+        guard outermost.count == 1, let box = outermost.first else {
             throw AX.Failure(detail: "The exact composer's readable text field could not be identified. Its draft was left untouched; nothing was typed.")
         }
         return box

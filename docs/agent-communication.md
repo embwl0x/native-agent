@@ -361,6 +361,16 @@ person denied permission. A permission card the agent's call waits on is a wait
 on the person: the call keeps waiting and its turn says so; Stop ends it, and no
 clock does.
 
+An ACP session runs in a mode the agent itself offers (`session/new` modes): the
+recipe's `permissionMode` when offered, else the offered mode that lets it do the
+least without asking (ask, default, plan before accepting edits, before auto or
+yolo; the agent's current mode among equals), never a more permissive one
+silently: the receipt's `mode_note` names the mode it ran in, and says so when
+every offered mode asks less than the recipe's. An agent that offers none runs as
+it is and no mode is sent. The connect
+check writes the offered modes and the picked mode to the recipe, so a recipe
+never holds a mode its agent does not offer.
+
 An ACP turn has no clock of its own. The agent's running program is attached to
 the call as what it waits on, and every line the program writes is life of the
 call, so a quiet agent is shown waiting and only its exit, Stop or a protocol
@@ -369,7 +379,13 @@ said in it as `reply`, whatever ended it. ACP's "authentication required"
 (-32000), at any step (opening, restoring or answering), is classified once where
 the error is read, as `reason: sign_in_required`: the person signs the agent in
 to its own service once and the conversation continues; it is never a reason to
-abandon the conversation. A check-in contact (`mcpHost`) whose recipe now has
+abandon the conversation. The recipe's `acp.signIn` names that step in plain words
+(Grok CLI: run `grok login` once in Terminal); the receipt's `detail` and
+`person_step` say it, and the contact keeps it with its unavailable mark
+(`unavailableStep`), so its row, `agent.contacts` and its conversation say what
+the person does until the next answer clears the mark. A connect check's
+handshake proves no sign-in, so it clears only a mark that names no step. A local chat server that
+is off keeps the recipe's words for turning it on the same way. A check-in contact (`mcpHost`) whose recipe now has
 `host.acp` answers a send with `reconnect_required` and `agent.connect` as its
 next call; that reconnect keeps the contact's identity, mints a new key for the
 new route, leaves the old route's grants behind and carries the contact's
@@ -589,6 +605,12 @@ read failure. Controls and transcript reads inside that region must still be
 complete. Incomplete native reads report up to four unreadable element paths
 with their AXRole read errors, distinguishing a missing role from a native AX
 failure code. There is no alternate read or send path.
+
+The message box is whatever inside the composer takes typed text, whatever
+role the app gives it (a text role, an editable element, one holding a caret
+or one whose value can be written, so a box exposed as a button counts); the
+outermost such element is the box. `agent.verify` finds and reads the box as a
+send does, so a check and a send cannot disagree.
 
 Before desktop input, the exact selected composer's text must be readable
 and empty. A draft or unreadable value stops the send with the draft intact.
@@ -814,9 +836,10 @@ recorded conversation; a known archived conversation keeps that destination.
 A missing session record leaves the news owed with its repair, without guessing
 another conversation. Helper-owned and contact-owned conversations receive
 delivery receipts in the agent's own mind stream: receipt of their answer opens no
-contact reply turn and cannot generate another held answer by itself. Human
-conversation returns carry the recipient peer's steering stamp and use ordinary
-turn admission, so they cannot join an untainted person turn. Delivery and reply
+contact reply turn and cannot generate another held answer by itself. News of
+the agent's own send (its delivery, its reply, its refusal) is the contact
+answering the agent, never asking: it carries no steering, since a turn's
+steering is who asked it, and uses ordinary turn admission. Delivery and reply
 keep separate once-keys (`delivered:<send-id>` and `reply:<send-id>`); delivery
 reports receipt alone, never an owed-answer verdict. An inline or bridge reply
 keeps its existing reply path and suppression rules. Re-offering receipt after
@@ -872,8 +895,8 @@ contact to the table is the person's lever, per contact, off until set:
 `AgentPeerStore.setReadsDesk` through the lower-only setting
 `agent.reads_desk_<contact id>`. Their call may take a contact away from the table;
 their call to bring one asks the person on a card, and the person's tap on
-Connectors → the contact → **Reads my Desk**, or their own words asking for it,
-quoted in `because`, makes it. Only an MCP host or ACP
+Connectors → the contact → **Reads my Desk**, or their own ask in a turn they
+started, makes it. Only an MCP host or ACP
 contact, which calls the MCP tools with its own key (`canReadTable`), has the
 lever.
 

@@ -371,33 +371,26 @@ decision of that exact call (`PersonAct`), admitted once per run; a row the agen
 of its own is the agent's call, so the tap only asks. A lever's verb (`owner: .person(why, asks:)`)
 is never the agent's at any posture: its call raises the person's card, or is refused where no
 card can carry it; a change that widens the agent's own reach is a lever the same way, and
-lowering it stays the agent's. The person's own words in the conversation are their act too:
-when the call quotes their request in `because`, the quote names the act (`RequestWords.relates`: it
-shares a content word with the act's own words), and the turn's request evidence finds those words
-in their own message of the ask the turn is acting on now (`Turn.personWord`: the turn's own
-message, one that joined it while it ran, or the one a card's continuation carries on; their door;
-never an earlier message, a tool result, a page, a helper, another agent or the agent's own words),
-a lever a card can carry, a raise, or an owner-only setting (Full Mac among them), runs as their
-decision of that exact call (`PersonAct.By.word`), admitted once like a card's Approve, with no card;
-a card still waiting for that call is settled as decided by their word, and the consent record and
-the call's receipt carry their words.
-Safe allows no ask, so no word either; a lever no card can carry stays the person's own act. A lever can name the arguments under which its call only lowers
+lowering it stays the agent's. The person's own ask is their act too: in a turn the person started
+at a door that is theirs (`Turn.personsAsk`: their own message, one that joined it while it ran, or
+the one a card's continuation carries on; never a turn a helper, an untrusted agent or the mind's
+own thought started), every lever a card can carry, raise and owner-only setting (Full Mac among
+them) the agent calls runs as their decision of that exact call (`PersonAct.By.word`), admitted once
+like a card's Approve, with no card and no word matching; a card still waiting for that call is
+settled as decided by their ask, and the consent record and the call's receipt carry their message.
+Safe allows no ask, so no person's ask either; a lever no card can carry stays the person's own act. A lever can name the arguments under which its call only lowers
 (`freely:`): with exactly those arguments the call is the agent's own, and with any other, or with
 them missing, it stays the person's. `sense.switch` is the first: `value: false` turns a sense off
 as the agent's own act; turning one on is the person's consent. An owner of the stem's that needs the person's yes for an exact
 call replies `needs_person`, and the gate puts that call on the person's card; Approve replays it
 as the person's act. The door answers the agent's call of a lever a card can carry the same way, so
-that call is the person's card, unless their word decides it, and never a bare refusal; a lever no card can carry is
+that call is the person's card, unless their own turn's ask decides it, and never a bare refusal; a lever no card can carry is
 refused with where the person does it. A list (`app {actions:[…]}`) whose every change is such an
 ask, two or more of them, is one ask: nothing runs, the door replies `needs_person` for the list,
 and the gate puts the list on one card; Approve replays it as the person's decision of each of its
 calls, each admitted once (`PermissionLaw.decidedCalls`), and Decline leaves everything as it was.
-The person's word reads such a list step by step: a step is theirs when every quote reaching it (its
-own `because` and the list's) is about that step's own act, sharing a word with it, or, for a step that
-widens what the agent may do (a setting raise or owner row, a lever named for permission, access or
-grants), asking for the whole of that (`RequestWords.asksWhole`: "full permissions", "all your access",
-"everywhere" or "everything" beside such a word, "all of it"). The steps it names run as theirs; the
-others are left out of their act and each meets its own gate, card included.
+In the person's own turn such a list is theirs whole and runs on their ask; in any other turn it is
+the one card.
 A setting's own check reads the decided change itself (`PermissionLaw.personDecided(setting:)`),
 whatever `because` rode beside it.
 

@@ -39,7 +39,7 @@ extension AgentRecipeStore {
             "permissionFlags": enumeration(AgentHostCommandLine.PermissionFlags.self), "minimumVersion": text])
         let acp = object(["executable": text, "arguments": strings, "documentation": text, "permissionMode": text,
             "referenceVersion": text, "environment": map(text)], optional: ["protocolVersion": integer,
-            "modes": strings, "supportsLoad": flag, "supportsResume": flag])
+            "modes": strings, "supportsLoad": flag, "supportsResume": flag, "signIn": text])
         let localChat = object(["server": text, "models": text, "chat": text, "start": text])
         let host = object(["id": text, "displayName": text, "description": text, "aliases": strings,
             "installMarkers": strings, "configPath": text, "format": enumeration(AgentHostRow.Format.self),

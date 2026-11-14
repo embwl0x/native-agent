@@ -274,10 +274,11 @@ extension AppActions {
                  tool: "app_setting_get", read: true, scope: "setting value read get home timezone phone preferences appearance shortcut memory"),
         AppAction("setting.set", "*", "Set", ["setting", "value:any", "because?"], subject: ["setting"],
                   warn: """
-                      Your own mind settings need no request. For other settings below Full Mac, because must quote at least 3 words from a person \
-                      or trusted agent in this conversation (a run with no conversation has none to quote); you may restore a switch whose last \
-                      change was yours. A change that widens what you may do, and any change to an owner_only setting (Full Mac included), runs \
-                      when because quotes the person's own request, at any posture but Safe; without it, it asks them on a card.
+                      Your own mind settings need no request. In a turn the person started, what they asked is the request: every change runs \
+                      on it as theirs, owner_only settings and widenings (Full Mac included) too, at any posture but Safe. In any other turn below \
+                      Full Mac, because quotes at least 3 words from a person or trusted agent in this conversation (a run with no conversation has \
+                      none to quote), and you may restore a switch whose last change was yours; a widening or an owner_only change asks the person \
+                      on a card.
                       """,
                   tool: "app_setting_set", schema: arguments("app_setting_set", ["setting": ToolSchema.strSchema(), "because": ToolSchema.strSchema(),
                       "value": .object([

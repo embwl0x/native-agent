@@ -162,7 +162,7 @@ let extraDeps: [String: [String]] = [
     "Cognition": ["Experiences", "AuthoredCapabilities", "PersistenceCore", "CognitiveSubstrate", "Context", "ContextFlow", "MemoryV2", "PersonaEngine",
         "ProviderRouting", "BackgroundLoops", "ApprovalInbox", "TriggerScheduler", "NotificationInbox", "DreamREMCycle", "TurnTrace", "Studio", "Desk",
         "Privacy", "AgentConversations", "AgentWorkspace", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "Transcripts", "Senses",
-        "MacControl"],
+        "MacControl", "MacIntegration"],
     // The engine owns device sync and injects its mind; app mirrors arrive through DeviceSyncHost to avoid reverse imports.
     "DeviceSync": ["MultimodalTTS", "Experiences", "MacControl", "PersistenceCore", "CognitiveSubstrate", "Cognition", "MemoryV2", "ApprovalInbox",
         "NotificationInbox", "ProviderRouting", "MacIntegration", "TrustCenter", "PersonaEngine", "Transcripts", "Desk", "Privacy",

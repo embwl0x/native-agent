@@ -640,7 +640,7 @@ public struct AgentConversationContinuation: Sendable {
                     text: line, attachments: [], surface: row.sourceSurface, deliveryID: "requested-result:" + deliveryID,
                     mechanicalRow: .botReceipt, turn: turn)
                 AgentConversationStore.returnNews(row, scope: row.scopeSessionID, once: "reply:" + row.operationID,
-                    words: line, peers: nil, dataRoot: dataRoot)
+                    words: line, dataRoot: dataRoot)
                 // A bot receipt is written directly, never a turn, so it is never read by another.
                 return .ran((ChatResponse(runId: runID, model: "native", output: line,
                     sessionId: row.scopeSessionID, providerCallCount: 0), turn))

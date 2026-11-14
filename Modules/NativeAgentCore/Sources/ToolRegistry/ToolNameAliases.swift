@@ -98,8 +98,8 @@ public enum ToolNameAliases {
         "agent_connect": ["name": "agent"],
     ]
 
-    /// The app tool's own keys. Keys beginning with __ belong to the gate chain. `because` quotes the person's own request for the call: the
-    /// gate reads it as their word (`Turn.personWord`); an action that declares `because` (setting.set) takes it as its own.
+    /// The app tool's own keys. Keys beginning with __ belong to the gate chain. `because` quotes a request for the call; an action that
+    /// declares `because` (setting.set) takes it as its own.
     public static let appDoorKeys: Set<String> = ["page", "item", "action", "args", "actions", "preview", "expected_version", "find", "script",
                                                   "because"]
     /// A batch step's own keys: what must come back, its name for found, and whether it puts back what the deed moved.

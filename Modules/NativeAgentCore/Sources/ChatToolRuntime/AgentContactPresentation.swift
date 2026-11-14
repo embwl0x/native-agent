@@ -71,7 +71,7 @@ extension SwiftToolDispatcher {
     }
     /// Pull-only hosts receive held messages on their next inbound call; retained messages are not evidence of sending.
     static func hostPull(invocation: ChatToolInvocation, row: AgentHostRow?, contact: AgentPeerContact, text: String?, conversation: String,
-        peers: [AgentPeerContact] = []) throws -> JSONValue {
+        peers: [AgentPeerContact] = [], dataRoot: URL) throws -> JSONValue {
         let name = row?.displayName ?? contact.name
         var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("mcpHost"),
             "host": .string(row?.id ?? ""), "completed": .bool(false)]
@@ -117,10 +117,42 @@ extension SwiftToolDispatcher {
         result["status"] = .string("held"); result["delivered"] = .bool(false)
         result["delivery"] = .string("held")
         result["conversation_id"] = .string(conversation)
-        result["detail"] = .string("""
-            Held, not sent: it waits for \(name)'s next check-in and goes out in the result of that call; nothing is lost. Do not resend.\u{20}
-            """ + presence)
+        let open = openDoor(contact, conversation: conversation, dataRoot: dataRoot)
+        if let open { result["connected"] = .bool(open) }
+        switch open {
+        case true?:
+            result["detail"] = .string("""
+                Held, not sent yet: \(name) is connected (the relay of a session of it that called in still runs) and gets this in the result \
+                of its next call; its answer comes as a message of its own. Do not resend.
+                """)
+        case false?:
+            result["detail"] = .string("""
+                Held: \(name) is not connected right now (no session of it that called in still has its relay running), so this reaches no one \
+                yet. It gets this when it next connects and calls in; nothing is lost. Do not resend.
+                """)
+        case nil:
+            result["detail"] = .string("""
+                Held, not sent: it waits for \(name)'s next check-in and goes out in the result of that call; nothing is lost. Do not resend.\u{20}
+                """ + presence)
+        }
         return .object(result)
+    }
+    /// Whether a pull host has a door open now: a session of it that called in (a caller one of its conversations names) still has its relay,
+    /// the link process the app talks to, running. A held message goes to its conversation's caller, or to any caller once that one is gone, so
+    /// any open caller takes it. Nil when no conversation of the contact names a caller, or when a process or the conversations cannot be read.
+    static func openDoor(_ contact: AgentPeerContact, conversation: String, dataRoot: URL) -> Bool? {
+        var callers = Set<ContactCaller>()
+        if let owner = ContactCaller(conversation: conversation, peer: contact.id) { callers.insert(owner) }
+        guard let rows = try? AgentConversationStore(dataRoot: dataRoot).recordsUnlocked() else { return nil }
+        for row in rows where row.agent == "peer:" + contact.id {
+            if let id = row.conversationID, let caller = ContactCaller(conversation: id, peer: contact.id) { callers.insert(caller) }
+        }
+        guard !callers.isEmpty else { return nil }
+        var unreadable = false
+        for caller in callers {
+            do { if try caller.relayIsLive() { return true } } catch { unreadable = true }
+        }
+        return unreadable ? nil : false
     }
     static let desktopSetupNote = """
         Send-only. For this contact to answer, add this app's MCP server to it (command: nativeagent-link mcp) and have it reply with its \
@@ -233,13 +265,15 @@ extension SwiftToolDispatcher {
                 "route": .string(proof.endpoint.absoluteString), "at": .string(proof.at)])
         }
         if let stamp = peer.unavailableAt { value["unavailable_now_checked_at"] = .string(stamp) }
+        if let step = peer.unavailableStep { value["person_step"] = .string(step) }
         if peer.transport == .acp {
             value["kind"] = .string("agent_host")
             if peer.state == .setUp {
                 value["state_detail"] = .string(!peer.canStartTurn
                     ? "The saved executable cannot currently be verified. Reconnect to review the changed or missing program; earlier replies remain recorded."
                     : peer.unavailableAt != nil
-                        ? "The last connection attempt was unavailable. Earlier replies remain recorded; opening a new turn rechecks the route."
+                        ? (peer.unavailableStep.map { $0 + " " } ?? "The last connection attempt was unavailable. ")
+                            + "Earlier replies remain recorded; opening a new turn rechecks the route."
                         : "The connection is saved, but it has not answered a message yet.")
             }
             value["transport"] = .string("acp")

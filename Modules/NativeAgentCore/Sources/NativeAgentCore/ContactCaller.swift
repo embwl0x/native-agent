@@ -53,6 +53,30 @@ public struct ContactCaller: Sendable, Hashable {
         return Int64(start.tv_sec) == seconds && start.tv_usec == microseconds
     }
 
+    /// Whether this caller's door is open: the relay it started (a running child of this exact process whose command is the link) still runs.
+    /// The relay is what the app talks to, and it ends when the caller drops its connection, while the caller itself may run on. A process table
+    /// the kernel will not hand over throws: neither open nor closed.
+    public func relayIsLive(command: String = "nativeagent-link") throws -> Bool {
+        guard try isLive() else { return false }
+        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
+        var size = 0
+        guard sysctl(&name, u_int(name.count), nil, &size, nil, 0) == 0 else {
+            throw Unreadable(message: "The process table's size could not be read (errno \(errno)).")
+        }
+        // Room for processes that start between the two reads; a table that outgrew it still refuses, and that read is unknown.
+        let stride = MemoryLayout<kinfo_proc>.stride
+        size += size / 8 + 32 * stride
+        var table = [kinfo_proc](repeating: kinfo_proc(), count: size / stride)
+        guard sysctl(&name, u_int(name.count), &table, &size, nil, 0) == 0 else {
+            throw Unreadable(message: "The process table could not be read (errno \(errno)).")
+        }
+        return table.prefix(size / stride).contains { info in
+            info.kp_eproc.e_ppid == pid && withUnsafeBytes(of: info.kp_proc.p_comm) { raw in
+                String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self) == command
+            }
+        }
+    }
+
     /// The start time of the process with this id; nil when no process has it.
     private static func started(pid: Int32) throws -> timeval? {
         var info = kinfo_proc()

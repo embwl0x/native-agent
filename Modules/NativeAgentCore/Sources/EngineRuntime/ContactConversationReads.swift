@@ -254,7 +254,8 @@ public enum AgentContactThreads {
         if ChatGPTDotIPCTransport.owns(contact), !contact.canStartTurn { return ChatGPTDotIPCTransport.detail }
         if needsApproval(row) { return "Reconnect to approve its program before sending a message." }
         if !contact.canStartTurn { return "Replies only" }
-        return contact.unavailableAt != nil || !row.credentialAvailable ? "This connection is unavailable for sending." : nil
+        if !row.credentialAvailable { return "This connection is unavailable for sending." }
+        return contact.unavailableAt == nil ? nil : contact.unavailableStep ?? "This connection is unavailable for sending."
     }
 
     /// A connection that cannot start a turn until the person approves its program: neither Dot, whose readiness is its own, nor an MCP

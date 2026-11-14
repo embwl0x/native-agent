@@ -687,6 +687,54 @@ extension SwiftToolDispatcher {
                 payload["existing_agreements_error"] = .string("Saved, but the existing-agreement lookup failed: \(error)")
             }
         }
+        // A standing correction that names nothing it corrects leaves every earlier word on its subject surfacing beside it. Which one it
+        // corrects is a judgment of meaning (cosine cannot tell a paraphrase from a contradiction), so the save shows the nearest standing
+        // memories and the agent names the one; saving the same text again with corrects folds into this record and retires that one.
+        if supersedes.isEmpty, corrects == nil, kind == "correction" || kind == "instruction" {
+            do {
+                let near = try await memoryV2.recall(MemoryV2RecallRequest(text: text, topK: 6, surface: turn.runtime?.surface ?? "chat"),
+                                                     recordingUsage: false).scored.map(\.record).filter {
+                    $0.id != record.id && ($0.status ?? "active") == "active" && MemoryLifecycle.isRecallEligible($0.lifecycle)
+                        && !MemoryStorage.metadataFlag($0.extras, MemoryStorage.pendingAdmissionKey)
+                }
+                var remaining = Self.recallContentBudgetChars
+                // Each one reads as recall reads it: who it came from and whether an untrusted source steered it.
+                let nearTrust = MemoryDataProvenance.reading(near.map(\.extras))
+                // The retiring call is this save again, word for word and with the same scope (tags, topics, telling), so it folds into this
+                // record instead of making a broader copy.
+                var retire = input.filter { key, value in
+                    value != .null && ["kind", "tags", "context_topics", "provenance", "provenance_by", "since", "confidence", "importance"]
+                        .contains(key)
+                }
+                retire["text"] = .string(text)
+                payload["still_surfacing"] = .array(near.map { row in
+                    var fields: [String: JSONValue] = ["id": .string(row.id), "recorded_at": .string(row.createdAt),
+                                                       "kind": row.memoryKind.map(JSONValue.string) ?? .null]
+                    fields.merge(MemoryDataProvenance.fields(in: row.extras, trust: nearTrust)) { _, value in value }
+                    fields["provenance"] = .string(MemoryDataProvenance.lead(row.extras, trust: nearTrust))
+                    if row.text.count <= remaining {
+                        fields["text"] = .string(row.text)
+                        remaining -= row.text.count
+                    } else {
+                        fields["content_omitted"] = .bool(true)
+                        fields["read_more"] = .object(["action": .string("memory.recall"), "memory_id": .string(row.id)])
+                    }
+                    var call = retire
+                    call["corrects"] = .string(row.id)
+                    fields["retire_with"] = .object(["tool": .string("app"), "input": .object(["action": .string("memory.commit"), "args": .object(call)])])
+                    return .object(fields)
+                })
+                if !near.isEmpty {
+                    payload["detail"] = .string("""
+                        These older memories still say otherwise and still surface in recall and in every turn's context; retire each one this \
+                        correction replaces with its retire_with call (it is kept in history). Nothing was retired by this save.
+                        """)
+                }
+            } catch {
+                if error is CancellationError { throw error }
+                payload["still_surfacing_error"] = .string("Saved, but reading the memories it may correct failed: \(error)")
+            }
+        }
         return .object(payload)
     }
 

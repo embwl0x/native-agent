@@ -690,14 +690,22 @@ connectors and agent communication under the saved policy.
   coverage or a partial page with explicit partial coverage and named account
   gaps. Covered accounts are ready; the missing accounts remain visible in the
   Mail access row and connected-card receipt. Missing coverage and a page with
-  no covered account remain unavailable. Transcript reads
-  use that evidence without starting a Mail check; a grant alone cannot settle
-  a card, and absent or invalidated read evidence still needs Check Mail.
-  A Mail check refreshes grants after its read, publishing those grants before
-  the checked result in one ordered snapshot, so launching Mail cannot erase
-  that result. A Mail launch or quit, or an unknown Automation probe, is not a
-  permission change and does not invalidate checked Mail coverage; an observed
-  consent refusal, changed consent grant or changed Full Disk Access does.
+  no covered account remain unavailable. Readiness is read from what is true
+  now: with the read switch on, the live Automation grant for Mail decides
+  (granted is ready, denied needs permission), together with what the read path
+  needs that the app sees without a check: Mail's store and its Envelope Index
+  readable (Full Disk Access) and at least one account in it; a missing one is
+  named. The last check result is kept on disk with the grant readings it was
+  read under and speaks only where those readings cannot: a failed read or
+  coverage gap, or Mail not running so the grant reads unknown; with neither,
+  Check Mail is offered. A kept result whose grant readings no longer hold, also
+  after a change made while the app was closed, is dropped. A restart therefore never resets a working watch. Transcript reads
+  use that reading without starting a Mail check.
+  A Mail check refreshes grants after its read, then records its result as a
+  committed write (the newest-started check's result stands), so launching
+  Mail cannot erase it. A Mail launch or quit, or an unknown Automation probe, is not a
+  permission change and does not invalidate the kept result; a changed Mail
+  switch does.
   Assistant watch setup describes these local Mail read owners and EventKit's
   current grants. A missing Calendar or Reminders grant returns a permission
   card; only the person's Allow action opens macOS acquisition. The status read

@@ -137,6 +137,7 @@ final class NativeAgentHotkeyBootstrap {
 enum NativeAgentAppMain {
     @MainActor
     static func main() {
+        if SystemPermissionPreflight.runGrantProbeIfRequested() { return }
         if AppRelaunch.runRelaunchHelperIfRequested() { return }
         if SwiftToolDispatcher.runScheduledInstallerHelperIfRequestedBlocking() { return }
         NativeAgentEngine.prepareProcessFileLimit()

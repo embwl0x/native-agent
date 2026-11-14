@@ -173,7 +173,7 @@ public struct AgentContactRow: Identifiable, Sendable {
             "\nMCP return path · \($0.endpoint.absoluteString) · Proven \($0.at)"
         } ?? ""
         let unavailable = !keyAvailable ? AgentPeerCredentials.unavailableDetail + "\n"
-            : contact.unavailableAt.map { "Unavailable now · Checked \($0)\n" } ?? ""
+            : contact.unavailableAt.map { "Unavailable now · " + (contact.unavailableStep.map { $0 + " · " } ?? "") + "Checked \($0)\n" } ?? ""
         if let proof = contact.roundTripProof {
             return unavailable + (keyAvailable && contact.isReady ? "Ready" : "Historical round trip")
                 + """

@@ -13,6 +13,7 @@ extension SwiftToolDispatcher {
         guard let chat = row.localChat else { throw AgentCommunicationError.invalid("\(row.displayName) has no local chat server") }
         // The recipe this send is made under; a later edit does not restamp its proof.
         let recipe = AgentRecipeStore.recipe(row.id).flatMap { $0.host == row ? $0 : nil }
+        let began = Date()
         var receipt: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("mcpHost"), "host": .string(row.id),
             "route": .string("local-chat"), "completed": .bool(false)]
         if invocation.dryRun {
@@ -76,7 +77,7 @@ extension SwiftToolDispatcher {
                 return .object(receipt.merging(["status": .string("cancelled"), "sent": .bool(false), "terminal": .bool(true),
                     "detail": .string("The message was stopped before it went out. Nothing was sent.")]) { $1 })
             }
-            store.recordUnavailable(peerID: contact.id)
+            store.recordUnavailable(peerID: contact.id, step: "Its server is off. " + chat.start)
             return notSent("local_chat_server_off", """
                 \(row.displayName)'s server is not on at \(chat.server) (\(error.localizedDescription)), so nothing can answer. \(chat.start)
                 """)
@@ -137,6 +138,8 @@ extension SwiftToolDispatcher {
             return .object(result)
         }
         store.recordProof(peerID: contact.id, outbound: true)
+        // Its server answered: an earlier unavailable mark (server off) clears with its step.
+        store.clearUnavailable(peerID: contact.id, before: began)
         let answered = !said.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         receipt["sent"] = .bool(true)
         receipt["reply"] = .string(said)

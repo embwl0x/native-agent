@@ -1445,7 +1445,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `ChatOrchestrationClient+AttachmentEvidence.swift` | `CodexCompletionTranscriptEvidence`; Exact completion and saved-attachment recovery |
 | `ChatOrchestrationClient+Attachments.swift` | Trust-gated images and bounded document excerpts; audio stays attached |
 | `ChatOrchestrationClient+Client.swift` | `SwiftNativeChatOrchestrationClient` actor; `chat`, `chatExecution`; `StructuredChatExecution` carries the response and typed success/failure; `withCurrentChatModel` admits the current Chat pick at a wake's `model.call`, so a run that never thinks needs no model; `withModelContext` binds the same client/provider/model/effort/tier for turns and wakes |
-| `ChatOrchestrationClient+DispatchWrappers.swift` | File-access gates; exact-call consent carried to dispatch, the person's word deciding what is theirs; audit failures owe repairs |
+| `ChatOrchestrationClient+DispatchWrappers.swift` | File-access gates; exact-call consent carried to dispatch, the person's own turn deciding what is theirs; audit failures owe repairs |
 | `ChatOrchestrationClient+EphemeralToolTurn.swift` | `SwiftNativeChatOrchestrationClient`; `runEphemeralToolTurn`; `runPartToolTurn` |
 | `ChatOrchestrationClient+Factories.swift` | `makeChatOrchestrationClient`; `makeGatedToolDispatchClient`; Shared canonical gated construction |
 | `ChatOrchestrationClient+HumanConversationReply.swift` | `SwiftNativeChatOrchestrationClient`; `appendHumanConversationReply` |
@@ -2799,7 +2799,7 @@ Depends on NativeAgentCore support, PersistenceCore durable I/O and Experiences 
 | `PartFaces.swift` | Actor-owned page admission and demands; LatestRead snapshots, drawn-call checks and settlement |
 | `PartTrial.swift` | `PartTrial`: the trial judge over two version tallies, decidability and the candidate test; pure, no I/O |
 | `Parts.swift` | `storedRows`, `rows`; One part reader; display projections never write back; row-local name damage |
-| `PersonAct.swift` | `PersonAct`, `Turn.personAct`: the person's own decision of one run of one exact door call (a tap on a row the stem composed, a card they approved, which can carry a list of calls, or their own words in the conversation asking for it) |
+| `PersonAct.swift` | `PersonAct`, `Turn.personAct`: the person's own decision of one run of one exact door call (a tap on a row the stem composed, a card they approved, which can carry a list of calls, or their own ask in a turn they started) |
 | `SkillRunContext.swift` | Explicit authored run options and hand-back refusal |
 | `Turn+Skills.swift` | `Turn` holds authored run ownership and file reach |
 <!-- END GENERATED BLUEPRINT -->

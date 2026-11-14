@@ -275,7 +275,7 @@ public struct AgentConversationStore: Sendable {
                     + "its refusal notice could not be returned.")
             }
             Self.returnNews(saved.row, scope: scope, once: "not-sent:" + saved.item.id,
-                words: saved.row.name + ": " + TurnSecretRedactor.redactText(reason), peers: [saved.row.agent],
+                words: saved.row.name + ": " + TurnSecretRedactor.redactText(reason),
                 dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
         }
     }

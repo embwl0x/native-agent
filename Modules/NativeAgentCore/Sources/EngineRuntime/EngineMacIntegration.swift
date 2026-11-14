@@ -40,6 +40,7 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
     public private(set) var checkedPermissions: Result<MacIntegrationPermissionStore.Snapshot, Error>?
     @ObservationIgnored private lazy var permissionRead = LatestRead()
     @ObservationIgnored private lazy var watchRead = LatestRead()
+    @ObservationIgnored private lazy var mailCheckRead = LatestRead()
     @ObservationIgnored private var permissionObservation: AnyCancellable?
     @ObservationIgnored private var activationObservation: AnyCancellable?
     @ObservationIgnored private var permissionWatcher: FileChangeWatcher?
@@ -53,12 +54,94 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
     private func publishSettings() {
         settingsFeed?.updatePermissions(statuses: systemStatuses, issue: permissionLoadError, isReading: isLoading)
     }
-    private var mailCheck: (status: String, word: String, next: String?)?
+    /// The last Check Mail result, kept on disk across restarts: it speaks only for what the live readings cannot tell (a read that
+    /// failed, account coverage, Mail not running), and is dropped once a grant it was read under reads otherwise, even across a restart.
+    /// The kept result and the Mail Automation and Full Disk Access readings it was read under, read from disk on first use on the main actor.
+    @ObservationIgnored private var keptMailCheckStore: (check: (status: String, word: String, next: String?)?, under: [String: String])?
+    private var keptMailCheck: (check: (status: String, word: String, next: String?)?, under: [String: String]) {
+        get {
+            if let kept = keptMailCheckStore { return kept }
+            let saved = MacIntegrationFacade.savedMailCheck(dataRoot: dataRoot)
+            let kept = (check: saved?.check, under: saved?.under ?? [:])
+            keptMailCheckStore = kept
+            return kept
+        }
+        set { keptMailCheckStore = newValue }
+    }
+    private var mailCheck: (status: String, word: String, next: String?)? {
+        get { keptMailCheck.check }
+        set { keptMailCheck.check = newValue }
+    }
+    private var mailCheckUnder: [String: String] {
+        get { keptMailCheck.under }
+        set { keptMailCheck.under = newValue }
+    }
+    /// What Mail's read path lacks that the app can see without a check; nil when nothing is missing.
+    private var mailPathGap: (status: String, word: String, next: String?)?
+    private nonisolated static let mailCheckGrants = [AppleScriptExecution.automationStatusKey(app: "Mail"), "fullDiskAccess"]
 
     public nonisolated init(dataRoot: URL, deviceSync: DeviceSync?, platform: AppConnectorStatusPlatform) {
         self.dataRoot = dataRoot
         self.deviceSync = deviceSync
         self.platform = platform
+    }
+
+    private nonisolated static func mailCheckFile(_ dataRoot: URL) -> URL {
+        dataRoot.appendingPathComponent("security/mail_check.json")
+    }
+
+    private nonisolated static func savedMailCheck(dataRoot: URL)
+        -> (check: (status: String, word: String, next: String?), under: [String: String])? {
+        guard let data = try? Data(contentsOf: mailCheckFile(dataRoot)),
+              let saved = try? JSONDecoder().decode([String: String].self, from: data),
+              let status = saved["status"], let word = saved["word"] else { return nil }
+        return ((status, word, saved["next"]), saved.filter { mailCheckGrants.contains($0.key) })
+    }
+
+    /// What Mail's read path needs that the app can see without a check: Mail's local store and its Envelope Index readable (Full Disk
+    /// Access), and at least one account in it. Nil when all are there.
+    nonisolated static func mailReadPathGap() -> (status: String, word: String, next: String?)? {
+        typealias Gap = (status: String, word: String, next: String?)
+        let files = FileManager.default
+        let library = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Mail")
+        let noAccount: Gap = ("needs_setup", "Needs a Mail account",
+                              "Add and enable a Mail account in System Settings → Internet Accounts, then open Mail once.")
+        let noAccess: Gap = ("needs_permission", "Needs Full Disk Access",
+                             "Turn on NativeAgent in System Settings → Privacy & Security → Full Disk Access; Mail's index is read there.")
+        let noIndex: Gap = ("needs_setup", "Mail has no index yet", "Open Mail once so it builds its index, then check again.")
+        func gap(_ error: Error, missing: Gap) -> Gap {
+            guard let error = error as? CocoaError else { return ("unavailable", "Mail's store unreadable", error.localizedDescription) }
+            if [.fileReadNoSuchFile, .fileNoSuchFile].contains(error.code) { return missing }
+            if error.code == .fileReadNoPermission { return noAccess }
+            return ("unavailable", "Mail's store unreadable", error.localizedDescription)
+        }
+        let versions: [String]
+        do { versions = try files.contentsOfDirectory(atPath: library.path) } catch { return gap(error, missing: noAccount) }
+        guard let version = versions.compactMap({ $0.hasPrefix("V") ? Int($0.dropFirst()) : nil }).max() else { return noAccount }
+        let store = library.appendingPathComponent("V\(version)")
+        do { try FileHandle(forReadingFrom: store.appendingPathComponent("MailData/Envelope Index")).close() }
+        catch { return gap(error, missing: noIndex) }
+        do { return try files.contentsOfDirectory(atPath: store.path).contains { UUID(uuidString: $0) != nil } ? nil : noAccount }
+        catch { return gap(error, missing: noAccount) }
+    }
+
+    /// Record the check result as it stands with the grant readings it was read under, on disk too; nil forgets it.
+    private func keepMailCheck(_ check: (status: String, word: String, next: String?)?) {
+        mailCheck = check
+        mailCheckUnder = check == nil ? [:] : systemStatuses.filter { Self.mailCheckGrants.contains($0.key) }
+        let file = Self.mailCheckFile(dataRoot)
+        do {
+            if let check {
+                var saved = mailCheckUnder.merging(["status": check.status, "word": check.word]) { $1 }
+                saved["next"] = check.next
+                try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(saved).write(to: file, options: .atomic)
+            } else if FileManager.default.fileExists(atPath: file.path) {
+                try FileManager.default.removeItem(at: file)
+            }
+        } catch {
+            nativeLog("Mail check result not kept on disk: %@", error.localizedDescription)
+        }
     }
 
     /// Observe saved writes and returns to the body or its window; release both subscriptions with their facade.
@@ -88,7 +171,7 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
     }
 
     @discardableResult
-    public func refresh(refreshWatches: Bool = true, checkMail: Bool = false) async -> Result<MacIntegrationPermissionStore.Snapshot, Error> {
+    public func refresh(refreshWatches: Bool = true) async -> Result<MacIntegrationPermissionStore.Snapshot, Error> {
         if permissionWatcher == nil {
             let permissions = dataRoot.appendingPathComponent("security/mac_integration_permissions.json")
             let watcher = await FileChangeWatcher.armed(paths: [permissions]) { [weak self] _ in
@@ -101,16 +184,6 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
             let result: Result<MacIntegrationPermissionStore.Snapshot, Error>
             do { result = .success(try await MacIntegrationPermissionStore(dataRoot: dataRoot).snapshotChecked()) }
             catch { result = .failure(error) }
-            var mailEvidence: (status: String, word: String, next: String?)?
-            if checkMail, case .success(let snapshot) = result, snapshot.permissions["mail"]?.read == true {
-                do {
-                    // The person's Check Mail reads mail.recent through the door, as any read of it runs.
-                    mailEvidence = MacAssistantStatusResult.mailReadiness(from: try await MacAssistantParts.verb("mail.recent", input: ["limit": .int(1)],
-                        dataRoot: dataRoot, envelope: .personOnMac("mac_ui:mail.check")))
-                } catch {
-                    mailEvidence = (status: "failed", word: "Check failed", next: UserFacingError.cause(error, action: "check Mail"))
-                }
-            }
             let grants = await Task.detached(priority: .userInitiated) {
                 var statuses = ["speech_recognition": Self.badgeKey(SystemPermissionPreflight.status(.speechRecognition)),
                  "microphone": Self.badgeKey(SystemPermissionPreflight.status(.microphone)),
@@ -125,27 +198,22 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
                 }
                 return statuses
             }.value
-            return (result, grants, mailEvidence)
-        } publish: { result, grants, mailEvidence in
-            switch result {
-            case .success(let snapshot):
-                if permissions["mail"] != snapshot.permissions["mail"] { mailCheck = nil }
-            case .failure:
-                mailCheck = nil
-            }
+            let gap = await Task.detached(priority: .userInitiated) { Self.mailReadPathGap() }.value
+            return (result, grants, gap)
+        } publish: { result, grants, gap in
+            // Only a change from an earlier reading clears the kept result; the first reading after launch is no change.
+            if case .success(let prior)? = checkedPermissions, case .success(let snapshot) = result,
+               prior.permissions["mail"] != snapshot.permissions["mail"] { keepMailCheck(nil) }
             checkedPermissions = result
-            let mailAutomationKey = AppleScriptExecution.automationStatusKey(app: "Mail")
-            let priorAutomation = systemStatuses[mailAutomationKey]
-            let automation = grants[mailAutomationKey]
-            // Unknown probes say nothing about consent; a new refusal invalidates evidence, and grants alone cannot erase it.
-            let consentChanged = priorAutomation != automation
-                && (automation == "denied" || automation == "not_determined"
-                    || (automation == "granted" && (priorAutomation == "denied" || priorAutomation == "not_determined")))
-            if systemStatuses["fullDiskAccess"] != grants["fullDiskAccess"] || consentChanged { mailCheck = nil }
+            mailPathGap = gap
+            // A kept result read under a grant that now reads otherwise (consent or Full Disk Access changed, also while the app was
+            // closed) no longer holds; an unknown reading (Mail not running) says nothing.
+            if mailCheck != nil, Self.mailCheckGrants.contains(where: { key in
+                guard let live = grants[key], !["unknown", "app_not_running"].contains(live) else { return false }
+                return mailCheckUnder[key] != live
+            }) { keepMailCheck(nil) }
             let grantsChanged = systemStatuses != grants
             systemStatuses = grants
-            // Mail may launch during its read; publish refreshed grants before checked evidence in the same snapshot.
-            if let mailEvidence { mailCheck = mailEvidence }
             isLoading = false
             publishSettings()
             if grantsChanged { NotificationCenter.default.post(name: Self.systemStatusesDidChange, object: dataRoot) }
@@ -173,8 +241,10 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
             permissionRead.write {
                 // The write fences older reads; the page keeps every switch, this one as stored, until the reread publishes.
                 if case .success(let snapshot)? = checkedPermissions { checkedPermissions = .success(snapshot.with(id, stored)) }
-                mailCheck = nil
+                if id == "mail" { keepMailCheck(nil) }
             }
+            // A check that began under the old switch no longer speaks for Mail.
+            mailCheckRead.write {}
             await refresh()
         } catch {
             await refresh()
@@ -275,12 +345,33 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
         return currentMailReadiness()
     }
 
+    /// The check's result is a committed fact: a grants read that started while Mail was being read (the consent prompt, Mail's launch,
+    /// the window coming back, a permission write) never discards it. Of overlapping checks, the newest-started one's result stands.
     public func checkMail() async {
-        await refresh(refreshWatches: false, checkMail: true)
+        guard case .success(let snapshot) = await refresh(refreshWatches: false), snapshot.permissions["mail"]?.read == true else {
+            await refreshWatches(refreshPermissions: false)
+            return
+        }
+        _ = await mailCheckRead.read { () -> (status: String, word: String, next: String?) in
+            let evidence: (status: String, word: String, next: String?)
+            do {
+                // The person's Check Mail reads mail.recent through the door, as any read of it runs.
+                evidence = MacAssistantStatusResult.mailReadiness(from: try await MacAssistantParts.verb("mail.recent", input: ["limit": .int(1)],
+                    dataRoot: dataRoot, envelope: .personOnMac("mac_ui:mail.check")))
+            } catch {
+                evidence = (status: "failed", word: "Check failed", next: UserFacingError.cause(error, action: "check Mail"))
+            }
+            // Mail may ask consent or launch during its read: publish the grants it changed first, so their change cannot clear this result.
+            await refresh(refreshWatches: false)
+            return evidence
+        } publish: { evidence in
+            permissionRead.write { keepMailCheck(evidence) }
+        }
         await refreshWatches(refreshPermissions: false)
     }
 
-    /// Missing or invalidated read evidence needs a check even when every grant probe succeeds.
+    /// Mail's readiness from what is true now: the watch's read switch and the live Automation grant decide; the kept check result
+    /// speaks only where the grant cannot (a failed read or coverage gap, Mail not running), so a restart never resets a working watch.
     private func currentMailReadiness() -> (status: String, word: String, next: String?) {
         guard let checkedPermissions else {
             return ("unavailable", "Permission evidence unavailable", "Refresh Mac Integrations to read Mail access.")
@@ -293,10 +384,18 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
                 return ("needs_policy", "Read access off", "Enable read access in Mac Integrations.")
             }
         }
-        guard let mailCheck else {
-            return ("probe_needed", "Needs check", "Use Check Mail to check account coverage.")
+        switch systemStatuses[AppleScriptExecution.automationStatusKey(app: "Mail")] {
+        case "denied"?:
+            return ("needs_permission", "Needs macOS permission",
+                    "Allow NativeAgent to control Mail in System Settings → Privacy & Security → Automation.")
+        case "granted"?:
+            if let mailPathGap { return mailPathGap }
+            return mailCheck ?? ("ready", "Ready", nil)
+        default:
+            if let mailPathGap { return mailPathGap }
+            if let mailCheck { return mailCheck }
+            return ("probe_needed", "Needs check", "Use Check Mail to let NativeAgent read Mail.")
         }
-        return mailCheck
     }
 
     private func localStatusProjection() -> [String: [String: JSONValue]] {

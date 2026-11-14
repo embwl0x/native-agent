@@ -206,9 +206,9 @@ extension AppToolExecutor {
                             so a page changed and changed back has its old version again.
                             """)),
                         ("because", ToolSchema.strSchema("""
-                            With action or actions: the person's own words asking for it, quoted from their message asking for what you are doing now \
-                            (three words or more). A change that is theirs to decide (a lever, a setting that widens what you may do, an owner_only \
-                            setting) then runs on their word, with no card; without it, or if the words are not theirs, it asks them on a card.
+                            With action: for setting.set in a turn the person did not start, the request it answers, quoted (three words or more) from \
+                            a person or trusted agent in this conversation. In a turn the person started nothing is needed: what they asked decides \
+                            every change that is theirs (a lever, a widening, an owner_only setting), with no card; in any other turn those ask them.
                             """)),
                         ("find", ToolSchema.strSchema("""
                             What you want done, in words. Discovers actions on every page, including home, one line each as id(args) label, with the best \

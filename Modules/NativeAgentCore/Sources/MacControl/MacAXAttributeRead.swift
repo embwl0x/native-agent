@@ -167,6 +167,14 @@ package enum MacAXAttributeRead {
         }
     }
 
+    /// Whether the element lets the attribute be written; an unreadable answer is no.
+    package static func isSettable(_ element: AXUIElement, _ attribute: String, context: MacOperationContext) -> Bool {
+        guard prepare(element, context: context) else { return false }
+        defer { if context.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
+        var settable: DarwinBoolean = false
+        return AXUIElementIsAttributeSettable(element, attribute as CFString, &settable) == .success && settable.boolValue
+    }
+
     package static func copyString(_ element: AXUIElement, _ attribute: String, context: MacOperationContext) -> String? {
         do { let value = try checkedText(element, attribute, context: context); return value.isEmpty ? nil : value }
         catch { failed(error, context: context); return nil }

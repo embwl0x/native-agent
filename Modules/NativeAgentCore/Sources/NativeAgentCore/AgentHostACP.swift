@@ -7,8 +7,9 @@ public struct AgentHostACP: Sendable, Equatable, Codable {
     public let executable: String
     public let arguments: [String]
     public let documentation: String
-    /// Explicit ask mode, never the host's saved auto-approval setting.
-    public let permissionMode: String
+    /// Explicit ask mode, never the host's saved auto-approval setting: one of the modes the agent offers, picked at connect when the
+    /// recipe's is not among them.
+    public var permissionMode: String
     /// Registry pins bound compatibility; arbitrary installed releases are unverified.
     public let referenceVersion: String
     public var environment: [String: String] = [:]
@@ -17,6 +18,8 @@ public struct AgentHostACP: Sendable, Equatable, Codable {
     public var modes: [String]? = nil
     public var supportsLoad: Bool? = nil
     public var supportsResume: Bool? = nil
+    /// What the person does once to sign the agent in to its own service, in plain words (its login command).
+    public var signIn: String? = nil
 
     /// Exact installed version whose sandbox launcher was inspected. Do not infer compatibility for neighbouring releases or bypass its sandbox.
     /// https://github.com/google-gemini/gemini-cli/issues/23959

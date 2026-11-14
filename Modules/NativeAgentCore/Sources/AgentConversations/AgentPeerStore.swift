@@ -148,7 +148,9 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     public var roundTripProof: AgentRoundTripProof?
     public var mcpReturnProof: AgentRoundTripProof?
     var connectionProbe: AgentConnectionProbe?
-    public var unavailableAt: String?
+    public var unavailableAt: String? { didSet { if unavailableAt == nil { unavailableStep = nil } } }
+    /// What the person does to end this unavailability, in plain words (sign the agent in, turn its server on); it clears with the mark.
+    public var unavailableStep: String?
 
     /// This owner checks route proof and startability; contact health owns version and digest freshness.
     public var isReady: Bool {
@@ -401,6 +403,7 @@ public struct AgentPeerStore: Sendable {
                 merged.mcpReturnProof = resetProof ? nil : peers[index].mcpReturnProof
                 merged.connectionProbe = resetProof ? nil : peers[index].connectionProbe
                 merged.unavailableAt = resetProof ? nil : peers[index].unavailableAt
+                merged.unavailableStep = resetProof ? nil : peers[index].unavailableStep
                 peers[index] = merged
             } else {
                 merged.allowElevation = nil
@@ -596,6 +599,20 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
+    /// An answer clears the unavailable mark (and its step) made before the attempt it answered; a mark made since stands. A reach that
+    /// proves less than the person's step (a handshake, when the step is signing in) leaves a mark with a step in place.
+    public func clearUnavailable(peerID: String, before: Date, keepingStep: Bool = false) {
+        retainEvidence(peerID: peerID, operation: "answered") {
+            var peers = try read()
+            guard let index = peers.firstIndex(where: { $0.id == peerID }), let stamp = peers[index].unavailableAt,
+                  !(keepingStep && peers[index].unavailableStep != nil),
+                  let marked = NativeTimestampFormat.parseISO8601FractionalFirst(stamp), marked < before else { return false }
+            peers[index].unavailableAt = nil
+            try write(peers)
+            return true
+        }
+    }
+
     /// Clear marks only from the requested boundary while preserving ambiguous same-second timestamps.
     public func clearUnavailable(peerID: String, since: Date) {
         retainEvidence(peerID: peerID, operation: "clear-unavailable") {
@@ -611,11 +628,13 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
-    public func recordUnavailable(peerID: String) {
+    /// `step` is what the person does to end it, when the cause is theirs to end; a mark without one names no step.
+    public func recordUnavailable(peerID: String, step: String? = nil) {
         retainEvidence(peerID: peerID, operation: "unavailable") {
             var peers = try read()
             guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return false }
             peers[index].unavailableAt = NativeTimestampFormat.fractionalZulu(Date())
+            peers[index].unavailableStep = step
             try write(peers)
             return true
         }

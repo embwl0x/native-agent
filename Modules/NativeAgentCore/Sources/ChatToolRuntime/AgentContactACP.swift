@@ -46,6 +46,9 @@ extension SwiftToolDispatcher {
         if new.modes != old.modes {
             said.append(new.modes == [] ? "dropped set_mode — no modes advertised" : "its modes are " + (new.modes ?? []).joined(separator: ", "))
         }
+        if new.permissionMode != old.permissionMode {
+            said.append("it runs in its \(new.permissionMode) mode (\(old.permissionMode) is not one it offers)")
+        }
         if new.supportsLoad == false, new.supportsResume == false, old.supportsLoad != false || old.supportsResume != false {
             said.append("no session/load or session/resume — continuing the conversation opens a new ACP session")
         }
@@ -172,6 +175,7 @@ extension SwiftToolDispatcher {
             "environment": .object(childEnvironment.mapValues(JSONValue.string))
         ]).serialize(pretty: false)
         var lease: AgentACPConnections.Lease?
+        let began = Date()
         do {
             let acquired = try await AgentACPConnections.shared.acquire(peer: contact.id, conversation: dryRun ? nil : conversationID,
                 configuration: configuration, dataRoot: dataRoot)
@@ -212,6 +216,10 @@ extension SwiftToolDispatcher {
             guard await AgentACPConnections.shared.finish(acquired, peer: contact.id,
                 conversation: dryRun ? nil : reply.sessionID) else { throw AgentACPClient.Failure.interrupted }
             lease = nil
+            // The agent answered: the route is there, so an unavailable mark made before this turn clears (with its step) for every
+            // reader of the contact, the turn's contact summary as much as agent.contacts and the Agents row. A handshake proves no
+            // sign-in (an agent may ask for it only at its prompt), so a dry run leaves a mark that carries the person's step.
+            store.clearUnavailable(peerID: contact.id, before: began, keepingStep: dryRun)
             if dryRun {
                 let found = await acquired.client.learned(line)
                 var host = row
@@ -233,6 +241,7 @@ extension SwiftToolDispatcher {
                     "agent": .string("peer:" + contact.id), "transport": .string("acp"), "recipe_version": .int(Int64(now.recipeVersion)),
                     "detail": .string("\(shown) answered its handshake with no prompt sent.")]
                 if let written { result["healed"] = .string("\(shown): \(Self.learned(line, found)) — recipe updated to v\(written.recipeVersion)") }
+                if let note = reply.modeNote { result["mode_note"] = .string(note) }
                 return .object(result)
             }
             store.recordProof(peerID: contact.id, inbound: reply.completed && !reply.text.isEmpty, outbound: true)
@@ -241,11 +250,13 @@ extension SwiftToolDispatcher {
                 store.recordRoundTrip(peerID: contact.id, executable: approved.path,
                     version: approved.version, workspace: directory.path, recipe: recipe)
             }
-            let result: [String: JSONValue] = ["status": .string(reply.completed ? "replied" : reply.stopReason),
+            var result: [String: JSONValue] = ["status": .string(reply.completed ? "replied" : reply.stopReason),
                 "agent": .string("peer:" + contact.id), "transport": .string("acp"),
                 "conversation_id": .string(reply.sessionID), "continued": .bool(reply.continued),
                 "sent": .bool(true), "completed": .bool(reply.completed), "reply": .string(reply.text),
                 "untrusted_remote_data": .bool(!reply.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)]
+            // A session that could not run in the recipe's mode says which it ran in, and when that one asks less.
+            if let note = reply.modeNote { result["mode_note"] = .string(note) }
             return Self.peerRedact(.object(result), token: secret)
         } catch AgentACPClient.Failure.executableChanged {
             if let lease { await AgentACPConnections.shared.finish(lease, peer: contact.id, conversation: nil) }
@@ -275,12 +286,16 @@ extension SwiftToolDispatcher {
             }
             // The agent is not signed in to its own service (classified where its error is read). The conversation stays; signing in continues it.
             if (error as? AgentACPClient.Failure) == .signInRequired {
-                store.recordUnavailable(peerID: contact.id)
+                // The recipe names the person's one step in plain words; the contact row says it until the next answer clears it.
+                let step = line.signIn.map { "Not signed in: \($0)." } ?? "Not signed in to its own service: sign it in once in its own app or terminal."
+                store.recordUnavailable(peerID: contact.id, step: step)
                 var result: [String: JSONValue] = ["status": .string(dryRun ? "failed" : "unavailable"), "agent": .string("peer:" + contact.id),
                     "transport": .string("acp"), "sent": delivered ? .null : .bool(false), "completed": .bool(false),
                     "reason": .string("sign_in_required"),
-                    "detail": .string("\(shown): " + AgentACPClient.Failure.signInRequired.localizedDescription
+                    "detail": .string((line.signIn.map { "\(shown) is not signed in to its own service: \($0); then the conversation continues where it was." }
+                        ?? "\(shown): " + AgentACPClient.Failure.signInRequired.localizedDescription)
                         + (delivered ? " Whether it took the message is unknown; it was not resent." : " Nothing was sent."))]
+                result["person_step"] = .string(step)
                 if let session { result["conversation_id"] = .string(session) }
                 if dryRun { result["dry_run"] = .bool(true) }
                 return withSaid(result)

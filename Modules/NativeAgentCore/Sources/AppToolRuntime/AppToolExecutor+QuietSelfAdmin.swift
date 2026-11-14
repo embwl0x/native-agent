@@ -363,7 +363,7 @@ extension AppToolExecutor {
         catch { return refuse(Self.settingReadFailure(error, setting: setting)) }
 
         // Who decides: the person's own decided call of exactly these arguments (their tap, the phone's signed change, a card they approved,
-        // their own words asking for it) passes every person-only check below; nothing else does. Posture is what the agent may do, never
+        // their own ask in a turn they started) passes every person-only check below; nothing else does. Posture is what the agent may do, never
         // what the person may.
         let decided = QuietSettings.personDecided(input.filter { !$0.key.hasPrefix("__") }, turn: turn)
 
@@ -378,12 +378,14 @@ extension AppToolExecutor {
             restoresPrevious = true
         } else if !setting.mindOwned, !decided,
                   await Self.freshQuietPosture()?.name != Self.fullMacModeName {
-            // Under Full Mac the agent's own dials are its own; below it the agent's change, from any of its turns or parts, needs words asking
-            // for it, said in this conversation and about this setting (`RequestWords`).
+            // Under Full Mac the agent's own dials are its own; below it the agent's change needs someone's ask: in the person's own turn,
+            // their ask (`Turn.personsAsk`); in any other turn, words asking for it quoted in because, said in this conversation by someone
+            // whose words count.
             let quoted = Self.text(input["because"] ?? input["__because"])
             let value = input["value"] ?? .null
-            let act = [setting.label, setting.page, setting.id, value.scalarText ?? ""]
-            if quoted.split(whereSeparator: \.isWhitespace).count >= 3, RequestWords.relates(quoted, to: act),
+            if let asked = await turn.personsAsk?() {
+                request = asked
+            } else if quoted.split(whereSeparator: \.isWhitespace).count >= 3,
                let restores = await turn.settingRequestEvidence?(setting.id, value, currentValue, quoted) {
                 request = quoted
                 restoresPrevious = restores

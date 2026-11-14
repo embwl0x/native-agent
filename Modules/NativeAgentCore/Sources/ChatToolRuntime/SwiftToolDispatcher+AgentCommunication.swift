@@ -471,7 +471,7 @@ extension SwiftToolDispatcher {
                 // A held send that names no held thread waits in the contact's own.
                 return try Self.hostPull(invocation: invocation, row: row, contact: snapshot.contact, text: sending ? Self.peerString(args, "text", max: 64000)
                     : nil, conversation: heldThread ?? AgentConversationStore.heldThread(peerID: peer.id),
-                                         peers: snapshot.peers)
+                                         peers: snapshot.peers, dataRoot: dataRoot)
             }
             // Nothing to page through: the reply came back in the same call as the message that asked for it, and there is no second copy here.
             guard sending else {

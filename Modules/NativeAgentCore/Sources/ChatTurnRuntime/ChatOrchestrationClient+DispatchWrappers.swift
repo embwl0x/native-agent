@@ -21,7 +21,7 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import StandingBots
-// Blueprint: | `ChatOrchestrationClient+DispatchWrappers.swift` | File-access gates; exact-call consent carried to dispatch, the person's word deciding what is theirs; audit failures owe repairs |
+// Blueprint: | `ChatOrchestrationClient+DispatchWrappers.swift` | File-access gates; exact-call consent carried to dispatch, the person's own turn deciding what is theirs; audit failures owe repairs |
 
 /// Carry request ceilings to Trust's canonical refusal before any inner work.
 final class FileAccessGatedDispatcher: ExpansionToolDispatchClient, PreApprovalToolValidating, Sendable {
@@ -150,95 +150,21 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         return said.count > 240 ? String(said.prefix(240)) + "…" : said
     }
 
-    /// The person's requests a call quotes (`because`): beside the call or in its args, and on each step of a list, each once, in order.
-    static func becauseQuotes(_ input: [String: JSONValue]) -> [String] {
-        func said(_ call: [String: JSONValue]) -> [String] {
-            [call["because"], call["args"]?.objectValue?["because"]]
-                .compactMap { $0?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-        }
-        let all = said(input) + (input["actions"]?.arrayValue ?? []).flatMap { said($0.objectValue ?? [:]) }
-        return all.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+    /// The person's own ask this call runs on, when the turn is the person's (`Turn.personsAsk`): in a turn the person started at a door that
+    /// is theirs, every lever, raise and owner-only change the agent calls is the person's act, decided by that ask. A preview, a helper's
+    /// turn, a turn an agent the person has not trusted steers and the mind's own thought have none, so their ask keeps its card.
+    private func personsAsk(tool: String, input: [String: JSONValue], turn: Turn) async -> String? {
+        guard tool == "app", input["preview"] != .bool(true), !StandingBotContinuity.isHelperTurn(turn: turn),
+              let ask = turn.personsAsk else { return nil }
+        return await ask()
     }
 
-    /// The act as the person would name it, for `RequestWords`: each call's action id, the lever's declared name, the call's own values
-    /// (its target: an agent's, an app's, a setting's name), and what the owner's ask names (the setting, its label and page, the words of
-    /// each ask of a list).
-    static func actWords(tool: String, input: [String: JSONValue], ask: JSONValue?, turn: Turn) -> [String] {
-        func values(_ value: JSONValue?) -> [String] {
-            switch value {
-            case .string(let text)?: [text]
-            case .int?, .double?: [value?.scalarText ?? ""]
-            case .array(let items)?: items.flatMap { values($0) }
-            case .object(let fields)?: fields.filter { $0.key != "because" && !$0.key.hasPrefix("__") }.values.flatMap { values($0) }
-            default: []
-            }
-        }
-        let calls = input["actions"]?.arrayValue?.compactMap(\.objectValue) ?? [input]
-        var words = calls.flatMap { call -> [String] in
-            let lever = (try? PermissionLaw.lever(tool: tool, input: call, turn: turn))?.name
-            return [call["action"]?.stringValue, lever].compactMap { $0 } + values(call["args"])
-        }
-        // The ask's own fields, beside the door's receipt or inside its result.
-        for case .object(let answer)? in [ask, ask?.objectValue?["result"]] {
-            words += ["setting", "label", "page"].compactMap { answer[$0]?.stringValue }
-            words += (answer["asks"]?.arrayValue ?? []).compactMap { $0.objectValue?["words"]?.stringValue }
-        }
-        return words
-    }
-
-    /// Whether this call widens what the agent may do, the kind a whole ask names (`RequestWords.asksWhole`): a setting change its owner put
-    /// to the person (`asked`), or a lever whose own name is about the agent's permissions, access or grants.
-    static func widens(_ call: [String: JSONValue], asked: Bool, turn: Turn) -> Bool {
-        if call["action"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "setting.set" { return asked }
-        guard let name = (try? PermissionLaw.lever(tool: "app", input: call, turn: turn))?.name else { return false }
-        return RequestWords.namesKind(name)
-    }
-
-    /// The person's own words asking for this call, when it quotes them: every quote it carries (`becauseQuotes`), of three words or more,
-    /// is about the act (`RequestWords.relates` with `actWords`, and `widens`) and is found by the turn's request evidence (`Turn.personWord`)
-    /// in the person's own message of the ask this turn is acting on, at a door of theirs. A list the person is asked about together (the
-    /// owner's `asks`) is read step by step: each step is theirs only when the quotes reaching it (its own and the list's) are about that
-    /// step's own act, and the act returned holds the list without the steps the words do not name, so those keep their own decision. A
-    /// helper's turn or one an agent the person has not trusted steers has no word of theirs to quote. Any miss leaves the call on the card.
-    private func personsWord(tool: String, input: [String: JSONValue], ask: JSONValue?,
-                             turn: Turn) async -> (words: String, act: [String: JSONValue], steps: [Int]?)? {
-        guard tool == "app", input["preview"] != .bool(true), let heard = turn.personWord, !StandingBotContinuity.isHelperTurn(turn: turn),
-              CapabilityLifecycle.turnWriteCheck(turn)() == nil else { return nil }
-        var found: [String: Bool] = [:]
-        func said(_ quotes: [String], _ act: [String], widens: Bool) async -> Bool {
-            guard !quotes.isEmpty else { return false }
-            for quote in quotes {
-                guard quote.split(whereSeparator: \.isWhitespace).count >= 3, RequestWords.relates(quote, to: act, widens: widens) else { return false }
-                if found[quote] == nil { found[quote] = await heard(quote) }
-                guard found[quote] == true else { return false }
-            }
-            return true
-        }
-        guard case .array(let entries)? = input["actions"] else {
-            let quotes = Self.becauseQuotes(input)
-            let act = Self.actWords(tool: tool, input: input, ask: ask, turn: turn)
-            guard await said(quotes, act, widens: Self.widens(input, asked: ask != nil, turn: turn)) else { return nil }
-            return (quotes.joined(separator: " … "), input, nil)
-        }
-        let asks = (ask?.objectValue?["result"]?.objectValue?["asks"] ?? ask?.objectValue?["asks"])?.arrayValue ?? []
-        var named: [Int] = [], quoted: [String] = []
-        for case .object(let entry) in asks {
-            guard case .int(let number)? = entry["step"], number >= 1, number <= Int64(entries.count),
-                  case .object(let call) = entries[Int(number) - 1] else { continue }
-            let quotes = Self.becauseQuotes(["because": input["because"] ?? .null, "actions": .array([.object(call)])])
-            let act = Self.actWords(tool: tool, input: call, ask: .object(["asks": .array([.object(entry)])]), turn: turn)
-            guard await said(quotes, act, widens: Self.widens(call, asked: true, turn: turn)) else { continue }
-            named.append(Int(number))
-            for quote in quotes where !quoted.contains(quote) { quoted.append(quote) }
-        }
-        guard !named.isEmpty else { return nil }
-        let asked = Set(asks.compactMap { $0.objectValue?["step"]?.scalarText.flatMap { Int($0) } })
-        guard Set(named) != asked else { return (quoted.joined(separator: " … "), input, nil) }
-        var act = input
-        act["actions"] = .array(entries.enumerated().compactMap { index, entry in
-            !asked.contains(index + 1) || named.contains(index + 1) ? entry : nil
-        })
-        return (quoted.joined(separator: " … "), act, named)
+    /// The owner's own words for its answer: beside the door's receipt, or inside its `result`, where the door hands an action's own answer
+    /// back. One reader for both shapes, so an owner's ask is never missed for where the door put it.
+    static func ownersDetail(_ result: JSONValue) -> String? {
+        guard case .object(let fields) = result else { return nil }
+        return [fields, fields["result"]?.objectValue ?? [:]].lazy.compactMap { $0["detail"]?.stringValue }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty }
     }
 
     /// The call as a card names it, without the quoted request (`because`) beside it, in its args or on its steps: a card filed before the
@@ -268,7 +194,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                   case .object(let filed)? = payload["input"], Self.withoutBecause(filed) == call else { continue }
             do {
                 _ = try await inbox.resolve(record.id, decision: .canceled,
-                    provenance: .local(decidedBy: ApprovalRecord.personsWordDecider + "“\(words.prefix(240))”"))
+                    provenance: .local(decidedBy: ApprovalRecord.personsWordDecider + "“\(words)”"))
                 settled.append(.string(record.id))
             } catch {
                 failed.append(.object(["id": .string(record.id), "error": .string(error.localizedDescription)]))
@@ -669,20 +595,16 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             decision = .allow
             ownUndo = words
         }
-        // A change that is the person's to decide and that a card can carry (a lever's ask here, a setting raise's from its owner below) is
-        // decided by their card or by their own words asking for it (`personsWord`). Only that ask is theirs to answer by word: a security
-        // ask, another agent's steering or a peer's request keeps its card.
+        // A change that is the person's to decide and that a card can carry (a lever's ask here, a setting raise's or an owner-only row's
+        // from its owner below) is decided by their card, or by their own ask when the turn is theirs (`personsAsk`). A security ask,
+        // another agent's steering or a peer's request keeps its card.
         var theirs = false
         if case .requireApproval = autonomyDecision, !securityAsked, requester == nil,
            try PermissionLaw.lever(tool: tool, input: input, turn: turn)?.asks == true { theirs = true }
-        // The person's word, once it decides this call: their act for this exact call, as their card's Approve would be; and the cards it
+        // The person's ask, once it decides this call: their act for this exact call, as their card's Approve would be; and the cards it
         // settled that were waiting for this call.
         var wordTurn: Turn?
-        // The steps of a list the person's word decided, when it decided only some of them.
-        var wordSteps: [Int]?
         var cardsSettled: JSONValue = .null
-        // What the owner's ask named (`needs_person`), for the act's own words.
-        var ownerAsk: JSONValue?
         // The user's own contact send needs no card. Broader execution and Trust refusals must be stated plainly.
         if turn.personInitiatedSend?.claim(tool: tool, input: input, surface: surface) == true {
             let name: String = {
@@ -740,12 +662,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             let stemAsks: Bool = if let asking = input["action"]?.stringValue { AppActionBinding.declaredBinding(asking)?.folded == false }
                 else { input["action"] == nil && input["actions"]?.arrayValue != nil }
             if reply.said("needs_person"), !approvedReplayAuthorizes, turn.personAct == nil, input["preview"] != .bool(true), tool == "app",
-               stemAsks, let words = result.objectValue?["detail"]?.stringValue, !words.isEmpty {
+               stemAsks, let words = Self.ownersDetail(result) {
                 decision = .requireApproval(reason: words)
-                ownerAsk = result
                 ownerAsked = true
-                // The owner's ask is the person's, as a lever's is, unless another agent is behind this turn; one their word already
-                // answered and that still asks goes on their card.
+                // The owner's ask is the person's, as a lever's is, unless another agent is behind this turn; one their ask already
+                // decided and that still asks goes on their card.
                 theirs = requester == nil && wordTurn == nil
                 wordTurn = nil
                 continue
@@ -755,11 +676,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 fields["undoing_own_act"] = .string(ownUndo)
                 result = .object(fields)
             }
-            // What the agent reads says the call ran on the person's word, in their words.
+            // What the agent reads says the call ran as the person's act, on their own ask.
             if let words = wordTurn?.personAct?.words, case .object(var fields) = result {
                 fields["decided_by"] = .string("person")
                 fields["persons_word"] = .string(words)
-                if let wordSteps { fields["persons_word_steps"] = .array(wordSteps.map { .int(Int64($0)) }) }
                 if cardsSettled != .null { fields["cards_settled_by_persons_word"] = cardsSettled }
                 result = .object(fields)
             }
@@ -834,19 +754,13 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                     injectionApprovalID: nil,
                  turn: turn, work: work)
             }
-            // The person's word in this conversation is their act: when they asked for this exact call, it runs as theirs, admitted the way
-            // their card's Approve is (this call, once), and the consent record carries their words. No card is filed.
-            if theirs, let word = await personsWord(tool: tool, input: input, ask: ownerAsk, turn: turn) {
-                let words = word.words
-                // Steps of a list the words do not name are left out of the person's act: each then meets its own gate, as its own call.
-                wordTurn = turn.with(\.personAct, PersonAct(by: .word(quote: words), tool: tool, input: word.act, spent: [.call]))
-                wordSteps = word.steps
-                // A card waiting for the whole list is settled only when the words decided all of it.
-                if !work.admissionOnly, word.steps == nil {
-                    cardsSettled = await settleCards(decidedBy: words, tool: tool, input: input, turn: turn)
-                }
+            // In the person's own turn their ask is their act: this exact call runs as theirs, admitted the way their card's Approve is (this
+            // call, once), and the receipt and consent record carry their message. No card is filed; one still waiting for it is settled.
+            if theirs, let words = await personsAsk(tool: tool, input: input, turn: turn) {
+                wordTurn = turn.with(\.personAct, PersonAct(by: .word(quote: words), tool: tool, input: input, spent: [.call]))
+                if !work.admissionOnly { cardsSettled = await settleCards(decidedBy: words, tool: tool, input: input, turn: turn) }
                 admission = Self.securityEnvelope(envelope, decision: .allow,
-                    reason: "The person asked for this in their own words in this conversation: “\(words)”.")
+                    reason: "The person asked for this in their own message in this conversation: “\(words)”.")
                 theirs = false
                 decision = .allow
                 continue
@@ -900,19 +814,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                     fields["remedy"] = remedy
                     pending = .object(fields)
                 }
-                // The owner's ask, or a lever's, is now the person's card: what the agent reads says so, and what to do next. Where their word
-                // could have decided it, one more sentence says how.
+                // The owner's ask, or a lever's, is now the person's card: what the agent reads says so, and what to do next.
                 if ownerAsked || theirs, case .object(var fields) = pending {
                     let card = ApprovalWords.call(tool: tool, input: .object(approvalPayloadInput)).act
-                    let word = !theirs ? "do not call it again."
-                        : Self.becauseQuotes(input).isEmpty
-                        ? "if the person asked for this in their own words, call it again with because quoting them and it runs on their word; "
-                            + "otherwise do not call it again."
-                        : "the words in because were not found in the person's own message of what you are doing now (this turn's, one "
-                            + "they sent while you worked, or the one a card's answer continues), so the card decides it; call it again only "
-                            + "with their exact words."
                     fields["card"] = .string("The person's card \"\(card)\" (\(approvalId)) is up in Mac chat and on their phone, and they decide: "
-                        + "their Approve runs this exact call as theirs, their Decline leaves everything as it is; " + word)
+                        + "their Approve runs this exact call as theirs, their Decline leaves everything as it is; do not call it again.")
                     pending = .object(fields)
                 }
                 if StandingBotContinuity.isHelperTurn(turn: turn) { turn.execution?.keepApproval(id: approvalId, pending) }

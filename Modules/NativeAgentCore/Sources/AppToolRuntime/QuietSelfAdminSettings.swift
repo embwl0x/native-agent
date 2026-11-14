@@ -20,7 +20,7 @@ public enum QuietSettings {
     public static let trustVoicePreferenceDidChange = Notification.Name("NativeAgent.trustVoicePreferenceDidChange")
     /// The agent lowers its own fence at any posture; turning Full Mac on is the person's, as every raise is.
     public static let fullMacRefusal =
-        "Turning Full Mac on is the person's: it is made on their own words asking for it, quoted in because, or on their card. The agent's "
+        "Turning Full Mac on is the person's: it is made when they ask for it in their own turn, or on their card. The agent's "
         + "own preset choices are Safe, Work mode and Builder, and a choice that widens what the agent may do asks the person."
 
     /// The choices the Trust page's activity and Mac access controls offer, as their settings take them.
@@ -29,8 +29,8 @@ public enum QuietSettings {
     public static let macPresetChoices = ["off", "watch", "assistant", "full"]
 
     public static let ownerOnlyRefusal =
-        "This one is the person's to decide: it decides what the agent is allowed to do. When they ask for a change in their own words, "
-        + "quote them in because and it is made on their word; a change that is the agent's own idea asks them on a card."
+        "This one is the person's to decide: it decides what the agent is allowed to do. When they ask for a change in their own turn, "
+        + "it is made on their ask; a change that is the agent's own idea asks them on a card."
 
     // MARK: - Who decides
 
@@ -528,8 +528,8 @@ public enum QuietSettings {
             id: "trust.preset", label: "Trust preset", kind: .choice,
             choices: MobileTrustAction.Preset.allCases.map(\.rawValue),
             note: "Safe, Work mode, Builder and full_mac (Full Mac), applied through the page's own preset action. A choice that "
-                + "widens what you may do, Full Mac among them, is the person's at any mode: it is made when because quotes their own "
-                + "request, and otherwise asks them on a card.",
+                + "widens what you may do, Full Mac among them, is the person's at any mode: it is made when they ask for it in their "
+                + "own turn, and otherwise asks them on a card.",
             // A preset writes its whole Mac control block, so one at the same rank still raises any switch it turns back on.
             raises: { host, current, wanted in
                 guard let preset = MobileTrustAction.Preset(rawValue: wanted.stringValue ?? "") else { return true }
@@ -999,7 +999,7 @@ public enum QuietSettings {
                 if turningOn, await notificationsMasterOn(appModel) != true {
                     throw QuietSettingError.unavailable(
                         "Raising things unasked is off, so no trigger can be switched on yet. Turn notifications.raise_unasked "
-                        + "on first (the person's: on their words quoted in because, or on their card); switching triggers off still works.")
+                        + "on first (the person's: on their ask in their own turn, or on their card); switching triggers off still works.")
                 }
                 if let unknown = wanted.sorted().first(where: { !names.contains($0) }) {
                     throw QuietSettingError.badValue(

@@ -1,11 +1,11 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `PersonAct.swift` | `PersonAct`, `Turn.personAct`: the person's own decision of one run of one exact door call (a tap on a row the stem composed, a card they approved, which can carry a list of calls, or their own words in the conversation asking for it) |
+// Blueprint: | `PersonAct.swift` | `PersonAct`, `Turn.personAct`: the person's own decision of one run of one exact door call (a tap on a row the stem composed, a card they approved, which can carry a list of calls, or their own ask in a turn they started) |
 
 /// The person decided this exact call: a tap on a row the stem composed (a lever, a key lever, a stem page's row, a page owner's packet),
-/// the replay of a card they approved, or their own words in this conversation asking for it. Only the stem sets it (`PartFaces.act`'s run,
-/// the gate's verified replay, the gate's verified request evidence); model output never can. It answers for one run of that call: the gate
+/// the replay of a card they approved, or their own ask in a turn they started. Only the stem sets it (`PartFaces.act`'s run, the gate's
+/// verified replay, the gate's reading of the person's turn); model output never can. It answers for one run of that call: the gate
 /// spends it once for the call itself and once for the tool the call folds into, so the same call made again inside that run (a part's own
 /// call) is judged as the agent's.
 public final class PersonAct: @unchecked Sendable {
@@ -15,8 +15,8 @@ public final class PersonAct: @unchecked Sendable {
         case tap(door: String, device: String?, chat: String?, page: String, row: String)
         /// The person answered this call's card: approved it, or answered the card the call waited on.
         case card(id: String)
-        /// The person asked for this call in their own message in this conversation, at a door that is theirs; `quote` is their words as
-        /// the call quoted them (`because`), found in that message by the turn's request evidence (`Turn.personWord`).
+        /// The call was made in a turn the person started at a door that is theirs; `quote` is their own message, the ask it runs on
+        /// (`Turn.personsAsk`).
         case word(quote: String)
     }
     /// The forms of the call one run admits: the call as the door takes it, the tool it folds into, and each call of a list the person
