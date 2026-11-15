@@ -432,6 +432,13 @@ public actor SwiftNativeMemoryV2 {
         return deleted
     }
 
+    /// The store's rename of one principal across every memory's roots, a given teller telling its told roots; how many memories changed.
+    public func renamePrincipal(_ from: String, to: String, teller: String? = nil) async throws -> Int {
+        try await ensureCanonicalAttachment()
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        return try await storage.renamePrincipal(from, to: to, teller: teller)
+    }
+
     public func embedderDimensions() -> Int? { embedder?.dimensions }
 
     public func embeddingEpoch() -> MemoryEmbeddingEpoch? { embedder?.embeddingEpoch }

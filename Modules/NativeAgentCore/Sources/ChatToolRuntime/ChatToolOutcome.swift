@@ -30,8 +30,10 @@ extension ChatToolOutcome {
               !isWaitingApproval(reply.payload), !reply.isWaitingInteraction,
               !InlineInteractionNeed.isWaiting(reply.payload),
               case .object(var object) = output else { return output }
-        func text(_ key: String) -> String? {
-            guard case .string(let raw)? = object[key] else { return nil }
+        // The refusing owner's own answer sits beside the receipt or inside its result, where the door hands an action's answer back.
+        let owned: [String: JSONValue] = if case .object(let inner)? = object["result"] { inner } else { [:] }
+        func text(_ key: String, in fields: [String: JSONValue]? = nil) -> String? {
+            guard case .string(let raw)? = (fields ?? object)[key] else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return value.isEmpty ? nil : value
         }
@@ -53,12 +55,16 @@ extension ChatToolOutcome {
         let oldReason = text("reason")
         let inner: String? = if case .object(let detail)? = object["detail"], case .string(let error)? = detail["error"] { error } else { nil }
         let genericCodes: Set<String> = ["failed", "error", "dispatch_error", "tool_failed"]
-        let suppliedCodes = [text("failure_code"), text("error_code"), text("errorCode"), text("code")].compactMap { $0 }
-        let domainCodes = [oldReason, text("error"), inner].compactMap { $0 }.filter(isCode)
-        let code = oldReason.flatMap { isCode($0) && !genericCodes.contains($0) ? $0 : nil }
-            ?? (suppliedCodes + domainCodes).first { !genericCodes.contains($0) }
-            ?? suppliedCodes.first ?? domainCodes.first ?? "tool_failed"
-        let candidates = ["message", "spoken", "text", "detail", "output", "error", "content", "result", "fix", "recovery_hint",
+        let suppliedCodes: [String] = [object, owned].flatMap { (fields: [String: JSONValue]) -> [String] in
+            ["failure_code", "error_code", "errorCode", "code"].compactMap { text($0, in: fields) }
+        }
+        let domainCodes: [String] = [oldReason, text("error"), inner, text("reason", in: owned), text("error", in: owned)].compactMap { $0 }.filter(isCode)
+        let ownReason: String? = oldReason.flatMap { isCode($0) && !genericCodes.contains($0) ? $0 : nil }
+        let allCodes: [String] = suppliedCodes + domainCodes
+        let namedCode: String? = allCodes.first { !genericCodes.contains($0) }
+        let anyCode: String? = suppliedCodes.first ?? domainCodes.first
+        let code: String = ownReason ?? namedCode ?? anyCode ?? "tool_failed"
+        let candidates = ["message", "spoken", "text", "detail", "summary", "output", "error", "content", "result", "fix", "recovery_hint",
             "hint"].flatMap { explanations(object[$0]) }
         let exit = [object["exit_code"], object["exitCode"]].lazy.compactMap { value -> Int? in
             if case .int(let code)? = value { return Int(code) }
@@ -79,7 +85,9 @@ extension ChatToolOutcome {
                 ? "none" : "unknown")
         let explained: String? = candidates.first { !isCode($0) && $0 != code }
             ?? oldReason.flatMap { isCode($0) || $0 == code ? nil : $0 }
-        let message = explained ?? processFailure ?? "The action supplied no explanation."
+        // A code is the owner's reason when it gave no words; the generic line is only for an answer that named nothing at all.
+        let message = explained ?? processFailure
+            ?? (genericCodes.contains(code) ? "The action supplied no explanation." : "The action answered \(code), with no words of its own.")
         // Preserve prose reasons and refusals; failure_code projects the authoritative coded cause.
         object["failure_code"] = .string(code)
         if oldReason == nil || oldReason.map(isCode) == true { object["reason"] = .string(code) }

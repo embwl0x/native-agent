@@ -292,8 +292,8 @@ extension BuiltInToolSchemaFactory {
                             """)),
                         ("turn_id", ToolSchema.strSchema("Optional exact turn id filter.")),
                         ("receipt_id", ToolSchema.strSchema("""
-                            Exact dispatch receipt id, including from an expired result handle; reads retained evidence without repeating the \
-                            operation.
+                            Exact dispatch receipt id, including from an expired result handle or a life row; found in any conversation; reads \
+                            retained evidence without repeating the operation.
                             """)),
                         ("fields", stringArraySchema("""
                             Optional payload keys, with or without a turn window. Up to 16 keys, 80 characters each; values share an 8 KiB cap.

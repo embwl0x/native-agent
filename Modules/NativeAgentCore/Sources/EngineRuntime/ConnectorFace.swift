@@ -11,6 +11,25 @@ import PersistenceCore
 import Transcripts
 // Blueprint: | `ConnectorFace.swift` | The Connectors page: one connector list (accounts from `ConnectorReadiness`, the iPhone, each agent) whose rows hold their own settings, then kept secrets and folders; each row is a door call, and the `connections` verbs the stem pages call run here |
 
+/// A host verb's effect, as its owner's `prepare` returns it once every lookup the verb needs has held: what runs, and its words.
+public typealias HostVerbEffect = @MainActor () async throws -> String?
+
+/// The one rule for the row a call names (a contact, a phone): its exact id first, then any name the row is known by. A name no row is
+/// listed under is unknown (`unknown_<kind>`, with what is listed); a listed row the verb cannot act on now is stale (`stale_row`, with why).
+enum NamedRow {
+    static func find<Row>(_ wanted: String, kind: String, in rows: [Row], ids: (Row) -> [String], names: (Row) -> [String] = { _ in [] },
+                          shown: (Row) -> String) throws -> Row {
+        let key = wanted.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty, let row = rows.first(where: { ids($0).contains(key) })
+            ?? rows.first(where: { names($0).contains { $0.caseInsensitiveCompare(key) == .orderedSame } }) { return row }
+        let listed = rows.map(shown)
+        throw PartCallError(code: "unknown_\(kind)", message: "No \(kind) called \(key.isEmpty ? "that" : key) is listed. "
+            + (listed.isEmpty ? "None is listed; refresh Connectors." : "Listed: \(listed.joined(separator: ", "))."))
+    }
+
+    static func stale(_ why: String) -> PartCallError { PartCallError(code: "stale_row", message: why + " Refresh Connectors.") }
+}
+
 @MainActor
 extension ConnectorReadiness {
     func faceReader(pages: PartFaces) -> PartFaces.Read {
@@ -139,49 +158,63 @@ extension ConnectorReadiness {
             actions: actions.isEmpty ? nil : actions, control: connector.canToggle ? toggle : nil)
     }
 
-    /// `connector.share_folder`: the person chooses a folder and its access in the Mac's panel; the owner saves and confirms it.
-    func shareFolder(renderer: UUID?) async throws -> String? {
-        try await connectorVerb {
-            guard let choose = platform.chooseSharedFolder else {
-                throw PartCallError(code: "mac_required", message: "Share a folder on your Mac")
+    /// `connector.share_folder`: the Mac's folder panel (the lookup), where the person chooses a folder and its access; the owner saves and
+    /// confirms it (the effect).
+    func shareFolder(renderer: UUID?) throws -> HostVerbEffect {
+        guard let choose = platform.chooseSharedFolder else {
+            throw PartCallError(code: "mac_required", message: "Share a folder on your Mac")
+        }
+        return { [self] in
+            try await connectorVerb {
+                guard let selection = try await choose(renderer) else { return "No folder was shared." }
+                let result = try await addWorkspace(name: selection.name, path: selection.path, writable: selection.writable)
+                guard result.verified else {
+                    throw PartCallError(code: "unconfirmed", message: "The saved folder could not be confirmed. Refresh Connectors before sharing it again.")
+                }
+                return "Shared \(result.added.name) with \(selection.writable ? "read and write" : "read-only") access."
             }
-            guard let selection = try await choose(renderer) else { return "No folder was shared." }
-            let result = try await addWorkspace(name: selection.name, path: selection.path, writable: selection.writable)
-            guard result.verified else {
-                throw PartCallError(code: "unconfirmed", message: "The saved folder could not be confirmed. Refresh Connectors before sharing it again.")
-            }
-            return "Shared \(result.added.name) with \(selection.writable ? "read and write" : "read-only") access."
         }
     }
 
-    /// `connector.forget_secret`: a secret in the current reading leaves the keyring.
-    func forgetSecret(name: String) async throws -> String? {
+    /// `connector.forget_secret`: the secret is in the current reading (the lookup); it leaves the keyring (the effect).
+    func forgetSecret(name: String) async throws -> HostVerbEffect {
         try await connectorVerb {
             guard let secrets, try secrets.get().contains(where: { $0.name == name }) else {
                 throw PartCallError(code: "stale_secret", message: "That secret is not in the current reading. Refresh Connectors before forgetting it.")
             }
-            try Keyring.remove(name)
-            await refresh()
-            return "The secret was forgotten. What uses it needs a new grant before it can reach there again."
+            return { [self] in
+                try await connectorVerb {
+                    try Keyring.remove(name)
+                    await refresh()
+                    return "The secret was forgotten. What uses it needs a new grant before it can reach there again."
+                }
+            }
         }
     }
 
-    /// `connector.connect`: an account with a setup route gets its setup card in the open conversation.
-    func connect(id: String, turn: Turn) async throws -> String? {
-        try await connectorVerb {
-            guard let connector = try accounts.get().first(where: { $0.id == id }) else {
+    /// `connector.connect`: an account in the current reading that has a setup route (the lookups) gets its setup card in the open
+    /// conversation `setup` opens when the effect runs.
+    func connect(id: String, setup: @escaping @MainActor () async throws -> Turn) async throws -> HostVerbEffect {
+        let connector = try await connectorVerb {
+            guard let record = try accounts.get().first(where: { $0.id == id }) else {
                 throw PartCallError(code: "stale_connector", message: "That account is not in the current reading. Refresh Connectors before changing it.")
             }
             guard ConnectorWizardSetupRoute.resolve(provider: id) != .unavailable else {
                 throw PartCallError(code: "no_action", message: "That action is not available on this row. Refresh Connectors to read its controls.")
             }
-            return try await raiseSetupCard(id, name: connector.name, why: "You asked to connect \(connector.name).",
-                origin: "face:connectors:connect", turn: turn)
+            return record
+        }
+        return { [self] in
+            let turn = try await setup()
+            return try await connectorVerb {
+                try await raiseSetupCard(id, name: connector.name, why: "You asked to connect \(connector.name).",
+                    origin: "face:connectors:connect", turn: turn)
+            }
         }
     }
 
     /// A connector verb's failure is the owner's own words; any other error names itself and says to read Connectors again.
-    private func connectorVerb(_ body: () async throws -> String?) async throws -> String? {
+    private func connectorVerb<T>(_ body: @MainActor () async throws -> T) async throws -> T {
         do { return try await body() }
         catch let error as PartCallError { throw error }
         catch { throw PartCallError(code: "connector_action_failed", message: error.localizedDescription + " Refresh Connectors before trying again.") }
@@ -279,59 +312,87 @@ extension NativeAgentEngine {
     /// (`AppActions.providersConnectorsCapabilitiesVerbs`), each running its owner's code. The door judged the call before it came here (a
     /// lever runs only as the person's own act); the owner's words are the reply's detail, and its refusal or failure is its own code.
     @MainActor public func connectionsVerb(_ verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
-        func text(_ key: String) -> String { input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
-        let version: Int? = if case .int(let number)? = input["version"] { Int(number) } else { nil }
+        let effect: HostVerbEffect
         do {
-            let words: String?
-            switch verb {
-            case "provider_choose": words = try await chooseProviderFace(group: text("group"), setting: text("setting"), value: input["value"])
-            case "provider_sign_in": words = try await signInProviderFace(text("provider"), renderer: turn[FacePresentationPart.self])
-            case "provider_codex_session": words = try await answerCodexSession(text("answer"))
-            case "connector_connect": words = try await connectors.connect(id: text("id"), turn: connectorSetupTurn(turn))
-            case "connector_forget_secret": words = try await connectors.forgetSecret(name: text("name"))
-            case "connector_share_folder": words = try await connectors.shareFolder(renderer: turn[FacePresentationPart.self])
-            case "telegram_refresh": words = try await telegramRefresh()
-            case "telegram_token": words = try await telegramToken(turn: connectorSetupTurn(turn))
-            case "telegram_allowlist": words = try await telegramAllowlist(list: text("list"), value: text("value"))
-            case "telegram_allow_chat": words = try await telegramAllowChat(text("chat"))
-            case "telegram_check_sender": words = try await telegramCheckSender()
-            case "telegram_choose": words = try await telegramChoose(setting: text("setting"), value: text("value"))
-            case "telegram_voice_setup": words = try await telegramVoiceSetup()
-            case "pairing_check_delivery": words = try await pairingCheckDelivery()
-            case "pairing_pair": words = try await pairingPair(text("id"))
-            case "pairing_rotate": words = try await pairingRotate()
-            case "pairing_use_here": words = try await pairingUseHere()
-            case "agent_refresh": words = try await agentsRefresh()
-            case "agent_look": words = try await agentsLook()
-            case "agent_ask_in_chat": words = try await agentAskInChat(agent: text("agent"), ask: text("ask"))
-            case "agent_send": words = try await agentSend(agent: text("agent"), text: text("value"), session: text("session"), turn: turn)
-            case "agent_grok_paste": words = try await grokPaste(peer: text("agent"), turn: turn)
-            case "agent_grok_bot": words = try grokBot(peer: text("agent"), name: text("value"))
-            case "capability_check_trust": words = try await CapabilitiesFace.checkTrust(self, id: text("id"))
-            case "connector_dry_run": words = try await CapabilitiesFace.connectorDryRun(self, id: text("id"))
-            case "native_dry_run", "native_run":
-                words = try await CapabilitiesFace.nativeAction(self, id: text("id"), dryRun: verb == "native_dry_run")
-            case "improvement_run": words = try await CapabilitiesFace.runImprovement(self)
-            case "browser_preview": words = try await CapabilitiesFace.previewBrowser(self)
-            case "browser_cancel": words = try await CapabilitiesFace.cancelBrowser(self, id: text("id"))
-            case "tools_refresh": words = try await CapabilitiesFace.refreshTools(self)
-            case "sense_switch": words = try await CapabilitiesFace.switchSense(id: text("sense_id"), version: version, on: input["value"]?.boolValue,
-                byPerson: AppToolExecutor.personDecided(tool: "connections", input: input, turn: turn))
-            case "sense_share": words = try await CapabilitiesFace.shareSense(self, id: text("sense_id"), version: version)
-            case "ability_keep": words = try await CapabilitiesFace.keepAbility(self, id: text("id"), version: input["version"]?.stringValue)
-            case "ability_off": words = try await CapabilitiesFace.switchOffAbility(self, id: text("id"))
-            case "skill_build": words = try await CapabilitiesFace.buildSkill(self)
-            default: return AppToolExecutor.failure("unknown_verb", "No connections verb is called \(verb).")
+            guard let prepared = try await prepareConnections(verb, input, turn) else {
+                return AppToolExecutor.failure("unknown_verb", "No connections verb is called \(verb).")
             }
+            effect = prepared
+        } catch { return Self.prepareRefusal(error, verb: verb) }
+        do {
+            let words = try await effect()
             var reply: [String: JSONValue] = ["status": .string("ok")]
             if let words { reply["detail"] = .string(words) }
             return .object(reply)
-        } catch let error as ToolFailureError {
-            return ChatToolOutcome.failure(error: error, tool: "connections")
-        } catch let error as PartCallError {
-            return .object(["status": .string("failed"), "reason": .string(error.code), "detail": .string(error.message)])
-        } catch {
-            return .object(["status": .string("failed"), "reason": .string("\(verb)_failed"), "detail": .string(error.localizedDescription)])
+        } catch { return Self.connectionsFailure(error, verb: verb) }
+    }
+
+    /// The gate's check before any card: the verb's own `prepare`, its effect not run. Nil when every lookup holds.
+    @MainActor public func connectionsFence(_ verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue? {
+        do {
+            _ = try await prepareConnections(verb, input, turn)
+            return nil
+        } catch { return Self.prepareRefusal(error, verb: verb) }
+    }
+
+    /// The `connections` verbs' one switch: every lookup a verb needs (the account, secret, chat, contact, phone, record or value it names,
+    /// read now) throws its owner's refusal, or the verb's effect comes back to run. Nil for a verb that is not the engine's.
+    @MainActor func prepareConnections(_ verb: String, _ input: [String: JSONValue], _ turn: Turn) async throws -> HostVerbEffect? {
+        func text(_ key: String) -> String { input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+        let version: Int? = if case .int(let number)? = input["version"] { Int(number) } else { nil }
+        switch verb {
+        case "provider_choose": return try await chooseProviderFace(group: text("group"), setting: text("setting"), value: input["value"])
+        case "provider_sign_in": return try await providerSignIn(text("provider"), renderer: turn[FacePresentationPart.self])
+        case "provider_codex_session": return try await answerCodexSession(text("answer"))
+        case "connector_connect": return try await connectors.connect(id: text("id"), setup: { [self] in try await connectorSetupTurn(turn) })
+        case "connector_forget_secret": return try await connectors.forgetSecret(name: text("name"))
+        case "connector_share_folder": return try connectors.shareFolder(renderer: turn[FacePresentationPart.self])
+        case "telegram_refresh": return { [self] in try await telegramRefresh() }
+        case "telegram_token": return { [self] in try await telegramToken(turn: connectorSetupTurn(turn)) }
+        case "telegram_allowlist": return try telegramAllowlist(list: text("list"), value: text("value"))
+        case "telegram_allow_chat": return try await telegramAllowChat(text("chat"))
+        case "telegram_check_sender": return { [self] in try await telegramCheckSender() }
+        case "telegram_choose": return try telegramChoose(setting: text("setting"), value: text("value"))
+        case "telegram_voice_setup": return { [self] in try await telegramVoiceSetup() }
+        case "pairing_check_delivery": return try pairingCheckDelivery()
+        case "pairing_pair": return try pairingPair(text("id"))
+        case "pairing_rotate": return try pairingRotate()
+        case "pairing_use_here": return try pairingUseHere()
+        case "agent_refresh": return { [self] in try await agentsRefresh() }
+        case "agent_look": return { [self] in try await agentsLook() }
+        case "agent_ask_in_chat": return try agentAskInChat(agent: text("agent"), ask: text("ask"))
+        case "agent_send": return try await agentSend(agent: text("agent"), text: text("value"), session: text("session"), turn: turn)
+        case "agent_grok_paste": return try grokPaste(peer: text("agent"), turn: turn)
+        case "agent_grok_bot": return try grokBot(peer: text("agent"), name: text("value"))
+        case "capability_check_trust": return try CapabilitiesFace.checkTrust(self, id: text("id"))
+        case "connector_dry_run": return try CapabilitiesFace.connectorDryRun(self, id: text("id"))
+        case "native_dry_run", "native_run": return try CapabilitiesFace.nativeAction(self, id: text("id"), dryRun: verb == "native_dry_run")
+        case "improvement_run": return { [self] in try await CapabilitiesFace.runImprovement(self) }
+        case "browser_preview": return { [self] in try await CapabilitiesFace.previewBrowser(self) }
+        case "browser_cancel": return try CapabilitiesFace.cancelBrowser(self, id: text("id"))
+        case "tools_refresh": return { [self] in try await CapabilitiesFace.refreshTools(self) }
+        case "sense_switch": return try await CapabilitiesFace.switchSense(id: text("sense_id"), version: version, on: input["value"]?.boolValue,
+            byPerson: AppToolExecutor.personDecided(tool: "connections", input: input, turn: turn))
+        case "sense_share": return try await CapabilitiesFace.shareSense(self, id: text("sense_id"), version: version)
+        case "ability_keep": return try CapabilitiesFace.keepAbility(self, id: text("id"), version: input["version"]?.stringValue)
+        case "ability_off": return try CapabilitiesFace.switchOffAbility(self, id: text("id"))
+        case "skill_build": return try CapabilitiesFace.buildSkill(self)
+        default: return nil
+        }
+    }
+
+    /// A host verb's lookup that threw before its effect ran: the one refusal shape (`ChatToolOutcome.refusedBeforeRunning`), in the
+    /// owner's own code and words, for its run and the gate's check alike.
+    public static func prepareRefusal(_ error: Error, verb: String) -> JSONValue {
+        ChatToolOutcome.refusedBeforeRunning(owner: (error as? QuietArgumentRefusal)?.json ?? connectionsFailure(error, verb: verb))
+    }
+
+    /// A `connections` verb's failure as its answer: the owner's own code and words.
+    static func connectionsFailure(_ error: Error, verb: String) -> JSONValue {
+        switch error {
+        case let error as ToolFailureError: ChatToolOutcome.failure(error: error, tool: "connections")
+        case let error as PartCallError: .object(["status": .string("failed"), "reason": .string(error.code), "detail": .string(error.message)])
+        default: .object(["status": .string("failed"), "reason": .string("\(verb)_failed"), "detail": .string(error.localizedDescription)])
         }
     }
 

@@ -221,8 +221,8 @@ extension SwiftToolDispatcher {
         let file = studio.url(ref, chosen)
         let type = file.pathExtension.lowercased()
         // The same words the Desk page uses for what a piece is.
-        let kind = MakeStudio.textTypes.contains(type) ? "document" : MakeStudio.webTypes.contains(type) ? "page"
-            : MakeStudio.imageTypes.contains(type) ? "picture" : "file"
+        let kind = BoardDocument.isBoard(type: type) ? "board" : MakeStudio.textTypes.contains(type) ? "document"
+            : MakeStudio.webTypes.contains(type) ? "page" : MakeStudio.imageTypes.contains(type) ? "picture" : "file"
         guard let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
             throw ToolFailureError("\(ref) version \(chosen.n) has no readable size.", effects: .none, code: "piece_unreadable")
         }
@@ -230,7 +230,7 @@ extension SwiftToolDispatcher {
             "make_ref": .string(ref), "title": .string(title), "kind": .string(kind), "type": .string(type),
             "version": .int(Int64(chosen.n)), "newest_version": .int(Int64(newest.n)), "size": .int(Int64(size)),
             "created": .string(chosen.created)])]
-        guard kind == "document" || kind == "page" else {
+        guard kind == "document" || kind == "page" || kind == "board" else {
             result["detail"] = .string("A \(kind) reads as its facts here; its bytes stay on the Mac.")
             return .object(result)
         }

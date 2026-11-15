@@ -82,8 +82,17 @@ extension AppToolExecutor {
     @MainActor
     func doorDo(_ id: String, resolved: (action: AppAction, discovery: [String: JSONValue])?, input: [String: JSONValue], surface: String,
         inProcess: Bool, turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+        // Who decided the call is on every receipt the door returns, a read's and a refusal's too: the person when their own act is this exact
+        // call, else the agent.
+        func stamped(_ result: JSONValue) -> JSONValue {
+            guard case .object(var fields) = result, fields["decided_by"] == nil else { return result }
+            let decided = PermissionLaw.personDecided(tool: "app", input: ["action": .string(id), "args": input["args"] ?? .object([:])], turn: turn)
+            fields["decided_by"] = .string(decided ? "person" : "agent")
+            return .object(fields)
+        }
         guard let resolved else {
-            return try await doorDoBound(id, resolved: nil, input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
+            return stamped(try await doorDoBound(id, resolved: nil, input: input, surface: surface, inProcess: inProcess, turn: turn,
+                execution: execution))
         }
         let binding = AppActions.boundArguments(resolved.action, input["args"]?.objectValue ?? [:], schema: resolved.discovery["args_schema"])
         var input = input
@@ -106,7 +115,7 @@ extension AppToolExecutor {
             "status": .string(ChatToolOutcome.statusWord(advised, verdict: reply.outcome)),
             "execution": .string(reply.outcome == .succeeded ? "executed" : "attempted")]
         if !binding.understood.isEmpty { receipt["understood"] = .string(binding.understood.joined(separator: "; ")) }
-        return .object(receipt)
+        return stamped(.object(receipt))
     }
 
     @MainActor
@@ -240,8 +249,10 @@ extension AppToolExecutor {
         // at any posture, and the agent's call of it becomes their card or names where they do it.
         let decided = PermissionLaw.personDecided(tool: "app", input: ["action": .string(action.id), "args": input["args"] ?? .object([:])],
             turn: turn)
-        // A preview of a lever a card can carry is the gate's own check before it asks the person: it reads on, and the card decides.
-        if let lever = action.lever, lever.holds(input["args"]?.objectValue ?? [:]), !decided, !(lever.asks && input["preview"] == .bool(true)) {
+        // A lever's preview is the gate's own check: it reads on to the owner's checks of what the call names, so a call that cannot run is
+        // refused in its owner's words first; one that can is the card's to decide, or the person's own to do (below, after the checks).
+        let ownersOnly = action.lever.map { $0.holds(input["args"]?.objectValue ?? [:]) && !decided && !$0.asks } ?? false
+        if let lever = action.lever, lever.holds(input["args"]?.objectValue ?? [:]), !decided, input["preview"] != .bool(true) {
             let why = lever.why
             receipt["owner"] = .string("person")
             receipt["why"] = .string(why)
@@ -261,13 +272,6 @@ extension AppToolExecutor {
                 receipt["alternatives"] = .array([alternative("To stop Telegram without removing its token, turn it off.", "setting.set",
                     ["setting": .string("telegram.enabled"), "value": .bool(false)])])
             default: break
-            }
-            if input["preview"] == .bool(true) {
-                receipt["status"] = .string("preview")
-                receipt["would_refuse"] = .string("owners_call")
-                receipt["checks_not_run"] = .array([.string("Target, policy preflight and execution checks: this action belongs to the owner.")])
-                receipt["detail"] = .string("Would refuse: that's the owner's, \(why). Nothing was done.")
-                return .object(receipt)
             }
             let named = lever.name.isEmpty ? action.id : "\(lever.name) (\(action.id))"
             if lever.asks {
@@ -381,6 +385,15 @@ extension AppToolExecutor {
                 refusal = Self.advisedRefusal(Self.foldedResult(ChatToolOutcome.normalizedFailure(refused, tool: action.tool),
                     guide: nil, tool: action.tool), action: action, args: args, root: root)
             }
+            // The owner's checks held for a lever no card can carry: it is the person's own to do.
+            if refusal == nil, ownersOnly, let why = action.lever?.why {
+                receipt["owner"] = .string("person")
+                receipt["why"] = .string(why)
+                receipt["remedy"] = ownerRemedy
+                receipt["would_refuse"] = .string("owners_call")
+                receipt["detail"] = .string("Would refuse: that's the owner's, \(why). Nothing was done.")
+                return .object(receipt)
+            }
             guard case .object(let refused)? = refusal, refused["status"] != .string("would") else {
                 receipt["would_card"] = .bool(try await doorWouldCard(action, call: call, input: input, surface: surface, turn: turn, execution: execution))
                 receipt["detail"] = .string("""
@@ -406,8 +419,9 @@ extension AppToolExecutor {
                 return .object(receipt)
             }
             receipt["would_refuse"] = .string(code)
-            for (key, value) in refused where key.hasPrefix("would_") || ["versions", "tools", "argument_path", "backups", "remedy", "try_instead"].contains(
-                key) { receipt[key] = value }
+            // The owner's refusal keeps what it says is accepted (the targets, ids or accounts there are), so the next call can pick one.
+            for (key, value) in refused where key.hasPrefix("would_") || ["versions", "tools", "argument_path", "backups", "remedy", "try_instead",
+                "accepted", "ids", "providers"].contains(key) { receipt[key] = value }
             if glass || Self.doorFloorReasons.contains(code) {
                 receipt["owner"] = .string("person")
                 receipt["why"] = .string(why)
@@ -506,7 +520,10 @@ extension AppToolExecutor {
             let seen = Set(notesBefore.map(\.id))
             raised = .array(notesAfter.filter { !seen.contains($0.id) }.map { .string("\($0.id): \($0.title)") })
         }
-        if watch { receipt["side_effects"] = .object([
+        // A call refused before it ran keeps its own receipt (nothing raised, nothing delivered), for reads too.
+        if case .object(let fields) = result, fields["execution"] == .string("not_run"), let own = fields["side_effects"] {
+            receipt["side_effects"] = own
+        } else if watch { receipt["side_effects"] = .object([
             // Cards and approvals the app filed during the call land here too.
             "notes_raised": raised,
             "knocks_delivered": Self.knocksDelivered(before: knocksBefore, after: knocksAfter),
@@ -514,11 +531,7 @@ extension AppToolExecutor {
                 + "result.continuation), and anything the app does after this call returns."),
         ]) }
         if returnsVersion { receipt = await attachPageVersion(to: receipt, scope: scope, surface: surface, turn: turn, execution: execution) }
-        // Who decided this call: the person when their own act is this exact call, else the agent.
-        if watch {
-            let decided = PermissionLaw.personDecided(tool: "app", input: ["action": .string(action.id), "args": .object(args)], turn: turn)
-            receipt["decided_by"] = .string(decided ? "person" : "agent")
-        }
+
         return .object(receipt)
     }
 

@@ -109,7 +109,7 @@ extension InlineInteractionResolver {
             let secrets = values.values.map { Data($0.utf8) } + (value.map { [Data($0.utf8)] } ?? [])
             await completeControl(interaction.id, sessionID: sessionID, expectedRevision: interaction.revision, selection: selection,
                 scope: nil, setupError: error.map { FaceSecretRedaction.text($0, secrets: secrets) },
-                note: note.map { FaceSecretRedaction.text($0, secrets: secrets) }, dataRoot: dataRoot)
+                note: note.map { FaceSecretRedaction.text($0, secrets: secrets) }, door: "mac", dataRoot: dataRoot)
             await refresh()
         }
         func finishEffect() async {
@@ -183,7 +183,7 @@ extension InlineInteractionResolver {
                 try await present(.providerGroupModel)
             } else if let picked = choice, !picked.isEmpty {
                 await completeModelChoice(interaction, picked: picked,
-                    sessionID: sessionID, controls: controls, dataRoot: dataRoot)
+                    sessionID: sessionID, door: "mac", controls: controls, dataRoot: dataRoot)
                 await refresh()
             } else {
                 try await present(.providerGroupModel)
@@ -216,8 +216,11 @@ extension InlineInteractionResolver {
         }
     }
 
-    public static func settleOrReopen(_ id: String, sessionID: String, expectedRevision: Int, dataRoot: URL) async {
-        guard !(await completeIfVerified(id: id, sessionID: sessionID, expectedRevision: expectedRevision, dataRoot: dataRoot)) else { return }
+    /// Back from a control left unfinished: the card settles if its owner verifies it, else goes back to pending so it can be answered again.
+    public static func settleOrReopen(_ id: String, sessionID: String, expectedRevision: Int, selection: String? = nil,
+                                      scope: InlineInteraction.Scope? = nil, dataRoot: URL) async {
+        guard !(await completeIfVerified(id: id, sessionID: sessionID, expectedRevision: expectedRevision,
+                                         selection: selection, scope: scope, dataRoot: dataRoot)) else { return }
         do {
             if let current = try await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
                current.revision == expectedRevision, case .running = current.state {
@@ -347,27 +350,28 @@ extension InlineInteractionResolver {
     /// Every door begins on the card revision and settles from the Mac control's actual save outcome.
     public static func answerModelChoice(
         _ card: InlineInteraction, sessionID: String, picked: String, scope: InlineInteraction.Scope?,
-        attribution: String? = nil, controls: @MainActor () -> (any InlineInteractionControlPort)?, dataRoot: URL
+        attribution: String? = nil, door: String? = nil, controls: @MainActor () -> (any InlineInteractionControlPort)?, dataRoot: URL
     ) async throws -> InlineInteraction {
         let running = try await begin(id: card.id, sessionID: sessionID, expectedRevision: card.revision, dataRoot: dataRoot)
         return try await settleModelChoice(card, sessionID: sessionID, picked: picked, scope: scope,
-            expectedRevision: running.revision, attribution: attribution, controls: controls(), dataRoot: dataRoot)
+            expectedRevision: running.revision, attribution: attribution, door: door, controls: controls(), dataRoot: dataRoot)
     }
 
     /// The Mac card's control already began the card.
     public static func completeModelChoice(
-        _ interaction: InlineInteraction, picked: String, sessionID: String,
+        _ interaction: InlineInteraction, picked: String, sessionID: String, door: String? = nil,
         controls: any InlineInteractionControlPort, dataRoot: URL
     ) async {
         do {
             _ = try await settleModelChoice(interaction, sessionID: sessionID, picked: picked,
-                scope: interaction.primaryScope ?? .persistent, expectedRevision: interaction.revision, controls: controls, dataRoot: dataRoot)
+                scope: interaction.primaryScope ?? .persistent, expectedRevision: interaction.revision, door: door, controls: controls,
+                dataRoot: dataRoot)
         } catch { recordControlFailure(interaction.id, dataRoot: dataRoot, error: error) }
     }
 
     private static func settleModelChoice(
         _ card: InlineInteraction, sessionID: String, picked: String, scope: InlineInteraction.Scope?,
-        expectedRevision: Int? = nil, attribution: String? = nil,
+        expectedRevision: Int? = nil, attribution: String? = nil, door: String? = nil,
         controls: (any InlineInteractionControlPort)?, dataRoot: URL
     ) async throws -> InlineInteraction {
         let current = try await require(id: card.id, sessionID: sessionID, dataRoot: dataRoot)
@@ -383,7 +387,7 @@ extension InlineInteractionResolver {
             } catch { setupError = error.localizedDescription }
         }
         return try await complete(id: card.id, sessionID: sessionID, selection: picked, scope: scope,
-            expectedRevision: expectedRevision, attribution: attribution, setupError: setupError, turn: nil, dataRoot: dataRoot)
+            expectedRevision: expectedRevision, attribution: attribution, setupError: setupError, door: door, turn: nil, dataRoot: dataRoot)
     }
 
     public static func settleVerifiedControls(
@@ -401,11 +405,11 @@ extension InlineInteractionResolver {
     /// Complete against the session captured at the tap; a control can outlive a conversation switch, and a refusal must not disappear into UI refresh.
     public static func completeControl(
         _ id: String, sessionID: String, expectedRevision: Int, selection: String?, scope: InlineInteraction.Scope?,
-        setupError: String?, note: String?, dataRoot: URL
+        setupError: String?, note: String?, door: String? = nil, dataRoot: URL
     ) async {
         do {
-            _ = try await complete(id: id, sessionID: sessionID, selection: selection,
-                scope: scope, expectedRevision: expectedRevision, setupError: setupError, note: note, turn: nil, dataRoot: dataRoot)
+            _ = try await complete(id: id, sessionID: sessionID, selection: selection, scope: scope, expectedRevision: expectedRevision,
+                setupError: setupError, note: note, door: door, turn: nil, dataRoot: dataRoot)
         } catch {
             recordControlFailure(id, dataRoot: dataRoot, error: error)
         }

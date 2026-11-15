@@ -272,68 +272,97 @@ extension NativeAgentEngine {
     /// `provider.choose`: one group's model (an account and model as the page's option id), thinking, Fast or Same as Chat, through the
     /// group transaction. Choosing a model uses its declared thinking default and turns Fast off.
     @MainActor
-    func chooseProviderFace(group id: String, setting field: String, value: JSONValue?) async throws -> String? {
+    func chooseProviderFace(group id: String, setting field: String, value: JSONValue?) async throws -> HostVerbEffect {
         try await providersVerb { settings in
-            guard let group = ProviderSurfaceGroups.all.first(where: { $0.id == id }) else {
-                throw PartCallError(code: "provider_setting_unavailable", message: "This setting is no longer on Providers.")
+            let save = try providersFaceChoice(group: id, field: field, value: value, settings: settings)
+            return {
+                try await save()
+                return nil
             }
-            try await setProvidersFace(group: group, field: field, value: value, settings: settings)
-            return nil
         }
     }
 
     /// The person's own request opens protected entry directly; it needs neither a conversation nor a new ask.
     @MainActor
     public func signInProviderFace(_ provider: String, renderer: UUID? = nil) async throws -> String? {
+        try await providerSignIn(provider, renderer: renderer)()
+    }
+
+    /// `provider.sign_in`: the account listed in the settings read now, one with a sign-in, and the Mac that opens its protected entry (the
+    /// lookups); the entry opening (the effect).
+    @MainActor
+    func providerSignIn(_ provider: String, renderer: UUID?) async throws -> HostVerbEffect {
         try await providersVerb { settings in
             guard let account = settings.providers.first(where: { $0.provider_id == provider }) else {
-                throw PartCallError(code: "provider_row_unavailable", message: "That account is no longer listed. Read Providers again.")
+                // An id that is not listed is named, with the ids there are.
+                let ids = settings.providers.map(\.provider_id)
+                let named = provider.isEmpty ? "Pass provider" : "No account called \(provider) is listed"
+                throw PartCallError(code: "provider_row_unavailable", message: named
+                    + (ids.isEmpty ? "; no account is listed. Read Providers again." : ". The accounts listed are: \(ids.joined(separator: ", "))."))
             }
             guard account.auth_modes.contains("api_key") || account.auth_modes.contains("oauth") else {
                 throw PartCallError(code: "provider_sign_in_unavailable", message: "Read Providers again for this account's current actions.")
             }
+            let opened = "Opened protected entry for \(account.display_name) on the Mac. The connection is ready only after verification."
             if let renderer {
-                let reply = try await faceActs.call(.showProviderSetup(provider: provider, operation: UUID()), renderer: renderer)
-                switch reply {
-                case .acknowledged: break
-                case .failed(let issue), .refused(let issue): throw issue
-                case .cancelled: throw CancellationError()
-                default: throw FaceWireError.invalidFeedOrder
+                return { [self] in
+                    let reply = try await faceActs.call(.showProviderSetup(provider: provider, operation: UUID()), renderer: renderer)
+                    switch reply {
+                    case .acknowledged: break
+                    case .failed(let issue), .refused(let issue): throw issue
+                    case .cancelled: throw CancellationError()
+                    default: throw FaceWireError.invalidFeedOrder
+                    }
+                    return opened
                 }
-            } else {
-                guard let show = ports.connectorStatus.showProviderSetup else {
-                    throw PartCallError(code: "mac_required", message: "Open this account's protected entry on the Mac.")
-                }
-                try await show(account, dataRoot)
             }
-            return "Opened protected entry for \(account.display_name) on the Mac. The connection is ready only after verification."
+            guard let show = ports.connectorStatus.showProviderSetup else {
+                throw PartCallError(code: "mac_required", message: "Open this account's protected entry on the Mac.")
+            }
+            return { [self] in
+                try await show(account, dataRoot)
+                return opened
+            }
         }
     }
 
     /// `provider.codex_session`: the person's answer to the Codex CLI sign-in found on this Mac (use, ignore, or back up and reset an
     /// unreadable consent).
     @MainActor
-    func answerCodexSession(_ answer: String) async throws -> String? {
-        try await providersVerb { settings in try await actProvidersCLIOffer(answer, settings: settings) }
+    func answerCodexSession(_ answer: String) async throws -> HostVerbEffect {
+        try await providersVerb { settings in try codexOfferAction(answer, settings: settings) }
     }
 
-    /// Every Providers verb reads the checked settings first; its failure is the owner's words, and any other error is redacted.
+    /// Every Providers verb reads the checked settings first, then its own lookups; a failure there or in its effect is the owner's words,
+    /// and any other error is redacted.
     @MainActor
-    private func providersVerb(_ body: (ProviderSettingsSnapshot) async throws -> String?) async throws -> String? {
+    private func providersVerb(_ body: (ProviderSettingsSnapshot) async throws -> HostVerbEffect) async throws -> HostVerbEffect {
+        let effect: HostVerbEffect
         do {
             guard providers.settingsError == nil, let settings = providers.settings else {
                 throw PartCallError(code: "providers_unavailable",
                     message: providers.settingsError ?? "Providers have not been read. Refresh Models before changing a choice.")
             }
-            return try await body(settings)
+            effect = try await body(settings)
+        } catch { throw Self.providersFailure(error) }
+        return {
+            do { return try await effect() } catch { throw Self.providersFailure(error) }
         }
-        catch let error as PartCallError { throw error }
-        catch { throw PartCallError(code: "provider_action_failed", message: NativeAppSecretRedactor.redactText(error.localizedDescription)) }
     }
 
+    private static func providersFailure(_ error: Error) -> Error {
+        if error is PartCallError { return error }
+        return PartCallError(code: "provider_action_failed", message: NativeAppSecretRedactor.redactText(error.localizedDescription))
+    }
+
+    /// What `provider.choose` names, checked against the settings read now (the group, the setting and its value), and the save it makes:
+    /// every check comes before the save, so the gate's check before any card and the run make the same ones.
     @MainActor
-    private func setProvidersFace(group: ProviderSurfaceGroup, field: String, value: JSONValue?,
-                                  settings: ProviderSettingsSnapshot) async throws {
+    private func providersFaceChoice(group id: String, field: String, value: JSONValue?,
+                                     settings: ProviderSettingsSnapshot) throws -> @MainActor () async throws -> Void {
+        guard let group = ProviderSurfaceGroups.all.first(where: { $0.id == id }) else {
+            throw PartCallError(code: "provider_setting_unavailable", message: "This setting is no longer on Providers.")
+        }
         guard let value, value != .null else {
             throw PartCallError(code: "provider_value_missing", message: "Choose a value before saving this setting.")
         }
@@ -356,8 +385,10 @@ extension NativeAgentEngine {
                     message: "\(model.name)'s thinking default is unavailable. Refresh Models before choosing it.")
             }
             let effort = account.provider_id == "openrouter" && model.supportedReasoningEfforts.isEmpty ? "default" : model.defaultReasoningEffort
-            _ = try await saveProviderGroupSelection(group: group, providerID: account.provider_id, model: model.id,
-                                                     reasoningEffort: effort, serviceTier: "default")
+            return { [self] in
+                _ = try await saveProviderGroupSelection(group: group, providerID: account.provider_id, model: model.id,
+                                                         reasoningEffort: effort, serviceTier: "default")
+            }
         case "thinking":
             let selections = providers.faceSelections(settings)
             let lead = ProvidersFacade.leadSurface(group, selections: selections)
@@ -366,7 +397,7 @@ extension NativeAgentEngine {
                   model.reasoningCapabilitiesKnown, model.supportedReasoningEfforts.contains(effort) else {
                 throw PartCallError(code: "provider_thinking_unavailable", message: "That thinking level is no longer offered. Read Providers again.")
             }
-            _ = try await saveProviderGroupSelection(group: group, reasoningEffort: effort)
+            return { [self] in _ = try await saveProviderGroupSelection(group: group, reasoningEffort: effort) }
         case "fast":
             let on = try providersFaceToggle(value)
             let selections = providers.faceSelections(settings)
@@ -376,17 +407,18 @@ extension NativeAgentEngine {
                     .first(where: { $0.id == pick.model })?.supportsFast == true else {
                 throw PartCallError(code: "provider_fast_unavailable", message: "This account and model do not offer Fast. Read Providers again.")
             }
-            _ = try await saveProviderGroupSelection(group: group, serviceTier: on ? "priority" : "default")
+            return { [self] in _ = try await saveProviderGroupSelection(group: group, serviceTier: on ? "priority" : "default") }
         case "use_chat":
             guard group.id != ProviderSurfaceGroups.chat.id else {
                 throw PartCallError(code: "provider_chat_root", message: "Chat is the root choice and cannot follow itself.")
             }
             if try providersFaceToggle(value) {
-                _ = try await saveProviderGroupSelection(group: group, clearOverride: true)
-            } else {
-                guard let chat = providers.faceSelections(settings)["chat"], settings.routing.unusablePicks["chat"] == nil else {
-                    throw PartCallError(code: "provider_chat_unavailable", message: "Choose a usable Chat model before pinning it to this group.")
-                }
+                return { [self] in _ = try await saveProviderGroupSelection(group: group, clearOverride: true) }
+            }
+            guard let chat = providers.faceSelections(settings)["chat"], settings.routing.unusablePicks["chat"] == nil else {
+                throw PartCallError(code: "provider_chat_unavailable", message: "Choose a usable Chat model before pinning it to this group.")
+            }
+            return { [self] in
                 _ = try await saveProviderGroupSelection(group: group, providerID: chat.provider, model: chat.model,
                     reasoningEffort: chat.reasoningEffort, serviceTier: chat.fast ? "priority" : "default")
             }
@@ -399,29 +431,39 @@ extension NativeAgentEngine {
         return on
     }
 
+    /// The offer read now and the answer it takes (every check comes before the action), and the action itself: the gate's check before any
+    /// card and the run make the same ones.
     @MainActor
-    private func actProvidersCLIOffer(_ answer: String, settings: ProviderSettingsSnapshot) async throws -> String {
+    private func codexOfferAction(_ answer: String, settings: ProviderSettingsSnapshot) throws -> HostVerbEffect {
         guard let offer = settings.codexCLISessionOffer else {
             throw PartCallError(code: "codex_offer_unavailable", message: "No Codex CLI sign-in offer is available. Read Providers again.")
         }
         switch (offer, answer) {
         case (.available, "use"):
-            var failure: String?
-            let saved = await providers.acceptCodexCLISession { error, _ in failure = error.localizedDescription }
-            guard saved else { throw PartCallError(code: "codex_consent_failed", message: "The consent decision could not be saved. Check the data folder.") }
-            if let failure { throw PartCallError(code: "codex_adoption_failed", message: failure) }
-            _ = await providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
-            return "Codex CLI session consent saved. Accounts shows its checked connection state."
-        case (.available(_, false), "ignore"):
-            guard await NativeOAuthFlow.recordCodexCLISessionDecision(allow: false, source: "providers_offer", dataRoot: dataRoot) else {
-                throw PartCallError(code: "codex_consent_failed", message: "The consent decision could not be saved. Check the data folder.")
+            return { [self] in
+                var failure: String?
+                let saved = await providers.acceptCodexCLISession { error, _ in failure = error.localizedDescription }
+                guard saved else {
+                    throw PartCallError(code: "codex_consent_failed", message: "The consent decision could not be saved. Check the data folder.")
+                }
+                if let failure { throw PartCallError(code: "codex_adoption_failed", message: failure) }
+                _ = await providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
+                return "Codex CLI session consent saved. Accounts shows its checked connection state."
             }
-            _ = await providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
-            return "Codex CLI sign-in offer ignored."
+        case (.available(_, false), "ignore"):
+            return { [self] in
+                guard await NativeOAuthFlow.recordCodexCLISessionDecision(allow: false, source: "providers_offer", dataRoot: dataRoot) else {
+                    throw PartCallError(code: "codex_consent_failed", message: "The consent decision could not be saved. Check the data folder.")
+                }
+                _ = await providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
+                return "Codex CLI sign-in offer ignored."
+            }
         case (.unavailable, "repair"):
-            let backup = try await NativeOAuthFlow.repairCodexCLISessionConsent(dataRoot: dataRoot)
-            _ = await providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
-            return "Unreadable consent backed up as \(backup.lastPathComponent). Choose Use it or Ignore again."
+            return { [self] in
+                let backup = try await NativeOAuthFlow.repairCodexCLISessionConsent(dataRoot: dataRoot)
+                _ = await providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
+                return "Unreadable consent backed up as \(backup.lastPathComponent). Choose Use it or Ignore again."
+            }
         default: throw PartCallError(code: "codex_action_unavailable", message: "Read Providers again for this offer's current actions.")
         }
     }

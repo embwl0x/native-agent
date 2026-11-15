@@ -170,6 +170,8 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
     public let frame: MacAXFrame?
     /// Optional window attributes that failed, distinct from unsupported/absent values.
     public let attributeGaps: [String]
+    /// The document AX names for this window when it was read (AXDocument, else AXFilename), or nil where AX gives none or the read had a gap.
+    package var document: String? = nil
     #if canImport(ApplicationServices) && os(macOS)
     package var nativeWindow: MacAXNativeWindowIdentity?
     package func retaining(_ window: AXUIElement) -> Self {
@@ -177,11 +179,26 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
         identity.nativeWindow = MacAXNativeWindowIdentity(element: window)
         return identity
     }
+    /// AX no longer answers for this exact window: it closed, or its app replaced it. Nil when no window of its own was kept.
+    package var closed: Bool? {
+        guard let element = nativeWindow?.element else { return nil }
+        var role: CFTypeRef?
+        return MacAXExecutionLane.sync { AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) } == .invalidUIElement
+    }
     #endif
-    func retainingWindow(_ ref: MacAXElementRef, in source: any MacAXElementSource) -> Self {
+    /// Keep the read window itself and the document it shows, so a later step can tell this exact window from any other.
+    func retainingWindow(_ ref: MacAXElementRef, in source: any MacAXElementSource, context: MacOperationContext) -> Self {
         #if canImport(ApplicationServices) && os(macOS)
         if let source = source as? SystemMacAXElementSource, let window = source.element(ref) {
-            return retaining(window)
+            var identity = retaining(window)
+            // An optional attribute: a gap leaves the document unrecorded and never fails the enclosing read.
+            identity.document = MacAXExecutionLane.sync { () -> String? in
+                for attribute in [kAXDocumentAttribute, kAXFilenameAttribute] {
+                    if let name = try? MacAXAttributeRead.checkedText(window, attribute, context: context), !name.isEmpty { return name }
+                }
+                return nil
+            }
+            return identity
         }
         #endif
         return self

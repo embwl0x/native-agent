@@ -189,6 +189,10 @@ public enum MyQueue {
         public var card: String? { if case .afterCard(let id) = self { id } else { nil } }
     }
 
+    /// An after_card step its card's settle released to run on its own: the card had no continued turn to hand it to. A card that continues a
+    /// turn hands its steps to that turn instead (`AgentScreen.resume`), so a card answer never wakes a second turn.
+    public static let cardReleased = "card_released"
+
     /// When-free work is due this long after the agent's last turn.
     public static let freeAfter: TimeInterval = 30 * 60
 
@@ -286,7 +290,7 @@ public enum MyQueue {
         switch condition {
         case .nextTurn: return true
         case .ownTurn, .quiet: return context.ownTurn
-        case .afterCard(let id): return context.completedCards.contains(id)
+        case .afterCard: return entry.step.status == cardReleased
         case .at(let date): return context.now >= date
         case .every: return context.occurrence(entry.step, context.now) != nil
         case .userHere, .userAway:

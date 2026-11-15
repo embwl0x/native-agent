@@ -16,6 +16,7 @@ import ToolRegistry
 import Desk
 import TrustCenter
 import TurnTrace
+import AgentConversations
 // Blueprint: | `ChatOrchestration+ToolLoop.swift` | `TurnContext`; `withToolSchemas`; `finishReplyTurn`; `.completed` |
 
 // MARK: - Tool-dispatch loops
@@ -192,6 +193,11 @@ extension SwiftNativeTurnEngine {
          turn: turn, work: work)
         dispatches.append(contentsOf: iterationRecords)
         conversation.append(contentsOf: LocalToolImage.continuation(toolResultBlocks))
+        // A held send's answer in these results is now in the turn's input: that is its delivery.
+        if let root = remPinsDataRoot {
+            let held = iterationRecords.flatMap { HeldSends.answers(in: $0.result) }
+            if !held.isEmpty { await HeldSends.delivered(held, via: "tool", dataRoot: root) }
+        }
         if let toolBoundaryReason {
             TurnObservation.apply(.boundary(toolBoundaryReason), to: &conversation, surface: surface, turn: turn)
         }

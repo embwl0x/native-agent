@@ -152,14 +152,14 @@ extension NativeAgentEngine {
     @MainActor
     public static func prepareStateAtLaunch(
         dataRoot: URL, currentVersion: String, resources: URL?,
-        publicReleaseUnavailable: @MainActor @Sendable (String) -> Void,
-        backupRestoreUnavailable: @MainActor @Sendable (String) -> Void,
-        confirmMissingRoots: @MainActor @Sendable ([String]) -> Bool
+        publicReleaseUnavailable: @MainActor @Sendable (String) async -> Void,
+        backupRestoreUnavailable: @MainActor @Sendable (String) async -> Void,
+        confirmMissingRoots: @MainActor @Sendable ([String]) async -> Bool
     ) async -> Bool {
         if case .failed(let error) = await Task.detached(priority: .userInitiated, operation: {
             InstallPaths.preparePublicReleaseDataRootIfNeeded()
         }).value {
-            publicReleaseUnavailable(error)
+            await publicReleaseUnavailable(error)
             return false
         }
         do {
@@ -168,12 +168,12 @@ extension NativeAgentEngine {
             }.value
             for note in restored?.notCarried ?? [] { ModuleLog.app("[backup-restore] %@", note) }
         } catch {
-            backupRestoreUnavailable(error.localizedDescription)
+            await backupRestoreUnavailable(error.localizedDescription)
             return false
         }
         if !InstallPaths.isPublicReleaseBundle {
             let missing = await Task.detached { PersistenceCore.missingLaunchRoots(dataRoot: dataRoot) }.value
-            if !missing.isEmpty, !confirmMissingRoots(missing) { return false }
+            if !missing.isEmpty, !(await confirmMissingRoots(missing)) { return false }
         }
         do {
             let recovered = try await MacControlOperationStore(dataRoot: dataRoot).recoverInterruptedOperations()
@@ -667,6 +667,7 @@ extension NativeAgentEngine {
         if let quitSettlement { return quitSettlement }
         let task = Task.detached { () -> NativeCognitionSleepOutcome? in
             await producers.value
+            ModuleLog.app("[quit] drained producers")
             // Arm before the registry read so admitted producers’ final completions cannot race it.
             let events = EventDeadlinePhysiology.storeAndFileEvents(paths: [],
                 notifications: [ChatCancelFlag.inFlightDidChange])
@@ -678,9 +679,11 @@ extension NativeAgentEngine {
                     return nil
                 }
             }
-            await AdaptiveMemoryPromoter.shared.sleep()
+            ModuleLog.app("[quit] drained admitted turns")
+            await quitDrained("memory promoter") { await AdaptiveMemoryPromoter.shared.sleep() }
             let slept = await NativeAgentEngine.live.mind?.end() ?? .noMind
-            await retireBrowser()
+            ModuleLog.app("[quit] drained mind")
+            await quitDrained("browser") { await retireBrowser() }
             return slept
         }
         quitSettlement = task
@@ -705,55 +708,48 @@ extension NativeAgentEngine {
         AgentOpened.shared.shutdown()
         NativeAgentNotifications.shutdown()
         return Task.detached {
-            async let wakes: Void = EnginePartWake.shared.stop()
-            async let loops: Void = BackgroundLoopLifetimes.shared.shutdown()
-            for task in launch { await task.value }
-            await appLaunch?.value
-            await frontSense?.value
-            for observer in appObservers { await observer.value }
-            await otherDoors.value
-            await make.value
-            await activity.value
+            async let wakes: Void = quitDrained("part wake") { await EnginePartWake.shared.stop() }
+            async let loops: Void = quitDrained("background loops") { await BackgroundLoopLifetimes.shared.shutdown() }
+            await quitDrained("launch work (\(launch.count))") { for task in launch { await task.value } }
+            await quitDrained("app launch") { await appLaunch?.value }
+            await quitDrained("front sense") { await frontSense?.value }
+            await quitDrained("app observers (\(appObservers.count))") { for observer in appObservers { await observer.value } }
+            await quitDrained("other doors' turns") { await otherDoors.value }
+            await quitDrained("make") { await make.value }
+            await quitDrained("activity watch") { await activity.value }
             _ = await (wakes, loops)
         }
     }
 
-    @MainActor
-    public static func drainResidentWorkForTermination(
-        shutdownSenses: @escaping @Sendable () async -> Void,
-        retireBrowser: @escaping @MainActor @Sendable () -> Void
-    ) {
-        let settlement = quitSettlement ?? beginQuitSleep(
-            after: beginQuitProducerSettlement(appLaunch: nil),
-            runs: NativeAgentEngine.live.turns.inFlightRunIDs(), retireBrowser: retireBrowser)
-        let group = DispatchGroup()
+    /// Each piece quit waits on names itself when it is seen done, so a quit that never answers names the piece still running.
+    static func quitDrained(_ name: String, _ piece: () async -> Void) async {
+        await piece()
+        ModuleLog.app("[quit] drained %@", name)
+    }
+
+    /// The held quit retires resident dependencies after the sleep settled and before it answers the termination, so no clock bounds it:
+    /// each step ends when its own work is seen done (cancelled tasks joined, writes returned) or its processes are seen exited.
+    public static func retireResidentWork(after settlement: Task<NativeCognitionSleepOutcome?, Never>,
+                                          shutdownSenses: @escaping @Sendable () async -> Void) async {
+        // An unavailable barrier keeps dependencies until exit rather than retiring them under live turns.
+        guard await settlement.value != nil else {
+            ModuleLog.app("[quit] dependencies retained: admitted-turn observation unavailable")
+            return
+        }
         let attention = NativeAgentEngine.live.ports.backgroundWork.attention
-        group.enter()
-        Task.detached {
-            // Retire dependencies only after completed sleep; an unavailable barrier remains unfinished until exit.
-            guard await settlement.value != nil else {
-                ModuleLog.app("[quit] dependencies retained: admitted-turn observation unavailable")
-                group.leave()
-                return
-            }
-            async let chrome: Void = NativeAgentEngine.live.chrome.stop()
-            async let senses: Void = shutdownSenses()
-            async let programs: Void = OwnedProgramRunner.endResidents()
-            async let acp: Void = SwiftToolDispatcher.closeACPConnections()
-            async let context: Void = NativeAgentEngine.live.contextFlow.stop()
-            async let embeddings: Void = SwiftNativeMemoryV2.shared.shutdownEmbeddingConvergence()
-            async let promoter: Void = AdaptiveMemoryPromoter.shared.shutdown()
-            async let projections: Void = SwiftNativeMemoryV2.shared.shutdownProjections()
-            async let notifications: Void = attention.shutdown()
-            async let trace: Void = NativeAgentEngine.live.trace.stop()
-            _ = await (chrome, senses, programs, acp, context, embeddings, promoter, projections, notifications, trace)
-            // Retire inventory only after every producer, turn, sense and program has settled.
-            await MacAppIndex.shared.shutdown()
-            group.leave()
-        }
-        if group.wait(timeout: .now() + 3.0) == .timedOut {
-            ModuleLog.app("[quit] resident settlement unfinished at the 3 s termination bound")
-        }
+        async let chrome: Void = NativeAgentEngine.live.chrome.stop()
+        async let senses: Void = shutdownSenses()
+        async let programs: Void = OwnedProgramRunner.endResidents()
+        async let acp: Void = SwiftToolDispatcher.closeACPConnections()
+        async let context: Void = NativeAgentEngine.live.contextFlow.stop()
+        async let embeddings: Void = SwiftNativeMemoryV2.shared.shutdownEmbeddingConvergence()
+        async let promoter: Void = AdaptiveMemoryPromoter.shared.shutdown()
+        async let projections: Void = SwiftNativeMemoryV2.shared.shutdownProjections()
+        async let notifications: Void = attention.shutdown()
+        async let trace: Void = NativeAgentEngine.live.trace.stop()
+        _ = await (chrome, senses, programs, acp, context, embeddings, promoter, projections, notifications, trace)
+        // Retire inventory only after every producer, turn, sense and program has settled.
+        await MacAppIndex.shared.shutdown()
     }
 
     @MainActor

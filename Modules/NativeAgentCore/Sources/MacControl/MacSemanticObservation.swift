@@ -719,7 +719,7 @@ extension SwiftNativeMacControl {
             context.appCapture?.augment(bundleID: bundle,
                 fields: ["affordances": output["affordances"] ?? .array([])])
         }
-        if fourVerbs { context.capture?.percept = percept }
+        if fourVerbs { context.capture?.percept = percept; context.capture?.window = read.windowIdentity }
         guard let observedApp = read.app,
               accessibilitySource(context: context).appInfo(pid: observedApp.processIdentifier) == observedApp else {
             return (MacControlResult(ok: false, action: "look", output: .object([

@@ -187,6 +187,8 @@ public enum AppDoorNames {
         "phone senses": "pairing/phone-senses",
         "ongoing": "desk", "computer": "mac", "skill": "skills", "agent": "agents", "abilities": "tools", "ability": "tools",
         "bot": "bots", "helpers": "bots", "connector": "connectors",
+        // Trust and Connectors both show secrets; the name alone opens their home, Connectors' Kept secrets.
+        "secrets": "connectors/secrets",
         "skills & tools": "skills",
         "health": "status", "doctor": "diagnostics/doctor",
         // A page's own rows that open page:<page>/<row> lead to these places, as the window draws them.

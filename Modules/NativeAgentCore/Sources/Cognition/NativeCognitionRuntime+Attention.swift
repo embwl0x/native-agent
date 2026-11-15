@@ -1,3 +1,4 @@
+import AgentConversations
 import AuthoredCapabilities
 import ChatTurnRuntime
 import CognitiveSubstrate
@@ -102,6 +103,8 @@ extension NativeCognitionRuntime: AttentionIntake {
         owed += attention.openingHappenings.values.filter { !read.contains($0.id) }
         attention.openingHappenings.removeAll()
         attention.opened = true
+        // Held answers no turn has taken in are the agent's news: read from their records whenever attention opens or wakes.
+        HeldSends.publish(dataRoot: dataRoot)
         open(owed)
         await igniteReady(mode: "awake")
         await weighWaiting(mode: "awake")
@@ -204,7 +207,8 @@ extension NativeCognitionRuntime: AttentionIntake {
                 touch = .none
             } else {
                 touch = await substrate.careTouch(by: happening.words)
-                if case .touches(let touched, _, _, _) = touch { care = touched.id }
+                // A watch's news is about what the watch watches: the touch says what it is worth, and it gathers on its own subject.
+                if case .touches(let touched, _, _, _) = touch, !happening.watchNews { care = touched.id }
             }
             let felt: JSONValue
             let given: JSONValue
@@ -242,7 +246,8 @@ extension NativeCognitionRuntime: AttentionIntake {
                 break weighing
             case .worth(let worth, let said):
                 attentionSucceeded("weigh", subject: experience.id)
-                weighed.append((experience, happening, care, worth, felt, said))
+                // A watch's news is worth its own match, never less than the one that opens a thought: the agent set the watch to see it.
+                weighed.append((experience, happening, care, happening.watchNews ? max(worth, 1) : worth, felt, said))
             }
         }
         guard !weighed.isEmpty else { return }
@@ -455,6 +460,7 @@ extension NativeCognitionRuntime: AttentionIntake {
         catch { attentionFailed("wake", subject: "sleep", error: error); return }
         attentionSucceeded("wake", subject: "sleep")
         attention.asleep = false
+        HeldSends.publish(dataRoot: dataRoot)
         await igniteReady(mode: "waking")
         await weighWaiting(mode: "waking")
     }

@@ -220,6 +220,8 @@ extension MacFourVerbs {
         var obstructions: [MacAXFrame] = []
         /// The look this sighting was read from, so a pointer press is judged by the same evidence as an accessibility one.
         var percept: MacLookPercept? = nil
+        /// The exact window this sighting read (pid, its own AX window, its document), so a second look can stay inside it.
+        var window: MacAXWindowIdentity? = nil
     }
 
     /// A resolvable thing on the screen. `label` is the DISPLAY text — what the renderer printed — so anything redaction withheld cannot be named.

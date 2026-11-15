@@ -90,7 +90,7 @@ private struct TranscriptResolvedAttachmentView: View {
                     .textSelection(.enabled)
             }
             if case .card = reference, let card = attachment.secureCard {
-                ProtectedFaceEntry { CardChrome(card: card) }
+                CardChrome(card: card)
             }
             if case .trouble = reference {
                 HStack {

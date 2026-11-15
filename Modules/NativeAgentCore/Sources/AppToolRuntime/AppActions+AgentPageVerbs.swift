@@ -22,6 +22,13 @@ extension AppActions {
                           irreversible: true, tool: "upkeep", input: verb("desk_veto")),
                 AppAction("memories.search", "memories", "Search the Memories page (three letters or more; empty shows every memory)",
                           ["value"], tool: "upkeep", input: verb("memories_search"), read: true),
+                AppAction("memories.bring_back", "memories", """
+                    Bring an old memory store's memories back into the agent's memory, each through her own memory write with the root its recorded \
+                    provenance names: from is an archive .zip, an old data folder, or its memory/memory.sqlite
+                    """, ["from"], subject: ["from"],
+                          owner: .person("an old store is the agent's past self; bringing it back is the person's say",
+                                         name: "Bringing back my old memories"),
+                          capabilities: ["memory_write", "tool_call"], tool: "upkeep", input: verb("memories_bring_back")),
                 AppAction("memories.refresh", "memories", "Read the kept memories again", tool: "upkeep", input: verb("memories_refresh"),
                           read: true),
                 AppAction("graph.refresh", "memories", "Read the canonical graph again", tool: "upkeep", input: verb("graph_refresh"), read: true),

@@ -70,7 +70,8 @@ Its `self` kind gathers on subject `hour`; `yield` reads that thought class thro
 The seed gives it worth `2 * curiosity * min(1, (yield.hits + 1) / (yield.tries + 1))`, or zero without curiosity.
 Its ordinary thought carries `attended.hour`, the offered material, alongside its happenings and readings.
 [Subconscious: Attention](SUBCONSCIOUS.md#attention) owns the night policy. It returns a number, or an object whose `worth` is that number and whose other
-fields are recorded beside it in the `attention.weigh` detail. A program without `weigh` is never upgraded by launch: what it would weigh waits
+fields are recorded beside it in the `attention.weigh` detail. A watch's news (door `sense:<watch>`) lands
+at least one, whatever `weigh` returns, so it always opens its own thought. A program without `weigh` is never upgraded by launch: what it would weigh waits
 unweighed and one `body` happening per program digest tells the agent of the organ to grow, showing the seed's. A `weigh` that throws or returns
 no finite worth leaves the same wait and says so once per program; a helper that cannot run it leaves the wait and logs it. What waited is weighed
 after every thought settles, when admission opens and on waking.

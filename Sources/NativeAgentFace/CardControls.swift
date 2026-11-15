@@ -34,8 +34,9 @@ final class CardControls {
         return result
     }
 
+    /// A card whose connector sheet is still open has not been returned from; its owner verifies the sheet's own saves meanwhile.
     func pendingReturn(in session: String) -> [CardIdentity] {
-        awaitingReturn.values.filter { $0.session == session }.sorted { $0.card < $1.card }
+        awaitingReturn.values.filter { $0.session == session && connectorSheet?.id != $0.card }.sorted { $0.card < $1.card }
     }
 
     private func isAwaiting(_ identity: CardIdentity) -> Bool { awaitingReturn[identity.card] == identity }
@@ -50,9 +51,10 @@ final class CardControls {
         guard case .card(let result) = reply, result.identity == identity else {
             throw PartCallError(code: "card_unconfirmed", message: "The request's verification has no matching reply.")
         }
-        if let failure = result.failure { throw failure }
         if result.verified { closeVerifiedControl(identity) }
-        else if isAwaiting(identity), let control = result.controlIdentity { awaitingReturn[control.card] = control }
+        // Unverified with no control named: the card no longer runs one (back to pending, declined, failed), so the watch ends.
+        else if isAwaiting(identity) { awaitingReturn[identity.card] = result.controlIdentity }
+        if let failure = result.failure { throw failure }
     }
 
     func show(_ identity: CardIdentity, presentation: CardControlPresentation) throws {

@@ -238,13 +238,16 @@ public struct TurnFace: FaceValue {
     public let steps: [Step]
     public let preview: Preview?
     public let approvalStatus: String?
+    /// Where the running turn's attention is now: the face link of the place its last call that worked names (`page:desk/<handle>`,
+    /// `page:memories`). Nil between turns and before the turn has been anywhere; the window follows it (`WindowFollowsPreference`).
+    public let nowOn: String?
 
     public var isWorking: Bool { isBusy || isStreaming }
     public var isRunning: Bool { isWorking || isInFlight || phase.map { !$0.isTerminal } == true }
 
     public init(sessionID: String, turnID: String?, activeTurnID: String?, phase: TurnPresentationPhase?, isInFlight: Bool,
                 card: MacChatTurnCardModel?, hasReservation: Bool, isBusy: Bool, isStreaming: Bool, isReplying: Bool, isThinking: Bool,
-                liveLine: String?, workPill: String?, steps: [Step], preview: Preview?, approvalStatus: String?) {
+                liveLine: String?, workPill: String?, steps: [Step], preview: Preview?, approvalStatus: String?, nowOn: String? = nil) {
         self.sessionID = sessionID
         self.turnID = turnID
         self.activeTurnID = activeTurnID
@@ -261,6 +264,7 @@ public struct TurnFace: FaceValue {
         self.steps = steps
         self.preview = preview
         self.approvalStatus = approvalStatus
+        self.nowOn = nowOn
     }
 
     /// One step of the turn, one identity from its start to its end. Only her acts (calls) are steps; a wait is a state of the turn.
@@ -296,6 +300,11 @@ public struct TurnFace: FaceValue {
             self.updatedAt = updatedAt
         }
     }
+}
+
+/// "The window follows me": on (the default), the window shows where the running turn's attention is, unless the person has taken it.
+public enum WindowFollowsPreference {
+    public static let key = "NativeAgent.window.follows"
 }
 
 /// Membership and payload-free movement for views spanning conversations; room content stays in its own slot.

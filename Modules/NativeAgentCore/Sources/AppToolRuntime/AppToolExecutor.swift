@@ -767,9 +767,10 @@ public final class AppToolExecutor: ChatToolExecuting {
             return Self.failure(refusal.rawValue,
                 "mind.\(verb): \(refusal.spoken). It is done from inside your own conversation, in your own turn.")
         }
-        if action.tool == "upkeep" {
+        // A host verb's owner checks its own arguments, as its run does, before anything asks the person.
+        if ["upkeep", "connections", "provider"].contains(action.tool) {
             guard let host = quietHost() else { return Self.unattachedFailure() }
-            return await host.upkeepFence(verb: action.input["verb"]?.scalarText ?? "", input: input)
+            return await host.verbFence(tool: action.tool, verb: action.input["verb"]?.scalarText ?? "", input: input, turn: turn)
         }
         // Origin, steer and Trust decide who may restore an off switch; preview uses the real call's checks and reports its proposed state.
         if let lifecycle = action.lifecycle, lifecycle != .drop, lifecycle != .change {

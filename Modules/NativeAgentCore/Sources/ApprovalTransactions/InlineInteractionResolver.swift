@@ -1,3 +1,4 @@
+import AgentWorkspace
 import ApprovalInbox
 import AuthoredCapabilities
 import Experiences
@@ -305,7 +306,8 @@ public enum InlineInteractionResolver {
             return InlineInteraction?.none
         }
         guard let current, !Task.isCancelled else {
-            await invalidateContinuation(id: raised.id, sessionID: sessionID, dataRoot: dataRoot)
+            // The card stays answerable, so its continuation is stopped, not retired: an answer begins a fresh continue-turn.
+            await invalidateContinuation(id: raised.id, sessionID: sessionID, to: .stopped, dataRoot: dataRoot)
             return .object(["status": .string("failed"), "reason": .string("cancelled"),
                 "detail": .string("The turn stopped while waiting for the card.")])
         }
@@ -315,9 +317,15 @@ public enum InlineInteractionResolver {
                     "detail": .string("The blocked call could not resume; check its card before continuing.")])
         }
         await invalidateContinuation(id: raised.id, sessionID: sessionID, dataRoot: dataRoot)
+        // The waiting turn is this card's continuation: it takes the card's after_card steps.
+        let queued = await AgentScreen.resume(card: current.id, decision: current.state.outcome != nil ? "approved" : "declined",
+            completed: current.state.outcome != nil, handOff: true, dataRoot: dataRoot)
+        queued.sources.forEach { turn.peerSteering?.mark(peer: $0) }
+        queued.elevated.forEach { turn.peerSteering?.elevate(peer: $0) }
         guard case .object(var receipt) = receiptEnvelope(current) else { return receiptEnvelope(current) }
         if case .declined = current.state { receipt["reason"] = .string("declined"); receipt["effects"] = .string("none") }
         if let choice = current.state.outcome?.selection { receipt["answer"] = .string(choice) }
+        if !queued.text.isEmpty { receipt["queued_after_card"] = .string(queued.text) }
         return .object(receipt)
     }
     /// Permission-remedy asks use the same locked transcript filing boundary. A different conversation or access axis is a different ask.
@@ -348,6 +356,12 @@ public enum InlineInteractionResolver {
         turn: Turn,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> InlineInteraction? {
+        var interaction = interaction
+        if interaction.kind == .modelChoice, interaction.modelAtStart == nil {
+            // An unreadable routing snapshot keeps no baseline: a later return then settles on whatever model is saved, as before.
+            do { interaction.modelAtStart = try await selectionForReturn(interaction, dataRoot: dataRoot) ?? "" }
+            catch { nativeLog("[interaction] model baseline unavailable for \(interaction.id): \(error)") }
+        }
         let stamped: InlineInteraction
         var changed: Bool
         do {
@@ -397,13 +411,7 @@ public enum InlineInteractionResolver {
         try checkRevision(current, expectedRevision)
         if current.continuation?.state == .stopped {
             guard !byAgent else { throw ResolveError.alreadySettled("stopped") }
-            let previous = current.continuation
-            current.continuation = .init(mode: .continueTurn, resumeRunId: UUID().uuidString,
-                resumeText: previous?.resumeText, peerSources: previous?.peerSources,
-                elevatedPeerSources: previous?.elevatedPeerSources)
-            current.continuation?.originTurnId = previous?.originTurnId
-            current.continuation?.originRunId = previous?.originRunId
-            current.continuation?.lifeID = try await Task.detached { try DataRootLife.current(in: dataRoot) }.value
+            current = try await continuingStopped(current, dataRoot: dataRoot)
         }
         // Failed cards remain answerable; running controls refuse another tap to prevent duplicate mutations.
         switch current.state {
@@ -439,6 +447,7 @@ public enum InlineInteractionResolver {
         setupError: String? = nil,
         note: String? = nil,
         byAgent: Bool = false,
+        door: String? = nil,
         turn: Turn?,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> InlineInteraction {
@@ -463,11 +472,26 @@ public enum InlineInteractionResolver {
             verification = .success(outcome)
         }
         return try await finish(current, verification: verification, sessionID: sessionID,
-                                attribution: attribution, turn: turn, dataRoot: dataRoot)
+                                attribution: attribution, continuesStopped: !byAgent, door: door, turn: turn, dataRoot: dataRoot)
     }
+    /// A stopped continuation left its turn, not its card: answering the card begins a fresh continue-turn from the saved conversation.
+    static func continuingStopped(_ card: InlineInteraction, dataRoot: URL) async throws -> InlineInteraction {
+        guard card.continuation?.state == .stopped else { return card }
+        var card = card
+        let previous = card.continuation
+        card.continuation = .init(mode: .continueTurn, resumeRunId: UUID().uuidString,
+            resumeText: previous?.resumeText, peerSources: previous?.peerSources,
+            elevatedPeerSources: previous?.elevatedPeerSources)
+        card.continuation?.originTurnId = previous?.originTurnId
+        card.continuation?.originRunId = previous?.originRunId
+        card.continuation?.lifeID = try await Task.detached { try DataRootLife.current(in: dataRoot) }.value
+        return card
+    }
+    /// `continuesStopped`: a settle by any door continues a stopped turn as `begin` does; the agent's own answer does not, as `begin` refuses it.
+    /// `door` names the person's door that answered, when the caller knows it.
     static func finish(
         _ current: InlineInteraction, verification: Verification, sessionID: String,
-        attribution: String? = nil, turn: Turn?, dataRoot: URL
+        attribution: String? = nil, continuesStopped: Bool = true, door: String? = nil, turn: Turn?, dataRoot: URL
     ) async throws -> InlineInteraction {
         switch verification {
         case .failure(let reason):
@@ -486,10 +510,12 @@ public enum InlineInteractionResolver {
                     ? attribution
                     : "\(stamped.summary) \u{2014} \(attribution)"
             }
-            let settled = current.settled(stamped)
+            let settled = try await continuesStopped
+                ? continuingStopped(current.settled(stamped), dataRoot: dataRoot) : current.settled(stamped)
             try await persist(
                 settled, sessionID: sessionID, ifRevision: current.revision, dataRoot: dataRoot
             )
+            traceSettled(settled, sessionID: sessionID, by: continuesStopped ? door ?? "person" : "agent")
             try await settleMatter(settled.id, evidence: .init(source: Matter.messages(sessionID), id: settled.id), dataRoot: dataRoot)
             if [.permission, .capability].contains(settled.kind) {
                 for target in settled.allTargets {
@@ -504,6 +530,7 @@ public enum InlineInteractionResolver {
                 }
             }
             await resumeOnce(settled, sessionID: sessionID, dataRoot: dataRoot, turn: turn)
+            await releaseAfterCardWithoutContinuation(settled, dataRoot: dataRoot)
             return settled
         }
     }
@@ -515,6 +542,8 @@ public enum InlineInteractionResolver {
         sessionID: String,
         expectedRevision: Int? = nil,
         resume: Bool = true,
+        byAgent: Bool = false,
+        door: String? = nil,
         turn: Turn?,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> InlineInteraction {
@@ -528,9 +557,46 @@ public enum InlineInteractionResolver {
         try await persist(
             declined, sessionID: sessionID, ifRevision: current.revision, dataRoot: dataRoot
         )
+        traceSettled(declined, sessionID: sessionID, by: byAgent ? "agent" : door ?? "person")
         try await settleMatter(declined.id, evidence: nil, reason: resume ? .cancelled : .expired, dataRoot: dataRoot)
         if resume { await resumeOnce(declined, sessionID: sessionID, dataRoot: dataRoot, turn: turn) }
+        await releaseAfterCardWithoutContinuation(declined, dataRoot: dataRoot)
         return declined
+    }
+
+    /// A settled card with no turn to continue (non-blocking, or its continuation retired) releases its after_card steps to MY QUEUE, or drops
+    /// them when it was declined. A card that continues a turn leaves them to that turn (`continueRequest`, or its waiting host).
+    private static func releaseAfterCardWithoutContinuation(_ card: InlineInteraction, dataRoot: URL) async {
+        guard card.continuation?.state != .waiting else { return }
+        _ = await AgentScreen.resume(card: card.id, decision: card.state.outcome != nil ? "approved" : "declined",
+            completed: card.state.outcome != nil, handOff: false, dataRoot: dataRoot)
+    }
+
+    /// A card's settlement is that card's receipt: written through the trace bus under the receipt id of each call that raised it (its birth
+    /// and every re-ask), so `trace.recent` with that receipt id (where an expired result handle points) returns what was answered, by whom
+    /// (the door, or the agent) and when, newest first above the call's waiting row. Its own card id reads it as well.
+    private static func traceSettled(_ card: InlineInteraction, sessionID: String, by: String) {
+        // The card's own id reads it too: the agent holds the card id even when it never held the raising call's receipt.
+        let ids = [card.id] + (card.receiptIDs ?? []).filter { !$0.isEmpty && $0 != card.id }
+        for receipt in ids { traceSettled(card, receipt: receipt, sessionID: sessionID, by: by) }
+    }
+
+    private static func traceSettled(_ card: InlineInteraction, receipt: String, sessionID: String, by: String) {
+        let at = card.settledAt ?? Date()
+        var answered: [String: JSONValue] = ["interaction_id": .string(card.id), "state": .string(card.state.name),
+            "by": .string(by), "at": .string(NativeTimestampFormat.plainZulu(at))]
+        if let outcome = card.state.outcome {
+            answered["answer"] = outcome.selection.map(JSONValue.string)
+            answered["label"] = card.options.first { $0.id == outcome.selection }.map { JSONValue.string($0.label) }
+            answered["summary"] = .string(outcome.summary)
+        }
+        answered["origin_turn_id"] = card.continuation?.originTurnId.map(JSONValue.string)
+        let row: [String: JSONValue] = ["id": .string(receipt), "source": .string("detail"), "action": .string(InlineInteractionWire.toolName),
+            "preview": .bool(false), "status": .string(card.state.name), "resultReceipt": .object(answered)]
+        TurnTraceBus.fire(TurnTraceEvent(kind: "tool.dispatch", title: InlineInteractionWire.toolName, status: card.state.name,
+            payload: .object(["name": .string(InlineInteractionWire.toolName), "phase": .string("end"), "args": .string("{}"),
+                "status": .string(card.state.name), "receipt": .object(row)]),
+            id: receipt, createdAt: NativeTimestampFormat.plainZulu(at), ts: at, sessionId: sessionID, turn: nil))
     }
 
     private static func settleMatter(_ id: String, evidence: Experience.Ref?, reason: ObligationPhase.LetGo = .abandoned,
@@ -570,9 +636,11 @@ public enum InlineInteractionResolver {
         return reverted
     }
     /// Dismissal, Stop, or a cleared conversation: the card stops being a thing that can restart a turn. It stays in scrollback as a record.
+    /// Stop on a held turn whose card stays open marks it `.stopped` instead, which `begin` turns into a fresh continue-turn.
     public static func invalidateContinuation(
         id: String,
         sessionID: String,
+        to retired: InlineInteraction.Continuation.ResumeState = .invalidated,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async {
         if let owner = resumesInFlight[id] {
@@ -593,9 +661,9 @@ public enum InlineInteractionResolver {
                 }
                 guard var current = found,
                       let state = current.continuation?.state,
-                      state != .resumed, state != .invalidated else { return nil }
+                      state != .resumed, state != .invalidated, state != retired else { return nil }
                 let revision = current.revision
-                current.continuation?.state = .invalidated
+                current.continuation?.state = retired
                 current.revision += 1
                 do {
                     try await persist(current, sessionID: sessionID, dataRoot: dataRoot, expecting: {

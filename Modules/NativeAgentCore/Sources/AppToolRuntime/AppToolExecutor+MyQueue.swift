@@ -2,6 +2,7 @@ import ApprovalInbox
 import ChatTurnContracts
 import AgentWorkspace
 import Desk
+import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -251,10 +252,13 @@ extension AppToolExecutor {
                     return Self.doorRefusal("invalid_input", "Nothing was queued.", remedy: "fix_args",
                         "until \(untilText ?? "") has already passed. Give a time ahead, words for when it is done, or standing.")
                 }
+                // Any card: an approval, or a card a call raised (card.request, a permission, a model or key). Its settle owns the step.
                 if let card = when.card, editing == nil || named.contains("when") {
-                    do { _ = try await SwiftNativeApprovalInbox(root: store.dataRoot).get(card) } catch {
+                    let approval = (try? await SwiftNativeApprovalInbox(root: store.dataRoot).get(card)) != nil
+                    let raised = try? await ForPerson.at(store.dataRoot).matter("interaction:" + card)
+                    guard approval || raised != nil else {
                         return Self.doorRefusal("not_found", "No card \(card); nothing was queued.", remedy: "fix_args",
-                            "after_card takes the approvalId a carded call returned.")
+                            "after_card takes the id of a card: the approvalId or card_id a carded call returned.")
                     }
                 }
                 let steer = PeerDataTaint.carried(turn: turn, peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),

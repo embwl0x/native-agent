@@ -253,7 +253,10 @@ enum EngineFaceWorkProjection {
             meta.versions.map { version in
                 FaceMakeVersion(reference: meta.ref, version: String(version.n), title: versionTitle(meta.ref, version),
                     date: NativeTimestampFormat.parseISO8601(version.created),
-                    prompt: version.prompt.map(NativeAppSecretRedactor.redactText), kind: makeKind(URL(fileURLWithPath: version.file)))
+                    prompt: version.prompt.map(NativeAppSecretRedactor.redactText),
+                    // A board is named as one, so the Make pane draws it as the piece it is across its versions.
+                    kind: BoardDocument.isBoard(type: (version.file as NSString).pathExtension) ? BoardDocument.type
+                        : makeKind(URL(fileURLWithPath: version.file)))
             }
         }
         return MakeShelfFace(versions: versions, newest: newest, state: state(issue, loaded: loaded, owner: "Make shelf"))

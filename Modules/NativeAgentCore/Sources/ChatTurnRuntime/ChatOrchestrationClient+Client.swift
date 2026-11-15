@@ -13,6 +13,8 @@ import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
 import ChatTurnContracts
+import ChatToolRuntime
+import NativeAgentShared
 // Blueprint: | `ChatOrchestrationClient+Client.swift` | `SwiftNativeChatOrchestrationClient` actor; `chat`, `chatExecution`; `StructuredChatExecution` carries the response and typed success/failure; `withCurrentChatModel` admits the current Chat pick at a wake's `model.call`, so a run that never thinks needs no model; `withModelContext` binds the same client/provider/model/effort/tier for turns and wakes |
 
 // MARK: - SwiftNative impl
@@ -147,8 +149,18 @@ public actor SwiftNativeChatOrchestrationClient {
         turn.userText = message
         return try await StandingBotContinuity.withSessionContract(
             sessionID: sessionId, dataRoot: dataRoot, turn: turn) { turn in
-            let choice = turn.botContract?.choice ?? turn.providerChoice
-            let admission = try await engine.router.checkedRoutingSnapshot().routeAdmission(
+            let snapshot = try await engine.router.checkedRoutingSnapshot()
+            var choice = turn.botContract?.choice ?? turn.providerChoice
+            if choice == nil, let bound = Self.requestOnlyModel(turn.modelOverride) {
+                // The turn keeps its own Fast and effort (the requested one, else the saved one, else the default level); only the account and
+                // model are the card's. The effort is always a real level: "default" names no level a provider takes.
+                let saved = try? snapshot.routeAdmission(for: surface, requestedModel: model, requestedReasoningEffort: reasoningEffort)
+                let effort = [reasoningEffort, saved?.reasoningEffort ?? ""].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .first { !$0.isEmpty && $0 != "default" } ?? DEFAULT_REASONING_EFFORT
+                choice = ProviderTurnChoice(provider: bound.providerID, model: bound.model, reasoningEffort: effort,
+                    fast: (turn.requestedServiceTier ?? saved?.serviceTier) == "priority")
+            }
+            let admission = try snapshot.routeAdmission(
                 for: surface, requestedModel: model, requestedReasoningEffort: reasoningEffort, choice: choice)
             guard let admittedReasoningEffort = admission.reasoningEffort else {
                 throw ProviderRoutingError.configurationFailed("The turn's admitted reasoning effort is unavailable.")
@@ -167,5 +179,13 @@ public actor SwiftNativeChatOrchestrationClient {
                 return execution
             }
         }
+    }
+
+    /// A model card the turn itself raised, answered "for this one", binds the continued turn: it runs on the chosen account and model, at
+    /// the turn's own effort level, and nothing saved changes. A card a tool raised (an image's) binds only that tool's call.
+    nonisolated static func requestOnlyModel(_ bound: InlineInteractionModelOverride.Binding?) -> InlineInteractionModelOverride.Binding? {
+        guard let bound, bound.drivesTurn, !bound.providerID.isEmpty, !bound.model.isEmpty,
+              ProviderSurfaceGroups.all.contains(where: { $0.id == bound.group }) else { return nil }
+        return bound
     }
 }

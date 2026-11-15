@@ -168,7 +168,7 @@ extension SwiftNativeMacControl {
                 )
             }
         }
-        identity = identity?.retainingWindow(root, in: accessibilitySource(context: context))
+        identity = identity?.retainingWindow(root, in: accessibilitySource(context: context), context: context)
         var sectionRoot = root
         var sectionPath: [Int] = []
         var ancestors: [MacAXNode] = []

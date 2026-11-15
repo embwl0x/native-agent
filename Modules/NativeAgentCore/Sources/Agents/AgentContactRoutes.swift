@@ -186,8 +186,10 @@ public struct AgentContactRoutes: Sendable {
             let tool = request?["method"] as? String == "tools/call" ? (request?["params"] as? [String: Any])?["name"] as? String : nil
             let session = principal.peerID.map { peer in caller?.conversation(peer: peer) ?? AgentConversationStore.heldThread(peerID: peer) } ?? ""
             func wire(_ item: AgentConversationStore.Held) -> [String: String] {
-                ["at": NativeTimestampFormat.plainZulu(item.at), "text": item.text, "conversation_id": item.conversation ?? session,
-                 "conversation_name": item.name]
+                var message = ["at": NativeTimestampFormat.plainZulu(item.at), "text": item.text, "conversation_id": item.conversation ?? session,
+                    "conversation_name": item.name]
+                message["reply_to"] = item.replyTo
+                return message
             }
             let held: AgentConversationStore.HeldDrain
             do {
@@ -459,8 +461,10 @@ public struct AgentContactRoutes: Sendable {
         let context = String(stored.dropFirst(prefix.count))
         let session = protocolSession ? context : stored
         let request = json["request_id"] as? String ?? UUID().uuidString
-        let send = NativeAgentA2AWire.Send(rpcID: request, context: context, request: request,
+        var message = NativeAgentA2AWire.Send(rpcID: request, context: context, request: request,
             clientMessageID: request, parts: [.text(text)])
+        message.replyTo = json["reply_to"] as? String
+        let send = message
         Task {
             do {
                 let task = try await tasks.send(send, principal: principal, digest: peer.bodyDigest, protocolName: peer.protocolName)
@@ -736,8 +740,12 @@ struct AgentContactHeldResponse: Sendable {
     }
 
     private static func messages(_ items: [AgentConversationStore.Held], conversation: String) -> [[String: String]] {
-        items.map { ["at": NativeTimestampFormat.plainZulu($0.at), "text": $0.text, "conversation_id": $0.conversation ?? conversation,
-                     "conversation_name": $0.name] }
+        items.map {
+            var message = ["at": NativeTimestampFormat.plainZulu($0.at), "text": $0.text, "conversation_id": $0.conversation ?? conversation,
+                "conversation_name": $0.name]
+            message["reply_to"] = $0.replyTo
+            return message
+        }
     }
 
     func adding(to object: [String: Any]) -> [String: Any] {

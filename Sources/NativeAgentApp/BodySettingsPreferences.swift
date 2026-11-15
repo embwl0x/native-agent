@@ -24,7 +24,8 @@ enum BodySettingsPreferences {
          WorkPaneState.widthKey: .double(WorkPane.defaultWidth), "voiceAutoRead": .bool(false),
          "nativeagent.showTour": .bool(false), ShotgunController.enabledKey: .bool(true),
          ShotgunShortcut.storageKey: .string(ShotgunShortcut.optionSpace.rawValue), MoodTintPreference.key: .bool(true),
-         "studioWanderEnabled": .bool(true), "cognitiveSubstrateEnabled": .bool(true), "chatFileAccess": .string("auto")]
+         "studioWanderEnabled": .bool(true), "cognitiveSubstrateEnabled": .bool(true), "chatFileAccess": .string("auto"),
+         WindowFollowsPreference.key: .bool(true)]
     }
 
     @discardableResult

@@ -421,10 +421,13 @@ final class BodyFaceTranscripts {
                 }
             }
             for card in message.inlineCards {
-                let row = inbox?.sections.flatMap(\.rows).first { $0.id == "interaction:" + card.interaction.id }
+                // The card reads from itself; its Inbox row lends only its answers, so a card the Inbox no longer holds still draws whole.
+                let answers = inbox?.sections.flatMap(\.rows).first { $0.id == "interaction:" + card.interaction.id }
+                let face = card.face(answers: answers)
+                let unanswerable = card.model.needsAttention && answers == nil && snapshot?.error != nil
                 attachments.append(.init(id: "card-" + card.interaction.id, message: message.id, kind: "card", title: card.model.title,
-                    text: nil, resource: nil, card: row.map { PartFace(sections: [.init(id: $0.id, style: .list, rows: [$0])]) },
-                    failure: row == nil ? .init(code: "card_presentation_unavailable", message: "This request could not be read from Inbox.",
+                    text: nil, resource: nil, card: PartFace(sections: [.init(id: face.id, style: .list, rows: [face])]),
+                    failure: unanswerable ? .init(code: "card_answers_unavailable", message: "This request's answers could not be read from Inbox.",
                         cause: snapshot?.error?.message, effects: .none) : nil, secureCard: card.secureFace))
             }
             if let approval = message.metadata?.approvalId, message.metadata?.isPendingApproval == true {

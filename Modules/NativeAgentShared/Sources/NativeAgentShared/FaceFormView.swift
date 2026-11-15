@@ -189,8 +189,8 @@ struct FaceFormBlock: View {
                 if let failure = outcome.failure { Text(failure.localizedDescription).foregroundStyle(.red).textSelection(.enabled) }
                 if let words = outcome.words { Text(words).textSelection(.enabled) }
                 if outcome.unresolved {
-                    Text("The effect is unconfirmed. Read its current state before submitting again.").foregroundStyle(.secondary)
-                    Button("Read current state") { session.check(item, door: door) }.buttonStyle(.plain)
+                    Text("Not sure that went through. Check before sending again.").foregroundStyle(.secondary)
+                    Button("Check") { session.check(item, door: door) }.buttonStyle(.plain)
                 }
             } else {
                 HStack {

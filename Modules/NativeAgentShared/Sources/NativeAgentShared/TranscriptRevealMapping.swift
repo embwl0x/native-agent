@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 // Blueprint: | `TranscriptRevealMapping.swift` | Parser-position glyph cuts shared by Mac and phone transcript renderers |
 
@@ -9,7 +10,12 @@ public enum TranscriptRevealMapping: Equatable, Sendable, Codable {
     @available(macOS 15, iOS 18, *)
     public init(_ block: TranscriptBlock, rendered: String) {
         do { self = .mapped(try Self.cuts(block, rendered: rendered)) }
-        catch { self = .failed(reason: error.localizedDescription) }
+        catch {
+            // The paragraph then shows whole, with no reveal; why is a diagnostic, never the person's to act on.
+            Logger(subsystem: "com.nativeagent.app", category: "transcript-reveal")
+                .notice("Reveal mapping fell back for \(block.id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            self = .failed(reason: error.localizedDescription)
+        }
     }
 
     /// Parser positions address source bytes, including entities and escapes whose glyphs are not literal source characters.
@@ -87,16 +93,22 @@ public enum TranscriptRevealMapping: Equatable, Sendable, Codable {
                 throw CocoaError(.formatting,
                     userInfo: [NSLocalizedDescriptionKey: "The transcript reveal mapping parse failed: " + reason])
             case .parsed(let styled):
+                // Runs are read in order from a cursor in the source. A run whose glyphs stand in the source as they are (plain text, emphasis,
+                // a link's words, an autolink the parser gives no position or a position spanning its neighbours) reveals glyph by glyph where
+                // it stands; only a run the parser transformed (an entity, an escape) is one unit, ending where its parser position ends.
+                var cursor = input.text.startIndex
                 for run in styled.runs {
-                    guard let position = run.markdownSourcePosition, let range = Range(position, in: input.text) else {
-                        throw mappingFailure()
-                    }
-                    let text = oneParagraph(String(styled[run.range].characters))
-                    if text == oneParagraph(String(input.text[range])) {
-                        try appendLiteral(range)
-                    } else {
+                    let raw = String(styled[run.range].characters)
+                    let text = oneParagraph(raw)
+                    if let found = input.text.range(of: raw, range: cursor..<input.text.endIndex) {
+                        try appendLiteral(found)
+                        cursor = found.upperBound
+                    } else if let position = run.markdownSourcePosition, let range = Range(position, in: input.text), range.lowerBound >= cursor {
                         // A transformed parser run is one reveal unit; none of its source is copied before all its glyphs show.
                         try append(text, end: input.text.utf8.distance(from: input.text.utf8.startIndex, to: range.upperBound))
+                        cursor = range.upperBound
+                    } else {
+                        throw mappingFailure()
                     }
                 }
             }

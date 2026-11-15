@@ -179,13 +179,14 @@ that fails is reported, never swallowed.
 
 Ordinary quit waits for the turns captured at entry and joins the retained
 producer/turn settlement and final mind save from their actual completion.
-Neither join has a clock cutoff. The final synchronous resident drain still
-waits only three seconds at the app termination callback. Process exit can
-therefore interrupt unfinished dependency settlement; removing that remaining
-bound requires the app callback to await the dependency join before termination.
-The three-second drain joins the very same retained operation;
-it cannot start a competing flush or retire Chrome, senses, resident programs,
-ACP, ContextFlow or memory services ahead of producer and turn settlement.
+The held quit then retires resident dependencies (Chrome, senses, resident
+programs, ACP, ContextFlow, memory services, attention, the trace feed, then
+the app index) before it answers the termination, so none of it is cut by
+process exit and the quit puts no clock on it: each step ends when its own work
+is seen done or its processes are seen exited (ACP's escalation keeps its own
+inventoried signal graces). Retirement follows the very same
+retained operation; it cannot start a competing flush or retire any of them
+ahead of producer and turn settlement.
 Browser IPC's full stop likewise follows tracked turns and wake runs, so it
 does not cancel their browser operations early. Browser admission-only closure
 and universal turn/cognition admission still require their owning APIs; new
@@ -203,7 +204,7 @@ capture ownership or cancelling the pump; a wedged thread can leave this join
 pending until process exit. A
 policy-disable handoff alone is not the controller's full termination barrier. The quit producer
 settlement joins both the OtherDoorTurns and ActivityWatch handles before the
-final mind save, subject to the final dependency-drain/process-exit limitation above.
+final mind save.
 The next launch reconciles retained journal work and committed
 dream cutoffs; the quit result must never claim an unfinished snapshot landed.
 
@@ -217,10 +218,10 @@ spawn all check cancellation. Stop before spawn schedules no termination;
 An unscheduled attempt (Stop or spawn failure) retains its evidence with
 `restartScheduled: false`, which does not consume the fired-restart cooldown.
 A tool restart waits for its originating turn's settlement before requesting
-quit. Its stalled-turn allowance is 60 wall-clock seconds (the 120-second
-relauncher exit deadline minus the 60-second whole-quit reserve); expiry is
-reported as unfinished. The detached relauncher still waits for actual process
-exit before reopening the app. Restart discovery describes this settlement wait
+quit. Its stalled-turn allowance is 60 wall-clock seconds; expiry is
+reported as unfinished. The detached relauncher waits for the old process's
+exit, with no deadline, before reopening the app, so a quit that is still
+settling is never abandoned. Restart discovery describes this settlement wait
 and stalled-turn allowance; the separate 20-second install delay is not a
 restart grace period.
 The shared detached-spawn API reports a missing executable as an argument

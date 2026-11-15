@@ -205,7 +205,7 @@ extension InlineInteractionResolver {
             // A call the person decided resumes as the person's own act once the person answered its card: the gate admits that exact
             // call once, with no second ask. Any other parked call (and arguments that do not read as one object) replays as the agent's.
             // The person's act names the call held in memory when it parked; a replayed call that differs from it is judged as the agent's.
-            var replayAs = replayTurn
+            var replayAs = replayTurn.with(\.cardCause, CardCause(record.id))
             let personParked = PersonParkedCalls.take(record.id)
             if let personParked {
                 replayAs = replayTurn.with(\.personAct, PersonAct(by: .card(id: record.id), tool: personParked.tool, input: personParked.input,
@@ -231,13 +231,22 @@ extension InlineInteractionResolver {
             try await persistTransition(record, from: .replaying, sessionID: sessionID, dataRoot: dataRoot)
         }
         try Task.checkCancellation()
+        // The card's after_card steps ride this one continued turn; none of them wakes a turn of its own.
+        let queued = await AgentScreen.resume(card: record.id, decision: record.state.outcome != nil ? "approved" : "declined",
+            completed: record.state.outcome != nil, handOff: true, dataRoot: dataRoot)
+        queued.sources.forEach { turn.peerSteering?.mark(peer: $0) }
+        queued.elevated.forEach { turn.peerSteering?.elevate(peer: $0) }
         if servesRunningTurn, waitingHosts.contains(record.id) {
-            guard let hostResult else { throw failure("The blocked call could not resume.") }
+            guard var hostResult else { throw failure("The blocked call could not resume.") }
+            if !queued.text.isEmpty, case .object(var fields) = hostResult {
+                fields["queued_after_card"] = .string(queued.text)
+                hostResult = .object(fields)
+            }
             record.continuation?.resumedByTurnId = turn.id
             return (hostResult, nil)
         }
         let replayed = record.continuation?.replayedAt != nil
-        let prompt: String
+        var prompt: String
         if record.continuation?.mode == .continueTurn, record.state.outcome != nil,
            let text = record.continuation?.resumeText, !text.isEmpty {
             prompt = text
@@ -245,6 +254,7 @@ extension InlineInteractionResolver {
             prompt = continuationPrompt(for: record, replayed: replayed,
                                         replayedResult: record.continuation?.replayedResult)
         }
+        if !queued.text.isEmpty { prompt += "\n\n" + queued.text }
         if servesRunningTurn, await ChatTurnSteering.shared.isTurnOpen(sessionId: sessionID, turnID: originTurnID) {
             try Task.checkCancellation()
             record.continuation?.resumedByTurnId = turn.id
@@ -257,8 +267,9 @@ extension InlineInteractionResolver {
             guard let qualified = InlineInteractionRegistry.splitModelOptionID(model) else {
                 throw failure("This saved model choice does not name its account. Choose an account-qualified model in Providers before continuing.")
             }
+            // A card a tool raised (image generation's) binds that tool's call; one the turn raised itself binds the continued turn.
             return .init(group: record.target, providerID: qualified.providerID,
-                         model: qualified.modelID)
+                         model: qualified.modelID, drivesTurn: record.continuation?.mode == .continueTurn)
         }()
         record.continuation?.state = .replaying
         try await persistTransition(record, from: .claimed, sessionID: sessionID, dataRoot: dataRoot)
@@ -268,7 +279,13 @@ extension InlineInteractionResolver {
             .with(\.session, sessionID)
             .with(\.modelOverride, binding)
             .with(\.rows.questionRunID, synthetic ? record.continuation?.originRunId : nil)
-        let admitted = try await startTurn(prompt, sessionID, synthetic, resumedTurn)
+        // A start refused for a real reason says it on the card; Stop still settles as Stop.
+        let admitted: Bool
+        do { admitted = try await startTurn(prompt, sessionID, synthetic, resumedTurn) }
+        catch {
+            try Task.checkCancellation()
+            throw error
+        }
         guard admitted else {
             try Task.checkCancellation()
             throw failure("That couldn't be continued just now. Try again.")

@@ -291,7 +291,9 @@ struct NativeAgentApp: App {
             if !hideUserBubble { appModel.publishConversationAnchor(for: started.acceptance) }
             switch started.acceptance {
             case .accepted: return true
-            case .rejected: return false
+            // The refusal's own reason is the card's: a deleted conversation says so, never "just now".
+            case .rejected(let message):
+                throw NSError(domain: "InteractionCard", code: 2, userInfo: [NSLocalizedDescriptionKey: message])
             }
         })
 

@@ -46,7 +46,9 @@ public actor GraphUpkeepOwner {
         return PartFace(title: "Graph upkeep", line: "Nothing is removed until you apply this review.", sections: sections)
     }
 
-    public func apply(expectedIDs: [String], token: String) async throws -> String {
+    /// What Apply checks of its call, read without effect: the review token is the current one (not consumed, not replaced), it names exactly
+    /// the reviewed entities, and there is something to remove. Its run and the gate's check before any card make them.
+    public func applyCandidates(expectedIDs: [String], token: String) throws -> [KnowledgeGraphGCCandidate] {
         guard let reviewed, reviewed.token == token, Set(reviewed.candidates.map(\.id)) == Set(expectedIDs),
               reviewed.candidates.count == expectedIDs.count else {
             throw PartCallError(code: "graph_preview_unavailable", message: "Review the orphan candidates again before removing them.")
@@ -54,9 +56,14 @@ public actor GraphUpkeepOwner {
         guard !reviewed.candidates.isEmpty else {
             throw PartCallError(code: "graph_review_empty", message: "This review contains no entities to remove.")
         }
+        return reviewed.candidates
+    }
+
+    public func apply(expectedIDs: [String], token: String) async throws -> String {
+        let candidates = try applyCandidates(expectedIDs: expectedIDs, token: token)
         self.reviewed = nil
         switch try await KnowledgeGraphMaintenanceActions(dataRoot: dataRoot).applyOrphanSweep(
-            expectedCandidateIDs: Set(reviewed.candidates.map(\.id))) {
+            expectedCandidateIDs: Set(candidates.map(\.id))) {
         case .applied(let report): return "Removed \(report.entitiesDeleted) entities · \(report.edgesDeleted) edges."
         case .previewDiverged:
             throw PartCallError(code: "graph_preview_changed", message: "The orphan set changed. Review it again before confirming deletion.")

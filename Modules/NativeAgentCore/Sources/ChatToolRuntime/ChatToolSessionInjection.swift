@@ -42,10 +42,11 @@ package enum ChatToolSessionInjection {
         if toolName == "scratchpad_read" {
             out["session_id"] = .string(sessionId)
         }
-        // An event read stays in the calling conversation unless it asks for the whole life (scope:all).
+        // An event read stays in the calling conversation unless it asks for the whole life (scope:all). A receipt_id names one receipt
+        // wherever it ran (a life row, another conversation, the background), so it is never narrowed to this one.
         if toolName == "recent_trace_summary",
            out["view"] != .string("receipts"), out["effects_only"] != .bool(true), out["scope"] != .string("all"),
-           out["session_id"] == nil {
+           out["receipt_id"] == nil, out["session_id"] == nil {
             out["session_id"] = .string(sessionId)
         }
         if toolName == "search_chat_history" {

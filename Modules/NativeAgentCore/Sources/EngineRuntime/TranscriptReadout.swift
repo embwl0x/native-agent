@@ -88,13 +88,44 @@ public struct TranscriptReadout: Sendable {
         public let sessionID: String
         public let model: InlineCardModel
         public let repeatCount: Int
-        public var secureFace: SecureCardFace {
-            SecureCardFace(identity: .init(card: interaction.id, session: sessionID, revision: interaction.revision),
+        /// The card's protected entry, only while it has something entered there: a field, a sign-in or full setup, from asking until the
+        /// card settles (a sign-in it started runs on in that form, which holds the callback until the browser finishes), or a restart.
+        /// Nil otherwise, so a card that collects nothing, or has settled, never holds the chat window's protection. A walking permission
+        /// card's restart is its own answer on its row, so it is not drawn twice.
+        public var secureFace: SecureCardFace? {
+            let entry = model.state == .pending || model.canRetry
+            let restart = model.kind == .needsPermission && model.state == .running ? nil : model.restartNote
+            let entered = !model.fields.isEmpty || model.signInLabel != nil || model.fullSetupLabel != nil
+            guard restart != nil || (entered && (entry || model.state == .running)) else { return nil }
+            return SecureCardFace(identity: .init(card: interaction.id, session: sessionID, revision: interaction.revision),
                 fields: model.fields.map { .init(id: $0.id, label: $0.label, placeholder: $0.placeholder,
                     helper: $0.helper, secret: $0.isSecret, optional: $0.isOptional) },
                 primaryLabel: model.primaryLabel, signInLabel: model.signInLabel, fullSetupLabel: model.fullSetupLabel,
-                restartNote: model.restartNote, busyNote: model.state == .running ? model.busyNote : nil,
-                acceptsEntry: model.state == .pending || model.canRetry)
+                restartNote: restart, busyNote: model.state == .running ? model.busyNote : nil, acceptsEntry: entry)
+        }
+
+        /// The card as it draws in its own conversation, on the Mac and the phone: read from the card itself and whole (why, what it
+        /// grants, each option's consequence, how long, what Not now costs; a decided card's outcome), so a card the Inbox no longer holds
+        /// still reads. Only its answers come from its Inbox row (`cardAnswers`), the one place a press is bound to its door call; a
+        /// decided card has none. No link: the card is already where it would lead.
+        public func face(answers inboxRow: PartFace.Row?) -> PartFace.Row {
+            var lines: [String?] = interaction.state.isOpen
+                ? [model.why, model.grantsNow, model.state == .running ? model.busyNote : nil]
+                : [model.outcome, model.outcomeMeta]
+            if model.needsAttention {
+                lines += model.choices.map { choice in choice.note.map { choice.title + ": " + $0 } }
+                lines += model.scopeLines.map { Optional($0) } + [model.persistenceNote, "Not now: " + model.consequence]
+            }
+            let detail = lines.compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            // The card's own form enters the key here; opening another entry for it beside the form is the same answer twice.
+            let entry = secureFace != nil
+            let answers = model.needsAttention
+                ? inboxRow?.cardAnswers?.filter { !(entry && $0.call?.action == "provider.sign_in") } : nil
+            return PartFace.Row(id: "interaction:" + interaction.id, title: NativeAppSecretRedactor.redactText(model.title),
+                detail: detail.isEmpty ? nil : NativeAppSecretRedactor.redactText(detail.joined(separator: "\n\n")),
+                symbol: "hand.raised.fill",
+                tone: model.needsAttention ? PartFace.Tone.attention : [.failed, .stopped].contains(model.state) ? .failed : nil,
+                actions: answers?.isEmpty == false ? answers : nil)
         }
     }
     public var messages: [ChatMessage]

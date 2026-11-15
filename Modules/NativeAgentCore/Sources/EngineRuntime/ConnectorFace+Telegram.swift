@@ -220,34 +220,48 @@ extension NativeAgentEngine {
         }
     }
 
-    /// `telegram.allowlist`: the allowed chat (`list` chats) or user (`list` users) IDs become exactly the numeric IDs given.
-    @MainActor func telegramAllowlist(list: String, value: String) async throws -> String? {
-        try await telegramVerb {
-            guard ["chats", "users"].contains(list) else {
-                throw ToolFailureError("list is chats or users. Nothing was saved.", argumentPath: "list", effects: .none, code: "bad_value")
+    /// `telegram.allowlist`: `list` is chats or users and `value` holds only numeric IDs (the lookups); the allowed chat (`list` chats) or
+    /// user (`list` users) IDs become exactly those IDs (the effect).
+    @MainActor func telegramAllowlist(list: String, value: String) throws -> HostVerbEffect {
+        guard ["chats", "users"].contains(list) else {
+            throw ToolFailureError("list is chats or users. Nothing was saved.", argumentPath: "list", effects: .none, code: "bad_value")
+        }
+        let parsed = parseTelegramNumericIDs(value)
+        guard parsed.invalidTokens.isEmpty else {
+            throw ToolFailureError("""
+                These are not usable IDs: \(parsed.invalidTokens.joined(separator: ", ")). Use the numeric chat or user ID. Nothing was saved.
+                """, argumentPath: "value", effects: .none, code: "bad_ids")
+        }
+        let ids = parsed.canonicalIDs
+        return { [self] in
+            try await telegramVerb {
+                let saved = try await telegram.refresh()
+                if list == "chats" { try await saveTelegramLever(saved, chats: ids) }
+                else { try await saveTelegramLever(saved, users: ids) }
+                return nil
             }
-            let saved = try await telegram.refresh()
-            let parsed = parseTelegramNumericIDs(value)
-            guard parsed.invalidTokens.isEmpty else {
-                throw ToolFailureError("""
-                    These are not usable IDs: \(parsed.invalidTokens.joined(separator: ", ")). Use the numeric chat or user ID. Nothing was saved.
-                    """, argumentPath: "value", effects: .none, code: "bad_ids")
-            }
-            if list == "chats" { try await saveTelegramLever(saved, chats: parsed.canonicalIDs) }
-            else { try await saveTelegramLever(saved, users: parsed.canonicalIDs) }
-            return nil
         }
     }
 
-    /// `telegram.allow_chat`: a chat Telegram turned away (it is under Blocked and ignored) may message the agent.
-    @MainActor func telegramAllowChat(_ chat: String) async throws -> String? {
+    /// `telegram.allow_chat`: the chat is one Telegram turned away (it is under Blocked and ignored), in the saved reading read now (the
+    /// lookup); it may message the agent (the effect).
+    @MainActor func telegramAllowChat(_ chat: String) async throws -> HostVerbEffect {
         try await telegramVerb {
-            let saved = try await telegram.refresh()
-            guard saved.blocked.contains(where: { $0.chatId == chat }), Int64(chat) != nil else {
+            let read = try await telegram.load()
+            guard read.blocked.contains(where: { $0.chatId == chat }), Int64(chat) != nil else {
                 throw PartCallError(code: "stale_row", message: "That blocked message is no longer readable. Refresh Connectors before allowing it.")
             }
-            try await saveTelegramLever(saved, chats: saved.allowedChatIds + [chat])
-            return "Chat \(chat) may now message me" + (saved.enabled ? "." : " once Telegram is on.")
+            return { [self] in
+                try await telegramVerb {
+                    // The reading the save overwrites is the one that must still hold the blocked chat.
+                    let saved = try await telegram.refresh()
+                    guard saved.blocked.contains(where: { $0.chatId == chat }) else {
+                        throw PartCallError(code: "stale_row", message: "That blocked message is no longer readable. Refresh Connectors before allowing it.")
+                    }
+                    try await saveTelegramLever(saved, chats: saved.allowedChatIds + [chat])
+                    return "Chat \(chat) may now message me" + (saved.enabled ? "." : " once Telegram is on.")
+                }
+            }
         }
     }
 
@@ -260,24 +274,30 @@ extension NativeAgentEngine {
         }
     }
 
-    /// `telegram.choose`: Telegram's model (`setting` model: any provider's model ID, keeping a thinking level it supports) or its
-    /// thinking level (`setting` think).
-    @MainActor func telegramChoose(setting: String, value: String) async throws -> String? {
-        try await telegramVerb {
-            let saved = try await telegram.refresh()
-            switch setting {
-            case "model":
-                guard !value.isEmpty else { throw PartCallError(code: "bad_value", message: "Choose or paste a model ID. Nothing was saved.") }
-                let choice = providers.selection(for: "telegram")
-                let effort = ProvidersFacade.normalizedReasoningEffort(from: providers.catalog, providers: providers.connections,
-                    providerID: choice.provider, model: value, selected: choice.reasoningEffort)
-                try await saveTelegramLever(saved, model: value, effort: effort)
-            case "think":
-                guard !value.isEmpty else { throw PartCallError(code: "bad_value", message: "Choose a think level. Nothing was saved.") }
-                try await saveTelegramLever(saved, model: providers.selection(for: "telegram").model, effort: value)
-            default: throw PartCallError(code: "bad_value", message: "setting is model or think. Nothing was saved.")
+    /// `telegram.choose`: `setting` is model or think, with a value (the lookups); the effect saves Telegram's model (`setting` model: any
+    /// provider's model ID, keeping a thinking level it supports) or its thinking level (`setting` think).
+    @MainActor func telegramChoose(setting: String, value: String) throws -> HostVerbEffect {
+        guard ["model", "think"].contains(setting) else {
+            throw PartCallError(code: "bad_value", message: "setting is model or think. Nothing was saved.")
+        }
+        guard !value.isEmpty else {
+            throw PartCallError(code: "bad_value", message: setting == "model" ? "Choose or paste a model ID. Nothing was saved."
+                : "Choose a think level. Nothing was saved.")
+        }
+        return { [self] in
+            try await telegramVerb {
+                let saved = try await telegram.refresh()
+                switch setting {
+                case "model":
+                    let choice = providers.selection(for: "telegram")
+                    let effort = ProvidersFacade.normalizedReasoningEffort(from: providers.catalog, providers: providers.connections,
+                        providerID: choice.provider, model: value, selected: choice.reasoningEffort)
+                    try await saveTelegramLever(saved, model: value, effort: effort)
+                default:
+                    try await saveTelegramLever(saved, model: providers.selection(for: "telegram").model, effort: value)
+                }
+                return nil
             }
-            return nil
         }
     }
 
@@ -297,7 +317,7 @@ extension NativeAgentEngine {
     }
 
     /// A Telegram verb's failure is the owner's words; any other error is redacted.
-    @MainActor private func telegramVerb(_ body: () async throws -> String?) async throws -> String? {
+    @MainActor private func telegramVerb<T>(_ body: @MainActor () async throws -> T) async throws -> T {
         do { return try await body() }
         catch let error as ToolFailureError { throw error }
         catch let error as PartCallError { throw error }

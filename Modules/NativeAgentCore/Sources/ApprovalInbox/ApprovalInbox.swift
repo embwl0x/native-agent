@@ -428,6 +428,20 @@ public actor SwiftNativeApprovalInbox {
         return final
       }
     }
+    /// An approved action that has started says so on its record (`running_since`) until its outcome is saved: a read in between sees it
+    /// running, never a record with no result.
+    /// `running: false` clears it when the run ends without an outcome to save (its application is then owed).
+    public func markRunning(_ id: String, running: Bool = true, at now: Date = Date()) async throws {
+        try await SwiftNativePersistenceCore.withFileLock(approvalsPath) { [approvalsPath] in
+            var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
+            guard let index = items.firstIndex(where: { $0.objectValue?["id"] == .string(id) }),
+                  case .object(var object) = items[index], object["executedAction"] == nil else { return }
+            object["running_since"] = running ? .string(Self.isoTimestamp(now)) : nil
+            items[index] = .object(object)
+            try await SwiftNativePersistenceCore.writeJSON(.array(items), to: approvalsPath)
+        }
+    }
+
     @discardableResult
     public func annotateExecution(
         _ id: String,
@@ -444,6 +458,7 @@ public actor SwiftNativeApprovalInbox {
                       object["id"] == .string(id) else { continue }
                 object["executedAction"] = executedAction
                 object["detail"] = .string(detail)
+                object["running_since"] = nil
                 guard let record = ApprovalRecord(json: .object(object)) else {
                     throw ApprovalInboxError.malformedResponse(
                         "could not re-parse annotated approval record"

@@ -37,6 +37,8 @@ public struct AgentContactTask: Codable, Sendable {
     public var acceptedOutputModes: [String]?
     /// Set when the contact gave this task as a job rather than a conversation.
     public var job: AgentContactJob?
+    /// The held send this message names as the one it answers. Whether it did is the send's record, never a copy here.
+    public var replyTo: String?
     public var toolResult: JSONValue?
     public var delegatedCompletions: [String: AgentContactPart]?
     public var approvalIDs: Set<String>?
@@ -77,6 +79,7 @@ struct AgentContactTurn: Sendable {
     var accepted: EnqueuedUserMessage? = nil
     var bridgeInput: AgentContactBridgeInput? = nil
     var job: AgentContactJob? = nil
+    var replyTo: String? = nil
 }
 enum AgentContactProgress: Sendable {
     case working

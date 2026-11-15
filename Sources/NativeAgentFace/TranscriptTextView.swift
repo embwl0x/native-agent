@@ -70,6 +70,15 @@ final class TranscriptTextView: NSTextView {
         subviews.filter { !$0.isHidden && controller?.attachments.hosts($0) == true }
     }
 
+    /// A point over a hosted view (a card, a table) is that view's, whatever TextKit has stacked over it: TextKit adds and re-adds the views it
+    /// draws text in as it renders, and one above a card would take its clicks as text selection. Where the hosted view takes no click, the
+    /// text does.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        if let view = shownHostedViews.last(where: { $0.frame.contains(local) }), let hit = view.hitTest(local) { return hit }
+        return super.hitTest(point)
+    }
+
     /// The text area's children are its own and every hosted view on screen, so VoiceOver and an accessibility press reach a card's buttons
     /// (Approve, Deny, a choice) inside the transcript.
     override func accessibilityChildren() -> [Any]? {

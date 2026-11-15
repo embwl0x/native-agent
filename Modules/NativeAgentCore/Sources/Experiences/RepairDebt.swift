@@ -45,6 +45,11 @@ public struct RepairDebt: Sendable, Equatable {
     /// The same open debt: one operation met again by the same owner.
     public func matches(operation: String, owner: String) -> Bool { self.operation == operation && self.owner == owner }
 
-    /// A success of `operation` settles this debt when it is the failed operation or its lever.
-    public func isSettled(by operation: String) -> Bool { self.operation == operation || lever == operation }
+    /// A success of `operation` settles this debt when it is the failed operation or its lever. A success named with its subject
+    /// (`desk.set_status:<handle>`) also settles a debt of the same action recorded under its bare name, as debts were before the action
+    /// declared that subject.
+    public func isSettled(by operation: String) -> Bool {
+        self.operation == operation || lever == operation
+            || self.operation.map { !$0.contains(":") && operation.hasPrefix($0 + ":") } == true
+    }
 }

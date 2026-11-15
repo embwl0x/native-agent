@@ -9,6 +9,7 @@ import ChatTurnRuntime
 import ChatToolRuntime
 import DoctorChecks
 import EngineRuntime
+import Experiences
 import Foundation
 import MacControl
 import MacIntegration
@@ -286,6 +287,25 @@ final class BodySettingsActHandler: FaceActHandler {
             catch { issue = WireFailure(code: "inbox_publication_failed", message: "The Inbox action completed, but its list could not be refreshed.",
                 cause: error.localizedDescription, effects: .known) }
             return committed(.object(["action": .string(action)]), identities: [id], publicationFailure: issue)
+        case .openCard(let id):
+            // The card's own conversation, opened as a notification opens one: where its request was raised, or the thread its matter came
+            // from. A card: link names a request by its id or its matter's, and a note by its matter's.
+            let owner = ForPerson.at(engine.dataRoot)
+            var found = try await owner.matter(id)
+            if found == nil, !id.hasPrefix("interaction:") { found = try await owner.matter("interaction:" + id) }
+            guard let matter = found else {
+                throw PartCallError(code: "card_unavailable", message: "This card is no longer kept, so it has no conversation to open.")
+            }
+            let raised = matter.evidence.first { $0.source.hasPrefix(Matter.conversations) }
+                .map { String($0.source.dropFirst(Matter.conversations.count)) }
+            var thread: String?
+            if case .conversation(let session)? = ForPerson.thread(matter) { thread = session }
+            guard let session = raised ?? thread else {
+                throw PartCallError(code: "card_conversation_unavailable",
+                    message: "This item was not raised in a conversation; it reads in the Inbox.")
+            }
+            try await BodyFacePresentation.current(model: requireModel()).present(.openConversation(session: session, message: nil))
+            return .acknowledged
         case .restartBody:
             try Self.restart()
             return .acknowledged

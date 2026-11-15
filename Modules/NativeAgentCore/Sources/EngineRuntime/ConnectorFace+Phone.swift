@@ -106,7 +106,7 @@ extension NativeAgentEngine {
             let pair = PartFace.Action(id: "pair", label: "Pair", role: .primary, doors: ["mac"], call: .init("pairing.pair", id))
             let canApprove = phone.status == .paired && !phone.confirmationOwed
             return PartFace.Row(id: "phone:" + phone.id, title: phone.status == .paired ? "iPhone or iPad" : "Phone waiting to pair",
-                detail: phone.id, value: canApprove ? "Can approve" : phone.status == .paired ? "Waiting for it to confirm" : "Waiting",
+                detail: String(phone.id.prefix(8)), value: canApprove ? "Can approve" : phone.status == .paired ? "Waiting for it to confirm" : "Waiting",
                 symbol: "iphone", tone: canApprove ? .live : .attention,
                 actions: (phone.status == .pending ? [pair] : [])
                     + [PartFace.Action(id: "remove", label: "Remove", role: .destructive, doors: ["mac"], call: .init("pairing.remove", id))])
@@ -146,39 +146,48 @@ extension NativeAgentEngine {
     }
 
     /// `pairing.check_delivery`: the pairing owner checks iCloud delivery of the pairing key.
-    @MainActor func pairingCheckDelivery() async throws -> String? {
+    @MainActor func pairingCheckDelivery() throws -> HostVerbEffect {
         _ = try pairingOwner()
-        guard !sync.isCheckingPairing else { return "An iCloud delivery check is already running." }
-        await sync.checkPairingDelivery()
-        return sync.pairingError ?? "iCloud delivery was checked. Tap Check for Mac on your phone."
+        return { [self] in
+            guard !sync.isCheckingPairing else { return "An iCloud delivery check is already running." }
+            await sync.checkPairingDelivery()
+            return sync.pairingError ?? "iCloud delivery was checked. Tap Check for Mac on your phone."
+        }
     }
 
     /// `pairing.use_here`: the iPhone paired with another Mac on this Apple Account follows this one.
-    @MainActor func pairingUseHere() async throws -> String? {
-        guard try await pairingOwner().bridge.usePhoneHere() else {
-            throw PartCallError(code: "pairing_failed", message: "This Mac could not take the iPhone pairing. Check iCloud and try again.")
+    @MainActor func pairingUseHere() throws -> HostVerbEffect {
+        let owner = try pairingOwner()
+        return {
+            guard try await owner.bridge.usePhoneHere() else {
+                throw PartCallError(code: "pairing_failed", message: "This Mac could not take the iPhone pairing. Check iCloud and try again.")
+            }
+            return "Your iPhone now follows this Mac."
         }
-        return "Your iPhone now follows this Mac."
     }
 
     /// `pairing.rotate`: a new pairing key replaces the old one, which stops working at once.
-    @MainActor func pairingRotate() async throws -> String? {
+    @MainActor func pairingRotate() throws -> HostVerbEffect {
         _ = try pairingOwner()
-        await sync.regenerateSecret()
-        if let error = sync.pairingError { throw PartCallError(code: "rotate_failed", message: error) }
-        return "A new pairing key was made; iCloud is delivering it to each paired iPhone and iPad."
+        return { [self] in
+            await sync.regenerateSecret()
+            if let error = sync.pairingError { throw PartCallError(code: "rotate_failed", message: error) }
+            return "A new pairing key was made; iCloud is delivering it to each paired iPhone and iPad."
+        }
     }
 
-    /// `pairing.pair`: a phone waiting in the paired list may approve.
-    @MainActor func pairingPair(_ id: String) async throws -> String? {
+    /// `pairing.pair`: the pairing owner, and the phone `id` names in the paired list, not removed (the lookups); that waiting phone may
+    /// approve (the effect).
+    @MainActor func pairingPair(_ id: String) throws -> HostVerbEffect {
         let owner = try pairingOwner()
-        guard let phone = sync.phones.first(where: { $0.id == id && $0.status != .removed }) else {
-            throw PartCallError(code: "stale_row", message: "That phone is no longer in the paired list. Refresh Connectors before changing it.")
+        let phone = try NamedRow.find(id, kind: "phone", in: sync.phones, ids: { [$0.id, String($0.id.prefix(8))] }, shown: { String($0.id.prefix(8)) })
+        guard phone.status != .removed else { throw NamedRow.stale("That phone was removed from the paired list.") }
+        return {
+            guard await owner.pairedPhones.setStatus(.paired, id: phone.id) else {
+                throw PartCallError(code: "pairing_failed", message: (owner.pairedPhones.message ?? "The change did not save.") + " The phone is as it was.")
+            }
+            return "Paired on this Mac. The phone confirms as soon as it hears from this Mac, then it can approve."
         }
-        guard await owner.pairedPhones.setStatus(.paired, id: phone.id) else {
-            throw PartCallError(code: "pairing_failed", message: (owner.pairedPhones.message ?? "The change did not save.") + " The phone is as it was.")
-        }
-        return "Paired on this Mac. The phone confirms as soon as it hears from this Mac, then it can approve."
     }
 
     @MainActor private func pairingOwner() throws -> DeviceSync {

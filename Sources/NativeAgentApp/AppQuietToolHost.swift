@@ -14,6 +14,7 @@ import PersistenceCore
 import Privacy
 import ChatToolRuntime
 import Desk
+import MacIntegration
 import NotificationInbox
 import TrustPersistence
 // Blueprint: | `AppQuietToolHost.swift` | `AppQuietToolHost`: `inboxFence`, `inbox`, `provider` |
@@ -120,17 +121,75 @@ import TrustPersistence
         }
         return nil
     }
-    func upkeepFence(verb: String, input: [String: JSONValue]) async -> JSONValue? {
-        guard verb == "backup_restore" else { return nil }
-        if case .failure(let failure) = await AppToolExecutor.quietBackupRestoreTarget(
-            input,
-            dataRoot: appModel.engine.trust.dataRoot
-        ) { return failure.refusal }
-        return nil
+    /// Each owner's own checks of what its verb names, the ones its run makes before any effect; the gate runs them before any card.
+    func verbFence(tool: String, verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue? {
+        switch (tool, verb) {
+        case ("upkeep", _):
+            do {
+                if try await prepareUpkeep(verb: verb, input: input, turn: turn) != nil { return nil }
+            } catch { return NativeAgentEngine.prepareRefusal(error, verb: verb) }
+            return await appModel.engine.pageVerbFence(verb, input: input)
+        case ("connections", _): return await connectionsFence(verb: verb, input: input, turn: turn)
+        case ("provider", _):
+            do {
+                _ = try await prepareProvider(verb: verb, input: input, turn: turn)
+                return nil
+            } catch { return NativeAgentEngine.prepareRefusal(error, verb: verb) }
+        default: return nil
+        }
+    }
+
+    /// The upkeep verbs whose lookups are this host's own, in one switch: the backup, grants or grant a verb names (read now) throw their
+    /// owner's refusal, or the verb's effect comes back to run. Nil for another owner's verb.
+    private func prepareUpkeep(verb: String, input: [String: JSONValue], turn: Turn) async throws
+        -> (@MainActor () async -> (ok: Bool, detail: String, fields: [String: JSONValue]))? {
+        let retry = " Read \(AppToolExecutor.doorDoctor) to see what is wrong, then try again."
+        switch verb {
+        // The person's own act needs no decided row; only the agent's change under Full Mac (no person act on its turn) leaves one.
+        case "backup_restore":
+            let backup: BackupRecord
+            switch await AppToolExecutor.quietBackupRestoreTarget(input, dataRoot: appModel.engine.trust.dataRoot) {
+            case .success(let target): backup = target
+            case .failure(let failure): throw QuietArgumentRefusal(failure.refusal)
+            }
+            return { [self] in
+                let message: String
+                switch await appModel.restoreBackup(backup) {
+                case .saved(let detail): message = detail
+                case .failed(let detail): return (false, detail + retry, [:])
+                }
+                // Await staging because a staged restore restarts the app after this turn settles.
+                if turn.personAct == nil {
+                    _ = await BodyDecidedRow.record(turn: turn, requester: "Full Mac", tool: "backup.restore \(backup.id)",
+                                                       sessionID: input["__session_id"]?.scalarText,
+                                                       dataRoot: appModel.engine.dataRoot)
+                }
+                return (true, message, ["id": .string(backup.id)])
+            }
+        case "trust_ask_grant":
+            let targets = try Self.grantTargets(input).get()
+            return { [self] in
+                do { return try await askGrants(targets) }
+                catch { return (false, error.localizedDescription, ["effects": .string("unknown")]) }
+            }
+        case "trust_grant_settings":
+            let gate = try Self.grantSettingsTarget(input).get()
+            return {
+                if let failure = await SystemPermissionPreflight.openSettings(gate) { return (false, failure, [:]) }
+                return (true, "System Settings is open at \(gate.displayName). Opening it granted nothing.", [:])
+            }
+        default: return nil
+        }
     }
     /// Share each page button's own call so tool and UI mutations have one owner.
     func runUpkeep(verb: String, input: [String: JSONValue], turn: Turn) async -> (ok: Bool, detail: String, fields: [String: JSONValue]) {
         let retry = " Read \(AppToolExecutor.doorDoctor) to see what is wrong, then try again."
+        do {
+            if let effect = try await prepareUpkeep(verb: verb, input: input, turn: turn) { return await effect() }
+        } catch {
+            var refusal = NativeAgentEngine.prepareRefusal(error, verb: verb).objectValue ?? [:]
+            return (false, refusal.removeValue(forKey: "detail")?.stringValue ?? "", refusal)
+        }
         switch verb {
         case "support_report":
             switch await appModel.loadSupportDiagnostics() {
@@ -175,25 +234,6 @@ import TrustPersistence
             let outcome = await MemorySpotlightReindexOperation.run(dataRoot: appModel.engine.dataRoot)
             if case .indexed = outcome { return (true, outcome.userMessage, [:]) }
             return (false, outcome.agentMessage, [:])
-        // The person's own act needs no decided row; only the agent's change under Full Mac (no person act on its turn) leaves one.
-        case "backup_restore":
-            let backup: BackupRecord
-            switch await AppToolExecutor.quietBackupRestoreTarget(input, dataRoot: appModel.engine.trust.dataRoot) {
-            case .success(let target): backup = target
-            case .failure(let failure): return (false, failure.detail, failure.fields.merging(["effects": .string("none")]) { $1 })
-            }
-            let message: String
-            switch await appModel.restoreBackup(backup) {
-            case .saved(let detail): message = detail
-            case .failed(let detail): return (false, detail + retry, [:])
-            }
-            // Await staging because a staged restore restarts the app after this turn settles.
-            if turn.personAct == nil {
-                _ = await BodyDecidedRow.record(turn: turn, requester: "Full Mac", tool: "backup.restore \(backup.id)",
-                                                   sessionID: input["__session_id"]?.scalarText,
-                                                   dataRoot: appModel.engine.dataRoot)
-            }
-            return (true, message, ["id": .string(backup.id)])
         case "activity_wipe":
             let activity = appModel.engine.activityWatch
             let removed: Int
@@ -260,24 +300,18 @@ extension AppQuietToolHost: QuietInboxHost {
         await appModel.engine.approvals.refresh()
         return record
     }
-    func runCardControl(id: String, sessionID: String, choice: String?) async {
-        if let face {
-            do {
-                guard let card = try await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: appModel.engine.dataRoot) else {
-                    throw PartCallError(code: "card_unavailable", message: "This request has no saved interaction.")
-                }
-                let answer = CardAnswer(identity: .init(card: id, session: sessionID, revision: card.revision),
-                    choice: choice ?? "begin", fields: [:], secrets: [:])
-                let reply = try await face.act(.answerCard(answer))
-                switch reply {
-                case .card(let result): if let failure = result.failure { throw failure }
-                case .failed(let issue), .refused(let issue): throw issue
-                default: throw FaceWireError.invalidFeedOrder
-                }
-            } catch { appModel.setFailureStatus(error, action: "answer the request") }
-            return
+    func runCardControl(id: String, sessionID: String, choice: String?) async throws {
+        guard let face else { throw FaceWireError.disconnected }
+        guard let card = try await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: appModel.engine.dataRoot) else {
+            throw PartCallError(code: "card_unavailable", message: "This request has no saved interaction.")
         }
-        appModel.setFailureStatus(FaceWireError.disconnected, action: "open the request's window control")
+        let answer = CardAnswer(identity: .init(card: id, session: sessionID, revision: card.revision),
+            choice: choice ?? "begin", fields: [:], secrets: [:])
+        switch try await face.act(.answerCard(answer)) {
+        case .card(let result): if let failure = result.failure { throw failure }
+        case .failed(let issue), .refused(let issue): throw issue
+        default: throw FaceWireError.invalidFeedOrder
+        }
     }
     func inboxFence(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue? {
         await quietInboxFence(verb: verb, input: input, turn: turn)
@@ -313,7 +347,16 @@ extension AppQuietToolHost: QuietInboxHost {
 
 extension AppQuietToolHost {
     func provider(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
-        await ProvidersFacade.runQuietProvider(
+        let effect: @MainActor () async -> JSONValue
+        do { effect = try await prepareProvider(verb: verb, input: input, turn: turn) }
+        catch { return NativeAgentEngine.prepareRefusal(error, verb: verb) }
+        return await effect()
+    }
+
+    /// The provider verb's one switch, on the Providers page's own owners: its lookups, then its effect.
+    private func prepareProvider(verb: String, input: [String: JSONValue], turn: Turn) async throws -> @MainActor () async -> JSONValue {
+        let appModel = self.appModel
+        return try await ProvidersFacade.prepareQuietProvider(
             verb: verb, input: input, dataRoot: appModel.engine.dataRoot, turn: turn,
             refresh: {
                 switch await appModel.engine.providers.refreshSettings(refreshCatalog: true, cause: UserFacingError.cause) {

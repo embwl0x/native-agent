@@ -39,6 +39,10 @@ public struct MemoryWriteContext: Sendable {
     /// The principals the stem attests for this write.
     public var through: [String] { material ?? MemoryDataProvenance.through(turn: turn) }
 
+    /// A live turn's words: the steer a principal puts on them is today's. Material the stem attests (an archive, a night's lesson) carries its
+    /// own dates.
+    var turnSteers: Bool { material == nil }
+
     /// The one root this write adds, built by the stem whatever the writer states. A write of words that states no telling is refused.
     public func root() throws -> MemoryRoot {
         guard let telling else {
@@ -153,8 +157,9 @@ public enum MemoryDataProvenance {
     public static func presented(_ root: MemoryRoot, trust: PeerDataTaint.TrustRead? = nil) -> MemoryRoot {
         let trust = trust ?? PeerDataTaint.readTrust(root.through)
         if let teller = steering(root.through, trust: trust).first(where: { !material.contains($0) }) {
-            // A telling an untrusted agent carried is dated when the store wrote it; its stated time stays underneath.
-            return MemoryRoot(how: .told, by: tellerName(teller, trust: trust), at: root.written, written: root.written, through: root.through)
+            // A telling an untrusted agent carried reads as that agent's, at the time the root records: a live turn's root is dated when it was
+            // told, an attested record's when it was.
+            return MemoryRoot(how: .told, by: tellerName(teller, trust: trust), at: root.at, written: root.written, through: root.through)
         }
         if root.how == .told, root.by == nil, let peer = root.through.first(where: { $0.hasPrefix("peer:") }),
            let name = trust.sourceName(peer).flatMap(MemoryRoot.validName) {

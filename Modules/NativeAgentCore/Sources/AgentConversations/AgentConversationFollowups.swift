@@ -208,6 +208,17 @@ extension AgentConversationSession {
             throw AgentConversationStore.Failure(
                 message: "The displayed send has moved on; its newer send was not stopped. Read the contact again before requesting Stop.")
         }
+        // A held send still owed its answer is withdrawn: the agent's own word on its record, the one thing besides the answer that ends it. A
+        // delivery still waiting for it (a send held for the Mac) goes in the same step; every other delivery reads the record and skips it.
+        if heldReplyPending(latest, dataRoot: dataRoot) {
+            let withdrew = try await store.held.withdraw(latest.operationID)
+            if withdrew { try store.clearQueued(id: latest.id, onlyHeld: latest.operationID) }
+            let why = store.held.read(latest.operationID).unreadable ?? "it could not be withdrawn"
+            return .object(["agent": .string(name), "status": .string(withdrew ? "ok" : "failed"), "stopped": .bool(false),
+                "withdrawn": .bool(withdrew), "detail": .string(withdrew
+                    ? "Your message to \(name) is withdrawn: nothing waits on its answer now. If \(name) answers it, that comes as a message of its own."
+                    : "Your message to \(name) still waits on its answer: \(why). Repair its record, then withdraw it again.")])
+        }
         // Restart-interrupted sends remain releasable even without a live process.
         let orphan = latest.phase == "sending" && ownerless(latest)
         // A message waiting on the person's card is theirs to decide: a stop neither withdraws the card nor releases the conversation from it.

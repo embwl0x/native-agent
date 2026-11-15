@@ -49,6 +49,12 @@ extension SwiftToolDispatcher {
             case "invalid_mode":
                 path = "$.mode"
                 accepted = "read, write or read_write"
+            case "reserved_option_id":
+                path = "$.options"
+                accepted = "Option ids other than answer, begin, full_setup, restart and signIn, which name the card's own buttons."
+            case "invalid_model_option":
+                path = "$.options"
+                accepted = "Model options with id <provider>::<model>, as Providers lists them."
             default:
                 path = "$"
                 accepted = "A supported kind, target and additional targets with an available control in this app. Inspect request_interaction's argument form."
@@ -197,6 +203,15 @@ extension SwiftToolDispatcher {
             guard !target.isEmpty else {
                 return failed("missing_target", "Name the Providers group.")
             }
+            // A pick settles only as a provider::model pair; any other id would leave the card unanswerable.
+            let unsettleable = options.map(\.id).filter {
+                $0 != InlineInteractionRegistry.persistentChoiceOptionID && InlineInteractionRegistry.splitModelOptionID($0) == nil
+            }
+            guard unsettleable.isEmpty else {
+                return failed("invalid_model_option", "No card was raised: \(unsettleable.joined(separator: ", ")) "
+                    + "\(unsettleable.count == 1 ? "is" : "are") not <provider>::<model> ids, so picking \(unsettleable.count == 1 ? "it" : "them") "
+                    + "could never settle.")
+            }
             interaction = InlineInteractionRegistry.modelChoice(
                 group: target, why: why, options: options,
                 scopedToThisRequest: text("scope_noun"),
@@ -299,6 +314,12 @@ extension SwiftToolDispatcher {
                     "missing_consequence",
                     "A choice needs decline_consequence: say what happens if they don't pick."
                 )
+            }
+            // The card's own buttons answer with these words; an option named the same would be read as the button, not the pick.
+            let reserved = options.map(\.id).filter { InlineInteractionRegistry.cardControlWords.contains($0) }
+            guard reserved.isEmpty else {
+                return failed("reserved_option_id", "No card was raised: option id \(reserved.joined(separator: ", ")) "
+                    + "names one of the card's own buttons. Rename \(reserved.count == 1 ? "it" : "them").")
             }
             interaction = InlineInteractionRegistry.choose(
                 question: question, why: why, options: options,

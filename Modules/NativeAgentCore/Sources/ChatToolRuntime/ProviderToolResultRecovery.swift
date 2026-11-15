@@ -2,10 +2,12 @@ import ChatSessionWork
 import ChatToolParsing
 import ChatTurnContracts
 import CryptoKit
+import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
+import TurnTrace
 // Blueprint: | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`, `impl_tool_result_page`: Retain turn-bound results without loss. |
 
 private enum ResultRecoveryScopePart: TurnPart { static let unset: ProviderToolResultRecoveryStore.Scope? = nil }
@@ -446,8 +448,9 @@ package actor ProviderToolResultRecoveryStore {
     private func unavailable(handle: String, reason: String, sessionId: String?) -> JSONValue {
         let receipt = handle.hasPrefix("receipt-") ? UUID(uuidString: String(handle.dropFirst(8).prefix(36))) : nil
         var args: [String: JSONValue] = ["view": .string("receipts")]
+        // The receipt is found by its own id wherever it was recorded; only listing receipts needs this conversation.
         if let receipt { args["receipt_id"] = .string(receipt.uuidString.lowercased()) }
-        if let sessionId { args["session_id"] = .string(sessionId) }
+        else if let sessionId { args["session_id"] = .string(sessionId) }
         let recovery = receipt == nil
             ? "This handle has no bound receipt; next_call lists this conversation's receipts."
             : "next_call reads the original dispatch receipt."
@@ -704,10 +707,10 @@ extension SwiftToolDispatcher {
             // way: on from where that same read stopped, or from its start when it is a different read.
             // A query given, even an empty one (read everything), is named; only an absent or null query keeps the previous read's.
             let handle = input["result_handle"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return await ProviderToolResultRecoveryStore.shared.continueReading(
+            return await heldReceiptPointer(turnId: turn.id, await ProviderToolResultRecoveryStore.shared.continueReading(
                 handle: handle?.isEmpty == false ? handle : nil,
                 sessionId: ChatToolSessionInjection.explicitSessionId(in: input), turnId: turn.id, pages: pages,
-                query: input["query"]?.stringValue, raw: input["raw"] == .bool(true))
+                query: input["query"]?.stringValue, raw: input["raw"] == .bool(true)))
         }
         guard case .string(let handle)? = input["result_handle"], !handle.isEmpty else {
             return .object([
@@ -728,13 +731,38 @@ extension SwiftToolDispatcher {
                     """),
             ])
         }
-        return await ProviderToolResultRecoveryStore.shared.page(
+        return await heldReceiptPointer(turnId: turn.id, await ProviderToolResultRecoveryStore.shared.page(
             handle: handle,
             page: page,
             sessionId: ChatToolSessionInjection.explicitSessionId(in: input),
             turnId: turn.id,
             query: input["raw"] == .bool(true) ? nil : (input["query"]?.stringValue ?? ""),
             pages: pages
-        )
+        ))
+    }
+
+    /// An unavailable output points at its dispatch receipt only while the trace still holds it. Every receipt is dated by its own time in the
+    /// trace, which keeps details `ExperienceStore.detailHorizon`. A receipt the whole readable trace no longer holds within that gets no pointer,
+    /// and the answer says the detail aged out; a trace that cannot be read whole leaves the pointer as it was.
+    func heldReceiptPointer(turnId: String, _ answer: JSONValue) async -> JSONValue {
+        guard case .object(var fields) = answer, case .object(let remedy)? = fields["remedy"],
+              let id = remedy["next_call"]?.objectValue?["input"]?.objectValue?["args"]?.objectValue?["receipt_id"]?.stringValue else { return answer }
+        // This turn's receipts still on their way to the trace land first, so a fresh receipt is never read as aged out.
+        try? await TurnTraceBus.shared.flush(turnId: turnId)
+        guard let trace = try? await TurnTraceRecentReader(dataRootOverride: dataRoot).read(history: true,
+                  since: Date().addingTimeInterval(-ExperienceStore.detailHorizon), kinds: ["tool.dispatch"]), trace.completeSequences,
+              !trace.events.contains(where: { $0.payload.objectValue?["phase"] == .string("end")
+                  && $0.payload.objectValue?["receipt"]?.objectValue?["id"] == .string(id) }) else { return answer }
+        let days = Int(ExperienceStore.detailHorizon / 86_400)
+        fields["detail"] = .string("""
+            This retained output is unavailable, and its dispatch receipt is no longer in the trace: trace details are kept \(days) days, so \
+            the detail aged out. Missing output does not establish failure; never repeat a write to recover output.
+            """)
+        fields["receipt_aged_out"] = .bool(true)
+        fields["remedy"] = Repair.terminal(instruction: """
+            This handle and its receipt can no longer be read back; a file the output was saved to (saved_result_path in its first answer) \
+            still reads. Otherwise inspect the affected state itself before any further change; never repeat a write to recover output.
+            """)
+        return .object(fields)
     }
 }

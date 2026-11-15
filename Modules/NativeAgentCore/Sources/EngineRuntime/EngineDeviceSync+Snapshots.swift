@@ -153,6 +153,8 @@ extension NativeAgentEngine {
                     // Phone builds 61/63 require all three fields to draw their conversation card. These are the same prepared owner's facts.
                     row.interactionDescriptorJSON = try Self.phoneDisplayJSON(projected.descriptor, encoder: encoder)
                     row.interactionSessionID = projected.sessionID
+                    // The card's own face, whole; the phone puts its own Inbox row's answers on it.
+                    row.cardFaceJSON = try Self.phoneDisplayJSON(projected.face(answers: nil), encoder: encoder)
                 }
             } catch {
                 // One row the phone copy cannot prepare is that row's own failure, named with its cause; its siblings still cross.

@@ -39,6 +39,12 @@ final class MacSightCaptureBinding: @unchecked Sendable {
         get { lock.withLock { compiledPercept } }
         set { lock.withLock { compiledPercept = newValue } }
     }
+    private var sightedWindow: MacAXWindowIdentity?
+    /// The exact window this look read: its pid, its own AX window and the document AX names for it.
+    var window: MacAXWindowIdentity? {
+        get { lock.withLock { sightedWindow } }
+        set { lock.withLock { sightedWindow = newValue } }
+    }
     func confirm(validate: @escaping @Sendable () async -> Bool = { true }) {
         lock.lock(); defer { lock.unlock() }
         self.validate = validate
@@ -518,7 +524,8 @@ extension MacFourVerbs {
                     } == true
             }(),
             obstructions: nativeAXSupplement?.obstructions ?? [],
-            percept: percept
+            percept: percept,
+            window: captureBinding.window
         ))
     }
 

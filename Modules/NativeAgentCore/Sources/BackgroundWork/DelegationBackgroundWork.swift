@@ -221,10 +221,10 @@ public struct DelegationBackgroundWork: Sendable {
                     let word = job.runStatus ?? job.status ?? "failed"
                     var line = "\(name)'s wake failed" + (word == "failed" ? "" : " (\(word))")
                     if signIn { line += ": its sign-in failed or expired" } else if let head { line += ": \"\(head)\"" }
-                    // The line quotes the contact's words only when it carries the head of its reply.
-                    let quoted: [String]? = signIn || head == nil || job.agent.isEmpty ? nil : [job.agent]
+                    // News of the agent's own send, even quoting the head of the contact's reply, is the contact answering, never asking:
+                    // it steers nothing, since a turn's steering is who asked it.
                     Attention.post(Happening(.returned, subject: "wake:" + job.agent, door: "delegation:" + job.source, words: line,
-                        once: "wake-failed:\(job.source):\(job.id)", peers: quoted), dataRoot: dataRoot)
+                        once: "wake-failed:\(job.source):\(job.id)"), dataRoot: dataRoot)
                 }
                 return await recordBoundDelegationSettlement(dataRoot: dataRoot, job: job)
             },

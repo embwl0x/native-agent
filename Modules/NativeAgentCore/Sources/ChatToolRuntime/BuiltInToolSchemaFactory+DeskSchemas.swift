@@ -164,8 +164,8 @@ extension BuiltInToolSchemaFactory {
                     waiting-on-owner count. A wait on a name, a sentence or a conversation is a status only: nothing ends it but a status change. on also accepts an observed Desk handle/number or experience id (card, \
                     message, delivery, repair); a list waits on those dependencies; such a wait is released by itself when what it names settles. \
                     To be told when a contact answers, wait on the wait_on id your send to them returned (thread.wait_on); a send held for a \
-                    contact that collects its messages returns none, because its answer comes as a message of its own. Unknown \
-                    identifier-shaped inputs are refused.
+                    contact that collects its messages settles when the contact's message naming it answers it, or when you withdraw it. \
+                    Unknown identifier-shaped inputs are refused.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [

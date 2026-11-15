@@ -2,7 +2,8 @@ import AppKit
 import Foundation
 import NativeAgentShared
 import Observation
-// Blueprint: | `ApplicationLifetime.swift` | Renderer-owned scene mounting, command admission and acknowledged navigation |
+import SwiftUI
+// Blueprint: | `ApplicationLifetime.swift` | Scene mounting, command admission and acknowledged navigation; the window follows the turn's attention |
 
 enum NativeAgentNavigationDestination: Equatable, Sendable {
     case sidebar(SidebarItem)
@@ -33,8 +34,19 @@ final class ApplicationLifetime {
     @ObservationIgnored private var pending: [NativeAgentNavigationDestination] = []
     @ObservationIgnored private var mounted: (id: UUID, input: () -> [String: PartFace.Value]?,
         replayTour: () -> Void, deliver: (NativeAgentNavigationDestination) -> Void)?
+    /// The page the window showed right after the agent last moved it; the window coming to any other page was the person's choice.
+    @ObservationIgnored private var agentShown: [String: PartFace.Value]?
+    /// How many times the person has brought the window to a page, so a turn can tell whether the person took the window during it.
+    @ObservationIgnored private(set) var personMoves = 0
 
     var visiblePageInput: [String: PartFace.Value]? { mounted?.input() }
+
+    /// The window shows another page. The page the agent's own move brought it to is the agent's; any other is the person's.
+    func sceneShown() {
+        if visiblePageInput == agentShown { agentShown = nil } else { personMoves += 1 }
+    }
+    /// The person chose a place or a tab, which counts even when the page shown stays the same.
+    func personChose() { personMoves += 1 }
     var currentPage: QuietPage? {
         guard case .string(let page)? = visiblePageInput?["page"] else { return nil }
         return QuietPages.page(named: page)
@@ -110,9 +122,13 @@ final class ApplicationLifetime {
         guard let mounted else { throw PartCallError(code: "scene_unmounted", message: "Open the main window before replaying its tour.") }
         mounted.replayTour()
     }
-    func navigate(_ request: FaceNavigationRequest) async throws -> FaceReply {
+    /// `wanted` is asked again after every wait and before anything moves: a move nobody wants any more changes nothing.
+    func navigate(_ request: FaceNavigationRequest, wanted: @MainActor () -> Bool = { true }) async throws -> FaceReply {
         let target = request.destination
         guard let appModel else { throw FaceWireError.disconnected }
+        func stillWanted() throws {
+            guard wanted() else { throw PartCallError(code: "navigation_overtaken", message: "The window was taken before this move landed.") }
+        }
         if let session = target.session {
             try FaceWindowReply.check(await appModel.client.act(.selectConversation(session: session, userInitiated: false)))
             appModel.activeChatSessionId = session
@@ -139,6 +155,7 @@ final class ApplicationLifetime {
                 if item == .desk {
                     // Showing an item opens it, as its row does: the Desk's owner selects it, and the page draws it open.
                     // Selecting is an act, answered as one: only its failure or refusal stops the show.
+                    try stillWanted()
                     switch try await appModel.client.act(.deskCommand(.init(command: "select", handle: handle, arguments: [:]))) {
                     case .failed(let failure), .refused(let failure): throw failure
                     default: break
@@ -159,6 +176,11 @@ final class ApplicationLifetime {
                             _ = try await appModel.client.act(.readRun(id: handle)).checkedValue()
                             diagnosticsRun = handle
                             tab = "diagnostics"
+                        } else if item == .memories {
+                            // Any other item on Memories is a memory by its id, the id a recall names it by.
+                            appModel.pendingMemoryFaceTarget = .init(page: "memories", item: MemoriesFaceTarget.memory(handle).row,
+                                                                     session: nil, message: nil)
+                            tab = "memories"
                         } else {
                             throw PartCallError(code: "page_item_unavailable", message: "This page has no current item named " + handle + ".")
                         }
@@ -168,8 +190,10 @@ final class ApplicationLifetime {
         } else {
             throw PartCallError(code: "page_unavailable", message: "The requested page is absent from my current face.")
         }
+        try stillWanted()
         if request.policy == .quiet {
             let delivered = deliverQuietly(destination)
+            if delivered { agentShown = visiblePageInput }
             if delivered, let tab, let item { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(item)) }
             if delivered, let diagnosticsRun { appModel.diagnosticsRunID = diagnosticsRun }
             FaceReports.shared.sceneChanged()
@@ -177,6 +201,7 @@ final class ApplicationLifetime {
                                      reason: delivered ? nil : "The main scene is not mounted."))
         }
         let receipt = self.request(destination)
+        if receipt == .deliveredToMountedScene { agentShown = visiblePageInput }
         if let tab, let item { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(item)) }
         if let diagnosticsRun { appModel.diagnosticsRunID = diagnosticsRun }
         return .navigation(.init(disposition: receipt == .deliveredToMountedScene ? .mounted : .queued,
@@ -187,5 +212,104 @@ final class ApplicationLifetime {
         NSApp.activate()
         if let destination { return try await navigate(.init(destination: destination, policy: .foreground)) }
         return .acknowledged
+    }
+}
+
+/// The window is the agent's face, so it shows where the running turn's attention is (`TurnFace.nowOn`): each place once a turn, quietly,
+/// never brought to the front, and only while "The window follows me" is on. The record moves at most once a model round (the engine
+/// settles it when the model next speaks), and one move runs at a time: a place named while the window moves replaces any still waiting.
+/// The person outranks it: once the person brings the window to a page, chooses a place or a tab, or types in the composer or an ask bar
+/// during a turn, the window stays where the person has it for the rest of that turn, and a move already on its way lands nowhere. When
+/// the turn ends the window stays, unless the turn began in Chat and the person never took the window: then it returns to Chat.
+@MainActor final class FaceFollows {
+    static let shared = FaceFollows()
+    private var turn: String?
+    private var followed: Set<String> = []
+    private var personMovesAtStart = 0
+    private var taken = false
+    private var beganInChat = false
+    private var moved = false
+    private var moving = false
+    /// The move still to make and the turn it belongs to; it lands only while that turn is the window's and the person has not taken it.
+    private var owed: (destination: FaceDestination, turn: String?)?
+
+    func receive(_ attention: FaceAttention, appModel: AppModel) {
+        if attention.turn != turn {
+            let backToChat = turn != nil && moved && beganInChat && !personTook()
+            turn = attention.turn
+            followed = []
+            taken = false
+            moved = false
+            personMovesAtStart = ApplicationLifetime.shared.personMoves
+            let inChat = ApplicationLifetime.shared.currentPage?.item == .chat
+            if backToChat, !inChat { go(.init(page: "chat", item: nil, session: nil, message: nil), for: turn) }
+            // A turn that begins while the window goes back to Chat begins in Chat.
+            beganInChat = inChat || backToChat
+        }
+        guard turn != nil, let link = attention.link, !followed.contains(link),
+              case .page(let page, let item)? = FaceLink(link) else { return }
+        followed.insert(link)
+        guard appModel.facePreference(WindowFollowsPreference.key, as: Bool.self) == true, !personTook() else { return }
+        moved = true
+        go(.init(page: page, item: item, session: nil, message: nil), for: turn)
+    }
+
+    /// The person wrote in the composer or an ask bar: during a turn, the window is the person's for the rest of it.
+    func personTyped() {
+        if turn != nil { taken = true }
+    }
+
+    /// Whether the person has taken the window this turn: typed, or brought the window to a page or chose a place or tab since it began.
+    private func personTook() -> Bool {
+        if !taken { taken = ApplicationLifetime.shared.personMoves != personMovesAtStart }
+        return taken
+    }
+
+    private func wants(_ owner: String?) -> Bool { owner == turn && !personTook() }
+
+    private func go(_ destination: FaceDestination, for owner: String?) {
+        owed = (destination, owner)
+        guard !moving else { return }
+        moving = true
+        Task { @MainActor [self] in
+            while let next = owed {
+                owed = nil
+                guard wants(next.turn) else { continue }
+                let place = "page=" + next.destination.page + " item=" + (next.destination.item ?? "")
+                do {
+                    let reply = try await ApplicationLifetime.shared.navigate(.init(destination: next.destination, policy: .quiet),
+                                                                              wanted: { self.wants(next.turn) })
+                    if case .navigation(let receipt) = reply {
+                        transcriptLog.append { "face.follow " + place + " disposition=" + receipt.disposition.rawValue }
+                    }
+                } catch {
+                    let reason = error.localizedDescription
+                    transcriptLog.append { "face.follow.unshown " + place + " reason=" + reason }
+                }
+            }
+            moving = false
+        }
+    }
+}
+
+/// One conversation's turn and where its attention is, as the window reads it from the turn's face.
+struct FaceAttention: Equatable {
+    let turn: String?
+    let link: String?
+}
+
+/// Next to the Work pane's own watcher: reads the shown conversation's turn and hands its attention to `FaceFollows`.
+struct FaceFollowsWatcher: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        // Any door's turn the conversation shows: the Mac's own, the phone's, a resident's.
+        let attention = appModel.turnPart("nowOn", for: appModel.activeChatSessionId) {
+            FaceAttention(turn: $0?.isRunning == true ? $0?.turnID : nil, link: $0?.nowOn)
+        }
+        Color.clear
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+            .onChange(of: attention, initial: true) { _, attention in FaceFollows.shared.receive(attention, appModel: appModel) }
     }
 }

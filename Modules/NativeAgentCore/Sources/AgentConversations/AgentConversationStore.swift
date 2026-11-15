@@ -229,6 +229,13 @@ public struct AgentConversationStore: Sendable {
             guard let i = rows.firstIndex(where: { $0.id == id }), rows[i].queueReservation == nil, try ready(rows[i]),
                   let head = rows[i].queued?.first(where: { $0.held == nil || $0.waitingForMac == true }),
                   head.held == nil, head.id == item else { return nil }
+            // A send the agent withdrew never goes out: its record says so, and it leaves the queue unsent.
+            if held.read(head.id).withdrawn != nil {
+                rows[i].queued?.removeAll { $0.id == head.id }
+                if rows[i].queued?.isEmpty == true { rows[i].queued = nil }
+                try save(rows)
+                return nil
+            }
             // Keep a reservation visible in the queue until its send begins.
             rows[i].queueReservation = item
             try save(rows)

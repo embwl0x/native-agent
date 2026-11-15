@@ -13,6 +13,31 @@ public enum ChatToolOutcome {
         return .object(fields)
     }
 
+    /// A call refused before anything ran has one shape, whoever refuses it (an owner's lookup, the argument check, the autonomy gate's
+    /// deny): its code is the reason, its owner's words the detail, and it ran nothing, raised nothing and delivered nothing.
+    public static func refusedBeforeRunning(code: String, detail: String, extra: [String: JSONValue] = [:]) -> JSONValue {
+        // The words live in detail alone, a refusal has no outcome of its own, and who made the call is always said (the agent, unless the
+        // refuser knows it was the person's).
+        var fields = extra.filter { !["message", "error", "outcome"].contains($0.key) }
+        if fields["decided_by"] == nil { fields["decided_by"] = .string("agent") }
+        fields["status"] = .string("refused")
+        fields["reason"] = .string(code)
+        fields["detail"] = .string(detail)
+        fields["execution"] = .string("not_run")
+        fields["effects"] = .string("none")
+        fields["side_effects"] = .object(["notes_raised": .array([]), "knocks_delivered": .int(0)])
+        return .object(fields)
+    }
+
+    /// An owner's refusal object (its `reason` code and `detail` words, with what it lists) in the one shape above.
+    public static func refusedBeforeRunning(owner refusal: JSONValue) -> JSONValue {
+        var fields = refusal.objectValue ?? [:]
+        let code = fields.removeValue(forKey: "reason")?.stringValue ?? fields["failure_code"]?.stringValue ?? "refused"
+        let detail = [fields.removeValue(forKey: "detail"), fields["message"], fields["error"]].lazy.compactMap { $0?.stringValue }
+            .first { !$0.isEmpty } ?? ""
+        return refusedBeforeRunning(code: code, detail: detail, extra: fields)
+    }
+
     /// A raised need did not run and cannot count as progress or failure.
     public static func isWaitingInteraction(_ output: JSONValue, verdict: ExactResultClass? = nil) -> Bool {
         guard case .object(let object) = output,

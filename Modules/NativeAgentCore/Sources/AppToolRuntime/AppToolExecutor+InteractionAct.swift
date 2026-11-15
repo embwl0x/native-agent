@@ -263,7 +263,7 @@ extension AppToolExecutor {
             do {
                 let declined = try await InlineInteractionResolver.decline(
                     id: id, sessionID: sessionID,
-                    expectedRevision: current.revision, turn: turn, dataRoot: dataRoot
+                    expectedRevision: current.revision, byAgent: true, turn: turn, dataRoot: dataRoot
                 )
                 return await interactionReceipt(
                     declined, action: action, status: "ok",
@@ -419,16 +419,17 @@ extension AppToolExecutor {
                 try await InlineInteractionResolver.retryContinuation(current, sessionID: sessionID, dataRoot: dataRoot, turn: nil)
             } else if action == "decline" {
                 // The person's Not now wakes the conversation that raised the card with its promised consequence.
-                _ = try await InlineInteractionResolver.decline(id: id, sessionID: sessionID, expectedRevision: current.revision, turn: nil,
-                    dataRoot: dataRoot)
+                _ = try await InlineInteractionResolver.decline(id: id, sessionID: sessionID, expectedRevision: current.revision,
+                    door: turn.personAct?.door, turn: nil, dataRoot: dataRoot)
             } else if turn.personAct?.door == "mac" {
-                await host.runCardControl(id: id, sessionID: sessionID, choice: choice.isEmpty ? nil : choice)
+                try await host.runCardControl(id: id, sessionID: sessionID, choice: choice.isEmpty ? nil : choice)
             } else if !choice.isEmpty, current.kind == .choose {
                 _ = try await InlineInteractionResolver.complete(id: id, sessionID: sessionID, selection: choice,
-                    expectedRevision: current.revision, turn: nil, dataRoot: dataRoot)
+                    expectedRevision: current.revision, door: turn.personAct?.door, turn: nil, dataRoot: dataRoot)
             } else if !choice.isEmpty, current.kind == .modelChoice, choice != InlineInteractionRegistry.persistentChoiceOptionID {
                 _ = try await InlineInteractionResolver.answerModelChoice(current, sessionID: sessionID, picked: choice,
-                    scope: current.primaryScope, controls: { InlineInteractionResolver.platform.interactionControls() }, dataRoot: dataRoot)
+                    scope: current.primaryScope, door: turn.personAct?.door,
+                    controls: { InlineInteractionResolver.platform.interactionControls() }, dataRoot: dataRoot)
             } else {
                 return Self.interactionFailure("needs_mac", "This card's control runs on the Mac: answer it there. Nothing was changed.",
                     extra: ["interaction_id": .string(id)])

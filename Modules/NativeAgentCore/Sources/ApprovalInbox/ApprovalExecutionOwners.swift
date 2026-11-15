@@ -78,9 +78,15 @@ public final class ApprovalExecutionOwners: @unchecked Sendable {
         if let retained = shared.settlement(root: dataRoot, approvalID: record.id) { settlement = retained }
         else {
             do {
-                guard let returned = try await operation() else { return false }
+                // Between the yes and the saved outcome the record reads running, not empty.
+                try? await SwiftNativeApprovalInbox(root: dataRoot).markRunning(record.id)
+                guard let returned = try await operation() else {
+                    try? await SwiftNativeApprovalInbox(root: dataRoot).markRunning(record.id, running: false)
+                    return false
+                }
                 settlement = returned
             } catch {
+                try? await SwiftNativeApprovalInbox(root: dataRoot).markRunning(record.id, running: false)
                 await RepairOwed.owe(dataRoot, id: "approval.application:" + record.id, kind: .run,
                     operation: "approval.application:" + record.id, owner: "Approval " + record.id,
                     words: error.localizedDescription,

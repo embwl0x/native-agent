@@ -34,6 +34,8 @@ extension AgentConversationStore {
             }
         } catch { ExperienceStore.record(dataRoot, "agent-conversations") { _ in throw error } }
         release(dataRoot: dataRoot)
+        // What an earlier life answered and no turn took in is the agent's news now, once.
+        HeldSends.publish(dataRoot: dataRoot)
     }
 
     static func release(dataRoot: URL) {
@@ -137,8 +139,13 @@ extension AgentConversationStore {
                     // An empty or unreadable-as-empty list proves no contact was removed.
                     || (row.agent.hasPrefix("peer:") && !contacts.isEmpty && !contacts.contains(row.agent))
                 let queued = Set((row.queued ?? []).map(\.id))
-                // The row owns all sends it began; only each exchange proves its acceptance after the current operation advances.
+                // The row owns all sends it began; only each exchange proves its acceptance after the current operation advances. A held send
+                // is the exception: only its record moves it, so no later send, restore, lost contact or lost record lets it go.
                 for experience in open where experience.evidence.contains(evidence) {
+                    if experience.evidence.contains(HeldSends.evidence(experience.id)) {
+                        try await HeldSends.settle(experience, in: store, dataRoot: root)
+                        continue
+                    }
                     guard abandoned || (experience.id != row.operationID && !queued.contains(experience.id)) else { continue }
                     let exchange = row.exchanges?.last { $0.id == experience.id }
                     let accepted = !abandoned && (exchange?.reply != nil
@@ -175,8 +182,13 @@ extension AgentConversationStore {
                     evidence: [.init(source: "agents/conversations", id: row.id)],
                     addressedTo: [destination], owes: ["accept": .init(to: destination), "answer": .init(to: destination)])
                 if current == nil { try await store.begin(experience) }
+                let mark = HeldSends.evidence(experience.id)
+                if AgentConversationSession.heldSend(row), try await store.experience(experience.id)?.evidence.contains(mark) == false {
+                    try await store.append([.evidence(mark)], to: experience.id)
+                }
+                let held = try await store.experience(experience.id)?.evidence.contains(mark) == true
                 let delivery = AgentConversationDelivery.of(row, read: false)
-                if [.failed, .notDelivered, .unanswered].contains(delivery) {
+                if !held, [.failed, .notDelivered, .unanswered].contains(delivery) {
                     if let current = try await store.experience(experience.id) {
                         try await Self.settleExperience(current, in: store, accepted: false, evidence: evidence,
                                                         reason: delivery == .unanswered ? .expired : .failed)
@@ -189,6 +201,10 @@ extension AgentConversationStore {
                 }
                 try await store.append([.face(.init(words: TurnSecretRedactor.redactText(exchange?.reply ?? exchange?.prompt ?? ""),
                     artifacts: []))], to: experience.id)
+                if held, let now = try await store.experience(experience.id) {
+                    try await HeldSends.settle(now, in: store, dataRoot: root)
+                    continue
+                }
                 guard try await store.experience(experience.id)?.owes["answer"]?.phase.isSettled == false else { continue }
                 if delivery == .answered || (!row.awaitsReply && [.delivered, .read].contains(delivery)) {
                     try await store.append([.obligation(key: "answer", phase: .accepted,

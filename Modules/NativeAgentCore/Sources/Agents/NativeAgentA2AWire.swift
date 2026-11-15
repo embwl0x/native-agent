@@ -29,6 +29,8 @@ public enum NativeAgentA2AWire {
         var pushConfig: JSONValue?
         /// Set when the message's skill is the job.
         var job: AgentContactJob?
+        /// The held send this message names as the one it answers (`HeldSends.claim`).
+        var replyTo: String?
         var taskID: String { "na3.\(context).\(request)" }
 
         public init(rpcID: Any, context: String, request: String, clientMessageID: String,
@@ -181,6 +183,14 @@ public enum NativeAgentA2AWire {
             }
             var send = Send(rpcID: id, context: context, request: UUID().uuidString.lowercased(), clientMessageID: messageID, parts: decodedParts)
             send.job = job
+            // A held message's answer names it. The answer is words: a job or a message with files runs as ordinary work, files and all, and the
+            // send stays owed (AgentContactRuntime.run).
+            if let raw = metadata["reply_to"] {
+                guard let named = raw as? String, UUID(uuidString: named) != nil else {
+                    return .response(error(id, -32602, "reply_to is the reply_to of a held message you were given"))
+                }
+                send.replyTo = named
+            }
             send.streaming = method == "message/stream" || method == "SendStreamingMessage"
             send.blocking = blocking
             send.continuedTask = message["taskId"] as? String

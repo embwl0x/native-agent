@@ -63,7 +63,7 @@ extension EngineFaceActs {
             secrets = []
         // Account operations carry ids, consent or choices; credentials use the typed cases above.
         case .readProviderAccount, .saveChatChoice, .disconnectProvider, .beginOAuth, .signOutProvider, .decideCodexCLIConsent,
-             .repairCodexCLIConsent, .verifyCardOnReturn, .setConnectorEnabled, .disconnectConnector,
+             .repairCodexCLIConsent, .verifyCardOnReturn, .openCard, .setConnectorEnabled, .disconnectConnector,
              .testTelegram, .clearTelegramLogs, .repairTelegram, .removePhonePairing, .setUpChrome:
             secrets = []
         // Named app preferences, policy and maintenance carry decisions, identifiers, counts and declared modes.

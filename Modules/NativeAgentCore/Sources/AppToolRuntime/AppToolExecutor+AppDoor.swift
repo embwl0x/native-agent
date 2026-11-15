@@ -903,13 +903,27 @@ extension AppToolExecutor: PureToolArgumentValidating {
                 """, effects: .none, code: "argument_preflight_failed"), tool: "app")
         }
         if case .string(let code)? = fields["would_refuse"] {
-            fields["status"] = .string("refused")
             fields["reason"] = .string(code)
-            fields["effects"] = .string("none")
-            return .object(fields)
+            // The detail is the owner's own words, without the preview's "Would refuse: <code>." and "Nothing was done." around them.
+            var words = Self.doorText(fields["detail"])
+            for prefix in ["Would refuse: \(code). ", "Would refuse: "] where words.hasPrefix(prefix) {
+                words.removeFirst(prefix.count)
+                break
+            }
+            if words.hasSuffix(" Nothing was done.") { words.removeLast(" Nothing was done.".count) }
+            if !words.isEmpty { fields["detail"] = .string(words) }
+            return Self.liveRefusal(fields)
         }
         // Keep the exact failed spelling; reply.status also accepts state and normalized spellings.
         return reply.outcome == .refused || fields["status"] == .string("failed")
-            ? .object(fields) : nil
+            ? Self.liveRefusal(fields) : nil
+    }
+
+    /// A live call refused here was refused before any card: its receipt reads as that refusal (nothing ran, nothing raised), never as the
+    /// preview its checks ran in.
+    private static func liveRefusal(_ preview: [String: JSONValue]) -> JSONValue {
+        ChatToolOutcome.refusedBeforeRunning(owner: .object(preview.filter {
+            !$0.key.hasPrefix("would_") && !["preview_scope", "checks_not_run", "approver"].contains($0.key)
+        }))
     }
 }

@@ -204,7 +204,12 @@ extension AppActions {
             Add a file (path), or words I already hold (content with a file name such as board.html), to Make as a new version of ref (a new \
             ref when left out); returns the ref
             """,
-                  ["path?", "content?", "name?", "ref?", "prompt?", "model?"], tool: "make_studio", input: verb("add"), versionExempt: true),
+                  ["path?", "content?", "name?", "ref?", "prompt?", "model?"], warn: """
+                      A whiteboard is name.board, the whole document each version: {board:1,elements:[{id,type,…}]}; shape x,y,w,h,text,color,\
+                      kind:rounded|pill|rect; text x,y,text,size:title|large|body|small; container (a section) x,y,w,h,text,color; arrow from,to \
+                      (ids),label?; stroke x,y,points:[x0,y0,…] from x,y,color,width; colors green|yellow|purple|blue|peach|white|ink
+                      """,
+                  tool: "make_studio", input: verb("add"), versionExempt: true),
         AppAction("make.read", "make", "A Make ref's versions: n, path, prompt, created (newest ref when left out). Read page:make for the paged shelf.",
                   ["ref?"],tool: "make_studio", input: verb("read"), read: true),
         AppAction("studio.intake.read", "personality", """
@@ -685,7 +690,7 @@ extension AppActions {
                           use rhythms for schedule:),\u{20}
                           """
                       + """
-                          after_card <approval id>, at <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), \"in 20 minutes\" or \
+                          after_card <card id>, at <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), \"in 20 minutes\" or \
                           {seconds:120}, or a rhythm that brings it back each time:\u{20}
                           """
                       + "\"every 0 9,16 * * *\" (cron, Mac clock), \"every 2 hours\", or a schedule object {type: daily|weekly|cron|…}. "
@@ -765,7 +770,8 @@ extension AppActions {
               ["detail?:compact|full"], read: true),
         .fold("recent_trace_summary", "diagnostics", """
             Read traces from the life record; events stay in this conversation unless scope:all, which reads every conversation and the background \
-            life; receipts span all conversations unless session_id is explicit, with non-read actions first and complete retained since windows
+            life; receipts and a receipt_id span all conversations unless session_id is explicit, with non-read actions first and complete \
+            retained since windows
             """,
               ["view?:receipts", "effects_only?:bool", "since?", "limit?:int", "before?", "offset?:int", "completed_turns?:int", "kind?", "name?",
                   "status?", "scope?:conversation|all", "session_id?", "turn_id?", "receipt_id?", "fields?:[str]"], read: true),
@@ -782,22 +788,22 @@ extension AppActions {
 
         .fold("desk_read", "desk", """
             Your Desk: paged items with status, summary, notes and refs; handle reads one item, query searches, limit/offset page, sort changes order only
-            """, read: true),
+            """, subject: ["handle"], read: true),
         .fold("desk_add_item", "desk"),
-        .fold("desk_note", "desk"),
-        .fold("desk_set_status", "desk"),
-        .fold("desk_wait", "desk"),
-        .fold("desk_update_item", "desk"),
-        .fold("desk_add_ref", "desk"),
-        .fold("desk_blocked_on", "desk"),
-        .fold("desk_defer", "desk"),
+        .fold("desk_note", "desk", subject: ["handle"]),
+        .fold("desk_set_status", "desk", subject: ["handle"]),
+        .fold("desk_wait", "desk", subject: ["handle"]),
+        .fold("desk_update_item", "desk", subject: ["handle"]),
+        .fold("desk_add_ref", "desk", subject: ["handle"]),
+        .fold("desk_blocked_on", "desk", subject: ["handle"]),
+        .fold("desk_defer", "desk", subject: ["handle"]),
         .fold("desk_breakdown", "desk"),
-        .fold("desk_close", "desk", argumentNames: ["reason": ["evidence", "summary"], "canceled": ["status"]],
+        .fold("desk_close", "desk", subject: ["handle"], argumentNames: ["reason": ["evidence", "summary"], "canceled": ["status"]],
               argumentValues: ["canceled": ["canceled": .bool(true), "cancelled": .bool(true), "done": .bool(false)]]),
-        .fold("desk_archive", "desk"),
-        .fold("desk_work_log", "desk"),
-        .fold("desk_set_cadence", "desk"),
-        .fold("desk_set_notify", "desk"),
+        .fold("desk_archive", "desk", subject: ["handle"]),
+        .fold("desk_work_log", "desk", subject: ["handle"]),
+        .fold("desk_set_cadence", "desk", subject: ["handle"]),
+        .fold("desk_set_notify", "desk", subject: ["handle"]),
         .fold("desk_nag_control", "desk"),
         .fold("desk_open_pursuit", "desk"),
         .fold("task_ledger_list", "desk", "Shared task ledger: a separate list from your Desk", read: true),
@@ -808,7 +814,8 @@ extension AppActions {
             """),
         .fold("scheduler_cancel_job", "desk", "Cancel a scheduled read: it leaves the clock; a read already running finishes"),
         .fold("scheduler_cancel_job", "desk", id: "schedule.delete"),
-        .fold("recall_memory", "memories", "Recall saved facts, decisions and preferences; use studio.recall for journal entries", read: true, advisory: true),
+        .fold("recall_memory", "memories", "Recall saved facts, decisions and preferences; use studio.recall for journal entries",
+              subject: ["memory_id"], read: true, advisory: true),
         // Version-exempt: it appends a new memory; supersedes demotes the ids it names, which a repeat leaves demoted.
         .fold("commit_memory", "memories", versionExempt: true),
         .fold("memory_proposals_pending", "memories", read: true),

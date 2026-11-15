@@ -76,13 +76,16 @@ public actor MindStream: AttentionStream {
         }
     }
 
-    /// Runs one piece of the stream's work as a task the stream holds; the caller's cancellation reaches it, and so does closing.
+    /// Runs one piece of the stream's work as a task the stream holds; the caller's cancellation reaches it, and so does closing. The task retires
+    /// itself as its last step (as the night does), so a joined task is never still held: `close` sees each one leave and never spins on the actor.
     private func held(_ body: @escaping @Sendable () async -> Void) async {
         let id = UUID()
-        let task = Task { await body() }
+        let task = Task {
+            await body()
+            await self.retire(id)
+        }
         work[id] = task
         await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
-        work[id] = nil
     }
 
     private func retire(_ id: UUID) { work[id] = nil }
@@ -233,10 +236,13 @@ public actor MindStream: AttentionStream {
             let client = clients.bridgeChatClient()
             let admitted = try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: session, arrival: request.arrival(.hidden),
                                                               waitForCapacity: true, turn: turn) { held in
-                (try await request.chat(on: client, holding: held), held)
+                // The thought's input carries this news now: a held send's answer in it is delivered.
+                await HeldSends.delivered(HeldSends.answers(inNews: happenings), via: "news", dataRoot: self.dataRoot)
+                return (try await request.chat(on: client, holding: held), held)
             }
             switch admitted {
             case .steered(let reading):
+                await HeldSends.delivered(HeldSends.answers(inNews: happenings), via: "news", dataRoot: dataRoot)
                 // The open thought read it; that thought's settlement is its record.
                 await Attention.settle(happenings, by: .init(source: "thought", id: "thought:" + reading.runID), dataRoot: dataRoot)
             case .ran(let (response, held)):
@@ -689,6 +695,8 @@ public actor MindStream: AttentionStream {
                 // An open turn answers through its own door. Resolve a reply route only when this return runs on its own.
                 let target = try await self.returnDestination(contact: contact, promised: promised, session: session)
                 try await claim(target)
+                // The return's turn takes this news as its input now: a held send's answer in it is delivered.
+                await HeldSends.delivered(HeldSends.answers(inNews: happenings), via: "news", dataRoot: self.dataRoot)
                 var turn = turn
                 turn.envelope = turn.envelope?.withDeliveryRoute(target.chatToolReplyRoute)
                 do {
@@ -721,6 +729,7 @@ public actor MindStream: AttentionStream {
         switch admitted {
         case .steered(let reading):
             do { try await claim(nil) } catch is HeldByLedger { return Returned(evidence: ledger, status: .completed) }
+            await HeldSends.delivered(HeldSends.answers(inNews: happenings), via: "news", dataRoot: dataRoot)
             let saved: Result<Void, Error> = await settle {
                 do {
                     try await lifecycle.recordDelivery(.init(status: "steered", surface: "chat",

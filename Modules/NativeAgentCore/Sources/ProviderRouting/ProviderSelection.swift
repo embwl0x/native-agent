@@ -101,14 +101,15 @@ extension SwiftNativeProviderRouting {
     }
     /// May a helper hold this model? Asked in the order the causes stand: the account is connected, its model list reads, then the model is
     /// one the account offered (`ModelSlot.mayHold`, over the same rows `botModelChoices` lists) or the one this helper already holds (`held`),
-    /// so re-saving it with other settings is not a choice. Nil when it may; else the first cause, in its own words.
+    /// so re-saving it with other settings is not a choice. Nil when it may; else the first cause, in its own words. The account is the one the
+    /// helper names and runs on, never a sibling of its family: an API key and a sign-in of one vendor list different models.
     public func botModelRefusal(provider: String, model: String, held: String?) throws -> BotModelRefusal? {
         let openRouterModels = OpenRouterModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
         let moonshotModels = MoonshotModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
-        let route = Self.normalizeProviderId(provider)
+        let route = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let notConnected = "\(provider) is not connected. Connect it in Providers, or choose an account that is."
         guard let account = try nativeListProviders(openRouterModels: openRouterModels, moonshotModels: moonshotModels).providers
-                .first(where: { $0.configured == true && Self.normalizeProviderId($0.id) == route }) else {
+                .first(where: { $0.configured == true && $0.id.lowercased() == route }) else {
             return .init(field: "provider", code: "provider_not_connected", message: notConnected)
         }
         let readiness = providerReadiness(id: account.id)

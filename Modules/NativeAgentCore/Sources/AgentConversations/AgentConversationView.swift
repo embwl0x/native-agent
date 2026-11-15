@@ -131,10 +131,9 @@ public enum AgentConversationView {
         var thread: [String: JSONValue] = ["conversation": .string(row.label), "exchanges": .int(Int64(row.exchanges?.count ?? 0)),
             "state": .string(row.phase), "history": .string("agent_read shows the conversation, both directions.")]
         if let id = AgentConversationSession.threadID(row) { thread["thread_id"] = .string(id) }
-        // An unanswered send is a condition the Desk can wait on: its record settles when the answer lands, fails or expires. Not a held
-        // send: a contact that pulls its messages answers with a message of its own, which nothing ties to the send, so a wait on it
-        // would end only when the send expired.
-        if fields["reply"] == nil, row.awaitsReply, !AgentConversationSession.heldReplyPending(row) {
+        // An unanswered send is a condition the Desk can wait on: its record settles when the answer lands, fails or expires. A held send's
+        // settles when the message naming it by its reply_to answers it, or when the agent withdraws it.
+        if fields["reply"] == nil, row.awaitsReply {
             thread["wait_on"] = .string(row.operationID)
         }
         fields["thread"] = .object(thread)
@@ -145,6 +144,18 @@ public enum AgentConversationView {
     package static func view(_ row: AgentConversationRecord, details: Bool, read: Bool = false, dataRoot: URL,
                      historyBefore: String? = nil, historyExchange: String? = nil, includeHistory: Bool = true,
                      historyLimit: Int = 8, sendPrefix: String? = nil) -> JSONValue {
+        // A held send's answer is read from its record, never copied onto the row: the view shows it as the send's reply.
+        var row = row
+        // It names the send (`held_answer`): the turn that takes this result in records the answer delivered (`HeldSends.delivered`), and one
+        // already delivered says so.
+        let record = HeldSends(dataRoot: dataRoot).read(row.operationID)
+        if AgentConversationSession.heldSend(row), let answer = record.answered, let text = answer.text, case .object(var fields)? = row.receipt {
+            fields["reply"] = .string(text); fields["status"] = .string("answered"); fields["reply_from"] = answer.from.map(JSONValue.string)
+            fields["held_answer"] = .string(row.operationID)
+            if record.delivered != nil { fields["held_answer_delivered"] = .bool(true) }
+            row.receipt = .object(fields)
+            if let i = row.exchanges?.lastIndex(where: { $0.id == row.operationID }) { row.exchanges?[i].reply = text }
+        }
         let receipt = row.sendReceipt ?? .object(["status": .string("unknown")])
         guard case .object = receipt else { return receipt }
         let peers: [AgentPeerContact]
@@ -280,7 +291,7 @@ public enum AgentConversationView {
         }
         if let text = reply(value) { result["reply"] = .string(text) }
         for key in ["untrusted_remote_data", "source_availability", "read_error", "retention_error", "reply_truncated", "reply_location",
-            "receipt_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages"] {
+            "receipt_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages", "held_answer", "held_answer_delivered"] {
             if let field = value[key] ?? root[key] { result[key] = field }
         }
         for key in ["reply_state", "automatic_resend", "read", "execution", "completed", "terminal", "needs_input",

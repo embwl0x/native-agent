@@ -64,6 +64,123 @@ extension AppQuietSettingsHost {
 // MARK: - connections
 
 extension AppQuietToolHost {
+    /// The connections verbs' own checks of what they name, made before any effect: the run makes them, and the gate makes them before any
+    /// card. The verbs the engine's rows run are the engine's to check.
+    func connectionsFence(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue? {
+        do {
+            if try await prepareConnections(verb: verb, input: input, turn: turn) != nil { return nil }
+        } catch { return NativeAgentEngine.prepareRefusal(error, verb: verb) }
+        return await appModel.engine.connectionsFence(verb, input: input, turn: turn)
+    }
+
+    /// The Full Mac connections verbs' one switch: the connector or phone a verb names (read now) throws its owner's refusal, or the verb's
+    /// effect comes back to run. Nil for a verb whose lookups are another owner's.
+    private func prepareConnections(verb: String, input: [String: JSONValue], turn: Turn) async throws -> (@MainActor () async -> JSONValue)? {
+        func decided(_ tool: String) {
+            BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: tool, sessionID: input["__session_id"]?.scalarText,
+                                   dataRoot: appModel.engine.dataRoot)
+        }
+        switch verb {
+        case "connector_off", "connector_on":
+            // Below Full Mac, enabling belongs to the user; the tool door refuses it.
+            let on = verb == "connector_on"
+            let connector = try await namedSwitch(verb: verb, input: input).get()
+            return { [self] in
+                guard connector.enabled != on else {
+                    return .object(["status": .string("ok"), "changed": .bool(false), "id": .string(connector.id),
+                                    "detail": .string("\(connector.name) is already \(on ? "on" : "off").")])
+                }
+                switch await appModel.updateConnector(connector, enabled: on) {
+                case .verified:
+                    if on {
+                        BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "connector.on \(connector.id)",
+                                               sessionID: input["__session_id"]?.scalarText,
+                                               dataRoot: appModel.engine.dataRoot)
+                    }
+                    return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(connector.id),
+                                    "detail": .string(on ? "\(connector.name) is on."
+                                        : "\(connector.name) is off. Turning it back on is the owner's below Full Mac.")])
+                case .failed(let detail):
+                    // Preserve the raw cause alongside the plain failure line.
+                    let line = appModel.statusCause == nil ? detail : appModel.statusForAgent
+                    return AppToolExecutor.failure("\(verb)_failed",
+                        "\(line) \(connector.name) may still be \(on ? "off" : "on"); read app {page:\"connectors\"}, then retry.",
+                        extra: ["id": .string(connector.id), "effects": .string("unknown")])
+                }
+            }
+        // Below Full Mac, these four controls belong to the user; each publishes its decided row.
+        case "connector_disconnect":
+            let connector = try await namedConnector(input).get()
+            return { [self] in
+                do { _ = try await NativeAgentEngine.live.ports.deviceSyncHost.disconnectConnector(id: connector.id) } catch {
+                    return AppToolExecutor.failure("connector_disconnect_failed",
+                        "\(error.localizedDescription) Read app {page:\"connectors\"} for where \(connector.name) stands.",
+                        extra: ["id": .string(connector.id), "effects": .string("unknown")])
+                }
+                _ = await appModel.refreshForSidebarItem(.connectors)
+                decided("connector.disconnect \(connector.id)")
+                return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(connector.id),
+                                "detail": .string("\(connector.name) is disconnected and off. Signing back in is the owner's.")])
+            }
+        case "pairing_remove":
+            let (store, phone) = try await namedPhone(input).get()
+            return {
+                guard await store.setStatus(.removed, id: phone.id) else {
+                    return AppToolExecutor.failure(
+                        "pairing_remove_failed",
+                        (store.message ?? "The removal did not save.") + " The phone is as it was.",
+                        extra: ["id": .string(phone.id), "effects": .string("unknown")]
+                    )
+                }
+                decided("pairing.remove \(phone.id)")
+                return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(phone.id),
+                                "detail": .string("Removed the phone: it no longer decides approvals. Pairing it again is the owner's.")])
+            }
+        default: return nil
+        }
+    }
+
+    /// The connector a call names by `id` (its id or its name), read now, or the refusal that lists the ids there are.
+    private func namedConnector(_ input: [String: JSONValue]) async -> Result<ConnectorRecord, QuietArgumentRefusal> {
+        let wanted = input["id"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let connectors: [ConnectorRecord]
+        do { connectors = try await appModel.engine.connectors.refresh().get() }
+        catch { return .failure(QuietArgumentRefusal(ChatToolOutcome.failure(error: error, tool: "app"))) }
+        guard let connector = connectors.first(where: { $0.id.lowercased() == wanted || $0.name.lowercased() == wanted }) else {
+            return .failure(QuietArgumentRefusal(AppToolExecutor.failure("unknown_connector",
+                "No connector is called \(wanted.isEmpty ? "that" : wanted). Pass id, one of the ids below.",
+                extra: ["ids": .array(connectors.map { .string($0.id) }), "argument_path": .string("args.id")])))
+        }
+        return .success(connector)
+    }
+
+    /// The connector a switch's change names, with the position it moves to: a position this verb does not move to is a switch read before
+    /// a change, refused as stale.
+    private func namedSwitch(verb: String, input: [String: JSONValue]) async -> Result<ConnectorRecord, QuietArgumentRefusal> {
+        let on = verb == "connector_on"
+        let named = await namedConnector(input)
+        guard case .success(let connector) = named, let value = input["value"], value != .bool(on) else { return named }
+        return .failure(QuietArgumentRefusal(AppToolExecutor.failure("stale_switch", """
+            \(connector.name)'s switch moved since it was read: \(verb) does not turn it \(on ? "off" : "on"). Read Connectors again.
+            """, extra: ["id": .string(connector.id), "argument_path": .string("args.value")])))
+    }
+
+    /// The paired or waiting phone a call names by `id`, read now, with the store that holds it, or the refusal that lists the ids there are.
+    private func namedPhone(_ input: [String: JSONValue]) async -> Result<(PairedPhoneStore, PairedPhoneStore.Phone), QuietArgumentRefusal> {
+        guard let store = appModel.engine.sync.owner?.pairedPhones else {
+            return .failure(QuietArgumentRefusal(AppToolExecutor.failure("pairing_unavailable", "Pairing is unavailable, so nothing was removed.")))
+        }
+        await store.reload()
+        let phones = store.phones.filter { $0.status != .removed }
+        let wanted = input["id"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let phone = phones.first(where: { $0.id == wanted }) else {
+            return .failure(QuietArgumentRefusal(AppToolExecutor.failure("unknown_phone",
+                "No paired or waiting phone has that id. Pass id, one of the ids below.",
+                extra: ["ids": .array(phones.map { .string($0.id) }), "argument_path": .string("args.id")])))
+        }
+        return .success((store, phone))
+    }
+
     func connections(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
         func text(_ key: String) -> String {
             input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -75,66 +192,10 @@ extension AppQuietToolHost {
             BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: tool, sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: appModel.engine.dataRoot)
         }
+        do {
+            if let effect = try await prepareConnections(verb: verb, input: input, turn: turn) { return await effect() }
+        } catch { return NativeAgentEngine.prepareRefusal(error, verb: verb) }
         switch verb {
-        case "connector_off", "connector_on":
-            // Below Full Mac, enabling belongs to the user; the tool door refuses it.
-            let on = verb == "connector_on"
-            let wanted = text("id").lowercased()
-            let connectors: [ConnectorRecord]
-            do { connectors = try await appModel.engine.connectors.refresh().get() }
-            catch { return ChatToolOutcome.failure(error: error, tool: "app") }
-            guard let connector = connectors.first(where: { $0.id.lowercased() == wanted || $0.name.lowercased() == wanted }) else {
-                return AppToolExecutor.failure("unknown_connector",
-                    "No connector is called \(wanted.isEmpty ? "that" : wanted). Pass id, one of the ids below.",
-                    extra: ["ids": .array(connectors.map { .string($0.id) })])
-            }
-            // A switch's change names the position it moves to; a position this verb does not move to is a switch read before a change.
-            if let value = input["value"], value != .bool(on) {
-                return AppToolExecutor.failure("stale_switch", """
-                    \(connector.name)'s switch moved since it was read: \(verb) does not turn it \(on ? "off" : "on"). Read Connectors again.
-                    """, extra: ["id": .string(connector.id)])
-            }
-            guard connector.enabled != on else {
-                return .object(["status": .string("ok"), "changed": .bool(false), "id": .string(connector.id),
-                                "detail": .string("\(connector.name) is already \(on ? "on" : "off").")])
-            }
-            switch await appModel.updateConnector(connector, enabled: on) {
-            case .verified:
-                if on {
-                    BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "connector.on \(connector.id)",
-                                           sessionID: input["__session_id"]?.scalarText,
-                                           dataRoot: appModel.engine.dataRoot)
-                }
-                return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(connector.id),
-                                "detail": .string(on ? "\(connector.name) is on."
-                                    : "\(connector.name) is off. Turning it back on is the owner's below Full Mac.")])
-            case .failed(let detail):
-                // Preserve the raw cause alongside the plain failure line.
-                let line = appModel.statusCause == nil ? detail : appModel.statusForAgent
-                return AppToolExecutor.failure("\(verb)_failed",
-                    "\(line) \(connector.name) may still be \(on ? "off" : "on"); read app {page:\"connectors\"}, then retry.",
-                    extra: ["id": .string(connector.id), "effects": .string("unknown")])
-            }
-        // Below Full Mac, these four controls belong to the user; each publishes its decided row.
-        case "connector_disconnect":
-            let wanted = text("id").lowercased()
-            let connectors: [ConnectorRecord]
-            do { connectors = try await appModel.engine.connectors.refresh().get() }
-            catch { return ChatToolOutcome.failure(error: error, tool: "app") }
-            guard let connector = connectors.first(where: { $0.id.lowercased() == wanted || $0.name.lowercased() == wanted }) else {
-                return AppToolExecutor.failure("unknown_connector",
-                    "No connector is called \(wanted.isEmpty ? "that" : wanted). Pass id, one of the ids below.",
-                    extra: ["ids": .array(connectors.map { .string($0.id) })])
-            }
-            do { _ = try await NativeAgentEngine.live.ports.deviceSyncHost.disconnectConnector(id: connector.id) } catch {
-                return AppToolExecutor.failure("connector_disconnect_failed",
-                    "\(error.localizedDescription) Read app {page:\"connectors\"} for where \(connector.name) stands.",
-                    extra: ["id": .string(connector.id), "effects": .string("unknown")])
-            }
-            _ = await appModel.refreshForSidebarItem(.connectors)
-            decided("connector.disconnect \(connector.id)")
-            return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(connector.id),
-                            "detail": .string("\(connector.name) is disconnected and off. Signing back in is the owner's.")])
         case "telegram_disconnect":
             // Defer Telegram poll restart until all turns finish because shutdown awaits them, including this turn.
             // Read metadata independently so a Keychain fault cannot erase settings or block revocation.
@@ -146,27 +207,6 @@ extension AppQuietToolHost {
             }
             if result.succeeded { decided("telegram.disconnect") }
             return outcome(result)
-        case "pairing_remove":
-            guard let store = appModel.engine.sync.owner?.pairedPhones else {
-                return AppToolExecutor.failure("pairing_unavailable", "Pairing is unavailable, so nothing was removed.")
-            }
-            await store.reload()
-            let phones = store.phones.filter { $0.status != .removed }
-            guard let phone = phones.first(where: { $0.id == text("id") }) else {
-                return AppToolExecutor.failure("unknown_phone",
-                    "No paired or waiting phone has that id. Pass id, one of the ids below.",
-                    extra: ["ids": .array(phones.map { .string($0.id) })])
-            }
-            guard await store.setStatus(.removed, id: phone.id) else {
-                return AppToolExecutor.failure(
-                    "pairing_remove_failed",
-                    (store.message ?? "The removal did not save.") + " The phone is as it was.",
-                    extra: ["id": .string(phone.id), "effects": .string("unknown")]
-                )
-            }
-            decided("pairing.remove \(phone.id)")
-            return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(phone.id),
-                            "detail": .string("Removed the phone: it no longer decides approvals. Pairing it again is the owner's.")])
         case "telegram_repair":
             do {
                 return try await TelegramUpdateInbox.repair(dataRoot: appModel.engine.dataRoot, inbox: text("inbox"))

@@ -35,12 +35,8 @@ public actor AppRelaunch {
     /// The cooldown prevents a model from restarting the app on every turn.
     public static let cooldownSeconds: TimeInterval = 600
     public static let terminateGraceSeconds: TimeInterval = 20
-    /// A refused or stalled quit must not leave a surviving helper forever.
-    public static let relaunchExitDeadlineSeconds = 120
-    /// The whole-quit deadline includes the turn wait (20 s), sleep (30 s), termination drain (3 s) and 7 s for AppKit and process exit.
-    public static let operatorRelaunchExitDeadlineSeconds = 60
-    /// Reserve the operator's whole-quit budget within the relauncher's bound.
-    public static let stalledTurnSeconds = TimeInterval(relaunchExitDeadlineSeconds - operatorRelaunchExitDeadlineSeconds)
+    /// How long the originating turn may take to settle before the restart asks to quit anyway.
+    public static let stalledTurnSeconds: TimeInterval = 60
     /// Platform hooks live above this module; refuse restarts until app launch configures both hooks.
     public static let shared = AppRelaunch()
 
@@ -76,20 +72,20 @@ public actor AppRelaunch {
 
     /// Run the exit observer before app state or UI startup so the helper remains detached from the app lifecycle.
     public static func relauncherArgv(pid: Int32, appPath: String) -> [String] {
-        exitObserverArgv(pid: pid, appPath: appPath, seconds: relaunchExitDeadlineSeconds)
+        exitObserverArgv(pid: pid, appPath: appPath)
     }
 
-    private nonisolated static func exitObserverArgv(pid: Int32, appPath: String, seconds: Int) -> [String] {
+    private nonisolated static func exitObserverArgv(pid: Int32, appPath: String) -> [String] {
         [Bundle.main.executablePath ?? appPath + "/Contents/MacOS/NativeAgentApp",
-         "--nativeagent-relaunch-after-exit", String(pid), appPath, String(seconds)]
+         "--nativeagent-relaunch-after-exit", String(pid), appPath]
     }
 
     /// Called at the executable entry point, before single-instance admission. kqueue registration precedes the parent read, closing the exit race.
+    /// The helper reopens the app only when the old process is seen exited, however long its quit settles; no clock ends the wait.
     public nonisolated static func runRelaunchHelperIfRequested() -> Bool {
         let args = CommandLine.arguments
         guard args.dropFirst().first == "--nativeagent-relaunch-after-exit" else { return false }
-        guard args.count == 5, let pid = Int32(args[2]), pid > 1,
-              let seconds = Int(args[4]), seconds > 0, seconds <= relaunchExitDeadlineSeconds else { return true }
+        guard args.count == 4, let pid = Int32(args[2]), pid > 1 else { return true }
         let queue = kqueue()
         guard queue >= 0 else { return true }
         defer { close(queue) }
@@ -101,13 +97,8 @@ public actor AppRelaunch {
         if getppid() == pid {
             guard registered == 0 else { return true }
             var event = kevent()
-            let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(seconds) * 1_000_000_000
             while true {
-                let now = DispatchTime.now().uptimeNanoseconds
-                guard now < deadline else { return true }
-                let remaining = deadline - now
-                var timeout = timespec(tv_sec: Int(remaining / 1_000_000_000), tv_nsec: Int(remaining % 1_000_000_000))
-                let count = kevent(queue, nil, 0, &event, 1, &timeout)
+                let count = kevent(queue, nil, 0, &event, 1, nil)
                 if count < 0 && errno == EINTR { continue }
                 guard count == 1, event.flags & UInt16(EV_ERROR) == 0,
                       event.fflags & UInt32(NOTE_EXIT) != 0 else { return true }
@@ -292,7 +283,7 @@ public actor AppRelaunch {
                     "tool": .string("restart_app"),
                     "note": .string("""
                         Restarting after this turn settles. If it stalls for \(Int(grace))s, the app exits with an explicit unfinished outcome. A \
-                        detached relauncher reopens \(appPath) after process exit; it aborts after \(Self.relaunchExitDeadlineSeconds)s.
+                        detached relauncher reopens \(appPath) once the old process has exited.
                         """),
                     "runId": .string(runId),
                     "reason": .string(effectiveReason),
@@ -415,8 +406,7 @@ extension AppRelaunch {
         onSpawnFailure: (Error) -> Void
     ) {
         do {
-            try spawnDetached(argv: exitObserverArgv(pid: pid, appPath: bundlePath,
-                                                     seconds: operatorRelaunchExitDeadlineSeconds))
+            try spawnDetached(argv: exitObserverArgv(pid: pid, appPath: bundlePath))
         } catch {
             onSpawnFailure(error)
             return

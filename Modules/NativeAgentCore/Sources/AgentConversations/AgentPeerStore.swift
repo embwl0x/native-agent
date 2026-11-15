@@ -4,9 +4,11 @@ import Darwin
 import Dispatch
 import Foundation
 import Experiences
+import MemoryV2
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
+import Synchronization
 import TurnTrace
 // Blueprint: | `AgentPeerStore.swift` | `isReady`, `AgentContactHealth`, `list` |
 
@@ -843,11 +845,13 @@ public struct AgentPeerStore: Sendable {
     private func write(_ peers: [AgentPeerContact]) throws {
         let previous = try read()
         guard peers != previous else { return }
+        let peers = carryLevers(from: previous, to: peers)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(peers)
         guard data.count <= Self.maximumConfigurationBytes else { throw AgentPeerStoreError.configurationTooLarge.failure(file: fileURL) }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
+        renameRelinked(from: previous, to: peers)
         if Self.trustIdentity(peers) != Self.trustIdentity(previous) {
             NotificationCenter.default.post(name: Self.trustDidChange, object: fileURL)
             let locator = fileURL.standardizedFileURL.path
@@ -857,6 +861,113 @@ public struct AgentPeerStore: Sendable {
                     canonicalLocator: locator, reason: "contact_trust_changed"))
             }
         }
+    }
+
+    /// A contact removed is a link retired: its id is kept under its endpoint in `agents/retired-links.json` (never a trust file). A contact
+    /// added later, in this save or another, at an endpoint with retired ids is the same agent relinked: memory's roots that name each
+    /// `peer:<old>` name `peer:<new>`, once the save has landed, and the endpoint's entry clears. Only who a root records changes; the new
+    /// contact's trust is its own switch, and nothing of the old one (grant, elevation, Desk, proof) is copied or raised.
+    private func renameRelinked(from previous: [AgentPeerContact], to peers: [AgentPeerContact]) {
+        let now = Set(peers.map(\.id)), before = Set(previous.map(\.id))
+        let file = fileURL.deletingLastPathComponent().appendingPathComponent("retired-links.json")
+        let held = Self.retiredLinks(file)
+        var retired = held
+        for old in previous where !now.contains(old.id) {
+            let links = retired[Self.linkKey(old), default: []]
+            if !links.contains(where: { $0.id == old.id }) {
+                retired[Self.linkKey(old)] = links + [RetiredLink(id: old.id, allowElevation: old.allowElevation, readsDesk: old.readsDesk)]
+            }
+        }
+        // An id still saved is no retired link, wherever it was retired from (a contact moved to a new route keeps its id).
+        retired = retired.mapValues { $0.filter { !now.contains($0.id) } }.filter { !$0.value.isEmpty }
+        var renames: [(from: String, to: String)] = []
+        let added = peers.filter { !before.contains($0.id) }
+        for new in added {
+            let key = Self.linkKey(new)
+            // Two new contacts on one link name no one agent: its retired ids wait.
+            guard let ids = retired[key], added.count(where: { Self.linkKey($0) == key }) == 1 else { continue }
+            renames += ids.map(\.id).filter { $0 != new.id }.map { ("peer:" + $0, "peer:" + new.id) }
+        }
+        if retired != held {
+            do {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(try encoder.encode(retired), to: file)
+            } catch { nativeLog("Contacts: retired links could not be kept (%@)", error.localizedDescription) }
+        }
+        guard !renames.isEmpty else { return }
+        let dataRoot = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        // A root with no memory store has no roots to rename; opening one would create it.
+        guard SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot)
+            || FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("memory/memory.sqlite").path) else { return }
+        let pending = renames
+        // Renames run in the order the saves landed (A then B then C), and a retired id clears only once its rename has landed; one that
+        // fails stays retired for the next save on its link.
+        Self.renames.withLock { last in
+            let previous = last
+            last = Task {
+                await previous?.value
+                for rename in pending {
+                    do {
+                        _ = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot).renamePrincipal(rename.from, to: rename.to)
+                        Self.clearRetired(String(rename.from.dropFirst("peer:".count)), file: file)
+                    } catch {
+                        nativeLog("Contacts: memories naming %@ still name it, not %@ (%@)", rename.from, rename.to, error.localizedDescription)
+                    }
+                }
+            }
+        }
+    }
+
+    private static let renames = Mutex<Task<Void, Never>?>(nil)
+
+    /// One link: an endpoint and, for an ACP host, the folder it starts in, so two workspaces of one host are two links.
+    static func linkKey(_ contact: AgentPeerContact) -> String {
+        contact.endpoint.absoluteString + (contact.acpWorkingDirectory.map { "|" + $0 } ?? "")
+    }
+
+    /// A retired link: the old id, and the person's own levers on it as they last were.
+    struct RetiredLink: Codable, Equatable {
+        let id: String
+        let allowElevation: Bool?
+        let readsDesk: Bool?
+    }
+
+    static func retiredLinks(_ file: URL) -> [String: [RetiredLink]] {
+        (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode([String: [RetiredLink]].self, from: $0) } ?? [:]
+    }
+
+    /// The same agent relinked keeps the levers the person set on it (Trust's elevation, the Desk): a contact added on a link that a contact
+    /// left, in this save or an earlier one, takes that contact's levers as they last were. Nothing is raised that the person had not set,
+    /// and elevation only follows where it can stand (the new contact's own credential holds).
+    private func carryLevers(from previous: [AgentPeerContact], to peers: [AgentPeerContact]) -> [AgentPeerContact] {
+        let before = Set(previous.map(\.id)), now = Set(peers.map(\.id))
+        var retired = Self.retiredLinks(fileURL.deletingLastPathComponent().appendingPathComponent("retired-links.json"))
+        for old in previous where !now.contains(old.id) {
+            retired[Self.linkKey(old), default: []].append(RetiredLink(id: old.id, allowElevation: old.allowElevation, readsDesk: old.readsDesk))
+        }
+        let added = peers.filter { !before.contains($0.id) }
+        var out = peers
+        for (index, peer) in out.enumerated() where !before.contains(peer.id) {
+            let key = Self.linkKey(peer)
+            guard added.count(where: { Self.linkKey($0) == key }) == 1, let last = retired[key]?.last(where: { $0.id != peer.id }) else { continue }
+            if peer.readsDesk == nil, last.readsDesk == true { out[index].readsDesk = true }
+            if peer.allowElevation == nil, last.allowElevation == true {
+                out[index].allowElevation = true
+                if out[index].elevationUnavailable(peers: out) != nil { out[index].allowElevation = nil }
+            }
+        }
+        return out
+    }
+
+    /// A retired id whose rename landed leaves the record.
+    static func clearRetired(_ id: String, file: URL) {
+        var held = retiredLinks(file)
+        guard !held.isEmpty else { return }
+        held = held.mapValues { $0.filter { $0.id != id } }.filter { !$0.value.isEmpty }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try? SwiftNativePersistenceCore.writeDataAtomicDurable(try encoder.encode(held), to: file)
     }
 
     /// Compare the canonical fields read by principal/name resolution and credential-backed grants, without persisting another truth.

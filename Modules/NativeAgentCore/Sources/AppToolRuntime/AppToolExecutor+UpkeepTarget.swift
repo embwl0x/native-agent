@@ -2,7 +2,13 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import TrustPersistence
-// Blueprint: | `AppToolExecutor+UpkeepTarget.swift` | backup restore target validation |
+// Blueprint: | `AppToolExecutor+UpkeepTarget.swift` | backup restore target validation; `QuietArgumentRefusal` |
+
+/// An owner's refusal of a call's arguments, in its own words: what its run returns, and what the gate's check before any card returns.
+public struct QuietArgumentRefusal: Error {
+    public let json: JSONValue
+    public init(_ json: JSONValue) { self.json = json }
+}
 
 public struct QuietBackupRestoreFailure: Error {
     public let detail: String

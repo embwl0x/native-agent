@@ -77,7 +77,11 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     private var executionDetail: String?
     public var cause: String? = nil
     public var detail: String? {
-        get { executedAction == nil ? executionDetail : decisionExperience.face?.words }
+        get {
+            // An approved action still running says so, not an empty outcome.
+            if executedAction == nil, let runningSince { return "Running since \(runningSince); its outcome lands here when it settles." }
+            return executedAction == nil ? executionDetail : decisionExperience.face?.words
+        }
         set { executionDetail = newValue }
     }
 
@@ -255,6 +259,8 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         return "\(who), \(clock.string(from: at))"
     }
     public var chatContinuation: JSONValue? = nil
+    /// Set while an approved action runs, from its start until its outcome is saved.
+    public var runningSince: String? = nil
     /// The inline conversation card: `{sessionId, telegramChatId?, at}`. Display binding only; set once, so a request never posts two cards.
     public var chatCard: JSONValue? = nil
 
@@ -388,6 +394,7 @@ extension ApprovalRecord {
         self.cause = obj["cause"]?.stringValue
         self.chatContinuation = obj["chatContinuation"]
         self.chatCard = obj["chatCard"]
+        self.runningSince = obj["running_since"]?.stringValue
     }
 
     /// Nullable decision fields are explicit null; execution and detail keys are omitted until present.
@@ -425,6 +432,7 @@ extension ApprovalRecord {
         }
         if let chatContinuation { obj["chatContinuation"] = chatContinuation }
         if let chatCard { obj["chatCard"] = chatCard }
+        if let runningSince { obj["running_since"] = .string(runningSince) }
         return .object(obj)
     }
 }

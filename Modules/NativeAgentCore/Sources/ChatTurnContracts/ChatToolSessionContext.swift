@@ -148,6 +148,11 @@ public struct TurnEnvelope: Sendable, Equatable {
         put("answerExperienceID", answerExperienceID)
         put("chatId", verifiedChatId)
         put("userId", verifiedUserId)
+        // The door an answer goes back through, when it is not the turn's own surface (a contact calling in through `chat` answers to its
+        // caller's result): restored from history, the route still names the door that owns the turn.
+        // Only a contact's caller-result door is kept: every other door (Telegram, phone, a peer reply's asker) restores from the turn's own
+        // surface with its own destination, as before.
+        if let door = Self.cleaned(deliveryRoute?.surface), door != surface, door == "caller-result" { object["routeSurface"] = .string(door) }
         put("requesterUserId", Self.cleaned(deliveryRoute?.requesterUserId))
         put("destinationId", Self.cleaned(deliveryRoute?.destinationId))
         put("threadId", Self.cleaned(deliveryRoute?.threadId))
@@ -172,7 +177,7 @@ public struct TurnEnvelope: Sendable, Equatable {
         default: return nil
         }
         let route = ChatToolSessionContext.ReplyRoute(
-            surface: surface,
+            surface: read("routeSurface") ?? surface,
             destinationId: read("destinationId"),
             threadId: read("threadId"),
             sourceKey: read("sourceKey"),

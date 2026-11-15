@@ -243,14 +243,22 @@ struct FaceRowView: View {
         }
     }
 
+    /// What asks for the person reads whole, wherever it is drawn: its full title, every line of its detail (what a secret is for, what it
+    /// grants, for how long, what Not now costs) and every answer it offers.
+    private var whole: Bool { row.tone == .attention }
+
     private var titleWords: some View {
-        FaceWordTitle(title: row.title).font(style.title)
+        FaceWordTitle(title: row.title, whole: whole).font(style.title)
             .foregroundStyle(row.tone == .quiet || sectionStyle == .note ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
     }
 
     @ViewBuilder private var detailWords: some View {
         if let detail = row.detail, !detail.isEmpty {
-            Text(detail).font(style.detail).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            if whole {
+                Text(detail).font(style.detail).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(detail).font(style.detail).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            }
         }
     }
 
@@ -397,13 +405,25 @@ struct FaceRowView: View {
     /// A row's actions are buttons with a shape. The one answer leads, filled; it wears the door's accent only when the row waits on the
     /// person, because the accent means only that. The rest are quiet. No action is coloured by its role: a destructive one asks before it
     /// runs, and its confirmation names it.
-    private var actionStrip: some View {
-        ViewThatFits(in: .horizontal) {
-            stripButtons(compact ? Array(answers.prefix(2)) : answers).fixedSize()
-            stripButtons(Array(answers.prefix(1))).fixedSize()
-            moreMenu(actions)
+    /// A row that asks keeps every answer as a button, wrapping onto further lines; only housekeeping goes behind "…".
+    @ViewBuilder private var actionStrip: some View {
+        if whole {
+            FaceFlow(spacing: 8) {
+                ForEach(answers) { action in
+                    stripButton(action).focused(focus, equals: .action(item, action.id))
+                }
+                let rest = actions.filter { action in !answers.contains { $0.id == action.id } }
+                if !rest.isEmpty { moreMenu(rest) }
+            }
+            .controlSize(.small)
+        } else {
+            ViewThatFits(in: .horizontal) {
+                stripButtons(compact ? Array(answers.prefix(2)) : answers).fixedSize()
+                stripButtons(Array(answers.prefix(1))).fixedSize()
+                moreMenu(actions)
+            }
+            .controlSize(.small)
         }
-        .controlSize(.small)
     }
 
     private func stripButtons(_ shown: [PartFace.Action]) -> some View {
@@ -510,11 +530,11 @@ struct FaceRowView: View {
                     }
                 }
                 if outcome.unresolved {
-                    Text(named + (outcome.effects == .unknown ? "This may have happened. Read its current state before repeating it."
-                        : "The owner has not confirmed a terminal outcome. Read its current state before repeating it."))
+                    Text(named + (outcome.effects == .unknown ? "Not sure that went through. Check before trying again."
+                        : "Not finished yet. Check before trying again."))
                         .foregroundStyle(.secondary)
                     if let words = outcome.words { Text(words).foregroundStyle(.secondary).textSelection(.enabled) }
-                    Button("Read current state") { session.check(item, door: door) }.buttonStyle(.plain)
+                    Button("Check") { session.check(item, door: door) }.buttonStyle(.plain)
                 }
                 if let undo = outcome.undo, !session.held(item) {
                     Button(word.map { "Undo " + $0 } ?? "Undo") {
@@ -546,13 +566,19 @@ struct FaceRowView: View {
 }
 
 /// One line, cut by the system at its tail. A plain Text is measured once and cached, so a title as long as a whole prompt costs the
-/// same as a short one however deeply its row is nested; only the part a line could ever show is handed over.
+/// same as a short one however deeply its row is nested; only the part a line could ever show is handed over. A `whole` title (a row that
+/// asks for the person) wraps instead, every word of it.
 private struct FaceWordTitle: View {
     let title: String
+    var whole = false
 
     var body: some View {
-        Text(title.prefix(400)).lineLimit(1).truncationMode(.tail)
-            .accessibilityLabel(Text(title))
+        if whole {
+            Text(title).fixedSize(horizontal: false, vertical: true)
+        } else {
+            Text(title.prefix(400)).lineLimit(1).truncationMode(.tail)
+                .accessibilityLabel(Text(title))
+        }
     }
 }
 

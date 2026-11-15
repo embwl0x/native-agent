@@ -227,12 +227,13 @@ struct FacePageView: View {
         appModel.pageDoor(page: page, open: open)
     }
 
-    /// A piece a page lays out (key `piece:…`, ref its Make ref, revision its version) is drawn through the Make pane's granted preview;
-    /// any other leaf reads as its words.
+    /// A piece a page lays out (key `piece:…`, ref its Make ref, revision its version) is drawn through the Make pane's granted preview,
+    /// and a board piece (leaf `board`) as a board that holds across its versions; any other leaf reads as its words.
     static func leaf(_ block: PartFace.Block) -> AnyView {
         guard let piece = piece(block) else {
             return AnyView(Text(block.alt ?? PartFace.Block.updateNote).foregroundStyle(.secondary))
         }
+        if block.leaf == BoardDocument.type { return AnyView(PageMakeBoard(reference: piece.reference, version: piece.version)) }
         return AnyView(PageMakePreview(reference: piece.reference, version: piece.version))
     }
 
@@ -317,7 +318,7 @@ extension AppModel {
 }
 
 /// The Mac's places for a row's link, for every page it draws (the link itself is read by `FaceLink`). A link into the page being drawn goes
-/// to `here` first (a Home room); an approval or Inbox card opens through `card`. Returns the page a page link opened.
+/// to `here` first (a Home room); a card opens its own conversation; an approval opens through `card`. Returns the page a page link opened.
 enum MacFaceLinks {
     @MainActor static func follow(_ destination: FaceDestination, appModel: AppModel) async throws {
         if let session = destination.session {
@@ -352,7 +353,9 @@ enum MacFaceLinks {
             try openPage(page)
             return page
         case .approval(let id): card(.init(kind: .approval, id: id))
-        case .card(let id): card(.init(kind: .inbox, id: id))
+        case .card(let id):
+            // A card opens in its own conversation, where it is answered; following the link answers nothing.
+            try FaceWindowReply.check(await appModel.client.act(.openCard(id: id)))
         case .url(let url):
             guard NSWorkspace.shared.open(url) else {
                 throw PartCallError(code: "url_unavailable", message: "The browser could not open this web link.")

@@ -1105,8 +1105,11 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
   yield (hits over tries of thoughts on that node through that door) and, for the world, by how the agent feels.
 - **Drive.** Worth lands as `drive` on the touched care's anchor node (`ContinuityField` node kind `.care`, decaying on the
   care's depth half-life) or on the happening's subject node (kind `.happening`, the field's default half-life)
-  (`ContinuityField.land`). Drive is finite and nonnegative, never clamped or spread, retained while positive, and persisted with the
-  field (`cognition.sqlite`). Activation and salience keep their jobs (priming, workspace, capsule).
+  (`ContinuityField.land`). A watch's news (`Happening.watchNews`: door `sense:<watch>`, subject `sense:<watch>:<address>`) is
+  about what the watch watches, a care the agent made on purpose: it always lands on its own subject, never on the care its words
+  come nearest, and its worth is the weigher's but never below one, so it always opens its own thought. Drive is finite and nonnegative,
+  never clamped or spread, retained while positive, and persisted with the field (`cognition.sqlite`). Activation and salience keep
+  their jobs (priming, workspace, capsule).
 - **One admitted batch.** The attention runtime owns admission across every await: weigh the batch, land each worth in one
   substrate call at one field clock reading, checkpoint that application and its exact unfinished rows together in
   `cognition.sqlite` (`attention_landing`), record the weigh rows durably, then claim each crossing and hand on its thought before

@@ -4,6 +4,19 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.19 — cards you can count on (2026-11-15)
+
+- Cards: every control takes its click and a key field takes a paste in the chat; an answered card continues its turn once, from any door; a one-request model
+  pick runs that request; a settled card leaves nothing behind and its record names the answer, who gave it and what it changed
+- Memory: memories.bring_back brings an older store home through the agent's own memory write, keeping each memory's date and teller; a reconnected contact
+  keeps its memories' credit and its Trust switch
+- Refusals: a request that cannot work is refused before any card or ping, every refusal written one way; contacts resolve by id or name; a long approved
+  action reads running until it settles
+- Held sends: one append-only record per send; only the reply naming it or the agent's withdrawal ends it; a reply that lands as the app quits is delivered
+  once after relaunch
+- Desk and Mac: a free board on the Desk; the window follows the agent; Quit always quits, even mid-thought; a step's second look stays in its own window
+- Correction: 0.6.18's notes claimed an OpenRouter output allowance; none is sent
+
 ## 0.6.18 — current and calm (2026-11-14)
 
 - Each account's model list is what its provider says, refreshed on demand; one effective contract per model; an account offers only what its provider listed

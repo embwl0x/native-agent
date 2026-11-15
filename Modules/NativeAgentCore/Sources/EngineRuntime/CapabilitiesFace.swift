@@ -686,35 +686,42 @@ extension CapabilitiesFace {
 
 // MARK: - The verbs the rows call
 
-/// What the Capabilities rows' `connections` verbs run (`NativeAgentEngine.connectionsVerb`): each is the code its row ran, on the record
-/// its arguments name as it reads now; a record that moved is refused as stale.
+/// What the Capabilities rows' `connections` verbs run (`NativeAgentEngine.prepareConnections`): each reads the record its arguments name as
+/// it reads now, a record that moved refused as stale, and returns the code its row ran as its effect.
 @MainActor
 extension CapabilitiesFace {
-    /// `capability.check_trust`
-    static func checkTrust(_ engine: NativeAgentEngine, id: String) async throws -> String? {
+    /// `capability.check_trust`: the capability is in the summary read now; the effect checks its trust.
+    static func checkTrust(_ engine: NativeAgentEngine, id: String) throws -> HostVerbEffect {
         guard engine.trust.capabilitySummaryError == nil,
               engine.trust.capabilitySummary?.records.contains(where: { $0.id == id }) == true else { throw stale() }
-        let result = try await engine.trust.checkCapabilityTrust(id: id)
-        return "\(result.name ?? result.id): \(result.trustTier). " + result.reasons.joined(separator: " ")
+        return {
+            let result = try await engine.trust.checkCapabilityTrust(id: id)
+            return "\(result.name ?? result.id): \(result.trustTier). " + result.reasons.joined(separator: " ")
+        }
     }
 
-    /// `connector.dry_run`
-    static func connectorDryRun(_ engine: NativeAgentEngine, id: String) async throws -> String? {
+    /// `connector.dry_run`: an action read now that has a dry run; the effect dry-runs it.
+    static func connectorDryRun(_ engine: NativeAgentEngine, id: String) throws -> HostVerbEffect {
         guard let record = engine.connectors.actions?.actions.first(where: { $0.id == id }) else { throw stale() }
         guard record.dryRunAvailable != false else {
             throw PartCallError(code: "dry_run_unavailable", message: "Dry run is unavailable for this connector action.")
         }
-        let receipt = try await engine.runConnectorAction(id: id, dryRun: true,
-            origin: "mac_ui:connector_action:" + id, platform: engine.ports.connectorActions(engine))
-        _ = try await engine.connectors.refreshActions()
-        return "\(record.name): \(receipt.status)."
+        return {
+            let receipt = try await engine.runConnectorAction(id: id, dryRun: true,
+                origin: "mac_ui:connector_action:" + id, platform: engine.ports.connectorActions(engine))
+            _ = try await engine.connectors.refreshActions()
+            return "\(record.name): \(receipt.status)."
+        }
     }
 
-    /// `native.dry_run` and `native.run`: the run is the person's own act on the Mac, behind the action's approval gate.
-    static func nativeAction(_ engine: NativeAgentEngine, id: String, dryRun: Bool) async throws -> String? {
+    /// `native.dry_run` and `native.run`: the Mac action read now; the run is the person's own act on the Mac, behind the action's approval
+    /// gate.
+    static func nativeAction(_ engine: NativeAgentEngine, id: String, dryRun: Bool) throws -> HostVerbEffect {
         guard let record = engine.tools.nativeActions.first(where: { $0.id == id }) else { throw stale() }
-        let receipt = try await engine.tools.runNativeAction(record, dryRun: dryRun, trust: engine.trust, browser: engine.ports.browserRoutes)
-        return "\(record.name): \(receipt.status)" + (receipt.detail.map { ": " + $0 } ?? ".")
+        return {
+            let receipt = try await engine.tools.runNativeAction(record, dryRun: dryRun, trust: engine.trust, browser: engine.ports.browserRoutes)
+            return "\(record.name): \(receipt.status)" + (receipt.detail.map { ": " + $0 } ?? ".")
+        }
     }
 
     /// `improvement.run`
@@ -729,12 +736,14 @@ extension CapabilitiesFace {
         return "Browser dry run: \(run.status) · \(run.url ?? "URL unavailable")."
     }
 
-    /// `browser.cancel`
-    static func cancelBrowser(_ engine: NativeAgentEngine, id: String) async throws -> String? {
+    /// `browser.cancel`: the run is active in the status read now; the effect cancels it.
+    static func cancelBrowser(_ engine: NativeAgentEngine, id: String) throws -> HostVerbEffect {
         guard engine.tools.browserStatus?.activeRuns?.contains(where: { $0.id == id }) == true else { throw stale() }
-        let run = try await engine.ports.browserRoutes.cancelBrowserRun(id: id, dataRoot: engine.dataRoot)
-        _ = await engine.tools.refreshNativePower()
-        return "Browser run: \(run.status)."
+        return {
+            let run = try await engine.ports.browserRoutes.cancelBrowserRun(id: id, dataRoot: engine.dataRoot)
+            _ = await engine.tools.refreshNativePower()
+            return "Browser run: \(run.status)."
+        }
     }
 
     /// `tools.refresh`
@@ -743,36 +752,43 @@ extension CapabilitiesFace {
         return "The tools were read again."
     }
 
-    /// `skill.build`: chat opens on the Mac with the request started in the message box.
-    static func buildSkill(_ engine: NativeAgentEngine) async throws -> String? {
-        try await host(engine).buildSkillInChat()
+    /// `skill.build`: the Mac's Capabilities controls; chat opens on the Mac with the request started in the message box.
+    static func buildSkill(_ engine: NativeAgentEngine) throws -> HostVerbEffect {
+        let mac = try host(engine)
+        return { try await mac.buildSkillInChat() }
     }
 
-    /// `sense.switch` on the version the row showed. Turning a sense on is always the person's decision (the door admits nothing else).
-    /// Turning one off is the person's when they did it, and the registry then records an owner's off that the agent cannot turn back
-    /// on; the agent's own off is recorded as its own.
-    static func switchSense(id: String, version: Int?, on: Bool?, byPerson: Bool) async throws -> String? {
-        guard let on else { throw PartCallError(code: "bad_value", message: "A sense switch takes on or off; nothing changed.") }
+    /// `sense.switch` on the version the row showed: a position, and that exact sense version, ready. Turning a sense on is always the
+    /// person's decision (the door admits nothing else). Turning one off is the person's when they did it, and the registry then records an
+    /// owner's off that the agent cannot turn back on; the agent's own off is recorded as its own.
+    static func switchSense(id: String, version: Int?, on: Bool?, byPerson: Bool) async throws -> HostVerbEffect {
+        guard let turnsOn = on else { throw PartCallError(code: "bad_value", message: "A sense switch takes on or off; nothing changed.") }
         let (registry, record) = try await sense(id, version: version)
         guard record.status != .draft else {
             throw PartCallError(code: "not_ready", message: "This sense is not ready yet; nothing changed.")
         }
-        let saved = try await registry.setStatus(id: record.id, version: record.version, status: on ? .on : .off,
-            ownerAuthorized: on || byPerson, turn: nil)
-        return saved.corner.surfaceName + " is " + (saved.status == .on ? "on" : saved.status == .off ? "off" : saved.status.rawValue) + "."
+        return {
+            let saved = try await registry.setStatus(id: record.id, version: record.version, status: turnsOn ? .on : .off,
+                ownerAuthorized: turnsOn || byPerson, turn: nil)
+            return saved.corner.surfaceName + " is " + (saved.status == .on ? "on" : saved.status == .off ? "off" : saved.status.rawValue) + "."
+        }
     }
 
-    /// `sense.share`: the sense version goes to a file the person chooses in the Mac's save panel.
-    static func shareSense(_ engine: NativeAgentEngine, id: String, version: Int?) async throws -> String? {
+    /// `sense.share`: the exact sense version the row showed, one that is portable, and the Mac's save panel; the effect writes it to a
+    /// file the person chooses there.
+    static func shareSense(_ engine: NativeAgentEngine, id: String, version: Int?) async throws -> HostVerbEffect {
         let (registry, record) = try await sense(id, version: version)
         guard record.language != .native else {
             throw PartCallError(code: "not_shareable", message: "Built-in native code cannot be shared as a portable sense.")
         }
-        guard let destination = try await host(engine).chooseSenseDestination(name: record.id + ".sense.json") else {
-            return "No place was chosen; nothing was shared."
+        let mac = try host(engine)
+        return {
+            guard let destination = try await mac.chooseSenseDestination(name: record.id + ".sense.json") else {
+                return "No place was chosen; nothing was shared."
+            }
+            _ = try await registry.exportBundle(id: record.id, to: destination, userApproved: true)
+            return "Shared " + record.corner.surfaceName + " to " + destination.path + "."
         }
-        _ = try await registry.exportBundle(id: record.id, to: destination, userApproved: true)
-        return "Shared " + record.corner.surfaceName + " to " + destination.path + "."
     }
 
     /// The registry and the exact sense version the call names, read now; a version that moved is refused as stale.
@@ -787,32 +803,37 @@ extension CapabilitiesFace {
         return (registry, record)
     }
 
-    /// `ability.keep`: approve the exact version the row's fold showed; it reads back through the registry before answering.
-    static func keepAbility(_ engine: NativeAgentEngine, id: String, version seen: String?) async throws -> String? {
+    /// `ability.keep`: the exact waiting version the row's fold showed, one the keep accepts; the effect approves it and reads it back
+    /// through the registry before answering.
+    static func keepAbility(_ engine: NativeAgentEngine, id: String, version seen: String?) throws -> HostVerbEffect {
         let tools = engine.tools
         guard let tool = tools.authored.first(where: { $0.id == id }), tool.reviewedKeepDigest == seen else { throw stale() }
         if let refusal = tools.keepRefusal(tool, turn: nil) { throw PartCallError(code: "keep_refused", message: refusal) }
-        let version = tool.reviewedKeepDigest
-        guard version != nil || (tool.candidateDigest ?? tool.codeFingerprint) == nil
+        guard tool.reviewedKeepDigest != nil || (tool.candidateDigest ?? tool.codeFingerprint) == nil
             && tool.activePath.map({ URL(fileURLWithPath: $0).pathExtension == "md" }) == true else {
             throw PartCallError(code: "version_unread", message: "Read Capabilities again before approving this ability.")
         }
-        let updated = try await tools.keep(id: tool.id, version: version)
-        guard try await tools.refreshAuthored(confirming: updated.id, status: "active") else {
-            throw PartCallError(code: "unconfirmed", message: "Approving \(tool.name) could not be confirmed after reading it again.")
+        return {
+            let updated = try await tools.keep(id: tool.id, version: tool.reviewedKeepDigest)
+            guard try await tools.refreshAuthored(confirming: updated.id, status: "active") else {
+                throw PartCallError(code: "unconfirmed", message: "Approving \(tool.name) could not be confirmed after reading it again.")
+            }
+            return tool.name + " is approved and on."
         }
-        return tool.name + " is approved and on."
     }
 
-    /// `ability.off`: the person's off, which stays off until the person turns it on; it reads back through the registry before answering.
-    static func switchOffAbility(_ engine: NativeAgentEngine, id: String) async throws -> String? {
+    /// `ability.off`: the ability it names; the effect is the person's off, which stays off until the person turns it on, read back through
+    /// the registry before answering.
+    static func switchOffAbility(_ engine: NativeAgentEngine, id: String) throws -> HostVerbEffect {
         let tools = engine.tools
         guard let tool = tools.authored.first(where: { $0.id == id }) else { throw stale() }
-        let updated = try await tools.switchOff(id: tool.id, reason: "Owner switched off from NativeAgent UI.")
-        guard try await tools.refreshAuthored(confirming: updated.id, status: "disabled") else {
-            throw PartCallError(code: "unconfirmed", message: "Turning \(tool.name) off could not be confirmed after reading it again.")
+        return {
+            let updated = try await tools.switchOff(id: tool.id, reason: "Owner switched off from NativeAgent UI.")
+            guard try await tools.refreshAuthored(confirming: updated.id, status: "disabled") else {
+                throw PartCallError(code: "unconfirmed", message: "Turning \(tool.name) off could not be confirmed after reading it again.")
+            }
+            return tool.name + " is off."
         }
-        return tool.name + " is off."
     }
 
     private static func host(_ engine: NativeAgentEngine) throws -> any CapabilitiesFaceHost {

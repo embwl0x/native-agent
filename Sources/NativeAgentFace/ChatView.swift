@@ -127,8 +127,9 @@ struct ChatView: View {
                         .layoutPriority(1)
                         .transition(NativeAgentMotion.fade)
                 }
-                // Offscreen quiet reads must not open the Work pane.
+                // Offscreen quiet reads must not open the Work pane or move the window.
                 if !inSimple && !quietOffscreenRead { WorkPaneAutoOpen() }
+                if !quietOffscreenRead { FaceFollowsWatcher() }
             }
         }
         .navigationTitle("Chat")

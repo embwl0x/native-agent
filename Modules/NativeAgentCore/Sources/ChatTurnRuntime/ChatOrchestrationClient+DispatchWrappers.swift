@@ -417,10 +417,33 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             ),
             enforceAutonomy: false, turn: turn
         )
-        // Only .block hard-denies here; .ask enters the approval flow and denies if no filer exists.
+        // Arguments first: the call is checked against its schema and its owner's own checks (targets, names, ids, values) before any
+        // decision but .allow is acted on, so a call that cannot run is refused at once in its owner's words and never becomes a card, an
+        // approval, a notification or a deny. The order is validate, decide, card, run, for every caller. An allowed call pays no preview:
+        // its run's own prepare refuses in the same shape. A question the check would put to the person (a permission it needs) gives way
+        // to a deny, which raises nothing.
+        func argumentRefusal(denied: Bool) async -> JSONValue? {
+            // Screen control's card admits a part's hand on its watched window before primitive validation.
+            let primitiveCall = work.authoredCall?.tool == tool && !AuthoredToolEffects.handOperations.contains(tool)
+            var refusal: JSONValue?
+            if !primitiveCall, let validating = inner as? any PreApprovalToolValidating {
+                refusal = await holding(turn.with(\.verifiedSessionID, verifiedSessionId ?? turn.verifiedSessionID)) { turn in
+                    await validating.preApprovalRefusal(turn: turn, invocation: work.invocation, tool: tool, input: input, surface: surface)
+                }
+            } else if !primitiveCall, let validating = inner as? any PureToolArgumentValidating {
+                refusal = await validating.argumentRefusal(tool: tool, input: input, turn: turn)
+            }
+            guard let refusal else { return nil }
+            if ChatToolOutcome.isWaitingInteraction(refusal) { return denied ? nil : refusal }
+            return ChatToolOutcome.refusedBeforeRunning(owner: refusal)
+        }
+        // .block is the person's Trust (Safe's blocked level, Pause everything) or their security policy: a good call it stops is refused
+        // before it ran, as the person's call. .ask enters the approval flow and denies if no filer exists.
         if envelope.decision == .block {
             await audit(envelope)
-            throw AutonomyGateError.toolDenied(reason: envelope.primaryReason, remedy: envelope.remedy)
+            if let refusal = await argumentRefusal(denied: true) { return refusal }
+            return ChatToolOutcome.refusedBeforeRunning(code: "owners_call", detail: envelope.primaryReason,
+                extra: (envelope.remedy.map { ["remedy": $0] } ?? [:]).merging(["decided_by": .string("trust")]) { $1 })
         }
 
         // Use SecurityCenter's decision for this exact call, including roots, profile, class, reach and saved user entries.
@@ -605,6 +628,13 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         // settled that were waiting for this call.
         var wordTurn: Turn?
         var cardsSettled: JSONValue = .null
+        if case .allow = decision {} else {
+            if case .deny(let reason) = decision {
+                // Trust's consent history keeps every deny, a call refused for its arguments too.
+                await audit(Self.securityEnvelope(envelope, decision: .block, reason: reason))
+                if let refusal = await argumentRefusal(denied: true) { return refusal }
+            } else if let refusal = await argumentRefusal(denied: false) { return refusal }
+        }
         // The user's own contact send needs no card. Broader execution and Trust refusals must be stated plainly.
         if turn.personInitiatedSend?.claim(tool: tool, input: input, surface: surface) == true {
             let name: String = {
@@ -652,8 +682,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 personApprovedHost: namedConnect,
                 // A verified replay of the person's approved card runs as their decision of this exact call, levers included; so does a call
                 // the person asked for in their own words.
-                turn: approvedReplay.flatMap { replay in approvedReplayAuthorizes
-                    ? turn.with(\.personAct, PersonAct(by: .card(id: replay.approvalID), tool: tool, input: input, spent: [.call])) : nil }
+                turn: approvedReplay.flatMap { (replay) -> Turn? in
+                    guard approvedReplayAuthorizes else { return nil }
+                    turn.cardCause?.approved(by: replay.approvalID)
+                    return turn.with(\.personAct, PersonAct(by: .card(id: replay.approvalID), tool: tool, input: input, spent: [.call])) }
                     ?? wordTurn ?? turn,
                 work: work)
             let reply = ToolResult(result)
@@ -696,20 +728,23 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             }
             return result
         case .deny(let reason):
-            await audit(Self.securityEnvelope(envelope, decision: .block, reason: reason))
-            throw AutonomyGateError.toolDenied(reason: reason, remedy: envelope.remedy)
+            // A good call the person's Trust denies is refused before it ran, in the gate's words: the person's call, not a failure. Its
+            // deny was audited above, with the argument check.
+            return ChatToolOutcome.refusedBeforeRunning(code: "owners_call", detail: reason,
+                extra: (envelope.remedy.map { ["remedy": $0] } ?? [:]).merging(["decided_by": .string("trust")]) { $1 })
         case .requireApproval(let gateReason):
+            // The arguments were checked above, before any decision was acted on.
             let root = peerDirectoryDataRoot ?? defaultDataRoot()
             if let refusal = try await MacAppActGate.requestRefusal(tool: tool, input: input, dataRoot: root,
                 turn: turn, context: work.invocation.macContext(dataRoot: root)) {
-                return ChatToolOutcome.refusedBeforeRunning(.object(refusal.fields))
+                return ChatToolOutcome.refusedBeforeRunning(owner: .object(refusal.fields))
             }
             // A switch the user turned off refuses before any card, regardless of posture.
             if let gate = try SwiftToolDispatcher.integrationGate(tool: tool, input: input, turn: turn) {
                 let root = peerDirectoryDataRoot ?? defaultDataRoot()
                 let store = root == defaultDataRoot() ? MacIntegrationPermissionStore.shared : MacIntegrationPermissionStore(dataRoot: root)
                 if let refusal = try await SwiftToolDispatcher.switchRefusal(integration: gate.integration, mode: gate.mode, store: store) {
-                    return ChatToolOutcome.refusedBeforeRunning(refusal)
+                    return ChatToolOutcome.refusedBeforeRunning(owner: refusal)
                 }
             }
             // A skill's step never files a card: it hands back to the agent.
@@ -726,18 +761,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                let disclosed = await validating.approvalCardReason(
                 tool: tool, input: input, surface: surface) {
                 reason = disclosed + " " + reason
-            }
-            // Pre-approval validation returns certain refusals as tool errors without filing an approval.
-            // Screen control's card admits a part's hand on its watched window before primitive validation.
-            let primitiveCall = work.authoredCall?.tool == tool && !AuthoredToolEffects.handOperations.contains(tool)
-            if !primitiveCall, !work.admissionOnly, let validating = inner as? any PreApprovalToolValidating {
-                let refusal = await holding(turn.with(\.verifiedSessionID, verifiedSessionId ?? turn.verifiedSessionID)) { turn in
-                    await validating.preApprovalRefusal(turn: turn, invocation: work.invocation, tool: tool, input: input, surface: surface)
-                }
-                if let refusal { return ChatToolOutcome.refusedBeforeRunning(refusal) }
-            } else if !primitiveCall, !work.admissionOnly, let validating = inner as? any PureToolArgumentValidating,
-                      let refusal = await validating.argumentRefusal(tool: tool, input: input, turn: turn) {
-                return ChatToolOutcome.refusedBeforeRunning(refusal)
             }
             let ownsACPConnectCard: Bool
             if namedConnect, case .string(let name)? = input["name"] {
@@ -879,8 +902,9 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                     injectionApprovalID: mintApprovalID,
                     personApprovedHost: namedConnect,
                     // The person approved this exact call on its card: it runs as their decision, levers included.
-                    turn: resolved.approvalID.map { id in
-                        turn.with(\.personAct, PersonAct(by: .card(id: id), tool: tool, input: input, spent: [.call])) } ?? turn,
+                    turn: resolved.approvalID.map { (id) -> Turn in
+                        turn.cardCause?.approved(by: id)
+                        return turn.with(\.personAct, PersonAct(by: .card(id: id), tool: tool, input: input, spent: [.call])) } ?? turn,
                     work: work)
             case .deny(let r):
                 await audit(Self.securityEnvelope(envelope, decision: .block, reason: r))

@@ -176,10 +176,12 @@ public struct BrowserToolPlatformPort: Sendable {
         async -> QuietComposerOutcome?
     func chatSessionFence(verb: String, input: [String: JSONValue], reachesUser: Bool, turn: Turn) async -> JSONValue?
     /// The person's tap on a card's answer at the Mac runs the card's own control there (its window, page or sheet), as the Mac presents it.
-    func runCardControl(id: String, sessionID: String, choice: String?) async
+    /// Its failure is the tap's failure, thrown to the act that ran it.
+    func runCardControl(id: String, sessionID: String, choice: String?) async throws
     func runUpkeep(verb: String, input: [String: JSONValue], turn: Turn) async -> (ok: Bool, detail: String, fields: [String: JSONValue])
-    /// Upkeep previews use effect-free input and target checks.
-    func upkeepFence(verb: String, input: [String: JSONValue]) async -> JSONValue?
+    /// A host verb's own argument checks (`upkeep`, `connections`, `provider`): the targets, names, ids and values it accepts, read without
+    /// effect; nil when they hold. The gate runs them before any card; they are the verb owner's `prepare`, which its run calls too.
+    func verbFence(tool: String, verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue?
     /// Inbox reads and actions share the page's owner.
     func inbox(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue
     /// Inbox preview shares execution's pre-write checks without mutation.

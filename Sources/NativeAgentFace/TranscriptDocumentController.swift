@@ -1290,6 +1290,11 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
             setHover(nil, code: code)
             return
         }
+        // The bar sits in the room under the message; a card or other hosted view starting right there has that room, and its own controls.
+        if last + 1 < shown.blocks.count, case .attachment = shown.blocks[last + 1].kind {
+            setHover(nil, code: code)
+            return
+        }
         var seatsRight = false
         if case .user = shown.blocks[hit.block].kind { seatsRight = true }
         let bottom = fragment.layoutFragmentFrame.maxY + origin.y

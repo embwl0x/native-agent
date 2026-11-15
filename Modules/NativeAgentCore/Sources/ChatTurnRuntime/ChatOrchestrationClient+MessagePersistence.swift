@@ -79,10 +79,21 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     /// Contact appends may throw after persistence; reconcile ambiguous writes against the store before repeating.
-    /// `byPerson` distinguishes the user's typed send from agent-authored work; a completion can bind its existing answer as the send without another row.
+    /// `byPerson` distinguishes the user's typed send from agent-authored work. A turn's answer is written once, by the turn:
+    /// naming its completion (`reusingCompletionID`) or its run (`reusingRunID`) binds that saved row as the send, never another row.
     public func appendAgentConversationSend(sessionID: String, text: String, clientUserMessageID: String? = nil,
-                                            byPerson: Bool = false, reusingCompletionID: String? = nil, turn: Turn) async throws {
+                                            byPerson: Bool = false, reusingCompletionID: String? = nil,
+                                            reusingRunID: String? = nil, turn: Turn) async throws {
+        let isAnswer: (@Sendable ([String: JSONValue]) -> Bool)?
         if let completionID = reusingCompletionID {
+            isAnswer = { row in
+                guard case .object(let metadata)? = row["metadata"], case .object(let binding)? = metadata["codexCompletion"] else { return false }
+                return binding["deliveryId"] == .string(completionID)
+            }
+        } else if let runID = reusingRunID {
+            isAnswer = { row in row["runId"] == .string(runID) }
+        } else { isAnswer = nil }
+        if let isAnswer {
             guard let sendID = clientUserMessageID, !byPerson else {
                 throw ChatOrchestrationError.underlying("A saved contact answer needs its exact send identity.")
             }
@@ -95,9 +106,8 @@ extension SwiftNativeChatOrchestrationClient {
                     let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(file)
                     guard report.isClean else { throw ChatOrchestrationError.underlying("The contact answer's transcript needs repair.") }
                     return rows.filter { value in
-                        guard case .object(let row) = value, row["role"] == .string("assistant"),
-                              case .object(let metadata)? = row["metadata"], case .object(let binding)? = metadata["codexCompletion"] else { return false }
-                        return binding["deliveryId"] == .string(completionID)
+                        guard case .object(let row) = value, row["role"] == .string("assistant") else { return false }
+                        return isAnswer(row)
                     }.count
                 }
                 guard matches <= 1, matches == 0 || answerPath == nil else {
@@ -112,10 +122,8 @@ extension SwiftNativeChatOrchestrationClient {
                 let (read, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
                 guard report.isClean else { throw ChatOrchestrationError.underlying("The contact answer's transcript needs repair.") }
                 let matches = read.indices.filter { index in
-                    guard case .object(let row) = read[index], row["role"] == .string("assistant"),
-                          case .object(let metadata)? = row["metadata"],
-                          case .object(let binding)? = metadata["codexCompletion"] else { return false }
-                    return binding["deliveryId"] == .string(completionID)
+                    guard case .object(let row) = read[index], row["role"] == .string("assistant") else { return false }
+                    return isAnswer(row)
                 }
                 guard matches.count == 1, let index = matches.first,
                       case .object(var row) = read[index], case .object(var metadata)? = row["metadata"],

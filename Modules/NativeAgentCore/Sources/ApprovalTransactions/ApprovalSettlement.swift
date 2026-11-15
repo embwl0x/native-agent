@@ -163,6 +163,8 @@ extension ApprovalExecution {
                     verifiedChatID: replay.telegramChatId,
                     verifiedUserID: replay.verifiedUserId
                 ),
+                // The replay's receipt is traced like any call, naming the approval it runs on.
+                tracePeerTurn: true,
                 work: ChatTurnWork(admissionOnly: host?.effectOptions.admissionOnly ?? false)
             )
             // The verified card is this replay's ingress, including its original remote/agent identity.
@@ -297,8 +299,13 @@ extension ApprovalExecution {
             return false
         }
         // Validate provenance before queued steps can be consumed or released.
+        let abandonedClaim: Bool = {
+            guard case .object(let state)? = rec.chatContinuation else { return false }
+            return state["started"] != nil && state["done"] != .bool(true)
+        }()
+        // A card that continues its conversation hands its after_card steps to that turn; one that does not releases them to run on their own.
         let resume = await AgentScreen.resume(card: rec.id, decision: decision, completed: resultClass == .succeeded,
-                                            dataRoot: dataRoot)
+                                            handOff: continueConversation && !abandonedClaim, dataRoot: dataRoot)
         let steer = PeerDataTaint(restoring: carried.sources + resume.sources, elevated: carried.elevated + resume.elevated)
         // Approval elevates the carried peers for the rest of this command.
         if decision == "approved" { steer.checkpointSources.forEach(steer.elevate) }
@@ -312,10 +319,6 @@ extension ApprovalExecution {
                 returnedID: executedAction.objectValue?["returned_id"]?.stringValue,
                 effects: executedAction.objectValue?["effects"]?.stringValue,
                 recoveredAt: continueConversation ? nil : (rec.resolvedAt ?? rec.createdAt))
-            let abandonedClaim: Bool = {
-                guard case .object(let state)? = rec.chatContinuation else { return false }
-                return state["started"] != nil && state["done"] != .bool(true)
-            }()
             // The receipt is durable before any claim becomes evictable. A prior process may have delivered already, so never resend it.
             if abandonedClaim {
                 _ = try await inbox.annotateChatContinuation(rec.id, done: true, settlement: "interrupted")

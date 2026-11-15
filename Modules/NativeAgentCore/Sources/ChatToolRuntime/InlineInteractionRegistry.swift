@@ -409,6 +409,9 @@ public enum InlineInteractionRegistry {
     /// Permanent group changes go through Providers' page; the option must not be decoded as a model.
     public static let persistentChoiceOptionID = "__save_for_group__"
 
+    /// The words a card's own buttons answer with (the Mac's card actions read them before any pick); no choose option may take one as its id.
+    public static let cardControlWords: Set<String> = ["answer", "begin", "full_setup", "restart", "signIn"]
+
     /// Read image-capable options from the same checked provider catalog and image-route table as Providers; hide accounts absent from the routing snapshot.
     public static func imageCapableModelOptions(
         providerIDs: [String], dataRoot: URL

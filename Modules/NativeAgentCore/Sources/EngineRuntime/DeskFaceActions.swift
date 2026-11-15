@@ -90,49 +90,66 @@ enum DeskMacPlace: Equatable {
         return "Desk readings refreshed; any unavailable sources are named on the page."
     }
 
-    /// A reminder switch: every project (global), one project, or one Desk item, written through the reminder settings' owner.
-    func deskRemind(_ input: [String: JSONValue]) async throws -> String {
+    /// A reminder switch: a position, and the scope it names, every project (global), one project, or one Desk item on the board read now
+    /// (the lookups); written through the reminder settings' owner (the effect).
+    func deskRemind(_ input: [String: JSONValue]) async throws -> HostVerbEffect {
         guard case .bool(let on)? = input["value"] else {
             throw PartCallError(code: "invalid_value", message: "A reminder switch takes value true or false; nothing changed.")
         }
         let id = input["scope_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let store = DeskNagConfigStore(dataRoot: dataRoot)
-        let named: String
+        let scope: DeskRemindScope
         switch input["scope_kind"]?.stringValue {
-        case "global":
-            _ = try await store.update { $0.settingGlobal(on) }
-            named = "every project"
+        case "global": scope = .global
         case "project":
             guard !id.isEmpty else { throw PartCallError(code: "invalid_input", message: "A project's switch needs scope_id, its name.") }
-            _ = try await store.update { $0.settingScope(kind: .project, id: id, enabled: on) }
-            named = "project " + id
+            scope = .project(id)
         case "item":
             guard let item = await desk.loadPage().boardItems.first(where: { $0.handle == id }) else {
                 throw PartCallError(code: "invalid_input", message: "An item's switch needs scope_id, the handle of an item on the Desk board.")
             }
-            _ = try await store.update { $0.settingScope(kind: .item, id: item.handle, enabled: on) }
-            named = "desk." + item.alias
+            scope = .item(item)
         default:
             throw PartCallError(code: "invalid_input", message: "scope_kind is global, project or item; nothing changed.")
         }
-        _ = await desk.refreshPage()
-        return "Reminders \(on ? "on" : "off") for \(named)."
+        return { [self] in
+            let store = DeskNagConfigStore(dataRoot: dataRoot)
+            let named: String
+            switch scope {
+            case .global:
+                _ = try await store.update { $0.settingGlobal(on) }
+                named = "every project"
+            case .project(let id):
+                _ = try await store.update { $0.settingScope(kind: .project, id: id, enabled: on) }
+                named = "project " + id
+            case .item(let item):
+                _ = try await store.update { $0.settingScope(kind: .item, id: item.handle, enabled: on) }
+                named = "desk." + item.alias
+            }
+            _ = await desk.refreshPage()
+            return "Reminders \(on ? "on" : "off") for \(named)."
+        }
     }
 
-    /// The person's Veto closes an open pursuit through the pursuit veto owner.
-    func deskVeto(_ input: [String: JSONValue]) async throws -> String {
+    /// What a reminder switch names.
+    enum DeskRemindScope { case global, project(String), item(DeskItem) }
+
+    /// The person's Veto: `handle` names an open pursuit on the Desk board, read now (the lookup); the pursuit veto owner closes it (the
+    /// effect).
+    func deskVeto(_ input: [String: JSONValue]) async throws -> HostVerbEffect {
         let handle = input["handle"]?.stringValue ?? ""
         guard let item = await desk.loadPage().boardItems.first(where: { $0.handle == handle }), !item.status.isTerminal,
               DeskBoardLayout.isPursuitLaneItem(item), item.pursuit != nil else {
             throw PartCallError(code: "action_unavailable", message: "That is not an open pursuit on the Desk board; nothing was vetoed.")
         }
-        let outcome = await desk.vetoHandler.veto(item.handle)
-        _ = await desk.refreshPage()
-        switch outcome {
-        case .completed: return "Pursuit vetoed and closed."
-        case .alreadyVetoed: return "Pursuit was already vetoed."
-        case .inFlight: throw PartCallError(code: "in_flight", message: "That veto is still being written.")
-        case .failed(let detail): throw PartCallError(code: "veto_failed", message: detail)
+        return { [self] in
+            let outcome = await desk.vetoHandler.veto(item.handle)
+            _ = await desk.refreshPage()
+            switch outcome {
+            case .completed: return "Pursuit vetoed and closed."
+            case .alreadyVetoed: return "Pursuit was already vetoed."
+            case .inFlight: throw PartCallError(code: "in_flight", message: "That veto is still being written.")
+            case .failed(let detail): throw PartCallError(code: "veto_failed", message: detail)
+            }
         }
     }
 }

@@ -235,7 +235,7 @@ final class PipeFaceClient: FaceClient {
         if let link { await link.close() }
         link = nil
         state = bodyGone ? .closed : .failed(detail)
-        if bodyGone { NSApplication.shared.terminate(nil) }
+        if bodyGone { FaceAppDelegate.endWithBody() }
     }
 
     private static func bodyIsGone(_ error: any Error) -> Bool {

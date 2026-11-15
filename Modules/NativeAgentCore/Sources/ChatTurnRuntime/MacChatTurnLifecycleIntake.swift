@@ -18,8 +18,9 @@ public extension MacChatTurnPresentationPort {
         let sessionId = identity.sessionId
         guard !sessionId.isEmpty, !identity.turnId.isEmpty else { return (false, false) }
         macChatTurns.activeTurnIDsBySession[sessionId] = identity.turnId
-        // A new turn must not inherit the previous turn's screen evidence.
+        // A new turn must not inherit the previous turn's screen evidence or its attention.
         macChatTurns.screenPreviewBySession.removeValue(forKey: sessionId)
+        macChatTurns.nowOnBySession.removeValue(forKey: sessionId)
         let state = MacChatTurnLifecycleState(
             identity: identity,
             startedAt: instant
@@ -121,8 +122,9 @@ public extension MacChatTurnPresentationPort {
             macChatTurns.lifecycleBySession[sessionId] = state
         }
         macChatTurns.activeTurnIDsBySession.removeValue(forKey: sessionId)
-        // Release desktop frames when work ends so a transient preview does not retain the user's screen.
+        // Release desktop frames when work ends so a transient preview does not retain the user's screen; the turn's attention ends with it.
         macChatTurns.screenPreviewBySession.removeValue(forKey: sessionId)
+        macChatTurns.nowOnBySession.removeValue(forKey: sessionId)
         return state
     }
 
@@ -132,8 +134,9 @@ public extension MacChatTurnPresentationPort {
         if macChatTurns.lifecycleBySession[sessionId]?.identity.turnId == turnId {
             macChatTurns.lifecycleBySession.removeValue(forKey: sessionId)
         }
-        // Discard the frame with its turn because no later close owns that key.
+        // Discard the frame and the attention with their turn because no later close owns that key.
         macChatTurns.screenPreviewBySession.removeValue(forKey: sessionId)
+        macChatTurns.nowOnBySession.removeValue(forKey: sessionId)
     }
 
     @discardableResult
@@ -286,10 +289,13 @@ public extension MacChatTurnPresentationPort {
 
 /// Project all doors' trace milestones into the same display state without creating tasks, Stop authority or receipts.
 /// Seed from the engine's open runs so an already-running conversation is visible; a local Mac turn takes precedence.
+/// Every door's turn also keeps its attention here (`MacChatTurnRuntime.nowOnBySession`), see `attend`.
 @MainActor
 public final class OtherDoorTurns {
     public static let shared = OtherDoorTurns()
     private var open: [String: MacChatTurnLifecycleState] = [:]
+    /// Each running turn's newest place, from its last call that worked, until the model next speaks.
+    private var placed: [String: String] = [:]
     private var task: Task<Void, Never>?
     private var generation: UUID?
     /// Words reaching the surface prove movement and select the replying phase.
@@ -310,6 +316,7 @@ public final class OtherDoorTurns {
         let consumer = task
         consumer?.cancel()
         open.removeAll()
+        placed.removeAll()
         return Task.detached {
             await settle { await consumer?.value }
         }
@@ -340,11 +347,36 @@ public final class OtherDoorTurns {
         for sessionId in open.keys { show(sessionId, appModel) }
         for await event in subscription.stream {
             guard self.generation == generation, !Task.isCancelled else { break }
+            attend(event, appModel.macChatTurns)
             guard let sessionId = event.sessionId, let ended = reduce(event, appModel) else { continue }
             // Let the store's own publication deliver the ended turn's reply.
             if !ended { show(sessionId, appModel) }
         }
         await settle { await TurnTraceBus.shared.unsubscribe(subscription.id) }
+    }
+
+    /// Where a turn's attention is, for every door's turn and each call it makes, nested steps of a batch or a script included: a call that
+    /// worked names its place on its end (`face`), and the turn's last such place becomes its attention when the model next speaks
+    /// (`provider.roundOutput`). So the window moves at most once a model round, never through each read inside one, and only for the
+    /// turn the conversation shows. A new turn or a turn's end clears the conversation's record.
+    private func attend(_ event: TurnTraceEvent, _ turns: MacChatTurnRuntime) {
+        switch event.kind {
+        case "tool.dispatch":
+            if case .object(let payload) = event.payload, case .string(let place)? = payload["face"] { placed[event.turnId] = place }
+        case "provider.roundOutput":
+            guard let place = placed.removeValue(forKey: event.turnId), let sessionId = event.sessionId,
+                  turns.lifecycle(for: sessionId)?.identity.turnId == event.turnId else { return }
+            turns.nowOnBySession[sessionId] = place
+        case TurnLifecycleMilestone.turnAccepted.rawValue:
+            placed[event.turnId] = nil
+            if let sessionId = event.sessionId { turns.nowOnBySession.removeValue(forKey: sessionId) }
+        case let terminal where TurnTraceEvent.isTerminalKind(terminal):
+            placed[event.turnId] = nil
+            if let sessionId = event.sessionId, turns.lifecycle(for: sessionId).map({ $0.identity.turnId == event.turnId }) != false {
+                turns.nowOnBySession.removeValue(forKey: sessionId)
+            }
+        default: break
+        }
     }
 
     @discardableResult

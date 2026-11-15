@@ -182,9 +182,10 @@ extension SwiftNativeMemoryV2 {
         // again, so metadata-only changes during embedding cannot be lost.
         let roots = MemoryRoot.union(try [MemoryRoot.roots(in: record.metadata)] + existingRows.map { try MemoryRoot.roots(in: $0.metadata) })
         record.metadata = MemoryRoot.setting(roots, in: record.metadata)
-        // Words an untrusted agent steered stay its telling, dated when it told them: never the agent's own past.
+        // Words an untrusted agent steered in a live turn stay its telling, dated when it told them: never the agent's own past. A record the
+        // stem attests keeps the date it records.
         let steer = MemoryDataProvenance.sources(in: record.metadata)
-        if context.restatesOwnPast, !steer.isEmpty {
+        if context.turnSteers, context.restatesOwnPast, !steer.isEmpty {
             throw ToolFailureError("""
                 These words came through \(steer.joined(separator: ", ")), so they stay its telling, dated when it told you. since and remembered \
                 are for your own past, kept in a turn no untrusted agent started.

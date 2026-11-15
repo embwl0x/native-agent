@@ -109,6 +109,8 @@ public struct AppActionBinding: Sendable {
     public let capabilities: Set<String>
     /// Subject arguments distinguish debts so success settles only its own target.
     public let subject: [String]
+    /// The page the action lives on, as the door names it; "*" when every page shares it.
+    public let page: String
     /// The argument names the action declares, as the door spells them; the door's one reading of a call takes a declared name for the action.
     public let declaredArguments: Set<String>
     /// The agent's own words to its own person (`chat.post`): no act on anyone's world and no send to a third party, so no posture and no
@@ -117,7 +119,7 @@ public struct AppActionBinding: Sendable {
 
     public init(lever: Lever?, irreversible: Bool, read: Bool, secretArgs: [String],
                 boundArguments: @escaping @Sendable ([String: JSONValue]) throws -> [String: JSONValue], readWhen: [String: JSONValue] = [:],
-                lifecycle: CapabilityLifecycle.Action? = nil, subject: [String] = [],
+                lifecycle: CapabilityLifecycle.Action? = nil, subject: [String] = [], page: String = "",
                 tool: String = "", fixedInput: [String: JSONValue] = [:], rename: [String: String] = [:],
                 folded: Bool = false, descriptor: ToolDescriptor? = nil, toolClass: ToolClass = .write,
                 reach: ToolReach = .agent, capabilities: Set<String>? = nil, declaredArguments: Set<String> = [], voice: Bool = false) {
@@ -128,6 +130,7 @@ public struct AppActionBinding: Sendable {
         self.boundArguments = boundArguments
         self.lifecycle = lifecycle
         self.subject = subject
+        self.page = page
         self.declaredArguments = declaredArguments
         self.toolClass = toolClass
         self.reach = reach
@@ -140,6 +143,30 @@ public struct AppActionBinding: Sendable {
         let binding = declaredBinding(action)
         let subject = (binding?.subject ?? []).compactMap { (args[$0] ?? binding?.rename[$0].flatMap { args[$0] })?.stringValue }
         return ([action] + subject).joined(separator: ":")
+    }
+
+    /// Where one call puts the agent's attention, as a face link: the page the action lives on and the thing its declared subject names
+    /// there (`page:desk/<handle>`), the page alone when the subject is not given. A shared action, and a page read, name their page in
+    /// their own page argument (`page.show`, `app {page, item}`). An action that declares no subject names no place. A batch or a
+    /// script names none of its own: each step it runs is a call of its own and names its own place.
+    public static func faceLink(_ tool: String, input: JSONValue) -> String? {
+        guard case .object(let given) = input else { return nil }
+        if tool == "app", given["action"] == nil {
+            return link(page: given["page"]?.stringValue, item: given["item"]?.stringValue)
+        }
+        let call = ToolNameAliases.shown(tool, input: input)
+        guard let binding = declaredBinding(ToolNameAliases.appAction(call.name) ?? call.name), !binding.subject.isEmpty,
+              case .object(let fields) = call.input else { return nil }
+        let args = (try? binding.boundArguments(fields)) ?? fields
+        func value(_ name: String) -> String? { (args[name] ?? binding.rename[name].flatMap { args[$0] })?.stringValue }
+        if binding.page == "*" { return link(page: value("page"), item: value("item")) }
+        return link(page: binding.page, item: binding.subject.lazy.compactMap(value).first)
+    }
+
+    private static func link(page: String?, item: String?) -> String? {
+        guard let page = page?.trimmingCharacters(in: .whitespacesAndNewlines), !page.isEmpty, page != "*" else { return nil }
+        let item = item?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "page:" + page + (item.map { $0.isEmpty ? "" : "/" + $0 } ?? "")
     }
 
     public func readOnly(args: [String: JSONValue]) -> Bool {

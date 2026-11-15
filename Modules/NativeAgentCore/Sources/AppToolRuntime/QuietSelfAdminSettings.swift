@@ -791,6 +791,13 @@ public enum QuietSettings {
             id: "settings.dark_mode", page: "settings",
             label: "Dark appearance", key: "nativeagent.darkMode", defaultOn: true
         ))
+        rows.append(defaultsBool(
+            id: "settings.window_follows", page: "settings",
+            label: "The window follows me", key: WindowFollowsPreference.key, defaultOn: true,
+            note: "On, the window shows what I am working on while I work: the Desk item I change, my memories while I recall. "
+                + "It never comes to the front, and once you pick a page or type, it stays where you put it until I finish. "
+                + "Off, the window moves only when I show you a page."
+        ))
         rows.append(QuietSetting(
             id: "settings.haze_color", page: "settings",
             label: "Haze colour", kind: .choice,

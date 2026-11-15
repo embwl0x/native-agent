@@ -14,6 +14,8 @@ final class QuietCaptureSession {
         var image: NSImage?
         /// A table file, read whole, so a picture draws the table the window draws and not a thumbnail of its file.
         var table: SheetTable?
+        /// A board file, read whole, so a picture draws the board the window draws.
+        var board: BoardDocument?
         var resources: [FaceResourceAccess.Opened] = []
     }
     private(set) var make: MakePreviewFace?
@@ -148,6 +150,10 @@ final class QuietCaptureSession {
                 guard held.resources.dropFirst().first != nil else { throw Self.failure("The Make mockup has no granted resource folder.") }
             // ImageIO cannot decode an SVG; Quick Look draws it as the picture it is.
             case "file", "web":
+                if BoardDocument.isBoard(type: first.url.pathExtension) {
+                    held.board = try await BoardFile.read(first.url)
+                    break
+                }
                 if let delimiter = SheetTable.delimiter(type: first.url.pathExtension),
                    let table = try await MakeSheetFile.table(first.url, delimiter: delimiter) {
                     held.table = table

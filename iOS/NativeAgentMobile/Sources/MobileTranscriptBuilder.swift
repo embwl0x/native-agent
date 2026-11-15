@@ -143,8 +143,20 @@ enum MobileTranscriptPreparation {
             .filter { !asked.values.contains($0) }
         for matter in owedMatters { asked[matter] = matter }
         var inbox: [String: PartFace.Row] = [:]
+        // What the Inbox still owes the person (its Waiting for you and Went wrong); nil until the Inbox has been read.
+        var waiting: Set<String>?
         if let face = input.inboxFace?.drawnFace {
             for row in face.sections.flatMap(\.rows) { inbox[row.id] = row }
+            waiting = Set(face.sections.filter { ["waiting", "went-wrong"].contains($0.id) }.flatMap(\.rows).map(\.id))
+        }
+        // Each card's own face as the Mac read it from the card, by its matter; a Mac build that sends none leaves the Inbox row.
+        var cardFaces: [String: PartFace.Row] = [:]
+        for record in input.records {
+            guard let json = record.cardFaceJSON else { continue }
+            do {
+                let card = try JSONDecoder().decode(PartFace.Row.self, from: Data(json.utf8))
+                cardFaces[card.id] = card
+            } catch { log("press.card unreadable row=%@", record.id) }
         }
         var messages: [String: ChatMessage] = [:]
         for message in input.messages { messages[message.id.uuidString] = message }
@@ -174,7 +186,7 @@ enum MobileTranscriptPreparation {
         }
         let data = TranscriptAttachmentData(messages: messages,
             rowContent: Dictionary(rows.map { ($0.id, $0.content) }, uniquingKeysWith: { _, latest in latest }),
-            asked: asked, inbox: inbox)
+            asked: asked, inbox: inbox, cards: cardFaces, waiting: waiting)
         let cards = input.cardsAvailable ? messages.compactMapValues { $0.matter.map { [$0] } } : [:]
         let pressed = TranscriptPressInput(
             session: input.sessionKey, presentation: "phone", groups: TranscriptGrouping.groups(rows), exchanges: input.exchanges,

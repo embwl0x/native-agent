@@ -288,19 +288,54 @@ unconfirmed.
 
 An explicit `mac.wait` with an `agent` also watches an unanswered held send whose receipt is
 `held`, `delivering` or `delivered`, through the same conversation-change signal.
-Stop or release ends that watch; its requested deadline returns `still_waiting`
-without resending or ending the owed answer. This leaves held sends' ordinary
+Its deadline returns `still_waiting` without resending or ending the owed answer. This leaves held sends' ordinary
 queue behavior unchanged. Reading an already-selected conversation with no new
 receipt or selection change performs no store rewrite or change notification;
 the store compares the completed row collection, including sibling selections.
 
-A bridge reply names the accepted send, or answers the sole delivered held
-message in its returned conversation. That inbound arrival hands the answer
+A held send is one append-only record, `agents/held/<send>.jsonl`
+(`HeldSends`), each line saying the process life that wrote it: `sent` (written
+before the row that hands the message out is saved), then at most one of
+`answered` or the agent's own `withdrawn`, and `delivered` (the first wins) once
+a turn of theirs has taken the answer into its input. Only an answer or a withdrawal ends what the send is
+owed: not another send, not a restart, not a restore, not a missing or
+unreadable record, which reads as still owed and says why. Its experience
+carries the `agents/held` mark and moves only by the record; an answer and a
+withdrawal settle it in the same step. A held message that awaits an answer
+carries `reply_to` (the send's id, from its row when its record is lost); a
+contact's message naming it (MCP `agent_message` `reply_to`, `/agent/message`
+`reply_to`, A2A `message.metadata.reply_to`) is its answer, claimed by
+appending `answered` under the record's lock with the message's task id. The
+first claim wins; every other message, including one that only comes next in
+the conversation, is ordinary. A claim naming a send whose record is missing or
+unreadable is refused with that cause, and the send stays owed. The answer is
+words: a job, or a message with files, runs as ordinary work with its files and
+the send stays owed. The answering task completes without a turn. Waits (the
+send's inline wait, `mac.wait`), the conversation's view and a restarted task
+all read the record; the row keeps no copy, and the claim's append wakes waits
+through the conversation-change signal. `delivered` is appended by one function,
+`HeldSends.delivered`, only where a turn takes the answer in: the turn's
+tool-result append (a wait's or a read's result names the send as
+`held_answer`; one already delivered also says `held_answer_delivered`) and
+the news's intake into a thought or a return turn (`MindStream`). "Answered and
+not delivered" is their news, read from the records after each claim, after a
+wait ends, when attention opens or wakes, and at launch: each such record gets
+its contact-thread reply and settled experience, then its `reply:<send>` news,
+unless a wait still watches the send or is carrying its answer to its turn (the
+news waits for that wait to end). The news stays owed in attention until a turn
+takes it in, so a stop anywhere between the answer and `delivered` delivers it
+again, once. The person's own send's answer reaches them in its thread and is
+recorded delivered there. The agent's stop
+withdraws a held send still owed and drops its Mac-waiting delivery in the same
+step; every delivery (the held-message drain, the queue) reads the record and
+skips a withdrawn send.
+
+A bridge reply names the accepted send by its `reply_to`/`in_reply_to`;
+nothing else makes it an answer. That inbound arrival hands the answer
 to the active waiter under the conversation store's settlement lock and files
 it through the existing contact-thread owner, without starting another turn.
-The call that first takes a held message cannot also answer it. If the waiter
-has released, the incoming reply follows its existing bridge-turn path.
-Replies carrying attachments retain that path too.
+If the waiter has released, the incoming reply follows its existing bridge-turn
+path. Replies carrying attachments retain that path too.
 Inline and delayed bridge answers share the store's answer mutation and receipt
 bound; transcript publication receives the complete answer in either path.
 
@@ -653,7 +688,7 @@ Builder, MCP and A2A ingress share `AgentContactTasks` admission, record-owned
 execution, output settlement and retained receipts. Builder formatting remains
 at its door. Enqueue acknowledgment (30 seconds) and reply (600 seconds) bounds
 end only the HTTP wait: a late enqueue still admits its original run. `enqueued` is answered once the task's worker has
-saved the input in its conversation and bound its run to the task (or a waiting conversation took it inline); a message
+saved the input in its conversation and bound its run to the task (or the message answered a held send by its reply_to); a message
 that failed before it was saved returns its failure instead. The bridge
 reads the app's actual selected chat; recent activity cannot select a chat.
 Discovery publication must commit before readiness, admission and recovery begin;
@@ -796,8 +831,8 @@ actual exit and never runs again to repair bookkeeping.
 Held replies have one owner, `AgentConversationStore.drainHeld`, across contact
 doors. Native HTTP `/agent/message` and `/agent/reply`, MCP calls, and the
 Claude/Codex/OMP bridge's message and reply results carry `held_messages` and
-`held_remaining`. Each message contains `at`, `text`, `conversation_id` and
-`conversation_name`. A caller takes what is held in its own conversation, in
+`held_remaining`. Each message contains `at`, `text`, `conversation_id`,
+`conversation_name` and, when it awaits the contact's answer, `reply_to`. A caller takes what is held in its own conversation, in
 the contact's own, and in any caller's conversation whose process is gone
 (`AgentConversationStore.reaches`: the pid no longer runs, or runs with another
 start time); a live caller's messages go only to it, and a caller whose process
@@ -829,7 +864,7 @@ Pruned exchanges retain their acceptance obligation, and the transcript retains
 the send's authorship. Missing or unreadable evidence owes repair for that send;
 it never means delivered or not delivered. A failed response write leaves the
 send held and creates no delivery news. A contact that never calls leaves the
-note held, with the existing read/Stop levers and no clock deciding its outcome.
+note held, with the existing read lever and the agent's withdrawal, and no clock deciding its outcome.
 
 When the asking turn has ended, the receipt follows the existing return to its
 recorded conversation; a known archived conversation keeps that destination.
@@ -837,8 +872,9 @@ A missing session record leaves the news owed with its repair, without guessing
 another conversation. Helper-owned and contact-owned conversations receive
 delivery receipts in the agent's own mind stream: receipt of their answer opens no
 contact reply turn and cannot generate another held answer by itself. News of
-the agent's own send (its delivery, its reply, its refusal) is the contact
-answering the agent, never asking: it carries no steering, since a turn's
+the agent's own send (its delivery, its reply, its refusal, a failed delegation
+wake quoting the reply's head) is the contact answering the agent, never
+asking: it carries no steering, since a turn's
 steering is who asked it, and uses ordinary turn admission. Delivery and reply
 keep separate once-keys (`delivered:<send-id>` and `reply:<send-id>`); delivery
 reports receipt alone, never an owed-answer verdict. An inline or bridge reply

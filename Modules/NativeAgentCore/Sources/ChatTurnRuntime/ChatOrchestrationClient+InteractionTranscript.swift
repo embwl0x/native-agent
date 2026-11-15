@@ -183,8 +183,9 @@ extension SwiftNativeChatOrchestrationClient {
         }
         record["metadata"] = .object(metadata)
         let toolRow: JSONValue = .object(record)
-        let filed = try await Self.appendTranscriptRow(
-            toolRow, to: path)
+        // The call's receipt id: its own result's after dispatch returned, the act in progress while it runs.
+        let filed = try await Self.appendTranscriptRow(toolRow,
+            raisedBy: originalResult.objectValue?["dispatch_receipt_id"]?.stringValue ?? turn.act, to: path)
         if stampedInteraction != nil, filed.changed {
             NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: sessionId)
         }
@@ -290,22 +291,27 @@ extension SwiftNativeChatOrchestrationClient {
             guard case .object(var object) = rows[index],
                   case .object(var metadata)? = object["metadata"]
             else { throw InlineInteractionResolveError.notFound }
-            if let encoded = InlineInteractionNeed.encode(interaction) {
+            // A re-ask linked while this writer held an older copy keeps its receipt: receipts only ever join.
+            var written = interaction
+            let saved = persisted.receiptIDs ?? []
+            let joined = saved + (written.receiptIDs ?? []).filter { !saved.contains($0) }
+            written.receiptIDs = joined.isEmpty ? nil : joined
+            if let encoded = InlineInteractionNeed.encode(written) {
                 metadata[InlineInteractionWire.metadataKey] = encoded
             }
-            let envelope = inlineInteractionReceiptEnvelope(interaction)
+            let envelope = inlineInteractionReceiptEnvelope(written)
             let reply = ToolResult(envelope)
             metadata["resultSummary"] = .string(
                 try reply.payload.serialize(pretty: false)
             )
-            metadata["resultStatus"] = .string(interaction.state.name)
+            metadata["resultStatus"] = .string(written.state.name)
             metadata["resultClass"] = .string(
                 reply.outcome.rawValue
             )
-            if let summary = interaction.state.outcome?.summary, !summary.isEmpty {
+            if let summary = written.state.outcome?.summary, !summary.isEmpty {
                 metadata["resultBody"] = .string(summary)
             }
-            metadata["ok"] = .bool(interaction.state.outcome != nil)
+            metadata["ok"] = .bool(written.state.outcome != nil)
             object["metadata"] = .object(metadata)
             rows[index] = .object(object)
             try ContactThread.replace(rows, to: file)
@@ -394,15 +400,18 @@ extension SwiftNativeChatOrchestrationClient {
             "metadata": .object(metadata),
         ])
         let path = dataRoot.appendingPathComponent("chat/messages/\(safeSession).jsonl")
-        let filed = try await appendTranscriptRow(row, to: path)
+        let filed = try await appendTranscriptRow(row, raisedBy: turn.act, to: path)
         guard let retained = filed.card else {
             throw ChatOrchestrationError.underlying("The interaction append returned no card.")
         }
         return (retained, filed.changed)
     }
 
+    /// `raisedBy` is the dispatch receipt of the call that raised a card on this row: a new card is born with it, and a re-ask of an open
+    /// card adds it (`receiptIDs`).
     @discardableResult
-    package static func appendTranscriptRow(_ row: JSONValue, to path: URL) async throws -> (card: InlineInteraction?, changed: Bool) {
+    package static func appendTranscriptRow(_ row: JSONValue, raisedBy receipt: String? = nil,
+                                            to path: URL) async throws -> (card: InlineInteraction?, changed: Bool) {
         let lifeID: String?
         if row.objectValue?["metadata"]?.objectValue?["kind"] == .string(InlineInteractionWire.transcriptKind) {
             lifeID = try DataRootLife.current(in: path.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent())
@@ -411,12 +420,12 @@ extension SwiftNativeChatOrchestrationClient {
             let root = path.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             // One provider ask across conversations and producers. This lock carries no credential or copied account state.
             return try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("chat/provider-asks")) {
-                let retained = try await appendLockedTranscriptRow(row, to: path, lifeID: lifeID)
+                let retained = try await appendLockedTranscriptRow(row, raisedBy: receipt, to: path, lifeID: lifeID)
                 if let card = retained.card { await supersedeProviderAsks(card, except: path, root: root, lifeID: lifeID) }
                 return retained
             }
         }
-        return try await appendLockedTranscriptRow(row, to: path, lifeID: lifeID)
+        return try await appendLockedTranscriptRow(row, raisedBy: receipt, to: path, lifeID: lifeID)
     }
 
     private static func supersedeProviderAsks(_ incoming: InlineInteraction, except path: URL, root: URL, lifeID: String?) async {
@@ -475,7 +484,8 @@ extension SwiftNativeChatOrchestrationClient {
         }
     }
 
-    private static func appendLockedTranscriptRow(_ row: JSONValue, to path: URL, lifeID: String?) async throws -> (card: InlineInteraction?, changed: Bool) {
+    private static func appendLockedTranscriptRow(_ row: JSONValue, raisedBy receipt: String?, to path: URL,
+                                                  lifeID: String?) async throws -> (card: InlineInteraction?, changed: Bool) {
         return try await SwiftNativePersistenceCore.withFileLock(path) { () async throws -> (card: InlineInteraction?, changed: Bool) in
             let incoming = try checkedInlineInteraction(in: row, lifeID: lifeID)
             if let incoming {
@@ -496,6 +506,22 @@ extension SwiftNativeChatOrchestrationClient {
                     receipt["metadata"] = .object(metadata)
                     try await ContactThread.append(.object(receipt), to: path)
                     return true
+                }
+                // A re-ask is one more receipt of the same card: link it, so the card's settlement is written under it too.
+                func linking(_ card: InlineInteraction, at index: Int) throws -> InlineInteraction {
+                    guard let receipt, !receipt.isEmpty, !(card.receiptIDs ?? []).contains(receipt),
+                          case .object(var fields) = read.rows[index], case .object(var metadata)? = fields["metadata"] else { return card }
+                    var linked = card
+                    linked.receiptIDs = (card.receiptIDs ?? []) + [receipt]
+                    guard let encoded = InlineInteractionNeed.encode(linked) else {
+                        throw ChatOrchestrationError.underlying("The re-asked card could not be encoded; nothing was filed.")
+                    }
+                    metadata[InlineInteractionWire.metadataKey] = encoded
+                    fields["metadata"] = .object(metadata)
+                    var rows = read.rows
+                    rows[index] = .object(fields)
+                    try ContactThread.replace(rows, to: path)
+                    return linked
                 }
                 for (index, prior) in read.rows.enumerated().reversed() {
                     let card: InlineInteraction
@@ -519,7 +545,8 @@ extension SwiftNativeChatOrchestrationClient {
                         continue
                     }
                     if card.id == incoming.id {
-                        return (card, try await retainReceipt(pointingTo: card))
+                        let linked = try linking(card, at: index)
+                        return (linked, try await retainReceipt(pointingTo: linked))
                     }
                     if card.state.isOpen,
                        (card.kind == .apiKey && card.secret == nil || tool(card, prior) == tool(incoming, row)),
@@ -529,12 +556,25 @@ extension SwiftNativeChatOrchestrationClient {
                        (card.kind != .choose || (row.objectValue?["metadata"]?.objectValue?["choiceSubject"] != nil
                         && prior.objectValue?["metadata"]?.objectValue?["choiceSubject"] == row.objectValue?["metadata"]?.objectValue?["choiceSubject"])),
                        card.options.sorted(by: { $0.id < $1.id }) == incoming.options.sorted(by: { $0.id < $1.id }) {
-                        return (card, try await retainReceipt(pointingTo: card))
+                        let linked = try linking(card, at: index)
+                        return (linked, try await retainReceipt(pointingTo: linked))
                     }
                 }
             }
-            try await ContactThread.append(row, to: path)
-            return (incoming, true)
+            // Every card is born here, and keeps the receipt of the call that raised it: its settlement is written under that id.
+            guard var born = incoming, born.receiptIDs == nil, let receipt, !receipt.isEmpty,
+                  case .object(var fields) = row, case .object(var metadata)? = fields["metadata"] else {
+                try await ContactThread.append(row, to: path)
+                return (incoming, true)
+            }
+            born.receiptIDs = [receipt]
+            guard let encoded = InlineInteractionNeed.encode(born) else {
+                throw ChatOrchestrationError.underlying("The interaction card could not be encoded; no card was filed.")
+            }
+            metadata[InlineInteractionWire.metadataKey] = encoded
+            fields["metadata"] = .object(metadata)
+            try await ContactThread.append(.object(fields), to: path)
+            return (born, true)
         }
     }
 

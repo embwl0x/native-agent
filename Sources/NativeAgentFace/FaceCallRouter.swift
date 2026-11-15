@@ -105,6 +105,7 @@ final class FaceCallRouter {
                     host = parent
                 }
                 alerts[id] = AlertPresentation(alert: alert, host: host, continuation: continuation)
+                alert.window.preventsApplicationTerminationWhenModal = false
                 alert.beginSheetModal(for: parent) { [weak self] response in
                     guard let shown = self?.alerts.removeValue(forKey: id) else { return }
                     shown.host?.close()

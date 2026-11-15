@@ -285,16 +285,28 @@ words or a `leaf` block (key `piece:<refId>`, `ref` the Make ref, `revision` the
 version, `alt` the Make ref and the `make.read`/`make.add` calls, and for a table
 its size and first rows; a text piece's section footer says the same).
 Mockups, pages and pictures share `beside:"pieces"` and stand as columns
-(`FaceColumns`); documents and tables follow at full width. `FacePageView` draws
+(`FaceColumns`); documents, tables and boards follow at full width. `FacePageView` draws
 those leaves through the Make pane's granted preview (`PageMakePreview`,
-`WorkPaneMakeView.swift`), on its selection path too; other doors read the
-`alt`. A CSV or TSV version there is `MakeSheetView`: a changed cell sends the
-whole table to the body's `save_sheet` Desk command, which checks the changed
-version is a table, the name its type and the words within
-`MakePreviewFace.wordsLimit`, then runs `make.add` as the
+`WorkPaneMakeView.swift`), on its selection path too, and a board leaf
+(`leaf:"board"`) through `PageMakeBoard`, which keeps drawing the version it read
+until the next one is read; other doors read the `alt`. A CSV or TSV version
+there is `MakeSheetView`, a `.board` version `MakeBoardView`: a changed cell sends
+the whole table, and a change by hand the whole board, to the body's
+`save_piece` Desk command, which checks the changed version is a table or a
+board, the name its type, the words within `MakePreviewFace.wordsLimit` and a
+board's words a `BoardDocument`, then runs `make.add` as the
 person's tap (`ToolsFacade.personTap` with `personEditOf`, carried as
 `Turn.personEditOf`); `MakeStudio.add` appends it only while that version is
-the newest and records `personEditOf` on the new version. A piece's rows open it
+the newest and records `personEditOf` on the new version. `save_piece` reads
+Make's record after the tap: it answers the version it laid, names a refusal
+`version_superseded` when nothing was laid and the newest is not the edited
+version, and passes any other failure on. A board's state for its ref
+(`MakeBoardState`) is shared by its drawings: the newest version read and the
+person's changes not yet laid, each applied to the newest version at save time,
+one save at a time; the save under way is drawn on top only of the version it
+was made on, only `version_superseded` is made again (once a newer version is
+read), and the Make shelf names a board version's kind `board` so the Make pane
+keeps one page and one board across its versions. A piece's rows open it
 in the Work pane's Make view (`pane.show`, Mac). What the Make shelf publishes
 refreshes the Desk page (`EnginePages.swift`), so a new version shows without
 another write.
@@ -716,8 +728,9 @@ routing reconstruction, the Providers and minds pickers, the default-model
 setting and the account editor, the agent's `provider.set_default_model`,
 `providers.*_model` and `chat.model`, Telegram's model menu, the image-model
 card, and a helper's pinned model (`bot.create`/`bot.update`, through
-`botModelRefusal` over the rows `bot.list include_models` lists; the slot is
-the helper's own saved model). Pickers and menus list offered rows only, plus the slot's current model
+`botModelRefusal` over the rows `bot.list include_models` lists for the very
+account the helper names, never a sibling of its vendor; the slot is the
+helper's own saved model). Pickers and menus list offered rows only, plus the slot's current model
 shown selected with its note; a picker with nothing offered says the account's
 sentence; a picker over several accounts (the composer, the image-model card)
 has no entries from an account that offers nothing. The phone and the agent's
@@ -731,7 +744,7 @@ Completions and Responses, Anthropic by key and by Claude sign-in, Kimi Code and
 Meta; and, while a run's budget is bound, xAI and Moonshot in
 `max_completion_tokens`). xAI documents its field as visible output only, so
 reasoning there is held by the routing stream alone. OpenRouter, ChatGPT and
-Codex write no cap (OpenRouter's catalog states no output ceiling to bound one), so the provider's own ceiling stands
+Codex write no cap (the OpenRouter list this build keeps holds no output ceiling to bound one), so the provider's own ceiling stands
 while the routing stream holds the run's aggregate budget. An explicit Think level the model's row offers is sent as written (xAI's
 `none` included); "use the provider's default" and a model with one level send no
 field, and the word `default` is never sent. **Refresh** (`provider.refresh`)

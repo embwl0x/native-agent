@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 import NativeAgentShared
 import UserNotifications
-// Blueprint: | `NativeAgentFaceApp.swift` | Copied window bootstrap; its only agent owner is the inherited pipe client |
+// Blueprint: | `NativeAgentFaceApp.swift` | Copied window bootstrap; its only agent owner is the inherited pipe client; it ends with its body's process |
 
 @main
 struct NativeAgentFaceApp: App {
@@ -58,7 +58,7 @@ struct FaceWindowCommands: Commands {
             Button("Quit NativeAgent") {
                 Task {
                     do { _ = try await appModel.client.act(.quitBody) }
-                    catch { NSApp.terminate(nil) }
+                    catch { FaceAppDelegate.endWithBody() }
                 }
             }.keyboardShortcut("q", modifiers: .command)
         }
@@ -96,7 +96,30 @@ struct FaceWindowCommands: Commands {
 
 @MainActor final class FaceAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     /// This process is already ending with the body.
-    private var endingWithBody = false
+    private static var endingWithBody = false
+    /// The body's process exit, seen by the kernel.
+    private var bodyExit: DispatchSourceProcess?
+
+    /// The body is gone or will not answer: nothing is left to ask, so this process ends at once. Its termination answers now and waits on
+    /// no main-actor work, so it may start inside a main-queue job.
+    static func endWithBody() {
+        endingWithBody = true
+        NSApp.terminate(nil)
+    }
+
+    /// The process that spawned this one is its body. The body's exit ends this process however the body ended: Quit, a crash or a kill.
+    private func followBody() {
+        let body = getppid()
+        // A body that exited before this read handed this process to launchd.
+        guard body != 1 else { Self.endWithBody(); return }
+        let watch = DispatchSource.makeProcessSource(identifier: body, eventMask: .exit, queue: .main)
+        watch.setEventHandler { MainActor.assumeIsolated { FaceAppDelegate.endWithBody() } }
+        watch.resume()
+        bodyExit = watch
+        // An exit between the read and the arming is seen as the new parent.
+        if getppid() != body { Self.endWithBody() }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Opened without the body (a kept Dock icon, Finder): start the body, which opens its own window, and leave.
         guard ProcessInfo.processInfo.environment["NATIVEAGENT_FACE_DATA_ROOT"] != nil else {
@@ -106,6 +129,7 @@ struct FaceWindowCommands: Commands {
             }
             return
         }
+        followBody()
         NSApp.setActivationPolicy(.regular)
         UNUserNotificationCenter.current().delegate = self
         // The link starts with this process, never with a window: the body asks for the window over it.
@@ -116,10 +140,11 @@ struct FaceWindowCommands: Commands {
 
     /// Quit is the whole app, however it is asked for. A Quit that reaches only this process (the Dock's menu, a system quit, a logout)
     /// asks the body to end before this process does; left running, the body would open the window again the next time it had something
-    /// to show. An answer and a failure both end the wait: the body is ending, or there is no body to ask.
+    /// to show. An answer and a failure both end the wait: the body is ending, or there is no body to ask. The ask needs main-actor work, so a
+    /// termination started inside a main-queue job goes through `endWithBody` instead.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard ProcessInfo.processInfo.environment["NATIVEAGENT_FACE_DATA_ROOT"] != nil, !endingWithBody else { return .terminateNow }
-        endingWithBody = true
+        guard ProcessInfo.processInfo.environment["NATIVEAGENT_FACE_DATA_ROOT"] != nil, !Self.endingWithBody else { return .terminateNow }
+        Self.endingWithBody = true
         Task { @MainActor in
             _ = try? await FaceSession.shared.client.act(.quitBody)
             NSApp.reply(toApplicationShouldTerminate: true)
@@ -136,6 +161,7 @@ struct FaceWindowCommands: Commands {
                 let alert = NSAlert()
                 alert.messageText = "The NativeAgent window could not open."
                 alert.informativeText = error.localizedDescription
+                alert.window.preventsApplicationTerminationWhenModal = false
                 alert.runModal()
             }
         }

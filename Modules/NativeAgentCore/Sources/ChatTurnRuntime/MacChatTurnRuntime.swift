@@ -58,6 +58,10 @@ public final class MacChatTurnRuntime {
     @ObservationIgnored public var screenPreviewBySession: [String: TurnFace.Preview] = [:] {
         didSet { if screenPreviewBySession != oldValue { faceDidChange?() } }
     }
+    /// Where each running turn's attention is now (`TurnFace.nowOn`), one face link per conversation; the turn's end clears it.
+    @ObservationIgnored public var nowOnBySession: [String: String] = [:] {
+        didSet { if nowOnBySession != oldValue { faceDidChange?() } }
+    }
     @ObservationIgnored public var lifecycleBySession: [String: MacChatTurnLifecycleState] = [:] {
         didSet { if lifecycleBySession != oldValue { faceDidChange?() } }
     }

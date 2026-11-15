@@ -143,24 +143,32 @@ final class BodyFaceServices {
                 input: ["prompt": .string(prompt), "__make_ref": .string(asked)])
             try Self.requireSuccess(value, action: "make_again")
             return .string("Image made.")
-        case "save_sheet":
-            // Its subject is a Make reference: the person changed a table drawn from one version, and their own tap lays the whole table
-            // as that version's successor (`make.add`, recorded as the person's edit of it).
+        case "save_piece":
+            // Its subject is a Make reference: the person changed a piece drawn from one version (a table's cells, a board's cards), and
+            // their own tap lays the whole piece as that version's successor (`make.add`, recorded as the person's edit of it).
             guard case .string(let from)? = request.arguments["version"], let edited = Int(from),
                   case .string(let name)? = request.arguments["name"], case .string(let content)? = request.arguments["content"],
                   request.arguments.count == 3 else {
-                throw Self.failure("sheet_save_invalid", "A table is saved whole, with its file name and the version it was changed from.")
+                throw Self.failure("piece_save_invalid", "A piece is saved whole, with its file name and the version it was changed from.")
             }
-            try await Self.checkSheetSave(asked, edited: edited, name: name, content: content, root: engine.dataRoot)
+            try await Self.checkPieceSave(asked, edited: edited, name: name, content: content, root: engine.dataRoot)
             let call = PartFace.Call("make.add", ["ref": .string(asked), "name": .string(name), "content": .string(content)])
             let outcome = try await engine.tools.personTap(call, PartFaces.Tap(page: "make", row: asked, action: "make.add", door: "mac",
                 device: nil, chat: nil, decided: true), personEditOf: edited)
-            if let failure = outcome.failure { throw failure }
-            guard !outcome.unresolved else {
-                throw Self.failure("sheet_save_unconfirmed", "I can't confirm the table was saved. Look at its versions in Make before saving again.",
+            // Make lays a person's edit of a version only while that version is the newest, so one version at most is its edit. Make's
+            // own record says what happened: the edit laid, or a newer version and nothing written, which the window makes again on it.
+            let after = try await Self.editRecord(asked, of: edited, root: engine.dataRoot)
+            if let failure = outcome.failure {
+                if after.laid == nil, after.newest != edited {
+                    throw WireFailure(code: "version_superseded", message: failure.message, cause: failure.cause, effects: .none)
+                }
+                throw failure
+            }
+            guard !outcome.unresolved, let laid = after.laid else {
+                throw Self.failure("piece_save_unconfirmed", "I can't confirm the change was saved. Look at its versions in Make before changing it again.",
                                    effects: .unknown)
             }
-            return .string("Saved as a new version.")
+            return .object(["words": .string("Saved as version \(laid)."), "version": .string(String(laid))])
         case "close", "defer", "note": return try await paletteCommand(request, handle: try await deskItem(asked))
         case "select":
             // "board" is the page's own name for no item: the open item is let go, as its Back to the board does.
@@ -268,24 +276,39 @@ final class BodyFaceServices {
 
     /// The window says what the person changed; the body decides what that may lay. The version they changed is a table (CSV or TSV) of an
     /// existing ref, the new words are a file of that same type, and they fit make.add's own limit. Anything else writes nothing.
-    @concurrent private static func checkSheetSave(_ reference: String, edited: Int, name: String, content: String, root: URL) async throws {
+    /// A piece is changed from the window only when it is a table or a board, saved as the type it was, within the words Make takes in
+    /// hand; a board's words must read as a board.
+    @concurrent private static func checkPieceSave(_ reference: String, edited: Int, name: String, content: String, root: URL) async throws {
         let studio = MakeStudio(dataRoot: root)
         guard MakeStudio.isRef(reference), let meta = try studio.readMeta(reference) else {
-            throw failure("sheet_ref_missing", "No Make ref is called \(reference). Nothing was saved.")
+            throw failure("piece_ref_missing", "No Make ref is called \(reference). Nothing was saved.")
         }
         guard let version = meta.versions.first(where: { $0.n == edited }) else {
-            throw failure("sheet_version_missing", "\(reference) has no version \(edited). Nothing was saved.")
+            throw failure("piece_version_missing", "\(reference) has no version \(edited). Nothing was saved.")
         }
         let type = studio.url(reference, version).pathExtension.lowercased()
-        guard SheetTable.delimiter(type: type) != nil else {
-            throw failure("sheet_not_a_table", "Version \(edited) of \(reference) is not a table, so no table is saved as its next version. Nothing was saved.")
+        let board = BoardDocument.isBoard(type: type)
+        guard board || SheetTable.delimiter(type: type) != nil else {
+            throw failure("piece_not_changeable", """
+                Version \(edited) of \(reference) is neither a table nor a board, so nothing is saved as its next version from here. Nothing was saved.
+                """)
         }
         guard (name as NSString).lastPathComponent == name, (name as NSString).pathExtension.lowercased() == type else {
-            throw failure("sheet_type_changed", "A table changed from a .\(type) version is saved as .\(type). Nothing was saved.")
+            throw failure("piece_type_changed", "A piece changed from a .\(type) version is saved as .\(type). Nothing was saved.")
         }
         guard content.utf8.count <= MakePreviewFace.wordsLimit else {
-            throw failure("sheet_too_large", "This table is over 2 MB, too large to save from here. Nothing was saved.")
+            throw failure("piece_too_large", "This is over 2 MB, too large to save from here. Nothing was saved.")
         }
+        if board {
+            do { _ = try BoardDocument(content) }
+            catch { throw failure("board_unreadable", "This is not a board: " + error.localizedDescription + " Nothing was saved.") }
+        }
+    }
+
+    /// The version Make laid as the person's edit of `edited`, if any, and the ref's newest version.
+    @concurrent private static func editRecord(_ reference: String, of edited: Int, root: URL) async throws -> (laid: Int?, newest: Int?) {
+        let versions = try MakeStudio(dataRoot: root).readMeta(reference)?.versions ?? []
+        return (versions.first { $0.personEditOf == edited }?.n, versions.last?.n)
     }
 
     @concurrent private static func imagePrompt(_ reference: String, version: String, root: URL) async throws -> String {

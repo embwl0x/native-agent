@@ -39,10 +39,12 @@ struct WorkPaneMakeView: View {
         VStack(alignment: .leading, spacing: 8) {
             FaceReadStatus(state: shelf?.state)
             if let version {
+                // A board is one piece across its versions: its page is not made anew per version, so a card in the hand or words
+                // being written survive a version arriving.
                 MakeVersionPage(version: version, versions: versions,
                     selectedVersion: Binding(get: { selectedVersion }, set: { selectedVersion = $0 }),
                     session: appModel.pageSessions.page("work-make/" + version.reference + "/" + version.version))
-                    .id(version.reference + "/" + version.version)
+                    .id(version.kind == BoardDocument.type ? version.reference : version.reference + "/" + version.version)
             } else if shelf?.state == .ready {
                 Text("Nothing made yet.").foregroundStyle(.secondary).padding()
             }
@@ -54,8 +56,8 @@ struct WorkPaneMakeView: View {
             }
         }
         // Leaving a ref lets go of what its last table save said.
-        .onChange(of: reference) { left, _ in if let left { MakeSheetWords.shared.said[left] = nil } }
-        .onDisappear { if let reference { MakeSheetWords.shared.said[reference] = nil } }
+        .onChange(of: reference) { left, _ in if let left { MakePieceWords.shared.said[left] = nil } }
+        .onDisappear { if let reference { MakePieceWords.shared.said[reference] = nil } }
         .modifier(FaceObservation(demand: .key(.makeShelf)))
     }
 }
@@ -85,11 +87,14 @@ private struct MakeVersionPage: View {
                 if let error = titleSnapshot?.error { Text(error.message).foregroundStyle(.red).textSelection(.enabled) }
                 FaceView(face: WorkPaneFace.make(version, versions: versions, title: title, preview: preview),
                          door: door, session: session, leaf: { block in
+                    // A board is drawn under the page, outside the per-version preview leaf.
+                    if version.kind == BoardDocument.type { return AnyView(EmptyView()) }
                     if let preview, block.key == "make-preview", block.ref == preview.reference, block.revision == preview.revision {
                         return AnyView(GrantedMakePreview(preview: preview).id(preview.revision).frame(minHeight: preview.isPicture ? nil : 240))
                     }
                     return AnyView(Text("This preview does not match its owner's current resource grant.").foregroundStyle(.red))
                 })
+                if version.kind == BoardDocument.type { PageMakeBoard(reference: version.reference, version: version.version) }
             }.padding(12)
         }
         // A picture fitted to the width gets shorter as the page narrows. A scroll bar that takes width would then appear, narrow the
@@ -184,7 +189,7 @@ struct PageMakePreview: View {
         }
         .modifier(FaceObservation(demand: .key(key)))
         // The piece stays drawn here across its versions; leaving it lets go of what its last table save said.
-        .onDisappear { MakeSheetWords.shared.said[reference] = nil }
+        .onDisappear { MakePieceWords.shared.said[reference] = nil }
     }
 }
 
@@ -196,7 +201,10 @@ private struct GrantedMakePreview: View {
     @State private var issue: String?
     var body: some View {
         Group {
-            if let capture {
+            if preview.resources.first.map({ BoardDocument.isBoard(type: ($0.name as NSString).pathExtension) }) == true {
+                // A board reads its own file and holds across versions, in a picture of the page too.
+                PageMakeBoard(reference: preview.reference, version: preview.version)
+            } else if let capture {
                 let held = capture.held(preview)
                 if let image = held?.image { Image(nsImage: image).resizable().scaledToFit().padding(12) }
                 else if let table = held?.table, let file = held?.resources.first?.url,
@@ -222,7 +230,8 @@ private struct GrantedMakePreview: View {
             } else { Text("Waiting on preview resources…").foregroundStyle(.secondary) }
         }
         .task(id: preview) {
-            guard capture == nil else { return }
+            guard capture == nil, preview.resources.first.map({ BoardDocument.isBoard(type: ($0.name as NSString).pathExtension) }) != true
+            else { return }
             for resource in resources where resource.scoped { resource.url.stopAccessingSecurityScopedResource() }
             resources = []
             image = nil

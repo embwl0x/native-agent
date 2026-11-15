@@ -170,19 +170,18 @@ enum AgentContactRuntime {
             let inputs = try AgentContactJob.stage(turn.parts, taskID: turn.taskID, dataRoot: dataRoot)
             jobLines = AgentBridgeSurface.jobLines(folder: AgentContactJob.folder(taskID: turn.taskID, dataRoot: dataRoot), inputs: inputs, done: job.done)
         } else { jobLines = "" }
-        // A job is new work, never the answer to a send of the agent's that is waiting on this contact.
-        if acceptedMessage == nil, turn.job == nil, turn.parts.allSatisfy({ if case .text = $0 { true } else { false } }),
+        // Only a message naming a held send by its reply_to answers it, and only the first does; any other message is an ordinary one. The claim
+        // is the answer's one write, on the send's own record, by this task's id: a restart reads it there (AgentContactTasks.get).
+        // The answer is words: a job or a message with files is ordinary work, and the send it names stays owed.
+        if acceptedMessage == nil, let send = turn.replyTo, turn.job == nil,
+           turn.parts.allSatisfy({ if case .text = $0 { true } else { false } }),
            let peerID = try revalidated(principal, dataRoot: dataRoot).peerID {
             let from = "peer:" + peerID
-            let offered = await settle {
-                Result {
-                    try AgentConversationStore(dataRoot: dataRoot).offerBridgeReplyToInlineWait(
-                        agent: from, conversationID: turn.context, text: plain, from: from, steeredBy: [from])
-                }
+            let claim = await settle {
+                Result { try HeldSends(dataRoot: dataRoot).claim(send, contact: from, by: turn.taskID, text: plain, from: from) }
             }
-            if try offered.get() {
-                return AgentContactOutcome(state: .completed,
-                    parts: [.text("Your reply was returned to the waiting conversation.")])
+            if try claim.get() == .answered {
+                return AgentContactOutcome(state: .completed, parts: [.text(HeldSends.answeredNote(send))])
             }
         }
         // Pin the minted run before enqueue so the canonical row keeps the same identity.

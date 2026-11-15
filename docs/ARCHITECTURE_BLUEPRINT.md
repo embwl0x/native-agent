@@ -432,13 +432,13 @@ this grant, and `script/verify_release_artifact.sh` checks the signed entitlemen
 | `BodyFaceNotifications.swift` | Native notification effects retain their originating renderer and canonical body action owner |
 | `BodyFacePalette.swift` | Connection-owned global search using the canonical inventory, ranking and saved-result owners |
 | `BodyFacePresentation.swift` | Connection-bound tool presentations and applied-frame page screenshots |
-| `BodyFaceProcess.swift` | Body-owned child process, inherited pipes and explicit window reopening; process exit owns retirement |
+| `BodyFaceProcess.swift` | Body-owned child process, inherited pipes and explicit window reopening; process exit owns retirement; orphans end |
 | `BodyFaceServices.swift` | Body-owned contact, Desk, graph and resource acts for the separate window |
 | `BodyFaceTranscripts.swift` | Connection-owned press readers, live conversation projections and checked transcript resource grants |
 | `BodyFaceVoice.swift` | Body microphone, speech and attachment reads publish operation-bound values to the window |
 | `BodyFolderPresentation.swift` | Cancellable native shared-folder selection for body presentation calls |
 | `BodyInboxCardActions.swift` | Copied Inbox effects return through its pipe; draft receipts confirm the applied renderer edit |
-| `BodyNativePanels.swift` | Cancellable body-native folder and exclusion panels |
+| `BodyNativePanels.swift` | Cancellable body-native panels and questions; once its run loop runs the body never runs modal |
 | `BodyOAuthPlatform.swift` | Body OAuth protocol adapter; only authentication-session presentation crosses the pipe |
 | `BodyQuietChatCommands.swift` | Connection-held quiet composer snapshots, CAS edits and canonical session commands |
 | `BodySettingsActHandler.swift` | Body platform acts, mounted presentation demands and pipe-owned reverse calls |
@@ -526,7 +526,7 @@ The body retains its existing window while the copied renderer is assembled.
 | `AppShellMenuPresentation.swift` | Rail-derived shortcuts, status words and ordered rail rows |
 | `AppTrustFaceActions.swift` | Native Trust workbench and confirmed app-exclusion picker |
 | `AppearanceController.swift` | `AppearanceController`: one explicit light/dark answer applied consistently to SwiftUI and AppKit |
-| `ApplicationLifetime.swift` | Renderer-owned scene mounting, command admission and acknowledged navigation |
+| `ApplicationLifetime.swift` | Scene mounting, command admission and acknowledged navigation; the window follows the turn's attention |
 | `CardChrome.swift` | Shared protected card forms retain nonsecret edits and route secret bytes to the card's own control |
 | `CardControls.swift` | Native card presentations and checked verification; mounted hosts own return work and feedback |
 | `ChatClipboardAndAttachmentSupport.swift` | Picker, paste and drop transfers; body attachment validation, capture and voice acts |
@@ -593,6 +593,7 @@ The body retains its existing window while the copied renderer is assembled.
 | `MacChatTurnCard.swift` | `MacChatTurnCard`: main/detached display of the shared turn face |
 | `MacControlWorkbenchView.swift` | Shared Mac control forms, policy availability and retained owner outcomes |
 | `MacWorkOverviewDetail.swift` | Shared work facts and document body; approvals and Inbox draw the Inbox page |
+| `MakeBoardView.swift` | A Make board drawn as a native board; a change by hand is laid as the next version on the newest |
 | `MakeSheetView.swift` | A Make table version drawn as a native table; a changed cell is laid as the next version by the person's tap |
 | `MemoriesFaceNavigation.swift` | Memory and helper document demands; existing correction/Forget controls and local graph/upkeep destinations |
 | `MemoryView.swift` | Memory upkeep acts, full text, feed read status and scoped face observations |
@@ -602,7 +603,7 @@ The body retains its existing window while the copied renderer is assembled.
 | `MoodTint.swift` | Feed warmth drives local display damping; window visibility owns the animation timer |
 | `NativeAgentDesign.swift` | `View`: `settingsCardSurface`; centered shell layout and shared surfaces |
 | `NativeAgentDesignTokens.swift` | Mac fonts, layout, status colours and brand palette; geometry lives in Shared |
-| `NativeAgentFaceApp.swift` | Copied window bootstrap; its only agent owner is the inherited pipe client |
+| `NativeAgentFaceApp.swift` | Copied window bootstrap; its only agent owner is the inherited pipe client; it ends with its body's process |
 | `NativeAgentFeel.swift` | `NAInteractiveModifier` and `NAButtonStyle`: shared hover/press feedback vocabulary for interactive Mac surfaces |
 | `NativeAgentMotion.swift` | `NativeAgentMotion`: shared transitions; Reduce Motion stops layout, retains fades |
 | `NativeAgentWindowChrome.swift` | `MainWindowContent`, `MenuBarOpenButton`; main-window content and menu-bar opening |
@@ -811,6 +812,7 @@ NativeAgent approval cards cover only requests the agent submits.
 | `BuilderWorktreeAllocator.swift` | `BuilderWorktreeAllocator`, `resolve`, `discard`: one worktree per job |
 | `ChatGPTDotIPCTransport.swift` | `ChatGPTDotIPCTransport`, `listen`, `reconnect`, `stop`, `readiness` |
 | `GrokBotRoute.swift` | `GrokBotRoute` enum; `withHistory`, `takenByWaiter`; cancellation ends the waiter handoff without resampling |
+| `HeldSend.swift` | `HeldSend`, `HeldSends`: one append-only record per held send (agents/held/<send>.jsonl); only its answer or the agent's withdrawal ends it |
 | `HelperContact.swift` |  |
 | `JSONEntrySplice.swift` |  |
 | `JobDoor.swift` | `JobDoors.install`; what every job door shares: its outlet and beat, the envelope broker, what the organ made, its live runs |
@@ -1019,7 +1021,7 @@ Directory: `Modules/NativeAgentCore/Sources/AppToolRuntime/`
 | `AppToolExecutor+SenseMake.swift` | `AppToolExecutor`; Author captured material under owner-off authority |
 | `AppToolExecutor+Senses.swift` | Sense corner reads, served verb discovery and gated in-turn acts |
 | `AppToolExecutor+ToolSchemas.swift` | `AppToolExecutor`, `appToolSchemas`, `modelSchemas`; the agent's hand, drawn again only when it can change |
-| `AppToolExecutor+UpkeepTarget.swift` | backup restore target validation |
+| `AppToolExecutor+UpkeepTarget.swift` | backup restore target validation; `QuietArgumentRefusal` |
 | `AppToolExecutor.swift` | Platform routing and canonical effect owners; phone sends and chat.post knocks tell one matter |
 | `AppToolNotificationInput.swift` | `NativeAgentNotificationDefaults`: `parseInput` |
 | `AppToolPorts.swift` | `AppActionExecution`, `BrowserToolPlatformPort`, `QuietToolPresentationPort`: operation ports |
@@ -2172,7 +2174,9 @@ success cannot revive a stopped subscription.
 Launch stop also disarms the first-anchor observation/wait and Doctor's
 first-turn observation/refresh; completed one-shot task handles retire.
 Quit follows in-flight-turn changes and an explicit restart wake, armed before
-reading, with one 20-second response deadline and no turn-state sampling.
+reading, with no deadline and no turn-state sampling: each held turn ends by its
+own liveness. Every body quit enters from the run loop, never from inside a
+main-queue job, and a quit asked while one is held joins its one settlement.
 Doctor repair verification consumes successful Telegram poll notifications
 (including empty polls, without extra checkpoints) and the bridges' existing
 ready-callback descriptor publications, then rereads owner health. The 35/3-second
@@ -2664,6 +2668,7 @@ Directory: `Modules/NativeAgentCore/Sources/MemoryV2/`
 | `KnowledgeGraphReadProjection.swift` | `canonicalAgentGraphProjection`, `canonicalKnowledgeGraphSnapshotData`: checked graph projections |
 | `KnowledgeGraphReader.swift` | `SwiftNativeKnowledgeGraphReader`: bounded checked canonical reads |
 | `KnowledgeGraphTypedRead.swift` | Typed checked projections on `SwiftNativeKnowledgeGraphReader` |
+| `MemoryBringBack.swift` | `MemoryBringBack`: an old store's memories come back through the agent's own write, each rooted in its recorded provenance |
 | `MemoryCandidateQuality.swift` | `MemoryCandidateQuality`: source-independent shape gates |
 | `MemoryDataProvenance.swift` | `MemoryDataProvenance` builds a write's root from the stem and reads the steer from roots; `MemoryWriteContext` holds the turn, sense reads and telling |
 | `MemoryEmbeddingEpoch.swift` | vector-space identity, item outcomes and owned convergence |
@@ -3462,6 +3467,7 @@ Directory: `Modules/NativeAgentShared/Sources/NativeAgentShared/`
 |---|---|
 | `ApprovalRequest.swift` | Mac-owned consent, execution evidence and exact chat provenance |
 | `ApprovalsFace.swift` | Finished approval count, availability and public row words for the face feed |
+| `BoardDocument.swift` | A board kept as a `.board` Make piece: one JSON document of elements, read, changed and written whole |
 | `BridgeMessage.swift` | `BridgeMessage`: signed device envelope, exact reply correlation and inner HMAC |
 | `ChatAttachmentTypeResolver.swift` | `ChatAttachmentTypeResolver`, `typeAndMime`, `fileByteLimit`, `submittingSpeech` |
 | `ChatComposerModelGroup.swift` | Finished provider/model menu groups and their vendor sections |

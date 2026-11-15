@@ -464,7 +464,8 @@ public struct TurnContinuationRuntime: Sendable {
                 model: entry.model, approvalID: entry.approvalID), sessionID: sessionID, runID: entry.id.uuidString)
         } else {
             let profile: NativeAgentAppChatSurfaceProfile
-            if door.isAgentBridge { profile = .bridge }
+            // A contact's turn runs on the bridge's client whatever surface it authorizes through (an elevated contact's is `chat`).
+            if door.isAgentBridge || AgentBridgeCompletionRoute.Kind(surface: envelope.replyRoute.surface) == .callerResult { profile = .bridge }
             else if door.isIOSRemote { profile = .ios }
             else if door.id == "chat" { profile = .mac }
             else if let supported = NativeAgentAppChatSurfaceProfile(rawValue: door.id) { profile = supported }

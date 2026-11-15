@@ -292,7 +292,7 @@ final class UpdateController: NSObject {
             alert.messageText = "Software updates could not start"
             alert.informativeText = startupFailure
             alert.addButton(withTitle: "OK")
-            alert.runModal()
+            Task { _ = try? await FaceNativePanel.confirm(alert) }
             return
         }
         let reason = unavailability ?? .notConfigured
@@ -308,8 +308,10 @@ final class UpdateController: NSObject {
         alert.addButton(withTitle: "OK")
         if releaseURL != nil { alert.addButton(withTitle: "Open Releases") }
 
-        if alert.runModal() == .alertSecondButtonReturn, let releaseURL {
-            NSWorkspace.shared.open(releaseURL)
+        Task {
+            if try await FaceNativePanel.confirm(alert) == .alertSecondButtonReturn, let releaseURL {
+                NSWorkspace.shared.open(releaseURL)
+            }
         }
     }
 

@@ -90,7 +90,7 @@ extension NativeAgentEngine {
         ("preferences.inner_life", "Inner life", ["settings.inner_life", "settings.inner_life_background", "settings.reflection",
                                                   "settings.organism_kernel", "settings.wander_hour", "settings.inner_life_capsule",
                                                   "personality.dreams", "personality.rem_cycle", "personality.self_improvement"]),
-        ("preferences.look", "How I look", ["settings.dark_mode", "settings.haze_color", "settings.view_mode"]),
+        ("preferences.look", "How I look", ["settings.dark_mode", "settings.haze_color", "settings.view_mode", "settings.window_follows"]),
         ("preferences.shortcuts", "Shortcuts", ["settings.global_hotkey", "settings.shotgun_shortcut"]),
     ]
     /// Developer dials, drawn last under Advanced with the search service.

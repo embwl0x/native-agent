@@ -86,6 +86,8 @@ extension AgentConversationSession {
         var latest: AgentConversationRecord?
         // While this watches, a reply that lands comes back here, not as a second turn.
         var watching: String?
+        // Once the watch ends, the news takes a held answer this wait did not deliver.
+        defer { HeldSends.publish(dataRoot: dataRoot) }
         defer { if let watching { AgentConversationRunning.shared.unwatch(watching) } }
         while !Task.isCancelled {
             let seen = AgentConversationRunning.shared.seen
@@ -96,7 +98,7 @@ extension AgentConversationSession {
             latest = row
             if watching == nil { watching = row.id; AgentConversationRunning.shared.watch(row.id) }
             guard try replyInFlight(row, transport, dataRoot: dataRoot)
-                    || !stoppedOrReleased(row) && heldReplyPending(row) else {
+                    || !stoppedOrReleased(row) && heldReplyPending(row, dataRoot: dataRoot) else {
                 if outcome != "nothing_in_flight" { outcome = "settled" }
                 break
             }
@@ -105,6 +107,8 @@ extension AgentConversationSession {
             await AgentConversationRunning.shared.change(after: seen, until: deadline)
         }
         if Task.isCancelled { outcome = "cancelled" }
+        // A held send's answer this wait returns reaches the turn in its tool result, said while it still watches.
+        if let latest, watching != nil { store.held.carry(latest.operationID) }
         // A reply handed to this wait just before it gave up is in the row: stop watching under the store's lock and take the row as it is
         // then, so that reply is returned here and never falls between this wait and a turn of its own. A row that cannot be updated keeps
         // the last snapshot.
@@ -117,7 +121,7 @@ extension AgentConversationSession {
                 watching = nil
                 latest = current
                 if outcome == "still_waiting", try !(replyInFlight(current, transport, dataRoot: dataRoot)
-                    || !stoppedOrReleased(current) && heldReplyPending(current)) { outcome = "settled" }
+                    || !stoppedOrReleased(current) && heldReplyPending(current, dataRoot: dataRoot)) { outcome = "settled" }
             }
         }
         // Out of time (or stopped): the row as the release left it, never another read that could hold the turn past `seconds` or find the

@@ -30,6 +30,12 @@ final class BodyCardActions {
     let call: @MainActor @Sendable (FaceCall) async throws -> FaceReply
     let restart: @MainActor () async throws -> Void
     private var pending: [String: CardIdentity] = [:]
+    /// Controls that open something outside the card (a page, sheet, System Settings, Chrome) and leave it running until the person comes
+    /// back. A watched one keeps its watch after a return reopens it. A walking permission card stays answerable while running, and its walk
+    /// goes on across returns, so it is not among them.
+    private static let returnControls: Set<InlineInteractionDescriptor.Control> = [
+        .pairDevice, .connectorManualToken, .trustPostureRequired, .providerGroupModel, .internetAccounts, .chromeSetup, .capabilityFlag,
+    ]
     private var observation: Task<Void, Never>?
 
     init(engine: NativeAgentEngine, controls: any InlineInteractionControlPort,
@@ -121,15 +127,23 @@ final class BodyCardActions {
             }
     }
 
-    func verify(_ identity: CardIdentity) async throws -> FaceActReply {
+    /// `returned` is the person back from the control (the chat showing again, or Check); a page or sheet left unfinished then puts the card
+    /// back to pending. A page's own changes verify without it, and leave the card running while the person is still there.
+    func verify(_ identity: CardIdentity, returned: Bool = true) async throws -> FaceActReply {
         let current = try await read(identity)
         if current.state.isOpen {
             let selection = try await InlineInteractionResolver.selectionForReturn(current, dataRoot: engine.dataRoot)
-            _ = await InlineInteractionResolver.completeIfVerified(id: identity.card, sessionID: identity.session,
-                expectedRevision: current.revision, selection: selection,
-                scope: current.kind == .modelChoice ? .persistent : nil, dataRoot: engine.dataRoot)
+            let scope: InlineInteraction.Scope? = current.kind == .modelChoice ? .persistent : nil
+            let control = await InlineInteractionResolver.descriptor(for: current, dataRoot: engine.dataRoot).control
+            if returned, Self.returnControls.contains(control), current.state == .running, current.revision == identity.revision {
+                await InlineInteractionResolver.settleOrReopen(identity.card, sessionID: identity.session, expectedRevision: current.revision,
+                    selection: selection, scope: scope, dataRoot: engine.dataRoot)
+            } else {
+                _ = await InlineInteractionResolver.completeIfVerified(id: identity.card, sessionID: identity.session,
+                    expectedRevision: current.revision, selection: selection, scope: scope, dataRoot: engine.dataRoot)
+            }
         }
-        return try await result(identity, controlIdentity: identity)
+        return try await result(identity, controlIdentity: identity, onlyWhileRunning: true)
     }
 
     private func read(_ identity: CardIdentity) async throws -> InlineInteraction {
@@ -140,9 +154,13 @@ final class BodyCardActions {
         return card
     }
 
-    private func result(_ identity: CardIdentity, controlIdentity: CardIdentity) async throws -> FaceActReply {
+    /// `onlyWhileRunning`: a verification names its control only while the card still runs it; unverified and not running, nothing is
+    /// underway to come back from, so the watch on it ends here and on the face.
+    private func result(_ identity: CardIdentity, controlIdentity: CardIdentity,
+                        onlyWhileRunning: Bool = false) async throws -> FaceActReply {
         let current = try await read(identity)
         let verified = current.state.outcome != nil
+        let watched = verified || !onlyWhileRunning || current.state == .running
         let failure = current.state.failureReason.map {
             WireFailure(code: "card_control_failed", message: TurnSecretRedactor.redactText($0), cause: nil, effects: .known)
         }
@@ -150,9 +168,10 @@ final class BodyCardActions {
             try BodyInboxCardActionEffects.requirePresentation(try await call(.closeCardControl(shown)))
             pending[identity.card] = nil
         }
+        if !watched { pending[identity.card] = nil }
         if pending.isEmpty { observation?.cancel(); observation = nil }
         return .card(.init(identity: identity, effects: .known, presentationOperation: nil, failure: failure,
-            controlIdentity: controlIdentity, verified: verified))
+            controlIdentity: watched ? controlIdentity : nil, verified: verified))
     }
 
     private func present(_ control: InlineInteractionDescriptor.Control, descriptor: InlineInteractionDescriptor,
@@ -200,7 +219,7 @@ final class BodyCardActions {
 
     private func verifyPending() async {
         for identity in pending.values {
-            do { _ = try await verify(identity) }
+            do { _ = try await verify(identity, returned: false) }
             catch { SystemToastCenter.shared.push(error: error.localizedDescription, autoDismissAfter: nil) }
         }
     }

@@ -1,11 +1,13 @@
 import AppKit
+import Darwin
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import MacControl
-// Blueprint: | `BodyFaceProcess.swift` | Body-owned child process, inherited pipes and explicit window reopening; process exit owns retirement |
+// Blueprint: | `BodyFaceProcess.swift` | Body-owned child process, inherited pipes and explicit window reopening; process exit owns retirement; orphans end |
 
 actor BodyFaceProcess {
+    private let app: URL
     private let executable: URL
     private let source: FaceFeedSource
     private let handler: any FaceActHandler
@@ -24,7 +26,8 @@ actor BodyFaceProcess {
     init(bodyBundle: URL, dataRoot: URL, source: FaceFeedSource, handler: any FaceActHandler,
          connected: @escaping @Sendable (UUID) async throws -> Void,
          disconnected: @escaping @Sendable (UUID?, String) async -> Void) {
-        executable = bodyBundle.appendingPathComponent("Contents/Helpers/NativeAgentFace.app/Contents/MacOS/NativeAgentFace")
+        app = bodyBundle.appendingPathComponent("Contents/Helpers/NativeAgentFace.app")
+        executable = app.appendingPathComponent("Contents/MacOS/NativeAgentFace")
         self.source = source; self.handler = handler
         self.dataRoot = dataRoot
         self.connected = connected; self.disconnected = disconnected
@@ -81,6 +84,7 @@ actor BodyFaceProcess {
         try Task.checkCancellation()
         guard !closing else { throw FaceWireError.disconnected }
         let log = try await FaceLinkLog.open(dataRoot: dataRoot, role: .body)
+        await Self.endOrphanedWindows(app: app)
         try Task.checkCancellation()
         guard !closing else { throw FaceWireError.disconnected }
         let process = Process()
@@ -138,6 +142,18 @@ actor BodyFaceProcess {
                     cause: "\(error.localizedDescription)\nPipe cleanup: \(cleanup.localizedDescription)", effects: .unknown)
             }
             throw error
+        }
+    }
+
+    /// One engine owns one window process. A window process whose engine is gone (launchd now holds it) is ended before this engine starts
+    /// its own; no engine speaks to a window it did not spawn.
+    @MainActor private static func endOrphanedWindows(app: URL) {
+        guard let id = Bundle(url: app)?.bundleIdentifier else { return }
+        for window in NSRunningApplication.runningApplications(withBundleIdentifier: id) {
+            var info = proc_bsdinfo()
+            let expected = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(window.processIdentifier, PROC_PIDTBSDINFO, 0, &info, expected) == expected, info.pbi_ppid == 1 else { continue }
+            window.forceTerminate()
         }
     }
 

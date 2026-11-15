@@ -165,11 +165,10 @@ extension NativeAgentEngine {
         return "\(found.count) agent \(found.count == 1 ? "contact or app is" : "contacts or apps are") listed."
     }
 
-    /// `agent.ask_in_chat`: a new conversation on the Mac's chat column opens with the contact's own prompt to connect, test or disconnect.
-    @MainActor func agentAskInChat(agent: String, ask: String) async throws -> String? {
-        guard let contact = contacts.rows.first(where: { $0.id == agent }) else {
-            throw PartCallError(code: "stale_row", message: "That agent is no longer listed. Refresh Connectors before choosing it.")
-        }
+    /// `agent.ask_in_chat`: the listed contact, the ask, and the Mac's chat (the lookups); a new conversation on the Mac's chat column opens
+    /// with the contact's own prompt to connect, test or disconnect (the effect).
+    @MainActor func agentAskInChat(agent: String, ask: String) throws -> HostVerbEffect {
+        let contact = try contactRow(agent)
         let prompt: AgentContactRow.Action
         switch ask {
         case "connect": prompt = .connect
@@ -180,18 +179,19 @@ extension NativeAgentEngine {
         guard let host = ports.appTools(SwiftNativeSecurityCenter(dataRoot: dataRoot), false).quietHost() as? any AgentContactsFaceHost else {
             throw PartCallError(code: "unavailable", message: "The Mac's chat is unavailable; nothing was asked.")
         }
-        return try await host.askInNewChat(contact.prompt(prompt))
+        return { try await host.askInNewChat(contact.prompt(prompt)) }
     }
 
     /// `agent.send`: the person's own words to a contact, from `session` when the person's door names the conversation it was typed in (the
-    /// phone's thread view), otherwise the person's current conversation.
-    @MainActor func agentSend(agent: String, text: String, session named: String, turn: Turn) async throws -> String? {
+    /// phone's thread view), otherwise the person's current conversation. The words, the reachable contact, the door and the conversation
+    /// are the lookups; the send is the effect.
+    @MainActor func agentSend(agent: String, text: String, session named: String, turn: Turn) async throws -> HostVerbEffect {
         guard !text.isEmpty, text.count <= 16_000 else {
             throw PartCallError(code: "bad_value", message: "A message to an agent is between 1 and 16,000 characters. Nothing was sent.")
         }
-        guard contacts.rows.contains(where: { $0.id == agent && $0.contact != nil }) else {
-            throw PartCallError(code: "stale_row", message: "This agent is no longer reachable. Refresh Connectors before sending.")
-        }
+        let row = try contactRow(agent)
+        guard row.contact != nil else { throw NamedRow.stale("\(row.name) is listed but not connected, so nothing was sent.") }
+        let agent = row.id
         guard let envelope = turn.envelope else {
             throw PartCallError(code: "door_unknown", message: "The door this message came from is not known, so nothing was sent.")
         }
@@ -202,43 +202,62 @@ extension NativeAgentEngine {
             }
             session = named
         }
-        if let why = await sendContactMessage(agent: agent, text: text, session: session, root: dataRoot,
-                                              turn: Turn(session: session).with(\.envelope, envelope)) {
-            throw PartCallError(code: "send_failed", message: why)
+        return { [self] in
+            if let why = await sendContactMessage(agent: agent, text: text, session: session, root: dataRoot,
+                                                  turn: Turn(session: session).with(\.envelope, envelope)) {
+                throw PartCallError(code: "send_failed", message: why)
+            }
+            return "Message accepted."
         }
-        return "Message accepted."
     }
 
     /// `agent.grok_paste`: a Grok Bot routine's webhook goes from a secure paste to the keychain only. One rule decides the path. The person's own press
     /// of the Connectors row's button in the app opens the Mac's secure field for the person's paste. Every other call through the door (the agent's
     /// own, one the person's word decided, an approved card's replay) is the one paste that field allows the agent: the clipboard, read natively at
     /// once, never a window and never waiting on one. Each call is independent: address and key in either order, each saved as it arrives; the one
-    /// that completes the setup closes any secure window still open for the contact.
-    @MainActor func grokPaste(peer: String, turn: Turn) async throws -> String? {
-        guard let contact = contacts.rows.first(where: { $0.contact?.id == peer || $0.contact?.name.caseInsensitiveCompare(peer) == .orderedSame })?
-                .contact,
-              contact.transport == .grokBot, ["creating", "secure-paste"].contains(contact.grokSetup ?? "") else {
-            throw PartCallError(code: "stale_row", message: "This contact is not waiting for routine credentials. Refresh Connectors.")
+    /// that completes the setup closes any secure window still open for the contact. The contact waiting for routine credentials is the
+    /// lookup; the window or the paste is the effect.
+    @MainActor func grokPaste(peer: String, turn: Turn) throws -> HostVerbEffect {
+        guard let contact = try contactRow(peer).contact, contact.transport == .grokBot,
+              ["creating", "secure-paste"].contains(contact.grokSetup ?? "") else {
+            throw NamedRow.stale("This contact is not waiting for routine credentials.")
         }
-        if case .tap(let door, _, _, let page, _)? = turn.personAct?.by, door == "mac", page == "connectors",
-           let renderer = turn[FacePresentationPart.self] {
-            switch try await faceActs.call(.showGrokSetup(contact: contact.id, operation: UUID()), renderer: renderer) {
-            case .acknowledged: return nil
-            case .failed(let issue), .refused(let issue): throw issue
-            case .cancelled: throw CancellationError()
-            default: throw FaceWireError.invalidFeedOrder
+        return { [self] in
+            if case .tap(let door, _, _, let page, _)? = turn.personAct?.by, door == "mac", page == "connectors",
+               let renderer = turn[FacePresentationPart.self] {
+                switch try await faceActs.call(.showGrokSetup(contact: contact.id, operation: UUID()), renderer: renderer) {
+                case .acknowledged: return nil
+                case .failed(let issue), .refused(let issue): throw issue
+                case .cancelled: throw CancellationError()
+                default: throw FaceWireError.invalidFeedOrder
+                }
             }
+            let pasted = try await GrokBotConnection.pasteClipboard(peer: contact.id, dataRoot: dataRoot)
+            if pasted.complete, let close = connectors.platform.closeGrokSecureSetup { try? await close(contact.id) }
+            return pasted.words
         }
-        let pasted = try await GrokBotConnection.pasteClipboard(peer: contact.id, dataRoot: dataRoot)
-        if pasted.complete, let close = connectors.platform.closeGrokSecureSetup { try? await close(contact.id) }
-        return pasted.words
     }
 
-    /// `agent.grok_bot`: the Grok Bot's exact sidebar name for a contact's routine request.
-    @MainActor func grokBot(peer: String, name: String) throws -> String? {
+    /// `agent.grok_bot`: a name was given, and the contact it names (its id or its name), read now, is a Grok Bot contact that is connected
+    /// and has no routine conversation yet, the ones the Bot's name can still be chosen for (the lookups); the Bot's exact sidebar name is
+    /// saved for the contact's routine request (the effect).
+    @MainActor func grokBot(peer: String, name: String) throws -> HostVerbEffect {
         guard !name.isEmpty else { throw PartCallError(code: "bad_value", message: "Enter the Bot's exact sidebar name. Nothing was saved.") }
-        try GrokBotConnection.selectBot(peer: peer, name: name, dataRoot: dataRoot)
-        return "Bot selected. Connect again for the setup steps in that Bot's chat."
+        guard let contact = try contactRow(peer).contact, contact.transport == .grokBot, contact.grokSetup != "disconnected",
+              contact.grokConversation == nil else {
+            throw NamedRow.stale("That is not a Grok Bot contact that can take a Bot name.")
+        }
+        return { [self] in
+            try GrokBotConnection.selectBot(peer: contact.id, name: name, dataRoot: dataRoot)
+            return "Bot selected. Connect again for the setup steps in that Bot's chat."
+        }
+    }
+
+    /// The listed contact a call names by its row id, its contact id or its name (`NamedRow`).
+    @MainActor private func contactRow(_ named: String) throws -> AgentContactRow {
+        try NamedRow.find(named, kind: "agent", in: contacts.rows,
+            ids: { [$0.id] + ($0.contact.map { [$0.id] } ?? []) }, names: { [$0.name] + ($0.contact.map { [$0.name] } ?? []) },
+            shown: { "\($0.name) (\($0.id))" })
     }
 
     @MainActor private func anchoredSession(for purpose: String) throws -> String {

@@ -44,7 +44,8 @@ The card is the effect's one execution claim:
 while it is undecided, the same call (tool and arguments) proposed again runs
 nothing and gets the card's waiting receipt; after the decision, one
 re-proposal gets the card's receipt, and an identical call after that is a
-fresh invocation through the gate. Ordinary conversation has no universal clock or iteration limit.
+fresh invocation through the gate. The card's settlement is written to the trace under the receipt id of the
+call that raised it, so `trace.recent` with that receipt id, or with the card's own id, reads what was answered, by whom (the door, or the agent) and when. Ordinary conversation has no universal clock or iteration limit.
 Each dispatch batch lazily reads claimed cards once, retaining the records or the read failure.
 Callers may bound helper work with output budgets and active-work deadlines; a spent output budget returns `provider_failure`, naming the cap and its control, and ends the turn incomplete.
 Mac takeover reaches their next model round as the recorded tool refusal. The

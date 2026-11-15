@@ -53,6 +53,19 @@ public struct FaceResolvedAttachment: Codable, Sendable, Equatable {
     }
 }
 
+extension PartFace.Row {
+    /// A card's answers where it shows in its own conversation (Mac or phone): this Inbox row's own answers, same ids and door calls, so a
+    /// press there is the Inbox's press. Housekeeping (read, archive, dismiss) stays the Inbox page's; opening the card is no answer where
+    /// the card already is; Not now is one of the card's answers, drawn plain and never asked twice. Nil when nothing is left to answer.
+    public var cardAnswers: [PartFace.Action]? {
+        let answers = (actions ?? []).filter { $0.aside != true && $0.call?.action != "inbox.open_on_mac" }.map { action in
+            action.role == .destructive ? PartFace.Action(id: action.id, label: action.label, doors: action.doors, call: action.call,
+                open: action.open, unavailable: action.unavailable) : action
+        }
+        return answers.isEmpty ? nil : answers
+    }
+}
+
 public struct FaceThreadLine: Codable, Sendable, Equatable {
     public var id: String
     public var speaker: String

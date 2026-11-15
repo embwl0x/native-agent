@@ -15,7 +15,14 @@ struct ShellAskBar: View {
     @State private var openIssue: String?
 
     private var subject: String { "ask-bar/" + page }
-    private var text: Binding<String> { appModel.editBinding(subject, seed: "") }
+    /// The person's typing here keeps the window on this page for the rest of a running turn (`FaceFollows`).
+    private var text: Binding<String> {
+        let draft = appModel.editBinding(subject, seed: "")
+        return Binding(get: { draft.wrappedValue }, set: {
+            draft.wrappedValue = $0
+            FaceFollows.shared.personTyped()
+        })
+    }
     private var placeholder: String {
         let name = appModel.agentDisplayName
         return name.isEmpty ? "Tell me what to change here" : "Tell \(name) what to change here"

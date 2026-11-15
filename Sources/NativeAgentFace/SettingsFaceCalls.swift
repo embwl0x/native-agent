@@ -83,7 +83,9 @@ enum SettingsFaceCalls {
 @MainActor
 enum FaceNativePanel {
     static func choose(_ panel: NSSavePanel) async throws -> NSApplication.ModalResponse {
-        try await withTaskCancellationHandler {
+        // A question never holds Quit: the person can always quit the app while it is open.
+        panel.preventsApplicationTerminationWhenModal = false
+        return try await withTaskCancellationHandler {
             try Task.checkCancellation()
             let result = await panel.begin()
             try Task.checkCancellation()
@@ -92,6 +94,7 @@ enum FaceNativePanel {
     }
 
     static func confirm(_ alert: NSAlert) async throws -> NSApplication.ModalResponse {
+        alert.window.preventsApplicationTerminationWhenModal = false
         let host: NSWindow?
         let parent: NSWindow
         if let current = NSApp.keyWindow { parent = current; host = nil }

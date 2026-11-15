@@ -727,6 +727,36 @@ public actor MemoryStorage {
             && (prior.embedding == nil) == (next.embedding == nil)
     }
 
+    /// One principal under another name in every memory's roots: each root whose `through` holds `from` holds `to` in its place, re-encoded
+    /// by the root codec in one write, nothing else changed (no time, no vector, no root's how or date). A `teller` given (a valid root name)
+    /// becomes the `by` of each such told root whose `by` is `from` itself; any other `by` stays. It renames who steered, never removes a steer. Returns how
+    /// many memories changed.
+    public func renamePrincipal(_ from: String, to: String, teller: String? = nil) async throws -> Int {
+        guard !from.isEmpty, !to.isEmpty, from != to else { return 0 }
+        let teller = teller.flatMap(MemoryRoot.validName)
+        let changed = try await dbPool.write { db -> Int in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT * FROM memories WHERE id IN (
+                    SELECT m.id FROM memories m, json_each(m.metadata_json, '$.\(MemoryRoot.key)') r, json_each(r.value, '$.through') t
+                    WHERE t.value = ?)
+                """, arguments: [from]).map(Self.decodeMemory)
+            for row in rows {
+                let roots = try MemoryRoot.roots(in: row.metadata).map { root in
+                    guard root.through.contains(from) else { return root }
+                    // Only the teller's own spelling is renamed: a told root by someone else (the person's words relayed) keeps its teller.
+                    let renamed = root.how == .told && root.by?.caseInsensitiveCompare(from) == .orderedSame ? teller : nil
+                    return MemoryRoot(how: root.how, by: renamed ?? root.by, at: root.at,
+                                      written: root.written, through: root.through.map { $0 == from ? to : $0 })
+                }
+                try db.execute(sql: "UPDATE memories SET metadata_json = ? WHERE id = ?",
+                               arguments: [Self.encodeMetadata(MemoryRoot.setting(roots, in: row.metadata)), row.id])
+            }
+            return rows.count
+        }
+        if changed > 0 { invalidateRecallCache() }
+        return changed
+    }
+
     @discardableResult
     public func deleteMemory(id: String) async throws -> Bool {
         // Read before deletion so projection hooks retain the actual persona and content.

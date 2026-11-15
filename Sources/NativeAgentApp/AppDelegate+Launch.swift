@@ -68,7 +68,7 @@ extension AppDelegate {
         do { try await ApplicationLifetime.shared.prepare() }
         catch {
             guard !Task.isCancelled else { return }
-            NSApp.terminate(nil)
+            Self.terminateFromRunLoop()
             return
         }
         guard !Task.isCancelled else { return }
@@ -131,7 +131,7 @@ extension AppDelegate {
                     memory store.
                     """
                 alert.addButton(withTitle: "OK")
-                alert.runModal()
+                Task { _ = try? await FaceNativePanel.confirm(alert) }
             },
             resumeMacTurn: { checkpoint, runtime in
                 guard let model = await ApplicationLifetime.shared.appModel else { throw MacChatTurnLifecycleStoreError.invalidRecord }
@@ -235,9 +235,9 @@ extension AppDelegate {
         restartQuit.withLock { $0 = false }
     }
 
-    /// Bound the turn wait at 20 seconds so Quit remains responsive while active replies get time to finish.
-    /// The retained sleep joins tracked turns before its final snapshot or dependency retirement.
-    /// The async hold and termination drain share one joinable settlement; neither wait bound owns its lifetime.
+    /// A quit holds for the turns in flight at entry until each one ends (its own liveness, no clock), then the retained sleep joins every
+    /// tracked turn before its final snapshot. The async hold and termination drain share one joinable settlement.
+    /// A quit asked again while one is held joins it: the pending termination is answered once, when that one settlement ends.
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if Self.quitWaitingForTurns { return .terminateLater }
@@ -258,7 +258,7 @@ extension AppDelegate {
         let waitsForTurns = !runs.isEmpty && !Self.restartQuit.withLock({ $0 })
         Self.quitWaitingForTurns = true
         if waitsForTurns {
-            ModuleLog.app("[quit] holding quit for %d in-flight turn(s), at most 20s", runs.count)
+            ModuleLog.app("[quit] holding quit for %d in-flight turn(s) until each ends", runs.count)
         }
         Task.detached {
             await Self.closeFaceProcess()
@@ -268,6 +268,8 @@ extension AppDelegate {
             }
             let slept = await NativeAgentEngine.sleepMind(after: settlement)
             ModuleLog.app("[quit] the agent's sleep: %@", slept)
+            await NativeAgentEngine.retireResidentWork(after: settlement, shutdownSenses: { await SensesAssembly.shutdown() })
+            ModuleLog.app("[quit] resident work retired")
             // Use a run-loop block because MainActor.run cannot drain until an originating main-queue block returns.
             let main = CFRunLoopGetMain()
             CFRunLoopPerformBlock(main, CFRunLoopMode.commonModes.rawValue) {
@@ -297,13 +299,10 @@ extension AppDelegate {
         }
     }
 
+    /// The held quit already slept and retired resident work before it answered, so termination only closes ingress.
     @MainActor
     func applicationWillTerminate(_ notification: Notification) {
         closeQuitIngress()
-        guard ApplicationLifetime.shared.appModel != nil else { return }
-        NativeAgentEngine.drainResidentWorkForTermination(
-            shutdownSenses: { await SensesAssembly.shutdown() },
-            retireBrowser: { BrowserWindowController.shared.stopIPCServer() })
     }
 
     @MainActor @objc private func contextFlowWillSleep(_ notification: Notification) {

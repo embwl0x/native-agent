@@ -37,8 +37,12 @@ final class ChatComposerDraft {
         if hasVisibleText != visible { hasVisibleText = visible }
     }
 
-    /// Bind directly to the draft child so writes do not invalidate ChatView state.
+    /// Bind directly to the draft child so writes do not invalidate ChatView state. This is the person's own typing: it also keeps the
+    /// window where the person has it for the rest of a running turn (`FaceFollows`).
     var textBinding: Binding<String> {
-        Binding(get: { self.text }, set: { self.edit($0) })
+        Binding(get: { self.text }, set: {
+            self.edit($0)
+            FaceFollows.shared.personTyped()
+        })
     }
 }

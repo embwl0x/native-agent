@@ -191,8 +191,9 @@ extension NativeAgentEngine {
         return found.sorted { $0.utf16.count != $1.utf16.count ? $0.utf16.count > $1.utf16.count : $0 < $1 }
     }
 
-    /// The Memories page's search (`memories.search`): three letters or more, or empty to show every memory.
-    @MainActor func memoriesSearch(_ input: [String: JSONValue]) async throws -> String {
+    /// The Memories page's search (`memories.search`): three letters or more, or empty to show every memory (the lookups); the search is
+    /// the effect.
+    @MainActor func memoriesSearch(_ input: [String: JSONValue]) throws -> HostVerbEffect {
         guard case .string(let raw)? = input["value"] else {
             throw PartCallError(code: "invalid_value", message: "Search takes value: the words to search for, or empty; nothing was searched.")
         }
@@ -200,8 +201,33 @@ extension NativeAgentEngine {
         guard words.isEmpty || words.count >= 3 else {
             throw PartCallError(code: "short_query", message: "Search needs at least three letters; nothing was searched.")
         }
-        await memory.search(query: words)
-        return words.isEmpty ? "Memories shows every memory." : "Memories searched for \u{201C}\(words)\u{201D}."
+        return { [self] in
+            await memory.search(query: words)
+            return words.isEmpty ? "Memories shows every memory." : "Memories searched for \u{201C}\(words)\u{201D}."
+        }
+    }
+
+    /// `memories.bring_back`: the archive `from` names is read now (the lookups; an unreadable one is `archive_unreadable`, one with nothing new
+    /// and nothing to rename is `nothing_to_bring`, each with its counts), and the effect renames the archive's principals still held here to
+    /// today's, writes each memory through the agent's own memory write and tells the agent once.
+    @MainActor func memoriesBringBack(_ input: [String: JSONValue]) async throws -> HostVerbEffect {
+        guard let raw = input["from"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            throw PartCallError(code: "invalid_from", message: """
+                Bring back takes from: an archive .zip, an old data folder, or its memory/memory.sqlite; nothing was brought back.
+                """)
+        }
+        let from = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath).standardizedFileURL
+        let root = dataRoot
+        let owner = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
+        let prepared = try await MemoryBringBack.prepare(from: from, into: root, owner: owner)
+        guard !prepared.memories.isEmpty || prepared.toRename > 0 else {
+            throw PartCallError(code: "nothing_to_bring", message: prepared.words + " Nothing was brought back.")
+        }
+        return { [self] in
+            let outcome = await MemoryBringBack.run(prepared, into: root, owner: owner)
+            _ = try? await memoriesRefresh()
+            return prepared.words + " " + outcome.words
+        }
     }
 
     /// The kept memories read again (`memories.refresh`); the page then reads its packet from them.

@@ -153,7 +153,10 @@ struct ContentView: View {
                 // Links that await the body before navigating slightly undercount the person's wait.
                 FacePageDiagnostics.selected(page: displayedPage)
             }
-            .onChange(of: shownRow, initial: true) { surfacePages[shownSurface] = shownRow }
+            .onChange(of: shownRow, initial: true) {
+                surfacePages[shownSurface] = shownRow
+                ApplicationLifetime.shared.sceneShown()
+            }
 
             if showTour, let layout = appModel.shellLayout?.value {
                 OnboardingTourOverlay(
@@ -415,13 +418,16 @@ struct ContentView: View {
         } catch { appModel.statusText = error.localizedDescription }
     }
 
-    /// Choosing a surface shows the page last shown in it, or the page it opens on.
+    /// Choosing a surface shows the page last shown in it, or the page it opens on. The choice is the person's.
     private func chooseSurface(_ surface: ShellSurface, pages: [ShellRailRow]) {
+        ApplicationLifetime.shared.personChose()
         if let page = surface.opening(pages, last: surfacePages[surface]) { selectRow(page) }
     }
 
     /// A tab or surface selects its page the way every other writer does: an app page by its item, a page of the agent's own by its id.
+    /// The rail, the tabs and Simple's sidebar are the person's own choices, a tab included where the page shown stays the same.
     private func selectRow(_ row: ShellRailRow) {
+        ApplicationLifetime.shared.personChose()
         switch row {
         case .item(let item): selectSidebarItem(item)
         case .page(let page): selectionRaw = SurfaceLayout.pagePrefix + page

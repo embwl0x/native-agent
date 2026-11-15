@@ -61,6 +61,9 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
     }
 
     package func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
+        // The card this call runs on, carried in by a replay or filled by the gate when the person approves it mid-call.
+        var turn = turn
+        if turn.cardCause == nil { turn.cardCause = CardCause() }
         let ability = Self.abilityName(tool: tool, input: input)
         if onlyAbilities, ability == nil {
             return try await inner.dispatch(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
@@ -276,6 +279,8 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         if let origin = TurnTraceContext.automaticOrigin { payload["automaticOrigin"] = .string(origin) }
         let shown = ToolNameAliases.shown(tool, input: .object(input)).name
         if shown != tool { payload["shown"] = .string(shown) }
+        // A call that worked names the place it was about, each nested step its own (`AppActionBinding.faceLink`): the turn's attention.
+        if phase == "end", status == "ok", let place = AppActionBinding.faceLink(tool, input: .object(input)) { payload["face"] = .string(place) }
         if tool == "act", case .object(let reply)? = result, case .object(let detail)? = reply["detail"],
            let changed = detail["owner_front_changed"] {
             payload["user_front_changed"] = changed
@@ -391,6 +396,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             fields["action"] = .string(ChatSecretRedactor.redactText(String(action.prefix(512))))
         }
         fields["model"] = (turn.admission?.model).map(JSONValue.string)
+        if let card = turn.cardCause?.card { fields["cause"] = .object(["card": .string(card)]) }
         fields["reasoningEffort"] = (turn.admission?.reasoningEffort).map(JSONValue.string)
         if let result {
             let reply = ToolResult(result)

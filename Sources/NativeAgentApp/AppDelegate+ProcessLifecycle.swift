@@ -66,16 +66,19 @@ extension AppDelegate {
     /// The body keeps running without a window; the person is told the window could not open, never shown the old one.
     @MainActor
     static func presentFaceUnavailable(_ error: Error) {
-        NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.messageText = "The NativeAgent window could not open."
         alert.informativeText = "\(error.localizedDescription)\n\nI keep running. Reopen NativeAgent to try the window again."
         alert.alertStyle = .critical
-        alert.runModal()
-        NSApp.setActivationPolicy(.accessory)
+        Task {
+            NSApp.setActivationPolicy(.regular)
+            _ = try? await FaceNativePanel.confirm(alert)
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
-    /// Termination waits on main-actor settlement, so it starts from the run loop, never inside the main-queue job that asked for it.
+    /// Termination waits on main-actor settlement, so it starts from the run loop, never inside the main-queue job that asked for it:
+    /// from inside one, the held quit's own main-actor work could never run and nothing would answer it. Every quit of the body enters here.
     nonisolated static func terminateFromRunLoop() {
         RunLoop.main.perform(inModes: [.common]) {
             MainActor.assumeIsolated { NSApplication.shared.terminate(nil) }
@@ -92,7 +95,7 @@ extension AppDelegate {
                 alert.messageText = "The NativeAgent window could not open."
                 alert.informativeText = error.localizedDescription
                 alert.alertStyle = .critical
-                alert.runModal()
+                _ = try? await FaceNativePanel.confirm(alert)
             }
         }
     }
@@ -126,6 +129,7 @@ extension AppDelegate {
         return false
     }
 
+    /// The one modal question left: it runs in `main()` before the app's run loop or any actor work exists, and this duplicate exits after it.
     @MainActor
     static func presentSingleInstanceActivationError(pids: [pid_t], detail: String) {
         NSApp.setActivationPolicy(.regular)
@@ -139,20 +143,20 @@ extension AppDelegate {
         alert.runModal()
     }
 
+    /// A launch gate that refuses says so and is answered before the failed preparation ends the process (`finishLaunching`).
     @MainActor
-    static func presentPublicReleaseDataRootError(_ detail: String) {
+    static func presentPublicReleaseDataRootError(_ detail: String) async {
         ModuleLog.app("[paths] refusing to start NativeAgent after public-release data preparation failure: \(detail)")
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.messageText = "NativeAgent could not prepare a clean data directory."
         alert.informativeText = "For safety, NativeAgent will not start with existing pre-release data.\n\n\(detail)"
         alert.alertStyle = .critical
-        alert.runModal()
-        NSApp.terminate(nil)
+        _ = try? await FaceNativePanel.confirm(alert)
     }
 
     @MainActor
-    static func presentBackupRestoreError(_ detail: String) {
+    static func presentBackupRestoreError(_ detail: String) async {
         ModuleLog.app("[backup-restore] refusing to start after staged restore failure: \(detail)")
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
@@ -162,13 +166,13 @@ extension AppDelegate {
             details are in the log.
             """
         alert.alertStyle = .critical
-        alert.runModal()
-        NSApp.terminate(nil)
+        _ = try? await FaceNativePanel.confirm(alert)
     }
 
     /// Require a choice before continuing on the named root so missing data or SOUL.md cannot silently start an empty agent.
+    /// Launch waits on the answer without a modal session; Quit refuses the launch and the failed preparation ends the process.
     @MainActor
-    static func confirmLaunchWithMissingRoots(_ missing: [String]) -> Bool {
+    static func confirmLaunchWithMissingRoots(_ missing: [String]) async -> Bool {
         ModuleLog.app("[paths] launch roots missing: %@", missing.joined(separator: " | "))
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
@@ -178,9 +182,7 @@ extension AppDelegate {
             + "\n\nContinuing starts with what is named above, and anything missing is created empty."
         alert.addButton(withTitle: "Quit")
         alert.addButton(withTitle: "Continue Anyway")
-        let continued = alert.runModal() == .alertSecondButtonReturn
-        if !continued { NSApp.terminate(nil) }
-        return continued
+        return (try? await FaceNativePanel.confirm(alert)) == .alertSecondButtonReturn
     }
 
     // MARK: - Login item

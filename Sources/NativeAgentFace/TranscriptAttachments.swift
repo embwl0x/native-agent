@@ -83,6 +83,8 @@ struct TranscriptDiagnostics: Sendable {
         // TextKit places the view by frame; the host neither drives Auto Layout nor insets for the window's bars.
         host.sizingOptions = []
         host.safeAreaRegions = []
+        // A hosted view draws only inside its paragraph's room: a card that settles smaller never leaves its old controls over the next row.
+        host.view.clipsToBounds = true
         let entry = Entry(ref: ref, role: role, box: box, host: host, attachment: TranscriptAttachment(blockID: blockID))
         entries[blockID] = entry
         // Sized before TextKit first lays the paragraph out, so the first layout is the right one.
@@ -137,6 +139,7 @@ struct TranscriptDiagnostics: Sendable {
             if view.isHidden { view.isHidden = false }
         }
     }
+
 
     private func remeasure(_ blockID: String) {
         pending.insert(blockID)

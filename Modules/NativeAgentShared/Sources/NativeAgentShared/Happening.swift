@@ -8,7 +8,7 @@ public struct Happening: Codable, Sendable, Equatable {
     public static let showsLimit = 4_000
 
     public var kind: Kind
-    /// What it is about (a watch, a job, a queue step, a care); worth that touches no care gathers on this subject.
+    /// What it is about (a watch, a job, a queue step, a care); worth that touches no care, and a watch's news always, gathers on this subject.
     public var subject: String
     /// Where it came from: `sense:<watch>`, `part:<id>`, `clock:day`, `mac:front`, `job:<id>`, `contact:<id>`, `queue:<handle>`, `stem`.
     public var door: String
@@ -43,6 +43,9 @@ public struct Happening: Codable, Sendable, Equatable {
         self.shows = shows.map { String($0.prefix(Self.showsLimit)) }
     }
 
+    /// News from a watch the agent set (`SenseNewsBoard`: door `sense:<watch>`, subject `sense:<watch>:<address>`). The watch is a care the
+    /// agent made on purpose: its news gathers on its own subject and always opens its own thought.
+    public var watchNews: Bool { kind == .world && door.hasPrefix("sense:") && subject.hasPrefix(door + ":") }
     /// Someone waits on it (a person or agent, the conversation that started some work, the agent's past self, its body): it opens a thought unweighed.
     public var owed: Bool { kind != .world && kind != .self }
     /// Its experience id in the record.

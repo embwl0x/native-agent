@@ -55,7 +55,7 @@ struct MakeSheetView: View {
         let words = query.trimmingCharacters(in: .whitespaces)
         let found = Set(shown.indices.filter { row in !words.isEmpty && shown[row].contains { $0.localizedCaseInsensitiveContains(words) } })
         return VStack(alignment: .leading, spacing: 8) {
-            if let said = MakeSheetWords.shared.said[reference] {
+            if let said = MakePieceWords.shared.said[reference] {
                 Text(said).font(ShellType.label).foregroundStyle(.secondary).textSelection(.enabled)
             }
             HStack {
@@ -130,13 +130,12 @@ struct MakeSheetView: View {
         edit(&changed)
         table = changed
         saving = true
-        MakeSheetWords.shared.said[reference] = nil
+        MakePieceWords.shared.said[reference] = nil
         Task {
             let words: String?
             do {
-                let reply = try await appModel.client.act(.deskCommand(.init(command: "save_sheet", handle: reference, arguments: [
-                    "version": .string(version), "name": .string(file.lastPathComponent), "content": .string(changed.text)])))
-                words = try FaceWindowReply.message(reply)
+                words = try await MakePieceSave.save(appModel, reference: reference, version: version, name: file.lastPathComponent,
+                                                     content: changed.text).words
                 saved = true
             } catch {
                 table = before
@@ -145,7 +144,7 @@ struct MakeSheetView: View {
             saving = false
             // What the save said belongs to the piece: it stays above whichever version is drawn next, the one just laid or the newer one
             // the save was refused for, until the person changes something or leaves the table.
-            MakeSheetWords.shared.said[reference] = words
+            MakePieceWords.shared.said[reference] = words
             WorkPaneState.shared.selectedMakeVersions[reference] = nil
         }
     }
@@ -169,12 +168,27 @@ struct MakeSheetView: View {
     }
 }
 
-/// What a table's last save said, held for its Make ref rather than one version's view, so a refusal stays readable above the newer
-/// version drawn in place of the refused one. The drawing that holds a piece lets it go when the person leaves (`PageMakePreview`,
-/// `WorkPaneMakeView`).
-@MainActor @Observable final class MakeSheetWords {
-    static let shared = MakeSheetWords()
+/// What a piece's last save said (a table's or a board's), held for its Make ref rather than one version's view, so a refusal stays
+/// readable above the newer version drawn in place of the refused one. The drawing that holds a piece lets it go when the person leaves
+/// (`PageMakePreview`, `PageMakeBoard`, `WorkPaneMakeView`).
+@MainActor @Observable final class MakePieceWords {
+    static let shared = MakePieceWords()
     var said: [String: String] = [:]
+}
+
+/// A piece the person changed in the window, saved whole as the next version of the one it was changed from: the body's `save_piece`
+/// runs `make.add` as the person's tap, and Make refuses it in plain words when that version is not the newest any more.
+enum MakePieceSave {
+    @MainActor static func save(_ appModel: AppModel, reference: String, version: String, name: String, content: String) async throws
+        -> (words: String?, version: String) {
+        let reply = try await appModel.client.act(.deskCommand(.init(command: "save_piece", handle: reference, arguments: [
+            "version": .string(version), "name": .string(name), "content": .string(content)])))
+        guard case .object(let fields) = try FaceWindowReply.value(reply), case .string(let laid)? = fields["version"] else {
+            throw WireFailure(code: "piece_save_unconfirmed", message: "I can't confirm the change was saved. Look at its versions in Make.",
+                              cause: nil, effects: .unknown)
+        }
+        return (fields["words"]?.stringValue, laid)
+    }
 }
 
 struct MakeSheetCell: Hashable {

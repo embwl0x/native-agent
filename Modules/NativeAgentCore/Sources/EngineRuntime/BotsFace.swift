@@ -119,25 +119,31 @@ enum BotsFace {
         ]
     }
 
-    /// A requested check (`bots.check`): the helper runs once and its reply stays in its own conversation.
-    @MainActor static func check(_ engine: NativeAgentEngine, _ input: [String: JSONValue]) async throws -> String {
+    /// A requested check (`bots.check`): the helper `id` names, readable and not deleted (the lookup); it runs once and its reply stays in
+    /// its own conversation (the effect).
+    @MainActor static func check(_ engine: NativeAgentEngine, _ input: [String: JSONValue]) async throws -> HostVerbEffect {
         let id = try await helper(engine, input)
-        do {
-            let request = try await BotRunConversation.enqueueRequestedCheck(botID: id, dataRoot: engine.dataRoot)
-            return "Run request: " + request.uuidString + ". Its reply stays in this helper's conversation."
-        } catch { throw PartCallError(code: "helper_action_failed", message: ChatToolOutcome.errorMessage(error)) }
+        return {
+            do {
+                let request = try await BotRunConversation.enqueueRequestedCheck(botID: id, dataRoot: engine.dataRoot)
+                return "Run request: " + request.uuidString + ". Its reply stays in this helper's conversation."
+            } catch { throw PartCallError(code: "helper_action_failed", message: ChatToolOutcome.errorMessage(error)) }
+        }
     }
 
-    /// The Paused switch (`bots.paused`): value true pauses the helper's scheduled and event work, false resumes it.
-    @MainActor static func paused(_ engine: NativeAgentEngine, _ input: [String: JSONValue]) async throws -> String {
+    /// The Paused switch (`bots.paused`): a position, and the helper `id` names (the lookups); value true pauses the helper's scheduled and
+    /// event work, false resumes it (the effect).
+    @MainActor static func paused(_ engine: NativeAgentEngine, _ input: [String: JSONValue]) async throws -> HostVerbEffect {
         guard case .bool(let paused)? = input["value"] else {
             throw PartCallError(code: "paused_value", message: "Paused takes value true or false; nothing changed.")
         }
         let id = try await helper(engine, input)
-        let store = BotDefinitionStore(dataRoot: engine.dataRoot)
-        do { _ = try await Task.detached { try store.pause(id, paused: paused) }.value }
-        catch { throw PartCallError(code: "helper_action_failed", message: ChatToolOutcome.errorMessage(error)) }
-        return paused ? "Paused." : "Resumed."
+        return {
+            let store = BotDefinitionStore(dataRoot: engine.dataRoot)
+            do { _ = try await Task.detached { try store.pause(id, paused: paused) }.value }
+            catch { throw PartCallError(code: "helper_action_failed", message: ChatToolOutcome.errorMessage(error)) }
+            return paused ? "Paused." : "Resumed."
+        }
     }
 
     /// The helper `id` names, refused when it is unreadable or deleted.

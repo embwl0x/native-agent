@@ -112,7 +112,7 @@ public enum MyQueueReady {
                     occurrence = freeOccurrence(item, filed: filed)
                 case .at(let date): occurrence = context.now >= date ? date : nil
                 case .every: occurrence = context.occurrence(entry.step, context.now)
-                case .afterCard(let card): occurrence = context.completedCards.contains(card) ? filed : nil
+                case .afterCard: occurrence = entry.step.status == MyQueue.cardReleased ? filed : nil
                 case .userHere, .userAway:
                     guard let presence = context.presence(), presence.since > filed, presence.here == (when == .userHere) else { continue }
                     occurrence = presence.since
@@ -237,7 +237,9 @@ extension AgentScreen {
     }
 
     /// Read approval follow-ups fresh; decline drops only unchanged steps, successful calls release them, and changed or failed work needs judgment.
-    package static func resume(card: String, decision: String, completed: Bool, dataRoot: URL) async
+    /// The one owner of a card's after_card steps, called at the card's settle. `handOff`: the card continues a turn, which takes the steps
+    /// (they close here, and their words ride its input); otherwise they are released to run from MY QUEUE on their own.
+    package static func resume(card: String, decision: String, completed: Bool, handOff: Bool, dataRoot: URL) async
         -> (text: String, sources: [String], elevated: [String]) {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         let state: DeskState
@@ -268,10 +270,23 @@ extension AgentScreen {
             } else if !entry.peerBorn, entry.item.title != entry.step.title {
                 lines.append("You queued \(entry.name) for after this card as \"\(entry.step.words)\", but it reads "
                     + "\"\(entry.item.title)\" now. It was not run; look at it and decide.")
+            } else if !handOff {
+                var released = entry.step
+                released.status = MyQueue.cardReleased
+                do { _ = try await MyQueue.update(entry, step: released, store: store) }
+                catch { lines.append("The step queued for after this card, \(queued), could not be released: " + error.localizedDescription + ".") }
             } else {
-                lines.append("You queued this step for after this card (\(entry.name) in MY QUEUE): \"\(entry.step.words)\""
-                    + (entry.step.actionText.map { "\nHabit: " + $0 } ?? ""))
-                lines.append("Do it now with your usual actions; it closes by itself once the work is seen done.")
+                do {
+                    try await MyQueue.finish(entry, dropped: false, why: "Taken by the card's continued turn.", store: store)
+                    lines.append("Queued after this card (\(entry.name), now taken from MY QUEUE): \"\(entry.step.words)\""
+                        + (entry.step.actionText.map { "\nHabit: " + $0 } ?? ""))
+                    lines.append("Do it now with your usual actions, in this turn.")
+                } catch is MyQueue.Superseded {
+                    lines.append("The step you queued for after this card, \(queued), changed or closed before the card settled. The newer state was kept.")
+                } catch {
+                    lines.append("The step queued for after this card, \(queued), could not be taken: " + error.localizedDescription
+                        + ". It is still in MY QUEUE and waits; nothing runs it twice.")
+                }
             }
         }
         return (lines.joined(separator: "\n"), sources, elevated)

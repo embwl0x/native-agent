@@ -274,7 +274,8 @@ extension AppToolExecutor {
             }
             var result: [String: JSONValue] = [
                 "status": .string(stopped ? "partial" : landed == receipts.count ? "ok" : landed > 0 || partial > 0 ? "partial" : unresolved > 0
-                    ? "outcome_unknown" : "failed"),
+                    // Every step refused before it ran is the batch refused, the word each receipt says.
+                    ? "outcome_unknown" : receipts.allSatisfy { $0.outcome == .refused } ? "refused" : "failed"),
                 "detail": .string("\(landed) of \(receipts.count) landed fully; \(partial) partially; each receipt, in order, says what happened."),
                 "receipts": .array(shown),
             ]
@@ -295,7 +296,8 @@ extension AppToolExecutor {
                 }
             }
             if let barrier {
-                let state = ChatToolOutcome.isWaitingApproval(barrier.reply.payload) || barrier.reply.isWaitingInteraction ? "is waiting on you" : "failed"
+                let state = ChatToolOutcome.isWaitingApproval(barrier.reply.payload) || barrier.reply.isWaitingInteraction ? "is waiting on you"
+                    : barrier.reply.outcome == .refused ? "was refused" : "failed"
                 let reason = ChatToolOutcome.explanation(barrier.reply.payload) ?? "The receipt gives no further reason."
                 let stop: String = if let surprise {
                     "Step \(barrier.index) (\(label(barrier.index, barrier.action))) did not come back as expected: " + surprise.at.map { miss in
@@ -306,7 +308,7 @@ extension AppToolExecutor {
                     + " Not run after it: " + (notRun.isEmpty ? "none." : notRun.map { label($0.index, $0.action) }.joined(separator: ", ") + ".")
                     + " Ran after it: " + (readsAfter.isEmpty ? "none." : readsAfter.joined(separator: ", ") + "."))
                 // Where the deed stopped and why, in one place; failed_step is kept for a step that failed or waits.
-                let because = surprise != nil ? "surprise" : state == "failed" ? "failed" : "waiting"
+                let because = surprise != nil ? "surprise" : state == "failed" ? "failed" : state == "was refused" ? "refused" : "waiting"
                 var stoppedAt: [String: JSONValue] = ["step": .int(Int64(barrier.index)), "because": .string(because)]
                 stoppedAt["as"] = named[barrier.index].map(JSONValue.string)
                 result["stopped_at"] = .object(stoppedAt)
@@ -341,6 +343,22 @@ extension AppToolExecutor {
                 })
                 result["next_step"] = .int(Int64(nextIndex + 1))
                 if receipts.isEmpty {
+                    result["execution"] = .string("not_run")
+                    result["effects"] = .string("none")
+                }
+            }
+            // Every step refused before it ran is the batch refused, written by the one refusal writer; every step a preview would refuse is the
+            // batch's preview refusal. Neither is a failure or an unknown outcome.
+            if !stopped, !handedBack, !receipts.isEmpty {
+                let first = receipts[0].payload.objectValue ?? [:]
+                if receipts.allSatisfy({ $0.outcome == .refused && $0.payload.objectValue?["execution"] == .string("not_run") }),
+                   case .object(let refused) = ChatToolOutcome.refusedBeforeRunning(
+                    code: Self.doorText(first["reason"]).isEmpty ? "refused" : Self.doorText(first["reason"]), detail: Self.doorText(result["detail"]),
+                    extra: result.filter { !["status", "reason", "detail", "failure_code", "effects", "execution", "outcome"].contains($0.key) }) {
+                    result = refused
+                } else if receipts.allSatisfy({ $0.payload.objectValue?["would_refuse"] != nil }) {
+                    result["status"] = .string("preview")
+                    result["would_refuse"] = first["would_refuse"]
                     result["execution"] = .string("not_run")
                     result["effects"] = .string("none")
                 }

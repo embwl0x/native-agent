@@ -8,7 +8,7 @@ import PersistenceCore
 import StandingBots
 // Blueprint: | `AgentContactHeldAnswer.swift` | `AgentContactHeldAnswer`: a contact's answer held as its one send row for the conversation store to deliver |
 
-/// Holding needs no open turn: persist the contact's one send row, then hand delivery to the conversation store every door drains.
+/// Holding needs no open turn: bind the turn's saved answer as the contact's one send row, then hand delivery to the conversation store every door drains.
 public enum AgentContactHeldAnswer {
     package static func complete(dataRoot: URL, peer: AgentPeerContact, session: String, deliveryID: String, requestDigest: String,
                                  response: ChatResponse, client: SwiftNativeChatOrchestrationClient, turn: Turn,
@@ -61,8 +61,10 @@ public enum AgentContactHeldAnswer {
         try AgentConversationStore.validateHeldText(text)
         let saved = try ContactThread.lines(dataRoot: dataRoot, owner: peer.id).filter { $0.sendID == sendID && $0.mine }
         if saved.isEmpty {
+            // The turn already wrote its answer: holding binds that row (by its completion, else its run) as the send, never a second row.
             try await client.appendAgentConversationSend(sessionID: session, text: text, clientUserMessageID: sendID,
-                reusingCompletionID: reusingCompletion ? deliveryID : nil, turn: turn)
+                reusingCompletionID: reusingCompletion ? deliveryID : nil,
+                reusingRunID: reusingCompletion ? nil : response.runId, turn: turn)
         }
         try store.holdReply(peer: peer, session: session, sendID: sendID, text: text)
     }

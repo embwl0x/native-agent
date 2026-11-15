@@ -85,8 +85,9 @@ states how they knows it. A memory's roots (`metadata.roots`, the type
 telling: `{how, by, at, written, through}`.
 
 - `how` is `told|noticed|inferred|verified|remembered`, or `kept` for a memory
-  whose origin nothing recorded or stated (only the stem writes `kept`: the fold,
-  and `memory.commit` with no `provenance`).
+  whose origin nothing recorded or stated (only the stem writes `kept`:
+  `memory.commit` with no `provenance`, and `memories.bring_back` for an old
+  memory that recorded none).
 - `by` is at most 40 characters (letters, digits, spaces and `. - '`): who told
   their, or where their own past was kept ("my backup", an app name).
 - `at` is when that root reached their: their `since`, or the write time.
@@ -235,6 +236,11 @@ steered, `untrusted_remote_data`, `agent` and `source_boundary`.
 Every memory and proposal read requires readable current roots. Store opening performs no provenance conversion,
 alias read, backup-and-fold or synthetic `kept` rewrite. Malformed metadata remains unchanged and fails its checked read.
 Any saved-data repair uses the actual retained evidence; it is not inferred by a store-open migration.
+An old store comes back only through the person's `memories.bring_back {from}` (`MemoryV2/MemoryBringBack.swift`): its own read-only
+reader on a temporary copy, then each active or archived memory not already here (`metadata.brought_back_from`) through
+`SwiftNativeMemoryV2.store` with the root its recorded provenance names: told or known by a recorded name keeps that how and name from when
+first known; stated with no name is remembered by the archive's past self ("Agent of Oct 19"); nothing recorded is kept. Recorded
+principals are its through, so a steered one stays its teller's, dated when brought back. Deleted rows, chats, diary, proposals and graph stay.
 `MemoryDataProvenance` owns the root a write adds, the steer, and the shared
 evidence/turn stamps and time helpers. `MemoryMoments` retains only interpretation of actual retained moment
 rows. A saved replacement whose correction read fails retains its save ID and

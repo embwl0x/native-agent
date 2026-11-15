@@ -495,7 +495,7 @@ public actor EngineFaceActs: FaceActHandler {
              .releaseTranscriptReader, .transcriptReceipt, .setTranscriptFold, .firstVisibleReply,
              .declarePreferences, .setPreference, .beginOAuth,
              .answerCard, .verifyCardOnReturn, .importGrokCredentials, .setUpChrome,
-             .resolveApproval, .inboxAction, .requestMacOSAccess,
+             .resolveApproval, .inboxAction, .openCard, .requestMacOSAccess,
              .openMacOSSettings, .runMacControl, .notify,
              .runDoctor, .reindexSpotlight, .requestUpdate, .updateInteraction,
              .deskCommand, .addDeskNote,

@@ -9,11 +9,15 @@ public enum InlineInteractionModelOverride {
         public var group: String
         public var providerID: String
         public var model: String
+        /// The card asked which model the continued turn itself runs on (raised by the turn's own question, not by a tool such as image
+        /// generation, whose card binds only that tool's call).
+        public var drivesTurn: Bool
 
-        public init(group: String, providerID: String, model: String) {
+        public init(group: String, providerID: String, model: String, drivesTurn: Bool = false) {
             self.group = group
             self.providerID = providerID
             self.model = model
+            self.drivesTurn = drivesTurn
         }
     }
 

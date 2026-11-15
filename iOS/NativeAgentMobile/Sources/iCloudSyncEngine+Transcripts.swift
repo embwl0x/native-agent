@@ -204,6 +204,7 @@ extension ChatMessageRecord {
         var record = record
         record.interactionJSON = try canonicalJSON(record.interactionJSON)
         record.interactionDescriptorJSON = try canonicalJSON(record.interactionDescriptorJSON)
+        record.cardFaceJSON = try canonicalJSON(record.cardFaceJSON)
         if var metadata = record.metadata {
             metadata.inputJSON = try canonicalJSON(metadata.inputJSON)
             record.metadata = metadata

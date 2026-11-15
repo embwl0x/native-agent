@@ -87,8 +87,9 @@ extension NativeAgentEngine {
         return "Reset complete. \(result.backedUp.count) document(s) backed up. The onboarding wizard appears next launch."
     }
 
-    /// The Memory and mind model (`personality.mind`, a lever): `value` is an option id the mind row offers.
-    @MainActor func personalityChooseMind(_ value: String?) async throws -> String {
+    /// What `personality.mind` names, checked against the providers read now (an offered model of a ready provider), and the save it makes:
+    /// every check comes before the save, so the gate's check before any card and the run make the same ones.
+    @MainActor func personalityMindChoice(_ value: String?) async throws -> @MainActor () async throws -> String {
         guard let value, !value.isEmpty else {
             throw PartCallError(code: "unknown_action", message: "Choose an offered Memory and mind model.")
         }
@@ -105,12 +106,14 @@ extension NativeAgentEngine {
                         message: ModelSlot.refusal(note: provider.models_note, accountName: provider.display_name))
                 }
                 let preference = snapshot.routing.preferences[NativeCognitionRuntime.studioWanderSurface]
-                _ = try await saveProviderGroupSelection(group: ProviderSurfaceGroups.mind,
-                    providerID: provider.provider_id, model: model.id,
-                    reasoningEffort: ProvidersFacade.normalizedReasoningEffort(from: providers.catalog, providers: connections,
-                        providerID: provider.provider_id, model: model.id, selected: preference?.reasoningEffort ?? ""),
-                    serviceTier: preference?.serviceTier)
-                return "Memory and mind → \(model.id) saved"
+                return { [self] in
+                    _ = try await saveProviderGroupSelection(group: ProviderSurfaceGroups.mind,
+                        providerID: provider.provider_id, model: model.id,
+                        reasoningEffort: ProvidersFacade.normalizedReasoningEffort(from: providers.catalog, providers: connections,
+                            providerID: provider.provider_id, model: model.id, selected: preference?.reasoningEffort ?? ""),
+                        serviceTier: preference?.serviceTier)
+                    return "Memory and mind → \(model.id) saved"
+                }
             }
         }
         throw PartCallError(code: "model_unavailable",

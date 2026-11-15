@@ -1,4 +1,5 @@
 import Foundation
+import AuthoredCapabilities
 import Experiences
 import NativeAgentCore
 import NativeAgentShared
@@ -149,14 +150,15 @@ public enum InlineInteractionDelivery {
            card.kind == .choose, card.options.indices.contains(index) {
             // Quiet inbox actions are agent-initiated; a signed phone tap carries the person's authority.
             _ = try await InlineInteractionResolver.complete(id: card.id, sessionID: pointer.sessionID,
-                selection: card.options[index].id, expectedRevision: card.revision, byAgent: quiet, turn: turn, dataRoot: dataRoot)
+                selection: card.options[index].id, expectedRevision: card.revision, byAgent: quiet, door: turn?.personAct?.door,
+                turn: turn, dataRoot: dataRoot)
         } else if action == "reject" || action == "deny" {
             let card = try await InlineInteractionResolver.require(id: pointer.interactionID,
                 sessionID: pointer.sessionID, dataRoot: dataRoot)
             // A previous decline may have saved while its inbox disposition failed. Reconcile that disposition without replaying continuation.
             if case .declined = card.state { return }
             _ = try await InlineInteractionResolver.decline(id: card.id, sessionID: pointer.sessionID,
-                expectedRevision: card.revision, resume: !quiet, turn: turn, dataRoot: dataRoot)
+                expectedRevision: card.revision, resume: !quiet, byAgent: quiet, door: turn?.personAct?.door, turn: turn, dataRoot: dataRoot)
         } else if action == "act" {
             try await open(pointer)
         } else {

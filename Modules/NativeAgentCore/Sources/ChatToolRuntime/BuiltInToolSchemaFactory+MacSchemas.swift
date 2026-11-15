@@ -383,9 +383,9 @@ extension BuiltInToolSchemaFactory {
                         Restart the already-installed NativeAgent.app bundle: writes an audit receipt, spawns a detached relauncher, then requests \
                         termination when the originating turn settles. If that turn stalls for \(Int(AppRelaunch.stalledTurnSeconds))s, the app \
                         exits with an explicit unfinished outcome. This does not build, stage, sign, or install new Swift code; after Swift source \
-                        edits use app.install instead. The relauncher observes process exit and reopens the app bundle; it aborts if quitting takes \
-                        more than \(AppRelaunch.relaunchExitDeadlineSeconds)s. Refuses if a restart called through app fired within the last 10 minutes \
-                        (cooldown). Requires admitted Full Mac file access; restarting needs no routine approval card.
+                        edits use app.install instead. The relauncher reopens the app bundle once the old process has exited, however long its \
+                        quit settles. Refuses if a restart called through app fired within the last 10 minutes (cooldown). Requires admitted Full \
+                        Mac file access; restarting needs no routine approval card.
                         """,
                     parametersJSON: ToolSchema.params(
                         properties: [

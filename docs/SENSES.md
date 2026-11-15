@@ -400,8 +400,9 @@ The runner retains the memory cap. App-served plug replies have no timer.
   IDs whose removal changes neither unread items nor retained histories returns
   before persistence and either presentation/context invalidation. Storage failure
   is visible news and damaged state remains preserved. What a new notice is worth
-  is the agent's `weigh` to say; worth that gathers on a care ignites a thought
-  ([SUBCONSCIOUS.md](SUBCONSCIOUS.md) Cares).
+  is the agent's `weigh` to say, never below one: the watch is a care the agent
+  made on purpose, so its news gathers on the watch's own subject, never on
+  another care, and always opens its own thought there ([SUBCONSCIOUS.md](SUBCONSCIOUS.md) Cares).
   File senses compare their full structural rows, not a clipped page; native
   Chrome and the site authoring example report navigation as the destination
   title and top sections with from → to. Content diffs compare only the same

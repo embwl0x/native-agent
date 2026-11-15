@@ -105,7 +105,7 @@ function face(input) {
     // A piece is something I made, laid on an item. A person reads its own title and what it is; the agent at the door reads its Make
     // ref and the two calls that work on it.
     const PIECE_ACTION = {"open-piece": "Open in Make", "copy-reference": "Copy reference"};
-    const WHAT = {picture: "a picture", page: "a page", document: "a document", sheet: "a table", file: "a file"};
+    const WHAT = {picture: "a picture", page: "a page", document: "a document", sheet: "a table", board: "a whiteboard", file: "a file"};
     const pieceTitle = piece => piece.title === null ? "Something I made" : piece.title;
     const versionsLine = n => n === 1 ? "one version" : spelled(n) + " versions";
     function pieceLine(piece) {
@@ -130,6 +130,13 @@ function face(input) {
             + JSON.stringify({content: "<the whole table>", name: t === undefined ? "<name>.csv" : t.file, ref: piece.ref})
             + " lays a new version; a version the person changed by hand reads person_edit_of there."
             + (t === undefined ? " " + piece.reason : " Its first rows:\n" + utf8Fit(t.first, 4096).text);
+    }
+    // A whiteboard reads as its document; the person moves, sizes, writes on, joins and adds its cards in the window, each change a new version.
+    function boardDoor(piece) {
+        return pieceTitle(piece) + " is a whiteboard I made, " + versionsLine(piece.versions) + ", in Make as " + piece.ref
+            + ". make.add " + JSON.stringify({content: "<the whole board>", name: "board.board", ref: piece.ref})
+            + " lays a new version; a version the person changed by hand reads person_edit_of in make.read."
+            + (piece.text === undefined ? (piece.reason ? " " + piece.reason : "") : " Its document:\n" + utf8Fit(piece.text, 4096).text);
     }
     const pieceTone = piece => piece.state === "missing" || piece.state === "unavailable" ? "attention" : null;
     const thingsLine = n => (n === 1 ? "one thing" : spelled(n) + " things") + " on the table";
@@ -241,10 +248,10 @@ function face(input) {
                 submit: [{id: "add", label: "Add"}]}});
         }
         // Each piece the item holds, drawn to be looked at in the order it was laid, newest version of each. Mockups, pages and pictures
-        // stand side by side as one canvas; a table and a document's own words keep the full width under them.
+        // stand side by side as one canvas; a table, a whiteboard and a document's own words keep the full width under them.
         // A face holds 64 sections, so an item draws its first 24 pieces and says how many more its rows list.
         const ready = s.pieces.filter(piece => piece.state === "ready"), laid = ready.slice(0, 24);
-        const wide = piece => piece.what === "document" || piece.what === "sheet";
+        const wide = piece => piece.what === "document" || piece.what === "sheet" || piece.what === "board";
         for (const piece of laid.filter(piece => !wide(piece))) {
             const key = "piece:" + piece.id;
             sections.push({id: key, title: pieceTitle(piece), beside: "pieces", block: {kind: "leaf", key, leaf: piece.leaf, ref: piece.ref,
@@ -252,9 +259,9 @@ function face(input) {
         }
         for (const piece of laid.filter(wide)) {
             const key = "piece:" + piece.id, title = pieceTitle(piece);
-            if (piece.what === "sheet") {
+            if (piece.what === "sheet" || piece.what === "board") {
                 sections.push({id: key, title, block: {kind: "leaf", key, leaf: piece.leaf, ref: piece.ref, revision: piece.version,
-                    alt: sheetDoor(piece)}});
+                    alt: piece.what === "sheet" ? sheetDoor(piece) : boardDoor(piece)}});
             } else if (piece.text === undefined) {
                 sections.push({id: key, title, style: "note", rows: [{id: "piece-words:" + piece.id, title: piece.reason, tone: "attention"}],
                     footer: "In Make as " + piece.ref + "."});

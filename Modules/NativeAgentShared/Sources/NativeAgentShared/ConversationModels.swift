@@ -338,6 +338,9 @@ public struct ChatMessageRecord: Identifiable, Codable, Hashable, Sendable {
     public var interactionJSON: String? = nil
     public var interactionDescriptorJSON: String? = nil
     public var interactionSessionID: String? = nil
+    /// The card this row carries as one `PartFace.Row` in JSON, read on the Mac from the card itself (`TranscriptReadout.Card.face`); the phone
+    /// draws it with its own Inbox row's answers (`cardAnswers`).
+    public var cardFaceJSON: String? = nil
     public var toolEvents: [ToolEvent]? = nil
     /// What the Mac read of this row; the phone builds the same face from it.
     public var face: TranscriptRowFace? = nil
@@ -351,7 +354,7 @@ public struct ChatMessageRecord: Identifiable, Codable, Hashable, Sendable {
     public var isPersonVisible = true
     private enum CodingKeys: String, CodingKey {
         case id, sessionId, role, content, createdAt, runId, source, metadata
-        case interactionJSON, interactionDescriptorJSON, interactionSessionID, toolEvents, face
+        case interactionJSON, interactionDescriptorJSON, interactionSessionID, cardFaceJSON, toolEvents, face
     }
     public mutating func omitAttachmentPreviews() {
         guard let attachments = metadata?.attachments else { return }

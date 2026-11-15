@@ -223,9 +223,10 @@ evidence. Desk writes invalidate this reading.
 
 `schedule.create` schedules reads only: `connector_action` (a watch) and
 `proactive_scan`, each a time on the one clock (`TriggerScheduler/ScheduledReads.swift`,
-`watch:<id>`, `scan:<id>`); any other kind refuses as unsupported, and the action's
-description points intentions, check-ins and reminders to `queue.add`.
-`schedule.list` and `schedule.delete` read and withdraw them. The night, REM and
+`watch:<id>`, `scan:<id>`; an id given with its kind's prefix keeps it once);
+any other kind refuses as unsupported, and the action's description points
+intentions, check-ins and reminders to `queue.add`. `schedule.list` and
+`schedule.delete` read and withdraw them (by id, with or without the prefix). The night, REM and
 part schedules are the app's and the parts' own clock times
 ([What stays a rhythm](#what-stays-a-rhythm)).
 
@@ -246,11 +247,14 @@ will act from now on ("when X happens, I'll Y", "I'll always…") is a lesson
 about how they works, never a queue step. No separate promise store exists.
 
 The supported moments are `next_turn`, `own_turn`, `when_user_messages`,
-`after_card <id>` only when their reply names that approval id, and
+`after_card <id>` only when their reply names that card's id (an approval or any card a call raised), and
 `at <ISO time>` only when they named a time, resolved on the exchange's Mac
-clock. A commitment without a named supported moment uses `own_turn`.
+clock. A card's settle is the one owner of its `after_card` steps: a card that
+continues a turn hands them to that turn (they close there, their words in its
+input), and only a card with no continued turn releases them to run from MY QUEUE,
+so one card answer never wakes two turns. A commitment without a named supported moment uses `own_turn`.
 The native parser checks nonblank words, an exact reply source and a supported
-moment; an approval id must also occur in their reply. No promises is `[]`;
+moment; a card id must also occur in their reply. No promises is `[]`;
 an absent section in a model reply also means none. A malformed present section
 refuses interpretation with its exact validation cause and leaves the turn owed.
 Saved meanings require their promises array; missing or invalid saved promises

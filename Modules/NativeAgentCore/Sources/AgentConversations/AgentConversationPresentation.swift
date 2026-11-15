@@ -115,6 +115,12 @@ extension AgentConversationSession {
             // Don't keep a previous request locator for a new uncertain send.
             $0.readInput = nil
             absorb(receipt, into: &$0)
+            // A held send's record begins before the row that hands it out is saved: no held message goes out without its record.
+            if heldSend($0) {
+                let task = if case .object(let fields) = receipt { string(fields["task_id"]) } else { nil as String? }
+                try store.held.send($0, conversation: $0.conversationID ?? AgentConversationStore.heldThread(peerID: String($0.agent.dropFirst(5))),
+                    task: task)
+            }
             if stopped, !AgentConversationRunning.shared.observing(row: row.id, operation: row.operationID) {
                 let detail = if case .object(let fields) = receipt { string(fields["detail"]) } else { nil as String? }
                 $0.stop = AgentConversationStop(state: "released", operationID: row.operationID, at: Date(), detail: detail
@@ -129,9 +135,9 @@ extension AgentConversationSession {
             if let firstActivity, let index = $0.exchanges?.lastIndex(where: { $0.id == row.operationID }) {
                 $0.exchanges?[index].firstActivityAt = firstActivity
             }
-            $0.shownInline = inline && $0.phase != "waiting" && !heldReplyPending($0) ? $0.operationID + ":" + $0.phase : nil
+            $0.shownInline = inline && $0.phase != "waiting" && !heldReplyPending($0, dataRoot: store.held.dataRoot) ? $0.operationID + ":" + $0.phase : nil
             // Publish settlement and delivery together, before a queued sender can observe the finished exchange and advance this conversation.
-            if background, $0.personInitiated != true, $0.phase != "waiting", !heldReplyPending($0), !$0.automaticRead,
+            if background, $0.personInitiated != true, $0.phase != "waiting", !heldReplyPending($0, dataRoot: store.held.dataRoot), !$0.automaticRead,
                !macHeld, !stoppedOrReleased($0), !AgentConversationRunning.shared.watched($0.id) {
                 $0.deliveryState = "delivering"; $0.automaticRead = true; $0.nextReadAt = Date()
             }

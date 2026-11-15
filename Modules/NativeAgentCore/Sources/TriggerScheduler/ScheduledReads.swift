@@ -35,7 +35,7 @@ public enum ScheduledReads {
         guard named.count <= 160 else { throw TriggerSchedulerError.schedulerInvalid("name must be at most 160 characters", path: "$.name") }
         payload["name"] = .string(named.isEmpty ? (kind == "proactive_scan" ? "Proactive scan" : "Watch " + (payload["actionId"]?.stringValue ?? "")) : named)
         let key = SchedulerJobNormalizer.string(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let id = owner + ":" + (key.isEmpty ? UUID().uuidString.lowercased() : key)
+        let id = clockID(key.isEmpty ? UUID().uuidString.lowercased() : key, owner: owner)
         let when = try timing(input, now: now)
         let clock = OneClock.at(dataRoot)
         guard try await clock.times(owner: owner).allSatisfy({ $0.id != id }) else {
@@ -72,14 +72,22 @@ public enum ScheduledReads {
         return .object(["status": .string("completed"), "count": .int(Int64(rows.count)), "reads": .array(rows)])
     }
 
-    /// Withdraw one scheduled read by its canonical id; an unknown id refuses.
+    /// A read's id on the clock: its owner's prefix exactly once, whether or not the agent's id already carries it.
+    static func clockID(_ key: String, owner: String) -> String {
+        key.hasPrefix(owner + ":") ? key : owner + ":" + key
+    }
+
+    /// Withdraw one scheduled read by its id: a read with exactly that id, else (for a bare id only) the id with its owner's prefix added; an
+    /// unknown or ambiguous id refuses.
     public static func cancel(_ id: String, dataRoot: URL) async throws -> JSONValue {
         let wanted = id.trimmingCharacters(in: .whitespacesAndNewlines)
         let clock = OneClock.at(dataRoot)
-        var matches: [OneClock.Time] = []
-        for owner in owners.values.sorted() {
-            matches += try await clock.times(owner: owner).filter { $0.id == wanted }
-        }
+        var times: [OneClock.Time] = []
+        for owner in owners.values.sorted() { times += try await clock.times(owner: owner) }
+        // An id that already names its kind (`watch:…`, `scan:…`) is only ever that read; a bare id may be any kind's.
+        let named = owners.values.contains { wanted.hasPrefix($0 + ":") }
+        var matches = times.filter { $0.id == wanted }
+        if matches.isEmpty, !named { matches = times.filter { $0.id == clockID(wanted, owner: $0.owner) } }
         guard !wanted.isEmpty, matches.count == 1, let time = matches.first else {
             throw ToolFailureError("No scheduled read is called \(id).", argumentPath: "$.job_id", accepted: "An id from schedule.list.", effects: .none)
         }

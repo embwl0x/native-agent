@@ -388,6 +388,12 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
     public var secret: SecretAsk?
     /// Set while a running permission card walks its grants; it is also what carries the card across its own restart.
     public var waitingOn: WaitingOn?
+    /// A model card's group model as the card was raised ("" when none was saved): a return reading that same model answers nothing.
+    /// Nil on cards raised before it was kept.
+    public var modelAtStart: String?
+    /// The dispatch receipts of the calls that raised this card, its birth and every re-ask it absorbed: its settlement is written to the trace
+    /// under each, so the agent reads what was answered as any of those calls' receipt. Nil on cards raised outside a traced call.
+    public var receiptIDs: [String]?
 
     // MARK: Init
 
@@ -554,7 +560,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         case version, id, revision, kind, target, additionalTargets, mode, title, why
         case primaryActionLabel, secondaryActionLabel, declineConsequence
         case persistenceNote, cardProse, options, primaryScope, state, createdAt, settledAt
-        case continuation, secret, waitingOn
+        case continuation, secret, waitingOn, modelAtStart, receiptIDs
     }
 
     private struct WireState: Codable {
@@ -589,6 +595,8 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         continuation = try container.decodeIfPresent(Continuation.self, forKey: .continuation)
         secret = try container.decodeIfPresent(SecretAsk.self, forKey: .secret)
         waitingOn = try container.decodeIfPresent(WaitingOn.self, forKey: .waitingOn)
+        modelAtStart = try container.decodeIfPresent(String.self, forKey: .modelAtStart)
+        receiptIDs = try container.decodeIfPresent([String].self, forKey: .receiptIDs)
         let wire = try container.decode(WireState.self, forKey: .state)
         switch wire.name {
         case "pending": state = .pending
@@ -634,6 +642,8 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         try container.encodeIfPresent(continuation, forKey: .continuation)
         try container.encodeIfPresent(secret, forKey: .secret)
         try container.encodeIfPresent(waitingOn, forKey: .waitingOn)
+        try container.encodeIfPresent(modelAtStart, forKey: .modelAtStart)
+        try container.encodeIfPresent(receiptIDs, forKey: .receiptIDs)
         let wire: WireState
         switch state {
         case .pending: wire = WireState(name: "pending", outcome: nil, reason: nil)

@@ -110,6 +110,8 @@ public enum FaceAct: Codable, Sendable {
     case setUpChrome
     case resolveApproval(id: String, decision: FaceApprovalDecision)
     case inboxAction(id: String, action: String, value: PartFace.Value?)
+    /// A `card:` link followed: the conversation the card was raised in opens, and nothing about the card is answered or read.
+    case openCard(id: String)
     case applyTrustPreset(TrustPresetRequest)
     case saveMemoryPolicy(MemoryPolicyPatch)
     case setAutonomyEnabled(Bool)

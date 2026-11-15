@@ -54,6 +54,16 @@ door, `app`, and its action registry.
 
 ## Resolution and execution
 
+The chat autonomy gate checks a call's arguments before anything asks the person:
+validate, decide, card, run. The check is the call's preview, its schema and its
+owner's own checks of what it names (targets, names, ids, values; a host verb's
+one `prepare` switch, which runs every lookup the verb needs and returns its effect,
+so its run is `prepare` then the effect and the gate's check is `prepare` alone),
+for every caller, admission checks included. A call whose arguments cannot run is
+refused at once in its owner's words, with what it accepts; no card, approval or
+notification is raised for it, and its receipt reads status refused, execution
+not_run, nothing raised.
+
 The chat autonomy gate validates its timeout before filing a request. A timeout
 must be finite, nonnegative and representable as UInt64 nanoseconds; unsupported
 values throw `AutonomyGateError.invalidApprovalTimeout` without creating a card.

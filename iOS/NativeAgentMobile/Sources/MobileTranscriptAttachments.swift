@@ -171,6 +171,10 @@ struct TranscriptAttachmentData: Sendable {
     var asked: [String: String]
     /// The Inbox face's rows by matter id.
     var inbox: [String: PartFace.Row]
+    /// Each card's own face by its matter id, read on the Mac from the card itself.
+    var cards: [String: PartFace.Row] = [:]
+    /// The matters the Inbox still owes the person; nil until the Inbox has been read.
+    var waiting: Set<String>? = nil
 }
 
 /// What one live hosted view shows. The owner writes it on every update; the view reads it, so an answered card or a loaded image
@@ -204,10 +208,24 @@ enum TranscriptAttachmentModel: Equatable {
 
     init(_ ref: TranscriptAttachmentRef, in data: TranscriptAttachmentData) {
         switch ref {
-        // A card names its matter; an ask names it through the block it sits in. Either draws that matter's Inbox row.
+        // A card draws its own face with only its Inbox row's answers, so a card the Inbox no longer holds still reads whole; a Mac build
+        // that sends no face leaves the Inbox row. An ask names its matter through the block it sits in and draws that matter's Inbox row.
         case .card(_, let matter):
-            self = data.inbox[matter].map { Self.matter($0) }
-                ?? .unavailable("Inbox matter \(matter) has not arrived. Open Inbox to inspect its sync status.")
+            if var card = data.cards[matter] {
+                if card.tone == .attention, let settled = data.inbox[matter], data.waiting?.contains(matter) == false {
+                    // A face read before the card settled (an older page of history keeps its first copy) never draws as still asking: the
+                    // Inbox holds the matter as settled, so its own row says the outcome. A card the Inbox does not hold yet draws its own
+                    // face with no answers until they arrive.
+                    self = .matter(PartFace.Row(id: card.id, title: settled.title, detail: settled.detail, symbol: settled.symbol ?? card.symbol,
+                        tone: settled.tone, actions: settled.cardAnswers))
+                } else {
+                    card.actions = card.tone == .attention ? data.inbox[matter]?.cardAnswers : nil
+                    self = .matter(card)
+                }
+            } else {
+                self = data.inbox[matter].map { Self.matter($0) }
+                    ?? .unavailable("Inbox matter \(matter) has not arrived. Open Inbox to inspect its sync status.")
+            }
         case .approval(let id):
             self = data.asked[id].flatMap { data.inbox[$0] }.map { Self.matter($0) }
                 ?? .unavailable("Approval \(id) has no available Inbox row. Open Inbox to inspect its sync status.")

@@ -361,139 +361,168 @@ extension ChatComposerModelGroup {
 
 /// Provider actions share page operations while preserving the saved sign-in method and keeping keys out of results.
 extension ProvidersFacade {
+    /// The account a provider verb names by `provider`, or the refusal that lists the ones there are: a lookup of `prepareQuietProvider`.
+    public static func quietProviderAccount(_ input: [String: JSONValue], in accounts: [ProviderInfo]) -> Result<ProviderInfo, QuietArgumentRefusal> {
+        let id = input["provider"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let account = accounts.first(where: { $0.provider_id == id }) else {
+            return .failure(QuietArgumentRefusal(AppToolExecutor.failure(
+                "unknown_provider",
+                (id.isEmpty ? "Pass provider" : "No account has id \(id)") + ". app {page:\"providers\"} lists them.",
+                extra: ["providers": .array(accounts.map { .string($0.provider_id) })])))
+        }
+        return .success(account)
+    }
+
+    /// `provider.set_fallback_model`'s checks of what it names: a connected account, and a model it offers or already holds as its default:
+    /// lookups of `prepareQuietProvider`.
+    public static func quietFallbackModelRefusal(_ account: ProviderInfo, _ input: [String: JSONValue]) -> QuietArgumentRefusal? {
+        let name = account.display_name
+        guard account.auth_status.eligible else {
+            return QuietArgumentRefusal(AppToolExecutor.failure(
+                "not_connected",
+                "\(name) is not connected, so it has no fallback model to set. Connecting it is the owner's: ask them to sign in on Providers."))
+        }
+        // A model choice: offered, or the default already saved here (`ModelSlot.mayHold`).
+        let offered = account.offeredModels.map(\.id)
+        let model = input["model"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let row = account.models.first { $0.id == model }
+        guard ModelSlot.mayHold(model, row: row, savedInSlot: account.default_model) else {
+            if offered.isEmpty || row != nil {
+                return QuietArgumentRefusal(AppToolExecutor.failure("no_model_list",
+                    ModelSlot.refusal(note: account.models_note, accountName: name) + " Run provider.refresh, then try again."))
+            }
+            return QuietArgumentRefusal(AppToolExecutor.failure(
+                "bad_model",
+                (model.isEmpty ? "Pass model" : "\(model) is not a model \(name) offers")
+                    + ". It takes one of: \(offered.joined(separator: ", ")).",
+                extra: ["argument_path": .string("args.model")]))
+        }
+        return nil
+    }
+
+    /// A provider verb's one switch: the accounts read now, the account `provider` names and what it sets there (the lookups) throw the
+    /// owner's refusal, or the verb's effect comes back to run. The gate's check before any card and the run make the same lookups.
     @MainActor
-    public static func runQuietProvider(
+    public static func prepareQuietProvider(
         verb: String, input: [String: JSONValue], dataRoot: URL, turn: Turn,
-        refresh: () async -> (accounts: [ProviderInfo], failure: String?),
-        cancelRefresh: () async -> String,
+        refresh: @escaping () async -> (accounts: [ProviderInfo], failure: String?),
+        cancelRefresh: @escaping () async -> String,
         list: () async throws -> [ProviderInfo],
-        test: (String) async throws -> NativeAgentShared.ProviderTestResult,
+        test: @escaping (String) async throws -> NativeAgentShared.ProviderTestResult,
         authMode: (ProviderInfo) -> (canSave: Bool, selectedMode: String),
-        configure: (String, String, String) async throws -> Void,
-        reload: () async -> Void,
-        disconnect: (String) async -> (ok: Bool, detail: String)
-    ) async -> JSONValue {
+        configure: @escaping (String, String, String) async throws -> Void,
+        reload: @escaping () async -> Void,
+        disconnect: @escaping (String) async -> (ok: Bool, detail: String)
+    ) async throws -> @MainActor () async -> JSONValue {
         let retry = " Try again; read \(AppToolExecutor.doorDoctor) if it keeps failing."
         if verb == "cancel_refresh" {
-            return .object(["status": .string("ok"), "detail": .string(await cancelRefresh())])
+            return { .object(["status": .string("ok"), "detail": .string(await cancelRefresh())]) }
         }
         if verb == "refresh_models" {
-            let refreshed = await refresh()
-            if let detail = refreshed.failure {
-                // Each account's own result stays readable: its row's models_note is the text beside its list (why it is the floor, or when it was fetched).
-                guard !refreshed.accounts.isEmpty else {
-                    return AppToolExecutor.failure("refresh_failed", "The model lists did not refresh: \(detail)." + retry,
-                        extra: ["effects": .string("unknown")])
+            return {
+                let refreshed = await refresh()
+                if let detail = refreshed.failure {
+                    // Each account's own result stays readable: its row's models_note is the text beside its list (why it is the
+                    // floor, or when it was fetched).
+                    guard !refreshed.accounts.isEmpty else {
+                        return AppToolExecutor.failure("refresh_failed", "The model lists did not refresh: \(detail)." + retry,
+                            extra: ["effects": .string("unknown")])
+                    }
+                    await reload()
+                    return AppToolExecutor.failure("refresh_failed", "Not every model list refreshed. \(detail)." + retry,
+                        extra: ["effects": .string("known"), "accounts": .array(refreshed.accounts.map { Self.quietProviderRow($0) })])
                 }
                 await reload()
-                return AppToolExecutor.failure("refresh_failed", "Not every model list refreshed. \(detail)." + retry,
-                    extra: ["effects": .string("known"), "accounts": .array(refreshed.accounts.map { quietProviderRow($0) })])
+                // The answer names each connected account and how many models its provider now lists.
+                let asked = refreshed.accounts.filter { $0.auth_status.eligible }.map { "\($0.display_name) \($0.offeredModels.count)" }
+                let listed = asked.isEmpty ? "No account is connected, so no provider was asked."
+                    : "Refreshed. Connected accounts now list: " + asked.joined(separator: ", ") + "."
+                return .object([
+                    "status": .string("ok"),
+                    "detail": .string(listed),
+                    "accounts": .array(refreshed.accounts.map { Self.quietProviderRow($0) }),
+                ])
             }
-            await reload()
-            // The answer names each connected account and how many models its provider now lists.
-            let asked = refreshed.accounts.filter { $0.auth_status.eligible }.map { "\($0.display_name) \($0.offeredModels.count)" }
-            let listed = asked.isEmpty ? "No account is connected, so no provider was asked."
-                : "Refreshed. Connected accounts now list: " + asked.joined(separator: ", ") + "."
-            return .object([
-                "status": .string("ok"),
-                "detail": .string(listed),
-                "accounts": .array(refreshed.accounts.map { quietProviderRow($0) }),
-            ])
         }
         let accounts: [ProviderInfo]
         do { accounts = try await list() } catch {
-            return AppToolExecutor.failure("providers_unreadable", "The accounts didn't read (\(error.localizedDescription))." + retry)
+            throw QuietArgumentRefusal(AppToolExecutor.failure("providers_unreadable", "The accounts didn't read (\(error.localizedDescription))." + retry))
         }
         if verb == "list" {
-            return .object(["status": .string("ok"), "accounts": .array(accounts.map { quietProviderRow($0) })])
+            return { .object(["status": .string("ok"), "accounts": .array(accounts.map { Self.quietProviderRow($0) })]) }
         }
-        let id = input["provider"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard let account = accounts.first(where: { $0.provider_id == id }) else {
-            return AppToolExecutor.failure(
-                "unknown_provider",
-                (id.isEmpty ? "Pass provider" : "No account has id \(id)") + ". app {page:\"providers\"} lists them.",
-                extra: ["providers": .array(accounts.map { .string($0.provider_id) })])
-        }
+        let account = try quietProviderAccount(input, in: accounts).get()
+        let id = account.provider_id
         let name = account.display_name
         switch verb {
         case "test":
-            let result: NativeAgentShared.ProviderTestResult
-            do { result = try await test(id) } catch {
-                return AppToolExecutor.failure("test_failed", "The test of \(name) could not run: \(error.localizedDescription)." + retry,
-                    extra: ["effects": .string("unknown")])
-            }
-            let works = result.tested && result.status == "ok"
-            let problem = NativeAppSecretRedactor.redactText(result.error ?? result.detail ?? result.status)
-            let detail = works
-                ? "\(name) works: it answered\(result.model_used.map { " on \($0)" } ?? "")."
-                : result.tested
-                    ? "\(name) did not work: \(problem). A rejected key or expired sign-in is the owner's to fix: ask them to reconnect \(name) in Providers."
-                    : "\(name) has no connection test, so nothing was checked. \(result.detail ?? "")"
-            var body: [String: JSONValue] = [
-                "status": .string("ok"), "provider": .string(id), "tested": .bool(result.tested),
-                // Untested is unknown, not broken.
-                "works": result.tested ? .bool(works) : .null, "detail": .string(detail),
-            ]
-            if let model = result.model_used { body["model_used"] = .string(model) }
-            return .object(body)
-        case "set_default_model":
-            guard account.auth_status.eligible else {
-                return AppToolExecutor.failure(
-                    "not_connected",
-                    "\(name) is not connected, so it has no fallback model to set. Connecting it is the owner's: ask them to sign in on Providers.")
-            }
-            // A model choice: offered, or the default already saved here (`ModelSlot.mayHold`).
-            let offered = account.offeredModels.map(\.id)
-            let model = input["model"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let row = account.models.first { $0.id == model }
-            guard ModelSlot.mayHold(model, row: row, savedInSlot: account.default_model) else {
-                if offered.isEmpty || row != nil {
-                    return AppToolExecutor.failure("no_model_list",
-                        ModelSlot.refusal(note: account.models_note, accountName: name) + " Run provider.refresh, then try again.")
+            return {
+                let result: NativeAgentShared.ProviderTestResult
+                do { result = try await test(id) } catch {
+                    return AppToolExecutor.failure("test_failed", "The test of \(name) could not run: \(error.localizedDescription)." + retry,
+                        extra: ["effects": .string("unknown")])
                 }
-                return AppToolExecutor.failure(
-                    "bad_model",
-                    (model.isEmpty ? "Pass model" : "\(model) is not a model \(name) offers")
-                        + ". It takes one of: \(offered.joined(separator: ", ")).")
+                let works = result.tested && result.status == "ok"
+                let problem = NativeAppSecretRedactor.redactText(result.error ?? result.detail ?? result.status)
+                let detail = works
+                    ? "\(name) works: it answered\(result.model_used.map { " on \($0)" } ?? "")."
+                    : result.tested
+                        ? "\(name) did not work: \(problem). A rejected key or expired sign-in is the owner's to fix: "
+                            + "ask them to reconnect \(name) in Providers."
+                        : "\(name) has no connection test, so nothing was checked. \(result.detail ?? "")"
+                var body: [String: JSONValue] = [
+                    "status": .string("ok"), "provider": .string(id), "tested": .bool(result.tested),
+                    // Untested is unknown, not broken.
+                    "works": result.tested ? .bool(works) : .null, "detail": .string(detail),
+                ]
+                if let model = result.model_used { body["model_used"] = .string(model) }
+                return .object(body)
             }
+        case "set_default_model":
+            if let refusal = quietFallbackModelRefusal(account, input) { throw refusal }
+            let model = input["model"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             // Preserve the sheet’s saved sign-in method.
             let mode = authMode(account)
             guard mode.canSave else {
-                return AppToolExecutor.failure(
+                throw QuietArgumentRefusal(AppToolExecutor.failure(
                     "sign_in_method_unclear",
                     """
                         \(name)'s saved sign-in method isn't one its sheet can keep, so nothing was changed. That's the owner's: ask them to open \(name) in \
                         Providers.
-                        """)
+                        """))
             }
             let old = account.default_model ?? ""
-            do {
-                try await configure(id, mode.selectedMode, model)
-            } catch {
-                return AppToolExecutor.failure("save_failed", "\(name)'s fallback model was not saved: \(error.localizedDescription)." + retry,
-                    extra: ["effects": .string("unknown")])
+            return {
+                do {
+                    try await configure(id, mode.selectedMode, model)
+                } catch {
+                    return AppToolExecutor.failure("save_failed", "\(name)'s fallback model was not saved: \(error.localizedDescription)." + retry,
+                        extra: ["effects": .string("unknown")])
+                }
+                await reload()
+                return .object([
+                    "status": .string("ok"), "provider": .string(id), "changed": .bool(old != model),
+                    "old_value": .string(old), "new_value": .string(model),
+                    "detail": .string("\(name) now falls back to \(model) wherever no other model is chosen for it."),
+                ])
             }
-            await reload()
-            return .object([
-                "status": .string("ok"), "provider": .string(id), "changed": .bool(old != model),
-                "old_value": .string(old), "new_value": .string(model),
-                "detail": .string("\(name) now falls back to \(model) wherever no other model is chosen for it."),
-            ])
         case "disconnect":
-            // Credential removal requires Full Mac at this door.
-            let outcome = await disconnect(id)
-            guard outcome.ok else {
-                return AppToolExecutor.failure("disconnect_failed",
-                    "\(outcome.detail) app {page:\"providers\"} shows where \(name) stands.",
-                    extra: ["provider": .string(id), "effects": .string("unknown")])
+            return {
+                // Credential removal requires Full Mac at this door.
+                let outcome = await disconnect(id)
+                guard outcome.ok else {
+                    return AppToolExecutor.failure("disconnect_failed",
+                        "\(outcome.detail) app {page:\"providers\"} shows where \(name) stands.",
+                        extra: ["provider": .string(id), "effects": .string("unknown")])
+                }
+                BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "provider.disconnect \(id)",
+                                       sessionID: input["__session_id"]?.scalarText,
+                                       dataRoot: dataRoot)
+                return .object(["status": .string("ok"), "provider": .string(id), "changed": .bool(true),
+                                "detail": .string("\(name) is disconnected. \(outcome.detail) Signing back in is the owner's.")])
             }
-            BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "provider.disconnect \(id)",
-                                   sessionID: input["__session_id"]?.scalarText,
-                                   dataRoot: dataRoot)
-            return .object(["status": .string("ok"), "provider": .string(id), "changed": .bool(true),
-                            "detail": .string("\(name) is disconnected. \(outcome.detail) Signing back in is the owner's.")])
         default:
-            return AppToolExecutor.failure("unknown_verb", "No provider verb is called \(verb).")
+            throw QuietArgumentRefusal(AppToolExecutor.failure("unknown_verb", "No provider verb is called \(verb)."))
         }
     }
 

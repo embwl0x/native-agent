@@ -75,10 +75,27 @@ public final class PersonAct: @unchecked Sendable {
 
 private enum PersonActPart: TurnPart { static let unset: PersonAct? = nil }
 
+/// The card (or approval) whose answer a call runs on: its receipt names it as the cause. The replay of an answered card carries it in; the
+/// gate fills it when the person approves a call while it waits, and the dispatch tracer writes it on that call's receipt.
+public final class CardCause: @unchecked Sendable {
+    private let lock = NSLock()
+    private var id: String?
+    public init(_ id: String? = nil) { self.id = id }
+    public var card: String? { lock.withLock { id } }
+    public func approved(by card: String) { lock.withLock { id = card } }
+}
+
+private enum CardCausePart: TurnPart { static let unset: CardCause? = nil }
+
 extension Turn {
     /// The person's own decision of one exact call this turn makes (see `PersonAct`).
     public var personAct: PersonAct? {
         get { self[PersonActPart.self] }
         set { self[PersonActPart.self] = newValue }
+    }
+    /// The card this turn's call runs on (see `CardCause`).
+    public var cardCause: CardCause? {
+        get { self[CardCausePart.self] }
+        set { self[CardCausePart.self] = newValue }
     }
 }

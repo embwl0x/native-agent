@@ -92,7 +92,7 @@ enum NativeAgentMCPWire {
                 return failure(id, code: -32602, message: "Tool name and arguments are required.")
             }
             if name == "agent_message" {
-                guard Set(args.keys).isSubset(of: ["text", "session_id", "request_id", "wait_seconds"]),
+                guard Set(args.keys).isSubset(of: ["text", "session_id", "request_id", "wait_seconds", "reply_to"]),
                       let text = args["text"] as? String,
                       !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                       text.utf8.count <= 64000 else {
@@ -124,7 +124,13 @@ enum NativeAgentMCPWire {
                 else if let number = rawToken as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
                         number.stringValue == String(number.int64Value) { token = .number(number.int64Value) }
                 // wait_seconds stays OUT of the message body: that body is the replay digest, and waiting longer is not different content.
-                let message: [String: Any] = ["text": text, "sessionId": session, "request_id": request]
+                var message: [String: Any] = ["text": text, "sessionId": session, "request_id": request]
+                if let supplied = args["reply_to"] {
+                    guard let named = supplied as? String, exactUUID(named) else {
+                        return failure(id, code: -32602, message: "reply_to is the reply_to of a held message you were given.")
+                    }
+                    message["reply_to"] = named
+                }
                 guard let data = try? JSONSerialization.data(withJSONObject: message, options: .sortedKeys) else {
                     return failure(id, code: -32603, message: "Could not encode message.")
                 }
@@ -374,10 +380,12 @@ enum NativeAgentMCPWire {
     static var heldNote: String {
         """
             Every agent_message, agent_reply and agent_desk result may also carry held_messages: what \(PeerFacingIdentity.agentName) wrote to \
-            you since your last call, oldest first, each {at, text, conversation_id, conversation_name}, with held_remaining saying how many \
+            you since your last call, oldest first, each {at, text, conversation_id, conversation_name, and reply_to when it awaits your answer}, \
+            with held_remaining saying how many \
             more wait for your next call. Messages in your own conversation come only to you; one from a conversation whose caller has ended \
             comes to whoever calls next, named by its conversation_name. They are delivered by being returned there and nowhere else, so read them \
-            every time; answer one with agent_message, session_id set to its conversation_id.
+            every time; answer one with agent_message, session_id set to its conversation_id and reply_to set to its reply_to. Only a message \
+            carrying its reply_to is its answer, and only the first one.
             """
     }
 
@@ -397,6 +405,10 @@ enum NativeAgentMCPWire {
                         Optional. Omit it to go on in your own conversation with \(agent); set it to a held message's conversation_id to answer \
                         in that conversation.
                         """],
+                "reply_to": ["type": "string", "description": """
+                    Optional. A held message's reply_to: this message is that message's answer (the first one that names it). Without it, a \
+                    message answers nothing.
+                    """],
                 "request_id": ["type": "string", "description": """
                     Required canonical UUID you generate. It is this message's replay key: a retry of the SAME message must carry the same \
                     request_id, and new content needs a new one. Never resend solely because a reply is missing.

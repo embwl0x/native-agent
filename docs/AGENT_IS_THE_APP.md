@@ -142,6 +142,14 @@ The stem has no features and no opinions. Every feature NativeAgent has today is
 
 - **Growth:** what they works out by hand repeatedly, they keeps, and what their mind only repeated, their part carries, inside the same turn. After each tool round the native stem meets the turn's hand work (ordered tool/action ids of landed writes or irreversible non-ability calls, or one call with the same input 3 rounds in a row), without arguments or incidental reads, as a `practice: ` line through `FamiliarLines` in `mind/familiar.bin`. Its first meeting is only recorded; a later meeting, unless an active ability's current recorded route already covers those ids in order, rides their next `model.call` in that turn as its note, once a turn ([Habits H3](HABITS.md#h3--keep-what-repeats-not-what-happened-once)). Keeping the route with `ability.save`, revising the part they worked around or looped, or keeping nothing is one of their acts in the work. There is no private call after the reply. Familiarity uses the existing bounded line record. Under Full Mac a newly kept part is live at once; its first real run is its proof.
 - **Their hands report what they did:** an act checks its own effect and returns the screen after it, and a verb that waits on a surface or puts one in front returns that surface as it now reads, through the reader the surface already has (a Chrome wait its page, a direct menu press its screen, `page.show` the page it shows), so their mind looks again only when a step did not happen or it needs what the act did not show, and the steps it can already see go in one act (mac.act steps, each checked against the screen the last one left).
+- **The window shows where the agent's attention is:** each call that worked, every step of a batch or a script included, names its place
+  from its own declaration, the action's page and the thing its declared subject names there (`AppActionBinding.faceLink`, on the call's
+  trace end). The turn's last such place becomes its attention when the model next speaks, so the record (`TurnFace.nowOn`, one per running
+  turn, any door's turn the conversation shows) moves at most once a model round. The window follows it quietly, never brought to the
+  front, once per place a turn (`FaceFollows`). The person outranks it: a place, tab or page the person picks, or typing in the composer
+  or an ask bar, keeps the window where the person has it for the rest of that turn, and a move already on its way lands nowhere; a turn
+  that began in Chat, with the window never taken, ends back in Chat. "The window follows me" in Settings (on by default) is the switch,
+  for the person or the agent.
 - **Effort is felt:** the stem measures what each turn took (model rounds, tokens, minutes, the longest stretch of one call repeated). Their after-turn mind reads it as one line beside the exchange, so a slog or a breeze moves a care about their craft the way a lost game does; their parts' records keep the rounds per use; the practice note names a looped call's stretch.
 - **Craft:** they sees their body: each turn starts with their own parts in front of them, each with how often they have used it, best match for the message first, so they reaches for the part instead of redoing its work.
 - **Noticing:** what nobody asked about is worth what it touches of the agent's cares; the seed gives a line below the chance bar zero worth.
@@ -431,7 +439,8 @@ mind. [Agent communication](agent-communication.md#jobs) owns the socket's contr
   the conversation that started the work (`MindStream.returnTo`); the rest open a thought in the agent's mind stream (`MindStream.think`).
 - **The rest is weighed by the agent.** A `world` happening (what nobody asked about) or a `self` happening (a care of the agent's moving) is given
   to `weigh(h, felt)` in the agent's installed turn program, run on CPU. Its worth lands as `drive` on the touched care's anchor node, or on the
-  happening's own subject; drive fades on that node's half-life, is never clamped or spread, and at one ignites a thought that drains it. Ignition is
+  happening's own subject (a watch's news, door `sense:<watch>`, always on its own subject, worth at least one); drive fades on that node's half-life, is never
+  clamped or spread, and at one ignites a thought that drains it. Ignition is
   checked when worth lands, when admission opens and on waking: no tick, no timer. The attention runtime holds one batch's admission across
   weighing, landing at one field clock reading, recording, claiming and handing on the thought. The field application and unfinished
   weigh rows checkpoint together in cognition; restart settles those rows idempotently before weighing or ignition.

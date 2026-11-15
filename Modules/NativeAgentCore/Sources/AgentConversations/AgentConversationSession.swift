@@ -457,7 +457,7 @@ package enum AgentConversationSession {
         defer { if watching { running.unwatch(row.id) } }
         func releaseWait(_ original: JSONValue) async throws -> AgentConversationRecord {
             do { return try store.update(id: row.id, operationID: row.operationID, touch: false) {
-                if $0.phase != "waiting", $0.phase != "sending", !heldReplyPending($0) {
+                if $0.phase != "waiting", $0.phase != "sending", !heldReplyPending($0, dataRoot: dataRoot) {
                     $0.shownInline = $0.operationID + ":" + $0.phase
                     $0.automaticRead = false; $0.nextReadAt = nil
                     if $0.deliveryState == "delivering" { $0.deliveryState = nil }
@@ -510,7 +510,11 @@ package enum AgentConversationSession {
             let current: AgentConversationRecord
             if watching {
                 try await waitInline(row: row, store: store, until: deadline)
+                // A held send's answer this wait returns reaches the turn in its tool result, said while it still watches; the news takes any it
+                // does not.
+                store.held.carry(row.operationID)
                 current = try await releaseWait(.object(running))
+                HeldSends.publish(dataRoot: dataRoot)
             }
             else { current = shown }
             return messageReceipt(AgentConversationView.compact(AgentConversationView.view(current, details: false, dataRoot: dataRoot,
@@ -527,8 +531,10 @@ package enum AgentConversationSession {
             throw await oweSettlement(error, stage: "read inline reply", original: receipt,
                 row: row, store: store, dataRoot: dataRoot)
         }
+        store.held.carry(row.operationID)
         // Release the watch under the same store lock as settlement. A reply either belongs to this receipt or sees no watch and delivers later.
         let current = try await releaseWait(receipt)
+        HeldSends.publish(dataRoot: dataRoot)
         return messageReceipt(AgentConversationView.compact(AgentConversationView.view(current, details: false, dataRoot: dataRoot,
             includeHistory: false), row: current), live: liveReply)
     }
@@ -552,11 +558,17 @@ package enum AgentConversationSession {
         return .object(fields)
     }
 
-    /// A held send stays available to every contact door while its sender awaits the inbound reply. Delivery alone does not end that wait.
-    package static func heldReplyPending(_ row: AgentConversationRecord) -> Bool {
-        guard row.phase == "ready", row.awaitsReply, case .object(let receipt)? = row.receipt,
-              ["held", "delivering", "delivered"].contains(string(receipt["status"]) ?? "") else { return false }
-        return row.exchanges?.last(where: { $0.id == row.operationID })?.reply == nil
+    /// The row's current send is held for a contact that collects its messages and awaits its answer: it has a record (`HeldSends`).
+    package static func heldSend(_ row: AgentConversationRecord) -> Bool {
+        guard row.agent.hasPrefix("peer:"), row.phase == "ready", row.awaitsReply, case .object(let receipt)? = row.receipt else { return false }
+        return ["held", "delivering", "delivered"].contains(string(receipt["status"]) ?? "")
+    }
+
+    /// A held send stays owed while its record says so: delivery does not end the wait, and neither does a record that cannot be read. Only
+    /// its answer or the agent's withdrawal does. Every wait on it reads this.
+    package static func heldReplyPending(_ row: AgentConversationRecord, dataRoot: URL) -> Bool {
+        heldSend(row) && row.exchanges?.last(where: { $0.id == row.operationID })?.reply == nil
+            && HeldSends(dataRoot: dataRoot).read(row.operationID).owed
     }
 
     /// The caller's requested duration bounds observation; only the send owner settles execution.
@@ -567,7 +579,7 @@ package enum AgentConversationSession {
                 let seen = running.seen
                 guard let current = try store.records().first(where: { $0.id == row.id }),
                       current.operationID == row.operationID,
-                      current.phase == "sending" || current.phase == "waiting" || heldReplyPending(current),
+                      current.phase == "sending" || current.phase == "waiting" || heldReplyPending(current, dataRoot: store.held.dataRoot),
                       Date() < deadline else { return }
                 await running.change(after: seen, until: deadline)
             }

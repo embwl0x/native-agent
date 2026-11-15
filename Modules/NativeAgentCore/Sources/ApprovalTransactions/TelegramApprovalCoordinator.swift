@@ -378,9 +378,9 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         } catch { return .failure(error) }
     }
 
-    public func settleChatCard(chatId: Int, messageId: Int, text: String) async throws {
+    public func settleChatCard(chatId: Int, messageId: Int, text: String, keyboard: [JSONValue] = []) async throws {
         try await TelegramPollLoop.defaultEditMessageTextWithReplyMarkup(
-            token, chatId, messageId, text, .object(["inline_keyboard": .array([])]))
+            token, chatId, messageId, text, .object(["inline_keyboard": .array(keyboard)]))
     }
 
     public func fileApprovalRequest(

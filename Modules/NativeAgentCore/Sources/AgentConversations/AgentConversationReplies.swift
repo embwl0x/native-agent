@@ -117,22 +117,15 @@ extension AgentConversationStore {
         }
     }
 
-    /// Claim replies by exact send, or the sole delivered held send in the named conversation. The draining call cannot answer its still-delivering exchange.
-    /// Claim and deadline release share one lock.
-    public func offerBridgeReplyToInlineWait(agent: String, messageID: String? = nil,
-                                             conversationID: String? = nil, text: String,
+    /// Claim a bridge reply by the exact send it names; a message that names none answers nothing. Claim and deadline release share one lock.
+    public func offerBridgeReplyToInlineWait(agent: String, messageID: String, text: String,
                                              from: String, steeredBy: [String]) throws -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         let identity = try AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
         return try locked {
             var rows = try load()
-            let matches = rows.indices.filter { index in
-                let row = rows[index]
-                guard identity.canonical(row.agent) == identity.canonical(agent) else { return false }
-                if let messageID { return row.readInput?["message_id"] == .string(messageID) }
-                return conversationID != nil && row.conversationID == conversationID
-                    && AgentConversationSession.heldReplyPending(row)
-                    && row.exchanges?.last(where: { $0.id == row.operationID })?.status == "delivered"
+            let matches = rows.indices.filter {
+                identity.canonical(rows[$0].agent) == identity.canonical(agent) && rows[$0].readInput?["message_id"] == .string(messageID)
             }
             guard matches.count == 1, let index = matches.first else { return false }
             let before = rows[index]
@@ -142,7 +135,7 @@ extension AgentConversationStore {
                 return true
             }
             guard AgentConversationRunning.shared.watched(before.id),
-                  before.phase == "waiting" || AgentConversationSession.heldReplyPending(before) else { return false }
+                  before.phase == "waiting" else { return false }
             try answer(&rows[index], text: text, from: from, steeredBy: steeredBy)
             rows[index].shownInline = before.operationID + ":ready"
             rows[index].deliveryState = nil
@@ -208,7 +201,9 @@ extension AgentConversationStore {
             row.updatedAt = Date()
             row.lifeID = life
             row.peerRouteFingerprint = Self.routeFingerprint(peer)
-            row.receipt = .object(["status": .string("held"), "conversation_id": .string(conversation), "delivered": .bool(false)])
+            // Held is a delivery on its way: it goes out in the contact's next call. Never a bare "delivered: false" that reads as failed.
+            row.receipt = .object(["status": .string("held"), "conversation_id": .string(conversation),
+                "detail": .string("Held for \(peer.name): it goes out in the result of \(peer.name)'s next call. Do not resend.")])
             rows.append(row)
             try save(rows)
         }
@@ -258,6 +253,8 @@ extension AgentConversationStore {
         public let conversation: String?
         /// The conversation's name: its record's label, the same for every send in that conversation.
         public let name: String
+        /// The send's id when it awaits the contact's answer (it has a record): the message carrying it as its reply_to is that answer.
+        public let replyTo: String?
     }
 
     /// Claim the held messages this caller (`caller`, the conversation it calls in) reaches, oldest-first, in one serialized write so concurrent
@@ -285,8 +282,9 @@ extension AgentConversationStore {
             guard !pending.isEmpty else { return ([], 0) }
             let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
             let lines = try ContactThread.lines(dataRoot: root, owner: String(agent.dropFirst(5)))
+            // A message the agent withdrew is not handed out.
             let all = try pending.flatMap { row in
-                try (row.exchanges ?? []).filter(waiting).map { exchange in
+                try (row.exchanges ?? []).filter { waiting($0) && self.held.read($0.id).withdrawn == nil }.map { exchange in
                     let messages = lines.filter { $0.sendID == exchange.id && $0.mine }
                     guard messages.count == 1, let message = messages.first else {
                         throw Failure(message: """
@@ -294,8 +292,12 @@ extension AgentConversationStore {
                             drained.
                             """)
                     }
+                    // A send awaiting its answer carries its reply_to, by its record or, when the record is lost, by its row: a lost record is
+                    // still owed, and the answer naming it is refused until it is repaired, never taken as ordinary work.
+                    let recorded = self.held.file(exchange.id).map { FileManager.default.fileExists(atPath: $0.path) } == true
+                    let replyTo = recorded || row.awaitsReply ? exchange.id : nil
                     return Held(row: row.id, exchange: exchange.id, at: exchange.sentAt,
-                        text: try Self.heldText(message), conversation: row.conversationID, name: row.label)
+                        text: try Self.heldText(message), conversation: row.conversationID, name: row.label, replyTo: replyTo)
                 }
             }.sorted { $0.at < $1.at }
             var taken: [Held] = []
@@ -408,21 +410,6 @@ extension AgentConversationStore {
             edited = true
         }
         return edited
-    }
-
-    public func waitingMessage(agent: String, conversationID: String) throws -> String? {
-        let identity = try AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
-        return try records().filter { identity.canonical($0.agent) == identity.canonical(agent) && $0.phase == "waiting"
-            && $0.conversationID == conversationID }
-            .map { row -> (row: AgentConversationRecord, started: Date) in
-                guard let started = row.operationStartedAt else {
-                    throw Failure(
-                        message: "Conversation \(row.id) has no operation start time; repair its retained evidence before selecting a waiting message.")
-                }
-                return (row, started)
-            }
-            .max { $0.started < $1.started }
-            .flatMap { if case .string(let id)? = $0.row.readInput?["message_id"], !id.isEmpty { id } else { nil } }
     }
 
     /// An unsolicited bridge answer settles only the exact accepted message it names. Avoid copying an answer already in the contact’s session; preserve its

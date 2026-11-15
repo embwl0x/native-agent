@@ -422,8 +422,9 @@ public struct PartFace: Codable, Sendable, Equatable {
             try fields.encode(wireRows, forKey: .rows)
         }
 
-        /// The section as one of the person's doors draws it: each row keeps the actions that run from that door, and a row that was only
-        /// actions for other doors (no link, no control) is not drawn there.
+        /// The section as one of the person's doors draws it: an answer that runs from another door stays, greyed with where it runs
+        /// ("Runs on your Mac"), so the ask never vanishes there; housekeeping for another door is not drawn, and a row left with nothing
+        /// (no action, link or control) is not drawn there.
         public func drawn(on door: String) -> Section {
             func draw(_ row: Row) -> Row? {
                 var drawn = row
@@ -432,7 +433,12 @@ public struct PartFace: Codable, Sendable, Equatable {
                 if row.rows?.isEmpty == false, drawn.rows?.isEmpty == true, row.actions == nil, row.open == nil, row.control == nil,
                    row.expands != true { return nil }
                 if let actions = row.actions, actions.contains(where: { !$0.runs(from: door) }) {
-                    let kept = actions.filter { $0.runs(from: door) }
+                    let kept = actions.compactMap { action -> Action? in
+                        if action.runs(from: door) { return action }
+                        guard action.aside != true, let doors = action.doorWords else { return nil }
+                        return Action(id: action.id, label: action.label, role: action.role, doors: action.doors, call: action.call,
+                                      open: action.open, unavailable: action.unavailable ?? "Runs on your " + doors, aside: action.aside)
+                    }
                     if kept.isEmpty, row.open == nil, row.control == nil, drawn.rows?.isEmpty != false, row.expands != true { return nil }
                     drawn.actions = kept
                 }

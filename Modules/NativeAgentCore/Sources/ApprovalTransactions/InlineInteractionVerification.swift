@@ -77,8 +77,11 @@ extension InlineInteractionResolver {
         else { return current.state.isTerminal }
         if let expectedRevision, current.revision != expectedRevision { return true }
         guard !Task.isCancelled else { return false }
+        let picked = selection ?? current.target
+        // Every door's check comes here: a model card read back at the group's model as it was raised was not answered.
+        if current.kind == .modelChoice, let baseline = current.modelAtStart, picked == baseline { return false }
         guard case .success(let outcome) = await verify(
-            current, selection: selection ?? current.target, scope: scope, dataRoot: dataRoot, checkMail: checkMail
+            current, selection: picked, scope: scope, dataRoot: dataRoot, checkMail: checkMail
         ) else { return false }
         do {
             return try await finish(current, verification: .success(outcome), sessionID: sessionID,

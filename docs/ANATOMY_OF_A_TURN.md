@@ -123,6 +123,7 @@ projects its saved tool receipts alone, with input still owned by the checkpoint
 Only an explicit hidden
 declaration permits this; an absent visible row remains a transcript fault. In an agent
 conversation with no open turn, its answer row becomes the contact's send row
+(a card's continue-turn included: the turn writes its answer once, and holding binds that row, never a second)
 and the conversation store holds its exchange for the contact's next door call.
 The `agent-held` reply route keeps this settlement out of person-result notices;
 completion records `completed` / `held_for_contact` after that handoff, while
@@ -206,7 +207,10 @@ it runs as its own hidden turn with the card's origin. A card raised from any ot
 door (a contact's conversation, the phone, a chat service) continues the same
 way through that door, with the card's turn as its authority (origin envelope,
 file-access ceiling, request-only model binding, steering); in a contact's
-conversation its answer is held for the contact's next call. Domain approvals without a
+conversation its answer is held for the contact's next call. The door is the one
+the card's recorded route names (a contact calling in through `chat` still answers
+to its caller's result), so a card answered after its caller stopped waiting
+continues there too; a start that cannot be admitted says why on the card. Domain approvals without a
 request envelope execute their bounded approved effect as a local approval
 act; the resolving door records who decided, never the effect's authority.
 Chat approval replay likewise installs the verified card's exact origin on

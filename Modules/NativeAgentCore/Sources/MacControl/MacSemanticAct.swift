@@ -15,6 +15,35 @@ import CoreText
 import ScreenCaptureKit
 // Blueprint: | `MacSemanticAct.swift` | `MacFourVerbs.actOnce`: Fresh-name transactions preserve key intent, focus typing and current-content scroll |
 extension MacFourVerbs {
+    /// The act's refusals that mean the screen changed under its sighting before anything was attempted.
+    static let changedBeforeActing: Set<String> = ["ax_evidence_unavailable", "window_evidence_unavailable", "handle_drifted",
+        "frame_window_gone", MacAccessibilityActuator.pathNotFoundError]
+
+    /// A second look stays inside the exact window its step first sighted: the same process, the same AX window, and the same document where AX
+    /// names one. Anywhere else it refuses untouched; it never looks for its subject in another window or app.
+    static func outsideSightedWindow(_ first: MacAXWindowIdentity, _ sighting: Sighting, target: String) -> MacFourVerbsReply? {
+        guard let now = sighting.window, now.pid == first.pid, let native = first.nativeWindow, now.nativeWindow == native
+        else {
+            if first.closed == true { return sightedWindowClosed(target, screen: "\n" + sighting.render) }
+            return MacFourVerbsReply(ok: false,
+                text: "The screen changed before I could act, and the window I first found \"\(target)\" in is no longer the one I can see. "
+                    + "I haven't touched anything.\n" + sighting.render,
+                detail: ["error": .string("sighted_window_changed"), "target": .string(target), "effects": .string("none")])
+        }
+        // Unrecorded on both sides is the same; a document on one side only, or a different one, is a changed window.
+        guard now.document == first.document else {
+            return MacFourVerbsReply(ok: false,
+                text: "The screen changed before I could act, and the window I first found \"\(target)\" in now shows another document. "
+                    + "I haven't touched anything.\n" + sighting.render,
+                detail: ["error": .string("sighted_window_changed"), "target": .string(target), "effects": .string("none")])
+        }
+        return nil
+    }
+    static func sightedWindowClosed(_ target: String, screen: String) -> MacFourVerbsReply {
+        MacFourVerbsReply(ok: false, text: "The window I first found \"\(target)\" in has closed, so I haven't touched anything." + screen,
+            detail: ["error": .string("sighted_window_closed"), "target": .string(target), "effects": .string("none")])
+    }
+
     func actOnce(
         verb rawVerb: String,
         target: String,
@@ -39,6 +68,9 @@ extension MacFourVerbs {
         menus: Bool = true,
         /// Pin recovery to the first sighting; delivered-image points go through the hand.
         place: MacImagePlace? = nil,
+        /// The subject this act first resolved and the exact window it was sighted in, when it is looking again after the screen changed under
+        /// that sighting: the second look acts only on that same subject, inside that same window.
+        firstSighted: (label: String, kind: String, window: MacAXWindowIdentity)? = nil,
         turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
         let rawButton = Self.isRightClick(rawVerb) ? "right" : rawButton
@@ -227,6 +259,7 @@ extension MacFourVerbs {
                 detail: ["error": .string(sighting.pid != expect.pid ? "owner_changed_apps" : "front_window_changed")]
             )
         }
+        if let first = firstSighted, let outside = Self.outsideSightedWindow(first.window, sighting, target: target) { return outside }
         // Explicit menu paths need no fuzzy control discovery.
         if Self.isMenuPath(target),
            let menu = await menuCommandReply(target, verb: verb, app: app, seen: sighting, turn: turn, context: context) {
@@ -270,6 +303,8 @@ extension MacFourVerbs {
                 }
             }
         }
+        // Motion samples read the screen again; a second look still resolves only in its first window.
+        if let first = firstSighted, let outside = Self.outsideSightedWindow(first.window, sighting, target: target) { return outside }
         // Use a remembered control only when fresh perception finds its kind and label at the stored path and it answers the name.
         var fromMemory = false
         if case .none = resolution, verb != .scroll {
@@ -292,7 +327,8 @@ extension MacFourVerbs {
         if unanswered, verb != .scroll, let bare = Self.bareField(target, in: sighting) {
             if let hit = bare.hit { resolution = .hit(hit); bareFieldHit = true } else { bareFields = bare.candidates }
         }
-        if mode == .replace, unanswered, verb == .type, let text, Self.typesAtFocus(target, in: sighting) {
+        // A second look types only into its re-resolved subject, never into whatever has focus now.
+        if mode == .replace, unanswered, verb == .type, let text, firstSighted == nil, Self.typesAtFocus(target, in: sighting) {
             if app != nil { return needsFront("typing where the keyboard focus is takes real keystrokes", screen: sighting.render) }
             let focused = sighting.targets.first { !$0.isSupplemental && $0.sourceAXPath == sighting.focusPath }
             return await typeKeystrokes(text, into: focused.map(Self.name) ?? "the focused element",
@@ -358,6 +394,13 @@ extension MacFourVerbs {
             )
 
         case .hit(let candidate):
+            // A second look acts only on the subject first resolved; a different one under the same name is refused untouched.
+            if let first = firstSighted, candidate.label != first.label || candidate.kind != first.kind {
+                return MacFourVerbsReply(ok: false,
+                    text: "The screen changed before I could act, and \"\(target)\" no longer names the \(first.kind) \"\(first.label)\" "
+                        + "I first found. I haven't touched anything.\n" + sighting.render,
+                    detail: ["error": .string("subject_changed"), "target": .string(target), "effects": .string("none")])
+            }
             // The resolved target must answer to the name before the act is admitted.
             if !candidate.regionOnly, !bareFieldHit, !(verb == .scroll && target.isEmpty), !Self.answers(target, candidate) {
                 let hint = menus ? await menuHint(target, verb: verb, app: app ?? sighting.appName, turn: turn, context: context) : MenuHint()
@@ -552,6 +595,20 @@ extension MacFourVerbs {
                 return Self.unknownActionReply(error, operation: "\(verb.rawValue) \(Self.name(candidate))", app: app ?? sighting.appName)
             }
             let output = Self.object(result.output)
+            // The screen changed between the sighting and the act (an element or window that went away, a handle that no longer names its
+            // control) and nothing was attempted: look again, once, and act only on the same subject by its identity, inside the exact window
+            // first sighted. A positional address (`button 2`, `row 3`) is never resolved again: after a reorder it can name another subject, so
+            // it keeps the refusal; so does a sighting that kept no window of its own.
+            if !result.ok, firstSighted == nil, output["performed"] == nil, Self.changedBeforeActing.contains(result.error ?? ""),
+               Self.mapName(target) != nil, let label = candidate.label, !label.isEmpty,
+               let window = sighting.window, window.nativeWindow != nil {
+                // Its window gone, the step refuses here and never looks in another window or app.
+                if window.closed == true { return Self.sightedWindowClosed(target, screen: "") }
+                return await actOnce(verb: rawVerb, target: target, text: text, mode: mode, to: destination, toApp: destinationApp,
+                    seconds: seconds, holding: holding, button: rawButton, scrollAmount: scrollAmount, attention: attention, app: app,
+                    expect: expect, carry: carry, commitFollows: commitFollows, menus: menus, place: place,
+                    firstSighted: (label, candidate.kind, window), turn: turn, context: context)
+            }
 
             guard result.ok else {
                 let mechanism = Self.string(output["status_note"]) ?? Self.string(output["guidance"]) ?? Self.string(output["detail"]) ?? Self.string(

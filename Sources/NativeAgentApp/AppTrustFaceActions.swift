@@ -34,19 +34,6 @@ extension AppQuietToolHost {
             case "trust_check_mail":
                 await appModel.engine.macIntegration.checkMail()
                 return (true, "Mail check finished; its current result is on Trust.", [:])
-            case "trust_ask_grant":
-                guard case .array(let listed)? = input["targets"] else { return (false, "Name the grants to ask for in targets; nothing was asked.", [:]) }
-                let targets = listed.compactMap(\.stringValue)
-                guard !targets.isEmpty, targets.count == listed.count else {
-                    return (false, "targets is a list of grant names like privacy:calendars; nothing was asked.", [:])
-                }
-                return try await askGrants(targets)
-            case "trust_grant_settings":
-                guard let target = input["target"]?.stringValue, let gate = SystemPermissionPreflight.cardSettingsCapability(target) else {
-                    return (false, "This names no macOS grant; nothing was opened.", [:])
-                }
-                if let failure = await SystemPermissionPreflight.openSettings(gate) { return (false, failure, [:]) }
-                return (true, "System Settings is open at \(gate.displayName). Opening it granted nothing.", [:])
             case "trust_test_notification":
                 guard try await appModel.macControlNotify(title: "NativeAgent", message: "Mac Control test") else {
                     return (false, "The notification was not confirmed sent.", [:])
@@ -65,13 +52,40 @@ extension AppQuietToolHost {
         } catch { return (false, error.localizedDescription, ["effects": .string("unknown")]) }
     }
 
+    /// The grants `trust.ask_grant` names: a list of grant names the permission card takes. Its run and the gate's check before any card
+    /// read it alike, so a call naming anything else is refused at once, with every target the card takes, and nothing is asked.
+    static func grantTargets(_ input: [String: JSONValue]) -> Result<[String], QuietArgumentRefusal> {
+        let accepted = SystemPermissionCapability.allCases.filter { $0 != .automation }.map { "privacy:" + $0.rawValue }
+            .joined(separator: ", ") + ", or applescript:<bundle id> for one app's Automation"
+        func refused(_ words: String) -> Result<[String], QuietArgumentRefusal> {
+            .failure(QuietArgumentRefusal(AppToolExecutor.failure("bad_grant", words + " Nothing was asked. targets takes \(accepted).",
+                extra: ["effects": .string("none"), "argument_path": .string("args.targets"), "accepted": .string(accepted)])))
+        }
+        guard case .array(let listed)? = input["targets"] else { return refused("Name the grants to ask for in targets.") }
+        let targets = listed.compactMap(\.stringValue)
+        guard !targets.isEmpty, targets.count == listed.count else { return refused("targets is a list of grant names.") }
+        if let unknown = targets.first(where: { SystemPermissionPreflight.cardSettingsCapability($0) == nil }) {
+            return refused("Unknown macOS grant \(unknown).")
+        }
+        return .success(targets)
+    }
+
+    /// The grant `trust.grant_settings` opens System Settings at, read alike by its run and the gate's check before any card.
+    static func grantSettingsTarget(_ input: [String: JSONValue]) -> Result<SystemPermissionCapability, QuietArgumentRefusal> {
+        let target = input["target"]?.stringValue ?? ""
+        guard let gate = SystemPermissionPreflight.cardSettingsCapability(target) else {
+            return .failure(QuietArgumentRefusal(AppToolExecutor.failure("bad_grant",
+                "\(target.isEmpty ? "No target was named" : target + " names no macOS grant"); nothing was opened. target takes a grant name like "
+                    + "privacy:calendars, or applescript:<bundle id> for one app's Automation.",
+                extra: ["effects": .string("none"), "argument_path": .string("args.target")])))
+        }
+        return .success(gate)
+    }
+
     /// Trust's ask, and the agent's ask on the person's word, walk the grants on the permission card: an open card already holding them goes
     /// on (Continue), else one card is filed in the open conversation and answered as the person's Allow. The card carries the walk, so
     /// coming back to the window goes on and the card says what is on now.
-    private func askGrants(_ targets: [String]) async throws -> (ok: Bool, detail: String, fields: [String: JSONValue]) {
-        if let unknown = targets.first(where: { SystemPermissionPreflight.cardSettingsCapability($0) == nil }) {
-            return (false, "Unknown macOS grant \(unknown); nothing was asked.", ["execution": .string("not_run"), "effects": .string("none")])
-        }
+    func askGrants(_ targets: [String]) async throws -> (ok: Bool, detail: String, fields: [String: JSONValue]) {
         let dataRoot = appModel.engine.dataRoot
         var card: (id: String, sessionID: String)?
         for open in try await InlineInteractionResolver.platform.openInteractionCards() {
@@ -94,7 +108,7 @@ extension AppQuietToolHost {
             card = (raised.id, session)
         }
         guard let card else { return (false, "No permission card holds these grants; nothing was asked.", ["effects": .string("none")]) }
-        await runCardControl(id: card.id, sessionID: card.sessionID, choice: nil)
+        try await runCardControl(id: card.id, sessionID: card.sessionID, choice: nil)
         await appModel.engine.macIntegration.refresh()
         guard let after = try await InlineInteractionResolver.interaction(id: card.id, sessionID: card.sessionID, dataRoot: dataRoot) else {
             return (false, "The permission card is absent from readback; check it before asking again.", ["effects": .string("unknown")])
@@ -115,7 +129,9 @@ extension AppQuietToolHost {
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
         panel.allowedContentTypes = [.application]
         panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK else { return (true, "No app was selected; nothing changed.", ["changed": .bool(false)]) }
+        guard try await FaceNativePanel.choose(panel) == .OK else {
+            return (true, "No app was selected; nothing changed.", ["changed": .bool(false)])
+        }
         guard let url = panel.url, let id = Bundle(url: url)?.bundleIdentifier else {
             return (false, "The chosen app has no readable bundle identity; nothing changed.", [:])
         }
@@ -124,7 +140,9 @@ extension AppQuietToolHost {
         alert.informativeText = "Everything already recorded for \(id) is deleted for good, including the recovery log. Future recording skips it entirely."
         alert.addButton(withTitle: "Exclude and delete")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return (true, "Exclusion cancelled; nothing changed.", ["changed": .bool(false)]) }
+        guard try await FaceNativePanel.confirm(alert) == .alertFirstButtonReturn else {
+            return (true, "Exclusion cancelled; nothing changed.", ["changed": .bool(false)])
+        }
         let controller = appModel.engine.activityWatch
         await controller.addExclusion(bundleID: id)
         guard try await controller.checkedPolicy().excludedBundleIDs.contains(id), let rows = controller.lastPurgedRowCount else {
@@ -180,7 +198,7 @@ extension AppQuietToolHost: CapabilitiesFaceHost {
         let panel = NSSavePanel()
         panel.title = "Share sense"
         panel.nameFieldStringValue = name
-        return panel.runModal() == .OK ? panel.url : nil
+        return try await FaceNativePanel.choose(panel) == .OK ? panel.url : nil
     }
 
     func buildSkillInChat() async throws -> String {

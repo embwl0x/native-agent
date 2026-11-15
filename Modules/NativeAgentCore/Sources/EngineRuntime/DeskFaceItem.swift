@@ -104,11 +104,12 @@ struct DeskPieceShelf: Sendable {
         let kind = EngineFaceWorkProjection.makeKind(file)
         let isText = MakeStudio.textTypes.contains(type)
         let delimiter = SheetTable.delimiter(type: type)
+        let board = BoardDocument.isBoard(type: type)
         if label == nil { fields["title"] = .string(EngineFaceWorkProjection.versionTitle(made, newest)) }
-        // An SVG is a picture to whoever looks at it, and the Mac draws it as one.
-        fields["what"] = .string(delimiter != nil ? "sheet" : isText ? "document" : kind == "image" || type == "svg" ? "picture"
+        // An SVG is a picture to whoever looks at it, and the Mac draws it as one. A board is drawn as a board, its cards moved by hand.
+        fields["what"] = .string(board ? "board" : delimiter != nil ? "sheet" : isText ? "document" : kind == "image" || type == "svg" ? "picture"
             : kind == "web" ? "page" : "file")
-        fields["leaf"] = .string(kind == "file" ? "preview" : kind)
+        fields["leaf"] = .string(board ? "board" : kind == "file" ? "preview" : kind)
         fields["versions"] = .int(Int64(meta.versions.count))
         fields["version"] = .string(String(newest.n))
         fields["newestAt"] = faceText(NativeTimestampFormat.parseISO8601(newest.created).map(NativeTimestampFormat.fractionalZulu))
@@ -118,7 +119,8 @@ struct DeskPieceShelf: Sendable {
             catch { fields["reason"] = .string("I couldn't read its table: " + error.localizedDescription) }
             return .object(fields)
         }
-        guard isText else { return .object(fields) }
+        // A board's words are its document, read by the agent as a document's are.
+        guard isText || board else { return .object(fields) }
         do {
             let read = try Self.words(file)
             fields["text"] = .string(read.text)

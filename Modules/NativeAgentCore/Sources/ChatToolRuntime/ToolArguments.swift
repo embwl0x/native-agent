@@ -181,6 +181,17 @@ public enum ToolArguments {
                 if element.schemaProblem(schema: items) == nil { return .array([element]) }
             }
         }
+        // A bare value where the form is an object of one required field is that field's value: {"cron":"0 7 * * *"} is
+        // {"cron":{"expression":"0 7 * * *"}}, as the scheduler's own timing reads cron and expression alike.
+        if type == .string("object"), case .object(let inner)? = field["properties"], inner.count == 1, let only = inner.first,
+           field["required"] == .array([.string(only.key)]) {
+            switch value {
+            case .string, .int, .double, .bool:
+                let wrapped = JSONValue.object([only.key: normalizedValue(value, schema: only.value, recordShims: recordShims)])
+                if wrapped.schemaProblem(schema: schema) == nil { return wrapped }
+            default: break
+            }
+        }
         if case .double(let number) = value, type == .string("integer"), let integer = Int64(exactly: number) {
             return .int(integer)
         }

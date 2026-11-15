@@ -65,14 +65,14 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     }
 
     public static func validGenericAgentMessage(_ json: [String: Any]) -> Bool {
-        guard Set(json.keys).isSubset(of: ["text", "sessionId", "request_id"]),
+        guard Set(json.keys).isSubset(of: ["text", "sessionId", "request_id", "reply_to"]),
               let text = json["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               text.utf8.count <= 64000 else { return false }
         if let raw = json["sessionId"] {
             guard let session = raw as? String, genericAgentSessionID(requested: session) != nil else { return false }
         }
-        if let raw = json["request_id"] {
-            guard let id = raw as? String, UUID(uuidString: id) != nil else { return false }
+        for key in ["request_id", "reply_to"] {
+            if let raw = json[key] { guard let id = raw as? String, UUID(uuidString: id) != nil else { return false } }
         }
         return true
     }
@@ -596,15 +596,10 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         return messageID
     }
 
-    /// A message naming neither a send nor a conversation answers nothing.
+    /// Only a message naming its send answers it; coming next in a conversation answers nothing.
     static func claudeReplyID(_ json: [String: Any], owner: String) throws -> String? {
-        if let named = (json["reply_to"] ?? json["in_reply_to"]) as? String, !named.isEmpty {
-            return try validClaudeReplyID(named, owner: owner)
-        }
-        guard let conversation = json["conversation_id"] as? String, !conversation.isEmpty, conversation.utf8.count <= 512
-        else { return nil }
-        return try AgentConversationStore(dataRoot: PersistenceCore.defaultDataRoot())
-            .waitingMessage(agent: owner, conversationID: conversation).flatMap { try validClaudeReplyID($0, owner: owner) }
+        guard let named = (json["reply_to"] ?? json["in_reply_to"]) as? String, !named.isEmpty else { return nil }
+        return try validClaudeReplyID(named, owner: owner)
     }
 
     /// Persist the answer before settling its receipt and exchange; copies retain its attested speaker and steering stamp.

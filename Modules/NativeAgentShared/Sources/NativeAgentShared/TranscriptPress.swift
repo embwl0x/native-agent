@@ -130,11 +130,7 @@ public actor TranscriptPress<Row: TranscriptRow> {
             if unconfirmedReply {
                 causes.append("Finished reply has no conversation row. Read the conversation again; its reply is unconfirmed.")
             }
-            for paragraph in paragraphs {
-                if case .failed(let reason) = paragraph.mapping {
-                    causes.append("Transcript reveal mapping failed for \(paragraph.block.id): \(reason)")
-                }
-            }
+            // A paragraph whose reveal could not be mapped shows whole; that is a diagnostic (TranscriptRevealMapping logs it), not an issue.
             return causes.isEmpty ? nil : causes.joined(separator: "\n")
         }
     }

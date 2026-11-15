@@ -17,6 +17,7 @@ actor TurnFaceProjection {
         let replying: Set<String>
         let active: [String: String]
         let previews: [String: TurnFace.Preview]
+        let nowOn: [String: String]
         let name: String
     }
 
@@ -83,7 +84,8 @@ actor TurnFaceProjection {
                 isThinking: (busy || streams) && turn.map { !$0.isTerminal && $0.streamedTextLength == 0 } != false,
                 liveLine: current ?? liveLine,
                 workPill: what.map { "Working · " + TodayWords.bounded($0, limit: 36) },
-                steps: Array(steps.reversed()), preview: preview, approvalStatus: approvalSnapshot.status
+                steps: Array(steps.reversed()), preview: preview, approvalStatus: approvalSnapshot.status,
+                nowOn: state.map { !$0.presentation.isTerminal } == true ? input.nowOn[session] : nil
             )
             if sent[session] != value {
                 await source.post(value, at: .turn(session: session))
@@ -156,7 +158,7 @@ extension TurnsFacade {
             knownSessions: transcripts.sessions,
             lifecycles: runtime.lifecycleBySession, busy: runtime.busySessions, streaming: runtime.streamingSessions,
             replying: runtime.replyingSessions, active: runtime.activeTurnIDsBySession, previews: runtime.screenPreviewBySession,
-            name: persona.displayName
+            nowOn: runtime.nowOnBySession, name: persona.displayName
         )
         // The newest input replaces one still waiting: a burst of changes is one projection of the latest state.
         pendingTurnFaceInput = input

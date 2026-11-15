@@ -30,8 +30,8 @@ extension ApprovalChatCards {
     }
 
     /// The router calls the same prompt transaction as recovery; a Telegram door gets one prompt, never a second text alert. The card is
-    /// its matter's Inbox row: its buttons are that row's actions the Telegram door runs, and a row that offers Telegram none (a key's
-    /// card, a Mac-only control) is never sent there; its Telegram door is let go.
+    /// its matter's Inbox row: its buttons are that row's actions the Telegram door runs. A row whose only Telegram button would be Not
+    /// now (a key's card, a Mac-only control) is sent as one plain line saying it is answered on the Mac, and settles like any card.
     public static func deliverInteractionAttentionPrompt(id: String, chatId: Int, dataRoot: URL) async -> NotificationDeliveryOutcome {
         do {
             guard let matter = try await interactionMatter(id, dataRoot: dataRoot),
@@ -44,15 +44,15 @@ extension ApprovalChatCards {
             if owed.phase == .accepted { return .delivered }
             guard card.state.isOpen else { return .notDelivered(reason: "The request is no longer open") }
             guard let telegram = runningTelegram else { return .notDelivered(reason: "The Telegram approval sender is not running") }
-            let keyboard = try await TelegramApprovalFiler.buttons(telegram.cardRow(matter.id), dataRoot: dataRoot)
-            guard !keyboard.isEmpty else {
-                try await ForPerson.at(dataRoot).letGo(matter.id, door, .cancelled)
-                return .suppressed(preference: "This request is answered on the Mac or the phone")
-            }
+            let keyboard = try await telegramKeyboard(telegram.cardRow(matter.id), dataRoot: dataRoot)
+            let answers = !keyboard.isEmpty
             guard let face = matter.face, let row = face.row else {
                 return .notDelivered(reason: "The request's canonical consent face is unavailable; no answer was offered")
             }
-            let text = [row.title, face.words].map(NativeAppSecretRedactor.redactText).filter { !$0.isEmpty }.joined(separator: "\n\n")
+            let title = NativeAppSecretRedactor.redactText(row.title)
+            let text = answers
+                ? [title, NativeAppSecretRedactor.redactText(face.words)].filter { !$0.isEmpty }.joined(separator: "\n\n")
+                : title + " \u{2014} answer this on your Mac."
             try await telegram.deliverChatCard(id: id, sessionID: session, dataRoot: dataRoot,
                 text: text, chatId: chatId, threadId: topic, markup: .object(["inline_keyboard": .array(keyboard)]))
             let fresh = try await interactionMatter(id, dataRoot: dataRoot)
@@ -63,6 +63,19 @@ extension ApprovalChatCards {
             if TelegramAPIFailure.isKnownNotDelivered(error) { return .notDelivered(reason: error.localizedDescription) }
             return .unknown(sent: true, reason: error.localizedDescription)
         }
+    }
+
+    /// Declining and the Inbox's housekeeping are no answer: a card whose Telegram buttons would be only these reads as a line.
+    private static let noAnswer: Set<String> = ["card.not_now", "inbox.not_now", "inbox.mark_read", "inbox.archive", "inbox.acknowledge",
+                                                "inbox.dismiss", "inbox.open_on_mac"]
+
+    /// The row's Telegram buttons while it holds an answer Telegram runs; none otherwise, and its card reads as a line.
+    static func telegramKeyboard(_ row: PartFace.Row?, dataRoot: URL) throws -> [JSONValue] {
+        guard let row else { return [] }
+        var answering = row
+        answering.actions = row.actions?.filter { $0.aside != true && !noAnswer.contains($0.call?.action ?? "") }
+        guard try !TelegramApprovalFiler.buttons(answering, dataRoot: dataRoot).isEmpty else { return [] }
+        return try TelegramApprovalFiler.buttons(row, dataRoot: dataRoot)
     }
 
     static func promptPendingInteractions(dataRoot: URL, telegram: TelegramApprovalFiler) async {
@@ -123,10 +136,18 @@ extension ApprovalChatCards {
                   let chatId = Int(chat), let messageId = Int(receipt.id),
                   let card = try await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
                   !card.state.isOpen else { return }
-            let summary = card.state.outcome?.summary.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let text = String((NativeAppSecretRedactor.redactText(card.title) + "\n\n"
-                + (summary.isEmpty ? "Closed." : "✓ " + NativeAppSecretRedactor.redactText(summary))).prefix(3500))
-            try await filer.settleChatCard(chatId: chatId, messageId: messageId, text: text)
+            // The receipt line every door reads. A closed card offers no answer (the Inbox row may not have caught up yet); only a
+            // retryable failure keeps a button, its Try again where Telegram runs it, and settles once it is done.
+            let model = InlineCards.model(card, descriptor: await InlineInteractionResolver.descriptor(for: card, dataRoot: dataRoot))
+            let outcome = model.outcome ?? ""
+            let text = String(([card.title, outcome].map(NativeAppSecretRedactor.redactText).filter { !$0.isEmpty })
+                .joined(separator: "\n\n").prefix(3500))
+            var retry: PartFace.Row?
+            if model.needsAttention { retry = try await filer.inbox.row(matter.id) }
+            if var row = retry { row.actions = row.actions?.filter { $0.call?.action == "card.try_again" }; retry = row }
+            let keyboard = try retry.map { try TelegramApprovalFiler.buttons($0, dataRoot: dataRoot) } ?? []
+            try await filer.settleChatCard(chatId: chatId, messageId: messageId, text: text, keyboard: keyboard)
+            guard !model.needsAttention else { return }
             await ExperienceStore.record(dataRoot, matter.id) { store in
                 try await store.append([.claim(.init(claim: "telegram_settled", evidence: [receipt]))], to: matter.id)
             }.value

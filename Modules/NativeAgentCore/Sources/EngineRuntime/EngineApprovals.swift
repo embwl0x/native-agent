@@ -254,7 +254,9 @@ extension NativeAgentEngine {
                 ),
                 fileAccess: "auto",
                 approvalFiler: approvalFiler,
-                dataRoot: dataRoot
+                dataRoot: dataRoot,
+                // The replay's receipt is traced like any call, naming the card it runs on.
+                tracePeerTurn: true
             )
             // Rehydrate only the replayed tool so it is available without admitting siblings.
             do {

@@ -82,8 +82,8 @@ projection (`DeskPage.render`) lists it as `piece make:<ref>`. The Desk page dra
 pieces under **On the table**, after what waits, and, in the opened item, shows the
 newest version of each in the order it was laid. Mockups, pages and pictures stand
 side by side as one canvas (sections `piece:<refId>` sharing `beside:"pieces"`;
-narrow windows stack them); a document's words and a table keep the full width
-under them. `make.read {ref}` gives its versions and file paths and
+narrow windows stack them); a document's words, a table and a whiteboard keep
+the full width under them. `make.read {ref}` gives its versions and file paths and
 `make.add {path, ref}` (or `{content, name, ref}` for words already in hand) lays a
 new version, which the page shows without another Desk write.
 
@@ -98,16 +98,48 @@ leaves it; **Add a row** at its foot and the add-a-column button at its right
 edge each save one version. Only what changed is written anew: every other field
 keeps its bytes as written and every row its own line break, and an added row
 ends with the file's own line break. A save is the person's own tap of
-`make.add {ref, name, content}` (`ToolsFacade.personTap`), recorded on the new
-version as `person_edit_of`, the version it was changed from. The body takes it
-only when the changed version of that ref is a table, the name is a file of the
-same type and the words are within the limit; Make appends it only while that
-version is still the newest, and otherwise refuses it in plain words with
-nothing written. What a save said stays above the version drawn next (the one
-just laid, or the newer one a refusal was for) until the person changes
+`make.add {ref, name, content}` (`ToolsFacade.personTap`, through the body's
+`save_piece`), recorded on the new version as `person_edit_of`, the version it
+was changed from. The body takes it only when the changed version of that ref is
+a table or a whiteboard, the name is a file of the same type, the words are
+within the limit and a whiteboard's words read as one; Make appends it only
+while that version is still the newest, and otherwise refuses it in plain words
+with nothing written. What a save said stays above the version drawn next (the
+one just laid, or the newer one a refusal was for) until the person changes
 something or leaves. The agent's reading of the opened item gives a table's rows
 and columns and its first rows as text. A plan or project row with steps draws
 a bar of its closed steps out of all of them (`meter`) beside its words.
+
+A whiteboard is a `.board` piece (`BoardDocument`): one JSON document,
+`{"board": 1, "elements": [...]}`, each element an object with a unique `id`
+and a `type`: `shape` (a card: x, y, w, h, text, color, kind rounded, pill or
+rect), `text` (x, y, text, size title, large, body or small), `container` (a
+section: x, y, w, h, its title as text, color), `arrow` (from and to element
+ids, an optional label, fromSide and toSide) and `stroke` (a pen line: x, y,
+points from x and y, color, width). Colours are green, yellow, purple, blue,
+peach, white and ink. The agent lays and changes a whiteboard as any piece, the
+whole document each version (`make.add {content, name:"<name>.board", ref}`);
+the opened item gives the agent its document as text. The window draws it as a
+board, on the Desk and in Make alike (`MakeBoardView`): drag a card to move it
+(a section carries what lies in it), its corner to size it, its edge onto
+another card to join them with an arrow; double-click to write on it, or on the
+empty board to add a card there, or add one in a colour from **Add a card**;
+Delete takes the chosen one off, with its arrows; drag the empty board to look
+around, pinch or the zoom buttons to zoom, **Fit** to see all of it. Each change
+is laid when the hand lets go, one version a change, and the fields it did not
+change keep what was written, the ones the window does not draw included. The
+whiteboard on the Desk holds across its versions: a newer version is drawn once
+it is read, and a drag under way keeps the board it began on until the hand lets
+go; the change is then made on the newest version read, and the board says when
+that is a newer version than the one it was made on. A change made while
+another save runs waits for it. A save Make refuses because a newer version
+exists (`version_superseded`, named by the body from Make's record, nothing
+written) waits for that version to be read and is made again on it; any other
+failure is said as it was said and never made again, since it may have landed,
+and what landed is drawn once it is read. A card or arrow added by hand gets an
+id of its own (`p` and eight hex digits), so no version laid meanwhile holds it
+and what the person chose or is writing on stays theirs. The Make pane draws a
+whiteboard the same way, one page across its versions.
 
 A plan is a board. An opened item with steps under it (items whose `parent` is
 its handle) draws them as columns side by side, one per state and only when it

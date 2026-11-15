@@ -211,12 +211,16 @@ extension AdaptiveMemoryPromoter {
                 matchingBasis = await readBasis(moment, cause: .provider, door: door)
                 do {
                     trace("matching")
-                    matched = try await memoryManager.capturePromises(pending.map(\.element), reply: turn.assistant,
+                    let proposed = try await memoryManager.capturePromises(pending.map(\.element), reply: turn.assistant,
                         open: open, call: LLMCall(turn: heldTurn, surface: turn.surface, purpose: "memory_promise"))
+                    // The settlement is read first: a capture that would refile an item this same interpretation settles is answered by that
+                    // settlement and files nothing. Refusing it failed the moment, and every drain matched again and failed the same way.
                     let settledIDs = Set(interpretation.settled.map(\.id))
-                    guard !matched.contains(where: {
-                        if case .keep(_, let target?, _) = $0 { return settledIDs.contains(target) }; return false
-                    }) else { throw ToolFailureError("A promise capture cannot refile a moment settled by this interpretation.", effects: .none) }
+                    matched = proposed.map { capture in
+                        guard case .keep(_, let target?, _) = capture, settledIDs.contains(target) else { return capture }
+                        trace("settled_by_interpretation", id: target)
+                        return .ignore
+                    }
                 } catch {
                     if Self.isCancellation(error) {
                         return .failure(PromiseFailure(cause: nil, words: "Promise matching was cancelled."))

@@ -133,7 +133,7 @@ public struct AppAction: Sendable {
 
     /// A folded tool runs under its own gates and Trust key. Omitted label and args come from its schema.
     static func fold(_ tool: String, _ page: String, id: String? = nil, _ label: String? = nil, _ args: [String]? = nil,
-                     input: [String: JSONValue] = [:], read: Bool = false,
+                     subject: [String] = [], input: [String: JSONValue] = [:], read: Bool = false,
                      argumentNames: [String: [String]] = [:], argumentValues: [String: [String: JSONValue]] = [:],
                      argumentReferences: [String: ArgumentReference] = [:],
                      irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .agent, capabilities: Set<String> = ["safe_read", "tool_call"],
@@ -153,7 +153,7 @@ public struct AppAction: Sendable {
         let declaredArgs = try (args ?? schema.map { try ToolSignature.doorArgs($0.parametersJSON) } ?? []).map(door)
         return AppAction(id ?? ToolNameAliases.appAction(tool) ?? tool, page,
                          label ?? schema.map { AppActions.firstSentence(ToolNameAliases.foldedProse($0.description)) } ?? tool,
-                         declaredArgs,
+                         declaredArgs, subject: subject.map(door),
                          irreversible: irreversible, toolClass: toolClass, reach: reach, capabilities: capabilities,
                          screen: screen, warn: warn, tool: tool, input: input,
                          read: read, argumentNames: argumentNames, argumentValues: argumentValues,
@@ -191,7 +191,7 @@ public struct AppAction: Sendable {
                              }
                              return AppActions.boundArguments(self, given, schema: schema).args
                          },
-                         readWhen: readWhen, lifecycle: lifecycle, subject: subject,
+                         readWhen: readWhen, lifecycle: lifecycle, subject: subject, page: page,
                          tool: tool, fixedInput: input, rename: rename, folded: isFold,
                          descriptor: schema.map { ToolDescriptor(schema: $0, bucket:
                              SwiftToolDispatcher.catalogBucket(forRegisteredToolNamed: tool) ?? AppToolExecutor.buckets[tool] ?? .unclassified) },

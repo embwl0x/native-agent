@@ -230,6 +230,7 @@ public actor AgentContactTasks {
                                                acceptedOutputModes: send.acceptedOutputModes)
                 created.lifeID = try DataRootLife.current(in: dataRoot)
                 created.job = send.job
+                created.replyTo = send.replyTo
                 if let pushConfig {
                     try pushConfig.keep()
                     created.callbacks = [pushConfig.id: pushConfig.callback]
@@ -258,7 +259,7 @@ public actor AgentContactTasks {
                                         try await self.bindRun(acceptedTask.id, session: session, run: run)
                                         mark.finish()
                                     },
-                                    job: acceptedTask.job)
+                                    job: acceptedTask.job, replyTo: acceptedTask.replyTo)
         let runner = self.runner
         let worker = startWorker(acceptedTask.id) {
             try await runner(turn) { progress in await self.progress(acceptedTask.id, progress) }
@@ -455,7 +456,13 @@ public actor AgentContactTasks {
                 checkpointed = try SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run)
             }
             var queued: AgentContactTurn?
-            if let recovered = try canonicalReply(task) {
+            // A message that answered a held send ran no turn: its send's record says so, by this task's id.
+            if let send = task.replyTo, HeldSends(dataRoot: dataRoot).read(send).answered?.by == task.id {
+                task.state = .completed
+                task.text = HeldSends.answeredNote(send)
+                task.parts = [.text(task.text)]
+                task.detail = nil
+            } else if let recovered = try canonicalReply(task) {
                 if !task.state.terminal { task.state = recovered.outcome.state }
                 task.approvalIDs = recovered.approvals
                 task.parts = recovered.outcome.parts.compactMap { $0.accepted(in: task.acceptedOutputModes ?? ["*/*"]) }
