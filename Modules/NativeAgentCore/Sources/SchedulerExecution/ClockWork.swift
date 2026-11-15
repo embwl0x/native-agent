@@ -99,9 +99,9 @@ public struct ClockWork: Sendable {
 
     // MARK: - A watch
 
-    /// One read of a watch. Rows are keyed by their ids (or their whole content); the first read only sets the baseline, and later reads post the rows
-    /// new since the last one as news. Returns every key this read saw, for the watch to keep, and how many were new. A read whose content cannot be
-    /// observed, or news the board did not accept, throws and keeps the last baseline.
+    /// One read of a watch. Rows are keyed by their ids and change stamp (or their whole content); the first read only sets the baseline, and later
+    /// reads post the rows new or changed since the last one as news. Returns every key this read saw, for the watch to keep, and how many were new.
+    /// A read whose content cannot be observed, or news the board did not accept, throws and keeps the last baseline.
     public static func watch(id: String, name: String, actionId: String, seen last: [String]?, output: JSONValue) async throws -> (seen: [String], fresh: Int) {
         var payload = output
         if case .object(let receipt) = payload, receipt["action"] != nil, let result = receipt["result"] { payload = result }
@@ -149,9 +149,11 @@ public struct ClockWork: Sendable {
         }
         let rows = try project(payload)
         func identifier(_ key: String) -> Bool { key == "id" || key.hasSuffix("Id") || key.hasSuffix("_id") || key.hasSuffix("ID") }
+        // A row with ids is known by them and by when it was last changed, if it says: an edited row is news, as a new one is.
         let keys = try rows.map { row in
             let ids = row.filter { identifier($0.key) }
-            return try JSONValue.object(ids.isEmpty ? row : ids).digest
+            let changed = row.filter { ["modified_at", "modifiedAt"].contains($0.key) }
+            return try JSONValue.object(ids.isEmpty ? row : ids.merging(changed) { id, _ in id }).digest
         }
         guard let last else { return (keys, 0) }
         var seen = Set(last)

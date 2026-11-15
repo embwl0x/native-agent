@@ -671,17 +671,24 @@ rows, while its non-array fields stay together as one observation, even when
 those arrays are empty. Null or status-only results fail explicitly and keep
 the previous baseline; an empty array is an observed empty collection.
 A row is known by its identifier fields
-(`id`, `…Id`, `…_id`) when it has them, else by its digest. The keys a read saw
+(`id`, `…Id`, `…_id`) and its change stamp (`modified_at`, `modifiedAt`) when it has ids, else by its digest, so an
+edited row is news as a new one is. The keys a read saw
 are kept beside its clock time (payload `seen` in `clock/times.json`). Rows new
 since the last read are posted to `SenseNewsBoard` as one notice whose observation
 is the watch, which posts it as a `world` happening, so a later read's notice
-replaces it rather than piling up; the first read only keeps what it saw, a read that did not complete keeps the last keys,
+replaces it rather than piling up. A watch is read once as it is made: `schedule.create` has the clock deliver it now
+(`OneClock.deliverNow`, without moving its next occurrence) and answers after that read, saying what it established. That first
+read only keeps what it saw, as the baseline, so whatever comes after creation is news to the first scheduled read; if it did not
+complete, or no mind takes watch deliveries yet, the first scheduled read that completes is the baseline. Each watch carries the
+mark of the schedule entry it is (payload `made`); a read's keys are kept only on the entry it was read for (`OneClock.revise`), so a
+watch cancelled and made again under the same id never takes an earlier read's keys. A read that did not complete keeps the last keys,
 and a changed read advances those keys only after durable news acceptance
 (a failed news write fails the occurrence and retains its prior baseline),
 and nothing new posts nothing. The occurrence output names the count
 (`newRows`). The Mail, Calendar and Reminders recipes in
 `Resources/abilities/mac-watch-catalog.js` are such watches (`mail.recent`,
-`calendar.upcoming`, `reminders.due_today`). A watch naming an action the door
+`calendar.upcoming`, and `reminders.query` over open reminders, dated or not, most recently made or edited first, 200 a read).
+A watch naming an action the door
 does not have keeps its time and owes that refusal as repair on each run.
 The catalog supplies recipes and words. `MacAssistantStatusResult` owns their
 displayed readiness: each recipe's `jobPayload.payload.actionId` selects its

@@ -86,6 +86,7 @@ extension BuiltInToolSchemaFactory {
                             """)),
                         ("undated_only", ToolSchema.boolSchema("Return only tasks with no due date; cannot be combined with a due range or split_due_at.")),
                         ("include_completed", ToolSchema.boolSchema("Include completed reminders (default false).")),
+                        ("sort", ToolSchema.strSchema("due (default: soonest due first, undated last) or changed (most recently made or edited first).")),
                         ("offset", ToolSchema.intSchema("Result offset (default 0); use next_offset from the preceding page.")),
                         ("limit", ToolSchema.intSchema("""
                             Maximum reminders per page from one native snapshot, independently for split parts (1-200, default 20).

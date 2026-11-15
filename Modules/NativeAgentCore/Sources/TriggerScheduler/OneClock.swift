@@ -109,6 +109,25 @@ public actor OneClock {
         await fire()
     }
 
+    /// Deliver one pending time to its owner once now, outside its rhythm, and return when the owner has taken it: its next occurrence and delivery
+    /// record stay as declared. Returns false when the time is not pending or no owner takes its delivery now.
+    public func deliverNow(_ id: String) async throws -> Bool {
+        guard let time = try read()[id], time.isPending, let deliver = handlers[time.owner] else { return false }
+        await deliver(time, Date())
+        return true
+    }
+
+    /// Replace one pending time's payload with what `change` returns, in one step: its rhythm and next occurrence stay. `change` returns nil to
+    /// leave it as it is. Returns whether the payload was replaced.
+    public func revise(_ id: String, _ change: @Sendable (Time) throws -> JSONValue?) throws -> Bool {
+        var times = try read()
+        guard var time = times[id], time.isPending, let payload = try change(time) else { return false }
+        time.payload = payload
+        times[id] = time
+        try save(times)
+        return true
+    }
+
     /// Import an old owner's time only once. Pending, delivered and withdrawn ids are all durably accounted for by this clock.
     public func carryOver(_ time: Time) async throws {
         var times = try read()

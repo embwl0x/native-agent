@@ -361,7 +361,7 @@ extension MacAssistantStatusResult {
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_reminders_watch"],
                 nextStep: try remAccess.nextStep ?? (remState == "ready" ? "" : step(reminders, "local_reminders")),
-                actionIds: ["reminders.due_today"],
+                actionIds: ["reminders.due_today", "reminders.query"],
                 toolNames: [remindersTool]
             ),
         ]

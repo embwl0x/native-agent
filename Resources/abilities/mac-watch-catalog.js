@@ -16,12 +16,13 @@ function run(input) {
          jobPayload:{kind:"connector_action",schedule:{type:"every",minutes:30},
              payload:{actionId:"calendar.upcoming",input:{hours_ahead:24}}},
          displayTitle:"Mac Calendar",sentence:"I check Calendar for the next day {when} (read only)."},
-        {id:"local_reminders_watch",title:"Local Reminders.app watch",summary:"Poll due and overdue Reminders.app items read-only.",
+        // Open reminders, dated or not, most recently made or edited first: a new or edited one is always on the page, and is news.
+        {id:"local_reminders_watch",title:"Local Reminders.app watch",summary:"Poll open Reminders.app items, dated or not, read-only.",
          scheduleLabel:"Hourly",sources:["reminders.app"],
-         actionIds:["reminders.due_today","schedule.create"],
+         actionIds:["reminders.query","schedule.create"],
          jobPayload:{kind:"connector_action",schedule:{type:"hourly",minute:5},
-             payload:{actionId:"reminders.due_today",input:{}}},
-         displayTitle:"Mac Reminders",sentence:"I check Reminders for due and overdue items {when} (read only)."}
+             payload:{actionId:"reminders.query",input:{limit:200,sort:"changed"}}},
+         displayTitle:"Mac Reminders",sentence:"I check Reminders for new and edited open reminders {when} (read only)."}
     ];
     const grant = " Reads check the current grant; missing access returns a permission card for you to allow.";
     // Each access row's words; the row's status, route and ids are the stem's verdict.

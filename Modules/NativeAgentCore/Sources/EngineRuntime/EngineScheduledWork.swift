@@ -189,7 +189,7 @@ extension NativeAgentEngine {
             let output = try await read(action: action, input: payload["input"]?.objectValue ?? [:])
             let seen = payload["seen"]?.arrayValue?.compactMap(\.stringValue)
             let read = try await ClockWork.watch(id: time.id, name: name, actionId: action, seen: seen, output: output)
-            try await ScheduledReads.remember(seen: read.seen, watch: time.id, dataRoot: root)
+            try await ScheduledReads.remember(seen: read.seen, watch: time, dataRoot: root)
             await RepairOwed.settle(root, operation: operation, evidence: .init(source: "clock", id: time.id)).value
         } catch {
             await RepairOwed.owe(root, id: "watch-read:" + time.id + ":" + UUID().uuidString, kind: .run, operation: operation,

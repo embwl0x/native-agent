@@ -44,6 +44,11 @@ extension LocalPIMConnectorActions {
         let end = parseInputDate(input["due_end"])
         let split = parseInputDate(input["split_due_at"])
         let undatedOnly = flags.undatedOnly
+        let sort = input["sort"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "due"
+        guard ["due", "changed"].contains(sort) else {
+            return .object(["status": .string("failed"), "actionId": .string(actionId), "effects": .string("none"),
+                "reason": .string("sort is due (soonest due first, undated last) or changed (most recently made or edited first).")])
+        }
         guard (input["due_start"] == nil || start != nil),
               (input["due_end"] == nil || end != nil),
               (input["split_due_at"] == nil || split != nil),
@@ -91,6 +96,11 @@ extension LocalPIMConnectorActions {
                 }
                 return true
             }.sorted {
+                if sort == "changed" {
+                    let left = $0.lastModifiedDate ?? $0.creationDate ?? .distantPast
+                    let right = $1.lastModifiedDate ?? $1.creationDate ?? .distantPast
+                    return left == right ? $0.calendarItemIdentifier < $1.calendarItemIdentifier : left > right
+                }
                 let left = $0.dueDateComponents?.date ?? .distantFuture
                 let right = $1.dueDateComponents?.date ?? .distantFuture
                 return left == right ? $0.calendarItemIdentifier < $1.calendarItemIdentifier : left < right
@@ -626,6 +636,9 @@ extension LocalPIMConnectorActions {
         }
         if let completedAt = reminder.completionDate {
             obj["completedAt"] = .string(iso(completedAt))
+        }
+        if let modified = reminder.lastModifiedDate ?? reminder.creationDate {
+            obj["modified_at"] = .string(iso(modified))
         }
         if let notes = reminder.notes, !notes.isEmpty {
             obj["notesPreview"] = .string(String(NativeAppSecretRedactor.redactText(notes).prefix(300)))

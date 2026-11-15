@@ -5,7 +5,8 @@ import PersistenceCore
 // Blueprint: | `ScheduledReads.swift` | `ScheduledReads`: create, list and cancel checked `watch:<id>` and `scan:<id>` clock times |
 
 /// What the agent schedules through `schedule.*`: a watch (a read through the app door whose new rows come to the agent as news) or a proactive scan.
-/// Each is one time on the one clock, its payload beside it; the clock delivers it to the `watch` or `scan` owner.
+/// Each is one time on the one clock, its payload beside it; the clock delivers it to the `watch` or `scan` owner. A new watch is also delivered once
+/// as it is made, and that read is its baseline.
 public enum ScheduledReads {
     /// The kind the agent names, and the clock owner it is delivered to.
     static let owners: [String: String] = ["connector_action": "watch", "proactive_scan": "scan"]
@@ -40,9 +41,28 @@ public enum ScheduledReads {
         guard try await clock.times(owner: owner).allSatisfy({ $0.id != id }) else {
             throw TriggerSchedulerError.schedulerInvalid("A scheduled read with id \(id) already exists; cancel it first or choose another id", path: "$.id")
         }
+        // The schedule entry this watch is: a read made for an earlier entry under the same id never becomes its baseline.
+        let made = UUID().uuidString.lowercased()
+        if owner == "watch" { payload["made"] = .string(made) }
         let time = OneClock.Time(id: id, rhythm: when.rhythm, next: when.next, payload: .object(payload))
         try await clock.declare(time)
-        return .object(["status": .string("completed"), "read": try row(time)])
+        var receipt: [String: JSONValue] = ["status": .string("completed"), "read": try row(time)]
+        if owner == "watch" { receipt["baseline"] = .string(try await baseline(id, made: made, clock: clock)) }
+        return .object(receipt)
+    }
+
+    /// A watch's baseline is what its read sees as it is made: its owner reads it once now, before the creation is answered, so whatever comes
+    /// after is news. Says what that read established.
+    private static func baseline(_ id: String, made: String, clock: OneClock) async throws -> String {
+        guard try await clock.deliverNow(id) else {
+            return "No mind takes watch deliveries yet, so nothing was read now; the first scheduled read takes the baseline."
+        }
+        let current = try await clock.times(owner: "watch").first(where: { $0.id == id })?.payload?.objectValue
+        guard current?["made"] == .string(made), let seen = current?["seen"]?.arrayValue else {
+            return "The baseline read did not complete; its cause is owed as repair on clock/times.json > \(id). "
+                + "The first scheduled read that completes takes the baseline."
+        }
+        return "Read once now: \(seen.count) observation\(seen.count == 1 ? "" : "s") are the baseline, and anything new after it is news."
     }
 
     public static func list(dataRoot: URL) async throws -> JSONValue {
@@ -69,14 +89,16 @@ public enum ScheduledReads {
     }
 
     /// A watch keeps the row keys its last read saw beside its time, so only rows new since then become news. A watch no longer on the clock (a single
-    /// moment already delivered, or cancelled) never reads again, so nothing is kept for it.
-    public static func remember(seen: [String], watch id: String, dataRoot: URL) async throws {
-        let clock = OneClock.at(dataRoot)
-        guard var time = try await clock.times(owner: "watch").first(where: { $0.id == id }) else { return }
-        var payload = try checkedPayload(time)
-        payload["seen"] = .array(seen.map(JSONValue.string))
-        time.payload = .object(payload)
-        try await clock.declare(time)
+    /// moment already delivered, or cancelled) never reads again, so nothing is kept for it; nor for a watch made again under the same id since the
+    /// delivered read (`made` differs).
+    public static func remember(seen: [String], watch delivered: OneClock.Time, dataRoot: URL) async throws {
+        let made = delivered.payload?.objectValue?["made"]
+        _ = try await OneClock.at(dataRoot).revise(delivered.id) { time in
+            guard time.owner == "watch", time.payload?.objectValue?["made"] == made else { return nil }
+            var payload = try checkedPayload(time)
+            payload["seen"] = .array(seen.map(JSONValue.string))
+            return .object(payload)
+        }
     }
 
     /// Exactly one of in_minutes (one moment), interval_seconds (a rhythm) or schedule (a rhythm, or one moment as `{type: once, at}` or a time string).
@@ -124,9 +146,15 @@ public enum ScheduledReads {
                 throw TriggerSchedulerError.persistenceFailure("Scheduled read \(time.id) has invalid saved seen keys; repair clock/times.json.")
             }
         }
+        if let made = payload["made"] {
+            guard time.owner == "watch", case .string = made else {
+                throw TriggerSchedulerError.persistenceFailure("Scheduled read \(time.id) has an invalid saved made mark; repair clock/times.json.")
+            }
+        }
         var arguments = payload
         arguments["name"] = nil
         arguments["seen"] = nil
+        arguments["made"] = nil
         try SchedulerJobNormalizer.validatePayload(kind: kind, payload: arguments)
         if time.owner == "watch", arguments["input"]?.objectValue == nil {
             throw TriggerSchedulerError.persistenceFailure("Watch \(time.id) has no saved input object; repair clock/times.json.")
@@ -137,6 +165,7 @@ public enum ScheduledReads {
     static func row(_ time: OneClock.Time) throws -> JSONValue {
         var payload = try checkedPayload(time)
         payload["seen"] = nil
+        payload["made"] = nil
         guard let name = payload.removeValue(forKey: "name") else {
             throw TriggerSchedulerError.persistenceFailure("Scheduled read \(time.id) has no saved name; repair clock/times.json.")
         }
